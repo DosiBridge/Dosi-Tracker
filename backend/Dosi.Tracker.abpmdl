@@ -1,0 +1,114 @@
+{
+  "template": "app",
+  "imports": {
+    "Volo.Abp.LeptonXLiteTheme": {
+      "version": "5.5.0",
+      "isInstalled": true,
+      "creationTime": "07/14/2026 09:34:17 +00:00"
+    },
+    "Volo.Abp.Account": {
+      "version": "10.5.0",
+      "isInstalled": true,
+      "creationTime": "07/14/2026 09:34:17 +00:00"
+    },
+    "Volo.Abp.OpenIddict": {
+      "version": "10.5.0",
+      "isInstalled": true,
+      "creationTime": "07/14/2026 09:34:17 +00:00"
+    },
+    "Volo.Abp.Identity": {
+      "version": "10.5.0",
+      "isInstalled": true,
+      "creationTime": "07/14/2026 09:34:17 +00:00"
+    },
+    "Volo.Abp.TenantManagement": {
+      "version": "10.5.0",
+      "isInstalled": true,
+      "creationTime": "07/14/2026 09:34:17 +00:00"
+    },
+    "Volo.Abp.SettingManagement": {
+      "version": "10.5.0",
+      "isInstalled": true,
+      "creationTime": "07/14/2026 09:34:17 +00:00"
+    },
+    "Volo.Abp.PermissionManagement": {
+      "version": "10.5.0",
+      "isInstalled": true,
+      "creationTime": "07/14/2026 09:34:17 +00:00"
+    },
+    "Volo.Abp.FeatureManagement": {
+      "version": "10.5.0",
+      "isInstalled": true,
+      "creationTime": "07/14/2026 09:34:17 +00:00"
+    },
+    "Volo.Abp.BlobStoring.Database": {
+      "version": "10.5.0",
+      "isInstalled": true,
+      "creationTime": "07/14/2026 09:34:17 +00:00"
+    }
+  },
+  "folders": {
+    "items": {
+      "src": {},
+      "test": {}
+    }
+  },
+  "packages": {
+    "Dosi.Tracker.Application": {
+      "path": "src/Dosi.Tracker.Application/Dosi.Tracker.Application.abppkg",
+      "folder": "src"
+    },
+    "Dosi.Tracker.Application.Tests": {
+      "path": "test/Dosi.Tracker.Application.Tests/Dosi.Tracker.Application.Tests.abppkg",
+      "folder": "test"
+    },
+    "Dosi.Tracker.Domain.Shared": {
+      "path": "src/Dosi.Tracker.Domain.Shared/Dosi.Tracker.Domain.Shared.abppkg",
+      "folder": "src"
+    },
+    "Dosi.Tracker.Application.Contracts": {
+      "path": "src/Dosi.Tracker.Application.Contracts/Dosi.Tracker.Application.Contracts.abppkg",
+      "folder": "src"
+    },
+    "Dosi.Tracker.HttpApi": {
+      "path": "src/Dosi.Tracker.HttpApi/Dosi.Tracker.HttpApi.abppkg",
+      "folder": "src"
+    },
+    "Dosi.Tracker.HttpApi.Client": {
+      "path": "src/Dosi.Tracker.HttpApi.Client/Dosi.Tracker.HttpApi.Client.abppkg",
+      "folder": "src"
+    },
+    "Dosi.Tracker.EntityFrameworkCore.Tests": {
+      "path": "test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.abppkg",
+      "folder": "test"
+    },
+    "Dosi.Tracker.EntityFrameworkCore": {
+      "path": "src/Dosi.Tracker.EntityFrameworkCore/Dosi.Tracker.EntityFrameworkCore.abppkg",
+      "folder": "src"
+    },
+    "Dosi.Tracker.TestBase": {
+      "path": "test/Dosi.Tracker.TestBase/Dosi.Tracker.TestBase.abppkg",
+      "folder": "test"
+    },
+    "Dosi.Tracker.Domain.Tests": {
+      "path": "test/Dosi.Tracker.Domain.Tests/Dosi.Tracker.Domain.Tests.abppkg",
+      "folder": "test"
+    },
+    "Dosi.Tracker.HttpApi.Client.ConsoleTestApp": {
+      "path": "test/Dosi.Tracker.HttpApi.Client.ConsoleTestApp/Dosi.Tracker.HttpApi.Client.ConsoleTestApp.abppkg",
+      "folder": "test"
+    },
+    "Dosi.Tracker.DbMigrator": {
+      "path": "src/Dosi.Tracker.DbMigrator/Dosi.Tracker.DbMigrator.abppkg",
+      "folder": "src"
+    },
+    "Dosi.Tracker.HttpApi.Host": {
+      "path": "src/Dosi.Tracker.HttpApi.Host/Dosi.Tracker.HttpApi.Host.abppkg",
+      "folder": "src"
+    },
+    "Dosi.Tracker.Domain": {
+      "path": "src/Dosi.Tracker.Domain/Dosi.Tracker.Domain.abppkg",
+      "folder": "src"
+    }
+  }
+}
