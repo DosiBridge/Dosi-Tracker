@@ -1,0 +1,7 @@
+.build/
+.swiftpm/
+Package.resolved
+config.json
+*.db
+*.db-journal
+.DS_Store
