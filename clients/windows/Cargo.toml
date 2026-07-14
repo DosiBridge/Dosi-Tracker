@@ -1,0 +1,67 @@
+[package]
+name = "dosi-tracker-windows"
+version = "0.1.0"
+edition = "2021"
+description = "Dosi-Tracker background activity agent for Windows"
+license = "MIT"
+authors = ["DosiBridge"]
+
+[[bin]]
+name = "dosi-tracker"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime (kept minimal: current-thread scheduler for low overhead)
+tokio = { version = "1", features = ["rt", "macros", "time", "signal", "sync"] }
+
+# HTTP client for syncing activity to the backend API
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Local offline-first storage (bundled SQLite, no system dependency)
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Timestamps
+chrono = { version = "0.4", features = ["serde"] }
+
+# Screenshots (cross-platform, uses native Win32 under the hood)
+xcap = "0.0.14"
+
+# Image encoding (PNG/JPEG) for screenshots and webcam frames
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+# Base64 encoding of captured images before upload
+base64 = "0.22"
+
+# Global keyboard/mouse activity listening (for counts only, event-driven)
+rdev = "0.5"
+
+# Webcam capture
+nokhwa = { version = "0.10", features = ["input-native"] }
+
+# Error handling + logging
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Config
+config = "0.14"
+
+# Windows-specific APIs (active window title / process, autostart)
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+] }
+
+[profile.release]
+opt-level = "z"      # optimize for small binary size
+lto = true           # link-time optimization
+codegen-units = 1
+strip = true         # strip symbols -> smaller, lower footprint
+panic = "abort"      # smaller binary, no unwinding machinery
