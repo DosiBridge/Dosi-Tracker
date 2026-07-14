@@ -1,0 +1,12 @@
+{
+  "apiBaseURL": "https://localhost:44300",
+  "intervalMinutes": 10,
+  "capture": {
+    "screenshot": true,
+    "webcam": false,
+    "keyboard": true,
+    "mouse": true,
+    "activeWindow": true,
+    "runningPrograms": true
+  }
+}
