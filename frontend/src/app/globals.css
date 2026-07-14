@@ -1,0 +1,207 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* ---------------- Design tokens ---------------- */
+:root {
+  --background: #f6f7fb;
+  --foreground: #0d1220;
+
+  --card: #ffffff;
+  --card-foreground: #0d1220;
+
+  --muted: #eef1f7;
+  --muted-foreground: #667085;
+
+  --border: #e6e9f0;
+  --input: #e6e9f0;
+  --ring: #6d5efc;
+
+  --primary: #6d5efc;
+  --primary-foreground: #ffffff;
+
+  --accent: #eef0ff;
+  --accent-foreground: #4536e0;
+
+  --sidebar: #ffffff;
+  --sidebar-foreground: #0d1220;
+
+  --success: #16a34a;
+  --warning: #f59e0b;
+  --danger: #ef4444;
+  --info: #0ea5e9;
+
+  --elev: 0 1px 2px rgb(16 24 40 / 0.06), 0 1px 3px rgb(16 24 40 / 0.1);
+  --elev-lg: 0 12px 40px -12px rgb(16 24 40 / 0.18);
+}
+
+.dark {
+  --background: #080a12;
+  --foreground: #e7e9f2;
+
+  --card: #10131e;
+  --card-foreground: #e7e9f2;
+
+  --muted: #171b28;
+  --muted-foreground: #93a0b8;
+
+  --border: #212636;
+  --input: #262c3d;
+  --ring: #8b7dff;
+
+  --primary: #8b7dff;
+  --primary-foreground: #0b0d16;
+
+  --accent: #1a1d33;
+  --accent-foreground: #c3bbff;
+
+  --sidebar: #0b0e18;
+  --sidebar-foreground: #e7e9f2;
+
+  --success: #22c55e;
+  --warning: #fbbf24;
+  --danger: #f87171;
+  --info: #38bdf8;
+
+  --elev: 0 1px 2px rgb(0 0 0 / 0.4), 0 1px 3px rgb(0 0 0 / 0.5);
+  --elev-lg: 0 16px 48px -12px rgb(0 0 0 / 0.6);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-danger: var(--danger);
+  --color-info: var(--info);
+
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, monospace;
+
+  --radius-xl: 1rem;
+  --radius-2xl: 1.25rem;
+}
+
+* {
+  border-color: var(--border);
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  /* Safety net: never allow accidental horizontal scroll on small screens.
+     Wide content (tables, timelines) uses its own overflow-x-auto containers. */
+  overflow-x: hidden;
+}
+
+/* Prevent long unbroken strings (URLs, emails) from forcing overflow on mobile. */
+h1, h2, h3, p, span, a, button, td, th, label, li {
+  overflow-wrap: break-word;
+}
+
+/* Thin, themed scrollbars */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--muted-foreground) 30%, transparent);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--muted-foreground) 50%, transparent);
+  background-clip: content-box;
+}
+
+/* Utility animations */
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes scale-in {
+  from { opacity: 0; transform: scale(0.97); }
+  to { opacity: 1; transform: scale(1); }
+}
+@keyframes slide-in-right {
+  from { transform: translateX(100%); }
+  to { transform: translateX(0); }
+}
+@keyframes shimmer {
+  100% { transform: translateX(100%); }
+}
+@keyframes pulse-ring {
+  0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--success) 55%, transparent); }
+  70% { box-shadow: 0 0 0 6px transparent; }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+
+.animate-fade-in { animation: fade-in 0.35s ease both; }
+.animate-scale-in { animation: scale-in 0.2s ease both; }
+.animate-slide-in-right { animation: slide-in-right 0.28s cubic-bezier(0.16, 1, 0.3, 1) both; }
+.live-dot { animation: pulse-ring 2s infinite; }
+
+.card-elev { box-shadow: var(--elev); }
+.card-elev-lg { box-shadow: var(--elev-lg); }
+
+.brand-gradient {
+  background-image: linear-gradient(135deg, #6d5efc 0%, #a855f7 50%, #ec4899 100%);
+}
+.brand-text {
+  background-image: linear-gradient(135deg, #6d5efc 0%, #a855f7 60%, #ec4899 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.grid-bg {
+  background-image:
+    linear-gradient(to right, color-mix(in srgb, var(--border) 60%, transparent) 1px, transparent 1px),
+    linear-gradient(to bottom, color-mix(in srgb, var(--border) 60%, transparent) 1px, transparent 1px);
+  background-size: 28px 28px;
+}
+
+/* ---------------- Print (Report → PDF) ---------------- */
+@media print {
+  aside,
+  header {
+    display: none !important;
+  }
+  main {
+    max-width: none !important;
+    padding: 0 !important;
+  }
+  .lg\:pl-64,
+  .lg\:pl-\[76px\] {
+    padding-left: 0 !important;
+  }
+  .card-elev,
+  .card-elev-lg {
+    box-shadow: none !important;
+  }
+  .no-print {
+    display: none !important;
+  }
+  body {
+    background: #fff !important;
+  }
+}
