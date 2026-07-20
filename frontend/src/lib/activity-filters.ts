@@ -63,8 +63,8 @@ function parseTime(hhmm: string): number | null {
 
 function resolveRange(f: ActivityFilters): { from: number; to: number } {
   if (f.rangeKey === "custom" && (f.customFrom || f.customTo)) {
-    const from = f.customFrom ? new Date(`${f.customFrom}T00:00:00`).getTime() : -Infinity;
-    const to = f.customTo ? new Date(`${f.customTo}T23:59:59`).getTime() : Infinity;
+    const from = f.customFrom ? new Date(`${f.customFrom}T00:00:00Z`).getTime() : -Infinity;
+    const to = f.customTo ? new Date(`${f.customTo}T23:59:59Z`).getTime() : Infinity;
     return { from, to };
   }
   const r = rangeForKey(f.rangeKey);

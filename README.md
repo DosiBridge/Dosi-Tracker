@@ -7,15 +7,37 @@ teams, and reports.
 
 This is a **monorepo** containing every part of the product.
 
+## Documentation
+
+| Doc | Language | Contents |
+|-----|----------|----------|
+| [`DOCUMENTATION.md`](./DOCUMENTATION.md) | English | Product: vision, roles, SaaS, frontend features, host console |
+| [`docs/AS_BUILT.md`](./docs/AS_BUILT.md) | English | **What the code actually has today** |
+| [`docs/PRODUCTION_READINESS.md`](./docs/PRODUCTION_READINESS.md) | English | Production gap scorecard + build order |
+| [`docs/RUNBOOK.md`](./docs/RUNBOOK.md) | English | How to run, health-check, recover (local → future prod) |
+| [`docs/SECURITY.md`](./docs/SECURITY.md) | English | Threats, as-built controls, hard rules |
+| [`docs/bn/`](./docs/bn/README.md) | **বাংলা** | Full engineering **course** (chs **1–23**) — product + implementation |
+| [`ENGINEERING_BLUEPRINT.md`](./ENGINEERING_BLUEPRINT.md) | English | Short index → course + production pack |
+| [`ENGINEERING_BLUEPRINT.bn.md`](./ENGINEERING_BLUEPRINT.bn.md) | বাংলা | Short index → `docs/bn/` + production pack |
+
 ## Repository layout
 
 ```
 Dosi-Tracker/
 ├── backend/            # .NET 10 + ABP Framework (DDD / Clean Architecture), REST API, PostgreSQL
 ├── frontend/           # Next.js (App Router, TypeScript, Tailwind) web dashboard
-└── clients/
-    ├── windows/        # Rust background agent (low RAM / low CPU)
-    └── macos/          # Swift background agent (ScreenCaptureKit / AVFoundation / Accessibility)
+├── clients/
+│   ├── windows/        # Rust background agent (low RAM / low CPU)
+│   └── macos/          # Swift background agent (ScreenCaptureKit / AVFoundation / Accessibility)
+├── docs/
+│   ├── bn/             # Bengali target engineering course
+│   ├── AS_BUILT.md     # Code reality
+│   ├── PRODUCTION_READINESS.md
+│   ├── RUNBOOK.md
+│   └── SECURITY.md
+├── DOCUMENTATION.md
+├── ENGINEERING_BLUEPRINT.md
+└── ENGINEERING_BLUEPRINT.bn.md
 ```
 
 ## Components

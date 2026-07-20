@@ -1,18 +1,20 @@
 "use client";
 
 import { useState } from "react";
-import { useRouter } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import { Eye, LogOut } from "lucide-react";
 import { Sidebar } from "@/components/layout/sidebar";
 import { Topbar } from "@/components/layout/topbar";
 import { CommandPalette } from "@/components/command-palette";
 import { ToastViewport } from "@/components/toast";
 import { RoleGuard } from "@/components/role-guard";
+import { PageEnter } from "@/components/motion/reveal";
 import { useSession } from "@/components/session-provider";
 import { cn } from "@/lib/utils";
 
 export default function DashboardLayout({ children }: { children: React.ReactNode }) {
   const router = useRouter();
+  const pathname = usePathname();
   const [collapsed, setCollapsed] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
   const { workspace, user, isImpersonating, stopImpersonating } = useSession();
@@ -45,10 +47,10 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
           </div>
         )}
         <Topbar onMenuClick={() => setMobileOpen(true)} />
-        {/* key on workspace → remount page subtree so every component re-reads
-            the active tenant's data when the workspace is switched. */}
-        <main key={workspace.id} className="mx-auto max-w-[1400px] p-4 lg:p-6">
-          <RoleGuard>{children}</RoleGuard>
+        <main key={workspace.id} className="app-canvas mx-auto max-w-[1400px] p-4 lg:p-6">
+          <PageEnter motionKey={`${workspace.id}:${pathname}`}>
+            <RoleGuard>{children}</RoleGuard>
+          </PageEnter>
         </main>
       </div>
       <CommandPalette />

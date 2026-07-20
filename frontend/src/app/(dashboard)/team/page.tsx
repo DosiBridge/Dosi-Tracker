@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { Plus, Search, Mail, Clock, FolderKanban, Send } from "lucide-react";
+import { Plus, Mail, Clock, FolderKanban, Send, Users } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -10,11 +10,15 @@ import { Ring } from "@/components/ui/ring";
 import { Modal } from "@/components/ui/modal";
 import { Input, Select } from "@/components/ui/input";
 import { Progress } from "@/components/ui/progress";
+import { EmptyState } from "@/components/ui/empty-state";
+import { PageHeader, PageStack } from "@/components/ui/page-header";
+import { SearchField, SegmentedControl, Toolbar } from "@/components/ui/toolbar";
 import { projects, users } from "@/lib/tenant-data";
 import { useSession } from "@/components/session-provider";
+import { countSeats, inviteableRoles } from "@/lib/roles";
 import { fmtLimit, planById, usagePct } from "@/lib/saas-data";
 import type { Role } from "@/lib/types";
-import { cn, formatDuration } from "@/lib/utils";
+import { formatDuration } from "@/lib/utils";
 import Link from "next/link";
 
 const roleTone: Record<Role, "primary" | "info" | "warning" | "muted"> = {
@@ -40,7 +44,7 @@ export default function TeamPage() {
   const [invite, setInvite] = useState(false);
 
   const plan = planById(workspace.planId);
-  const seatsUsed = users.filter((u) => u.role !== "client").length;
+  const seatsUsed = countSeats(users);
   const seatPct = usagePct(seatsUsed, plan.seats);
   const seatsFull = plan.seats !== Number.POSITIVE_INFINITY && seatsUsed >= plan.seats;
   const canManage = user.role === "owner" || user.role === "admin";
@@ -59,23 +63,21 @@ export default function TeamPage() {
   const projectCount = (userId: string) => projects.filter((p) => p.memberIds.includes(userId)).length;
 
   return (
-    <div className="space-y-6">
-      <div className="flex flex-wrap items-end justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-bold tracking-tight">Team</h1>
-          <p className="mt-1 text-sm text-muted-foreground">
-            {users.filter((u) => u.role !== "client").length} members · {users.filter((u) => u.status === "active").length} active now
-          </p>
-        </div>
-        {canManage && (
-          <Button onClick={() => setInvite(true)} disabled={seatsFull} title={seatsFull ? "Seat limit reached — upgrade your plan" : undefined}>
-            <Plus className="h-4 w-4" /> Invite member
-          </Button>
-        )}
-      </div>
+    <PageStack>
+      <PageHeader
+        eyebrow="Workspace"
+        title="Team"
+        description={`${seatsUsed} members · ${users.filter((u) => u.status === "active").length} active now`}
+        actions={
+          canManage ? (
+            <Button onClick={() => setInvite(true)} disabled={seatsFull} title={seatsFull ? "Seat limit reached — upgrade your plan" : undefined}>
+              <Plus className="h-4 w-4" /> Invite member
+            </Button>
+          ) : undefined
+        }
+      />
 
-      {/* Seats (plan usage) */}
-      <Card className="p-4">
+      <Card variant="quiet" className="p-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <div className="text-sm font-medium">
@@ -93,41 +95,36 @@ export default function TeamPage() {
           )}
         </div>
         <div className="mt-3">
-          <Progress value={seatPct} color={seatsFull ? "#ef4444" : seatPct >= 80 ? "#f59e0b" : undefined} />
+          <Progress value={seatPct} color={seatsFull ? "var(--danger)" : seatPct >= 80 ? "var(--warning)" : undefined} />
         </div>
       </Card>
 
-      {/* Controls */}
-      <div className="flex flex-wrap items-center gap-3">
-        <div className="relative min-w-0 flex-1">
-          <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-          <input
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search members…"
-            className="h-10 w-full rounded-lg border border-border bg-card pl-9 pr-3 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-          />
-        </div>
-        <div className="flex flex-wrap gap-1 rounded-lg border border-border bg-card p-1">
-          {filters.map((f) => (
-            <button
-              key={f.key}
-              onClick={() => setRole(f.key)}
-              className={cn(
-                "rounded-md px-3 py-1.5 text-sm font-medium transition-colors",
-                role === f.key ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground"
-              )}
-            >
-              {f.label}
-            </button>
-          ))}
-        </div>
-      </div>
+      <Toolbar>
+        <SearchField value={query} onChange={setQuery} placeholder="Search members…" />
+        <SegmentedControl
+          value={role}
+          onChange={setRole}
+          options={filters.map((f) => ({ value: f.key, label: f.label }))}
+        />
+      </Toolbar>
 
-      {/* Grid */}
+      {filtered.length === 0 ? (
+        <EmptyState
+          icon={Users}
+          title="No members match"
+          description="Try another role filter or clear the search."
+          action={{
+            label: "Reset filters",
+            onClick: () => {
+              setQuery("");
+              setRole("all");
+            },
+          }}
+        />
+      ) : (
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
         {filtered.map((u) => (
-          <Card key={u.id} className="p-5">
+          <Card key={u.id} variant="interactive" className="p-5">
             <div className="flex items-start justify-between">
               <div className="flex items-center gap-3">
                 <Avatar name={u.name} size="lg" status={u.status} />
@@ -144,11 +141,11 @@ export default function TeamPage() {
               <span className="truncate">{u.email}</span>
             </div>
 
-            <div className="mt-4 flex items-center justify-between rounded-lg bg-muted/50 p-3">
+            <div className="mt-4 flex items-center justify-between rounded-xl border border-border/60 bg-muted/40 p-3">
               <div className="space-y-2">
                 <div className="flex items-center gap-1.5 text-sm">
                   <Clock className="h-4 w-4 text-muted-foreground" />
-                  <span className="font-medium">{u.role === "client" ? "—" : formatDuration(u.trackedToday)}</span>
+                  <span className="font-medium tabular-nums">{u.role === "client" ? "—" : formatDuration(u.trackedToday)}</span>
                   <span className="text-xs text-muted-foreground">today</span>
                 </div>
                 <div className="flex items-center gap-1.5 text-sm">
@@ -167,16 +164,17 @@ export default function TeamPage() {
           </Card>
         ))}
       </div>
+      )}
 
-      {/* Invite modal */}
-      <InviteModal open={invite} onClose={() => setInvite(false)} />
-    </div>
+      <InviteModal open={invite} onClose={() => setInvite(false)} inviterRole={user.role} />
+    </PageStack>
   );
 }
 
-function InviteModal({ open, onClose }: { open: boolean; onClose: () => void }) {
+function InviteModal({ open, onClose, inviterRole }: { open: boolean; onClose: () => void; inviterRole: Role }) {
+  const roles = inviteableRoles({ role: inviterRole });
   const [emails, setEmails] = useState("");
-  const [role, setRole] = useState<Role>("worker");
+  const [role, setRole] = useState<Role>(roles[0] ?? "worker");
   const [project, setProject] = useState(projects[0]?.id ?? "");
   const [sent, setSent] = useState(false);
 
@@ -210,10 +208,11 @@ function InviteModal({ open, onClose }: { open: boolean; onClose: () => void }) 
             <div className="space-y-1.5">
               <label className="text-sm font-medium">Role</label>
               <Select value={role} onChange={(e) => setRole(e.target.value as Role)}>
-                <option value="worker">Worker</option>
-                <option value="owner">Owner</option>
-                <option value="client">Client</option>
-                <option value="admin">Admin</option>
+                {roles.map((r) => (
+                  <option key={r} value={r}>
+                    {r === "worker" ? "Member" : r.charAt(0).toUpperCase() + r.slice(1)}
+                  </option>
+                ))}
               </Select>
             </div>
             <div className="space-y-1.5">
@@ -227,7 +226,7 @@ function InviteModal({ open, onClose }: { open: boolean; onClose: () => void }) 
           </div>
           <div className="flex justify-end gap-2 pt-2">
             <Button variant="ghost" onClick={onClose}>Cancel</Button>
-            <Button onClick={send} disabled={!emails.trim()}>
+            <Button onClick={send} disabled={!emails.trim() || roles.length === 0}>
               <Send className="h-4 w-4" /> Send invites
             </Button>
           </div>

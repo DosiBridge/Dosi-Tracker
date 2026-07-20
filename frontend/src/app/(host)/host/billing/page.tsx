@@ -5,11 +5,13 @@ import { DollarSign, TrendingUp, Receipt, AlertTriangle, Download } from "lucide
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { PageHeader, PageStack, SectionLabel } from "@/components/ui/page-header";
 import { DataTable, type Column } from "@/components/ui/data-table";
 import { StatCard } from "@/components/dashboard/stat-card";
 import { MrrChart } from "@/components/host/host-charts";
 import { toast } from "@/components/toast";
 import { useSession } from "@/components/session-provider";
+import { brand } from "@/lib/brand";
 import { growthTrend, platformInvoices, platformOverview, type PlatformInvoice } from "@/lib/host-data";
 
 const usd = (n: number) => `$${Math.round(n).toLocaleString()}`;
@@ -62,39 +64,37 @@ export default function HostBillingPage() {
   ];
 
   return (
-    <div className="space-y-6">
-      <div className="flex flex-wrap items-end justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-bold tracking-tight">Platform Billing</h1>
-          <p className="mt-1 text-sm text-muted-foreground">Revenue, invoices and dunning across all tenants.</p>
-        </div>
-        <Button variant="outline" onClick={exportCsv}>
-          <Download className="h-4 w-4" /> Export invoices
-        </Button>
-      </div>
+    <PageStack>
+      <PageHeader
+        eyebrow="Host"
+        title="Platform Billing"
+        description="Revenue, invoices and dunning across all tenants."
+        actions={
+          <Button variant="outline" onClick={exportCsv}>
+            <Download className="h-4 w-4" /> Export invoices
+          </Button>
+        }
+      />
 
-      {/* KPIs */}
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        <StatCard label="MRR" value={usd(overview.mrr)} icon={DollarSign} trend={14} accent="#6d5efc" sub={`${usd(overview.arr)} ARR`} />
-        <StatCard label="Collected (recent)" value={usd(collected)} icon={TrendingUp} trend={9} accent="#22c55e" sub="paid invoices" />
-        <StatCard label="Upcoming" value={usd(upcoming)} icon={Receipt} accent="#0ea5e9" sub="trial conversions" />
-        <StatCard label="Outstanding" value={usd(outstanding)} icon={AlertTriangle} accent="#ef4444" sub={overview.pastDue > 0 ? `${overview.pastDue} suspended` : "all current"} />
+        <StatCard label="MRR" value={usd(overview.mrr)} icon={DollarSign} trend={14} accent={brand.primary} sub={`${usd(overview.arr)} ARR`} />
+        <StatCard label="Collected (recent)" value={usd(collected)} icon={TrendingUp} trend={9} accent={brand.success} sub="paid invoices" />
+        <StatCard label="Upcoming" value={usd(upcoming)} icon={Receipt} accent={brand.info} sub="trial conversions" />
+        <StatCard label="Outstanding" value={usd(outstanding)} icon={AlertTriangle} accent={brand.danger} sub={overview.pastDue > 0 ? `${overview.pastDue} suspended` : "all current"} />
       </div>
 
-      {/* Revenue chart */}
       <Card>
         <CardHeader><CardTitle>MRR trend</CardTitle><Badge tone="muted">Last 12 months</Badge></CardHeader>
         <CardContent><MrrChart data={growth} /></CardContent>
       </Card>
 
-      {/* Invoices */}
+      <SectionLabel>All invoices</SectionLabel>
       <Card className="p-2">
-        <div className="flex items-center justify-between p-3 pb-1">
-          <h2 className="text-sm font-semibold">All invoices</h2>
-          <Badge tone="muted">{invoices.length}</Badge>
+        <div className="flex items-center justify-between px-3 pb-1 pt-2">
+          <span className="text-xs text-muted-foreground">{invoices.length} records</span>
         </div>
         <DataTable columns={columns} rows={invoices} initialSort={{ key: "date", dir: "desc" }} emptyText="No invoices yet." />
       </Card>
-    </div>
+    </PageStack>
   );
 }

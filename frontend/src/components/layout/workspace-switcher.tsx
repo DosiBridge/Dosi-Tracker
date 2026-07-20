@@ -12,7 +12,7 @@ import { toast } from "@/components/toast";
 import { cn } from "@/lib/utils";
 
 export function WorkspaceSwitcher({ collapsed }: { collapsed: boolean }) {
-  const { workspace, workspaces, setWorkspaceById, createWorkspace } = useSession();
+  const { workspace, workspaces, setWorkspaceById, createWorkspace, setUserById } = useSession();
   const [open, setOpen] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
   const [name, setName] = useState("");
@@ -33,6 +33,7 @@ export function WorkspaceSwitcher({ collapsed }: { collapsed: boolean }) {
     e.preventDefault();
     if (!name.trim()) return;
     const ws = createWorkspace(name.trim(), planId);
+    setUserById(`${ws.id}-owner`);
     setCreateOpen(false);
     setName("");
     toast({ title: "Workspace created", description: `${ws.name} is ready on the ${planById(ws.planId).name} plan.`, tone: "success" });

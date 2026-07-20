@@ -3,7 +3,6 @@
 import { useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
-  Search,
   Plus,
   Building2,
   LogIn,
@@ -25,6 +24,8 @@ import { Modal } from "@/components/ui/modal";
 import { Drawer } from "@/components/ui/drawer";
 import { Avatar } from "@/components/ui/avatar";
 import { Progress } from "@/components/ui/progress";
+import { PageHeader, PageStack } from "@/components/ui/page-header";
+import { SearchField, Toolbar } from "@/components/ui/toolbar";
 import { DataTable, type Column } from "@/components/ui/data-table";
 import { toast } from "@/components/toast";
 import { useSession } from "@/components/session-provider";
@@ -135,7 +136,7 @@ export default function HostTenantsPage() {
       sortValue: (r) => r.ws.status,
       render: (r) => <Badge tone={statusTone[r.ws.status]}>{hostStatusLabel[r.ws.status]}</Badge>,
     },
-    { key: "seats", header: "Seats", align: "right", sortValue: (r) => r.ws.seatsUsed, render: (r) => r.ws.seatsUsed.toLocaleString() },
+    { key: "seats", header: "Seats", align: "right", sortValue: (r) => r.m.seats, render: (r) => r.m.seats.toLocaleString() },
     { key: "members", header: "Members", align: "right", sortValue: (r) => r.m.members, render: (r) => r.m.members },
     { key: "mrr", header: "MRR", align: "right", sortValue: (r) => r.m.mrr ?? 999999, render: (r) => <span className="font-medium">{usd(r.m.mrr)}</span> },
     { key: "created", header: "Created", align: "right", sortValue: (r) => r.ws.createdAt, render: (r) => <span className="text-muted-foreground">{r.ws.createdAt}</span> },
@@ -165,45 +166,33 @@ export default function HostTenantsPage() {
   ];
 
   return (
-    <div className="space-y-6">
-      <div className="flex flex-wrap items-end justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-bold tracking-tight">Tenants</h1>
-          <p className="mt-1 text-sm text-muted-foreground">
-            {rows.length} of {workspaces.length} workspaces on the platform.
-          </p>
-        </div>
-        <Button onClick={() => setCreateOpen(true)}>
-          <Plus className="h-4 w-4" /> New tenant
-        </Button>
-      </div>
+    <PageStack>
+      <PageHeader
+        eyebrow="Platform"
+        title="Tenants"
+        description={`${rows.length} of ${workspaces.length} workspaces on the platform.`}
+        actions={
+          <Button onClick={() => setCreateOpen(true)}>
+            <Plus className="h-4 w-4" /> New tenant
+          </Button>
+        }
+      />
 
-      {/* Filters */}
-      <Card className="p-3">
-        <div className="flex flex-wrap items-center gap-3">
-          <div className="relative min-w-0 flex-1">
-            <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-            <input
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="Search tenant name or slug…"
-              className="h-10 w-full rounded-lg border border-border bg-background pl-9 pr-3 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-            />
-          </div>
-          <Select value={status} onChange={(e) => setStatus(e.target.value as typeof status)} className="w-auto min-w-36">
-            <option value="all">All statuses</option>
-            <option value="active">Active</option>
-            <option value="trialing">Trial</option>
-            <option value="past_due">Suspended</option>
-          </Select>
-          <Select value={plan} onChange={(e) => setPlan(e.target.value as typeof plan)} className="w-auto min-w-36">
-            <option value="all">All plans</option>
-            {plans.map((p) => (
-              <option key={p.id} value={p.id}>{p.name}</option>
-            ))}
-          </Select>
-        </div>
-      </Card>
+      <Toolbar>
+        <SearchField value={query} onChange={setQuery} placeholder="Search tenant name or slug…" />
+        <Select value={status} onChange={(e) => setStatus(e.target.value as typeof status)} className="w-full sm:w-auto sm:min-w-36">
+          <option value="all">All statuses</option>
+          <option value="active">Active</option>
+          <option value="trialing">Trial</option>
+          <option value="past_due">Suspended</option>
+        </Select>
+        <Select value={plan} onChange={(e) => setPlan(e.target.value as typeof plan)} className="w-full sm:w-auto sm:min-w-36">
+          <option value="all">All plans</option>
+          {plans.map((p) => (
+            <option key={p.id} value={p.id}>{p.name}</option>
+          ))}
+        </Select>
+      </Toolbar>
 
       <Card className="p-2">
         <DataTable columns={columns} rows={rows} initialSort={{ key: "mrr", dir: "desc" }} emptyText="No tenants match your filters." />
@@ -245,7 +234,7 @@ export default function HostTenantsPage() {
           toast({ title: "Tenant deleted", tone: "danger" });
         }}
       />
-    </div>
+    </PageStack>
   );
 }
 
@@ -309,7 +298,7 @@ function TenantDrawer({
           <MiniMetric icon={DollarSign} label="MRR" value={usd(m.mrr)} tone="#22c55e" />
           <MiniMetric icon={Gauge} label="Avg productivity" value={`${m.avgProductivity}%`} tone="#ec4899" />
           <MiniMetric icon={HardDrive} label="Storage" value={`${m.storageGb} GB`} tone="#8b5cf6" />
-          <MiniMetric icon={Building2} label="Seats" value={String(ws.seatsUsed)} tone="#f59e0b" />
+          <MiniMetric icon={Building2} label="Seats" value={String(m.seats)} tone="#f59e0b" />
         </div>
 
         {/* Owner */}

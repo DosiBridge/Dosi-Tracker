@@ -207,8 +207,8 @@ export function availableDays(count = 7) {
     const iso = date.toISOString().slice(0, 10);
     out.push({
       iso,
-      label: date.toLocaleDateString("en", { month: "short", day: "numeric" }),
-      weekday: date.toLocaleDateString("en", { weekday: "short" }),
+      label: date.toLocaleDateString("en", { month: "short", day: "numeric", timeZone: "UTC" }),
+      weekday: date.toLocaleDateString("en", { weekday: "short", timeZone: "UTC" }),
       isToday: d === 0,
     });
   }

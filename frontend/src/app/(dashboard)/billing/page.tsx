@@ -18,11 +18,13 @@ import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { DataTable, type Column } from "@/components/ui/data-table";
 import { ExportMenu } from "@/components/reports/report-shell";
+import { PageHeader, PageStack } from "@/components/ui/page-header";
 import { useSession } from "@/components/session-provider";
 import { toast } from "@/components/toast";
 import {
   fmtLimit,
   invoicesFor,
+  liveSeatsUsed,
   monthlyCost,
   planById,
   plans,
@@ -59,7 +61,7 @@ export default function BillingPage() {
   }
 
   const invoiceColumns: Column<Invoice>[] = [
-    { key: "date", header: "Date", sortValue: (r) => r.date, render: (r) => new Date(r.date).toLocaleDateString("en", { year: "numeric", month: "short", day: "numeric" }) },
+    { key: "date", header: "Date", sortValue: (r) => r.date, render: (r) => new Date(r.date + "T00:00:00Z").toLocaleDateString("en", { year: "numeric", month: "short", day: "numeric", timeZone: "UTC" }) },
     { key: "plan", header: "Plan", render: (r) => r.plan },
     { key: "amount", header: "Amount", align: "right", sortValue: (r) => r.amount, render: (r) => <span className="font-medium">${r.amount.toLocaleString()}</span> },
     {
@@ -84,13 +86,16 @@ export default function BillingPage() {
   }
 
   return (
-    <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold tracking-tight">Billing &amp; Plan</h1>
-        <p className="mt-1 text-sm text-muted-foreground">
-          Manage the subscription for <span className="font-medium text-foreground">{workspace.name}</span>.
-        </p>
-      </div>
+    <PageStack>
+      <PageHeader
+        eyebrow="Workspace"
+        title="Billing & Plan"
+        description={
+          <>
+            Manage the subscription for <span className="font-medium text-foreground">{workspace.name}</span>.
+          </>
+        }
+      />
 
       {/* Trial banner */}
       {workspace.status === "trialing" && (
@@ -130,7 +135,7 @@ export default function BillingPage() {
                   {cost !== null && <span className="text-sm font-normal text-muted-foreground">/mo</span>}
                 </div>
                 <div className="text-xs text-muted-foreground">
-                  {plan.pricePerUser ? `$${plan.pricePerUser}/user · ${workspace.seatsUsed} seats` : "Contact sales"}
+                  {plan.pricePerUser !== null ? `$${plan.pricePerUser}/user · ${liveSeatsUsed(workspace)} seats` : "Contact sales"}
                   {workspace.status === "active" && workspace.cycleDays > 0 && ` · renews in ${workspace.cycleDays}d`}
                 </div>
               </div>
@@ -243,6 +248,6 @@ export default function BillingPage() {
         <Building2 className="h-3.5 w-3.5" />
         Tenant: <span className="font-medium text-foreground">{workspace.slug}.dositracker.app</span> · Billing is per-workspace.
       </div>
-    </div>
+    </PageStack>
   );
 }

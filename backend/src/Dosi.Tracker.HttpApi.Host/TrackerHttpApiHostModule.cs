@@ -39,6 +39,8 @@ using Volo.Abp.OpenIddict;
 using Volo.Abp.Swashbuckle;
 using Volo.Abp.Studio.Client.AspNetCore;
 using Volo.Abp.Security.Claims;
+using Volo.Abp.BlobStoring;
+using Volo.Abp.BlobStoring.Aws;
 
 namespace Dosi.Tracker;
 
@@ -52,7 +54,8 @@ namespace Dosi.Tracker;
     typeof(TrackerEntityFrameworkCoreModule),
     typeof(AbpAccountWebOpenIddictModule),
     typeof(AbpSwashbuckleModule),
-    typeof(AbpAspNetCoreSerilogModule)
+    typeof(AbpAspNetCoreSerilogModule),
+    typeof(AbpBlobStoringAwsModule)
     )]
 public class TrackerHttpApiHostModule : AbpModule
 {
@@ -127,6 +130,21 @@ public class TrackerHttpApiHostModule : AbpModule
         ConfigureSwagger(context, configuration);
         ConfigureVirtualFileSystem(context);
         ConfigureCors(context, configuration);
+
+        Configure<AbpBlobStoringOptions>(options =>
+        {
+            options.Containers.ConfigureDefault(container =>
+            {
+                container.UseAws(aws =>
+                {
+                    aws.AccessKeyId = configuration["S3:AccessKeyId"];
+                    aws.SecretAccessKey = configuration["S3:SecretAccessKey"];
+                    aws.ContainerName = configuration["S3:ContainerName"];
+                    // For Cloudflare R2:
+                    // aws.UseCredentials = false (not available in ABP by default, handled by S3 client config)
+                });
+            });
+        });
     }
 
     private void ConfigureStudio(IHostEnvironment hostingEnvironment)

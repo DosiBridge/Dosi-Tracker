@@ -6,6 +6,8 @@ import type { LucideIcon } from "lucide-react";
 import { ArrowLeft, Download, FileText, Printer, ChevronDown } from "lucide-react";
 import { Card } from "@/components/ui/card";
 import { Select } from "@/components/ui/input";
+import { PageHeader } from "@/components/ui/page-header";
+import { Toolbar } from "@/components/ui/toolbar";
 import { cn } from "@/lib/utils";
 import { projects, users } from "@/lib/tenant-data";
 import { toast } from "@/components/toast";
@@ -25,16 +27,10 @@ export function ReportShell({
 }) {
   return (
     <div className="space-y-6">
-      <Link href="/reports" className="inline-flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground">
+      <Link href="/reports" className="inline-flex items-center gap-1.5 text-sm text-muted-foreground transition-colors hover:text-foreground">
         <ArrowLeft className="h-4 w-4" /> All reports
       </Link>
-      <div className="flex flex-wrap items-start justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-bold tracking-tight">{title}</h1>
-          {description && <p className="mt-1 text-sm text-muted-foreground">{description}</p>}
-        </div>
-        {actions && <div className="flex items-center gap-2">{actions}</div>}
-      </div>
+      <PageHeader title={title} description={description} actions={actions} eyebrow="Report" />
       {children}
     </div>
   );
@@ -60,11 +56,11 @@ export function FilterBar({
   actions?: React.ReactNode;
 }) {
   return (
-    <Card className="p-3">
-      <div className="flex flex-wrap items-center gap-3">
+    <Toolbar>
+      <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2 sm:gap-3">
         <DateRangePicker value={rangeKey} onChange={onRange} />
         {onProject && (
-          <Select value={projectId} onChange={(e) => onProject(e.target.value)} className="w-auto min-w-40">
+          <Select value={projectId} onChange={(e) => onProject(e.target.value)} className="w-full min-w-0 sm:w-auto sm:min-w-40">
             <option value="all">All projects</option>
             {projects.map((p) => (
               <option key={p.id} value={p.id}>{p.title}</option>
@@ -72,17 +68,19 @@ export function FilterBar({
           </Select>
         )}
         {onMember && (
-          <Select value={memberId} onChange={(e) => onMember(e.target.value)} className="w-auto min-w-40">
+          <Select value={memberId} onChange={(e) => onMember(e.target.value)} className="w-full min-w-0 sm:w-auto sm:min-w-40">
             <option value="all">All members</option>
-            {users.filter((u) => u.role !== "client").map((u) => (
+            {users.filter((u) => u.role === "owner" || u.role === "admin" || u.role === "worker").map((u) => (
               <option key={u.id} value={u.id}>{u.name}</option>
             ))}
           </Select>
         )}
         {extra}
-        <div className="ml-auto flex items-center gap-2">{actions}</div>
       </div>
-    </Card>
+      {actions && (
+        <div className="flex w-full items-center gap-2 sm:ml-auto sm:w-auto">{actions}</div>
+      )}
+    </Toolbar>
   );
 }
 
@@ -102,7 +100,7 @@ export function ExportMenu({ onExportCSV }: { onExportCSV: () => void }) {
     <div className="relative" ref={ref}>
       <button
         onClick={() => setOpen((o) => !o)}
-        className="inline-flex h-10 items-center gap-2 rounded-lg bg-primary px-4 text-sm font-medium text-primary-foreground hover:opacity-90"
+        className="inline-flex h-10 w-full items-center justify-center gap-2 rounded-lg bg-primary px-4 text-sm font-medium text-primary-foreground hover:opacity-90 sm:w-auto"
       >
         <Download className="h-4 w-4" /> Export <ChevronDown className="h-4 w-4" />
       </button>
@@ -127,14 +125,14 @@ export function ExportMenu({ onExportCSV }: { onExportCSV: () => void }) {
 }
 
 export function KpiGrid({ children }: { children: React.ReactNode }) {
-  return <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">{children}</div>;
+  return <div className="grid grid-cols-2 gap-3 sm:gap-4 lg:grid-cols-4">{children}</div>;
 }
 
 export function Kpi({
   label,
   value,
   icon: Icon,
-  tone = "#6d5efc",
+  tone = "#0d9488",
   sub,
 }: {
   label: string;

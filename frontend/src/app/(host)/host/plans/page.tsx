@@ -6,22 +6,24 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { PageHeader, PageStack } from "@/components/ui/page-header";
 import { DataTable, type Column } from "@/components/ui/data-table";
 import { toast } from "@/components/toast";
 import { useSession } from "@/components/session-provider";
 import { planBreakdown, planColor, type PlanBreakdown } from "@/lib/host-data";
-import { fmtLimit } from "@/lib/saas-data";
+import { fmtLimit, plans } from "@/lib/saas-data";
 
 const usd = (n: number) => `$${Math.round(n).toLocaleString()}`;
 
 export default function HostPlansPage() {
   const { workspaces } = useSession();
-  const breakdown = useMemo(() => planBreakdown(workspaces), [workspaces]);
 
   // Local (demo) price overrides — a real host would persist these.
   const [prices, setPrices] = useState<Record<string, number | null>>({});
   const [editing, setEditing] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
+
+  const breakdown = useMemo(() => planBreakdown(workspaces), [workspaces, prices]);
 
   function priceOf(b: PlanBreakdown): number | null {
     return b.plan.id in prices ? prices[b.plan.id] : b.plan.pricePerUser;
@@ -31,6 +33,10 @@ export default function HostPlansPage() {
     const n = Number(draft);
     if (!Number.isNaN(n)) {
       setPrices((p) => ({ ...p, [id]: n }));
+      const plan = plans.find((p) => p.id === id);
+      if (plan) {
+        plan.pricePerUser = n;
+      }
       toast({ title: "Plan updated", description: `New price: $${n}/user/mo.`, tone: "success" });
     }
     setEditing(null);
@@ -54,20 +60,18 @@ export default function HostPlansPage() {
   ];
 
   return (
-    <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold tracking-tight">Plans &amp; Editions</h1>
-        <p className="mt-1 text-sm text-muted-foreground">
-          Pricing tiers, limits and adoption across the platform · {usd(totalMrr)} total MRR.
-        </p>
-      </div>
+    <PageStack>
+      <PageHeader
+        eyebrow="Host"
+        title="Plans & Editions"
+        description={`Pricing tiers, limits and adoption · ${usd(totalMrr)} total MRR.`}
+      />
 
-      {/* Plan cards */}
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
         {breakdown.map((b) => {
           const price = priceOf(b);
           return (
-            <Card key={b.plan.id} className={b.plan.highlight ? "border-primary/40 ring-1 ring-primary/20" : ""}>
+            <Card key={b.plan.id} variant={b.plan.highlight ? "interactive" : "default"} className={b.plan.highlight ? "border-primary/40 ring-1 ring-primary/20" : ""}>
               <CardHeader>
                 <CardTitle className="flex items-center gap-2">
                   <span className="h-2.5 w-2.5 rounded-full" style={{ background: b.color }} />
@@ -84,7 +88,7 @@ export default function HostPlansPage() {
                     </div>
                   ) : (
                     <div className="flex items-baseline gap-1">
-                      <span className="text-3xl font-bold">{price === null ? "Custom" : `$${price}`}</span>
+                      <span className="font-display text-3xl font-bold tracking-tight">{price === null ? "Custom" : `$${price}`}</span>
                       {price !== null && <span className="text-sm text-muted-foreground">/user/mo</span>}
                       {price !== null && (
                         <button
@@ -100,7 +104,7 @@ export default function HostPlansPage() {
                   <p className="mt-1 text-xs text-muted-foreground">{b.plan.tagline}</p>
                 </div>
 
-                <div className="grid grid-cols-3 gap-2 rounded-lg border border-border p-2 text-center">
+                <div className="grid grid-cols-3 gap-2 rounded-xl border border-border p-2 text-center">
                   <Stat label="Tenants" value={String(b.tenants)} />
                   <Stat label="Seats" value={String(b.seats)} />
                   <Stat label="MRR" value={usd(b.mrr)} />
@@ -119,7 +123,6 @@ export default function HostPlansPage() {
         })}
       </div>
 
-      {/* Comparison matrix */}
       <Card className="p-2">
         <div className="p-3 pb-1">
           <h2 className="text-sm font-semibold">Limits &amp; adoption</h2>
@@ -127,7 +130,6 @@ export default function HostPlansPage() {
         <DataTable columns={matrixCols} rows={breakdown} initialSort={{ key: "mrr", dir: "desc" }} />
       </Card>
 
-      {/* Adoption bars */}
       <Card>
         <CardHeader><CardTitle>Revenue by plan</CardTitle></CardHeader>
         <CardContent className="space-y-3">
@@ -147,7 +149,7 @@ export default function HostPlansPage() {
           ))}
         </CardContent>
       </Card>
-    </div>
+    </PageStack>
   );
 }
 

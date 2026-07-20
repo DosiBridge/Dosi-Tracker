@@ -22,8 +22,11 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Avatar } from "@/components/ui/avatar";
 import { Ring } from "@/components/ui/ring";
+import { PageStack } from "@/components/ui/page-header";
 import { ScreenMockView } from "@/components/screen-mock";
+import { useSession } from "@/components/session-provider";
 import { activitiesForProject, projectById, userById, NOW } from "@/lib/tenant-data";
+import { canViewProject } from "@/lib/scope";
 import { formatDuration } from "@/lib/utils";
 import type { TrackingPermissions } from "@/lib/types";
 
@@ -46,12 +49,13 @@ function agoLabel(iso: string) {
 
 export default function ProjectDetailPage() {
   const { id } = useParams<{ id: string }>();
+  const { user } = useSession();
   const project = projectById(id);
 
-  if (!project) {
+  if (!project || !canViewProject(user, project)) {
     return (
       <div className="flex flex-col items-center gap-4 py-20 text-center">
-        <p className="text-muted-foreground">Project not found.</p>
+        <p className="text-muted-foreground">{project ? "You don’t have access to this project." : "Project not found."}</p>
         <Link href="/projects">
           <Button variant="outline">
             <ArrowLeft className="h-4 w-4" /> Back to projects
@@ -72,30 +76,29 @@ export default function ProjectDetailPage() {
   });
 
   return (
-    <div className="space-y-6">
+    <PageStack>
       <Link href="/projects" className="inline-flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground">
         <ArrowLeft className="h-4 w-4" /> Projects
       </Link>
 
-      {/* Header */}
-      <div className="flex flex-wrap items-start justify-between gap-4">
+      <header className="flex flex-wrap items-start justify-between gap-4 border-b border-border/70 pb-5">
         <div className="flex items-center gap-4">
           <div className="flex h-14 w-14 items-center justify-center rounded-2xl text-white" style={{ background: project.color }}>
-            <span className="text-xl font-bold">{project.title[0]}</span>
+            <span className="font-display text-xl font-bold">{project.title[0]}</span>
           </div>
           <div>
-            <div className="flex items-center gap-2">
-              <h1 className="text-2xl font-bold tracking-tight">{project.title}</h1>
+            <div className="flex flex-wrap items-center gap-2">
+              <h1 className="page-title">{project.title}</h1>
               {project.archived && <Badge tone="muted">Archived</Badge>}
             </div>
-            <p className="mt-0.5 text-sm text-muted-foreground">{project.description}</p>
+            <p className="mt-1.5 text-sm leading-relaxed text-muted-foreground">{project.description}</p>
           </div>
         </div>
         <div className="flex gap-2">
           <Button variant="outline"><Pencil className="h-4 w-4" /> Edit</Button>
           <Button variant="outline"><Archive className="h-4 w-4" /> Archive</Button>
         </div>
-      </div>
+      </header>
 
       {/* Stats */}
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
@@ -107,11 +110,11 @@ export default function ProjectDetailPage() {
         ].map((s) => (
           <Card key={s.label} className="p-4">
             <div className="flex items-center gap-3">
-              <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-muted text-muted-foreground">
+              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-muted text-muted-foreground">
                 <s.icon className="h-5 w-5" />
               </div>
               <div>
-                <div className="text-lg font-bold">{s.value}</div>
+                <div className="font-display text-lg font-bold tabular-nums">{s.value}</div>
                 <div className="text-xs text-muted-foreground">{s.label}</div>
               </div>
             </div>
@@ -198,6 +201,6 @@ export default function ProjectDetailPage() {
           )}
         </CardContent>
       </Card>
-    </div>
+    </PageStack>
   );
 }

@@ -1,4 +1,5 @@
 import type { Activity, Project, ScreenMock, User, WindowInfo } from "./types";
+import { countSeats } from "./roles";
 
 /** Fixed reference time so SSR and client render identically (no hydration drift). */
 export const NOW = new Date("2026-07-14T15:30:00.000Z");
@@ -70,7 +71,7 @@ export const projects: Project[] = [
     id: "p1", title: "Dosi Web Platform", description: "Core SaaS dashboard & REST API.",
     color: "#6d5efc", archived: false, intervalMinutes: 10,
     permissions: { screenshot: true, webcam: false, keyboard: true, mouse: true, activeWindow: true, runningPrograms: true },
-    memberIds: ["u1", "u2", "u3", "u6"], createdAt: "2025-04-02",
+    memberIds: ["u1", "u2", "u3", "u6", "u8"], createdAt: "2025-04-02",
     loggedThisWeek: 1840, loggedThisMonth: 7320, loggedTotal: 41200,
   },
   {
@@ -84,7 +85,7 @@ export const projects: Project[] = [
     id: "p3", title: "Acme Corp CRM", description: "Client engagement portal for Acme.",
     color: "#0ea5e9", archived: false, intervalMinutes: 10,
     permissions: { screenshot: true, webcam: false, keyboard: true, mouse: true, activeWindow: true, runningPrograms: true },
-    memberIds: ["u1", "u3", "u4", "u7"], createdAt: "2025-06-08",
+    memberIds: ["u1", "u3", "u4", "u7", "u8"], createdAt: "2025-06-08",
     loggedThisWeek: 980, loggedThisMonth: 4020, loggedTotal: 9800,
   },
   {
@@ -160,7 +161,7 @@ const descriptions = [
 
 function buildActivities(): Activity[] {
   const list: Activity[] = [];
-  const trackingUsers = users.filter((u) => u.role === "worker" || u.role === "owner");
+  const trackingUsers = users.filter((u) => u.role === "worker" || u.role === "owner" || u.role === "admin");
   let id = 0;
 
   // Spread activities across the last 5 days, most recent first.
@@ -251,7 +252,7 @@ export function activitiesForUser(userId: string) {
 export const summary = {
   totalTrackedToday: users.reduce((s, u) => s + u.trackedToday, 0),
   activeMembers: users.filter((u) => u.status === "active").length,
-  totalMembers: users.filter((u) => u.role !== "client").length,
+  totalMembers: countSeats(users),
   activeProjects: projects.filter((p) => !p.archived).length,
   avgProductivity: Math.round(
     users.filter((u) => u.productivity > 0).reduce((s, u) => s + u.productivity, 0) /

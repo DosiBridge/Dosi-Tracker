@@ -1,11 +1,11 @@
 import type { Metadata } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
+import { Inter, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import { ThemeProvider } from "@/components/theme-provider";
 import { SessionProvider } from "@/components/session-provider";
 
-const geistSans = Geist({
-  variable: "--font-geist-sans",
+const inter = Inter({
+  variable: "--font-inter",
   subsets: ["latin"],
 });
 
@@ -20,7 +20,6 @@ export const metadata: Metadata = {
     "Dosi-Tracker: monitor team activity, time, and productivity across projects with a modern, privacy-conscious dashboard.",
 };
 
-// Set theme before paint to avoid a flash of the wrong theme.
 const themeScript = `
 (function() {
   try {
@@ -37,11 +36,11 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}>
+    <html lang="en" className={`${inter.variable} ${geistMono.variable} h-full antialiased`}>
       <head>
         <script dangerouslySetInnerHTML={{ __html: themeScript }} />
       </head>
-      <body className="min-h-full">
+      <body className="min-h-full font-sans">
         <ThemeProvider>
           <SessionProvider>{children}</SessionProvider>
         </ThemeProvider>

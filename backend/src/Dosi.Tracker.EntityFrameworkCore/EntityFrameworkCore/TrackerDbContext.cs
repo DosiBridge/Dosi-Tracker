@@ -14,6 +14,8 @@ using Volo.Abp.SettingManagement.EntityFrameworkCore;
 using Volo.Abp.OpenIddict.EntityFrameworkCore;
 using Volo.Abp.TenantManagement;
 using Volo.Abp.TenantManagement.EntityFrameworkCore;
+using Dosi.Tracker.Projects;
+using Dosi.Tracker.Activities;
 
 namespace Dosi.Tracker.EntityFrameworkCore;
 
@@ -26,7 +28,10 @@ public class TrackerDbContext :
     IIdentityDbContext
 {
     /* Add DbSet properties for your Aggregate Roots / Entities here. */
-
+    public DbSet<Project> Projects { get; set; }
+    public DbSet<ProjectMember> ProjectMembers { get; set; }
+    public DbSet<Activity> Activities { get; set; }
+    public DbSet<Screenshot> Screenshots { get; set; }
 
     #region Entities from the modules
 
@@ -81,11 +86,37 @@ public class TrackerDbContext :
 
         /* Configure your own tables/entities inside here */
 
-        //builder.Entity<YourEntity>(b =>
-        //{
-        //    b.ToTable(TrackerConsts.DbTablePrefix + "YourEntities", TrackerConsts.DbSchema);
-        //    b.ConfigureByConvention(); //auto configure for the base class props
-        //    //...
-        //});
+        builder.Entity<Project>(b =>
+        {
+            b.ToTable(TrackerConsts.DbTablePrefix + "Projects", TrackerConsts.DbSchema);
+            b.ConfigureByConvention(); //auto configure for the base class props
+            b.Property(x => x.Title).IsRequired().HasMaxLength(128);
+            b.HasMany(x => x.Members).WithOne().HasForeignKey(x => x.ProjectId).IsRequired();
+        });
+
+        builder.Entity<ProjectMember>(b =>
+        {
+            b.ToTable(TrackerConsts.DbTablePrefix + "ProjectMembers", TrackerConsts.DbSchema);
+            b.ConfigureByConvention();
+            b.Property(x => x.Role).IsRequired().HasMaxLength(64);
+        });
+
+        builder.Entity<Activity>(b =>
+        {
+            b.ToTable(TrackerConsts.DbTablePrefix + "Activities", TrackerConsts.DbSchema);
+            b.ConfigureByConvention();
+            b.HasIndex(x => new { x.TenantId, x.UserId, x.StartedAt }).IsDescending(false, false, true);
+            b.HasIndex(x => new { x.TenantId, x.ProjectId, x.StartedAt }).IsDescending(false, false, true);
+            b.HasIndex(x => new { x.TenantId, x.ClientActivityId }).IsUnique(); // Idempotency
+            b.HasOne(x => x.Screenshot).WithOne().HasForeignKey<Screenshot>(x => x.ActivityId);
+        });
+
+        builder.Entity<Screenshot>(b =>
+        {
+            b.ToTable(TrackerConsts.DbTablePrefix + "Screenshots", TrackerConsts.DbSchema);
+            b.ConfigureByConvention();
+            b.HasIndex(x => new { x.TenantId, x.CapturedAt }).IsDescending(false, true);
+            b.Property(x => x.StorageUrl).IsRequired().HasMaxLength(512);
+        });
     }
 }

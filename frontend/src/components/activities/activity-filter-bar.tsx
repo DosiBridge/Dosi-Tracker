@@ -79,20 +79,20 @@ export function ActivityFilterBar({
 
   return (
     <Card className="p-3">
-      {/* Row 1 */}
-      <div className="flex flex-wrap items-center gap-3">
-        <div className="relative min-w-0 flex-1">
+      {/* Row 1 — search + filters always; selects hide below md */}
+      <div className="flex flex-wrap items-center gap-2 sm:gap-3">
+        <div className="relative min-w-0 flex-1 basis-full sm:basis-auto">
           <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
           <input
             value={value.query}
             onChange={(e) => set("query", e.target.value)}
-            placeholder="Search task, app, window, member, project…"
-            className="h-10 w-full rounded-lg border border-border bg-background pl-9 pr-3 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+            placeholder="Search task, app, member…"
+            className="h-10 w-full rounded-xl border border-border bg-card pl-9 pr-3 text-sm shadow-[inset_0_1px_0_rgb(255_255_255_/_0.04)] focus:outline-none focus:ring-2 focus:ring-ring"
           />
         </div>
 
         {showMemberFilter && (
-          <Select value={value.memberId} onChange={(e) => set("memberId", e.target.value)} className="w-auto min-w-36">
+          <Select value={value.memberId} onChange={(e) => set("memberId", e.target.value)} className="hidden w-auto min-w-36 md:block">
             <option value="all">All members</option>
             {users.filter((u) => u.role !== "client").map((u) => (
               <option key={u.id} value={u.id}>{u.name}</option>
@@ -100,14 +100,14 @@ export function ActivityFilterBar({
           </Select>
         )}
 
-        <Select value={value.projectId} onChange={(e) => set("projectId", e.target.value)} className="w-auto min-w-36">
+        <Select value={value.projectId} onChange={(e) => set("projectId", e.target.value)} className="hidden w-auto min-w-36 md:block">
           <option value="all">All projects</option>
           {projects.map((p) => (
             <option key={p.id} value={p.id}>{p.title}</option>
           ))}
         </Select>
 
-        <Select value={value.sort} onChange={(e) => set("sort", e.target.value as ActivitySort)} className="w-auto min-w-44">
+        <Select value={value.sort} onChange={(e) => set("sort", e.target.value as ActivitySort)} className="hidden w-auto min-w-44 lg:block">
           {(Object.keys(sortLabels) as ActivitySort[]).map((s) => (
             <option key={s} value={s}>{sortLabels[s]}</option>
           ))}
@@ -116,11 +116,12 @@ export function ActivityFilterBar({
         <button
           onClick={() => setOpen((o) => !o)}
           className={cn(
-            "inline-flex h-10 items-center gap-2 rounded-lg border px-3 text-sm transition-colors",
+            "inline-flex h-10 shrink-0 items-center gap-2 rounded-lg border px-3 text-sm transition-colors",
             open || activeCount > 0 ? "border-primary/40 bg-accent text-accent-foreground" : "border-border hover:bg-muted"
           )}
         >
-          <SlidersHorizontal className="h-4 w-4" /> Filters
+          <SlidersHorizontal className="h-4 w-4" />
+          <span className="hidden xs:inline sm:inline">Filters</span>
           {activeCount > 0 && (
             <span className="flex h-5 min-w-5 items-center justify-center rounded-full bg-primary px-1 text-[10px] font-bold text-primary-foreground">
               {activeCount}
@@ -132,6 +133,38 @@ export function ActivityFilterBar({
       {/* Expanded panel */}
       {open && (
         <div className="mt-3 grid grid-cols-1 gap-4 border-t border-border pt-4 md:grid-cols-2 lg:grid-cols-4">
+          {/* Mobile-only primary filters */}
+          <div className="space-y-3 md:hidden">
+            {showMemberFilter && (
+              <div className="space-y-1.5">
+                <label className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Member</label>
+                <Select value={value.memberId} onChange={(e) => set("memberId", e.target.value)}>
+                  <option value="all">All members</option>
+                  {users.filter((u) => u.role !== "client").map((u) => (
+                    <option key={u.id} value={u.id}>{u.name}</option>
+                  ))}
+                </Select>
+              </div>
+            )}
+            <div className="space-y-1.5">
+              <label className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Project</label>
+              <Select value={value.projectId} onChange={(e) => set("projectId", e.target.value)}>
+                <option value="all">All projects</option>
+                {projects.map((p) => (
+                  <option key={p.id} value={p.id}>{p.title}</option>
+                ))}
+              </Select>
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Sort</label>
+              <Select value={value.sort} onChange={(e) => set("sort", e.target.value as ActivitySort)}>
+                {(Object.keys(sortLabels) as ActivitySort[]).map((s) => (
+                  <option key={s} value={s}>{sortLabels[s]}</option>
+                ))}
+              </Select>
+            </div>
+          </div>
+
           {/* Date range */}
           <div className="space-y-2 md:col-span-2">
             <label className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Date range</label>
@@ -150,14 +183,14 @@ export function ActivityFilterBar({
               ))}
             </div>
             {value.rangeKey === "custom" && (
-              <div className="flex items-center gap-2">
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
                 <input
                   type="date"
                   value={value.customFrom}
                   onChange={(e) => set("customFrom", e.target.value)}
                   className="h-9 w-full rounded-lg border border-input bg-background px-2 text-sm"
                 />
-                <span className="text-muted-foreground">→</span>
+                <span className="hidden text-muted-foreground sm:inline">→</span>
                 <input
                   type="date"
                   value={value.customTo}

@@ -8,6 +8,7 @@ import type {
   Insight,
   ProductivitySplit,
 } from "./reports-data";
+import { trackedMembers, countSeats } from "./roles";
 import {
   NOW,
   users as primaryUsers,
@@ -127,7 +128,7 @@ function genActivities(users: User[], projects: Project[], seedNum: number): Act
   const pick = <T>(arr: T[]) => arr[Math.floor(rand() * arr.length)];
   const between = (min: number, max: number) => Math.floor(rand() * (max - min + 1)) + min;
   const list: Activity[] = [];
-  const trackingUsers = users.filter((u) => u.role === "worker" || u.role === "owner");
+  const trackingUsers = trackedMembers(users);
   if (!projects.length || !trackingUsers.length) return list;
   let id = 0;
 
@@ -167,7 +168,7 @@ function genActivities(users: User[], projects: Project[], seedNum: number): Act
 
 function genWeekly(users: User[], seedNum: number) {
   const rand = mulberry32(seedNum ^ 0x51ed);
-  const team = users.filter((u) => u.role !== "client").length || 1;
+  const team = countSeats(users) || 1;
   const days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
   const factor = [1, 1.08, 0.96, 1.14, 1.24, 0.45, 0.23];
   return days.map((day, i) => {
@@ -202,7 +203,7 @@ const APP_PALETTE: { app: string; category: AppUsage["category"]; color: string 
 
 function genAppCatalog(users: User[], seedNum: number): AppUsage[] {
   const rand = mulberry32(seedNum ^ 0x9a3f);
-  const team = Math.max(1, users.filter((u) => u.role !== "client").length);
+  const team = Math.max(1, countSeats(users));
   return APP_PALETTE.map((a) => ({
     app: a.app,
     category: a.category,
@@ -222,8 +223,7 @@ function genTopApps(catalog: AppUsage[]) {
 /* ----------------------------- Derived (shared logic; matches original) ----------------------------- */
 
 function deriveSplit(users: User[]): ProductivitySplit[] {
-  return users
-    .filter((u) => u.role === "worker" || u.role === "owner")
+  return trackedMembers(users)
     .map((u) => {
       const total = u.trackedToday;
       const productive = Math.round((total * u.productivity) / 100);
@@ -239,7 +239,7 @@ const DAY = 24 * 60 * 60 * 1000;
 
 function deriveAttendance(users: User[], seedNum: number): AttendanceRecord[] {
   const rand = mulberry32(seedNum);
-  const tracking = users.filter((u) => u.role === "worker" || u.role === "owner");
+  const tracking = trackedMembers(users);
   const rows: AttendanceRecord[] = [];
   for (let d = 6; d >= 0; d--) {
     const date = new Date(NOW.getTime() - d * DAY);
@@ -272,12 +272,11 @@ function deriveAttendance(users: User[], seedNum: number): AttendanceRecord[] {
 
 function deriveBilling(users: User[], rates: Record<string, number>, seedNum: number): BillingRow[] {
   const rand = mulberry32(seedNum ^ 0x1234);
-  return users
-    .filter((u) => u.role === "worker" || u.role === "owner")
+  return trackedMembers(users)
     .map((u) => ({
       userId: u.id,
       rate: rates[u.id] ?? 38 + Math.round(rand() * 5) * 4,
-      billable: u.role !== "client",
+      billable: true,
     }));
 }
 
@@ -299,10 +298,10 @@ function computeSummary(users: User[], projects: Project[]): Summary {
   return {
     totalTrackedToday: users.reduce((s, u) => s + u.trackedToday, 0),
     activeMembers: users.filter((u) => u.status === "active").length,
-    totalMembers: users.filter((u) => u.role !== "client").length,
+    totalMembers: countSeats(users),
     activeProjects: projects.filter((p) => !p.archived).length,
     avgProductivity: active.length ? Math.round(active.reduce((s, u) => s + u.productivity, 0) / active.length) : 0,
-    screenshotsToday: users.filter((u) => u.role !== "client").length * 40,
+    screenshotsToday: countSeats(users) * 40,
   };
 }
 
@@ -455,6 +454,16 @@ function buildEmpty(id: string): Dataset {
 
 const cache = new Map<string, Dataset>();
 
+function getLocalStorageProjects(workspaceId: string): Project[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const val = localStorage.getItem(`dosi-projects-created-${workspaceId}`);
+    return val ? JSON.parse(val) : [];
+  } catch {
+    return [];
+  }
+}
+
 export function datasetFor(workspaceId: string): Dataset {
   const cached = cache.get(workspaceId);
   if (cached) return cached;
@@ -465,8 +474,36 @@ export function datasetFor(workspaceId: string): Dataset {
   else if (workspaceId === "w3") ds = buildGenerated({ id: "w3", users: nimbusUsers, projects: nimbusProjects });
   else ds = buildEmpty(workspaceId);
 
+  const localProjects = getLocalStorageProjects(workspaceId);
+  if (localProjects.length > 0) {
+    ds.projects = [...localProjects, ...ds.projects];
+  }
+
   cache.set(workspaceId, ds);
   return ds;
+}
+
+export function createTenantProject(workspaceId: string, project: Project): void {
+  const ds = datasetFor(workspaceId);
+  if (!ds.projects.some((p) => p.id === project.id)) {
+    ds.projects = [project, ...ds.projects];
+  }
+
+  if (typeof window !== "undefined") {
+    try {
+      const key = `dosi-projects-created-${workspaceId}`;
+      const existing = localStorage.getItem(key);
+      const list = existing ? JSON.parse(existing) : [];
+      if (!list.some((p: any) => p.id === project.id)) {
+        list.unshift(project);
+        localStorage.setItem(key, JSON.stringify(list));
+      }
+    } catch {}
+  }
+
+  if (active.workspaceId === workspaceId) {
+    projects = active.projects;
+  }
 }
 
 /* ============================================================================

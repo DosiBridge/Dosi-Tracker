@@ -8,6 +8,7 @@ import { Badge } from "@/components/ui/badge";
 import { DataTable, type Column } from "@/components/ui/data-table";
 import { ReportShell, FilterBar, ExportMenu, Kpi, KpiGrid } from "./report-shell";
 import { attendance, attendanceSummary, userById, users } from "@/lib/tenant-data";
+import { trackedMembers } from "@/lib/roles";
 import { rangeForKey, type AttendanceStatus, type RangeKey } from "@/lib/reports-data";
 import { exportRecords } from "@/lib/export";
 import { formatDuration } from "@/lib/utils";
@@ -36,13 +37,19 @@ export function AttendanceReport() {
   const [range, setRange] = useState<ResolvedRange>(() => ({ key: "7d", ...rangeForKey("7d") }));
   const [memberId, setMemberId] = useState("all");
 
-  const dates = useMemo(() => [...new Set(attendance.map((a) => a.date))].sort(), []);
-  const members = users.filter((u) => (u.role === "worker" || u.role === "owner") && (memberId === "all" || u.id === memberId));
+  const filteredAttendance = useMemo(() => {
+    const fromStr = range.from.toISOString().slice(0, 10);
+    const toStr = range.to.toISOString().slice(0, 10);
+    return attendance.filter((a) => a.date >= fromStr && a.date <= toStr);
+  }, [range]);
+
+  const dates = useMemo(() => [...new Set(filteredAttendance.map((a) => a.date))].sort(), [filteredAttendance]);
+  const members = trackedMembers(users).filter((u) => memberId === "all" || u.id === memberId);
 
   const rows = useMemo<Row[]>(
     () =>
       members.map((u) => {
-        const ua = attendance.filter((a) => a.userId === u.id);
+        const ua = filteredAttendance.filter((a) => a.userId === u.id);
         return {
           userId: u.id,
           name: u.name,
@@ -53,13 +60,18 @@ export function AttendanceReport() {
           worked: ua.reduce((s, a) => s + a.worked, 0),
         };
       }),
-    [members]
+    [members, filteredAttendance]
   );
 
-  const s = attendanceSummary();
+  const s = useMemo(() => {
+    const counts = { present: 0, late: 0, absent: 0, remote: 0 };
+    for (const r of filteredAttendance) counts[r.status]++;
+    return counts;
+  }, [filteredAttendance]);
+
   const totalDays = s.present + s.late + s.absent + s.remote;
   const attendanceRate = totalDays ? Math.round(((s.present + s.late + s.remote) / totalDays) * 100) : 0;
-  const onTimeRate = totalDays ? Math.round((s.present + s.remote) / totalDays * 100) : 0;
+  const onTimeRate = totalDays ? Math.round(((s.present + s.remote) / totalDays) * 100) : 0;
 
   const columns: Column<Row>[] = [
     { key: "name", header: "Member", sortValue: (r) => r.name, render: (r) => (
@@ -106,7 +118,7 @@ export function AttendanceReport() {
       <Card>
         <CardHeader>
           <CardTitle>Daily attendance</CardTitle>
-          <div className="flex items-center gap-3 text-xs text-muted-foreground">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 text-xs text-muted-foreground">
             {(Object.keys(statusMeta) as AttendanceStatus[]).map((k) => (
               <span key={k} className="flex items-center gap-1.5">
                 <span className={cn("h-2.5 w-2.5 rounded", statusMeta[k].cell)} /> {statusMeta[k].label}
@@ -114,39 +126,73 @@ export function AttendanceReport() {
             ))}
           </div>
         </CardHeader>
-        <CardContent className="overflow-x-auto">
-          <div className="min-w-[640px]">
-            <div className="grid gap-2" style={{ gridTemplateColumns: `180px repeat(${dates.length}, 1fr)` }}>
-              <div className="text-xs font-medium text-muted-foreground">Member</div>
-              {dates.map((d) => (
-                <div key={d} className="text-center text-xs font-medium text-muted-foreground">
-                  {new Date(d).toLocaleDateString("en", { weekday: "short" })}
+        <CardContent>
+          {/* Mobile: chip rows per member */}
+          <div className="space-y-3 md:hidden">
+            {members.map((u) => (
+              <div key={u.id} className="rounded-xl border border-border p-3">
+                <div className="mb-2.5 flex items-center gap-2">
+                  <Avatar name={u.name} size="sm" />
+                  <span className="truncate text-sm font-medium">{u.name}</span>
                 </div>
-              ))}
-              {members.map((u) => (
-                <div key={u.id} className="contents">
-                  <div className="flex items-center gap-2 py-1">
-                    <Avatar name={u.name} size="sm" />
-                    <span className="truncate text-sm font-medium">{u.name.split(" ")[0]}</span>
-                  </div>
+                <div className="flex gap-1.5 overflow-x-auto overscroll-x-contain pb-1">
                   {dates.map((d) => {
-                    const rec = attendance.find((a) => a.userId === u.id && a.date === d);
+                    const rec = filteredAttendance.find((a) => a.userId === u.id && a.date === d);
                     const meta = rec ? statusMeta[rec.status] : null;
                     return (
                       <div
                         key={d}
                         title={rec ? `${meta?.label}${rec.clockIn ? ` · ${rec.clockIn}–${rec.clockOut}` : ""}` : ""}
                         className={cn(
-                          "flex h-10 items-center justify-center rounded-lg text-[10px] font-semibold",
+                          "flex h-12 w-11 shrink-0 flex-col items-center justify-center rounded-lg text-[9px] font-semibold",
                           meta ? meta.cell : "bg-muted"
                         )}
                       >
-                        {rec?.clockIn ?? "—"}
+                        <span className="opacity-70">{new Date(d + "T00:00:00Z").toLocaleDateString("en", { weekday: "narrow", timeZone: "UTC" })}</span>
+                        <span>{rec?.clockIn?.slice(0, 5) ?? "—"}</span>
                       </div>
                     );
                   })}
                 </div>
-              ))}
+              </div>
+            ))}
+          </div>
+
+          {/* Desktop matrix */}
+          <div className="hidden overflow-x-auto overscroll-x-contain md:block">
+            <div className="min-w-[640px]">
+              <div className="grid gap-2" style={{ gridTemplateColumns: `180px repeat(${dates.length}, minmax(48px, 1fr))` }}>
+                <div className="sticky left-0 z-10 bg-card text-xs font-medium text-muted-foreground">Member</div>
+                {dates.map((d) => (
+                  <div key={d} className="text-center text-xs font-medium text-muted-foreground">
+                    {new Date(d + "T00:00:00Z").toLocaleDateString("en", { weekday: "short", timeZone: "UTC" })}
+                  </div>
+                ))}
+                {members.map((u) => (
+                  <div key={u.id} className="contents">
+                    <div className="sticky left-0 z-10 flex items-center gap-2 bg-card py-1">
+                      <Avatar name={u.name} size="sm" />
+                      <span className="truncate text-sm font-medium">{u.name.split(" ")[0]}</span>
+                    </div>
+                    {dates.map((d) => {
+                      const rec = filteredAttendance.find((a) => a.userId === u.id && a.date === d);
+                      const meta = rec ? statusMeta[rec.status] : null;
+                      return (
+                        <div
+                          key={d}
+                          title={rec ? `${meta?.label}${rec.clockIn ? ` · ${rec.clockIn}–${rec.clockOut}` : ""}` : ""}
+                          className={cn(
+                            "flex h-10 items-center justify-center rounded-lg text-[10px] font-semibold",
+                            meta ? meta.cell : "bg-muted"
+                          )}
+                        >
+                          {rec?.clockIn ?? "—"}
+                        </div>
+                      );
+                    })}
+                  </div>
+                ))}
+              </div>
             </div>
           </div>
         </CardContent>

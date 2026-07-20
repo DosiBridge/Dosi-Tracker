@@ -12,7 +12,7 @@ import type { Project, TrackingPermissions } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 const steps = ["Details", "Team", "Tracking"];
-const colors = ["#6d5efc", "#ec4899", "#0ea5e9", "#22c55e", "#f59e0b", "#a855f7"];
+const colors = ["#0d9488", "#0284c7", "#db2777", "#16a34a", "#d97706", "#6366f1"];
 
 const permLabels: { key: keyof TrackingPermissions; label: string; desc: string }[] = [
   { key: "screenshot", label: "Screenshots", desc: "Capture periodic screen images" },

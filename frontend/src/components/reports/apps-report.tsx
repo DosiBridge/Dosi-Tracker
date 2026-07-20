@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { Bar, BarChart, Cell, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+import { Bar, BarChart, Cell, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { AppWindow, Clock, TrendingUp, TrendingDown } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -9,10 +9,28 @@ import { Progress } from "@/components/ui/progress";
 import { Select } from "@/components/ui/input";
 import { DataTable, type Column } from "@/components/ui/data-table";
 import { ReportShell, FilterBar, ExportMenu, Kpi, KpiGrid } from "./report-shell";
-import { appCatalog } from "@/lib/tenant-data";
-import { categoryColor, rangeForKey, type AppCategory, type AppUsage, type RangeKey } from "@/lib/reports-data";
+import { activities, appCatalog, projects } from "@/lib/tenant-data";
+import { categoryColor, filterActivitiesByRange, rangeForKey, type AppCategory, type AppUsage, type RangeKey } from "@/lib/reports-data";
+
+const APP_PALETTE: { app: string; category: AppCategory; color: string }[] = [
+  { app: "Visual Studio Code", category: "productive", color: "#3b82f6" },
+  { app: "Terminal", category: "productive", color: "#22c55e" },
+  { app: "Figma", category: "productive", color: "#ec4899" },
+  { app: "Postman", category: "productive", color: "#f97316" },
+  { app: "Linear", category: "productive", color: "#8b7dff" },
+  { app: "Docker Desktop", category: "productive", color: "#0ea5e9" },
+  { app: "Google Chrome", category: "neutral", color: "#64748b" },
+  { app: "Slack", category: "neutral", color: "#a855f7" },
+  { app: "Notion", category: "neutral", color: "#94a3b8" },
+  { app: "Zoom", category: "neutral", color: "#38bdf8" },
+  { app: "YouTube", category: "unproductive", color: "#ef4444" },
+  { app: "Spotify", category: "unproductive", color: "#f43f5e" },
+  { app: "X (Twitter)", category: "unproductive", color: "#fb7185" },
+  { app: "X", category: "unproductive", color: "#fb7185" },
+];
 import { exportRecords } from "@/lib/export";
 import { formatDuration } from "@/lib/utils";
+import { useIsMdUp } from "@/hooks/use-media-query";
 import type { ResolvedRange } from "./date-range-picker";
 
 const tooltipStyle = {
@@ -30,24 +48,64 @@ const catTone: Record<AppCategory, "success" | "info" | "danger"> = {
 };
 
 export function AppsReport() {
+  const md = useIsMdUp();
   const [rangeKey, setRangeKey] = useState<RangeKey>("7d");
   const [range, setRange] = useState<ResolvedRange>(() => ({ key: "7d", ...rangeForKey("7d") }));
   const [category, setCategory] = useState<AppCategory | "all">("all");
 
-  const rows = useMemo<AppUsage[]>(
-    () =>
-      [...appCatalog]
-        .filter((a) => category === "all" || a.category === category)
-        .sort((a, b) => b.minutes - a.minutes),
-    [category]
-  );
+  const allApps = useMemo<AppUsage[]>(() => {
+    const acts = filterActivitiesByRange(activities, range.from, range.to);
+    const appMinutes = new Map<string, { app: string; category: AppCategory; minutes: number; color: string; users: Set<string> }>();
+    const appMetaMap = new Map(APP_PALETTE.map((a) => [a.app, { category: a.category, color: a.color }]));
 
-  const total = rows.reduce((s, a) => s + a.minutes, 0);
-  const productive = appCatalog.filter((a) => a.category === "productive").reduce((s, a) => s + a.minutes, 0);
-  const unproductive = appCatalog.filter((a) => a.category === "unproductive").reduce((s, a) => s + a.minutes, 0);
-  const topApp = rows[0];
+    acts.forEach((a) => {
+      const appName = a.screen.app;
+      const meta = appMetaMap.get(appName) || { category: "neutral" as AppCategory, color: "#64748b" };
+      const p = projects.find((pr) => pr.id === a.projectId);
+      const mins = p?.intervalMinutes ?? 10;
+      
+      const cur = appMinutes.get(appName) ?? {
+        app: appName,
+        category: meta.category,
+        minutes: 0,
+        color: meta.color,
+        users: new Set<string>(),
+      };
+      cur.minutes += mins;
+      cur.users.add(a.userId);
+      appMinutes.set(appName, cur);
+    });
+
+    return [...appMinutes.values()]
+      .map((x) => ({
+        app: x.app,
+        category: x.category,
+        minutes: x.minutes,
+        color: x.color,
+        activeUsers: x.users.size,
+      }));
+  }, [range]);
+
+  const rows = useMemo<AppUsage[]>(() => {
+    return allApps
+      .filter((a) => category === "all" || a.category === category)
+      .sort((a, b) => b.minutes - a.minutes);
+  }, [allApps, category]);
+
+  const total = useMemo(() => allApps.reduce((s, a) => s + a.minutes, 0), [allApps]);
+  const productive = useMemo(() => allApps.filter((a) => a.category === "productive").reduce((s, a) => s + a.minutes, 0), [allApps]);
+  const unproductive = useMemo(() => allApps.filter((a) => a.category === "unproductive").reduce((s, a) => s + a.minutes, 0), [allApps]);
+  const donutData = useMemo(() => {
+    const neutral = allApps.filter((a) => a.category === "neutral").reduce((s, a) => s + a.minutes, 0);
+    return [
+      { name: "Productive", value: productive, color: categoryColor.productive },
+      { name: "Neutral", value: neutral, color: categoryColor.neutral },
+      { name: "Unproductive", value: unproductive, color: categoryColor.unproductive },
+    ];
+  }, [allApps, productive, unproductive]);
 
   const chartData = rows.slice(0, 8).map((a) => ({ app: a.app, minutes: a.minutes, color: a.color }));
+  const topApp = rows[0];
 
   const columns: Column<AppUsage>[] = [
     { key: "app", header: "Application", sortValue: (r) => r.app, render: (r) => (
@@ -87,7 +145,7 @@ export function AppsReport() {
         rangeKey={rangeKey}
         onRange={onRange}
         extra={
-          <Select value={category} onChange={(e) => setCategory(e.target.value as AppCategory | "all")} className="w-auto min-w-40">
+          <Select value={category} onChange={(e) => setCategory(e.target.value as AppCategory | "all")} className="w-full min-w-0 sm:w-auto sm:min-w-40">
             <option value="all">All categories</option>
             <option value="productive">Productive</option>
             <option value="neutral">Neutral</option>
@@ -103,30 +161,72 @@ export function AppsReport() {
         <Kpi label="Unproductive" value={formatDuration(unproductive)} icon={TrendingDown} tone="#ef4444" />
       </KpiGrid>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Top applications</CardTitle>
-          <div className="flex items-center gap-3 text-xs text-muted-foreground">
-            {(["productive", "neutral", "unproductive"] as AppCategory[]).map((c) => (
-              <span key={c} className="flex items-center gap-1.5 capitalize">
-                <span className="h-2 w-2 rounded-full" style={{ background: categoryColor[c] }} /> {c}
-              </span>
-            ))}
-          </div>
-        </CardHeader>
-        <CardContent>
-          <ResponsiveContainer width="100%" height={280}>
-            <BarChart data={chartData} layout="vertical" margin={{ top: 0, right: 16, left: 20, bottom: 0 }}>
-              <XAxis type="number" hide />
-              <YAxis type="category" dataKey="app" tickLine={false} axisLine={false} width={130} tick={{ fill: "#94a3b8", fontSize: 12 }} />
-              <Tooltip contentStyle={tooltipStyle} cursor={{ fill: "var(--muted)" }} formatter={(v) => formatDuration(Number(v))} />
-              <Bar dataKey="minutes" radius={[0, 6, 6, 0]} barSize={18}>
-                {chartData.map((d) => <Cell key={d.app} fill={d.color} />)}
-              </Bar>
-            </BarChart>
-          </ResponsiveContainer>
-        </CardContent>
-      </Card>
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
+        <Card>
+          <CardHeader><CardTitle>Category share</CardTitle></CardHeader>
+          <CardContent>
+            <div className="mx-auto h-[160px] max-w-[240px] sm:h-[200px] sm:max-w-none">
+              <ResponsiveContainer width="100%" height="100%">
+                <PieChart>
+                  <Pie data={donutData} dataKey="value" innerRadius={44} outerRadius={68} paddingAngle={2} strokeWidth={0}>
+                    {donutData.map((d) => <Cell key={d.name} fill={d.color} />)}
+                  </Pie>
+                  <Tooltip contentStyle={tooltipStyle} formatter={(v) => formatDuration(Number(v))} />
+                </PieChart>
+              </ResponsiveContainer>
+            </div>
+            <div className="mt-2 space-y-1.5">
+              {donutData.map((d) => (
+                <div key={d.name} className="flex items-center justify-between text-sm">
+                  <span className="flex items-center gap-2">
+                    <span className="h-2.5 w-2.5 rounded-full" style={{ background: d.color }} /> {d.name}
+                  </span>
+                  <span className="font-medium">{total ? Math.round((d.value / total) * 100) : 0}%</span>
+                </div>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="lg:col-span-2">
+          <CardHeader>
+            <CardTitle>Top applications</CardTitle>
+            <div className="flex items-center gap-3 text-xs text-muted-foreground">
+              {(["productive", "neutral", "unproductive"] as AppCategory[]).map((c) => (
+                <span key={c} className="flex items-center gap-1.5 capitalize">
+                  <span className="h-2 w-2 rounded-full" style={{ background: categoryColor[c] }} /> {c}
+                </span>
+              ))}
+            </div>
+          </CardHeader>
+          <CardContent>
+            <div className="h-[220px] w-full min-w-0 sm:h-[260px]">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={chartData} layout="vertical" margin={{ top: 0, right: 8, left: 4, bottom: 0 }}>
+                  <XAxis type="number" hide />
+                  <YAxis
+                    type="category"
+                    dataKey="app"
+                    tickLine={false}
+                    axisLine={false}
+                    width={md ? 120 : 72}
+                    tick={{ fill: "#94a3b8", fontSize: md ? 12 : 10 }}
+                    tickFormatter={(v) => {
+                      const s = String(v);
+                      const max = md ? 16 : 10;
+                      return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+                    }}
+                  />
+                  <Tooltip contentStyle={tooltipStyle} cursor={{ fill: "var(--muted)" }} formatter={(v) => formatDuration(Number(v))} />
+                  <Bar dataKey="minutes" radius={[0, 6, 6, 0]} barSize={md ? 18 : 12}>
+                    {chartData.map((d) => <Cell key={d.app} fill={d.color} />)}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
 
       <Card>
         <CardHeader><CardTitle>All applications</CardTitle><span className="text-xs text-muted-foreground">{rows.length} apps</span></CardHeader>

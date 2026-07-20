@@ -1,6 +1,7 @@
 import type { User } from "./types";
 import {
   invoicesFor,
+  liveSeatsUsed,
   monthlyCost,
   planById,
   plans,
@@ -33,21 +34,21 @@ export interface TenantMetrics {
 
 export function tenantMetrics(ws: Workspace): TenantMetrics {
   const ds = datasetFor(ws.id);
-  const members = ds.users.filter((u) => u.role !== "client");
-  const activeUsers = members.filter((u) => u.productivity > 0);
+  const seatHolders = ds.users.filter((u) => u.role === "owner" || u.role === "admin" || u.role === "worker");
+  const activeUsers = seatHolders.filter((u) => u.productivity > 0);
   const avgProductivity = activeUsers.length
     ? Math.round(activeUsers.reduce((s, u) => s + u.productivity, 0) / activeUsers.length)
     : 0;
   return {
-    members: members.length,
-    activeMembers: members.filter((u) => u.status === "active").length,
+    members: seatHolders.length,
+    activeMembers: seatHolders.filter((u) => u.status === "active").length,
     clients: ds.users.filter((u) => u.role === "client").length,
     projects: ds.projects.filter((p) => !p.archived).length,
     activities: ds.activities.length,
     avgProductivity,
-    trackedToday: members.reduce((s, u) => s + u.trackedToday, 0),
+    trackedToday: seatHolders.reduce((s, u) => s + u.trackedToday, 0),
     mrr: monthlyCost(ws),
-    seats: ws.seatsUsed,
+    seats: liveSeatsUsed(ws),
     storageGb: ws.storageUsedGb,
   };
 }
@@ -134,7 +135,7 @@ export function planBreakdown(workspaces: Workspace[]): PlanBreakdown[] {
     return {
       plan,
       tenants: tenants.length,
-      seats: tenants.reduce((s, w) => s + w.seatsUsed, 0),
+      seats: tenants.reduce((s, w) => s + liveSeatsUsed(w), 0),
       mrr: tenants.reduce((s, w) => s + (monthlyCost(w) ?? 0), 0),
       color: planColor(plan.id),
     };

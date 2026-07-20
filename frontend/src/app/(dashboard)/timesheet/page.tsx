@@ -1,20 +1,20 @@
 "use client";
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { ChevronLeft, ChevronRight, Clock, TrendingUp } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { PageHeader, PageStack } from "@/components/ui/page-header";
 import { Button } from "@/components/ui/button";
 import { Avatar } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { users } from "@/lib/tenant-data";
+import { useSession } from "@/components/session-provider";
+import { trackedMembers } from "@/lib/roles";
 import { cn, formatDuration } from "@/lib/utils";
 
 const days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-const trackingUsers = users.filter((u) => u.role === "worker" || u.role === "owner");
 
-// Deterministic weekly matrix (minutes) derived from each user's baseline.
-function minutesFor(userIndex: number, dayIndex: number): number {
-  const base = trackingUsers[userIndex].trackedToday;
+function minutesFor(base: number, userIndex: number, dayIndex: number): number {
   const weekdayFactor = [0.95, 1.05, 0.85, 1.1, 1.0, 0.35, 0.15][dayIndex];
   const wobble = ((userIndex * 7 + dayIndex * 13) % 5) * 12 - 24;
   return Math.max(0, Math.round((base * weekdayFactor + wobble) / 5) * 5);
@@ -29,139 +29,194 @@ function cellTone(minutes: number): string {
 }
 
 export default function TimesheetPage() {
+  const { user } = useSession();
   const [weekOffset, setWeekOffset] = useState(0);
 
-  const matrix = trackingUsers.map((_, ui) => days.map((_, di) => minutesFor(ui, di)));
+  const trackingUsers = useMemo(() => {
+    const all = trackedMembers(users);
+    if (user.role === "worker") return all.filter((u) => u.id === user.id);
+    return all;
+  }, [user]);
+
+  const matrix = trackingUsers.map((u, ui) => days.map((_, di) => minutesFor(u.trackedToday, ui, di)));
   const dayTotals = days.map((_, di) => matrix.reduce((s, row) => s + row[di], 0));
   const grandTotal = dayTotals.reduce((s, v) => s + v, 0);
   const busiestDay = days[dayTotals.indexOf(Math.max(...dayTotals))];
+  const selfOnly = user.role === "worker";
 
   return (
-    <div className="space-y-6">
-      <div className="flex flex-wrap items-end justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-bold tracking-tight">Timesheet</h1>
-          <p className="mt-1 text-sm text-muted-foreground">Weekly tracked time across the team.</p>
-        </div>
-        <div className="flex items-center gap-2">
-          <Button variant="outline" size="icon" onClick={() => setWeekOffset((w) => w - 1)}>
-            <ChevronLeft className="h-4 w-4" />
-          </Button>
-          <span className="min-w-28 text-center text-sm font-medium">
-            {weekOffset === 0 ? "This week" : weekOffset === -1 ? "Last week" : `${Math.abs(weekOffset)} weeks ago`}
-          </span>
-          <Button
-            variant="outline"
-            size="icon"
-            onClick={() => setWeekOffset((w) => Math.min(0, w + 1))}
-            disabled={weekOffset === 0}
-          >
-            <ChevronRight className="h-4 w-4" />
-          </Button>
-        </div>
-      </div>
+    <PageStack>
+      <PageHeader
+        eyebrow="Monitor"
+        title={selfOnly ? "My timesheet" : "Timesheet"}
+        description={selfOnly ? "Your weekly tracked time." : "Weekly tracked time across the team."}
+        actions={
+          <div className="flex items-center gap-2">
+            <Button variant="outline" size="icon" onClick={() => setWeekOffset((w) => w - 1)}>
+              <ChevronLeft className="h-4 w-4" />
+            </Button>
+            <span className="min-w-28 text-center text-sm font-medium">
+              {weekOffset === 0 ? "This week" : weekOffset === -1 ? "Last week" : `${Math.abs(weekOffset)} weeks ago`}
+            </span>
+            <Button
+              variant="outline"
+              size="icon"
+              onClick={() => setWeekOffset((w) => Math.min(0, w + 1))}
+              disabled={weekOffset === 0}
+            >
+              <ChevronRight className="h-4 w-4" />
+            </Button>
+          </div>
+        }
+      />
 
-      {/* Summary */}
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
         <Card className="p-4">
           <div className="flex items-center gap-3">
-            <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-primary/15 text-primary">
+            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-muted text-muted-foreground">
               <Clock className="h-5 w-5" />
             </div>
             <div>
-              <div className="text-lg font-bold">{formatDuration(grandTotal)}</div>
+              <div className="font-display text-lg font-bold tabular-nums">{formatDuration(grandTotal)}</div>
               <div className="text-xs text-muted-foreground">Total this week</div>
             </div>
           </div>
         </Card>
         <Card className="p-4">
           <div className="flex items-center gap-3">
-            <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-success/15 text-success">
+            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-muted text-muted-foreground">
               <TrendingUp className="h-5 w-5" />
             </div>
             <div>
-              <div className="text-lg font-bold">{busiestDay}</div>
-              <div className="text-xs text-muted-foreground">Most productive day</div>
+              <div className="font-display text-lg font-bold tabular-nums">{busiestDay}</div>
+              <div className="text-xs text-muted-foreground">Busiest day</div>
             </div>
           </div>
         </Card>
         <Card className="p-4">
           <div className="flex items-center gap-3">
-            <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-info/15 text-info">
+            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-muted text-muted-foreground">
               <Clock className="h-5 w-5" />
             </div>
             <div>
-              <div className="text-lg font-bold">{formatDuration(Math.round(grandTotal / trackingUsers.length))}</div>
-              <div className="text-xs text-muted-foreground">Avg per member</div>
+              <div className="font-display text-lg font-bold tabular-nums">
+                {formatDuration(trackingUsers.length ? Math.round(grandTotal / trackingUsers.length) : 0)}
+              </div>
+              <div className="text-xs text-muted-foreground">{selfOnly ? "Daily average" : "Avg per member"}</div>
             </div>
           </div>
         </Card>
       </div>
 
-      {/* Heatmap grid */}
       <Card>
         <CardHeader>
-          <CardTitle>Weekly breakdown</CardTitle>
-          <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-            <span>Less</span>
-            <span className="h-3 w-3 rounded bg-primary/15" />
-            <span className="h-3 w-3 rounded bg-primary/30" />
-            <span className="h-3 w-3 rounded bg-primary/55" />
-            <span className="h-3 w-3 rounded bg-primary" />
-            <span>More</span>
-          </div>
+          <CardTitle className="text-base">{selfOnly ? "Your week" : "Team heatmap"}</CardTitle>
         </CardHeader>
-        <CardContent className="overflow-x-auto">
-          <div className="min-w-[640px]">
-            {/* Header row */}
-            <div className="grid grid-cols-[180px_repeat(7,1fr)_90px] gap-2 border-b border-border pb-2 text-xs font-medium text-muted-foreground">
-              <div>Member</div>
-              {days.map((d) => (
-                <div key={d} className="text-center">{d}</div>
-              ))}
-              <div className="text-right">Total</div>
-            </div>
-
-            {/* Member rows */}
+        <CardContent>
+          {/* Mobile: per-member week cards */}
+          <div className="space-y-3 md:hidden">
             {trackingUsers.map((u, ui) => {
               const rowTotal = matrix[ui].reduce((s, v) => s + v, 0);
               return (
-                <div key={u.id} className="grid grid-cols-[180px_repeat(7,1fr)_90px] items-center gap-2 border-b border-border py-2 last:border-0">
-                  <div className="flex items-center gap-2">
-                    <Avatar name={u.name} size="sm" status={u.status} />
-                    <div className="min-w-0">
-                      <div className="truncate text-sm font-medium">{u.name.split(" ")[0]}</div>
-                      <div className="truncate text-[11px] text-muted-foreground">{u.designation}</div>
+                <div key={u.id} className="rounded-xl border border-border p-3">
+                  <div className="mb-3 flex items-center justify-between gap-2">
+                    <div className="flex min-w-0 items-center gap-2.5">
+                      <Avatar name={u.name} size="sm" status={u.status} />
+                      <div className="min-w-0">
+                        <div className="truncate text-sm font-medium">{u.name}</div>
+                        <div className="truncate text-xs text-muted-foreground">{u.designation}</div>
+                      </div>
                     </div>
+                    <Badge tone="muted">{formatDuration(rowTotal)}</Badge>
                   </div>
-                  {matrix[ui].map((m, di) => (
-                    <div
-                      key={di}
-                      className={cn(
-                        "flex h-11 items-center justify-center rounded-lg text-[11px] font-medium transition-transform hover:scale-105",
-                        cellTone(m)
-                      )}
-                      title={`${u.name} · ${days[di]} · ${formatDuration(m)}`}
-                    >
-                      {m > 0 ? `${Math.round(m / 60)}h` : "–"}
-                    </div>
-                  ))}
-                  <div className="text-right text-sm font-semibold">{formatDuration(rowTotal)}</div>
+                  <div className="grid grid-cols-7 gap-1">
+                    {days.map((d, di) => (
+                      <div key={d} className="text-center">
+                        <div className="mb-1 text-[10px] font-medium text-muted-foreground">{d[0]}</div>
+                        <div
+                          className={cn(
+                            "flex h-9 items-center justify-center rounded-md text-[10px] font-medium tabular-nums",
+                            cellTone(matrix[ui][di])
+                          )}
+                        >
+                          {matrix[ui][di] === 0 ? "—" : formatDuration(matrix[ui][di])}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
                 </div>
               );
             })}
+            {!selfOnly && (
+              <div className="rounded-xl border border-border bg-muted/40 p-3 text-center text-xs font-medium text-muted-foreground">
+                Week total · {formatDuration(grandTotal)}
+              </div>
+            )}
+          </div>
 
-            {/* Totals row */}
-            <div className="grid grid-cols-[180px_repeat(7,1fr)_90px] items-center gap-2 pt-2 text-xs font-semibold">
-              <div className="text-muted-foreground">Daily total</div>
-              {dayTotals.map((t, i) => (
-                <div key={i} className="text-center text-muted-foreground">{Math.round(t / 60)}h</div>
-              ))}
-              <div className="text-right"><Badge tone="primary">{formatDuration(grandTotal)}</Badge></div>
-            </div>
+          {/* Desktop: heatmap table */}
+          <div className="hidden overflow-x-auto overscroll-x-contain md:block">
+            <table className="w-full min-w-[640px] border-collapse text-sm">
+              <thead>
+                <tr className="text-left text-xs text-muted-foreground">
+                  <th className="sticky left-0 z-10 bg-card pb-3 pr-3 font-medium">{selfOnly ? "You" : "Member"}</th>
+                  {days.map((d) => (
+                    <th key={d} className="pb-3 px-1 text-center font-medium">{d}</th>
+                  ))}
+                  <th className="pb-3 pl-3 text-right font-medium">Total</th>
+                </tr>
+              </thead>
+              <tbody>
+                {trackingUsers.map((u, ui) => {
+                  const rowTotal = matrix[ui].reduce((s, v) => s + v, 0);
+                  return (
+                    <tr key={u.id} className="group border-t border-border/60">
+                      <td className="sticky left-0 z-10 bg-card py-2.5 pr-3 group-hover:bg-muted/30">
+                        <div className="flex items-center gap-2.5">
+                          <Avatar name={u.name} size="sm" status={u.status} />
+                          <div className="min-w-0">
+                            <div className="truncate font-medium">{u.name}</div>
+                            <div className="truncate text-xs text-muted-foreground">{u.designation}</div>
+                          </div>
+                        </div>
+                      </td>
+                      {matrix[ui].map((mins, di) => (
+                        <td key={di} className="px-1 py-2.5 text-center">
+                          <div
+                            className={cn(
+                              "mx-auto flex h-10 w-full max-w-14 items-center justify-center rounded-md text-[11px] font-medium tabular-nums",
+                              cellTone(mins)
+                            )}
+                            title={formatDuration(mins)}
+                          >
+                            {mins === 0 ? "—" : formatDuration(mins)}
+                          </div>
+                        </td>
+                      ))}
+                      <td className="py-2.5 pl-3 text-right">
+                        <Badge tone="muted">{formatDuration(rowTotal)}</Badge>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+              {!selfOnly && (
+                <tfoot>
+                  <tr className="border-t border-border">
+                    <td className="sticky left-0 z-10 bg-card pt-3 pr-3 text-xs font-medium text-muted-foreground">Day total</td>
+                    {dayTotals.map((t, i) => (
+                      <td key={i} className="px-1 pt-3 text-center text-xs font-medium tabular-nums">
+                        {formatDuration(t)}
+                      </td>
+                    ))}
+                    <td className="pt-3 pl-3 text-right text-xs font-semibold">{formatDuration(grandTotal)}</td>
+                  </tr>
+                </tfoot>
+              )}
+            </table>
           </div>
         </CardContent>
       </Card>
-    </div>
+    </PageStack>
   );
 }

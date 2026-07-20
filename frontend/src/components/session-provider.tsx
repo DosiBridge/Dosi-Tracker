@@ -9,7 +9,7 @@ import type { User } from "@/lib/types";
 /** The platform operator. Not a member of any tenant. */
 export const hostUser: User = {
   id: "host",
-  name: "Platform Operator",
+  name: "Platform Admin",
   email: "ops@dositracker.app",
   role: "host",
   designation: "Host · Super Admin",
@@ -84,10 +84,11 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
   // remount key in the dashboard layout, every page re-reads this tenant's data.
   setActiveWorkspace(workspace.id);
 
-  // Resolve the current user across the host + every tenant roster so that
-  // impersonating a tenant owner (who lives in that tenant's dataset) works.
-  const pool: User[] = [hostUser, ...primaryUsers, ...datasetFor(workspace.id).users];
-  const user = pool.find((u) => u.id === userId) ?? primaryUsers[0];
+  // Resolve the current user from the active tenant roster (+ host).
+  // Do not keep primary-tenant users in the pool when viewing another workspace.
+  const activeUsers = datasetFor(workspace.id).users;
+  const pool: User[] = [hostUser, ...activeUsers];
+  const user = pool.find((u) => u.id === userId) ?? activeUsers[0] ?? primaryUsers[0];
 
   const setUserById = (id: string) => {
     setUserId(id);
@@ -101,6 +102,19 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
     try {
       localStorage.setItem(WS_KEY, id);
     } catch {}
+    // If the current user isn't in the target tenant, land as that tenant's owner.
+    if (userId !== hostUser.id) {
+      const ds = datasetFor(id);
+      if (!ds.users.some((u) => u.id === userId)) {
+        const owner = ds.users.find((u) => u.role === "owner") ?? ds.users[0];
+        if (owner) {
+          setUserId(owner.id);
+          try {
+            localStorage.setItem(USER_KEY, owner.id);
+          } catch {}
+        }
+      }
+    }
   };
 
   const persistCreated = (next: Workspace[]) => {

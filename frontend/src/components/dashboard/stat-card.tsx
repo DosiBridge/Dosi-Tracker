@@ -1,6 +1,7 @@
 import { ArrowDownRight, ArrowUpRight } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { Card } from "@/components/ui/card";
+import { brand } from "@/lib/brand";
 import { cn } from "@/lib/utils";
 
 export function StatCard({
@@ -8,7 +9,7 @@ export function StatCard({
   value,
   icon: Icon,
   trend,
-  accent = "#6d5efc",
+  accent = brand.primary,
   sub,
 }: {
   label: string;
@@ -20,15 +21,11 @@ export function StatCard({
 }) {
   const up = (trend ?? 0) >= 0;
   return (
-    <Card className="relative overflow-hidden p-5">
-      <div
-        className="absolute -right-6 -top-6 h-24 w-24 rounded-full opacity-10 blur-2xl"
-        style={{ background: accent }}
-      />
+    <Card className="motion-safe-lift p-5 transition-transform duration-300 hover:-translate-y-0.5">
       <div className="flex items-start justify-between">
         <div
-          className="flex h-11 w-11 items-center justify-center rounded-xl"
-          style={{ background: `${accent}1a`, color: accent }}
+          className="flex h-10 w-10 items-center justify-center rounded-xl transition-transform duration-300 group-hover:scale-105"
+          style={{ background: `${accent}18`, color: accent }}
         >
           <Icon className="h-5 w-5" />
         </div>
@@ -45,7 +42,7 @@ export function StatCard({
         )}
       </div>
       <div className="mt-4">
-        <div className="text-2xl font-bold tracking-tight">{value}</div>
+        <div className="font-display text-2xl font-bold tracking-tight tabular-nums">{value}</div>
         <div className="mt-1 text-sm text-muted-foreground">{label}</div>
         {sub && <div className="mt-0.5 text-xs text-muted-foreground/70">{sub}</div>}
       </div>

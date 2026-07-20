@@ -1,4 +1,6 @@
 import { NOW, projects, users } from "./mock-data";
+import { countSeats } from "./roles";
+import { datasetFor } from "./tenant-data";
 
 /* ----------------------------- Plans ----------------------------- */
 
@@ -90,7 +92,7 @@ export interface Workspace {
   isPrimary?: boolean;
 }
 
-const activeMembers = users.filter((u) => u.role !== "client").length;
+const activeMembers = countSeats(users);
 const activeProjects = projects.filter((p) => !p.archived).length;
 
 export const workspaces: Workspace[] = [
@@ -147,11 +149,20 @@ export interface UsageMetric {
   unit: string;
 }
 
+/** Live seat count from the tenant dataset (single source of truth). */
+export function liveSeatsUsed(ws: Workspace): number {
+  return countSeats(datasetFor(ws.id).users);
+}
+
+export function liveProjectsUsed(ws: Workspace): number {
+  return datasetFor(ws.id).projects.filter((p) => !p.archived).length;
+}
+
 export function workspaceUsage(ws: Workspace): UsageMetric[] {
   const plan = planById(ws.planId);
   return [
-    { label: "Seats", used: ws.seatsUsed, limit: plan.seats, unit: "members" },
-    { label: "Projects", used: ws.projectsUsed, limit: plan.projects, unit: "projects" },
+    { label: "Seats", used: liveSeatsUsed(ws), limit: plan.seats, unit: "members" },
+    { label: "Projects", used: liveProjectsUsed(ws), limit: plan.projects, unit: "projects" },
     { label: "Storage", used: ws.storageUsedGb, limit: plan.storageGb, unit: "GB" },
     { label: "Screenshot history", used: plan.retentionDays, limit: plan.retentionDays, unit: "days" },
   ];
@@ -160,7 +171,7 @@ export function workspaceUsage(ws: Workspace): UsageMetric[] {
 export function monthlyCost(ws: Workspace): number | null {
   const plan = planById(ws.planId);
   if (plan.pricePerUser === null) return null;
-  return plan.pricePerUser * ws.seatsUsed;
+  return plan.pricePerUser * liveSeatsUsed(ws);
 }
 
 /* ----------------------------- Invoices ----------------------------- */

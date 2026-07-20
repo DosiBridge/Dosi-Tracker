@@ -7,10 +7,10 @@ import { Avatar } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { DataTable, type Column } from "@/components/ui/data-table";
 import { ReportShell, FilterBar, ExportMenu, Kpi, KpiGrid } from "./report-shell";
-import { billing, userById, users } from "@/lib/tenant-data";
-import { rangeForKey, type RangeKey } from "@/lib/reports-data";
+import { activities, billing, projects, userById, users } from "@/lib/tenant-data";
+import { filterActivitiesByRange, rangeForKey, type RangeKey } from "@/lib/reports-data";
 import { exportRecords } from "@/lib/export";
-import { formatDuration } from "@/lib/utils";
+import { cn, formatDuration } from "@/lib/utils";
 import type { ResolvedRange } from "./date-range-picker";
 
 interface Row {
@@ -26,24 +26,30 @@ export function PayrollReport() {
   const [rangeKey, setRangeKey] = useState<RangeKey>("month");
   const [range, setRange] = useState<ResolvedRange>(() => ({ key: "month", ...rangeForKey("month") }));
   const [memberId, setMemberId] = useState("all");
+  const [viewMode, setViewMode] = useState<"table" | "grid">("table");
 
   const rows = useMemo<Row[]>(() => {
+    const acts = filterActivitiesByRange(activities, range.from, range.to);
     return billing
       .filter((b) => memberId === "all" || b.userId === memberId)
       .map((b) => {
         const u = userById(b.userId)!;
-        // Approx monthly hours from daily tracked (× ~22 working days).
-        const hours = Math.round((u.trackedToday * 22) / 60);
+        const ua = acts.filter((a) => a.userId === b.userId);
+        const minutes = ua.reduce((s, a) => {
+          const p = projects.find((pr) => pr.id === a.projectId);
+          return s + (p?.intervalMinutes ?? 10);
+        }, 0);
+        const hours = Math.round((minutes / 60) * 10) / 10;
         return {
           userId: b.userId,
           name: u.name,
           rate: b.rate,
           hours,
           billable: b.billable,
-          amount: hours * b.rate,
+          amount: Math.round(hours * b.rate),
         };
       });
-  }, [memberId]);
+  }, [range, memberId]);
 
   const totalHours = rows.reduce((s, r) => s + r.hours, 0);
   const totalPayable = rows.reduce((s, r) => s + r.amount, 0);
@@ -93,25 +99,81 @@ export function PayrollReport() {
       </KpiGrid>
 
       <Card>
-        <CardHeader>
-          <CardTitle>Payroll details</CardTitle>
-          <span className="text-xs text-muted-foreground">Estimated for {range.label.toLowerCase()}</span>
+        <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+          <div>
+            <CardTitle>Payroll details</CardTitle>
+            <span className="text-xs text-muted-foreground">Estimated for {range.label.toLowerCase()}</span>
+          </div>
+          <div className="flex items-center gap-1 rounded-lg bg-muted p-0.5 text-xs">
+            <button
+              onClick={() => setViewMode("table")}
+              className={cn("px-2.5 py-1.5 rounded-md transition-all", viewMode === "table" ? "bg-card text-foreground shadow-sm font-semibold" : "text-muted-foreground hover:text-foreground")}
+            >
+              Table
+            </button>
+            <button
+              onClick={() => setViewMode("grid")}
+              className={cn("px-2.5 py-1.5 rounded-md transition-all", viewMode === "grid" ? "bg-card text-foreground shadow-sm font-semibold" : "text-muted-foreground hover:text-foreground")}
+            >
+              Grid
+            </button>
+          </div>
         </CardHeader>
         <CardContent>
-          <DataTable
-            columns={columns}
-            rows={rows}
-            initialSort={{ key: "amount", dir: "desc" }}
-            footer={
-              <>
-                <td className="px-3 py-2.5">Total</td>
-                <td className="px-3 py-2.5 text-right text-muted-foreground">—</td>
-                <td className="px-3 py-2.5 text-right">{totalHours}h</td>
-                <td className="px-3 py-2.5" />
-                <td className="px-3 py-2.5 text-right">${totalPayable.toLocaleString()}</td>
-              </>
-            }
-          />
+          {viewMode === "table" ? (
+            <DataTable
+              columns={columns}
+              rows={rows}
+              initialSort={{ key: "amount", dir: "desc" }}
+              footer={
+                <>
+                  <td className="px-3 py-2.5">Total</td>
+                  <td className="px-3 py-2.5 text-right text-muted-foreground">—</td>
+                  <td className="px-3 py-2.5 text-right">{totalHours}h</td>
+                  <td className="px-3 py-2.5" />
+                  <td className="px-3 py-2.5 text-right">${totalPayable.toLocaleString()}</td>
+                </>
+              }
+            />
+          ) : (
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+              {rows.map((r) => {
+                const u = userById(r.userId);
+                return (
+                  <Card key={r.userId} className="p-4 hover:border-primary/40 transition-colors">
+                    <div className="flex items-center gap-3">
+                      <Avatar name={r.name} size="md" status={u?.status} />
+                      <div className="min-w-0 flex-1">
+                        <h4 className="font-semibold truncate text-sm">{r.name}</h4>
+                        <p className="text-xs text-muted-foreground truncate">{u?.designation ?? "Team Member"}</p>
+                      </div>
+                    </div>
+                    
+                    <div className="mt-4 grid grid-cols-2 gap-2 border-t border-border/60 pt-3 text-xs">
+                      <div>
+                        <span className="text-muted-foreground">Hourly Rate</span>
+                        <div className="text-sm font-bold text-foreground mt-0.5">${r.rate}/hr</div>
+                      </div>
+                      <div>
+                        <span className="text-muted-foreground">Hours Worked</span>
+                        <div className="text-sm font-bold text-foreground mt-0.5">{r.hours}h</div>
+                      </div>
+                    </div>
+                    
+                    <div className="mt-4 flex items-center justify-between text-xs border-t border-border/60 pt-3">
+                      <span className="text-muted-foreground">Classification</span>
+                      <Badge tone={r.billable ? "success" : "muted"}>{r.billable ? "Billable" : "Internal"}</Badge>
+                    </div>
+
+                    <div className="mt-3 flex items-center justify-between text-xs border-t border-border/60 pt-3 bg-muted/40 p-2 rounded-lg">
+                      <span className="font-medium text-muted-foreground">Total Earnings</span>
+                      <span className="text-base font-bold text-success">${r.amount.toLocaleString()}</span>
+                    </div>
+                  </Card>
+                );
+              })}
+            </div>
+          )}
         </CardContent>
       </Card>
 

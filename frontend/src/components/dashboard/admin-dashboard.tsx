@@ -8,6 +8,7 @@ import { Avatar } from "@/components/ui/avatar";
 import { Ring } from "@/components/ui/ring";
 import { Button } from "@/components/ui/button";
 import { StatCard } from "@/components/dashboard/stat-card";
+import { SetupChecklist } from "@/components/dashboard/setup-checklist";
 import { ActivityTrendChart, HourlyChart, ProjectDonut, TopAppsChart } from "@/components/dashboard/charts";
 import { ScreenMockView } from "@/components/screen-mock";
 import {
@@ -22,7 +23,9 @@ import {
   users,
   weeklyTrend,
 } from "@/lib/tenant-data";
+import { brand, greeting } from "@/lib/brand";
 import { formatDuration } from "@/lib/utils";
+import { Reveal, Stagger } from "@/components/motion/reveal";
 
 function agoLabel(iso: string) {
   const mins = Math.round((NOW.getTime() - new Date(iso).getTime()) / 60000);
@@ -42,17 +45,18 @@ export function AdminDashboard({ userName, isOwner }: { userName: string; isOwne
 
   return (
     <div className="space-y-6">
+      <Reveal>
       <div className="flex flex-wrap items-end justify-between gap-4">
         <div>
-          <div className="flex items-center gap-2">
-            <h1 className="text-2xl font-bold tracking-tight">Good afternoon, {userName}</h1>
+          <div className="flex flex-wrap items-center gap-2">
+            <h1 className="page-title">{greeting(userName)}</h1>
             <Badge tone="success" className="gap-1.5">
               <span className="h-1.5 w-1.5 rounded-full bg-success live-dot" />
               {summary.activeMembers} tracking now
             </Badge>
           </div>
           <p className="mt-1 text-sm text-muted-foreground">
-            {isOwner ? "Here's a complete overview of your organization today." : "Here's what your team is working on today."}
+            {isOwner ? "Organization overview for today." : "What your team is working on today."}
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -68,16 +72,22 @@ export function AdminDashboard({ userName, isOwner }: { userName: string; isOwne
           </Link>
         </div>
       </div>
+      </Reveal>
 
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        <StatCard label="Tracked today" value={formatDuration(summary.totalTrackedToday)} icon={Clock} trend={12} accent="#6d5efc" sub="across all members" />
-        <StatCard label="Active members" value={`${summary.activeMembers}/${summary.totalMembers}`} icon={Users} trend={8} accent="#0ea5e9" sub="currently online" />
-        <StatCard label="Avg productivity" value={`${summary.avgProductivity}%`} icon={Gauge} trend={-3} accent="#22c55e" sub="team average" />
-        <StatCard label="Screenshots today" value={String(summary.screenshotsToday)} icon={Camera} trend={5} accent="#ec4899" sub="auto-captured" />
-      </div>
+      <Reveal delay={60}>
+        <SetupChecklist isOwner={isOwner} />
+      </Reveal>
 
+      <Stagger className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4" baseDelay={55}>
+        <StatCard label="Tracked today" value={formatDuration(summary.totalTrackedToday)} icon={Clock} accent={brand.primary} sub="across all members" />
+        <StatCard label="Active members" value={`${summary.activeMembers}/${summary.totalMembers}`} icon={Users} accent={brand.info} sub="currently online" />
+        <StatCard label="Avg productivity" value={`${summary.avgProductivity}%`} icon={Gauge} accent={brand.success} sub="team average" />
+        <StatCard label="Captures today" value={String(summary.screenshotsToday)} icon={Camera} accent={brand.pink} sub="screen captures" />
+      </Stagger>
+
+      <Reveal delay={120}>
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
-        <Card className="lg:col-span-2">
+        <Card className="card-elev-lg lg:col-span-2">
           <CardHeader>
             <CardTitle>Activity this week</CardTitle>
             <div className="flex items-center gap-4 text-xs text-muted-foreground">
@@ -106,18 +116,22 @@ export function AdminDashboard({ userName, isOwner }: { userName: string; isOwne
           </CardContent>
         </Card>
       </div>
+      </Reveal>
 
+      <Reveal delay={180}>
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
-        <Card>
+        <Card className="card-quiet">
           <CardHeader><CardTitle>Most used apps</CardTitle><Badge tone="muted">This week</Badge></CardHeader>
           <CardContent><TopAppsChart data={topApps} /></CardContent>
         </Card>
-        <Card>
+        <Card className="card-quiet">
           <CardHeader><CardTitle>Today&apos;s focus by hour</CardTitle><Badge tone="muted">Minutes tracked</Badge></CardHeader>
           <CardContent><HourlyChart data={hourlyToday} /></CardContent>
         </Card>
       </div>
+      </Reveal>
 
+      <Reveal delay={220}>
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
         <Card>
           <CardHeader>
@@ -171,6 +185,7 @@ export function AdminDashboard({ userName, isOwner }: { userName: string; isOwne
           </CardContent>
         </Card>
       </div>
+      </Reveal>
     </div>
   );
 }

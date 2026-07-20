@@ -7,10 +7,13 @@ export const navAccess: Record<string, Role[]> = {
   "/projects": ["owner", "admin", "worker"],
   "/team": ["owner", "admin"],
   "/monitor": ["owner", "admin", "worker"],
-  "/activities": ["owner", "admin", "worker", "client"],
-  "/screenshots": ["owner", "admin", "worker", "client"],
+  // Capture review — not for clients (progress portal only)
+  "/activities": ["owner", "admin", "worker"],
+  // Legacy path redirects to /activities?view=screens
+  "/screenshots": ["owner", "admin", "worker"],
   "/timesheet": ["owner", "admin", "worker"],
   "/reports": ["owner", "admin"],
+  // Insights demoted — page redirects to dashboard
   "/insights": ["owner", "admin"],
   "/billing": ["owner"],
   "/settings": ["owner", "admin", "worker", "client"],
@@ -44,3 +47,34 @@ export const roleDescriptions: Record<Role, string> = {
   worker: "Your own activity, timesheet & projects",
   client: "Read-only view of your project's progress",
 };
+
+/**
+ * Roles that occupy a paid seat and can be activity-tracked.
+ * Clients are stakeholders (no seat); host is platform-only.
+ */
+export function isTrackedMember(user: { role: Role }): boolean {
+  return user.role === "owner" || user.role === "admin" || user.role === "worker";
+}
+
+/** Alias for seat counting — same rule as tracked members. */
+export function isSeatMember(user: { role: Role }): boolean {
+  return isTrackedMember(user);
+}
+
+export function trackedMembers<T extends { role: Role }>(list: T[]): T[] {
+  return list.filter(isTrackedMember);
+}
+
+export function countSeats(list: { role: Role }[]): number {
+  return list.filter(isSeatMember).length;
+}
+
+/**
+ * Roles the inviter may assign.
+ * Admins cannot invite/promote to Owner; only owners can invite admins.
+ */
+export function inviteableRoles(inviter: { role: Role }): Role[] {
+  if (inviter.role === "owner") return ["worker", "admin", "client"];
+  if (inviter.role === "admin") return ["worker", "client"];
+  return [];
+}

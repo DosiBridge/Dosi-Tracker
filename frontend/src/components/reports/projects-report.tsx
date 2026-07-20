@@ -8,8 +8,8 @@ import { Badge } from "@/components/ui/badge";
 import { Avatar } from "@/components/ui/avatar";
 import { DataTable, type Column } from "@/components/ui/data-table";
 import { ReportShell, FilterBar, ExportMenu, Kpi, KpiGrid } from "./report-shell";
-import { projects, userById } from "@/lib/tenant-data";
-import { rangeForKey, type RangeKey } from "@/lib/reports-data";
+import { activities, projects, userById } from "@/lib/tenant-data";
+import { filterActivitiesByRange, rangeForKey, type RangeKey } from "@/lib/reports-data";
 import { exportRecords } from "@/lib/export";
 import { formatDuration } from "@/lib/utils";
 import type { Project } from "@/lib/types";
@@ -29,9 +29,20 @@ export function ProjectsReport() {
   const [rangeKey, setRangeKey] = useState<RangeKey>("30d");
   const [range, setRange] = useState<ResolvedRange>(() => ({ key: "30d", ...rangeForKey("30d") }));
 
-  const useMonth = rangeKey === "30d" || rangeKey === "month";
   const rows = useMemo(() => projects.filter((p) => !p.archived), []);
-  const minutesOf = (p: Project) => (useMonth ? p.loggedThisMonth : p.loggedThisWeek);
+
+  const projectMinutes = useMemo(() => {
+    const acts = filterActivitiesByRange(activities, range.from, range.to);
+    const map = new Map<string, number>();
+    acts.forEach((a) => {
+      const p = projects.find((pr) => pr.id === a.projectId);
+      const mins = p?.intervalMinutes ?? 10;
+      map.set(a.projectId, (map.get(a.projectId) ?? 0) + mins);
+    });
+    return map;
+  }, [range]);
+
+  const minutesOf = (p: Project) => projectMinutes.get(p.id) ?? 0;
 
   const totalMinutes = rows.reduce((s, p) => s + minutesOf(p), 0);
   const totalCost = Math.round((totalMinutes / 60) * BLENDED_RATE);
@@ -58,7 +69,7 @@ export function ProjectsReport() {
         )}
       </div>
     )},
-    { key: "time", header: useMonth ? "This month" : "This week", align: "right", sortValue: (r) => minutesOf(r), render: (r) => <span className="font-medium">{formatDuration(minutesOf(r))}</span> },
+    { key: "time", header: range.label, align: "right", sortValue: (r) => minutesOf(r), render: (r) => <span className="font-medium">{formatDuration(minutesOf(r))}</span> },
     { key: "total", header: "Total logged", align: "right", sortValue: (r) => r.loggedTotal, render: (r) => formatDuration(r.loggedTotal) },
     { key: "share", header: "Share", align: "right", sortValue: (r) => minutesOf(r), render: (r) => <Badge tone="muted">{totalMinutes ? Math.round((minutesOf(r) / totalMinutes) * 100) : 0}%</Badge> },
     { key: "cost", header: "Est. cost", align: "right", sortValue: (r) => minutesOf(r), render: (r) => <span className="font-medium">${Math.round((minutesOf(r) / 60) * BLENDED_RATE).toLocaleString()}</span> },
@@ -69,7 +80,7 @@ export function ProjectsReport() {
     exportRecords(`projects-${range.key}`, rows, [
       { header: "Project", value: (r) => r.title },
       { header: "Members", value: (r) => r.memberIds.length },
-      { header: `${useMonth ? "Month" : "Week"} (min)`, value: (r) => minutesOf(r) },
+      { header: `${range.label} (min)`, value: (r) => minutesOf(r) },
       { header: "Total (min)", value: (r) => r.loggedTotal },
       { header: "Est. cost USD", value: (r) => Math.round((minutesOf(r) / 60) * BLENDED_RATE) },
     ]);
@@ -93,16 +104,18 @@ export function ProjectsReport() {
       <Card>
         <CardHeader><CardTitle>Time by project</CardTitle><span className="text-xs text-muted-foreground">{range.label}</span></CardHeader>
         <CardContent>
-          <ResponsiveContainer width="100%" height={260}>
-            <BarChart data={chartData} margin={{ top: 8, right: 8, left: -18, bottom: 0 }}>
-              <XAxis dataKey="name" tickLine={false} axisLine={false} tick={{ fill: "#94a3b8", fontSize: 11 }} />
-              <YAxis tickLine={false} axisLine={false} tick={{ fill: "#94a3b8", fontSize: 12 }} />
-              <Tooltip contentStyle={tooltipStyle} cursor={{ fill: "var(--muted)" }} formatter={(v) => formatDuration(Number(v))} />
-              <Bar dataKey="minutes" radius={[6, 6, 0, 0]} barSize={44}>
-                {chartData.map((d) => <Cell key={d.name} fill={d.color} />)}
-              </Bar>
-            </BarChart>
-          </ResponsiveContainer>
+          <div className="h-[200px] w-full min-w-0 sm:h-[260px]">
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={chartData} margin={{ top: 8, right: 8, left: -8, bottom: 0 }}>
+                <XAxis dataKey="name" tickLine={false} axisLine={false} tick={{ fill: "#94a3b8", fontSize: 10 }} interval={0} />
+                <YAxis tickLine={false} axisLine={false} tick={{ fill: "#94a3b8", fontSize: 11 }} width={36} />
+                <Tooltip contentStyle={tooltipStyle} cursor={{ fill: "var(--muted)" }} formatter={(v) => formatDuration(Number(v))} />
+                <Bar dataKey="minutes" radius={[6, 6, 0, 0]} barSize={36}>
+                  {chartData.map((d) => <Cell key={d.name} fill={d.color} />)}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
         </CardContent>
       </Card>
 

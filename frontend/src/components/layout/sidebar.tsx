@@ -4,7 +4,6 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
   Activity,
-  Camera,
   CalendarClock,
   LayoutDashboard,
   FolderKanban,
@@ -12,7 +11,6 @@ import {
   Settings,
   ChevronLeft,
   BarChart3,
-  Sparkles,
   MonitorDot,
   CreditCard,
 } from "lucide-react";
@@ -27,11 +25,9 @@ const nav = [
   { href: "/projects", label: "Projects", icon: FolderKanban, group: "Overview" },
   { href: "/team", label: "Team", icon: Users, group: "Overview" },
   { href: "/monitor", label: "Member Monitor", icon: MonitorDot, group: "Monitor" },
-  { href: "/activities", label: "Activities", icon: Activity, group: "Monitor" },
-  { href: "/screenshots", label: "Screenshots", icon: Camera, group: "Monitor" },
+  { href: "/activities", label: "Activity", icon: Activity, group: "Monitor" },
   { href: "/timesheet", label: "Timesheet", icon: CalendarClock, group: "Monitor" },
   { href: "/reports", label: "Reports", icon: BarChart3, group: "Analytics" },
-  { href: "/insights", label: "Insights", icon: Sparkles, group: "Analytics" },
   { href: "/billing", label: "Billing & Plan", icon: CreditCard, group: "Workspace" },
   { href: "/settings", label: "Settings", icon: Settings, group: "Workspace" },
 ];
@@ -50,6 +46,8 @@ export function Sidebar({
   const pathname = usePathname();
   const { user: currentUser } = useSession();
   const visibleNav = nav.filter((item) => canAccess(currentUser.role, item.href));
+  // Mobile drawer is always expanded; rail collapse is desktop-only.
+  const compact = collapsed && !mobileOpen;
 
   return (
     <>
@@ -58,15 +56,15 @@ export function Sidebar({
       )}
       <aside
         className={cn(
-          "fixed inset-y-0 left-0 z-50 flex flex-col border-r border-border bg-sidebar text-sidebar-foreground transition-all duration-300",
-          collapsed ? "w-[76px]" : "w-64",
+          "fixed inset-y-0 left-0 z-50 flex w-64 flex-col border-r border-border bg-sidebar text-sidebar-foreground transition-all duration-300",
+          compact ? "lg:w-[76px]" : "lg:w-64",
           "lg:translate-x-0",
           mobileOpen ? "translate-x-0" : "-translate-x-full lg:translate-x-0"
         )}
       >
         {/* Workspace switcher (multi-tenant) */}
         <div className="p-3">
-          <WorkspaceSwitcher collapsed={collapsed} />
+          <WorkspaceSwitcher collapsed={compact} />
         </div>
 
         {/* Nav */}
@@ -77,29 +75,29 @@ export function Sidebar({
             const showGroup = i === 0 || visibleNav[i - 1].group !== item.group;
             return (
               <div key={item.href}>
-                {showGroup && !collapsed && (
+                {showGroup && !compact && (
                   <div className={cn("px-3 pb-1 pt-3 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground", i === 0 && "pt-0")}>
                     {item.group}
                   </div>
                 )}
-                {showGroup && collapsed && i !== 0 && <div className="my-2 h-px bg-border" />}
+                {showGroup && compact && i !== 0 && <div className="my-2 h-px bg-border" />}
                 <Link
                   href={item.href}
                   onClick={onMobileClose}
-                  title={collapsed ? item.label : undefined}
+                  title={compact ? item.label : undefined}
                   className={cn(
                     "group relative flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors",
                     active
                       ? "bg-accent text-accent-foreground"
                       : "text-muted-foreground hover:bg-muted hover:text-foreground",
-                    collapsed && "justify-center px-0"
+                    compact && "lg:justify-center lg:px-0"
                   )}
                 >
                   {active && (
                     <span className="absolute left-0 top-1/2 h-5 w-1 -translate-y-1/2 rounded-r-full bg-primary" />
                   )}
                   <Icon className="h-[18px] w-[18px] shrink-0" />
-                  {!collapsed && <span>{item.label}</span>}
+                  {!compact && <span>{item.label}</span>}
                 </Link>
               </div>
             );
@@ -108,9 +106,9 @@ export function Sidebar({
 
         {/* User + collapse */}
         <div className="border-t border-border p-3">
-          <div className={cn("flex items-center gap-3 rounded-lg p-2", collapsed && "justify-center")}>
+          <div className={cn("flex items-center gap-3 rounded-lg p-2", compact && "lg:justify-center")}>
             <Avatar name={currentUser.name} size="sm" status={currentUser.status} />
-            {!collapsed && (
+            {!compact && (
               <div className="min-w-0 flex-1">
                 <div className="truncate text-sm font-medium">{currentUser.name}</div>
                 <div className="truncate text-[11px] text-muted-foreground">{roleLabels[currentUser.role]}</div>
@@ -123,8 +121,8 @@ export function Sidebar({
               "mt-2 hidden w-full items-center justify-center gap-2 rounded-lg py-2 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground lg:flex"
             )}
           >
-            <ChevronLeft className={cn("h-4 w-4 transition-transform", collapsed && "rotate-180")} />
-            {!collapsed && "Collapse"}
+            <ChevronLeft className={cn("h-4 w-4 transition-transform", compact && "rotate-180")} />
+            {!compact && "Collapse"}
           </button>
         </div>
       </aside>
