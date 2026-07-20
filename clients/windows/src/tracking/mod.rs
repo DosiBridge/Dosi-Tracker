@@ -61,6 +61,7 @@ impl Tracker {
         };
 
         Activity {
+            client_activity_id: uuid::Uuid::new_v4().to_string(),
             project_id: project_id.to_string(),
             started_at,
             ended_at: Utc::now(),

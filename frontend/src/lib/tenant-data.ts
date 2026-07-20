@@ -549,6 +549,20 @@ export function setActiveWorkspace(workspaceId: string): void {
   notifications = ds.notifications;
 }
 
+export function hydrateLiveBackendData(liveProjects: Project[], liveActivities: Activity[]) {
+  active.projects = liveProjects;
+  active.activities = liveActivities;
+  projects = liveProjects;
+  activities = liveActivities;
+  
+  // Update the cache as well
+  const ds = cache.get(active.workspaceId);
+  if (ds) {
+    ds.projects = liveProjects;
+    ds.activities = liveActivities;
+  }
+}
+
 /* ----------------------------- Lookups & derived helpers (read active) ----------------------------- */
 
 export const userById = (id: string) => users.find((u) => u.id === id);

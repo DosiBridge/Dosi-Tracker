@@ -22,8 +22,8 @@ import { SearchField, SegmentedControl, Toolbar } from "@/components/ui/toolbar"
 import { CreateProjectModal } from "@/components/projects/create-project-modal";
 import { EmptyState } from "@/components/ui/empty-state";
 import { useSession } from "@/components/session-provider";
-import { userById, createTenantProject } from "@/lib/tenant-data";
-import { scopeProjects } from "@/lib/scope";
+import { userById } from "@/lib/tenant-data";
+import { useApi, postApi } from "@/hooks/useApi";
 import type { Project } from "@/lib/types";
 import { cn, formatDuration } from "@/lib/utils";
 
@@ -38,12 +38,13 @@ const permIcons = [
 export default function ProjectsPage() {
   const { user, workspace } = useSession();
   const canManage = user.role === "owner" || user.role === "admin";
-  const [created, setCreated] = useState<Project[]>([]);
+  const { data: apiProjects, isLoading, refetch } = useApi<Project[]>('/api/app/project');
   const [query, setQuery] = useState("");
   const [tab, setTab] = useState<"active" | "archived">("active");
   const [open, setOpen] = useState(false);
+  const [isCreating, setIsCreating] = useState(false);
 
-  const list = useMemo(() => [...created, ...scopeProjects(user)], [created, user]);
+  const list = useMemo(() => apiProjects || [], [apiProjects]);
 
   const filtered = useMemo(
     () =>
@@ -181,9 +182,22 @@ export default function ProjectsPage() {
       <CreateProjectModal
         open={open}
         onClose={() => setOpen(false)}
-        onCreate={(p) => {
-          createTenantProject(workspace.id, p);
-          setCreated((l) => [p, ...l]);
+        onCreate={async (p) => {
+          setIsCreating(true);
+          try {
+            await postApi('/api/app/project', {
+              title: p.title,
+              description: p.description,
+              color: p.color,
+              intervalMinutes: p.intervalMinutes,
+              permissions: p.permissions
+            });
+            await refetch();
+          } catch (e) {
+            console.error(e);
+          } finally {
+            setIsCreating(false);
+          }
         }}
       />
     </PageStack>

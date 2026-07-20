@@ -9,10 +9,7 @@ import { Avatar } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { ThemeToggle } from "@/components/ui/theme-toggle";
 import { LoginHero } from "@/components/motion/login-hero";
-import { useSession } from "@/components/session-provider";
-import { users } from "@/lib/mock-data";
-import { landingFor, roleLabels, roleDescriptions } from "@/lib/roles";
-import type { PlanId } from "@/lib/saas-data";
+import { loginApi, registerApi } from "@/hooks/useApi";
 import type { Role } from "@/lib/types";
 
 const roleTone: Record<Role, "primary" | "success" | "info" | "warning"> = {
@@ -23,49 +20,40 @@ const roleTone: Record<Role, "primary" | "success" | "info" | "warning"> = {
   client: "info",
 };
 
-const roleOrder: Role[] = ["owner", "admin", "worker", "client"];
-const demoAccounts = [...users].sort(
-  (a, b) => roleOrder.indexOf(a.role) - roleOrder.indexOf(b.role)
-);
+// Demo mode removed.
 
 export default function LoginPage() {
   const router = useRouter();
-  const { setUserById, createWorkspace, loginAsHost } = useSession();
-  const [mode, setMode] = useState<"signin" | "signup">("signin");
-  const [email, setEmail] = useState("ayesha@dosi.dev");
-  const [password, setPassword] = useState("demo1234");
-  const [show, setShow] = useState(false);
-  const [loading, setLoading] = useState<string | null>(null);
-  const [wsName, setWsName] = useState("");
-  const [wsPlan, setWsPlan] = useState<PlanId>("starter");
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
-  function signInAs(userId: string) {
-    const user = users.find((u) => u.id === userId);
-    if (!user) return;
-    setLoading(userId);
-    setUserById(userId);
-    setTimeout(() => router.push(landingFor(user.role)), 500);
-  }
-
-  function onSubmit(e: React.FormEvent) {
+  async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
-    const match = users.find((u) => u.email.toLowerCase() === email.trim().toLowerCase());
-    signInAs((match ?? users[0]).id);
+    setLoading("signin");
+    setErrorMsg(null);
+    try {
+      await loginApi(email, password);
+      // Wait a moment for token to settle, then redirect
+      setTimeout(() => router.push("/dashboard"), 500);
+    } catch (err: any) {
+      setErrorMsg("Invalid username or password");
+      setLoading(null);
+    }
   }
 
-  function signInAsHost() {
-    setLoading("__host__");
-    loginAsHost();
-    setTimeout(() => router.push("/host"), 500);
-  }
-
-  function onCreateWorkspace(e: React.FormEvent) {
+  async function onCreateWorkspace(e: React.FormEvent) {
     e.preventDefault();
-    if (!wsName.trim()) return;
+    if (!wsName.trim() || !password) return;
     setLoading("__signup__");
-    const ws = createWorkspace(wsName.trim(), wsPlan);
-    setUserById(`${ws.id}-owner`);
-    setTimeout(() => router.push("/dashboard"), 600);
+    setErrorMsg(null);
+    try {
+      await registerApi(email, password, wsName);
+      // Automatically log them in after registration
+      await loginApi(email, password);
+      setTimeout(() => router.push("/dashboard"), 600);
+    } catch (err: any) {
+      setErrorMsg(err.message || "Registration failed");
+      setLoading(null);
+    }
   }
 
   return (
@@ -97,7 +85,14 @@ export default function LoginPage() {
                 Spin up a new, fully isolated tenant. You&apos;ll be the owner.
               </p>
 
-              <form onSubmit={onCreateWorkspace} className="mt-8 space-y-4">
+                <div className="space-y-1.5">
+                  <label className="text-sm font-medium">Email</label>
+                  <Input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="name@company.com" required autoFocus />
+                </div>
+                <div className="space-y-1.5">
+                  <label className="text-sm font-medium">Password</label>
+                  <Input type="password" value={password} onChange={(e) => setPassword(e.target.value)} required minLength={6} />
+                </div>
                 <div className="space-y-1.5">
                   <label className="text-sm font-medium">Workspace name</label>
                   <Input value={wsName} onChange={(e) => setWsName(e.target.value)} placeholder="Acme Corp" required autoFocus />
@@ -115,7 +110,8 @@ export default function LoginPage() {
                     <option value="business">Business — $12/user/mo · 14-day trial</option>
                   </Select>
                 </div>
-                <Button type="submit" size="lg" className="w-full" disabled={!!loading || !wsName.trim()}>
+                {errorMsg && <p className="text-sm text-red-500 font-medium">{errorMsg}</p>}
+                <Button type="submit" size="lg" className="w-full" disabled={!!loading || !wsName.trim() || !email || !password}>
                   {loading === "__signup__" && <Loader2 className="h-4 w-4 animate-spin" />}
                   {loading === "__signup__" ? "Creating…" : "Create workspace"}
                 </Button>
@@ -161,6 +157,7 @@ export default function LoginPage() {
                   </div>
                 </div>
 
+                {errorMsg && <p className="text-sm text-red-500 font-medium">{errorMsg}</p>}
                 <Button type="submit" size="lg" className="w-full" disabled={!!loading}>
                   {loading && <Loader2 className="h-4 w-4 animate-spin" />}
                   {loading ? "Signing in…" : "Sign in"}
@@ -168,65 +165,6 @@ export default function LoginPage() {
               </form>
 
               <div className="mt-8">
-                <div className="mb-3 flex items-center gap-3">
-                  <span className="h-px flex-1 bg-border" />
-                  <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-                    Demo accounts
-                  </span>
-                  <span className="h-px flex-1 bg-border" />
-                </div>
-
-                <div className="stagger space-y-1.5" style={{ ["--stagger-base" as string]: "45ms" }}>
-                  {demoAccounts.map((u) => (
-                    <button
-                      key={u.id}
-                      onClick={() => signInAs(u.id)}
-                      disabled={!!loading}
-                      className="group flex w-full items-center gap-3 rounded-xl border border-border bg-card p-2.5 text-left transition-colors hover:border-primary/35 hover:bg-accent/40 disabled:opacity-60"
-                    >
-                      <Avatar name={u.name} size="sm" status={u.status} />
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-2">
-                          <span className="truncate text-sm font-medium">{u.name}</span>
-                          <Badge tone={roleTone[u.role]} className="capitalize">{roleLabels[u.role]}</Badge>
-                        </div>
-                        <div className="truncate text-xs text-muted-foreground">{roleDescriptions[u.role]}</div>
-                      </div>
-                      {loading === u.id ? (
-                        <Loader2 className="h-4 w-4 shrink-0 animate-spin text-primary" />
-                      ) : (
-                        <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground transition-transform group-hover:translate-x-0.5" />
-                      )}
-                    </button>
-                  ))}
-                </div>
-
-                <p className="mt-3 text-center text-xs text-muted-foreground">
-                  Pick any account to explore its role-specific dashboard. Demo mode — no real password needed.
-                </p>
-
-                <button
-                  onClick={signInAsHost}
-                  disabled={!!loading}
-                  className="group mt-4 flex w-full items-center gap-3 rounded-xl border border-primary/25 bg-accent/40 p-2.5 text-left transition-colors hover:border-primary/45 hover:bg-accent/70 disabled:opacity-60"
-                >
-                  <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg brand-gradient text-white">
-                    <Server className="h-[18px] w-[18px]" />
-                  </span>
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2">
-                      <span className="truncate text-sm font-medium">Platform Admin</span>
-                      <Badge tone="primary">Host</Badge>
-                    </div>
-                    <div className="truncate text-xs text-muted-foreground">Manage all tenants, plans & revenue</div>
-                  </div>
-                  {loading === "__host__" ? (
-                    <Loader2 className="h-4 w-4 shrink-0 animate-spin text-primary" />
-                  ) : (
-                    <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground transition-transform group-hover:translate-x-0.5" />
-                  )}
-                </button>
-
                 <div className="mt-6 rounded-xl border border-dashed border-border p-3 text-center">
                   <p className="text-sm text-muted-foreground">New to Dosi-Tracker?</p>
                   <button

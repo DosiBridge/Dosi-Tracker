@@ -1,5 +1,6 @@
 using System;
 using System.Linq;
+using System.Text.Json;
 using System.Threading.Tasks;
 using Volo.Abp.Application.Dtos;
 using Volo.Abp.Application.Services;
@@ -41,8 +42,8 @@ public class ActivityAppService : ApplicationService, IActivityAppService
             MouseClicks = input.MouseClicks,
             KeyboardHits = input.KeyboardHits,
             Description = input.Description,
-            ActiveWindowsJson = input.ActiveWindowsJson,
-            RunningProgramsJson = input.RunningProgramsJson
+            ActiveWindowsJson = input.ActiveWindows != null ? JsonSerializer.Serialize(input.ActiveWindows) : "[]",
+            RunningProgramsJson = input.RunningPrograms != null ? JsonSerializer.Serialize(input.RunningPrograms) : "[]"
         };
 
         await _activityRepository.InsertAsync(activity);

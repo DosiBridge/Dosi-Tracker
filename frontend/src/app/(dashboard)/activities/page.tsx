@@ -22,7 +22,8 @@ import { PageHeader, PageStack } from "@/components/ui/page-header";
 import { SegmentedControl } from "@/components/ui/toolbar";
 import { ActivityFilterBar } from "@/components/activities/activity-filter-bar";
 import { useSession } from "@/components/session-provider";
-import { activities, NOW, projectById, userById } from "@/lib/tenant-data";
+import { NOW, projectById, userById } from "@/lib/tenant-data";
+import { useApi } from "@/hooks/useApi";
 import { applyActivityFilters, defaultActivityFilters, type ActivityFilters } from "@/lib/activity-filters";
 import { scopeActivities } from "@/lib/scope";
 import type { Activity } from "@/lib/types";
@@ -59,18 +60,40 @@ function ActivitiesPageInner() {
   const [selected, setSelected] = useState<Activity | null>(null);
   const [view, setView] = useState<ViewMode>(searchParams.get("view") === "screens" ? "screens" : "sessions");
 
+  const { data: apiActivities, isLoading } = useApi<any[]>('/api/app/activity');
+
   useEffect(() => {
     setView(searchParams.get("view") === "screens" ? "screens" : "sessions");
   }, [searchParams]);
+
+  const backendActivities: Activity[] = useMemo(() => {
+    if (!apiActivities) return [];
+    return apiActivities.map(a => ({
+      id: a.id,
+      userId: a.userId,
+      projectId: a.projectId,
+      startedAt: a.startedAt,
+      endedAt: a.endedAt,
+      description: a.description || "Activity block",
+      productivity: a.productivity || 0,
+      mouseClicks: a.mouseClicks || 0,
+      keyboardHits: a.keyboardHits || 0,
+      activeWindows: a.activeWindowsJson ? JSON.parse(a.activeWindowsJson) : [],
+      runningPrograms: a.runningProgramsJson ? JSON.parse(a.runningProgramsJson) : [],
+      screen: { app: "System", kind: "desktop" as any, accent: "#1e293b" }, // Fallback for UI
+      hasWebcam: false,
+      online: false,
+    }));
+  }, [apiActivities]);
 
   function setViewMode(mode: ViewMode) {
     setView(mode);
     router.replace(mode === "screens" ? "/activities?view=screens" : "/activities", { scroll: false });
   }
 
-  const base = useMemo(() => scopeActivities(user, activities), [user]);
+  const base = useMemo(() => scopeActivities(user, backendActivities), [user, backendActivities]);
   const filtered = useMemo(() => applyActivityFilters(base, filters), [base, filters]);
-  const updatedAt = activities[0]?.endedAt;
+  const updatedAt = backendActivities[0]?.endedAt;
 
   return (
     <PageStack>

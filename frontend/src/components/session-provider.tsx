@@ -2,9 +2,10 @@
 
 import { createContext, useContext, useEffect, useState } from "react";
 import { users as primaryUsers } from "@/lib/mock-data";
-import { datasetFor, setActiveWorkspace } from "@/lib/tenant-data";
+import { datasetFor, setActiveWorkspace, hydrateLiveBackendData } from "@/lib/tenant-data";
 import { primaryWorkspace, workspaces as seedWorkspaces, type PlanId, type Workspace } from "@/lib/saas-data";
-import type { User } from "@/lib/types";
+import type { User, Activity } from "@/lib/types";
+import { getApi } from "@/hooks/useApi";
 
 /** The platform operator. Not a member of any tenant. */
 export const hostUser: User = {
@@ -72,6 +73,67 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
     const storedWs = localStorage.getItem(WS_KEY);
     if (storedWs) setWorkspaceId(storedWs);
     setImpersonating(localStorage.getItem(IMPERSONATE_KEY) === "1");
+  }, []);
+
+  // Hydrate global mock state with real backend API data
+  useEffect(() => {
+    async function hydrate() {
+      try {
+        const [apiProjects, apiActivities, myProfile] = await Promise.all([
+          getApi('/api/app/project').catch(() => []),
+          getApi('/api/app/activity').catch(() => []),
+          getApi('/api/account/my-profile').catch(() => null)
+        ]);
+        
+        if (myProfile) {
+          // If we got a real backend user, override the mock user in our state
+          setUserId(myProfile.id);
+          const mappedUser: User = {
+            id: myProfile.id,
+            name: myProfile.name || myProfile.userName,
+            email: myProfile.email,
+            role: "admin", // Standardize role for the demo
+            designation: "Tracker User",
+            status: "active",
+            timezone: "UTC",
+            trackedToday: 0,
+            productivity: 0,
+            joinedAt: new Date().toISOString().slice(0,10)
+          };
+          // Add them to mock dataset if they aren't there
+          if (!datasetFor(workspaceId).users.find(u => u.id === mappedUser.id)) {
+             datasetFor(workspaceId).users.push(mappedUser);
+          }
+        }
+
+        const mappedActivities: Activity[] = (apiActivities || []).map((a: any) => ({
+          id: a.id,
+          userId: a.userId,
+          projectId: a.projectId,
+          startedAt: a.startedAt,
+          endedAt: a.endedAt,
+          description: a.description || "Activity block",
+          productivity: a.productivity || 0,
+          mouseClicks: a.mouseClicks || 0,
+          keyboardHits: a.keyboardHits || 0,
+          activeWindows: a.activeWindowsJson ? JSON.parse(a.activeWindowsJson) : [],
+          runningPrograms: a.runningProgramsJson ? JSON.parse(a.runningProgramsJson) : [],
+          screen: { app: "System", kind: "desktop" as any, accent: "#1e293b" },
+          hasWebcam: false,
+          online: false,
+        }));
+
+        hydrateLiveBackendData(apiProjects || [], mappedActivities);
+        console.log("Global tenant data hydrated from ABP backend.");
+      } catch (err) {
+        console.warn("Failed to hydrate tenant data from API:", err);
+      }
+    }
+    
+    // Only try to hydrate if we have a token
+    if (localStorage.getItem('dosi-token')) {
+      hydrate();
+    }
   }, []);
 
   const allWorkspaces = [...seedWorkspaces, ...created]

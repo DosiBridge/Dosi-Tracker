@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 /// Credentials/token returned by the backend after login.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AuthSession {
     pub access_token: String,
     pub user_id: String,
@@ -12,6 +13,7 @@ pub struct AuthSession {
 
 /// A project the current user may track against, with server-side permissions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Project {
     pub id: String,
     pub title: String,
@@ -26,7 +28,9 @@ pub struct Project {
 
 /// One tracked time block that gets uploaded to the backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Activity {
+    pub client_activity_id: String,
     pub project_id: String,
     pub started_at: DateTime<Utc>,
     pub ended_at: DateTime<Utc>,
@@ -42,6 +46,7 @@ pub struct Activity {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WindowInfo {
     pub app_name: String,
     pub window_title: String,
