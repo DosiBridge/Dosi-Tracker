@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Bar,
   BarChart,
@@ -22,7 +22,77 @@ import { activities, projects, userById, users } from "@/lib/tenant-data";
 import { categoryColor, filterActivitiesByRange, rangeForKey, type RangeKey } from "@/lib/reports-data";
 import { exportRecords } from "@/lib/export";
 import { cn, formatDuration } from "@/lib/utils";
+import { getApi } from "@/hooks/useApi";
 import type { ResolvedRange } from "./date-range-picker";
+
+/* ---- Live (API) shapes: /api/app/reporting/summary + /api/identity/users ---- */
+
+interface LivePerUser {
+  userId: string;
+  activityCount: number;
+  trackedMinutes: number;
+  averageProductivity: number;
+}
+
+interface LiveSummary {
+  perUser: LivePerUser[];
+}
+
+interface LiveIdentityUser {
+  id: string;
+  userName: string;
+  name?: string | null;
+  surname?: string | null;
+}
+
+const GUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
+/**
+ * Live queries pivot on the real clock (the shared range presets pivot on the demo NOW constant so
+ * mock data stays stable). Mirrors rangeForKey's per-preset logic.
+ */
+function liveRangeFor(key: RangeKey): { from: Date; to: Date } {
+  const to = new Date();
+  const from = new Date();
+  switch (key) {
+    case "today":
+      from.setHours(0, 0, 0, 0);
+      break;
+    case "yesterday":
+      from.setDate(from.getDate() - 1);
+      from.setHours(0, 0, 0, 0);
+      to.setDate(to.getDate() - 1);
+      to.setHours(23, 59, 59, 999);
+      break;
+    case "30d":
+      from.setDate(from.getDate() - 30);
+      break;
+    case "month":
+      from.setDate(1);
+      from.setHours(0, 0, 0, 0);
+      break;
+    default: // "7d" and "custom" fall back to the last 7 days
+      from.setDate(from.getDate() - 7);
+      break;
+  }
+  return { from, to };
+}
+
+/**
+ * Split a member's tracked minutes into productive / neutral / unproductive / idle from the backend's
+ * per-user tracked-minutes + average productivity. Kept identical to the demo derivation so live and
+ * demo modes read the same way.
+ */
+function splitFor(trackedMinutes: number, averageProductivity: number) {
+  const productive = Math.round((trackedMinutes * averageProductivity) / 100);
+  const rem = Math.max(trackedMinutes - productive, 0);
+  const unproductive = Math.round(rem * 0.35);
+  const neutral = rem - unproductive;
+  const idle = Math.round(trackedMinutes * 0.08);
+  const total = productive + neutral + unproductive;
+  const focus = total ? Math.round((productive / total) * 100) : 0;
+  return { productive, neutral, unproductive, idle, focus };
+}
 
 const tooltipStyle = {
   borderRadius: 12,
@@ -48,7 +118,41 @@ export function ProductivityReport() {
   const [memberId, setMemberId] = useState("all");
   const [viewMode, setViewMode] = useState<"table" | "grid">("table");
 
-  const rows = useMemo<Row[]>(() => {
+  const [liveSummary, setLiveSummary] = useState<LiveSummary | null>(null);
+  const [liveUsers, setLiveUsers] = useState<LiveIdentityUser[]>([]);
+  const [liveLoading, setLiveLoading] = useState(false);
+  const [liveError, setLiveError] = useState(false);
+
+  // The backend can only key off real GUIDs; a demo (non-GUID) member selection keeps the mock render.
+  const liveApplicable = memberId === "all" || GUID_RE.test(memberId);
+
+  const loadLive = useCallback(async () => {
+    setLiveLoading(true);
+    setLiveError(false);
+    try {
+      const { from, to } = liveRangeFor(range.key);
+      const qs = new URLSearchParams({ From: from.toISOString(), To: to.toISOString() });
+      const summary = await getApi(`/api/app/reporting/summary?${qs.toString()}`);
+      setLiveSummary(summary && typeof summary === "object" ? (summary as LiveSummary) : null);
+      // Best effort: admins resolve member names; workers get a 403 -> keep ids.
+      const identityUsers = await getApi("/api/identity/users?MaxResultCount=100").catch(() => []);
+      setLiveUsers(Array.isArray(identityUsers) ? (identityUsers as LiveIdentityUser[]) : []);
+    } catch {
+      setLiveSummary(null); // fall back to the demo dataset below
+      setLiveError(true);
+    } finally {
+      setLiveLoading(false);
+    }
+  }, [range]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !localStorage.getItem("dosi-token")) return;
+    if (!liveApplicable) return;
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- data fetch defers its own setState; see docs/QUALITY.md §10
+    loadLive();
+  }, [loadLive, liveApplicable]);
+
+  const mockRows = useMemo<Row[]>(() => {
     const acts = filterActivitiesByRange(activities, range.from, range.to);
     const members = users.filter((u) => u.role !== "client" && (memberId === "all" || u.id === memberId));
     return members.map((u) => {
@@ -57,7 +161,7 @@ export function ProductivityReport() {
       let neutral = 0;
       let unproductive = 0;
       let idle = 0;
-      
+
       ua.forEach((a) => {
         const p = projects.find((pr) => pr.id === a.projectId);
         const mins = p?.intervalMinutes ?? 10;
@@ -65,7 +169,7 @@ export function ProductivityReport() {
         const rem = mins - prod;
         const unprod = Math.round(rem * 0.35);
         const neut = rem - unprod;
-        
+
         productive += prod;
         neutral += neut;
         unproductive += unprod;
@@ -85,6 +189,26 @@ export function ProductivityReport() {
       };
     });
   }, [range, memberId]);
+
+  const liveRows = useMemo<Row[] | null>(() => {
+    if (!liveApplicable || !liveSummary) return null;
+    const perUserList = Array.isArray(liveSummary.perUser) ? liveSummary.perUser : [];
+    const filtered = memberId === "all" ? perUserList : perUserList.filter((u) => u.userId === memberId);
+    return filtered.map((u) => {
+      const identity = liveUsers.find((x) => x.id === u.userId);
+      const identityName = identity ? `${identity.name ?? ""} ${identity.surname ?? ""}`.trim() : "";
+      const mockUser = userById(u.userId);
+      return {
+        userId: u.userId,
+        name: identityName || identity?.userName || mockUser?.name || u.userId.slice(0, 8),
+        ...splitFor(u.trackedMinutes, u.averageProductivity),
+      };
+    });
+  }, [liveApplicable, liveSummary, liveUsers, memberId]);
+
+  const rows = liveRows ?? mockRows;
+  const showLiveLoading = liveApplicable && liveLoading && liveRows === null;
+  const showLiveError = liveApplicable && liveError && liveRows === null;
 
   const totals = useMemo(() => {
     const t = { productive: 0, neutral: 0, unproductive: 0, idle: 0 };
@@ -155,6 +279,17 @@ export function ProductivityReport() {
       actions={<ExportMenu onExportCSV={doExport} />}
     >
       <FilterBar rangeKey={rangeKey} onRange={onRange} memberId={memberId} onMember={setMemberId} />
+
+      {showLiveLoading && (
+        <div className="rounded-lg border border-border bg-muted px-3 py-2 text-xs text-muted-foreground">
+          Loading live report data…
+        </div>
+      )}
+      {showLiveError && (
+        <div className="rounded-lg border border-border bg-muted px-3 py-2 text-xs text-muted-foreground">
+          Live data unavailable right now — showing demo data.
+        </div>
+      )}
 
       <KpiGrid>
         <Kpi label="Team focus" value={`${focusPct}%`} icon={Gauge} tone="#6d5efc" sub={range.label} />

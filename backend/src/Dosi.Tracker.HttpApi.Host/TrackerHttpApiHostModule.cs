@@ -3,6 +3,13 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Security.Cryptography.X509Certificates;
+using System.Threading.RateLimiting;
+using System.Threading.Tasks;
+using Dosi.Tracker.Billing;
+using Dosi.Tracker.SaaS;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.RateLimiting;
+using Volo.Abp.BackgroundWorkers;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Cors;
@@ -94,6 +101,14 @@ public class TrackerHttpApiHostModule : AbpModule
         var configuration = context.Services.GetConfiguration();
         var hostingEnvironment = context.Services.GetHostingEnvironment();
 
+        // Fail fast rather than ship the template's well-known dev secrets to production.
+        if (hostingEnvironment.IsProduction())
+        {
+            RejectDefaultDevSecrets(configuration);
+        }
+
+        ConfigureRateLimiting(context);
+
         if (!configuration.GetValue<bool>("App:DisablePII"))
         {
             Microsoft.IdentityModel.Logging.IdentityModelEventSource.ShowPII = true;
@@ -131,17 +146,81 @@ public class TrackerHttpApiHostModule : AbpModule
         ConfigureVirtualFileSystem(context);
         ConfigureCors(context, configuration);
 
-        Configure<AbpBlobStoringOptions>(options =>
+        // Use S3/R2 when credentials are configured; otherwise fall back to the database
+        // blob provider so captures work out of the box (dev, small deployments).
+        if (!string.IsNullOrWhiteSpace(configuration["S3:AccessKeyId"]))
         {
-            options.Containers.ConfigureDefault(container =>
+            Configure<AbpBlobStoringOptions>(options =>
             {
-                container.UseAws(aws =>
+                options.Containers.ConfigureDefault(container =>
                 {
-                    aws.AccessKeyId = configuration["S3:AccessKeyId"];
-                    aws.SecretAccessKey = configuration["S3:SecretAccessKey"];
-                    aws.ContainerName = configuration["S3:ContainerName"];
-                    // For Cloudflare R2:
-                    // aws.UseCredentials = false (not available in ABP by default, handled by S3 client config)
+                    container.UseAws(aws =>
+                    {
+                        aws.AccessKeyId = configuration["S3:AccessKeyId"];
+                        aws.SecretAccessKey = configuration["S3:SecretAccessKey"];
+                        aws.ContainerName = configuration["S3:ContainerName"];
+                        // For Cloudflare R2:
+                        // aws.UseCredentials = false (not available in ABP by default, handled by S3 client config)
+                    });
+                });
+            });
+        }
+    }
+
+    /// <summary>Refuses to start in Production while any well-known template secret is still active.</summary>
+    private static void RejectDefaultDevSecrets(IConfiguration configuration)
+    {
+        var leaks = new List<string>();
+
+        if (configuration.GetConnectionString("Default")?.Contains("Password=myPassword") == true)
+        {
+            leaks.Add("ConnectionStrings:Default uses the template database password");
+        }
+
+        if (configuration["AuthServer:CertificatePassPhrase"] == "3f027835-7c52-4bf7-bc1f-77582ca37aef")
+        {
+            leaks.Add("AuthServer:CertificatePassPhrase is the template default");
+        }
+
+        if (configuration["StringEncryption:DefaultPassPhrase"] == "5pGzpfXjidNXJVDa")
+        {
+            leaks.Add("StringEncryption:DefaultPassPhrase is the template default");
+        }
+
+        if (leaks.Any())
+        {
+            throw new AbpInitializationException(
+                "Refusing to start in Production with template dev secrets. Fix: " + string.Join("; ", leaks) +
+                ". Override them via environment variables or a secret store.");
+        }
+    }
+
+    /// <summary>Brute-force / abuse protection for the anonymous entry points
+    /// (token endpoint and workspace self-registration), keyed by client IP.</summary>
+    private void ConfigureRateLimiting(ServiceConfigurationContext context)
+    {
+        context.Services.AddRateLimiter(options =>
+        {
+            options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+            options.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(httpContext =>
+            {
+                var path = httpContext.Request.Path;
+                var isSensitive =
+                    path.StartsWithSegments("/connect/token") ||
+                    (path.StartsWithSegments("/api/app/workspace/register") &&
+                     httpContext.Request.Method == HttpMethods.Post);
+
+                if (!isSensitive)
+                {
+                    return RateLimitPartition.GetNoLimiter("unlimited");
+                }
+
+                var clientIp = httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+                return RateLimitPartition.GetFixedWindowLimiter($"auth:{clientIp}", _ => new FixedWindowRateLimiterOptions
+                {
+                    Window = TimeSpan.FromMinutes(1),
+                    PermitLimit = 10,
+                    QueueLimit = 0
                 });
             });
         });
@@ -290,6 +369,7 @@ public class TrackerHttpApiHostModule : AbpModule
         }
 
         app.UseRouting();
+        app.UseRateLimiter();
         app.MapAbpStaticAssets();
         app.UseAbpStudioLink();
         app.UseAbpSecurityHeaders();
@@ -317,5 +397,14 @@ public class TrackerHttpApiHostModule : AbpModule
         app.UseAuditing();
         app.UseAbpSerilogEnrichers();
         app.UseConfiguredEndpoints();
+    }
+
+    public override async Task OnApplicationInitializationAsync(ApplicationInitializationContext context)
+    {
+        // Runs the synchronous OnApplicationInitialization (middleware pipeline) first.
+        await base.OnApplicationInitializationAsync(context);
+
+        await context.AddBackgroundWorkerAsync<TrialExpiryWorker>();
+        await context.AddBackgroundWorkerAsync<InvoiceGenerationWorker>();
     }
 }

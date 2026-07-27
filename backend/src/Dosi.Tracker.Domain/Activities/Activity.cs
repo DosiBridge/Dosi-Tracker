@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using Volo.Abp;
 using Volo.Abp.Domain.Entities.Auditing;
 using Volo.Abp.MultiTenancy;
 
@@ -18,12 +20,12 @@ public class Activity : CreationAuditedAggregateRoot<Guid>, IMultiTenant
     public int MouseClicks { get; set; }
     public int KeyboardHits { get; set; }
 
-    public string Description { get; set; }
-    public string ActiveWindowsJson { get; set; } // JSON array of active windows
-    public string RunningProgramsJson { get; set; } // JSON array of running apps
+    public string? Description { get; set; } // Optional: agents typically send no description
+    public string ActiveWindowsJson { get; set; } = "[]"; // JSON array of active windows
+    public string RunningProgramsJson { get; set; } = "[]"; // JSON array of running apps
 
-    // Navigation property
-    public Screenshot Screenshot { get; set; }
+    // Navigation property: screen + webcam captures taken during this block
+    public ICollection<Screenshot> Screenshots { get; set; } = new List<Screenshot>();
 
     protected Activity()
     {
@@ -39,6 +41,19 @@ public class Activity : CreationAuditedAggregateRoot<Guid>, IMultiTenant
         DateTime endedAt) 
         : base(id)
     {
+        if (clientActivityId == Guid.Empty)
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.ActivityClientIdRequired)
+                .WithData("clientActivityId", clientActivityId);
+        }
+
+        if (endedAt <= startedAt)
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.ActivityTimeRangeInvalid)
+                .WithData("startedAt", startedAt)
+                .WithData("endedAt", endedAt);
+        }
+
         TenantId = tenantId;
         UserId = userId;
         ProjectId = projectId;

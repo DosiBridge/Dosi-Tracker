@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Bar, BarChart, Cell, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { AppWindow, Clock, TrendingUp, TrendingDown } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -29,9 +29,46 @@ const APP_PALETTE: { app: string; category: AppCategory; color: string }[] = [
   { app: "X", category: "unproductive", color: "#fb7185" },
 ];
 import { exportRecords } from "@/lib/export";
-import { formatDuration } from "@/lib/utils";
+import { formatDuration, colorFromString } from "@/lib/utils";
+import { getApi } from "@/hooks/useApi";
 import { useIsMdUp } from "@/hooks/use-media-query";
 import type { ResolvedRange } from "./date-range-picker";
+
+/* ---- Live (API) shape: /api/app/reporting/app-usage ---- */
+interface LiveAppUsage {
+  appName: string;
+  trackedMinutes: number;
+  activityCount: number;
+  userCount: number;
+}
+
+/** Live queries pivot on the real clock; mirrors rangeForKey's per-preset logic. */
+function liveRangeFor(key: RangeKey): { from: Date; to: Date } {
+  const to = new Date();
+  const from = new Date();
+  switch (key) {
+    case "today":
+      from.setHours(0, 0, 0, 0);
+      break;
+    case "yesterday":
+      from.setDate(from.getDate() - 1);
+      from.setHours(0, 0, 0, 0);
+      to.setDate(to.getDate() - 1);
+      to.setHours(23, 59, 59, 999);
+      break;
+    case "30d":
+      from.setDate(from.getDate() - 30);
+      break;
+    case "month":
+      from.setDate(1);
+      from.setHours(0, 0, 0, 0);
+      break;
+    default: // "7d" and "custom" fall back to the last 7 days
+      from.setDate(from.getDate() - 7);
+      break;
+  }
+  return { from, to };
+}
 
 const tooltipStyle = {
   borderRadius: 12,
@@ -53,7 +90,33 @@ export function AppsReport() {
   const [range, setRange] = useState<ResolvedRange>(() => ({ key: "7d", ...rangeForKey("7d") }));
   const [category, setCategory] = useState<AppCategory | "all">("all");
 
-  const allApps = useMemo<AppUsage[]>(() => {
+  const [liveUsage, setLiveUsage] = useState<LiveAppUsage[] | null>(null);
+  const [liveLoading, setLiveLoading] = useState(false);
+  const [liveError, setLiveError] = useState(false);
+
+  const loadLive = useCallback(async () => {
+    setLiveLoading(true);
+    setLiveError(false);
+    try {
+      const { from, to } = liveRangeFor(range.key);
+      const qs = new URLSearchParams({ From: from.toISOString(), To: to.toISOString() });
+      const usage = await getApi(`/api/app/reporting/app-usage?${qs.toString()}`);
+      setLiveUsage(Array.isArray(usage) ? (usage as LiveAppUsage[]) : []);
+    } catch {
+      setLiveUsage(null); // fall back to the demo dataset below
+      setLiveError(true);
+    } finally {
+      setLiveLoading(false);
+    }
+  }, [range]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !localStorage.getItem("dosi-token")) return;
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- data fetch defers its own setState; see docs/QUALITY.md §10
+    loadLive();
+  }, [loadLive]);
+
+  const mockAllApps = useMemo<AppUsage[]>(() => {
     const acts = filterActivitiesByRange(activities, range.from, range.to);
     const appMinutes = new Map<string, { app: string; category: AppCategory; minutes: number; color: string; users: Set<string> }>();
     const appMetaMap = new Map(APP_PALETTE.map((a) => [a.app, { category: a.category, color: a.color }]));
@@ -85,6 +148,27 @@ export function AppsReport() {
         activeUsers: x.users.size,
       }));
   }, [range]);
+
+  const liveAllApps = useMemo<AppUsage[] | null>(() => {
+    if (!liveUsage) return null;
+    const meta = new Map(APP_PALETTE.map((a) => [a.app, { category: a.category, color: a.color }]));
+    // The backend tracks usage, not classification, and reports process names (code.exe). Category is
+    // a client heuristic: known apps keep their palette tone, everything else reads as neutral.
+    return liveUsage.map((u) => {
+      const m = meta.get(u.appName);
+      return {
+        app: u.appName,
+        category: m?.category ?? ("neutral" as AppCategory),
+        minutes: u.trackedMinutes,
+        color: m?.color ?? colorFromString(u.appName),
+        activeUsers: u.userCount,
+      };
+    });
+  }, [liveUsage]);
+
+  const allApps = liveAllApps ?? mockAllApps;
+  const showLiveLoading = liveLoading && liveAllApps === null;
+  const showLiveError = liveError && liveAllApps === null;
 
   const rows = useMemo<AppUsage[]>(() => {
     return allApps
@@ -153,6 +237,17 @@ export function AppsReport() {
           </Select>
         }
       />
+
+      {showLiveLoading && (
+        <div className="rounded-lg border border-border bg-muted px-3 py-2 text-xs text-muted-foreground">
+          Loading live report data…
+        </div>
+      )}
+      {showLiveError && (
+        <div className="rounded-lg border border-border bg-muted px-3 py-2 text-xs text-muted-foreground">
+          Live data unavailable right now — showing demo data.
+        </div>
+      )}
 
       <KpiGrid>
         <Kpi label="Total app time" value={formatDuration(total)} icon={Clock} tone="#6d5efc" sub={range.label} />

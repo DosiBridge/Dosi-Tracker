@@ -1,0 +1,25 @@
+{
+  "$schema": "./node_modules/@stryker-mutator/core/schema/stryker-schema.json",
+  "_comment": "Mutation testing for the web logic layer (docs/QUALITY.md §4). Scoped to the same src/lib business logic + middleware the unit tests cover; UI/pages/static data are out of scope until they have tests. 'break' is the ratcheting floor — raise it as the score improves, never lower.",
+  "testRunner": "vitest",
+  "vitest": {
+    "configFile": "vitest.config.ts"
+  },
+  "coverageAnalysis": "perTest",
+  "mutate": [
+    "src/lib/**/*.ts",
+    "src/middleware.ts",
+    "!src/lib/**/*-data.ts",
+    "!src/lib/types.ts",
+    "!src/**/*.test.ts",
+    "!src/**/*.spec.ts"
+  ],
+  "reporters": ["progress", "clear-text", "html", "json"],
+  "htmlReporter": { "fileName": "reports/mutation/mutation.html" },
+  "jsonReporter": { "fileName": "reports/mutation/mutation.json" },
+  "thresholds": {
+    "high": 90,
+    "low": 80,
+    "break": 78
+  }
+}

@@ -16,6 +16,7 @@
     <Folder Name="/test/">
         <Project Path="test/Dosi.Tracker.Application.Tests/Dosi.Tracker.Application.Tests.csproj" />
         <Project Path="test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj" />
+        <Project Path="test/Dosi.Tracker.Acceptance.Tests/Dosi.Tracker.Acceptance.Tests.csproj" />
         <Project Path="test/Dosi.Tracker.TestBase/Dosi.Tracker.TestBase.csproj" />
         <Project Path="test/Dosi.Tracker.Domain.Tests/Dosi.Tracker.Domain.Tests.csproj" />
         <Project Path="test/Dosi.Tracker.HttpApi.Client.ConsoleTestApp/Dosi.Tracker.HttpApi.Client.ConsoleTestApp.csproj" />

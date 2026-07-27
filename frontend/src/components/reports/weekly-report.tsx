@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { CalendarDays, Clock, Gauge, Users } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Avatar } from "@/components/ui/avatar";
@@ -9,12 +9,13 @@ import { Ring } from "@/components/ui/ring";
 import { DataTable, type Column } from "@/components/ui/data-table";
 import { ActivityTrendChart } from "@/components/dashboard/charts";
 import { ReportShell, FilterBar, ExportMenu, Kpi, KpiGrid } from "./report-shell";
-import { activities, productivitySplit, projects, userById, users } from "@/lib/tenant-data";
+import { activities, projects, userById, users } from "@/lib/tenant-data";
 import { trackedMembers } from "@/lib/roles";
 import { cn } from "@/lib/utils";
 import { filterActivitiesByRange, rangeForKey, type RangeKey } from "@/lib/reports-data";
 import { exportRecords } from "@/lib/export";
 import { formatDuration } from "@/lib/utils";
+import { getApi } from "@/hooks/useApi";
 import type { ResolvedRange } from "./date-range-picker";
 
 interface Row {
@@ -23,14 +24,107 @@ interface Row {
   tracked: number;
   activity: number;
   productive: number;
-  daysActive: number;
+  /** null in live mode: the summary API does not yet carry per-user active-day counts. */
+  daysActive: number | null;
   topProject: string;
+}
+
+/* ---- Live (API) shapes: /api/app/reporting/* + /api/identity/users ---- */
+
+interface LivePerUser {
+  userId: string;
+  activityCount: number;
+  trackedMinutes: number;
+  averageProductivity: number;
+}
+
+interface LiveSummary {
+  totalTrackedMinutes: number;
+  averageProductivity: number;
+  perUser: LivePerUser[];
+}
+
+interface LiveDailyPoint {
+  date: string;
+  trackedMinutes: number;
+  averageProductivity: number;
+}
+
+interface LiveIdentityUser {
+  id: string;
+  userName: string;
+  name?: string | null;
+  surname?: string | null;
+}
+
+/** Live queries pivot on the real clock; mirrors rangeForKey's per-preset logic. */
+function liveRangeFor(key: RangeKey): { from: Date; to: Date } {
+  const to = new Date();
+  const from = new Date();
+  switch (key) {
+    case "today":
+      from.setHours(0, 0, 0, 0);
+      break;
+    case "yesterday":
+      from.setDate(from.getDate() - 1);
+      from.setHours(0, 0, 0, 0);
+      to.setDate(to.getDate() - 1);
+      to.setHours(23, 59, 59, 999);
+      break;
+    case "30d":
+      from.setDate(from.getDate() - 30);
+      break;
+    case "month":
+      from.setDate(1);
+      from.setHours(0, 0, 0, 0);
+      break;
+    default: // "7d" and "custom" fall back to the last 7 days
+      from.setDate(from.getDate() - 7);
+      break;
+  }
+  return { from, to };
 }
 
 export function WeeklyReport() {
   const [rangeKey, setRangeKey] = useState<RangeKey>("7d");
   const [range, setRange] = useState<ResolvedRange>(() => ({ key: "7d", ...rangeForKey("7d") }));
   const [viewMode, setViewMode] = useState<"table" | "grid">("table");
+
+  const [liveSummary, setLiveSummary] = useState<LiveSummary | null>(null);
+  const [liveSeries, setLiveSeries] = useState<LiveDailyPoint[] | null>(null);
+  const [liveUsers, setLiveUsers] = useState<LiveIdentityUser[]>([]);
+  const [liveLoading, setLiveLoading] = useState(false);
+  const [liveError, setLiveError] = useState(false);
+
+  const loadLive = useCallback(async () => {
+    setLiveLoading(true);
+    setLiveError(false);
+    try {
+      const { from, to } = liveRangeFor(range.key);
+      const qs = new URLSearchParams({ From: from.toISOString(), To: to.toISOString() });
+      const [summary, series] = await Promise.all([
+        getApi(`/api/app/reporting/summary?${qs.toString()}`),
+        getApi(`/api/app/reporting/daily-series?${qs.toString()}`),
+      ]);
+      setLiveSummary(summary && typeof summary === "object" ? (summary as LiveSummary) : null);
+      setLiveSeries(Array.isArray(series) ? (series as LiveDailyPoint[]) : []);
+      // Best effort: admins resolve member names; workers get a 403 -> keep ids.
+      const identityUsers = await getApi("/api/identity/users?MaxResultCount=100").catch(() => []);
+      setLiveUsers(Array.isArray(identityUsers) ? (identityUsers as LiveIdentityUser[]) : []);
+    } catch {
+      setLiveSummary(null); // fall back to the demo dataset below
+      setLiveSeries(null);
+      setLiveError(true);
+    } finally {
+      setLiveLoading(false);
+    }
+  }, [range]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !localStorage.getItem("dosi-token")) return;
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- data fetch defers its own setState; see docs/QUALITY.md §10
+    loadLive();
+  }, [loadLive]);
 
   const members = trackedMembers(users);
 
@@ -61,7 +155,7 @@ export function WeeklyReport() {
     return Object.values(days);
   }, [acts, range]);
 
-  const rows = useMemo<Row[]>(() => {
+  const mockRows = useMemo<Row[]>(() => {
     return members.map((u) => {
       const ua = acts.filter((a) => a.userId === u.id);
       const tracked = ua.reduce((s, a) => {
@@ -106,9 +200,44 @@ export function WeeklyReport() {
     });
   }, [members, acts]);
 
+  const liveTrend = useMemo(() => {
+    if (!liveSeries) return null;
+    return liveSeries.map((d) => ({
+      day: new Date(d.date).toLocaleDateString("en", { weekday: "short", timeZone: "UTC" }),
+      tracked: Math.round(d.trackedMinutes),
+      productive: Math.round((d.trackedMinutes * d.averageProductivity) / 100),
+    }));
+  }, [liveSeries]);
+
+  const liveRows = useMemo<Row[] | null>(() => {
+    if (!liveSummary) return null;
+    const perUserList = Array.isArray(liveSummary.perUser) ? liveSummary.perUser : [];
+    return perUserList.map((u) => {
+      const identity = liveUsers.find((x) => x.id === u.userId);
+      const identityName = identity ? `${identity.name ?? ""} ${identity.surname ?? ""}`.trim() : "";
+      const mockUser = userById(u.userId);
+      const tracked = Math.round(u.trackedMinutes);
+      const activity = Math.round(u.averageProductivity);
+      return {
+        userId: u.userId,
+        name: identityName || identity?.userName || mockUser?.name || u.userId.slice(0, 8),
+        tracked,
+        activity,
+        productive: Math.round((tracked * activity) / 100),
+        daysActive: null, // not carried by the summary API yet
+        topProject: "—",
+      };
+    });
+  }, [liveSummary, liveUsers]);
+
+  const rows = liveRows ?? mockRows;
+  const trend = liveTrend ?? dynamicTrend;
+  const showLiveLoading = liveLoading && liveRows === null;
+  const showLiveError = liveError && liveRows === null;
+
   const totalTracked = rows.reduce((s, r) => s + r.tracked, 0);
   const avgActivity = rows.length ? Math.round(rows.reduce((s, r) => s + r.activity, 0) / rows.length) : 0;
-  const bestDay = [...dynamicTrend].sort((a, b) => b.productive - a.productive)[0];
+  const bestDay = [...trend].sort((a, b) => b.productive - a.productive)[0];
 
   const columns: Column<Row>[] = [
     { key: "name", header: "Member", sortValue: (r) => r.name, render: (r) => (
@@ -120,7 +249,7 @@ export function WeeklyReport() {
     { key: "tracked", header: "Tracked", align: "right", sortValue: (r) => r.tracked, render: (r) => <span className="font-medium">{formatDuration(r.tracked)}</span> },
     { key: "productive", header: "Productive", align: "right", sortValue: (r) => r.productive, render: (r) => formatDuration(r.productive) },
     { key: "activity", header: "Activity", align: "right", sortValue: (r) => r.activity, render: (r) => <Badge tone={r.activity >= 75 ? "success" : r.activity >= 55 ? "warning" : "danger"}>{r.activity}%</Badge> },
-    { key: "daysActive", header: "Days", align: "right", sortValue: (r) => r.daysActive, render: (r) => `${r.daysActive}/5` },
+    { key: "daysActive", header: "Days", align: "right", sortValue: (r) => r.daysActive ?? -1, render: (r) => (r.daysActive == null ? "—" : `${r.daysActive}/5`) },
     { key: "topProject", header: "Top project", sortValue: (r) => r.topProject, render: (r) => <span className="text-muted-foreground">{r.topProject}</span> },
   ];
 
@@ -144,6 +273,17 @@ export function WeeklyReport() {
     >
       <FilterBar rangeKey={rangeKey} onRange={onRange} />
 
+      {showLiveLoading && (
+        <div className="rounded-lg border border-border bg-muted px-3 py-2 text-xs text-muted-foreground">
+          Loading live report data…
+        </div>
+      )}
+      {showLiveError && (
+        <div className="rounded-lg border border-border bg-muted px-3 py-2 text-xs text-muted-foreground">
+          Live data unavailable right now — showing demo data.
+        </div>
+      )}
+
       <KpiGrid>
         <Kpi label="Team hours" value={formatDuration(totalTracked)} icon={Clock} tone="#6d5efc" sub={range.label} />
         <Kpi label="Avg activity" value={`${avgActivity}%`} icon={Gauge} tone="#22c55e" />
@@ -154,7 +294,7 @@ export function WeeklyReport() {
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
         <Card className="lg:col-span-2">
           <CardHeader><CardTitle>Daily activity this week</CardTitle></CardHeader>
-          <CardContent><ActivityTrendChart data={dynamicTrend} /></CardContent>
+          <CardContent><ActivityTrendChart data={trend} /></CardContent>
         </Card>
         <Card>
           <CardHeader><CardTitle>Team focus</CardTitle></CardHeader>
@@ -214,7 +354,7 @@ export function WeeklyReport() {
                     </div>
                     <div className="mt-4 flex items-center justify-between text-xs text-muted-foreground border-t border-border/60 pt-3">
                       <span>Activity: <strong className="text-foreground">{r.activity}%</strong></span>
-                      <span>Days Active: <strong className="text-foreground">{r.daysActive}</strong></span>
+                      <span>Days Active: <strong className="text-foreground">{r.daysActive ?? "—"}</strong></span>
                     </div>
                     <div className="mt-2 text-xs text-muted-foreground">
                       Top Project: <Badge tone="muted" className="ml-1 font-semibold">{r.topProject}</Badge>

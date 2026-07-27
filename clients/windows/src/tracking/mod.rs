@@ -18,43 +18,51 @@ use crate::model::{Activity, WindowInfo};
 use input::InputCounter;
 
 /// Collects one activity snapshot for the given project time block.
+///
+/// Capture permissions are passed per snapshot because the effective set
+/// (server-side project settings ∧ local config) may only become known after
+/// the first successful sync with the backend.
 pub struct Tracker {
     input: Arc<InputCounter>,
-    perms: CapturePermissions,
 }
 
 impl Tracker {
-    pub fn new(perms: CapturePermissions) -> Self {
+    pub fn new() -> Self {
         let input = Arc::new(InputCounter::new());
         // Start the global input listener once; it runs on its own thread and
         // is fully event-driven, so it costs ~0% CPU while idle.
         input::spawn_listener(input.clone());
-        Self { input, perms }
+        Self { input }
     }
 
     /// Build an activity for the elapsed interval, then reset counters.
-    pub fn snapshot(&self, project_id: &str, started_at: chrono::DateTime<Utc>) -> Activity {
+    pub fn snapshot(
+        &self,
+        perms: &CapturePermissions,
+        project_id: &str,
+        started_at: chrono::DateTime<Utc>,
+    ) -> Activity {
         let (keyboard_hits, mouse_clicks) = self.input.take();
 
-        let active_windows: Vec<WindowInfo> = if self.perms.active_window {
+        let active_windows: Vec<WindowInfo> = if perms.active_window {
             active_window::current().into_iter().collect()
         } else {
             Vec::new()
         };
 
-        let running_programs: Vec<WindowInfo> = if self.perms.running_programs {
+        let running_programs: Vec<WindowInfo> = if perms.running_programs {
             active_window::running_programs().unwrap_or_default()
         } else {
             Vec::new()
         };
 
-        let screenshot_png_base64 = if self.perms.screenshot {
+        let screenshot_png_base64 = if perms.screenshot {
             screenshot::capture_primary_png_base64().ok()
         } else {
             None
         };
 
-        let webcam_jpg_base64 = if self.perms.webcam {
+        let webcam_jpg_base64 = if perms.webcam {
             webcam::capture_jpg_base64().ok()
         } else {
             None
@@ -66,8 +74,8 @@ impl Tracker {
             started_at,
             ended_at: Utc::now(),
             description: None,
-            mouse_clicks: if self.perms.mouse { mouse_clicks } else { 0 },
-            keyboard_hits: if self.perms.keyboard { keyboard_hits } else { 0 },
+            mouse_clicks: if perms.mouse { mouse_clicks } else { 0 },
+            keyboard_hits: if perms.keyboard { keyboard_hits } else { 0 },
             active_windows,
             running_programs,
             screenshot_png_base64,

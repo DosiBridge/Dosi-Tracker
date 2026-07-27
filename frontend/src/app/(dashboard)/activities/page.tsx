@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useEffect, useMemo, useState } from "react";
+import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
   MousePointerClick,
@@ -22,8 +22,8 @@ import { PageHeader, PageStack } from "@/components/ui/page-header";
 import { SegmentedControl } from "@/components/ui/toolbar";
 import { ActivityFilterBar } from "@/components/activities/activity-filter-bar";
 import { useSession } from "@/components/session-provider";
-import { NOW, projectById, userById } from "@/lib/tenant-data";
-import { useApi } from "@/hooks/useApi";
+import { projectById, userById } from "@/lib/tenant-data";
+import { getApi, getAuthedBlobUrl, useApi } from "@/hooks/useApi";
 import { applyActivityFilters, defaultActivityFilters, type ActivityFilters } from "@/lib/activity-filters";
 import { scopeActivities } from "@/lib/scope";
 import type { Activity } from "@/lib/types";
@@ -31,17 +31,75 @@ import { cn, formatCompact } from "@/lib/utils";
 
 type ViewMode = "sessions" | "screens";
 
+/** Real backend rows have GUID ids; mock demo rows use short slugs. */
+const GUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+const isGuidId = (id: string) => GUID_RE.test(id);
+
+interface LiveProjectInfo {
+  id: string;
+  title: string;
+  color?: string | null;
+}
+
+interface ProjectLabel {
+  title: string;
+  color: string;
+}
+
+interface CaptureView {
+  id: string;
+  kind: "screen" | "webcam";
+  url: string;
+}
+
 function timeRange(a: Activity) {
   const fmt = (iso: string) =>
     new Date(iso).toLocaleTimeString("en", { hour: "2-digit", minute: "2-digit" });
   return `${fmt(a.startedAt)} – ${fmt(a.endedAt)}`;
 }
 function agoLabel(iso: string) {
-  const mins = Math.round((NOW.getTime() - new Date(iso).getTime()) / 60000);
+  const mins = Math.round((Date.now() - new Date(iso).getTime()) / 60000);
+  if (mins < 1) return "just now";
   if (mins < 60) return `${mins}m ago`;
   const h = Math.floor(mins / 60);
   if (h < 24) return `${h}h ago`;
   return `${Math.floor(h / 24)}d ago`;
+}
+
+/**
+ * Rewrite a NOW-relative date preset into explicit UTC bounds on the REAL clock.
+ * The shared range presets pivot on the frozen demo NOW (2026-07-14); live activity
+ * carries real timestamps, so applying the frozen window would filter everything out.
+ * Custom ranges (user-typed dates) are passed through untouched.
+ */
+function liveEffectiveFilters(filters: ActivityFilters): ActivityFilters {
+  if (filters.rangeKey === "custom") return filters;
+
+  const to = new Date();
+  const from = new Date();
+  switch (filters.rangeKey) {
+    case "today":
+      from.setUTCHours(0, 0, 0, 0);
+      break;
+    case "yesterday":
+      from.setUTCDate(from.getUTCDate() - 1);
+      from.setUTCHours(0, 0, 0, 0);
+      to.setUTCDate(to.getUTCDate() - 1);
+      break;
+    case "30d":
+      from.setUTCDate(from.getUTCDate() - 30);
+      break;
+    case "month":
+      from.setUTCDate(1);
+      from.setUTCHours(0, 0, 0, 0);
+      break;
+    case "7d":
+    default:
+      from.setUTCDate(from.getUTCDate() - 7);
+      break;
+  }
+  const iso = (d: Date) => d.toISOString().slice(0, 10);
+  return { ...filters, rangeKey: "custom", customFrom: iso(from), customTo: iso(to) };
 }
 
 export default function ActivitiesPage() {
@@ -60,11 +118,37 @@ function ActivitiesPageInner() {
   const [selected, setSelected] = useState<Activity | null>(null);
   const [view, setView] = useState<ViewMode>(searchParams.get("view") === "screens" ? "screens" : "sessions");
 
-  const { data: apiActivities, isLoading } = useApi<any[]>('/api/app/activity');
+  const { data: apiActivities, isLoading } = useApi<any[]>('/api/app/activity?MaxResultCount=200');
+  const [liveProjects, setLiveProjects] = useState<LiveProjectInfo[]>([]);
 
   useEffect(() => {
     setView(searchParams.get("view") === "screens" ? "screens" : "sessions");
   }, [searchParams]);
+
+  // LIVE MODE: resolve project names/colors from the real API; demo mode keeps the mock lookup.
+  useEffect(() => {
+    if (typeof window !== "undefined" && localStorage.getItem("dosi-token")) {
+      getApi("/api/app/project")
+        .then((list) => setLiveProjects(Array.isArray(list) ? list : []))
+        .catch(() => setLiveProjects([]));
+    }
+  }, []);
+
+  const liveProjectById = useMemo(() => {
+    const map = new Map<string, LiveProjectInfo>();
+    for (const p of liveProjects) map.set(p.id, p);
+    return map;
+  }, [liveProjects]);
+
+  const resolveProject = useCallback(
+    (projectId: string): ProjectLabel | undefined => {
+      const live = liveProjectById.get(projectId);
+      if (live) return { title: live.title, color: live.color || "#006bff" };
+      const mock = projectById(projectId);
+      return mock ? { title: mock.title, color: mock.color } : undefined;
+    },
+    [liveProjectById],
+  );
 
   const backendActivities: Activity[] = useMemo(() => {
     if (!apiActivities) return [];
@@ -92,7 +176,11 @@ function ActivitiesPageInner() {
   }
 
   const base = useMemo(() => scopeActivities(user, backendActivities), [user, backendActivities]);
-  const filtered = useMemo(() => applyActivityFilters(base, filters), [base, filters]);
+  // Live activity is timestamped on the real clock, but the shared date presets pivot on the
+  // frozen demo NOW (2026-07-14). Convert the selected preset to explicit real-clock bounds so
+  // real rows are not silently filtered out.
+  const effectiveFilters = useMemo(() => liveEffectiveFilters(filters), [filters]);
+  const filtered = useMemo(() => applyActivityFilters(base, effectiveFilters), [base, effectiveFilters]);
   const updatedAt = backendActivities[0]?.endedAt;
 
   return (
@@ -147,7 +235,7 @@ function ActivitiesPageInner() {
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
           {filtered.map((a) => {
             const u = userById(a.userId);
-            const p = projectById(a.projectId);
+            const p = resolveProject(a.projectId);
             return (
               <Card
                 key={a.id}
@@ -198,7 +286,7 @@ function ActivitiesPageInner() {
         <div className="grid grid-cols-2 gap-4 md:grid-cols-3 lg:grid-cols-4">
           {filtered.map((a) => {
             const u = userById(a.userId);
-            const p = projectById(a.projectId);
+            const p = resolveProject(a.projectId);
             return (
               <button
                 key={a.id}
@@ -221,15 +309,77 @@ function ActivitiesPageInner() {
         </div>
       )}
 
-      <ActivityDrawer activity={selected} onClose={() => setSelected(null)} />
+      <ActivityDrawer
+        activity={selected}
+        project={selected ? resolveProject(selected.projectId) ?? null : null}
+        onClose={() => setSelected(null)}
+      />
     </PageStack>
   );
 }
 
-function ActivityDrawer({ activity, onClose }: { activity: Activity | null; onClose: () => void }) {
+function ActivityDrawer({
+  activity,
+  project,
+  onClose,
+}: {
+  activity: Activity | null;
+  project: ProjectLabel | null;
+  onClose: () => void;
+}) {
   const a = activity;
   const u = a ? userById(a.userId) : null;
-  const p = a ? projectById(a.projectId) : null;
+  const p = project;
+
+  // LIVE MODE: real (GUID) activities load their actual captures from the backend.
+  const activityId = a?.id ?? null;
+  const live = !!activityId && isGuidId(activityId);
+  const [captures, setCaptures] = useState<CaptureView[]>([]);
+  const [capturesLoading, setCapturesLoading] = useState(false);
+  const [capturesError, setCapturesError] = useState(false);
+
+  useEffect(() => {
+    setCaptures([]);
+    setCapturesError(false);
+    setCapturesLoading(false);
+    if (!activityId || !isGuidId(activityId)) return;
+    if (typeof window === "undefined" || !localStorage.getItem("dosi-token")) return;
+
+    let cancelled = false;
+    const urls: string[] = [];
+    setCapturesLoading(true);
+
+    (async () => {
+      try {
+        const metas = await getApi(`/api/app/activity/screenshots?activityId=${activityId}`);
+        const list: Array<{ id: string; kind?: string }> = Array.isArray(metas) ? metas : [];
+        const loaded: CaptureView[] = [];
+        for (const meta of list) {
+          const url = await getAuthedBlobUrl(`/api/app/activity/screenshot/${meta.id}/content`);
+          if (cancelled) {
+            URL.revokeObjectURL(url);
+            return;
+          }
+          urls.push(url);
+          loaded.push({ id: meta.id, kind: meta.kind === "webcam" ? "webcam" : "screen", url });
+        }
+        if (!cancelled) setCaptures(loaded);
+      } catch {
+        if (!cancelled) setCapturesError(true);
+      } finally {
+        if (!cancelled) setCapturesLoading(false);
+      }
+    })();
+
+    // Revoke object URLs when the drawer closes, switches activity, or unmounts.
+    return () => {
+      cancelled = true;
+      urls.forEach((url) => URL.revokeObjectURL(url));
+    };
+  }, [activityId]);
+
+  const screenCaptures = captures.filter((c) => c.kind === "screen");
+  const webcamCaptures = captures.filter((c) => c.kind === "webcam");
 
   return (
     <Drawer open={!!a} onClose={onClose} title="Activity detail">
@@ -249,9 +399,37 @@ function ActivityDrawer({ activity, onClose }: { activity: Activity | null; onCl
           <div>
             <div className="mb-2 flex items-center gap-2 text-sm font-medium">
               <Camera className="h-4 w-4 text-muted-foreground" /> Screen capture
-              <Badge tone="muted">Mock preview</Badge>
+              {!live && <Badge tone="muted">Mock preview</Badge>}
             </div>
-            <ScreenMockView screen={a.screen} title={a.activeWindows[0]?.windowTitle} className="aspect-video w-full" />
+            {live ? (
+              capturesLoading ? (
+                <div className="flex aspect-video w-full items-center justify-center rounded-xl border border-border bg-muted/40 text-sm text-muted-foreground">
+                  Loading captures…
+                </div>
+              ) : capturesError ? (
+                <div className="flex aspect-video w-full items-center justify-center rounded-xl border border-border bg-muted/40 text-sm text-muted-foreground">
+                  Couldn&apos;t load captures.
+                </div>
+              ) : screenCaptures.length > 0 ? (
+                <div className="space-y-2">
+                  {screenCaptures.map((c) => (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img
+                      key={c.id}
+                      src={c.url}
+                      alt="Screen capture"
+                      className="aspect-video w-full rounded-xl border border-border object-cover"
+                    />
+                  ))}
+                </div>
+              ) : (
+                <div className="flex aspect-video w-full items-center justify-center rounded-xl border border-border bg-muted/40 text-sm text-muted-foreground">
+                  No screenshot captured
+                </div>
+              )
+            ) : (
+              <ScreenMockView screen={a.screen} title={a.activeWindows[0]?.windowTitle} className="aspect-video w-full" />
+            )}
           </div>
 
           <div className="grid grid-cols-2 gap-3">
@@ -271,18 +449,39 @@ function ActivityDrawer({ activity, onClose }: { activity: Activity | null; onCl
             </div>
           </div>
 
-          {a.hasWebcam && (
-            <div>
-              <div className="mb-2 flex items-center gap-2 text-sm font-medium">
-                <Video className="h-4 w-4 text-muted-foreground" /> Webcam (opt-in)
+          {live ? (
+            webcamCaptures.length > 0 && (
+              <div>
+                <div className="mb-2 flex items-center gap-2 text-sm font-medium">
+                  <Video className="h-4 w-4 text-muted-foreground" /> Webcam (opt-in)
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {webcamCaptures.map((c) => (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img
+                      key={c.id}
+                      src={c.url}
+                      alt="Webcam frame"
+                      className="aspect-video w-40 rounded-lg border border-border object-cover"
+                    />
+                  ))}
+                </div>
               </div>
-              <div
-                className="flex aspect-video w-40 items-center justify-center rounded-lg text-white/70"
-                style={{ background: `radial-gradient(circle at 50% 35%, ${a.screen.accent}, #0f1320)` }}
-              >
-                <Video className="h-8 w-8" />
+            )
+          ) : (
+            a.hasWebcam && (
+              <div>
+                <div className="mb-2 flex items-center gap-2 text-sm font-medium">
+                  <Video className="h-4 w-4 text-muted-foreground" /> Webcam (opt-in)
+                </div>
+                <div
+                  className="flex aspect-video w-40 items-center justify-center rounded-lg text-white/70"
+                  style={{ background: `radial-gradient(circle at 50% 35%, ${a.screen.accent}, #0f1320)` }}
+                >
+                  <Video className="h-8 w-8" />
+                </div>
               </div>
-            </div>
+            )
           )}
 
           <div>

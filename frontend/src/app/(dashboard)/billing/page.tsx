@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import {
   Check,
   Crown,
@@ -32,9 +33,56 @@ import {
   usagePct,
   workspaceUsage,
   type Invoice,
+  type PlanId,
+  type SubscriptionStatus,
 } from "@/lib/saas-data";
+import { getApi } from "@/hooks/useApi";
 import { exportRecords } from "@/lib/export";
 import { cn } from "@/lib/utils";
+
+/** Live billing state pulled from the ABP backend, when a real session exists. */
+interface LiveBilling {
+  planId: PlanId;
+  planName: string;
+  status: SubscriptionStatus;
+  cycleDays: number;
+  invoices: Invoice[];
+}
+
+async function fetchLiveBilling(): Promise<LiveBilling | null> {
+  const [subscription, apiPlans, apiInvoices] = await Promise.all([
+    getApi("/api/app/workspace/current-subscription").catch(() => null),
+    getApi("/api/app/workspace/available-plans").catch(() => []),
+    getApi("/api/app/billing/invoices").catch(() => []),
+  ]);
+  if (!subscription?.planId) return null;
+
+  const planRow = (Array.isArray(apiPlans) ? apiPlans : []).find((p: any) => p.id === subscription.planId);
+  const planName: string = planRow?.name ?? "Free";
+  const planId = (planName.toLowerCase() as PlanId) ?? "free";
+
+  const status: SubscriptionStatus =
+    subscription.status === "trialing" ? "trialing" : subscription.status === "past_due" ? "past_due" : "active";
+  const cycleDays = subscription.trialEndsAt
+    ? Math.max(0, Math.ceil((new Date(subscription.trialEndsAt).getTime() - Date.now()) / 86400_000))
+    : 0;
+
+  const now = Date.now();
+  const invoices: Invoice[] = (Array.isArray(apiInvoices) ? apiInvoices : []).map((inv: any) => ({
+    id: inv.id,
+    date: (inv.creationTime ?? inv.dueDate ?? "").slice(0, 10),
+    amount: Number(inv.amount ?? 0),
+    status:
+      inv.status === "paid"
+        ? "paid"
+        : new Date(inv.dueDate).getTime() < now
+          ? "due"
+          : "upcoming",
+    plan: planName,
+  }));
+
+  return { planId, planName, status, cycleDays, invoices };
+}
 
 const usageIcon: Record<string, LucideIcon> = {
   Seats: Users,
@@ -45,10 +93,20 @@ const usageIcon: Record<string, LucideIcon> = {
 
 export default function BillingPage() {
   const { workspace } = useSession();
-  const plan = planById(workspace.planId);
+  const [live, setLive] = useState<LiveBilling | null>(null);
+
+  useEffect(() => {
+    if (typeof window !== "undefined" && localStorage.getItem("dosi-token")) {
+      fetchLiveBilling().then(setLive).catch(() => setLive(null));
+    }
+  }, []);
+
+  const plan = planById(live?.planId ?? workspace.planId);
+  const status: SubscriptionStatus = live?.status ?? workspace.status;
+  const cycleDays = live?.cycleDays ?? workspace.cycleDays;
   const usage = workspaceUsage(workspace);
   const cost = monthlyCost(workspace);
-  const invoices = invoicesFor(workspace);
+  const invoices = live?.invoices ?? invoicesFor(workspace);
   const planOrder = plans.map((p) => p.id);
   const currentIdx = planOrder.indexOf(plan.id);
 
@@ -98,11 +156,11 @@ export default function BillingPage() {
       />
 
       {/* Trial banner */}
-      {workspace.status === "trialing" && (
+      {status === "trialing" && (
         <Card className="flex flex-wrap items-center gap-3 border-warning/40 bg-warning/10 p-4">
           <AlertTriangle className="h-5 w-5 text-warning" />
           <div className="min-w-0 flex-1">
-            <div className="text-sm font-medium">Your {plan.name} trial ends in {workspace.cycleDays} days</div>
+            <div className="text-sm font-medium">Your {plan.name} trial ends in {cycleDays} days</div>
             <div className="text-xs text-muted-foreground">Add a payment method to keep monitoring without interruption.</div>
           </div>
           <Button size="sm" onClick={() => changePlan(plan.name, true)}>Add payment method</Button>
@@ -114,8 +172,8 @@ export default function BillingPage() {
         <Card className="lg:col-span-2">
           <CardHeader>
             <CardTitle>Current plan</CardTitle>
-            <Badge tone={workspace.status === "active" ? "success" : workspace.status === "trialing" ? "warning" : "danger"}>
-              {statusLabel[workspace.status]}
+            <Badge tone={status === "active" ? "success" : status === "trialing" ? "warning" : "danger"}>
+              {statusLabel[status]}
             </Badge>
           </CardHeader>
           <CardContent>
@@ -136,7 +194,7 @@ export default function BillingPage() {
                 </div>
                 <div className="text-xs text-muted-foreground">
                   {plan.pricePerUser !== null ? `$${plan.pricePerUser}/user · ${liveSeatsUsed(workspace)} seats` : "Contact sales"}
-                  {workspace.status === "active" && workspace.cycleDays > 0 && ` · renews in ${workspace.cycleDays}d`}
+                  {status === "active" && cycleDays > 0 && ` · renews in ${cycleDays}d`}
                 </div>
               </div>
             </div>

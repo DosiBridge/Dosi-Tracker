@@ -1,34 +1,125 @@
-# ---- OS ----
+# ==========================================
+# Operating System Files
+# ==========================================
 .DS_Store
-Thumbs.db
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+ehthumbs_vista.db
+[Tt]humbs.db
+[Dd]esktop.ini
 
-# ---- Backend (.NET / ABP) ----
+# ==========================================
+# Backend (.NET / Visual Studio / Rider / ABP)
+# ==========================================
+# Build results
 [Bb]in/
 [Oo]bj/
 [Dd]ebug/
+[Dd]ebugPublic/
 [Rr]elease/
-*.user
-.vs/
-appsettings.secrets.json
-backend/**/wwwroot/libs/
+[Rr]eleases/
+x64/
+x86/
+bld/
+[Ll]og/
+*.log
 
-# ---- Frontend (Next.js) ----
+# Visual Studio / Rider
+.vs/
+.idea/
+*.user
+*.userosscache
+*.sln.docstates
+*.suo
+*.userprefs
+*.Rider.sln.iml
+_ReSharper*/
+*.[Rr]e[Ss]harper
+*.DotSettings.user
+
+# Misc .NET
+*.dbmdl
+*.dbproj.schemaview
+*.pfx
+*.publishsettings
+orleans.codegen.cs
+*.GhostDoc.xml
+*.sw?
+*.ntvs*
+*.njsproj
+
+# Test Results
+[Tt]est[Rr]esult*/
+[Bb]uild[Ll]og.*
+*.VisualState.xml
+TestResult.xml
+
+# ABP Studio
+**/.abpstudio/
+
+# Secrets & Configs
+appsettings.secrets.json
+**/appsettings.Development.json
+backend/**/wwwroot/libs/
+*.db
+*.db-journal
+
+# ==========================================
+# Frontend (Node.js / Next.js)
+# ==========================================
+# Dependencies
 frontend/node_modules/
+node_modules/
+.pnp
+.pnp.js
+.pnp.cjs
+.pnp.mjs
+
+# Next.js build output
 frontend/.next/
 frontend/out/
+build/
+dist/
+
+# Env files
 frontend/.env*.local
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
 
-# ---- Clients: Rust ----
+# Debug logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Misc Node
+coverage/
+.nyc_output/
+*.tsbuildinfo
+
+# ==========================================
+# Clients (Rust / Windows)
+# ==========================================
 clients/windows/target/
-clients/windows/Cargo.lock
+# Cargo.lock IS committed: the agent is a binary crate, so the lockfile pins exact
+# dependency versions for reproducible builds across machines and CI.
 clients/windows/config.toml
+**/*.rs.bk
 
-# ---- Clients: Swift ----
+# ==========================================
+# Clients (Swift / macOS)
+# ==========================================
 clients/macos/.build/
 clients/macos/.swiftpm/
 clients/macos/Package.resolved
 clients/macos/config.json
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
 
-# ---- Local data ----
-*.db
-*.db-journal
+# NSIS installer output
+clients/windows/installer/*.exe

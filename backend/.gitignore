@@ -281,3 +281,5 @@ src/Dosi.Tracker.Blazor.Server.Tiered/Logs/*
 # IdentityServer temp files
 tempkey.rsa
 tempkey.jwk
+# Stryker.NET mutation testing output
+StrykerOutput/

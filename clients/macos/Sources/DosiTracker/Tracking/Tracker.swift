@@ -3,17 +3,19 @@ import Foundation
 /// Collects one activity snapshot per interval. Input listening is event-driven
 /// (see InputMonitor); heavy captures run once per interval, then the agent
 /// sleeps — keeping idle CPU near zero.
+///
+/// Capture permissions are passed per snapshot because the effective set
+/// (server-side project settings ∧ local config) may only become known after
+/// the first successful sync with the backend.
 final class Tracker {
-    private let perms: CapturePermissions
     private let input = InputMonitor()
     private let webcam = WebcamCapturer()
 
-    init(perms: CapturePermissions) {
-        self.perms = perms
+    init() {
         input.start()
     }
 
-    func snapshot(projectId: String, startedAt: Date) async -> Activity {
+    func snapshot(perms: CapturePermissions, projectId: String, startedAt: Date) async -> Activity {
         let (keyboardHits, mouseClicks) = input.take()
 
         let activeWindows = perms.activeWindow
@@ -35,6 +37,7 @@ final class Tracker {
         }
 
         return Activity(
+            clientActivityId: UUID().uuidString.lowercased(),
             projectId: projectId,
             startedAt: startedAt,
             endedAt: Date(),

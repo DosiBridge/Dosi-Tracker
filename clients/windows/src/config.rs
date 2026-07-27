@@ -31,7 +31,7 @@ pub struct CapturePermissions {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            api_base_url: "https://localhost:44300".to_string(),
+            api_base_url: "https://localhost:44342".to_string(), // matches HttpApi.Host App:SelfUrl
             interval_minutes: 10,
             capture: CapturePermissions {
                 screenshot: true,

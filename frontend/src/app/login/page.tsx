@@ -2,28 +2,32 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { Radar, Eye, EyeOff, Loader2, ChevronRight, ArrowLeft, Building2, Server } from "lucide-react";
+import { Radar, Eye, EyeOff, Loader2, ArrowLeft, Building2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input, Select } from "@/components/ui/input";
-import { Avatar } from "@/components/ui/avatar";
-import { Badge } from "@/components/ui/badge";
 import { ThemeToggle } from "@/components/ui/theme-toggle";
 import { LoginHero } from "@/components/motion/login-hero";
-import { loginApi, registerApi } from "@/hooks/useApi";
-import type { Role } from "@/lib/types";
+import { loginApi, registerWorkspaceApi } from "@/hooks/useApi";
+import type { PlanId } from "@/lib/saas-data";
 
-const roleTone: Record<Role, "primary" | "success" | "info" | "warning"> = {
-  host: "primary",
-  owner: "primary",
-  admin: "warning",
-  worker: "success",
-  client: "info",
+// Backend plan names (seeded by PlanDataSeedContributor).
+const PLAN_NAME: Record<PlanId, string> = {
+  free: "Free",
+  starter: "Starter",
+  business: "Business",
+  enterprise: "Business",
 };
-
-// Demo mode removed.
 
 export default function LoginPage() {
   const router = useRouter();
+  const [mode, setMode] = useState<"signin" | "signup">("signin");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [workspace, setWorkspace] = useState("");
+  const [show, setShow] = useState(false);
+  const [loading, setLoading] = useState<string | null>(null);
+  const [wsName, setWsName] = useState("");
+  const [wsPlan, setWsPlan] = useState<PlanId>("free");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   async function onSubmit(e: React.FormEvent) {
@@ -31,11 +35,14 @@ export default function LoginPage() {
     setLoading("signin");
     setErrorMsg(null);
     try {
-      await loginApi(email, password);
-      // Wait a moment for token to settle, then redirect
-      setTimeout(() => router.push("/dashboard"), 500);
-    } catch (err: any) {
-      setErrorMsg("Invalid username or password");
+      const tenant = workspace.trim();
+      // Workspace (tenant) name scopes the login; leave empty for the host account.
+      await loginApi(email, password, tenant || undefined);
+      // A host sign-in (no tenant) lands on the platform console; tenant users on the dashboard.
+      const destination = tenant ? "/dashboard" : "/host";
+      setTimeout(() => router.push(destination), 500);
+    } catch {
+      setErrorMsg("Invalid username, password or workspace");
       setLoading(null);
     }
   }
@@ -46,12 +53,12 @@ export default function LoginPage() {
     setLoading("__signup__");
     setErrorMsg(null);
     try {
-      await registerApi(email, password, wsName);
-      // Automatically log them in after registration
-      await loginApi(email, password);
+      const result = await registerWorkspaceApi(wsName.trim(), email, password, PLAN_NAME[wsPlan]);
+      // Log straight into the freshly created tenant as its admin.
+      await loginApi(email, password, result.name);
       setTimeout(() => router.push("/dashboard"), 600);
-    } catch (err: any) {
-      setErrorMsg(err.message || "Registration failed");
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : "Registration failed");
       setLoading(null);
     }
   }
@@ -85,6 +92,7 @@ export default function LoginPage() {
                 Spin up a new, fully isolated tenant. You&apos;ll be the owner.
               </p>
 
+              <form onSubmit={onCreateWorkspace} className="mt-8 space-y-4">
                 <div className="space-y-1.5">
                   <label className="text-sm font-medium">Email</label>
                   <Input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="name@company.com" required autoFocus />
@@ -95,7 +103,7 @@ export default function LoginPage() {
                 </div>
                 <div className="space-y-1.5">
                   <label className="text-sm font-medium">Workspace name</label>
-                  <Input value={wsName} onChange={(e) => setWsName(e.target.value)} placeholder="Acme Corp" required autoFocus />
+                  <Input value={wsName} onChange={(e) => setWsName(e.target.value)} placeholder="Acme Corp" required />
                   {wsName && (
                     <p className="text-xs text-muted-foreground">
                       {wsName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "") || "workspace"}.dositracker.app
@@ -128,6 +136,14 @@ export default function LoginPage() {
               <p className="mt-1 text-sm text-muted-foreground">Sign in to your workspace to continue.</p>
 
               <form onSubmit={onSubmit} className="mt-8 space-y-4">
+                <div className="space-y-1.5">
+                  <label className="text-sm font-medium">Workspace</label>
+                  <Input
+                    value={workspace}
+                    onChange={(e) => setWorkspace(e.target.value)}
+                    placeholder="acme (leave empty for host sign-in)"
+                  />
+                </div>
                 <div className="space-y-1.5">
                   <label className="text-sm font-medium">Email</label>
                   <Input type="email" value={email} onChange={(e) => setEmail(e.target.value)} required />

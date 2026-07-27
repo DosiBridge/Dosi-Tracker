@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
   Plus,
@@ -29,6 +29,7 @@ import { SearchField, Toolbar } from "@/components/ui/toolbar";
 import { DataTable, type Column } from "@/components/ui/data-table";
 import { toast } from "@/components/toast";
 import { useSession } from "@/components/session-provider";
+import { delApi, getApi, postApi } from "@/hooks/useApi";
 import {
   ownerOf,
   planColor,
@@ -48,6 +49,34 @@ import {
 } from "@/lib/saas-data";
 
 const usd = (n: number | null) => (n === null ? "Custom" : `$${Math.round(n).toLocaleString()}`);
+
+/** Shape of GET /api/multi-tenancy/tenants items (ABP tenant management). */
+interface LiveTenant {
+  id: string;
+  name: string;
+}
+
+const LIVE_COLORS = ["#6d5efc", "#0ea5e9", "#ec4899", "#22c55e", "#f59e0b", "#8b5cf6"];
+
+const slugify = (name: string) =>
+  name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "tenant";
+
+/** Adapt a live ABP tenant to the Workspace shape the existing UI renders. */
+const toWorkspace = (t: LiveTenant, i: number): Workspace => ({
+  id: t.id,
+  name: t.name,
+  slug: slugify(t.name),
+  planId: "free",
+  status: "active",
+  color: LIVE_COLORS[i % LIVE_COLORS.length],
+  createdAt: "",
+  cycleDays: 0,
+  seatsUsed: 0,
+  projectsUsed: 0,
+  storageUsedGb: 0,
+});
+
+type Row = { ws: Workspace; m: TenantMetrics; live: boolean };
 
 const statusTone: Record<SubscriptionStatus, "success" | "warning" | "danger"> = {
   active: "success",
@@ -71,9 +100,51 @@ export default function HostTenantsPage() {
   const [createOpen, setCreateOpen] = useState(false);
   const [newName, setNewName] = useState("");
   const [newPlan, setNewPlan] = useState<PlanId>("starter");
+  const [newAdminEmail, setNewAdminEmail] = useState("");
+  const [newAdminPassword, setNewAdminPassword] = useState("");
+  const [creating, setCreating] = useState(false);
 
-  const rows = useMemo(() => {
-    return workspaces
+  // Live mode: real tenants from the backend when a session token exists.
+  // null = mock mode (no token, still loading, or the tenants call failed/403'd).
+  const [liveTenants, setLiveTenants] = useState<LiveTenant[] | null>(null);
+  const [liveLoading, setLiveLoading] = useState(false);
+  const [liveFailed, setLiveFailed] = useState(false);
+
+  const fetchTenants = useCallback(async () => {
+    setLiveLoading(true);
+    try {
+      const items = (await getApi("/api/multi-tenancy/tenants?MaxResultCount=100")) as LiveTenant[];
+      setLiveTenants(Array.isArray(items) ? items : []);
+      setLiveFailed(false);
+    } catch {
+      // Non-host users get a 403 here — fall back to the mock dataset.
+      setLiveTenants(null);
+      setLiveFailed(true);
+    } finally {
+      setLiveLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window !== "undefined" && localStorage.getItem("dosi-token")) {
+      fetchTenants();
+    }
+  }, [fetchTenants]);
+
+  const isLive = liveTenants !== null;
+  // liveLoading only ever turns on when a token exists, so this stays false in demo mode.
+  const initialLiveLoading = liveLoading && !isLive && !liveFailed;
+
+  const liveWorkspaces = useMemo<Workspace[]>(
+    () => (liveTenants ?? []).map(toWorkspace),
+    [liveTenants]
+  );
+
+  const allRows = isLive ? liveWorkspaces : workspaces;
+
+  const rows = useMemo<Row[]>(() => {
+    const source = isLive ? liveWorkspaces : workspaces;
+    return source
       .filter((w) => (status === "all" ? true : w.status === status))
       .filter((w) => (plan === "all" ? true : w.planId === plan))
       .filter((w) => {
@@ -81,10 +152,10 @@ export default function HostTenantsPage() {
         const q = query.toLowerCase();
         return w.name.toLowerCase().includes(q) || w.slug.toLowerCase().includes(q);
       })
-      .map((w) => ({ ws: w, m: tenantMetrics(w) }));
-  }, [workspaces, status, plan, query]);
+      .map((w) => ({ ws: w, m: tenantMetrics(w), live: isLive }));
+  }, [isLive, liveWorkspaces, workspaces, status, plan, query]);
 
-  const selected = workspaces.find((w) => w.id === selectedId) ?? null;
+  const selected = allRows.find((w) => w.id === selectedId) ?? null;
 
   function doImpersonate(ws: Workspace) {
     impersonate(ws.id);
@@ -92,9 +163,37 @@ export default function HostTenantsPage() {
     setTimeout(() => router.push("/dashboard"), 300);
   }
 
-  function onCreate(e: React.FormEvent) {
+  async function onCreate(e: React.FormEvent) {
     e.preventDefault();
     if (!newName.trim()) return;
+    if (isLive) {
+      if (!newAdminEmail.trim() || !newAdminPassword) return;
+      setCreating(true);
+      const name = newName.trim();
+      try {
+        const created = (await postApi("/api/multi-tenancy/tenants", {
+          name,
+          adminEmailAddress: newAdminEmail.trim(),
+          adminPassword: newAdminPassword,
+        })) as { id?: string } | null;
+        setCreateOpen(false);
+        setNewName("");
+        setNewAdminEmail("");
+        setNewAdminPassword("");
+        toast({ title: "Tenant created", description: `${name} is now provisioned.`, tone: "success" });
+        await fetchTenants();
+        if (created?.id) setSelectedId(created.id);
+      } catch (err) {
+        toast({
+          title: "Failed to create tenant",
+          description: err instanceof Error ? err.message : "Something went wrong.",
+          tone: "danger",
+        });
+      } finally {
+        setCreating(false);
+      }
+      return;
+    }
     const ws = createWorkspace(newName.trim(), newPlan);
     setCreateOpen(false);
     setNewName("");
@@ -102,7 +201,7 @@ export default function HostTenantsPage() {
     setSelectedId(ws.id);
   }
 
-  const columns: Column<{ ws: Workspace; m: TenantMetrics }>[] = [
+  const columns: Column<Row>[] = [
     {
       key: "name",
       header: "Tenant",
@@ -123,12 +222,15 @@ export default function HostTenantsPage() {
       key: "plan",
       header: "Plan",
       sortValue: (r) => r.ws.planId,
-      render: (r) => (
-        <span className="inline-flex items-center gap-1.5">
-          <span className="h-2 w-2 rounded-full" style={{ background: planColor(r.ws.planId) }} />
-          {planById(r.ws.planId).name}
-        </span>
-      ),
+      render: (r) =>
+        r.live ? (
+          <span className="text-muted-foreground">—</span>
+        ) : (
+          <span className="inline-flex items-center gap-1.5">
+            <span className="h-2 w-2 rounded-full" style={{ background: planColor(r.ws.planId) }} />
+            {planById(r.ws.planId).name}
+          </span>
+        ),
     },
     {
       key: "status",
@@ -136,10 +238,10 @@ export default function HostTenantsPage() {
       sortValue: (r) => r.ws.status,
       render: (r) => <Badge tone={statusTone[r.ws.status]}>{hostStatusLabel[r.ws.status]}</Badge>,
     },
-    { key: "seats", header: "Seats", align: "right", sortValue: (r) => r.m.seats, render: (r) => r.m.seats.toLocaleString() },
-    { key: "members", header: "Members", align: "right", sortValue: (r) => r.m.members, render: (r) => r.m.members },
-    { key: "mrr", header: "MRR", align: "right", sortValue: (r) => r.m.mrr ?? 999999, render: (r) => <span className="font-medium">{usd(r.m.mrr)}</span> },
-    { key: "created", header: "Created", align: "right", sortValue: (r) => r.ws.createdAt, render: (r) => <span className="text-muted-foreground">{r.ws.createdAt}</span> },
+    { key: "seats", header: "Seats", align: "right", sortValue: (r) => r.m.seats, render: (r) => (r.live ? <span className="text-muted-foreground">—</span> : r.m.seats.toLocaleString()) },
+    { key: "members", header: "Members", align: "right", sortValue: (r) => r.m.members, render: (r) => (r.live ? <span className="text-muted-foreground">—</span> : r.m.members) },
+    { key: "mrr", header: "MRR", align: "right", sortValue: (r) => r.m.mrr ?? 999999, render: (r) => (r.live ? <span className="text-muted-foreground">—</span> : <span className="font-medium">{usd(r.m.mrr)}</span>) },
+    { key: "created", header: "Created", align: "right", sortValue: (r) => r.ws.createdAt, render: (r) => <span className="text-muted-foreground">{r.live ? "—" : r.ws.createdAt}</span> },
     {
       key: "actions",
       header: "",
@@ -148,8 +250,9 @@ export default function HostTenantsPage() {
         <div className="flex items-center justify-end gap-1">
           <button
             onClick={() => doImpersonate(r.ws)}
-            title="Login as tenant"
-            className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-border text-muted-foreground hover:bg-muted hover:text-foreground"
+            disabled={r.live}
+            title={r.live ? "Not available yet" : "Login as tenant"}
+            className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-border text-muted-foreground hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-muted-foreground"
           >
             <LogIn className="h-4 w-4" />
           </button>
@@ -170,13 +273,23 @@ export default function HostTenantsPage() {
       <PageHeader
         eyebrow="Platform"
         title="Tenants"
-        description={`${rows.length} of ${workspaces.length} workspaces on the platform.`}
+        description={
+          initialLiveLoading
+            ? "Loading tenants…"
+            : `${rows.length} of ${allRows.length} workspaces on the platform.`
+        }
         actions={
           <Button onClick={() => setCreateOpen(true)}>
             <Plus className="h-4 w-4" /> New tenant
           </Button>
         }
       />
+
+      {liveFailed && (
+        <p className="text-xs text-muted-foreground">
+          Live tenant data is unavailable for this account — showing demo data.
+        </p>
+      )}
 
       <Toolbar>
         <SearchField value={query} onChange={setQuery} placeholder="Search tenant name or slug…" />
@@ -195,7 +308,11 @@ export default function HostTenantsPage() {
       </Toolbar>
 
       <Card className="p-2">
-        <DataTable columns={columns} rows={rows} initialSort={{ key: "mrr", dir: "desc" }} emptyText="No tenants match your filters." />
+        {initialLiveLoading ? (
+          <p className="py-10 text-center text-sm text-muted-foreground">Loading tenants…</p>
+        ) : (
+          <DataTable columns={columns} rows={rows} initialSort={{ key: "mrr", dir: "desc" }} emptyText="No tenants match your filters." />
+        )}
       </Card>
 
       {/* Create modal */}
@@ -205,19 +322,51 @@ export default function HostTenantsPage() {
             <label className="text-sm font-medium">Workspace name</label>
             <Input value={newName} onChange={(e) => setNewName(e.target.value)} placeholder="Acme Corp" autoFocus required />
           </div>
-          <div className="space-y-1.5">
-            <label className="text-sm font-medium">Plan</label>
-            <Select value={newPlan} onChange={(e) => setNewPlan(e.target.value as PlanId)}>
-              {plans.map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.name} — {p.pricePerUser === null ? "Custom" : `$${p.pricePerUser}/user/mo`}
-                </option>
-              ))}
-            </Select>
-          </div>
+          {isLive ? (
+            <>
+              <div className="space-y-1.5">
+                <label className="text-sm font-medium">Admin email</label>
+                <Input
+                  type="email"
+                  value={newAdminEmail}
+                  onChange={(e) => setNewAdminEmail(e.target.value)}
+                  placeholder="admin@acme.com"
+                  required
+                />
+              </div>
+              <div className="space-y-1.5">
+                <label className="text-sm font-medium">Admin password</label>
+                <Input
+                  type="password"
+                  value={newAdminPassword}
+                  onChange={(e) => setNewAdminPassword(e.target.value)}
+                  placeholder="••••••••"
+                  required
+                />
+              </div>
+            </>
+          ) : (
+            <div className="space-y-1.5">
+              <label className="text-sm font-medium">Plan</label>
+              <Select value={newPlan} onChange={(e) => setNewPlan(e.target.value as PlanId)}>
+                {plans.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name} — {p.pricePerUser === null ? "Custom" : `$${p.pricePerUser}/user/mo`}
+                  </option>
+                ))}
+              </Select>
+            </div>
+          )}
           <div className="flex justify-end gap-2 pt-2">
             <Button type="button" variant="outline" onClick={() => setCreateOpen(false)}>Cancel</Button>
-            <Button type="submit" disabled={!newName.trim()}>Create tenant</Button>
+            <Button
+              type="submit"
+              disabled={
+                !newName.trim() || creating || (isLive && (!newAdminEmail.trim() || !newAdminPassword))
+              }
+            >
+              {creating ? "Creating…" : "Create tenant"}
+            </Button>
           </div>
         </form>
       </Modal>
@@ -225,10 +374,26 @@ export default function HostTenantsPage() {
       {/* Detail drawer */}
       <TenantDrawer
         ws={selected}
+        live={isLive}
         onClose={() => setSelectedId(null)}
         onImpersonate={doImpersonate}
         onUpdate={updateWorkspace}
-        onDelete={(id) => {
+        onDelete={async (id) => {
+          if (isLive) {
+            try {
+              await delApi(`/api/multi-tenancy/tenants/${id}`);
+              setSelectedId(null);
+              toast({ title: "Tenant deleted", tone: "danger" });
+              await fetchTenants();
+            } catch (err) {
+              toast({
+                title: "Failed to delete tenant",
+                description: err instanceof Error ? err.message : "Something went wrong.",
+                tone: "danger",
+              });
+            }
+            return;
+          }
           deleteWorkspace(id);
           setSelectedId(null);
           toast({ title: "Tenant deleted", tone: "danger" });
@@ -240,18 +405,21 @@ export default function HostTenantsPage() {
 
 function TenantDrawer({
   ws,
+  live,
   onClose,
   onImpersonate,
   onUpdate,
   onDelete,
 }: {
   ws: Workspace | null;
+  live: boolean;
   onClose: () => void;
   onImpersonate: (ws: Workspace) => void;
   onUpdate: (id: string, patch: Partial<Workspace>) => void;
-  onDelete: (id: string) => void;
+  onDelete: (id: string) => void | Promise<void>;
 }) {
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleting, setDeleting] = useState(false);
 
   if (!ws) return null;
   const m = tenantMetrics(ws);
@@ -270,27 +438,41 @@ function TenantDrawer({
           </span>
           <div className="min-w-0 flex-1">
             <div className="truncate text-lg font-semibold">{ws.name}</div>
-            <div className="truncate text-xs text-muted-foreground">{ws.slug}.dositracker.app · since {ws.createdAt}</div>
+            <div className="truncate text-xs text-muted-foreground">
+              {ws.slug}.dositracker.app{ws.createdAt ? ` · since ${ws.createdAt}` : ""}
+            </div>
           </div>
           <Badge tone={statusTone[ws.status]}>{hostStatusLabel[ws.status]}</Badge>
         </div>
 
         {/* Quick actions */}
         <div className="grid grid-cols-2 gap-2">
-          <Button onClick={() => onImpersonate(ws)} className="w-full">
-            <LogIn className="h-4 w-4" /> Login as tenant
-          </Button>
-          {suspended ? (
-            <Button variant="outline" className="w-full" onClick={() => onUpdate(ws.id, { status: "active" })}>
-              <CheckCircle2 className="h-4 w-4" /> Reactivate
+          <div title={live ? "Not available yet" : undefined}>
+            <Button onClick={() => onImpersonate(ws)} className="w-full" disabled={live}>
+              <LogIn className="h-4 w-4" /> Login as tenant
             </Button>
-          ) : (
-            <Button variant="outline" className="w-full" onClick={() => onUpdate(ws.id, { status: "past_due" })}>
-              <Ban className="h-4 w-4" /> Suspend
-            </Button>
-          )}
+          </div>
+          <div title={live ? "Not available yet" : undefined}>
+            {suspended ? (
+              <Button variant="outline" className="w-full" disabled={live} onClick={() => onUpdate(ws.id, { status: "active" })}>
+                <CheckCircle2 className="h-4 w-4" /> Reactivate
+              </Button>
+            ) : (
+              <Button variant="outline" className="w-full" disabled={live} onClick={() => onUpdate(ws.id, { status: "past_due" })}>
+                <Ban className="h-4 w-4" /> Suspend
+              </Button>
+            )}
+          </div>
         </div>
 
+        {live && (
+          <p className="rounded-xl border border-border bg-muted/40 p-3 text-xs text-muted-foreground">
+            Live tenant — detailed usage, plan and billing metrics are not available yet.
+          </p>
+        )}
+
+        {!live && (
+        <>
         {/* Metrics */}
         <div className="grid grid-cols-2 gap-3">
           <MiniMetric icon={Users} label="Members" value={String(m.members)} tone="#0ea5e9" />
@@ -353,6 +535,8 @@ function TenantDrawer({
             ))}
           </div>
         </div>
+        </>
+        )}
 
         {/* Danger zone */}
         <div className="rounded-xl border border-danger/30 bg-danger/5 p-3">
@@ -360,9 +544,21 @@ function TenantDrawer({
           <p className="mt-0.5 text-xs text-muted-foreground">Deleting a tenant removes all of its data. This cannot be undone.</p>
           {confirmDelete ? (
             <div className="mt-3 flex gap-2">
-              <Button variant="outline" size="sm" onClick={() => setConfirmDelete(false)}>Cancel</Button>
-              <Button size="sm" className="bg-danger text-white hover:opacity-90" onClick={() => onDelete(ws.id)}>
-                <Trash2 className="h-4 w-4" /> Yes, delete {ws.name}
+              <Button variant="outline" size="sm" disabled={deleting} onClick={() => setConfirmDelete(false)}>Cancel</Button>
+              <Button
+                size="sm"
+                className="bg-danger text-white hover:opacity-90"
+                disabled={deleting}
+                onClick={async () => {
+                  setDeleting(true);
+                  try {
+                    await onDelete(ws.id);
+                  } finally {
+                    setDeleting(false);
+                  }
+                }}
+              >
+                <Trash2 className="h-4 w-4" /> {deleting ? "Deleting…" : `Yes, delete ${ws.name}`}
               </Button>
             </div>
           ) : (

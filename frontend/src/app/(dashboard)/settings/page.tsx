@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { User, ShieldCheck, Palette, Bell, Check, Monitor, Moon, Sun, Eye } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -10,6 +10,7 @@ import { Avatar } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { useTheme } from "@/components/theme-provider";
 import { useSession } from "@/components/session-provider";
+import { getApi, putApi } from "@/hooks/useApi";
 import { roleLabels } from "@/lib/roles";
 import { PageHeader, PageStack } from "@/components/ui/page-header";
 import { cn } from "@/lib/utils";
@@ -24,11 +25,57 @@ const allTabs = [
 
 type TabKey = (typeof allTabs)[number]["key"];
 
+/** GET/PUT /api/account/my-profile shape (ABP account profile). */
+interface ProfileForm {
+  userName: string;
+  name: string;
+  surname: string;
+  email: string;
+  phoneNumber: string;
+}
+
 export default function SettingsPage() {
   const { user: currentUser } = useSession();
   const tabs = allTabs.filter((t) => (t.roles as readonly string[]).includes(currentUser.role));
   const [tab, setTab] = useState<TabKey>("profile");
   const [saved, setSaved] = useState(false);
+
+  // Live profile (only when a real backend session exists; otherwise demo mode).
+  const [live, setLive] = useState(false);
+  const [profileRaw, setProfileRaw] = useState<Record<string, unknown> | null>(null);
+  const [profileForm, setProfileForm] = useState<ProfileForm | null>(null);
+  const [profileLoading, setProfileLoading] = useState(false);
+  const [profileError, setProfileError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (typeof window !== "undefined" && localStorage.getItem("dosi-token")) {
+      setLive(true);
+      setProfileLoading(true);
+      getApi("/api/account/my-profile")
+        .then((p) => {
+          setProfileRaw(p);
+          setProfileForm({
+            userName: p.userName ?? "",
+            name: p.name ?? "",
+            surname: p.surname ?? "",
+            email: p.email ?? "",
+            phoneNumber: p.phoneNumber ?? "",
+          });
+          setProfileError(null);
+        })
+        .catch(() => {
+          // Fall back to the demo profile rendering below.
+          setProfileError("Couldn't load your profile from the server — showing demo data.");
+          setProfileForm(null);
+        })
+        .finally(() => setProfileLoading(false));
+    }
+  }, []);
+
+  const setProfileField = (key: keyof ProfileForm, value: string) =>
+    setProfileForm((f) => (f ? { ...f, [key]: value } : f));
 
   const [prefs, setPrefs] = useState({
     screenshot: true,
@@ -42,7 +89,22 @@ export default function SettingsPage() {
   });
   const [notif, setNotif] = useState({ dailyReport: true, weeklyReport: true, lowActivity: false, newMember: true, mentions: true });
 
-  function save() {
+  async function save() {
+    if (tab === "profile" && live && profileForm) {
+      setSaving(true);
+      setSaveError(null);
+      try {
+        // Preserve any extra fields the backend returned (e.g. concurrencyStamp).
+        await putApi("/api/account/my-profile", { ...(profileRaw ?? {}), ...profileForm });
+        setSaved(true);
+        setTimeout(() => setSaved(false), 1600);
+      } catch (err) {
+        setSaveError(err instanceof Error ? err.message : "Failed to save profile.");
+      } finally {
+        setSaving(false);
+      }
+      return;
+    }
     setSaved(true);
     setTimeout(() => setSaved(false), 1600);
   }
@@ -87,19 +149,43 @@ export default function SettingsPage() {
                     <p className="mt-1 text-xs text-muted-foreground">JPG or PNG, up to 2MB.</p>
                   </div>
                 </div>
-                <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-                  <Field label="Full name" defaultValue={currentUser.name} />
-                  <Field label="Email" defaultValue={currentUser.email} />
-                  <Field label="Designation" defaultValue={currentUser.designation} />
-                  <div className="space-y-1.5">
-                    <label className="text-sm font-medium">Timezone</label>
-                    <Select defaultValue={currentUser.timezone}>
-                      <option value="Asia/Dhaka">Asia/Dhaka (GMT+6)</option>
-                      <option value="Europe/Madrid">Europe/Madrid</option>
-                      <option value="America/Los_Angeles">America/Los Angeles</option>
-                    </Select>
+                {live && profileLoading && (
+                  <p className="text-sm text-muted-foreground">Loading profile…</p>
+                )}
+                {live && profileError && (
+                  <p className="text-xs text-danger">{profileError}</p>
+                )}
+                {live && !profileLoading && profileForm ? (
+                  <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                    <Field label="First name" value={profileForm.name} onChange={(v) => setProfileField("name", v)} />
+                    <Field label="Surname" value={profileForm.surname} onChange={(v) => setProfileField("surname", v)} />
+                    <Field label="Email" value={profileForm.email} onChange={(v) => setProfileField("email", v)} />
+                    <Field label="Username" value={profileForm.userName} onChange={(v) => setProfileField("userName", v)} />
+                    <Field label="Phone number" value={profileForm.phoneNumber} onChange={(v) => setProfileField("phoneNumber", v)} />
+                    <div className="space-y-1.5">
+                      <label className="text-sm font-medium">Timezone</label>
+                      <Select defaultValue={currentUser.timezone}>
+                        <option value="Asia/Dhaka">Asia/Dhaka (GMT+6)</option>
+                        <option value="Europe/Madrid">Europe/Madrid</option>
+                        <option value="America/Los_Angeles">America/Los Angeles</option>
+                      </Select>
+                    </div>
                   </div>
-                </div>
+                ) : !profileLoading ? (
+                  <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                    <Field label="Full name" defaultValue={currentUser.name} />
+                    <Field label="Email" defaultValue={currentUser.email} />
+                    <Field label="Designation" defaultValue={currentUser.designation} />
+                    <div className="space-y-1.5">
+                      <label className="text-sm font-medium">Timezone</label>
+                      <Select defaultValue={currentUser.timezone}>
+                        <option value="Asia/Dhaka">Asia/Dhaka (GMT+6)</option>
+                        <option value="Europe/Madrid">Europe/Madrid</option>
+                        <option value="America/Los_Angeles">America/Los Angeles</option>
+                      </Select>
+                    </div>
+                  </div>
+                ) : null}
                 <div className="flex items-center gap-2">
                   <span className="text-sm text-muted-foreground">Role</span>
                   <Badge tone="primary">{roleLabels[currentUser.role]}</Badge>
@@ -204,12 +290,17 @@ export default function SettingsPage() {
           )}
 
           <div className="flex items-center justify-end gap-3">
+            {tab === "profile" && saveError && (
+              <span className="text-sm text-danger">{saveError}</span>
+            )}
             {saved && (
               <span className="flex items-center gap-1.5 text-sm text-success">
                 <Check className="h-4 w-4" /> Saved
               </span>
             )}
-            <Button onClick={save}>Save changes</Button>
+            <Button onClick={save} disabled={saving}>
+              {saving ? "Saving…" : "Save changes"}
+            </Button>
           </div>
         </div>
       </div>
@@ -217,11 +308,25 @@ export default function SettingsPage() {
   );
 }
 
-function Field({ label, defaultValue }: { label: string; defaultValue: string }) {
+function Field({
+  label,
+  defaultValue,
+  value,
+  onChange,
+}: {
+  label: string;
+  defaultValue?: string;
+  value?: string;
+  onChange?: (value: string) => void;
+}) {
   return (
     <div className="space-y-1.5">
       <label className="text-sm font-medium">{label}</label>
-      <Input defaultValue={defaultValue} />
+      {onChange ? (
+        <Input value={value ?? ""} onChange={(e) => onChange(e.target.value)} />
+      ) : (
+        <Input defaultValue={defaultValue} />
+      )}
     </div>
   );
 }

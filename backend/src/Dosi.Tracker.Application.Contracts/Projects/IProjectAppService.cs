@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.Threading.Tasks;
 using Volo.Abp.Application.Dtos;
 using Volo.Abp.Application.Services;
 
@@ -11,4 +13,13 @@ public interface IProjectAppService :
         PagedAndSortedResultRequestDto,
         CreateUpdateProjectDto>
 {
+    /// <summary>
+    /// Active (non-archived) projects the current user is a member of,
+    /// with the capture permissions the desktop agents must honor.
+    /// </summary>
+    Task<List<MyProjectDto>> GetMyProjectsAsync();
+
+    Task<ProjectDto> ArchiveAsync(Guid id);
+
+    Task<ProjectDto> UnarchiveAsync(Guid id);
 }
