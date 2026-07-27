@@ -1,0 +1,73 @@
+# Local/self-hosted stack: PostgreSQL + DB migrator + API host + web dashboard.
+#
+# 1) Publish the backend first (the Dockerfiles copy the publish output):
+#      dotnet publish backend/src/Dosi.Tracker.DbMigrator -c Release
+#      dotnet publish backend/src/Dosi.Tracker.HttpApi.Host -c Release
+# 2) docker compose up --build
+#
+# Override every secret below in production (env file / secret store) —
+# the defaults exist only so the stack boots for local evaluation.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: Tracker
+      POSTGRES_USER: ${TRACKER_DB_USER:-root}
+      POSTGRES_PASSWORD: ${TRACKER_DB_PASSWORD:-myPassword}
+    volumes:
+      - tracker-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  migrator:
+    build:
+      context: backend/src/Dosi.Tracker.DbMigrator
+      dockerfile: Dockerfile.local
+    environment:
+      ConnectionStrings__Default: "Host=postgres;Port=5432;Database=Tracker;User ID=${TRACKER_DB_USER:-root};Password=${TRACKER_DB_PASSWORD:-myPassword};"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build:
+      context: backend/src/Dosi.Tracker.HttpApi.Host
+      dockerfile: Dockerfile.local
+    environment:
+      ASPNETCORE_URLS: "http://+:8080"
+      App__SelfUrl: ${TRACKER_SELF_URL:-http://localhost:8080}
+      App__CorsOrigins: ${TRACKER_CORS_ORIGINS:-http://localhost:3000}
+      App__DisablePII: "true"
+      AuthServer__Authority: ${TRACKER_SELF_URL:-http://localhost:8080}
+      AuthServer__RequireHttpsMetadata: "false"
+      AuthServer__CertificatePassPhrase: ${TRACKER_CERT_PASSPHRASE:-3f027835-7c52-4bf7-bc1f-77582ca37aef}
+      StringEncryption__DefaultPassPhrase: ${TRACKER_ENCRYPTION_PASSPHRASE:-5pGzpfXjidNXJVDa}
+      ConnectionStrings__Default: "Host=postgres;Port=5432;Database=Tracker;User ID=${TRACKER_DB_USER:-root};Password=${TRACKER_DB_PASSWORD:-myPassword};"
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
+
+  web:
+    image: node:22-alpine
+    working_dir: /app
+    volumes:
+      - ./frontend:/app
+    environment:
+      NEXT_PUBLIC_API_URL: ${TRACKER_SELF_URL:-http://localhost:8080}
+    command: sh -c "npm ci && npm run build && npm run start -- -p 3000"
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+
+volumes:
+  tracker-pgdata:

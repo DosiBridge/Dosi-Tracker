@@ -82,10 +82,27 @@ Both agents share the same design:
 
 Each component has its own README with setup details:
 
-- [`backend/`](./backend) — run `abp` solution; configure PostgreSQL + run migrations
+- [`backend/`](./backend) — run `abp` solution; configure PostgreSQL + run migrations (`Dosi.Tracker.DbMigrator` also seeds the default plans and admin)
 - [`frontend/`](./frontend) — `npm install && npm run dev`
 - [`clients/windows/`](./clients/windows/README.md) — install Rust, then `cargo run --release`
 - [`clients/macos/`](./clients/macos/README.md) — build on a Mac with `swift run`
+
+### One-command stack (Docker)
+
+```bash
+dotnet publish backend/src/Dosi.Tracker.DbMigrator -c Release
+dotnet publish backend/src/Dosi.Tracker.HttpApi.Host -c Release
+docker compose up --build
+# API on http://localhost:8080 · dashboard on http://localhost:3000
+```
+
+### Tests & CI
+
+- Backend: `dotnet test backend/Dosi.Tracker.slnx` — domain unit tests + app-service
+  integration tests on in-memory SQLite.
+- CI ([`.github/workflows/ci.yml`](./.github/workflows/ci.yml)) builds and tests the
+  backend, typechecks/builds the frontend, `cargo check`s the Windows agent and
+  `swift build`s the macOS agent on every push/PR.
 
 ### Prerequisites
 

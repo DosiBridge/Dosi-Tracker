@@ -1,0 +1,63 @@
+name: Mutation testing
+
+# Mutation runs are slow, so they run nightly and on demand rather than on every PR (docs/QUALITY.md
+# §6). Each runner enforces its own break threshold from its stryker config, so the job fails if the
+# mutation score drops below the ratcheting floor.
+on:
+  schedule:
+    - cron: "0 3 * * *" # 03:00 UTC nightly
+  workflow_dispatch:
+
+jobs:
+  backend-mutation:
+    name: Backend domain mutation (Stryker.NET)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Install Stryker.NET
+        run: dotnet tool install -g dotnet-stryker
+
+      - name: Mutate the Domain layer (fails below the break threshold)
+        working-directory: backend/test/Dosi.Tracker.Domain.Tests
+        run: dotnet stryker
+
+      - name: Upload mutation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-mutation-report
+          path: backend/test/Dosi.Tracker.Domain.Tests/StrykerOutput/**/reports
+
+  frontend-mutation:
+    name: Frontend logic mutation (StrykerJS)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install
+        working-directory: frontend
+        run: npm ci
+
+      - name: Mutate the logic layer (fails below the break threshold)
+        working-directory: frontend
+        run: npx stryker run
+
+      - name: Upload mutation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-mutation-report
+          path: frontend/reports/mutation
