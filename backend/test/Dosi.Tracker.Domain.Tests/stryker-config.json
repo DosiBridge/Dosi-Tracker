@@ -1,0 +1,21 @@
+{
+  "$schema": "https://raw.githubusercontent.com/stryker-mutator/stryker-net/master/src/Stryker.Core/Stryker.Core/schema.json",
+    "stryker-config": {
+    "project": "Dosi.Tracker.Domain.csproj",
+    "mutate": [
+      "!**/InvoiceGenerationWorker.cs",
+      "!**/TrialExpiryWorker.cs",
+      "!**/InvoiceGenerator.cs",
+      "!**/Data/**",
+      "!**/Identity/**",
+      "!**/OpenIddict/**",
+      "!**/Settings/**",
+      "!**/*DataSeedContributor.cs",
+      "!**/TrackerDomainModule.cs",
+      "!**/TrackerConsts.cs",
+      "!**/Properties/**"
+    ],
+    "reporters": ["progress", "html", "json"],
+    "thresholds": { "high": 95, "low": 90, "break": 85 }
+  }
+}

@@ -24,19 +24,19 @@ public class CreateActivityDto
     public int MouseClicks { get; set; }
     public int KeyboardHits { get; set; }
     
-    public string Description { get; set; }
-    
+    public string? Description { get; set; }
+
     // Accept structured data from clients
     public List<WindowInfoDto> ActiveWindows { get; set; } = new();
     public List<WindowInfoDto> RunningPrograms { get; set; } = new();
-    
+
     // Accept base64 images from desktop agents
-    public string ScreenshotPngBase64 { get; set; }
-    public string WebcamJpgBase64 { get; set; }
+    public string? ScreenshotPngBase64 { get; set; }
+    public string? WebcamJpgBase64 { get; set; }
 }
 
 public class WindowInfoDto
 {
-    public string AppName { get; set; }
-    public string WindowTitle { get; set; }
+    public string? AppName { get; set; }
+    public string? WindowTitle { get; set; }
 }

@@ -33,6 +33,12 @@ public class TrackerDbContext :
     public DbSet<Activity> Activities { get; set; }
     public DbSet<Screenshot> Screenshots { get; set; }
 
+    // New Domains
+    public DbSet<Dosi.Tracker.SaaS.Plan> Plans { get; set; }
+    public DbSet<Dosi.Tracker.SaaS.Subscription> Subscriptions { get; set; }
+    public DbSet<Dosi.Tracker.Billing.Invoice> Invoices { get; set; }
+    public DbSet<Dosi.Tracker.Notifications.Notification> Notifications { get; set; }
+
     #region Entities from the modules
 
     /* Notice: We only implemented IIdentityProDbContext and ISaasDbContext
@@ -108,7 +114,7 @@ public class TrackerDbContext :
             b.HasIndex(x => new { x.TenantId, x.UserId, x.StartedAt }).IsDescending(false, false, true);
             b.HasIndex(x => new { x.TenantId, x.ProjectId, x.StartedAt }).IsDescending(false, false, true);
             b.HasIndex(x => new { x.TenantId, x.ClientActivityId }).IsUnique(); // Idempotency
-            b.HasOne(x => x.Screenshot).WithOne().HasForeignKey<Screenshot>(x => x.ActivityId);
+            b.HasMany(x => x.Screenshots).WithOne().HasForeignKey(x => x.ActivityId).IsRequired();
         });
 
         builder.Entity<Screenshot>(b =>
@@ -117,6 +123,36 @@ public class TrackerDbContext :
             b.ConfigureByConvention();
             b.HasIndex(x => new { x.TenantId, x.CapturedAt }).IsDescending(false, true);
             b.Property(x => x.StorageUrl).IsRequired().HasMaxLength(512);
+            b.Property(x => x.Kind).IsRequired().HasMaxLength(16);
+        });
+
+        // New Domains
+        builder.Entity<Dosi.Tracker.SaaS.Plan>(b =>
+        {
+            b.ToTable(TrackerConsts.DbTablePrefix + "Plans", TrackerConsts.DbSchema);
+            b.ConfigureByConvention();
+            b.Property(x => x.Name).IsRequired().HasMaxLength(64);
+        });
+
+        builder.Entity<Dosi.Tracker.SaaS.Subscription>(b =>
+        {
+            b.ToTable(TrackerConsts.DbTablePrefix + "Subscriptions", TrackerConsts.DbSchema);
+            b.ConfigureByConvention();
+            b.Property(x => x.Status).IsRequired().HasMaxLength(32);
+        });
+
+        builder.Entity<Dosi.Tracker.Billing.Invoice>(b =>
+        {
+            b.ToTable(TrackerConsts.DbTablePrefix + "Invoices", TrackerConsts.DbSchema);
+            b.ConfigureByConvention();
+            b.Property(x => x.Status).IsRequired().HasMaxLength(32);
+        });
+
+        builder.Entity<Dosi.Tracker.Notifications.Notification>(b =>
+        {
+            b.ToTable(TrackerConsts.DbTablePrefix + "Notifications", TrackerConsts.DbSchema);
+            b.ConfigureByConvention();
+            b.Property(x => x.Message).IsRequired().HasMaxLength(512);
         });
     }
 }

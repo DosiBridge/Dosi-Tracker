@@ -14,6 +14,7 @@ using Volo.Abp.OpenIddict;
 using Volo.Abp.PermissionManagement.OpenIddict;
 using Volo.Abp.AuditLogging;
 using Volo.Abp.BackgroundJobs;
+using Volo.Abp.BackgroundWorkers;
 using Volo.Abp.Emailing;
 using Volo.Abp.FeatureManagement;
 using Volo.Abp.Identity;
@@ -34,6 +35,7 @@ namespace Dosi.Tracker;
     typeof(AbpIdentityDomainModule),
     typeof(AbpOpenIddictDomainModule),
     typeof(AbpTenantManagementDomainModule),
+    typeof(AbpBackgroundWorkersModule),
     typeof(BlobStoringDatabaseDomainModule)
     )]
 public class TrackerDomainModule : AbpModule

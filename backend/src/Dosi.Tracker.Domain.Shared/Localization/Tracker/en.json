@@ -4,6 +4,25 @@
     "AppName": "Tracker",
     "Menu:Home": "Home",
     "LongWelcomeMessage": "Welcome to the application. This is a startup project based on the ABP framework. For more information visit",
-    "Welcome": "Welcome"
+    "Welcome": "Welcome",
+    "Permission:Tracker": "Tracker",
+    "Permission:Projects": "Project management",
+    "Permission:Projects.Create": "Create projects",
+    "Permission:Projects.Edit": "Edit projects",
+    "Permission:Projects.Delete": "Delete projects",
+    "Permission:Projects.Archive": "Archive projects",
+    "Permission:Activities": "Activity management",
+    "Permission:Activities.ViewAll": "View all members' activities",
+    "Permission:Team": "Team",
+    "Permission:Team.Manage": "Manage team members",
+    "Permission:Billing": "Billing",
+    "Permission:Reporting": "Reporting",
+    "Tracker:ActivityTimeRangeInvalid": "The activity's end time must be after its start time.",
+    "Tracker:ActivityClientIdRequired": "The activity must carry the client-generated activity id (idempotency key).",
+    "Tracker:DuplicateProjectMember": "This user is already a member of the project.",
+    "Tracker:InvalidCaptureData": "The uploaded capture is not valid base64 image data.",
+    "Tracker:CaptureTooLarge": "The uploaded capture exceeds the maximum allowed size.",
+    "Tracker:PlanNotFound": "The requested plan does not exist.",
+    "Tracker:SeatLimitReached": "Your plan's seat limit has been reached. Upgrade the plan to add more members."
   }
 }

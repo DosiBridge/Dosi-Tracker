@@ -13,7 +13,7 @@ public class ActivityDto : CreationAuditedEntityDto<Guid>
     public int Productivity { get; set; }
     public int MouseClicks { get; set; }
     public int KeyboardHits { get; set; }
-    public string Description { get; set; }
-    public string ActiveWindowsJson { get; set; }
-    public string RunningProgramsJson { get; set; }
+    public string? Description { get; set; }
+    public string ActiveWindowsJson { get; set; } = "[]";
+    public string RunningProgramsJson { get; set; } = "[]";
 }

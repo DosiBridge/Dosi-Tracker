@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Coverage configuration for the CI path: dotnet test with the "XPlat Code Coverage" collector.
+  Mirrors backend/test/Directory.Build.props (which configures the coverlet.msbuild path used
+  locally). Both must agree so the number a developer sees locally matches the CI gate.
+
+  Product-only: we measure the Dosi.Tracker.* assemblies, never the test assemblies, the
+  console sample, EF Core migrations, or compiler-generated code.
+-->
+<RunSettings>
+  <DataCollectionRunSettings>
+    <DataCollectors>
+      <DataCollector friendlyName="XPlat code coverage">
+        <Configuration>
+          <Format>cobertura</Format>
+          <Include>[Dosi.Tracker.*]*</Include>
+          <Exclude>[*.Tests]*,[Dosi.Tracker.HttpApi.Client.ConsoleTestApp]*,[Dosi.Tracker.DbMigrator]*</Exclude>
+          <ExcludeByAttribute>GeneratedCodeAttribute,CompilerGeneratedAttribute,ExcludeFromCodeCoverageAttribute</ExcludeByAttribute>
+          <ExcludeByFile>**/Migrations/*.cs</ExcludeByFile>
+          <SkipAutoProps>true</SkipAutoProps>
+        </Configuration>
+      </DataCollector>
+    </DataCollectors>
+  </DataCollectionRunSettings>
+</RunSettings>
