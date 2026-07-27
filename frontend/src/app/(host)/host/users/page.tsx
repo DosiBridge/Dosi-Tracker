@@ -1,8 +1,7 @@
 "use client";
 
-import { useMemo, useState } from "react";
-import { useRouter } from "next/navigation";
-import { LogIn, Users as UsersIcon } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { Users as UsersIcon } from "lucide-react";
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Avatar } from "@/components/ui/avatar";
@@ -10,89 +9,111 @@ import { Select } from "@/components/ui/input";
 import { PageHeader, PageStack } from "@/components/ui/page-header";
 import { SearchField, Toolbar } from "@/components/ui/toolbar";
 import { DataTable, type Column } from "@/components/ui/data-table";
-import { toast } from "@/components/toast";
 import { useSession } from "@/components/session-provider";
-import { globalUsers, type GlobalUser } from "@/lib/host-data";
-import { roleLabels } from "@/lib/roles";
-import { formatDuration } from "@/lib/utils";
-import type { Role } from "@/lib/types";
+import { globalUsers } from "@/lib/host-data";
+import { getApi } from "@/hooks/useApi";
 
-const roleTone: Record<string, "primary" | "warning" | "info" | "muted"> = {
-  owner: "primary",
-  admin: "warning",
-  worker: "info",
-  client: "muted",
-};
+/** Unified row shape for both the live (API) and demo (fallback) views. */
+interface Row {
+  id: string;
+  name: string;
+  email: string;
+  tenant: string;
+}
+
+/** Shape of GET /api/app/platform/users items. */
+interface ApiUser {
+  id: string;
+  userName: string;
+  email?: string | null;
+  name?: string | null;
+  tenantId?: string | null;
+  tenantName?: string | null;
+}
 
 export default function HostUsersPage() {
-  const router = useRouter();
-  const { workspaces, impersonate } = useSession();
+  const { workspaces } = useSession();
   const [query, setQuery] = useState("");
-  const [role, setRole] = useState<"all" | Role>("all");
-  const [wsId, setWsId] = useState<"all" | string>("all");
+  const [tenant, setTenant] = useState<"all" | string>("all");
 
-  const all = useMemo(() => globalUsers(workspaces), [workspaces]);
+  const [live, setLive] = useState<Row[] | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(false);
 
-  const rows = useMemo(() => {
-    return all
-      .filter((g) => (role === "all" ? true : g.user.role === role))
-      .filter((g) => (wsId === "all" ? true : g.workspaceId === wsId))
-      .filter((g) => {
-        if (!query.trim()) return true;
-        const q = query.toLowerCase();
-        return g.user.name.toLowerCase().includes(q) || g.user.email.toLowerCase().includes(q) || g.workspaceName.toLowerCase().includes(q);
-      });
-  }, [all, role, wsId, query]);
+  const loadLive = useCallback(async () => {
+    setLoading(true);
+    setError(false);
+    try {
+      const res = (await getApi("/api/app/platform/users?MaxResultCount=500")) as { items?: ApiUser[] };
+      const items = Array.isArray(res?.items) ? res.items : [];
+      setLive(
+        items.map((u) => ({
+          id: u.id,
+          name: (u.name && u.name.trim()) || u.userName,
+          email: u.email ?? "",
+          tenant: u.tenantName || "Host",
+        }))
+      );
+    } catch {
+      setLive(null); // fall back to the demo dataset
+      setError(true);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
 
-  function enter(g: GlobalUser) {
-    impersonate(g.workspaceId);
-    toast({ title: `Entering ${g.workspaceName}`, tone: "info" });
-    setTimeout(() => router.push("/dashboard"), 300);
-  }
+  useEffect(() => {
+    if (typeof window === "undefined" || !localStorage.getItem("dosi-token")) return;
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- data fetch defers its own setState; see docs/QUALITY.md §10
+    loadLive();
+  }, [loadLive]);
 
-  const columns: Column<GlobalUser>[] = [
+  const mockRows = useMemo<Row[]>(
+    () =>
+      globalUsers(workspaces).map((g) => ({
+        id: g.user.id,
+        name: g.user.name,
+        email: g.user.email,
+        tenant: g.workspaceName,
+      })),
+    [workspaces]
+  );
+
+  const all = live ?? mockRows;
+  const tenants = useMemo(() => [...new Set(all.map((r) => r.tenant))].sort(), [all]);
+
+  const rows = useMemo(
+    () =>
+      all
+        .filter((r) => (tenant === "all" ? true : r.tenant === tenant))
+        .filter((r) => {
+          if (!query.trim()) return true;
+          const q = query.toLowerCase();
+          return r.name.toLowerCase().includes(q) || r.email.toLowerCase().includes(q) || r.tenant.toLowerCase().includes(q);
+        }),
+    [all, tenant, query]
+  );
+
+  const columns: Column<Row>[] = [
     {
       key: "name",
       header: "User",
-      sortValue: (g) => g.user.name.toLowerCase(),
-      render: (g) => (
+      sortValue: (r) => r.name.toLowerCase(),
+      render: (r) => (
         <div className="flex items-center gap-2.5">
-          <Avatar name={g.user.name} size="sm" status={g.user.status} />
+          <Avatar name={r.name} size="sm" />
           <div className="min-w-0">
-            <div className="truncate font-medium">{g.user.name}</div>
-            <div className="truncate text-xs text-muted-foreground">{g.user.email}</div>
+            <div className="truncate font-medium">{r.name}</div>
+            <div className="truncate text-xs text-muted-foreground">{r.email || "—"}</div>
           </div>
         </div>
       ),
     },
     {
-      key: "workspace",
+      key: "tenant",
       header: "Tenant",
-      sortValue: (g) => g.workspaceName.toLowerCase(),
-      render: (g) => (
-        <span className="inline-flex items-center gap-1.5">
-          <span className="h-2.5 w-2.5 rounded-full" style={{ background: g.workspaceColor }} />
-          {g.workspaceName}
-        </span>
-      ),
-    },
-    { key: "role", header: "Role", sortValue: (g) => g.user.role, render: (g) => <Badge tone={roleTone[g.user.role] ?? "muted"}>{roleLabels[g.user.role]}</Badge> },
-    { key: "designation", header: "Designation", render: (g) => <span className="text-muted-foreground">{g.user.designation}</span> },
-    { key: "productivity", header: "Productivity", align: "right", sortValue: (g) => g.user.productivity, render: (g) => (g.user.role === "client" ? "—" : `${g.user.productivity}%`) },
-    { key: "tracked", header: "Tracked today", align: "right", sortValue: (g) => g.user.trackedToday, render: (g) => (g.user.trackedToday ? formatDuration(g.user.trackedToday) : "—") },
-    {
-      key: "actions",
-      header: "",
-      align: "right",
-      render: (g) => (
-        <button
-          onClick={() => enter(g)}
-          title="Open tenant"
-          className="inline-flex h-8 w-8 items-center justify-center rounded-xl border border-border text-muted-foreground hover:bg-muted hover:text-foreground"
-        >
-          <LogIn className="h-4 w-4" />
-        </button>
-      ),
+      sortValue: (r) => r.tenant.toLowerCase(),
+      render: (r) => <span className="text-muted-foreground">{r.tenant}</span>,
     },
   ];
 
@@ -105,25 +126,27 @@ export default function HostUsersPage() {
         actions={<Badge tone="muted" className="gap-1.5"><UsersIcon className="h-3.5 w-3.5" /> {all.length} total</Badge>}
       />
 
+      {loading && live === null && (
+        <div className="rounded-lg border border-border bg-muted px-3 py-2 text-xs text-muted-foreground">Loading users…</div>
+      )}
+      {error && live === null && (
+        <div className="rounded-lg border border-border bg-muted px-3 py-2 text-xs text-muted-foreground">
+          Live users unavailable right now — showing demo data.
+        </div>
+      )}
+
       <Toolbar>
         <SearchField value={query} onChange={setQuery} placeholder="Search name, email or tenant…" />
-        <Select value={wsId} onChange={(e) => setWsId(e.target.value)} className="w-full sm:w-auto sm:min-w-40">
+        <Select value={tenant} onChange={(e) => setTenant(e.target.value)} className="w-full sm:w-auto sm:min-w-40">
           <option value="all">All tenants</option>
-          {workspaces.map((w) => (
-            <option key={w.id} value={w.id}>{w.name}</option>
+          {tenants.map((t) => (
+            <option key={t} value={t}>{t}</option>
           ))}
-        </Select>
-        <Select value={role} onChange={(e) => setRole(e.target.value as typeof role)} className="w-full sm:w-auto sm:min-w-36">
-          <option value="all">All roles</option>
-          <option value="owner">Owner</option>
-          <option value="admin">Administrator</option>
-          <option value="worker">Member</option>
-          <option value="client">Client</option>
         </Select>
       </Toolbar>
 
       <Card className="p-2">
-        <DataTable columns={columns} rows={rows} initialSort={{ key: "tracked", dir: "desc" }} emptyText="No users match your filters." />
+        <DataTable columns={columns} rows={rows} initialSort={{ key: "name", dir: "asc" }} emptyText="No users match your filters." />
       </Card>
     </PageStack>
   );

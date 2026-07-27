@@ -1,55 +1,101 @@
 "use client";
 
-import { useMemo } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import {
-  DollarSign,
-  Building2,
-  Users,
-  Gauge,
-  HardDrive,
-  ArrowRight,
-  Sparkles,
-  CircleDot,
-} from "lucide-react";
+import { DollarSign, Building2, Users, Sparkles, ArrowRight, Receipt, CheckCircle2 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { PageHeader, PageStack } from "@/components/ui/page-header";
 import { StatCard } from "@/components/dashboard/stat-card";
 import { ProjectDonut } from "@/components/dashboard/charts";
-import { MrrChart, TenantsChart } from "@/components/host/host-charts";
 import { useSession } from "@/components/session-provider";
 import { brand } from "@/lib/brand";
-import {
-  growthTrend,
-  planBreakdown,
-  planColor,
-  platformOverview,
-  tenantMetrics,
-} from "@/lib/host-data";
-import { statusLabel } from "@/lib/saas-data";
+import { planBreakdown, platformOverview } from "@/lib/host-data";
+import { colorFromString } from "@/lib/utils";
+import { getApi } from "@/hooks/useApi";
 
 const usd = (n: number) => `$${Math.round(n).toLocaleString()}`;
 
-const statusTone: Record<string, "success" | "warning" | "danger"> = {
-  active: "success",
-  trialing: "warning",
-  past_due: "danger",
-};
+interface PlanRow {
+  name: string;
+  subscribers: number;
+  color: string;
+}
+interface Overview {
+  tenants: number;
+  activeSubs: number;
+  trialing: number;
+  mrr: number;
+  paidSeats: number;
+  totalInvoiced: number;
+  pendingInvoices: number;
+  plans: PlanRow[];
+}
+
+interface ApiOverview {
+  tenantCount: number;
+  activeSubscriptions: number;
+  trialingSubscriptions: number;
+  mrr: number;
+  paidSeats: number;
+  totalInvoiced: number;
+  pendingInvoices: number;
+  plans: { name: string; subscriberCount: number }[];
+}
 
 export default function HostOverviewPage() {
   const { workspaces } = useSession();
-  const overview = useMemo(() => platformOverview(workspaces), [workspaces]);
-  const growth = useMemo(() => growthTrend(workspaces), [workspaces]);
-  const plansB = useMemo(() => planBreakdown(workspaces), [workspaces]);
 
-  const donut = plansB
-    .filter((p) => p.tenants > 0)
-    .map((p) => ({ name: p.plan.name, value: p.tenants, color: p.color }));
+  const [live, setLive] = useState<Overview | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(false);
 
-  const recent = [...workspaces]
-    .sort((a, b) => +new Date(b.createdAt) - +new Date(a.createdAt))
-    .slice(0, 5);
+  const loadLive = useCallback(async () => {
+    setLoading(true);
+    setError(false);
+    try {
+      const o = (await getApi("/api/app/platform/overview")) as ApiOverview;
+      setLive({
+        tenants: o.tenantCount,
+        activeSubs: o.activeSubscriptions,
+        trialing: o.trialingSubscriptions,
+        mrr: o.mrr,
+        paidSeats: o.paidSeats,
+        totalInvoiced: o.totalInvoiced,
+        pendingInvoices: o.pendingInvoices,
+        plans: (o.plans ?? []).map((p) => ({ name: p.name, subscribers: p.subscriberCount, color: colorFromString(p.name) })),
+      });
+    } catch {
+      setLive(null);
+      setError(true);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !localStorage.getItem("dosi-token")) return;
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- data fetch defers its own setState; see docs/QUALITY.md §10
+    loadLive();
+  }, [loadLive]);
+
+  const demo = useMemo<Overview>(() => {
+    const o = platformOverview(workspaces);
+    const b = planBreakdown(workspaces);
+    return {
+      tenants: o.totalTenants,
+      activeSubs: o.active,
+      trialing: o.trialing,
+      mrr: o.mrr,
+      paidSeats: o.totalSeats,
+      totalInvoiced: 0,
+      pendingInvoices: o.pastDue,
+      plans: b.map((p) => ({ name: p.plan.name, subscribers: p.tenants, color: p.color })),
+    };
+  }, [workspaces]);
+
+  const o = live ?? demo;
+  const donut = o.plans.filter((p) => p.subscribers > 0).map((p) => ({ name: p.name, value: p.subscribers, color: p.color }));
 
   return (
     <PageStack>
@@ -60,7 +106,7 @@ export default function HostOverviewPage() {
             Platform Overview
             <Badge tone="success" className="gap-1.5 align-middle">
               <span className="h-1.5 w-1.5 rounded-full bg-success live-dot" />
-              {overview.active} live tenants
+              {o.activeSubs} active
             </Badge>
           </span>
         }
@@ -75,79 +121,57 @@ export default function HostOverviewPage() {
         }
       />
 
+      {loading && live === null && (
+        <div className="rounded-lg border border-border bg-muted px-3 py-2 text-xs text-muted-foreground">Loading platform metrics…</div>
+      )}
+      {error && live === null && (
+        <div className="rounded-lg border border-border bg-muted px-3 py-2 text-xs text-muted-foreground">
+          Live metrics unavailable right now — showing demo data.
+        </div>
+      )}
+
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
-        <StatCard label="Monthly recurring revenue" value={usd(overview.mrr)} icon={DollarSign} trend={14} accent={brand.primary} sub={`${usd(overview.arr)} ARR`} />
-        <StatCard label="Total tenants" value={String(overview.totalTenants)} icon={Building2} trend={9} accent={brand.info} sub={`${overview.newThisMonth} new this month`} />
-        <StatCard label="Paid seats" value={overview.totalSeats.toLocaleString()} icon={Users} trend={6} accent={brand.success} sub={`${overview.totalMembers} members total`} />
-        <StatCard label="Trials in progress" value={String(overview.trialing)} icon={Sparkles} accent={brand.warning} sub={overview.pastDue > 0 ? `${overview.pastDue} past due` : "no past-due accounts"} />
-        <StatCard label="Avg productivity" value={`${overview.avgProductivity}%`} icon={Gauge} trend={-2} accent={brand.pink} sub="weighted across tenants" />
-        <StatCard label="Storage used" value={`${overview.storageGb} GB`} icon={HardDrive} trend={11} accent={brand.ink} sub="all workspaces" />
+        <StatCard label="Monthly recurring revenue" value={usd(o.mrr)} icon={DollarSign} accent={brand.primary} sub={`${usd(o.mrr * 12)} ARR`} />
+        <StatCard label="Total tenants" value={String(o.tenants)} icon={Building2} accent={brand.info} sub={`${o.activeSubs} active · ${o.trialing} trialing`} />
+        <StatCard label="Paid seats" value={o.paidSeats.toLocaleString()} icon={Users} accent={brand.success} sub="occupied across tenants" />
+        <StatCard label="Trials in progress" value={String(o.trialing)} icon={Sparkles} accent={brand.warning} sub={o.trialing > 0 ? "converting soon" : "none active"} />
+        <StatCard label="Total invoiced" value={usd(o.totalInvoiced)} icon={Receipt} accent={brand.ink} sub="all-time, all tenants" />
+        <StatCard label="Pending invoices" value={String(o.pendingInvoices)} icon={CheckCircle2} accent={brand.pink} sub={o.pendingInvoices > 0 ? "awaiting payment" : "all settled"} />
       </div>
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
-        <Card className="lg:col-span-2">
-          <CardHeader>
-            <CardTitle>Revenue growth</CardTitle>
-            <Badge tone="muted">Last 12 months</Badge>
-          </CardHeader>
-          <CardContent><MrrChart data={growth} /></CardContent>
-        </Card>
-
-        <Card>
+        <Card className="lg:col-span-1">
           <CardHeader><CardTitle>Tenants by plan</CardTitle></CardHeader>
           <CardContent>
             <ProjectDonut data={donut} />
             <div className="mt-3 space-y-2">
-              {plansB.map((p) => (
-                <div key={p.plan.id} className="flex items-center justify-between text-sm">
+              {o.plans.map((p) => (
+                <div key={p.name} className="flex items-center justify-between text-sm">
                   <span className="flex items-center gap-2">
                     <span className="h-2.5 w-2.5 rounded-full" style={{ background: p.color }} />
-                    <span className="text-muted-foreground">{p.plan.name}</span>
+                    <span className="text-muted-foreground">{p.name}</span>
                   </span>
-                  <span className="font-medium">{p.tenants} · {usd(p.mrr)}</span>
+                  <span className="font-medium">{p.subscribers}</span>
                 </div>
               ))}
             </div>
           </CardContent>
         </Card>
-      </div>
 
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
-        <Card>
-          <CardHeader><CardTitle>Tenant growth</CardTitle><Badge tone="muted">Cumulative</Badge></CardHeader>
-          <CardContent><TenantsChart data={growth} /></CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader>
-            <CardTitle>Recent signups</CardTitle>
-            <Link href="/host/tenants" className="text-xs text-primary hover:underline">View all</Link>
-          </CardHeader>
-          <CardContent className="space-y-1">
-            {recent.map((ws) => {
-              const m = tenantMetrics(ws);
-              return (
-                <Link
-                  key={ws.id}
-                  href="/host/tenants"
-                  className="flex items-center gap-3 rounded-xl p-2 transition-colors hover:bg-muted/60"
-                >
-                  <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl text-sm font-bold text-white" style={{ background: ws.color }}>
-                    {ws.name.charAt(0)}
-                  </span>
-                  <div className="min-w-0 flex-1">
-                    <div className="truncate text-sm font-medium">{ws.name}</div>
-                    <div className="truncate text-xs text-muted-foreground">
-                      {m.members} members · {m.projects} projects · joined {ws.createdAt}
-                    </div>
-                  </div>
-                  <span className="flex items-center gap-1.5 text-xs">
-                    <CircleDot className="h-3 w-3" style={{ color: planColor(ws.planId) }} />
-                    <Badge tone={statusTone[ws.status]}>{statusLabel[ws.status]}</Badge>
-                  </span>
-                </Link>
-              );
-            })}
+        <Card className="lg:col-span-2">
+          <CardHeader><CardTitle>Manage the platform</CardTitle></CardHeader>
+          <CardContent className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+            {[
+              { href: "/host/tenants", label: "Tenants", icon: Building2 },
+              { href: "/host/billing", label: "Billing", icon: DollarSign },
+              { href: "/host/users", label: "Users", icon: Users },
+            ].map(({ href, label, icon: Icon }) => (
+              <Link key={href} href={href} className="flex items-center gap-3 rounded-xl border border-border p-3 transition-colors hover:bg-muted/60">
+                <span className="flex h-9 w-9 items-center justify-center rounded-lg bg-accent text-accent-foreground"><Icon className="h-4 w-4" /></span>
+                <span className="text-sm font-medium">{label}</span>
+                <ArrowRight className="ml-auto h-4 w-4 text-muted-foreground" />
+              </Link>
+            ))}
           </CardContent>
         </Card>
       </div>

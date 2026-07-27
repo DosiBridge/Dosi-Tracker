@@ -69,6 +69,10 @@ public abstract class PlatformAppServiceTests<TStartupModule> : TrackerApplicati
         overview.PendingInvoices.ShouldBe(1);
         overview.TotalInvoiced.ShouldBe(12m);
         overview.TenantCount.ShouldBeGreaterThanOrEqualTo(0);
+        // No project members seeded -> each subscription bills the minimum one seat.
+        // Starter is $6/user, two subscriptions => $12 MRR across 2 seats.
+        overview.PaidSeats.ShouldBe(2);
+        overview.Mrr.ShouldBe(12m);
     }
 
     [Fact]

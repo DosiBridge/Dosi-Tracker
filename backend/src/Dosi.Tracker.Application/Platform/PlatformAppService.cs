@@ -4,6 +4,7 @@ using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Authorization;
 using Dosi.Tracker.Billing;
+using Dosi.Tracker.Projects;
 using Dosi.Tracker.SaaS;
 using Volo.Abp.Application.Dtos;
 using Volo.Abp.Authorization;
@@ -23,6 +24,7 @@ public class PlatformAppService : TrackerAppService, IPlatformAppService
     private readonly IRepository<Subscription, Guid> _subscriptionRepository;
     private readonly IRepository<Plan, Guid> _planRepository;
     private readonly IRepository<Invoice, Guid> _invoiceRepository;
+    private readonly IRepository<ProjectMember, Guid> _memberRepository;
     private readonly IIdentityUserRepository _userRepository;
     private readonly IDataFilter _dataFilter;
     private readonly IGuidGenerator _guidGenerator;
@@ -32,6 +34,7 @@ public class PlatformAppService : TrackerAppService, IPlatformAppService
         IRepository<Subscription, Guid> subscriptionRepository,
         IRepository<Plan, Guid> planRepository,
         IRepository<Invoice, Guid> invoiceRepository,
+        IRepository<ProjectMember, Guid> memberRepository,
         IIdentityUserRepository userRepository,
         IDataFilter dataFilter,
         IGuidGenerator guidGenerator)
@@ -40,6 +43,7 @@ public class PlatformAppService : TrackerAppService, IPlatformAppService
         _subscriptionRepository = subscriptionRepository;
         _planRepository = planRepository;
         _invoiceRepository = invoiceRepository;
+        _memberRepository = memberRepository;
         _userRepository = userRepository;
         _dataFilter = dataFilter;
         _guidGenerator = guidGenerator;
@@ -57,12 +61,34 @@ public class PlatformAppService : TrackerAppService, IPlatformAppService
         {
             var subscriptions = await _subscriptionRepository.GetListAsync();
             var invoices = await _invoiceRepository.GetListAsync();
+            var members = await _memberRepository.GetListAsync();
+
+            // Occupied (billable) seats per tenant = distinct members holding a project seat there.
+            var seatsByTenant = members
+                .GroupBy(m => m.TenantId)
+                .ToDictionary(g => g.Key, g => g.Select(m => m.UserId).Distinct().Count());
+
+            decimal mrr = 0m;
+            var paidSeats = 0;
+            foreach (var sub in subscriptions.Where(s => s.Status == "active" || s.Status == "trialing"))
+            {
+                var plan = plans.FirstOrDefault(p => p.Id == sub.PlanId);
+                if (plan is null)
+                {
+                    continue;
+                }
+                var seats = Math.Max(1, seatsByTenant.GetValueOrDefault(sub.TenantId));
+                mrr += plan.PricePerUser * seats;
+                paidSeats += seats;
+            }
 
             return new PlatformOverviewDto
             {
                 TenantCount = tenantCount,
                 ActiveSubscriptions = subscriptions.Count(s => s.Status == "active"),
                 TrialingSubscriptions = subscriptions.Count(s => s.Status == "trialing"),
+                Mrr = mrr,
+                PaidSeats = paidSeats,
                 TotalInvoiced = invoices.Sum(i => i.Amount),
                 PendingInvoices = invoices.Count(i => i.Status == "pending"),
                 Plans = plans
