@@ -1,16 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// Credentials/token returned by the backend after login.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AuthSession {
-    pub access_token: String,
-    pub user_id: String,
-    pub display_name: String,
-    pub expires_at: DateTime<Utc>,
-}
-
 /// A project the current user may track against, with server-side permissions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

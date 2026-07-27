@@ -51,18 +51,37 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Config
 config = "0.14"
 
-# Windows-specific APIs (active window title / process, autostart)
+# Desktop UI: system tray + a small native window (login, status, settings).
+# Minimal feature set on purpose: the OpenGL (glow) backend instead of wgpu, and
+# no Linux windowing/accessibility stacks — this is a lightweight Windows agent,
+# so binary size and idle memory matter more than GPU features.
+eframe = { version = "0.35.0", default-features = false, features = ["glow", "default_fonts"] }
+egui = { version = "0.35.0", default-features = false }
+tray-icon = "0.24.1"
+
+# Per-user config/credential directory resolution
+dirs = "6.0.0"
+tracing-appender = "0.2.5"
+
+# Windows-specific APIs (active window title / process, autostart, DPAPI)
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Threading",
     "Win32_System_ProcessStatus",
+    "Win32_System_Registry",            # autostart (HKCU Run key)
+    "Win32_Security_Cryptography",      # DPAPI credential encryption
 ] }
+
+[dev-dependencies]
+# Property-based testing for invariant-heavy logic (the offline queue).
+proptest = "1"
 
 [profile.release]
 opt-level = "z"      # optimize for small binary size
 lto = true           # link-time optimization
 codegen-units = 1
 strip = true         # strip symbols -> smaller, lower footprint
-panic = "abort"      # smaller binary, no unwinding machinery
+# NOTE: no `panic = "abort"` — eframe/winit rely on unwinding, and aborting on a
+# panic in the UI thread would kill the tracker with no chance to flush the queue.

@@ -1,5 +1,5 @@
 {
-  "apiBaseURL": "https://localhost:44300",
+  "apiBaseURL": "https://localhost:44342",
   "intervalMinutes": 10,
   "capture": {
     "screenshot": true,

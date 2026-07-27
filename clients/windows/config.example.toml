@@ -1,7 +1,7 @@
 # Copy to `config.toml` next to the executable and edit.
 # Any value can also be set via env vars, e.g. DOSI__API_BASE_URL=...
 
-api_base_url = "https://localhost:44300"
+api_base_url = "https://localhost:44342"
 
 # Snapshot interval in minutes (clamped to 5..=60). Higher = lower CPU/battery.
 interval_minutes = 10

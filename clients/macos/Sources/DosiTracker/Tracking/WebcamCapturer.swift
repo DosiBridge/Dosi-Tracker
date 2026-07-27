@@ -10,6 +10,16 @@ import CoreImage
 final class WebcamCapturer: NSObject {
     private let ciContext = CIContext()
 
+    /// AVCaptureVideoDataOutput holds its delegate **weakly**, so we must keep the
+    /// FrameHandler (and its session) alive on the capturer itself until a frame
+    /// arrives — otherwise it deallocates immediately, tears down the session, and
+    /// the continuation never resumes (hanging the whole agent).
+    private var activeHandler: FrameHandler?
+    private let lock = NSLock()
+
+    /// Hard cap so a camera that never delivers a frame cannot block the agent forever.
+    private let timeout: TimeInterval = 10
+
     func captureJpgBase64() async throws -> String {
         try await withCheckedThrowingContinuation { continuation in
             guard let device = AVCaptureDevice.default(.builtInWideAngleCamera,
@@ -31,19 +41,38 @@ final class WebcamCapturer: NSObject {
                 session.addInput(input)
 
                 let output = AVCaptureVideoDataOutput()
-                let handler = FrameHandler(context: ciContext) { result in
-                    session.stopRunning()
+
+                // Resume exactly once and release the retained handler/session.
+                let finish: (Result<String, Error>) -> Void = { [weak self] result in
+                    guard let self else { return }
+                    let handlerToStop: FrameHandler? = self.lock.guarded {
+                        let h = self.activeHandler
+                        self.activeHandler = nil
+                        return h
+                    }
+                    guard let handlerToStop else { return } // already finished
+                    handlerToStop.session?.stopRunning()
                     continuation.resume(with: result)
                 }
-                output.setSampleBufferDelegate(handler,
-                                               queue: DispatchQueue(label: "dosi.webcam"))
+
+                let handler = FrameHandler(context: ciContext, completion: finish)
+                handler.session = session
+                output.setSampleBufferDelegate(handler, queue: DispatchQueue(label: "dosi.webcam"))
+
                 guard session.canAddOutput(output) else {
                     continuation.resume(throwing: Self.error("cannot add camera output"))
                     return
                 }
                 session.addOutput(output)
-                // Keep a strong ref alive until the frame arrives.
-                handler.retainSession(session)
+
+                // Strong reference on the capturer keeps the delegate alive for the capture.
+                lock.guarded { self.activeHandler = handler }
+
+                // Watchdog: if no frame arrives in time, fail rather than hang forever.
+                DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+                    finish(.failure(Self.error("timed out waiting for a webcam frame")))
+                }
+
                 session.startRunning()
             } catch {
                 continuation.resume(throwing: error)
@@ -60,7 +89,8 @@ final class WebcamCapturer: NSObject {
     private final class FrameHandler: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
         private let context: CIContext
         private let completion: (Result<String, Error>) -> Void
-        private var session: AVCaptureSession?
+        fileprivate var session: AVCaptureSession?
+        private let doneLock = NSLock()
         private var done = false
 
         init(context: CIContext, completion: @escaping (Result<String, Error>) -> Void) {
@@ -68,13 +98,13 @@ final class WebcamCapturer: NSObject {
             self.completion = completion
         }
 
-        func retainSession(_ session: AVCaptureSession) { self.session = session }
-
         func captureOutput(_ output: AVCaptureOutput,
                            didOutput sampleBuffer: CMSampleBuffer,
                            from connection: AVCaptureConnection) {
-            guard !done else { return }
+            doneLock.lock()
+            if done { doneLock.unlock(); return }
             done = true
+            doneLock.unlock()
 
             guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
                 completion(.failure(WebcamCapturer.error("no pixel buffer")))
@@ -91,5 +121,12 @@ final class WebcamCapturer: NSObject {
             }
             completion(.success(jpeg.base64EncodedString()))
         }
+    }
+}
+
+private extension NSLock {
+    func guarded<T>(_ body: () -> T) -> T {
+        lock(); defer { unlock() }
+        return body()
     }
 }

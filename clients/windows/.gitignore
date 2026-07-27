@@ -1,6 +1,7 @@
 /target
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock IS committed: this is a binary crate, so the lockfile pins exact
+# dependency versions for reproducible builds across machines and CI.
 config.toml
 *.db
 *.db-journal

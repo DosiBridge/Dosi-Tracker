@@ -1,12 +1,7 @@
 import Foundation
 
-struct AuthSession: Codable {
-    let accessToken: String
-    let userId: String
-    let displayName: String
-    let expiresAt: Date
-}
-
+/// A project the current user may track against, as returned by
+/// `GET /api/app/project/my-projects` (plain JSON array).
 struct Project: Codable {
     let id: String
     let title: String
@@ -26,6 +21,9 @@ struct WindowInfo: Codable {
 
 /// One tracked time block uploaded to the backend.
 struct Activity: Codable {
+    /// Client-generated idempotency key — the backend deduplicates retries on it
+    /// and rejects uploads without one.
+    let clientActivityId: String
     let projectId: String
     let startedAt: Date
     let endedAt: Date
