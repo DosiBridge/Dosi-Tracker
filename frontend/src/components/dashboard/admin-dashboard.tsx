@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import Link from "next/link";
 import { Clock, Users, Gauge, Camera, ArrowRight, Sparkles } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -26,6 +27,27 @@ import {
 import { brand, greeting } from "@/lib/brand";
 import { formatDuration } from "@/lib/utils";
 import { Reveal, Stagger } from "@/components/motion/reveal";
+import { getApi } from "@/hooks/useApi";
+
+/** Shapes returned by /api/app/reporting (live mode). */
+interface LiveReportSummary {
+  totalActivities: number;
+  totalTrackedMinutes: number;
+  averageProductivity: number;
+  totalMouseClicks: number;
+  totalKeyboardHits: number;
+  perUser: { userId: string; activityCount: number; trackedMinutes: number; averageProductivity: number }[];
+  perProject: { projectId: string; activityCount: number; trackedMinutes: number; averageProductivity: number }[];
+}
+
+interface LiveDailyPoint {
+  date: string;
+  activityCount: number;
+  trackedMinutes: number;
+  averageProductivity: number;
+  mouseClicks: number;
+  keyboardHits: number;
+}
 
 function agoLabel(iso: string) {
   const mins = Math.round((NOW.getTime() - new Date(iso).getTime()) / 60000);
@@ -36,6 +58,49 @@ function agoLabel(iso: string) {
 }
 
 export function AdminDashboard({ userName, isOwner }: { userName: string; isOwner: boolean }) {
+  // LIVE MODE: only when a real session token exists; otherwise the mock
+  // dataset below renders exactly as before (demo mode).
+  const [live, setLive] = useState<{ summary: LiveReportSummary; series: LiveDailyPoint[] } | null>(null);
+  const [liveLoading, setLiveLoading] = useState(false);
+  const [liveError, setLiveError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !localStorage.getItem("dosi-token")) return;
+    let cancelled = false;
+    setLiveLoading(true);
+    setLiveError(null);
+    const to = new Date();
+    const from = new Date(to.getTime() - 7 * 24 * 60 * 60 * 1000);
+    const range = `From=${encodeURIComponent(from.toISOString())}&To=${encodeURIComponent(to.toISOString())}`;
+    Promise.all([
+      getApi(`/api/app/reporting/summary?${range}`) as Promise<LiveReportSummary>,
+      getApi(`/api/app/reporting/daily-series?${range}`) as Promise<LiveDailyPoint[]>,
+    ])
+      .then(([summaryRes, seriesRes]) => {
+        if (cancelled) return;
+        setLive({ summary: summaryRes, series: Array.isArray(seriesRes) ? seriesRes : [] });
+      })
+      .catch(() => {
+        if (!cancelled) setLiveError("Couldn't load live team stats — showing demo data.");
+      })
+      .finally(() => {
+        if (!cancelled) setLiveLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const liveSummary = live?.summary ?? null;
+  const trendData =
+    live && live.series.length > 0
+      ? live.series.map((d) => ({
+          day: new Date(d.date).toLocaleDateString(undefined, { weekday: "short" }),
+          tracked: Math.round(d.trackedMinutes),
+          productive: Math.round((d.trackedMinutes * d.averageProductivity) / 100),
+        }))
+      : weeklyTrend;
+
   const dist = projectDistribution();
   const leaderboard = [...users]
     .filter((u) => u.productivity > 0)
@@ -52,12 +117,14 @@ export function AdminDashboard({ userName, isOwner }: { userName: string; isOwne
             <h1 className="page-title">{greeting(userName)}</h1>
             <Badge tone="success" className="gap-1.5">
               <span className="h-1.5 w-1.5 rounded-full bg-success live-dot" />
-              {summary.activeMembers} tracking now
+              {liveSummary ? `${liveSummary.perUser.length} active this week` : `${summary.activeMembers} tracking now`}
             </Badge>
           </div>
           <p className="mt-1 text-sm text-muted-foreground">
             {isOwner ? "Organization overview for today." : "What your team is working on today."}
           </p>
+          {liveLoading && <p className="mt-1 text-xs text-muted-foreground/70">Loading live team stats…</p>}
+          {liveError && <p className="mt-1 text-xs text-muted-foreground/70">{liveError}</p>}
         </div>
         <div className="flex items-center gap-2">
           <Link href="/reports/weekly">
@@ -79,10 +146,34 @@ export function AdminDashboard({ userName, isOwner }: { userName: string; isOwne
       </Reveal>
 
       <Stagger className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4" baseDelay={55}>
-        <StatCard label="Tracked today" value={formatDuration(summary.totalTrackedToday)} icon={Clock} accent={brand.primary} sub="across all members" />
-        <StatCard label="Active members" value={`${summary.activeMembers}/${summary.totalMembers}`} icon={Users} accent={brand.info} sub="currently online" />
-        <StatCard label="Avg productivity" value={`${summary.avgProductivity}%`} icon={Gauge} accent={brand.success} sub="team average" />
-        <StatCard label="Captures today" value={String(summary.screenshotsToday)} icon={Camera} accent={brand.pink} sub="screen captures" />
+        <StatCard
+          label={liveSummary ? "Tracked (7d)" : "Tracked today"}
+          value={liveSummary ? formatDuration(Math.round(liveSummary.totalTrackedMinutes)) : formatDuration(summary.totalTrackedToday)}
+          icon={Clock}
+          accent={brand.primary}
+          sub="across all members"
+        />
+        <StatCard
+          label="Active members"
+          value={liveSummary ? String(liveSummary.perUser.length) : `${summary.activeMembers}/${summary.totalMembers}`}
+          icon={Users}
+          accent={brand.info}
+          sub={liveSummary ? "active in last 7 days" : "currently online"}
+        />
+        <StatCard
+          label="Avg productivity"
+          value={`${liveSummary ? Math.round(liveSummary.averageProductivity) : summary.avgProductivity}%`}
+          icon={Gauge}
+          accent={brand.success}
+          sub="team average"
+        />
+        <StatCard
+          label={liveSummary ? "Activities (7d)" : "Captures today"}
+          value={liveSummary ? String(liveSummary.totalActivities) : String(summary.screenshotsToday)}
+          icon={Camera}
+          accent={brand.pink}
+          sub={liveSummary ? "tracked sessions" : "screen captures"}
+        />
       </Stagger>
 
       <Reveal delay={120}>
@@ -95,7 +186,7 @@ export function AdminDashboard({ userName, isOwner }: { userName: string; isOwne
               <span className="flex items-center gap-1.5"><span className="h-2 w-2 rounded-full bg-success" /> Productive</span>
             </div>
           </CardHeader>
-          <CardContent><ActivityTrendChart data={weeklyTrend} /></CardContent>
+          <CardContent><ActivityTrendChart data={trendData} /></CardContent>
         </Card>
 
         <Card>

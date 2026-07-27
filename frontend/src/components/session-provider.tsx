@@ -5,7 +5,7 @@ import { users as primaryUsers } from "@/lib/mock-data";
 import { datasetFor, setActiveWorkspace, hydrateLiveBackendData } from "@/lib/tenant-data";
 import { primaryWorkspace, workspaces as seedWorkspaces, type PlanId, type Workspace } from "@/lib/saas-data";
 import type { User, Activity } from "@/lib/types";
-import { getApi } from "@/hooks/useApi";
+import { getApi, logoutApi } from "@/hooks/useApi";
 
 /** The platform operator. Not a member of any tenant. */
 export const hostUser: User = {
@@ -79,21 +79,31 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     async function hydrate() {
       try {
-        const [apiProjects, apiActivities, myProfile] = await Promise.all([
+        const [apiProjects, apiActivities, appConfig] = await Promise.all([
           getApi('/api/app/project').catch(() => []),
           getApi('/api/app/activity').catch(() => []),
-          getApi('/api/account/my-profile').catch(() => null)
+          getApi('/api/abp/application-configuration?IncludeLocalizationResources=false').catch(() => null)
         ]);
-        
-        if (myProfile) {
-          // If we got a real backend user, override the mock user in our state
-          setUserId(myProfile.id);
+
+        const currentUser = appConfig?.currentUser;
+        if (currentUser?.isAuthenticated) {
+          // Map the real ABP identity onto the app's role model:
+          // host-side users run the platform; a tenant's "admin" role is the
+          // workspace owner; everyone else tracks time as a worker.
+          const roles: string[] = currentUser.roles ?? [];
+          const role = currentUser.tenantId == null
+            ? "host"
+            : roles.includes("admin")
+              ? "owner"
+              : "worker";
+
+          setUserId(currentUser.id);
           const mappedUser: User = {
-            id: myProfile.id,
-            name: myProfile.name || myProfile.userName,
-            email: myProfile.email,
-            role: "admin", // Standardize role for the demo
-            designation: "Tracker User",
+            id: currentUser.id,
+            name: currentUser.name || currentUser.userName,
+            email: currentUser.email,
+            role,
+            designation: role === "host" ? "Host · Super Admin" : role === "owner" ? "Workspace Owner" : "Member",
             status: "active",
             timezone: "UTC",
             trackedToday: 0,
@@ -252,6 +262,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
   };
 
   const logout = () => {
+    logoutApi(); // Clear the real backend bearer token, not just the mock session.
     try {
       localStorage.removeItem(USER_KEY);
       localStorage.setItem(IMPERSONATE_KEY, "0");

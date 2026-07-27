@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Bar, BarChart, Cell, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { FolderKanban, Clock, Users, DollarSign } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -12,10 +12,85 @@ import { activities, projects, userById } from "@/lib/tenant-data";
 import { filterActivitiesByRange, rangeForKey, type RangeKey } from "@/lib/reports-data";
 import { exportRecords } from "@/lib/export";
 import { formatDuration } from "@/lib/utils";
+import { getApi } from "@/hooks/useApi";
 import type { Project } from "@/lib/types";
 import type { ResolvedRange } from "./date-range-picker";
 
 const BLENDED_RATE = 48; // $/hr for cost estimate
+
+/* ---- Live (API) shapes ---- */
+
+interface LivePerProject {
+  projectId: string;
+  trackedMinutes: number;
+}
+
+interface LiveSummary {
+  perProject: LivePerProject[];
+}
+
+interface ApiProject {
+  id: string;
+  title: string;
+  color?: string | null;
+  intervalMinutes?: number;
+  isArchived?: boolean;
+}
+
+/** Map a real backend project onto the demo Project view-model the report markup expects.
+ *  Members and all-time totals aren't carried by these endpoints, so they degrade to empty in
+ *  live mode (loggedTotal reflects the queried window). */
+function toProjectView(p: ApiProject, trackedMinutes: number): Project {
+  return {
+    id: p.id,
+    title: p.title,
+    description: "",
+    color: p.color ?? "#0d9488",
+    archived: !!p.isArchived,
+    intervalMinutes: p.intervalMinutes ?? 10,
+    permissions: {
+      screenshot: false,
+      webcam: false,
+      keyboard: false,
+      mouse: false,
+      activeWindow: false,
+      runningPrograms: false,
+    },
+    memberIds: [],
+    createdAt: "",
+    loggedThisWeek: 0,
+    loggedThisMonth: 0,
+    loggedTotal: trackedMinutes,
+  };
+}
+
+/** Live queries pivot on the real clock; mirrors rangeForKey's per-preset logic. */
+function liveRangeFor(key: RangeKey): { from: Date; to: Date } {
+  const to = new Date();
+  const from = new Date();
+  switch (key) {
+    case "today":
+      from.setHours(0, 0, 0, 0);
+      break;
+    case "yesterday":
+      from.setDate(from.getDate() - 1);
+      from.setHours(0, 0, 0, 0);
+      to.setDate(to.getDate() - 1);
+      to.setHours(23, 59, 59, 999);
+      break;
+    case "7d":
+      from.setDate(from.getDate() - 7);
+      break;
+    case "month":
+      from.setDate(1);
+      from.setHours(0, 0, 0, 0);
+      break;
+    default: // "30d" and "custom" fall back to the last 30 days
+      from.setDate(from.getDate() - 30);
+      break;
+  }
+  return { from, to };
+}
 
 const tooltipStyle = {
   borderRadius: 12,
@@ -29,9 +104,41 @@ export function ProjectsReport() {
   const [rangeKey, setRangeKey] = useState<RangeKey>("30d");
   const [range, setRange] = useState<ResolvedRange>(() => ({ key: "30d", ...rangeForKey("30d") }));
 
-  const rows = useMemo(() => projects.filter((p) => !p.archived), []);
+  const [liveSummary, setLiveSummary] = useState<LiveSummary | null>(null);
+  const [liveProjects, setLiveProjects] = useState<ApiProject[] | null>(null);
+  const [liveLoading, setLiveLoading] = useState(false);
+  const [liveError, setLiveError] = useState(false);
 
-  const projectMinutes = useMemo(() => {
+  const loadLive = useCallback(async () => {
+    setLiveLoading(true);
+    setLiveError(false);
+    try {
+      const { from, to } = liveRangeFor(range.key);
+      const qs = new URLSearchParams({ From: from.toISOString(), To: to.toISOString() });
+      const [summary, projectList] = await Promise.all([
+        getApi(`/api/app/reporting/summary?${qs.toString()}`),
+        getApi("/api/app/project"),
+      ]);
+      setLiveSummary(summary && typeof summary === "object" ? (summary as LiveSummary) : null);
+      setLiveProjects(Array.isArray(projectList) ? (projectList as ApiProject[]) : []);
+    } catch {
+      setLiveSummary(null); // fall back to the demo dataset below
+      setLiveProjects(null);
+      setLiveError(true);
+    } finally {
+      setLiveLoading(false);
+    }
+  }, [range]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !localStorage.getItem("dosi-token")) return;
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- data fetch defers its own setState; see docs/QUALITY.md §10
+    loadLive();
+  }, [loadLive]);
+
+  const mockRows = useMemo(() => projects.filter((p) => !p.archived), []);
+
+  const mockMinutes = useMemo(() => {
     const acts = filterActivitiesByRange(activities, range.from, range.to);
     const map = new Map<string, number>();
     acts.forEach((a) => {
@@ -41,6 +148,27 @@ export function ProjectsReport() {
     });
     return map;
   }, [range]);
+
+  const liveMinutes = useMemo<Map<string, number> | null>(() => {
+    if (!liveSummary) return null;
+    const map = new Map<string, number>();
+    (Array.isArray(liveSummary.perProject) ? liveSummary.perProject : []).forEach((p) => {
+      map.set(p.projectId, Math.round(p.trackedMinutes));
+    });
+    return map;
+  }, [liveSummary]);
+
+  const liveRows = useMemo<Project[] | null>(() => {
+    if (!liveProjects || !liveMinutes) return null;
+    return liveProjects
+      .filter((p) => !p.isArchived)
+      .map((p) => toProjectView(p, liveMinutes.get(p.id) ?? 0));
+  }, [liveProjects, liveMinutes]);
+
+  const rows = liveRows ?? mockRows;
+  const projectMinutes = liveMinutes ?? mockMinutes;
+  const showLiveLoading = liveLoading && liveRows === null;
+  const showLiveError = liveError && liveRows === null;
 
   const minutesOf = (p: Project) => projectMinutes.get(p.id) ?? 0;
 
@@ -93,6 +221,17 @@ export function ProjectsReport() {
       actions={<ExportMenu onExportCSV={doExport} />}
     >
       <FilterBar rangeKey={rangeKey} onRange={onRange} />
+
+      {showLiveLoading && (
+        <div className="rounded-lg border border-border bg-muted px-3 py-2 text-xs text-muted-foreground">
+          Loading live report data…
+        </div>
+      )}
+      {showLiveError && (
+        <div className="rounded-lg border border-border bg-muted px-3 py-2 text-xs text-muted-foreground">
+          Live data unavailable right now — showing demo data.
+        </div>
+      )}
 
       <KpiGrid>
         <Kpi label="Total time" value={formatDuration(totalMinutes)} icon={Clock} tone="#6d5efc" sub={range.label} />

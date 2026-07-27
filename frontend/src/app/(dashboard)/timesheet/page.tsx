@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { ChevronLeft, ChevronRight, Clock, TrendingUp } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { PageHeader, PageStack } from "@/components/ui/page-header";
@@ -11,8 +11,27 @@ import { users } from "@/lib/tenant-data";
 import { useSession } from "@/components/session-provider";
 import { trackedMembers } from "@/lib/roles";
 import { cn, formatDuration } from "@/lib/utils";
+import { getApi } from "@/hooks/useApi";
 
 const days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+interface DailySeriesPoint {
+  date: string;
+  trackedMinutes: number;
+}
+
+/** Mon 00:00:00 UTC → Sun 23:59:59.999 UTC for the week `offset` weeks from now. */
+function weekRangeUtc(offset: number): { from: Date; to: Date } {
+  const now = new Date();
+  const sinceMonday = (now.getUTCDay() + 6) % 7;
+  const from = new Date(
+    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - sinceMonday + offset * 7)
+  );
+  const to = new Date(from.getTime() + 7 * DAY_MS - 1);
+  return { from, to };
+}
 
 function minutesFor(base: number, userIndex: number, dayIndex: number): number {
   const weekdayFactor = [0.95, 1.05, 0.85, 1.1, 1.0, 0.35, 0.15][dayIndex];
@@ -32,17 +51,62 @@ export default function TimesheetPage() {
   const { user } = useSession();
   const [weekOffset, setWeekOffset] = useState(0);
 
+  // LIVE MODE: real per-day minutes for the displayed week (Mon–Sun, UTC).
+  // The server scopes non-admin callers to their own data automatically.
+  const [hasToken, setHasToken] = useState(false);
+  const [liveWeek, setLiveWeek] = useState<number[] | null>(null);
+  const [liveLoading, setLiveLoading] = useState(false);
+  const [liveError, setLiveError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !localStorage.getItem("dosi-token")) return;
+    setHasToken(true);
+    const { from, to } = weekRangeUtc(weekOffset);
+    let cancelled = false;
+    setLiveLoading(true);
+    setLiveError(null);
+    getApi(
+      `/api/app/reporting/daily-series?From=${encodeURIComponent(from.toISOString())}&To=${encodeURIComponent(to.toISOString())}`
+    )
+      .then((series) => {
+        if (cancelled) return;
+        const week = Array<number>(7).fill(0);
+        for (const point of (Array.isArray(series) ? series : []) as DailySeriesPoint[]) {
+          // Anchor on the calendar date only — the backend may serialize without a zone suffix.
+          const dayUtc = Date.parse(`${String(point.date).slice(0, 10)}T00:00:00Z`);
+          const di = Math.floor((dayUtc - from.getTime()) / DAY_MS);
+          if (di >= 0 && di < 7) week[di] = Math.max(0, Math.round(point.trackedMinutes ?? 0));
+        }
+        setLiveWeek(week);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setLiveWeek(null); // fall back to the demo grid below
+        setLiveError("Couldn't load tracked time from the server — showing demo data.");
+      })
+      .finally(() => {
+        if (!cancelled) setLiveLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [weekOffset]);
+
   const trackingUsers = useMemo(() => {
     const all = trackedMembers(users);
     if (user.role === "worker") return all.filter((u) => u.id === user.id);
     return all;
   }, [user]);
 
-  const matrix = trackingUsers.map((u, ui) => days.map((_, di) => minutesFor(u.trackedToday, ui, di)));
+  const liveMatrix = hasToken && liveWeek ? [liveWeek] : null;
+  const live = liveMatrix !== null;
+  const gridUsers = live ? [user] : trackingUsers;
+  const matrix =
+    liveMatrix ?? trackingUsers.map((u, ui) => days.map((_, di) => minutesFor(u.trackedToday, ui, di)));
   const dayTotals = days.map((_, di) => matrix.reduce((s, row) => s + row[di], 0));
   const grandTotal = dayTotals.reduce((s, v) => s + v, 0);
   const busiestDay = days[dayTotals.indexOf(Math.max(...dayTotals))];
-  const selfOnly = user.role === "worker";
+  const selfOnly = user.role === "worker" || live;
 
   return (
     <PageStack>
@@ -100,7 +164,7 @@ export default function TimesheetPage() {
             </div>
             <div>
               <div className="font-display text-lg font-bold tabular-nums">
-                {formatDuration(trackingUsers.length ? Math.round(grandTotal / trackingUsers.length) : 0)}
+                {formatDuration(gridUsers.length ? Math.round(grandTotal / gridUsers.length) : 0)}
               </div>
               <div className="text-xs text-muted-foreground">{selfOnly ? "Daily average" : "Avg per member"}</div>
             </div>
@@ -113,9 +177,15 @@ export default function TimesheetPage() {
           <CardTitle className="text-base">{selfOnly ? "Your week" : "Team heatmap"}</CardTitle>
         </CardHeader>
         <CardContent>
+          {hasToken && liveLoading && (
+            <p className="mb-3 text-xs text-muted-foreground">Loading tracked time…</p>
+          )}
+          {hasToken && !liveLoading && liveError && (
+            <p className="mb-3 text-xs text-danger">{liveError}</p>
+          )}
           {/* Mobile: per-member week cards */}
           <div className="space-y-3 md:hidden">
-            {trackingUsers.map((u, ui) => {
+            {gridUsers.map((u, ui) => {
               const rowTotal = matrix[ui].reduce((s, v) => s + v, 0);
               return (
                 <div key={u.id} className="rounded-xl border border-border p-3">
@@ -167,7 +237,7 @@ export default function TimesheetPage() {
                 </tr>
               </thead>
               <tbody>
-                {trackingUsers.map((u, ui) => {
+                {gridUsers.map((u, ui) => {
                   const rowTotal = matrix[ui].reduce((s, v) => s + v, 0);
                   return (
                     <tr key={u.id} className="group border-t border-border/60">

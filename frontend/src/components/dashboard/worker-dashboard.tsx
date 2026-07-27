@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import Link from "next/link";
 import { Clock, Gauge, FolderKanban, Activity as ActivityIcon, ArrowRight } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -13,7 +14,19 @@ import { activitiesForUser, NOW, productivitySplit, projectById, projects } from
 import { brand, greeting } from "@/lib/brand";
 import { formatDuration } from "@/lib/utils";
 import { Reveal, Stagger } from "@/components/motion/reveal";
+import { getApi } from "@/hooks/useApi";
 import type { User } from "@/lib/types";
+
+/** Slice of /api/app/reporting/summary used by the headline stat cards. */
+interface ReportingSummary {
+  totalActivities: number;
+  totalTrackedMinutes: number;
+  averageProductivity: number;
+}
+
+function summaryEndpoint(from: Date, to: Date) {
+  return `/api/app/reporting/summary?From=${encodeURIComponent(from.toISOString())}&To=${encodeURIComponent(to.toISOString())}`;
+}
 
 function agoLabel(iso: string) {
   const mins = Math.round((NOW.getTime() - new Date(iso).getTime()) / 60000);
@@ -34,6 +47,41 @@ function personalWeek(trackedToday: number) {
 }
 
 export function WorkerDashboard({ user }: { user: User }) {
+  // LIVE MODE: with a token, headline stats come from the reporting summary
+  // (non-admins are auto-scoped server-side). Without one, the mock path below
+  // renders exactly as before.
+  const [liveToday, setLiveToday] = useState<ReportingSummary | null>(null);
+  const [liveWeek, setLiveWeek] = useState<ReportingSummary | null>(null);
+  const [liveLoading, setLiveLoading] = useState(false);
+  const [liveError, setLiveError] = useState(false);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !localStorage.getItem("dosi-token")) return;
+    let cancelled = false;
+    const now = new Date();
+    const todayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+    const weekStart = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+    setLiveLoading(true);
+    Promise.all([
+      getApi(summaryEndpoint(todayStart, now)) as Promise<ReportingSummary>,
+      getApi(summaryEndpoint(weekStart, now)) as Promise<ReportingSummary>,
+    ])
+      .then(([today, week]) => {
+        if (cancelled) return;
+        setLiveToday(today);
+        setLiveWeek(week);
+      })
+      .catch(() => {
+        if (!cancelled) setLiveError(true); // fall back to the demo dataset below
+      })
+      .finally(() => {
+        if (!cancelled) setLiveLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const myActivities = activitiesForUser(user.id);
   const myProjects = projects.filter((p) => !p.archived && p.memberIds.includes(user.id));
   const feed = myActivities.slice(0, 6);
@@ -79,11 +127,38 @@ export function WorkerDashboard({ user }: { user: User }) {
       </Reveal>
 
       <Stagger className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4" baseDelay={55}>
-        <StatCard label="Tracked today" value={formatDuration(user.trackedToday)} icon={Clock} accent={brand.primary} sub="your time" />
-        <StatCard label="Activity level" value={`${user.productivity}%`} icon={Gauge} accent={brand.success} sub="today" />
-        <StatCard label="My projects" value={String(myProjects.length)} icon={FolderKanban} accent={brand.info} sub="active" />
-        <StatCard label="Sessions" value={String(myActivities.length)} icon={ActivityIcon} accent={brand.pink} sub="captured" />
+        <StatCard
+          label="Tracked today"
+          value={liveLoading ? "…" : liveToday ? formatDuration(liveToday.totalTrackedMinutes) : formatDuration(user.trackedToday)}
+          icon={Clock}
+          accent={brand.primary}
+          sub="your time"
+        />
+        <StatCard
+          label="Activity level"
+          value={liveLoading ? "…" : liveToday ? `${Math.round(liveToday.averageProductivity)}%` : `${user.productivity}%`}
+          icon={Gauge}
+          accent={brand.success}
+          sub="today"
+        />
+        <StatCard
+          label={liveLoading || liveWeek ? "This week" : "My projects"}
+          value={liveLoading ? "…" : liveWeek ? formatDuration(liveWeek.totalTrackedMinutes) : String(myProjects.length)}
+          icon={FolderKanban}
+          accent={brand.info}
+          sub={liveLoading || liveWeek ? "last 7 days" : "active"}
+        />
+        <StatCard
+          label="Sessions"
+          value={liveLoading ? "…" : liveWeek ? String(liveWeek.totalActivities) : String(myActivities.length)}
+          icon={ActivityIcon}
+          accent={brand.pink}
+          sub={liveLoading || liveWeek ? "last 7 days" : "captured"}
+        />
       </Stagger>
+      {liveError && (
+        <p className="text-xs text-muted-foreground">Live stats unavailable — showing demo data.</p>
+      )}
 
       <Reveal delay={100}>
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
