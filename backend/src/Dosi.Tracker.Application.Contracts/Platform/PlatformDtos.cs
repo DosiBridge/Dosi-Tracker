@@ -39,6 +39,17 @@ public class PlatformInvoiceDto
     public DateTime DueDate { get; set; }
 }
 
+/// <summary>A user account resolved to its owning tenant, for the cross-tenant users view.</summary>
+public class PlatformUserDto
+{
+    public Guid Id { get; set; }
+    public string UserName { get; set; } = string.Empty;
+    public string? Email { get; set; }
+    public string? Name { get; set; }
+    public Guid? TenantId { get; set; }
+    public string TenantName { get; set; } = string.Empty;
+}
+
 public class CreateUpdatePlanDto
 {
     [Required]

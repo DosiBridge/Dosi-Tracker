@@ -17,6 +17,8 @@ public interface IPlatformAppService : IApplicationService
 
     Task<PagedResultDto<PlatformInvoiceDto>> GetInvoicesAsync(PagedAndSortedResultRequestDto input);
 
+    Task<PagedResultDto<PlatformUserDto>> GetUsersAsync(PagedAndSortedResultRequestDto input);
+
     Task<ListResultDto<PlanDto>> GetPlansAsync();
 
     Task<PlanDto> CreatePlanAsync(CreateUpdatePlanDto input);

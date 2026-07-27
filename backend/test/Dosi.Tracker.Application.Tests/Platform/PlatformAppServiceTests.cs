@@ -96,6 +96,24 @@ public abstract class PlatformAppServiceTests<TStartupModule> : TrackerApplicati
     }
 
     [Fact]
+    public async Task Users_Should_List_Accounts_Across_Tenants_With_Their_Workspace()
+    {
+        // Registering a workspace provisions a tenant with its own admin user.
+        await GetRequiredService<IWorkspaceAppService>().RegisterAsync(new RegisterWorkspaceDto
+        {
+            Name = "acme",
+            AdminEmail = "owner@acme.test",
+            AdminPassword = "1q2w3E*acme",
+            PlanName = "Free"
+        });
+
+        var page = await _platform.GetUsersAsync(new PagedAndSortedResultRequestDto { MaxResultCount = 100 });
+
+        page.TotalCount.ShouldBeGreaterThan(0);
+        page.Items.ShouldContain(u => u.Email == "owner@acme.test" && u.TenantName == "acme");
+    }
+
+    [Fact]
     public async Task Platform_Console_Should_Be_Refused_To_A_Tenant_Scoped_Caller()
     {
         using (_currentTenant.Change(Guid.NewGuid()))
@@ -103,6 +121,8 @@ public abstract class PlatformAppServiceTests<TStartupModule> : TrackerApplicati
             await Should.ThrowAsync<AbpAuthorizationException>(() => _platform.GetOverviewAsync());
             await Should.ThrowAsync<AbpAuthorizationException>(
                 () => _platform.GetInvoicesAsync(new PagedAndSortedResultRequestDto()));
+            await Should.ThrowAsync<AbpAuthorizationException>(
+                () => _platform.GetUsersAsync(new PagedAndSortedResultRequestDto()));
         }
     }
 }

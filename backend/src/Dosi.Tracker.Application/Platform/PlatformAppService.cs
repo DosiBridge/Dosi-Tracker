@@ -10,6 +10,7 @@ using Volo.Abp.Authorization;
 using Volo.Abp.Data;
 using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Guids;
+using Volo.Abp.Identity;
 using Volo.Abp.MultiTenancy;
 using Volo.Abp.TenantManagement;
 
@@ -22,6 +23,7 @@ public class PlatformAppService : TrackerAppService, IPlatformAppService
     private readonly IRepository<Subscription, Guid> _subscriptionRepository;
     private readonly IRepository<Plan, Guid> _planRepository;
     private readonly IRepository<Invoice, Guid> _invoiceRepository;
+    private readonly IIdentityUserRepository _userRepository;
     private readonly IDataFilter _dataFilter;
     private readonly IGuidGenerator _guidGenerator;
 
@@ -30,6 +32,7 @@ public class PlatformAppService : TrackerAppService, IPlatformAppService
         IRepository<Subscription, Guid> subscriptionRepository,
         IRepository<Plan, Guid> planRepository,
         IRepository<Invoice, Guid> invoiceRepository,
+        IIdentityUserRepository userRepository,
         IDataFilter dataFilter,
         IGuidGenerator guidGenerator)
     {
@@ -37,6 +40,7 @@ public class PlatformAppService : TrackerAppService, IPlatformAppService
         _subscriptionRepository = subscriptionRepository;
         _planRepository = planRepository;
         _invoiceRepository = invoiceRepository;
+        _userRepository = userRepository;
         _dataFilter = dataFilter;
         _guidGenerator = guidGenerator;
     }
@@ -99,6 +103,34 @@ public class PlatformAppService : TrackerAppService, IPlatformAppService
                 .ToList();
 
             return new PagedResultDto<PlatformInvoiceDto>(all.Count, page);
+        }
+    }
+
+    public async Task<PagedResultDto<PlatformUserDto>> GetUsersAsync(PagedAndSortedResultRequestDto input)
+    {
+        EnsureHost();
+
+        var tenantNames = (await _tenantRepository.GetListAsync()).ToDictionary(t => t.Id, t => t.Name);
+
+        using (_dataFilter.Disable<IMultiTenant>())
+        {
+            var count = await _userRepository.GetCountAsync();
+            var users = await _userRepository.GetListAsync(
+                sorting: nameof(IdentityUser.UserName),
+                maxResultCount: input.MaxResultCount,
+                skipCount: input.SkipCount);
+
+            var items = users.Select(u => new PlatformUserDto
+            {
+                Id = u.Id,
+                UserName = u.UserName,
+                Email = u.Email,
+                Name = u.Name,
+                TenantId = u.TenantId,
+                TenantName = u.TenantId.HasValue && tenantNames.TryGetValue(u.TenantId.Value, out var n) ? n : "Host"
+            }).ToList();
+
+            return new PagedResultDto<PlatformUserDto>(count, items);
         }
     }
 
