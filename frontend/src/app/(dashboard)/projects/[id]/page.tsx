@@ -26,6 +26,7 @@ import { Ring } from "@/components/ui/ring";
 import { PageStack } from "@/components/ui/page-header";
 import { ScreenMockView } from "@/components/screen-mock";
 import { useSession } from "@/components/session-provider";
+import { toast } from "@/components/toast";
 import { activitiesForProject, projectById, userById } from "@/lib/tenant-data";
 import { canViewProject } from "@/lib/scope";
 import { formatDuration } from "@/lib/utils";
@@ -252,12 +253,25 @@ export default function ProjectDetailPage() {
 
   async function toggleArchive() {
     if (!view || !view.live) return;
+    const wasArchived = view.archived;
     setBusy(true);
     try {
-      await postApi(`/api/app/project/${view.id}/${view.archived ? "unarchive" : "archive"}`, {});
+      await postApi(`/api/app/project/${view.id}/${wasArchived ? "unarchive" : "archive"}`, {});
       await loadFromApi();
-    } catch (err) {
-      console.error("Failed to toggle archive state", err);
+      toast({
+        title: wasArchived ? "Project restored" : "Project archived",
+        description: wasArchived
+          ? "It's active again and back in the projects list."
+          : "It's hidden from the active list. You can restore it any time.",
+      });
+    } catch {
+      // Previously swallowed into console.error: the button appeared to do
+      // nothing at all when the request failed.
+      toast({
+        tone: "danger",
+        title: wasArchived ? "Couldn't restore this project" : "Couldn't archive this project",
+        description: "The change wasn't saved. Check your connection and try again.",
+      });
     } finally {
       setBusy(false);
     }

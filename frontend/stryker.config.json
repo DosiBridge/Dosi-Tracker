@@ -1,6 +1,6 @@
 {
   "$schema": "./node_modules/@stryker-mutator/core/schema/stryker-schema.json",
-  "_comment": "Mutation testing for the web logic layer (docs/QUALITY.md §4). Scoped to the same src/lib business logic + middleware the unit tests cover; UI/pages/static data are out of scope until they have tests. 'break' is the ratcheting floor — raise it as the score improves, never lower.",
+  "_comment": "Mutation testing for the web DECISION logic (docs/QUALITY.md §4, docs/testing/TEST_STRATEGY.md): permissions, plan/money math, filtering, scoping, export escaping, report aggregation, route gating. saas-data.ts and reports-data.ts are in scope because they hold real derivation logic. tenant-data.ts is deliberately OUT: ~400 of its 650 lines are seeded-data GENERATORS, whose mutants are both low-signal and enormously expensive (a full run exceeded 50 minutes and did not finish) — it stays in the coverage denominator instead, where it measures cheaply. Fixture blobs (mock-data, monitor-data, host-data) and type-only modules are excluded outright. UI/pages are guarded behaviorally by the component and e2e suites. 'break' is the ratcheting floor — raise it as the score improves, never lower.",
   "testRunner": "vitest",
   "vitest": {
     "configFile": "vitest.config.ts"
@@ -9,7 +9,10 @@
   "mutate": [
     "src/lib/**/*.ts",
     "src/middleware.ts",
-    "!src/lib/**/*-data.ts",
+    "!src/lib/mock-data.ts",
+    "!src/lib/monitor-data.ts",
+    "!src/lib/host-data.ts",
+    "!src/lib/tenant-data.ts",
     "!src/lib/types.ts",
     "!src/**/*.test.ts",
     "!src/**/*.spec.ts"
@@ -19,7 +22,7 @@
   "jsonReporter": { "fileName": "reports/mutation/mutation.json" },
   "thresholds": {
     "high": 90,
-    "low": 80,
-    "break": 78
+    "low": 85,
+    "break": 85
   }
 }

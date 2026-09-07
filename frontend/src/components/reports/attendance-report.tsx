@@ -208,37 +208,63 @@ export function AttendanceReport() {
           </div>
         </CardHeader>
         <CardContent>
+          {/* A real table: this is tabular data (members x days), so screen
+              readers can announce "Tanvir, Wed: Present" from the row and
+              column headers. It also avoids `display: contents`, which
+              silently collapsed every row into a single grid cell here. */}
           <div className="overflow-x-auto overscroll-x-contain">
-            <div className="min-w-[640px]">
-              <div className="grid gap-2" style={{ gridTemplateColumns: `180px repeat(${dates.length}, minmax(40px, 1fr))` }}>
-                <div className="sticky left-0 z-10 bg-card text-xs font-medium text-muted-foreground">Member</div>
-                {dates.map((d) => (
-                  <div key={d} className="text-center text-xs font-medium text-muted-foreground">
-                    {new Date(d + "T00:00:00Z").toLocaleDateString("en", { weekday: "short", timeZone: "UTC" })}
-                  </div>
-                ))}
+            <table className="w-full min-w-[640px] border-separate border-spacing-1 text-left">
+              <caption className="sr-only">
+                Daily presence by member. Each cell shows whether the member was present or absent on that day.
+              </caption>
+              <thead>
+                <tr>
+                  <th scope="col" className="sticky left-0 z-10 w-[180px] bg-card text-xs font-medium text-muted-foreground">
+                    Member
+                  </th>
+                  {dates.map((d) => (
+                    <th key={d} scope="col" className="text-center text-xs font-medium text-muted-foreground">
+                      <abbr
+                        className="no-underline"
+                        title={new Date(d + "T00:00:00Z").toLocaleDateString("en", { dateStyle: "full", timeZone: "UTC" })}
+                      >
+                        {new Date(d + "T00:00:00Z").toLocaleDateString("en", { weekday: "short", timeZone: "UTC" })}
+                      </abbr>
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
                 {rows.map((r) => (
-                  <div key={r.userId} className="contents">
-                    <div className="sticky left-0 z-10 flex items-center gap-2 bg-card py-1">
-                      <Avatar name={r.name} size="sm" />
-                      <span className="truncate text-sm font-medium">{r.name.split(" ")[0]}</span>
-                    </div>
+                  <tr key={r.userId}>
+                    <th scope="row" className="sticky left-0 z-10 bg-card py-1 font-normal">
+                      <span className="flex items-center gap-2">
+                        <Avatar name={r.name} size="sm" />
+                        <span className="truncate text-sm font-medium">{r.name.split(" ")[0]}</span>
+                      </span>
+                    </th>
                     {dates.map((d) => {
                       const present = r.presentDays.has(d);
                       return (
-                        <div
-                          key={d}
-                          title={`${r.name} — ${present ? "Present" : "Absent"} (${d})`}
-                          className={cn("flex h-9 items-center justify-center rounded-lg text-[10px] font-semibold text-white", present ? "bg-success/80" : "bg-danger/50")}
-                        >
-                          {present ? "✓" : "—"}
-                        </div>
+                        <td key={d} className="p-0">
+                          <span
+                            title={`${r.name} — ${present ? "Present" : "Absent"} (${d})`}
+                            className={cn(
+                              "flex h-9 min-w-[40px] items-center justify-center rounded-lg text-[10px] font-semibold text-white",
+                              present ? "bg-success/80" : "bg-danger/50",
+                            )}
+                          >
+                            {/* Glyph as well as color, so presence is not conveyed by color alone. */}
+                            <span aria-hidden="true">{present ? "✓" : "—"}</span>
+                            <span className="sr-only">{present ? "Present" : "Absent"}</span>
+                          </span>
+                        </td>
                       );
                     })}
-                  </div>
+                  </tr>
                 ))}
-              </div>
-            </div>
+              </tbody>
+            </table>
           </div>
         </CardContent>
       </Card>

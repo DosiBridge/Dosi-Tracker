@@ -204,7 +204,7 @@ export function Topbar({ onMenuClick }: { onMenuClick: () => void }) {
                               {!n.read && <span className="h-2 w-2 shrink-0 rounded-full bg-primary" />}
                             </span>
                             <span className="mt-0.5 block text-xs text-muted-foreground">{n.body}</span>
-                            <span className="mt-1 block text-[11px] text-muted-foreground/70">{timeAgo(new Date(n.at))}</span>
+                            <span className="mt-1 block text-[11px] text-muted-foreground">{timeAgo(new Date(n.at))}</span>
                           </span>
                         </button>
                       );

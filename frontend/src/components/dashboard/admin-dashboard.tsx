@@ -123,8 +123,8 @@ export function AdminDashboard({ userName, isOwner }: { userName: string; isOwne
           <p className="mt-1 text-sm text-muted-foreground">
             {isOwner ? "Organization overview for today." : "What your team is working on today."}
           </p>
-          {liveLoading && <p className="mt-1 text-xs text-muted-foreground/70">Loading live team stats…</p>}
-          {liveError && <p className="mt-1 text-xs text-muted-foreground/70">{liveError}</p>}
+          {liveLoading && <p className="mt-1 text-xs text-muted-foreground">Loading live team stats…</p>}
+          {liveError && <p className="mt-1 text-xs text-muted-foreground">{liveError}</p>}
         </div>
         <div className="flex items-center gap-2">
           <Link href="/reports/weekly">

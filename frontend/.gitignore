@@ -43,3 +43,8 @@ next-env.d.ts
 # Stryker mutation testing
 .stryker-tmp/
 reports/
+
+# Playwright
+/playwright-report/
+/test-results/
+/blob-report/

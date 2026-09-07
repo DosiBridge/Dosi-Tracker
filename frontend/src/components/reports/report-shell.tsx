@@ -152,7 +152,7 @@ export function Kpi({
         <div className="min-w-0">
           <div className={cn("truncate text-xl font-bold")}>{value}</div>
           <div className="truncate text-xs text-muted-foreground">{label}</div>
-          {sub && <div className="truncate text-[11px] text-muted-foreground/70">{sub}</div>}
+          {sub && <div className="truncate text-[11px] text-muted-foreground">{sub}</div>}
         </div>
       </div>
     </Card>

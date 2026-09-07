@@ -94,16 +94,16 @@ export default function LoginPage() {
 
               <form onSubmit={onCreateWorkspace} className="mt-8 space-y-4">
                 <div className="space-y-1.5">
-                  <label className="text-sm font-medium">Email</label>
-                  <Input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="name@company.com" required autoFocus />
+                  <label htmlFor="signup-email" className="text-sm font-medium">Email</label>
+                  <Input id="signup-email" type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="name@company.com" required autoFocus />
                 </div>
                 <div className="space-y-1.5">
-                  <label className="text-sm font-medium">Password</label>
-                  <Input type="password" value={password} onChange={(e) => setPassword(e.target.value)} required minLength={6} />
+                  <label htmlFor="signup-password" className="text-sm font-medium">Password</label>
+                  <Input id="signup-password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} required minLength={6} />
                 </div>
                 <div className="space-y-1.5">
-                  <label className="text-sm font-medium">Workspace name</label>
-                  <Input value={wsName} onChange={(e) => setWsName(e.target.value)} placeholder="Acme Corp" required />
+                  <label htmlFor="signup-workspace-name" className="text-sm font-medium">Workspace name</label>
+                  <Input id="signup-workspace-name" value={wsName} onChange={(e) => setWsName(e.target.value)} placeholder="Acme Corp" required />
                   {wsName && (
                     <p className="text-xs text-muted-foreground">
                       {wsName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "") || "workspace"}.dositracker.app
@@ -111,8 +111,8 @@ export default function LoginPage() {
                   )}
                 </div>
                 <div className="space-y-1.5">
-                  <label className="text-sm font-medium">Choose a plan</label>
-                  <Select value={wsPlan} onChange={(e) => setWsPlan(e.target.value as PlanId)}>
+                  <label htmlFor="signup-plan" className="text-sm font-medium">Choose a plan</label>
+                  <Select id="signup-plan" value={wsPlan} onChange={(e) => setWsPlan(e.target.value as PlanId)}>
                     <option value="free">Free — $0 · up to 3 seats</option>
                     <option value="starter">Starter — $6/user/mo · 14-day trial</option>
                     <option value="business">Business — $12/user/mo · 14-day trial</option>
@@ -137,26 +137,28 @@ export default function LoginPage() {
 
               <form onSubmit={onSubmit} className="mt-8 space-y-4">
                 <div className="space-y-1.5">
-                  <label className="text-sm font-medium">Workspace</label>
+                  <label htmlFor="login-workspace" className="text-sm font-medium">Workspace</label>
                   <Input
+                    id="login-workspace"
                     value={workspace}
                     onChange={(e) => setWorkspace(e.target.value)}
                     placeholder="acme (leave empty for host sign-in)"
                   />
                 </div>
                 <div className="space-y-1.5">
-                  <label className="text-sm font-medium">Email</label>
-                  <Input type="email" value={email} onChange={(e) => setEmail(e.target.value)} required />
+                  <label htmlFor="login-email" className="text-sm font-medium">Email</label>
+                  <Input id="login-email" type="email" value={email} onChange={(e) => setEmail(e.target.value)} required />
                 </div>
                 <div className="space-y-1.5">
                   <div className="flex items-center justify-between">
-                    <label className="text-sm font-medium">Password</label>
-                    <button type="button" className="text-xs text-primary hover:underline">
+                    <label htmlFor="login-password" className="text-sm font-medium">Password</label>
+                    <button type="button" className="text-xs text-primary-strong hover:underline">
                       Forgot password?
                     </button>
                   </div>
                   <div className="relative">
                     <Input
+                      id="login-password"
                       type={show ? "text" : "password"}
                       value={password}
                       onChange={(e) => setPassword(e.target.value)}
@@ -166,6 +168,7 @@ export default function LoginPage() {
                     <button
                       type="button"
                       onClick={() => setShow((s) => !s)}
+                      aria-label={show ? "Hide password" : "Show password"}
                       className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
                     >
                       {show ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
@@ -185,7 +188,7 @@ export default function LoginPage() {
                   <p className="text-sm text-muted-foreground">New to Dosi-Tracker?</p>
                   <button
                     onClick={() => setMode("signup")}
-                    className="mt-1 text-sm font-semibold text-primary hover:underline"
+                    className="mt-1 text-sm font-semibold text-primary-strong hover:underline"
                   >
                     Create a workspace →
                   </button>

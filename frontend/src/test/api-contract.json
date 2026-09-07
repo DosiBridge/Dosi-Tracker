@@ -1,0 +1,28 @@
+{
+  "_comment": "Contract between the frontend and the ABP backend. Every backend endpoint referenced anywhere in src/ MUST appear here (enforced by the architecture spec). When the backend adds/renames a route, update this file in the same PR — a mismatch means either dead frontend code or a call that will 404.",
+  "endpoints": [
+    "/connect/token",
+    "/api/abp/application-configuration",
+    "/api/account/my-profile",
+    "/api/identity/users",
+    "/api/multi-tenancy/tenants",
+    "/api/app/workspace/register",
+    "/api/app/workspace/current-subscription",
+    "/api/app/workspace/available-plans",
+    "/api/app/billing/invoices",
+    "/api/app/project",
+    "/api/app/activity",
+    "/api/app/activity/screenshots",
+    "/api/app/activity/screenshot",
+    "/api/app/reporting/summary",
+    "/api/app/reporting/daily-series",
+    "/api/app/reporting/app-usage",
+    "/api/app/reporting/attendance",
+    "/api/app/team/project-members",
+    "/api/app/team/invite-member",
+    "/api/app/platform/overview",
+    "/api/app/platform/users",
+    "/api/app/platform/invoices",
+    "/api/app/platform/plans"
+  ]
+}

@@ -117,6 +117,7 @@ export function Sidebar({
           </div>
           <button
             onClick={onToggle}
+            aria-label={compact ? "Expand sidebar" : "Collapse sidebar"}
             className={cn(
               "mt-2 hidden w-full items-center justify-center gap-2 rounded-lg py-2 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground lg:flex"
             )}

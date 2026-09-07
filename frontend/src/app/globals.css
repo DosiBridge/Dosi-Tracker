@@ -21,6 +21,9 @@
 
   --primary: #006bff;
   --primary-foreground: #ffffff;
+  /* Accessible variant of --primary for SMALL text/links, where the brand blue
+     lands too close to the 4.5:1 floor on tinted backgrounds. */
+  --primary-strong: #0055cc;
 
   --accent: #eef4ff;
   --accent-foreground: #005be6;
@@ -32,6 +35,17 @@
   --warning: #f0a800;
   --danger: #d9363e;
   --info: #006bff;
+
+  /* Foregrounds for text sitting on the matching /12–/15 tinted backgrounds
+     (badges, pills). The vivid status hues above are chosen for fills and
+     icons; as small text on their own tint they fall under WCAG AA 4.5:1
+     (measured: success 2.78, warning 1.83, info 3.89, neutral 4.39). These
+     darkened variants are verified >= 5:1 by e2e/a11y.spec.ts. */
+  --success-on-tint: #00705d;
+  --warning-on-tint: #8a5a00;
+  --danger-on-tint: #b3151d;
+  --info-on-tint: #0055cc;
+  --muted-on-tint: #5b6270;
 
   --ink: #1a1a1a;
   --ink-soft: #4d5055;
@@ -61,7 +75,12 @@
   --ring: #3fb5b7;
 
   --primary: #3fb5b7;
-  --primary-foreground: #ffffff;
+  /* DARK ink on the light teal fill. White here measures 2.47:1 — every
+     primary button, active tab and CTA in the app failed WCAG AA. Against
+     #3fb5b7 this ink measures ~7.5:1. */
+  --primary-foreground: #0d1418;
+  /* Small-text variant: brighter on the dark ground (see the light-theme note). */
+  --primary-strong: #8de4e5;
 
   --accent: #1f2d33;
   --accent-foreground: #8de4e5;
@@ -69,10 +88,22 @@
   --sidebar: #1a2226;
   --sidebar-foreground: #e8edef;
 
-  --success: #3fb5b7;
+  /* Success and info must not equal --primary (they all used to be #3fb5b7),
+     or status color stops carrying meaning: a "live" pill, an "info" pill and
+     a primary button were indistinguishable. */
+  --success: #4ade80;
   --warning: #ff8a2e;
   --danger: #f87171;
-  --info: #3fb5b7;
+  --info: #7dd3fc;
+
+  /* Dark ground: the status hues are already light-on-dark over their own
+     tints, so the on-tint variants track the base colors. Only the neutral
+     pill needs lifting off the dark muted fill. */
+  --success-on-tint: var(--success);
+  --warning-on-tint: var(--warning);
+  --danger-on-tint: var(--danger);
+  --info-on-tint: var(--info);
+  --muted-on-tint: #b6c0c4;
 
   --ink: #ffffff;
   --ink-soft: #a0acb8;
@@ -98,6 +129,7 @@
   --color-ring: var(--ring);
   --color-primary: var(--primary);
   --color-primary-foreground: var(--primary-foreground);
+  --color-primary-strong: var(--primary-strong);
   --color-accent: var(--accent);
   --color-accent-foreground: var(--accent-foreground);
   --color-sidebar: var(--sidebar);
@@ -106,6 +138,11 @@
   --color-warning: var(--warning);
   --color-danger: var(--danger);
   --color-info: var(--info);
+  --color-success-on-tint: var(--success-on-tint);
+  --color-warning-on-tint: var(--warning-on-tint);
+  --color-danger-on-tint: var(--danger-on-tint);
+  --color-info-on-tint: var(--info-on-tint);
+  --color-muted-on-tint: var(--muted-on-tint);
 
   --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
   --font-display: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
@@ -254,9 +291,16 @@ h1, h2, h3, p, span, a, button, td, th, label, li {
   transform: translateY(0);
 }
 
-.stagger > * {
-  opacity: 0;
-  animation: stagger-in 0.5s cubic-bezier(0.16, 1, 0.3, 1) both;
+/* The resting state is VISIBLE. The entrance animation — which supplies the
+   final opacity — is only applied when motion is welcome, so killing the
+   animation can never leave content permanently transparent. (It previously
+   sat at opacity:0 and depended on the animation to appear, which meant every
+   "reduce motion" user got an invisible dashboard.) */
+@media (prefers-reduced-motion: no-preference) {
+  .stagger > * {
+    opacity: 0;
+    animation: stagger-in 0.5s cubic-bezier(0.16, 1, 0.3, 1) both;
+  }
 }
 .stagger > *:nth-child(1) { animation-delay: calc(var(--stagger-base, 40ms) * 0); }
 .stagger > *:nth-child(2) { animation-delay: calc(var(--stagger-base, 40ms) * 1); }
@@ -284,6 +328,9 @@ h1, h2, h3, p, span, a, button, td, th, label, li {
   .page-enter,
   .stagger > * {
     animation: none !important;
+    /* Belt and braces: even if a stagger rule leaks in, content stays visible. */
+    opacity: 1;
+    transform: none;
   }
   .reveal {
     opacity: 1;

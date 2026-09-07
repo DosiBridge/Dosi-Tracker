@@ -222,6 +222,7 @@ export function fmtLimit(n: number): string {
 
 export function usagePct(used: number, limit: number): number {
   if (limit === INF) return 0;
+  if (limit <= 0) return used > 0 ? 100 : 0; // guard 0/0 → NaN and n/0 → Infinity
   return Math.min(100, Math.round((used / limit) * 100));
 }
 

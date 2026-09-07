@@ -22,7 +22,7 @@ import { SearchField, SegmentedControl, Toolbar } from "@/components/ui/toolbar"
 import { CreateProjectModal } from "@/components/projects/create-project-modal";
 import { EmptyState } from "@/components/ui/empty-state";
 import { useSession } from "@/components/session-provider";
-import { userById } from "@/lib/tenant-data";
+import { createTenantProject, userById } from "@/lib/tenant-data";
 import { scopeProjects } from "@/lib/scope";
 import { useApi, getApi, postApi } from "@/hooks/useApi";
 import type { Project } from "@/lib/types";
@@ -97,7 +97,7 @@ function memberAvatarName(userId: string): string {
 }
 
 export default function ProjectsPage() {
-  const { user } = useSession();
+  const { user, workspace } = useSession();
   const canManage = user.role === "owner" || user.role === "admin";
   const { data: apiProjects, error, isLoading, refetch } = useApi<ApiProject[]>('/api/app/project');
   const [query, setQuery] = useState("");
@@ -130,7 +130,11 @@ export default function ProjectsPage() {
     } catch {
       scoped = []; // never let the demo fallback crash the page
     }
-    return [...created, ...scoped].map((p) => ({ ...p, live: false }));
+    // Demo-created projects also live in the tenant dataset (persisted there
+    // via createTenantProject), so drop them from the scoped list to avoid
+    // rendering duplicates.
+    const createdIds = new Set(created.map((p) => p.id));
+    return [...created, ...scoped.filter((p) => !createdIds.has(p.id))].map((p) => ({ ...p, live: false }));
   }, [created, user]);
 
   const list = liveProjects ?? mockProjects;
@@ -280,7 +284,7 @@ export default function ProjectsPage() {
                         <span className="font-display text-base font-bold">{p.title[0]}</span>
                       </div>
                       <div>
-                        <h3 className="font-semibold leading-tight group-hover:text-primary">{p.title}</h3>
+                        <h2 className="font-semibold leading-tight group-hover:text-primary">{p.title}</h2>
                         <p className="text-xs text-muted-foreground">Interval · {p.intervalMinutes}m</p>
                       </div>
                     </div>
@@ -366,7 +370,10 @@ export default function ProjectsPage() {
         onCreate={async (p) => {
           setCreateError(null);
           if (!isLive) {
-            // Demo mode: keep the mock behaviour — the project only lives in local state.
+            // Demo mode: persist through the tenant-data layer (localStorage-
+            // backed) so the project survives a reload; the local state only
+            // triggers the re-render.
+            createTenantProject(workspace.id, p);
             setCreated((prev) => [p, ...prev]);
             return;
           }

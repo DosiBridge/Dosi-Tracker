@@ -13,6 +13,13 @@ const eslintConfig = defineConfig([
     "build/**",
     "next-env.d.ts",
     "coverage/**",
+    // Generated reports contain bundled third-party JS; linting them produces
+    // hundreds of meaningless errors and masks the real count.
+    "playwright-report/**",
+    "test-results/**",
+    "blob-report/**",
+    "reports/**",
+    ".stryker-tmp/**",
   ]),
 
   // --- Grandfathered lint baseline (see docs/QUALITY.md §10 "Lint debt") ---
@@ -23,6 +30,10 @@ const eslintConfig = defineConfig([
   // can only DECREASE: any NEW violation breaks the build. Ratchet the cap down to 0, then delete
   // this block and let the rules return to their default `error` severity.
   {
+    // Scoped to src: the react-hooks plugin is only registered for app sources, and applying
+    // these overrides to config files (.dependency-cruiser.cjs) crashes eslint with an
+    // unknown-rule error.
+    files: ["src/**/*.{ts,tsx}"],
     rules: {
       "react-hooks/set-state-in-effect": "warn",
       "react-hooks/exhaustive-deps": "warn",
@@ -31,6 +42,15 @@ const eslintConfig = defineConfig([
       // files; capped alongside the effect debt so they too can only decrease.
       "@typescript-eslint/no-explicit-any": "warn",
       "@typescript-eslint/no-unused-vars": "warn",
+    },
+  },
+
+  // Playwright specs/fixtures are not React code: the fixture `use()` callback trips the
+  // React 19 `use` hook heuristic (rules-of-hooks false positive).
+  {
+    files: ["e2e/**/*.ts", "playwright.config.ts"],
+    rules: {
+      "react-hooks/rules-of-hooks": "off",
     },
   },
 ]);

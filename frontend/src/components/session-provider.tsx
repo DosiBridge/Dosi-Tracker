@@ -61,13 +61,27 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
     const storedUser = localStorage.getItem(USER_KEY);
     if (storedUser) setUserId(storedUser);
 
+    // Guard every parse: localStorage is user-editable, so a corrupted value
+    // (wrong-type JSON like "{}", "null" or "0") must fall back to the default
+    // instead of crashing the render with a spread/`.includes` TypeError.
     try {
       const rawCreated = localStorage.getItem(WS_CREATED_KEY);
-      if (rawCreated) setCreated(JSON.parse(rawCreated) as Workspace[]);
+      if (rawCreated) {
+        const parsedCreated: unknown = JSON.parse(rawCreated);
+        if (Array.isArray(parsedCreated)) setCreated(parsedCreated as Workspace[]);
+      }
       const rawPatch = localStorage.getItem(WS_PATCH_KEY);
-      if (rawPatch) setPatches(JSON.parse(rawPatch) as Record<string, Partial<Workspace>>);
+      if (rawPatch) {
+        const parsedPatches: unknown = JSON.parse(rawPatch);
+        if (parsedPatches && typeof parsedPatches === "object" && !Array.isArray(parsedPatches)) {
+          setPatches(parsedPatches as Record<string, Partial<Workspace>>);
+        }
+      }
       const rawDeleted = localStorage.getItem(WS_DELETED_KEY);
-      if (rawDeleted) setDeleted(JSON.parse(rawDeleted) as string[]);
+      if (rawDeleted) {
+        const parsedDeleted: unknown = JSON.parse(rawDeleted);
+        if (Array.isArray(parsedDeleted)) setDeleted(parsedDeleted as string[]);
+      }
     } catch {}
 
     const storedWs = localStorage.getItem(WS_KEY);
@@ -79,9 +93,13 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     async function hydrate() {
       try {
+        // Null = "this fetch failed". A merely-unreachable backend must never
+        // replace the active tenant's demo data with empty arrays, so failures
+        // resolve to null sentinels instead of [] and hydration below only runs
+        // when at least one payload is a real array.
         const [apiProjects, apiActivities, appConfig] = await Promise.all([
-          getApi('/api/app/project').catch(() => []),
-          getApi('/api/app/activity').catch(() => []),
+          getApi('/api/app/project').catch(() => null),
+          getApi('/api/app/activity').catch(() => null),
           getApi('/api/abp/application-configuration?IncludeLocalizationResources=false').catch(() => null)
         ]);
 
@@ -116,25 +134,29 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
           }
         }
 
-        const mappedActivities: Activity[] = (apiActivities || []).map((a: any) => ({
-          id: a.id,
-          userId: a.userId,
-          projectId: a.projectId,
-          startedAt: a.startedAt,
-          endedAt: a.endedAt,
-          description: a.description || "Activity block",
-          productivity: a.productivity || 0,
-          mouseClicks: a.mouseClicks || 0,
-          keyboardHits: a.keyboardHits || 0,
-          activeWindows: a.activeWindowsJson ? JSON.parse(a.activeWindowsJson) : [],
-          runningPrograms: a.runningProgramsJson ? JSON.parse(a.runningProgramsJson) : [],
-          screen: { app: "System", kind: "desktop" as any, accent: "#1e293b" },
-          hasWebcam: false,
-          online: false,
-        }));
+        const hasProjects = Array.isArray(apiProjects);
+        const hasActivities = Array.isArray(apiActivities);
+        if (hasProjects || hasActivities) {
+          const mappedActivities: Activity[] = (hasActivities ? apiActivities : []).map((a: any) => ({
+            id: a.id,
+            userId: a.userId,
+            projectId: a.projectId,
+            startedAt: a.startedAt,
+            endedAt: a.endedAt,
+            description: a.description || "Activity block",
+            productivity: a.productivity || 0,
+            mouseClicks: a.mouseClicks || 0,
+            keyboardHits: a.keyboardHits || 0,
+            activeWindows: a.activeWindowsJson ? JSON.parse(a.activeWindowsJson) : [],
+            runningPrograms: a.runningProgramsJson ? JSON.parse(a.runningProgramsJson) : [],
+            screen: { app: "System", kind: "desktop" as any, accent: "#1e293b" },
+            hasWebcam: false,
+            online: false,
+          }));
 
-        hydrateLiveBackendData(apiProjects || [], mappedActivities);
-        console.log("Global tenant data hydrated from ABP backend.");
+          hydrateLiveBackendData(hasProjects ? apiProjects : [], mappedActivities);
+          console.log("Global tenant data hydrated from ABP backend.");
+        }
       } catch (err) {
         console.warn("Failed to hydrate tenant data from API:", err);
       }

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useId, useState } from "react";
 import { User, ShieldCheck, Palette, Bell, Check, Monitor, Moon, Sun, Eye } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -8,6 +8,7 @@ import { Input, Select } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { Avatar } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
+import { toast } from "@/components/toast";
 import { useTheme } from "@/components/theme-provider";
 import { useSession } from "@/components/session-provider";
 import { getApi, putApi } from "@/hooks/useApi";
@@ -105,8 +106,14 @@ export default function SettingsPage() {
       }
       return;
     }
-    setSaved(true);
-    setTimeout(() => setSaved(false), 1600);
+    // Preferences below (privacy, tracking, appearance, notifications) are
+    // local-only in this build. Saying "Saved" would claim a round-trip that
+    // never happened, so be explicit about what actually persisted.
+    toast({
+      tone: "info",
+      title: "Preferences applied on this device",
+      description: "These settings aren't synced to your account yet.",
+    });
   }
 
   return (
@@ -163,8 +170,8 @@ export default function SettingsPage() {
                     <Field label="Username" value={profileForm.userName} onChange={(v) => setProfileField("userName", v)} />
                     <Field label="Phone number" value={profileForm.phoneNumber} onChange={(v) => setProfileField("phoneNumber", v)} />
                     <div className="space-y-1.5">
-                      <label className="text-sm font-medium">Timezone</label>
-                      <Select defaultValue={currentUser.timezone}>
+                      <label htmlFor="profile-timezone" className="text-sm font-medium">Timezone</label>
+                      <Select id="profile-timezone" defaultValue={currentUser.timezone}>
                         <option value="Asia/Dhaka">Asia/Dhaka (GMT+6)</option>
                         <option value="Europe/Madrid">Europe/Madrid</option>
                         <option value="America/Los_Angeles">America/Los Angeles</option>
@@ -177,8 +184,8 @@ export default function SettingsPage() {
                     <Field label="Email" defaultValue={currentUser.email} />
                     <Field label="Designation" defaultValue={currentUser.designation} />
                     <div className="space-y-1.5">
-                      <label className="text-sm font-medium">Timezone</label>
-                      <Select defaultValue={currentUser.timezone}>
+                      <label htmlFor="profile-timezone" className="text-sm font-medium">Timezone</label>
+                      <Select id="profile-timezone" defaultValue={currentUser.timezone}>
                         <option value="Asia/Dhaka">Asia/Dhaka (GMT+6)</option>
                         <option value="Europe/Madrid">Europe/Madrid</option>
                         <option value="America/Los_Angeles">America/Los Angeles</option>
@@ -319,13 +326,16 @@ function Field({
   value?: string;
   onChange?: (value: string) => void;
 }) {
+  // Generated id keeps the label programmatically associated with its input,
+  // so assistive tech announces the field by name.
+  const id = useId();
   return (
     <div className="space-y-1.5">
-      <label className="text-sm font-medium">{label}</label>
+      <label htmlFor={id} className="text-sm font-medium">{label}</label>
       {onChange ? (
-        <Input value={value ?? ""} onChange={(e) => onChange(e.target.value)} />
+        <Input id={id} value={value ?? ""} onChange={(e) => onChange(e.target.value)} />
       ) : (
-        <Input defaultValue={defaultValue} />
+        <Input id={id} defaultValue={defaultValue} />
       )}
     </div>
   );

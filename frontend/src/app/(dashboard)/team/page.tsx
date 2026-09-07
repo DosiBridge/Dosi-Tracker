@@ -211,7 +211,7 @@ export default function TeamPage() {
               <div className="flex items-center gap-3">
                 <Avatar name={u.name} size="lg" status={u.status} />
                 <div>
-                  <h3 className="font-semibold leading-tight">{u.name}</h3>
+                  <h2 className="font-semibold leading-tight">{u.name}</h2>
                   <p className="text-xs text-muted-foreground">{u.designation}</p>
                 </div>
               </div>
@@ -251,6 +251,15 @@ export default function TeamPage() {
       <InviteModal open={invite} onClose={() => setInvite(false)} inviterRole={user.role} live={hasToken} />
     </PageStack>
   );
+}
+
+/**
+ * Pragmatic address check: one @, no whitespace, a dotted domain. Deliberately
+ * not RFC 5322 — the goal is to catch typos and pasted junk before an invite
+ * is sent, not to adjudicate exotic-but-legal addresses.
+ */
+function isEmailAddress(value: string): boolean {
+  return /^[^\s@]+@[^\s@.]+(\.[^\s@.]+)+$/.test(value);
 }
 
 interface InviteOutcome {
@@ -332,7 +341,21 @@ function InviteModal({
   }
 
   async function send() {
+    const emailList = emails.split(",").map((e) => e.trim()).filter(Boolean);
+    if (emailList.length === 0) {
+      setFormError("Enter at least one email address.");
+      return;
+    }
+    // Reject malformed addresses before anything is sent — naming the offender
+    // so the user can correct it rather than guess.
+    const invalid = emailList.filter((e) => !isEmailAddress(e));
+    if (invalid.length > 0) {
+      setFormError(`Not a valid email address: ${invalid.join(", ")}`);
+      return;
+    }
+
     if (!live) {
+      setFormError(null);
       setSent(true);
       setTimeout(() => {
         setSent(false);
@@ -342,9 +365,8 @@ function InviteModal({
       return;
     }
 
-    const emailList = emails.split(",").map((e) => e.trim()).filter(Boolean);
-    if (emailList.length === 0 || !project) {
-      setFormError(!project ? "Select a project first." : "Enter at least one email address.");
+    if (!project) {
+      setFormError("Select a project first.");
       return;
     }
 
@@ -435,14 +457,14 @@ function InviteModal({
       ) : (
         <div className="space-y-4">
           <div className="space-y-1.5">
-            <label className="text-sm font-medium">Email addresses</label>
-            <Input value={emails} onChange={(e) => setEmails(e.target.value)} placeholder="jane@company.com, john@company.com" />
+            <label htmlFor="invite-emails" className="text-sm font-medium">Email addresses</label>
+            <Input id="invite-emails" value={emails} onChange={(e) => setEmails(e.target.value)} placeholder="jane@company.com, john@company.com" />
             <p className="text-xs text-muted-foreground">Separate multiple emails with commas.</p>
           </div>
           <div className="grid grid-cols-2 gap-3">
             <div className="space-y-1.5">
-              <label className="text-sm font-medium">Role</label>
-              <Select value={role} onChange={(e) => setRole(e.target.value as Role)}>
+              <label htmlFor="invite-role" className="text-sm font-medium">Role</label>
+              <Select id="invite-role" value={role} onChange={(e) => setRole(e.target.value as Role)}>
                 {roles.map((r) => (
                   <option key={r} value={r}>
                     {r === "worker" ? "Member" : r.charAt(0).toUpperCase() + r.slice(1)}
@@ -451,8 +473,8 @@ function InviteModal({
               </Select>
             </div>
             <div className="space-y-1.5">
-              <label className="text-sm font-medium">Project</label>
-              <Select value={project} onChange={(e) => setProject(e.target.value)} disabled={live && projectsLoading}>
+              <label htmlFor="invite-project" className="text-sm font-medium">Project</label>
+              <Select id="invite-project" value={project} onChange={(e) => setProject(e.target.value)} disabled={live && projectsLoading}>
                 {live && projectsLoading && projectOptions.length === 0 ? (
                   <option value="">Loading projects…</option>
                 ) : projectOptions.length === 0 ? (

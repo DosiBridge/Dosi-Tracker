@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
+import { Suspense, useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
   MousePointerClick,
@@ -13,6 +13,7 @@ import {
   SearchX,
 } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
+import { surfaceVariants } from "@/components/ui/surface";
 import { Badge } from "@/components/ui/badge";
 import { Avatar } from "@/components/ui/avatar";
 import { Ring } from "@/components/ui/ring";
@@ -22,7 +23,7 @@ import { PageHeader, PageStack } from "@/components/ui/page-header";
 import { SegmentedControl } from "@/components/ui/toolbar";
 import { ActivityFilterBar } from "@/components/activities/activity-filter-bar";
 import { useSession } from "@/components/session-provider";
-import { projectById, userById } from "@/lib/tenant-data";
+import { activities as demoActivities, projectById, userById } from "@/lib/tenant-data";
 import { getApi, getAuthedBlobUrl, useApi } from "@/hooks/useApi";
 import { applyActivityFilters, defaultActivityFilters, type ActivityFilters } from "@/lib/activity-filters";
 import { scopeActivities } from "@/lib/scope";
@@ -34,6 +35,13 @@ type ViewMode = "sessions" | "screens";
 /** Real backend rows have GUID ids; mock demo rows use short slugs. */
 const GUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 const isGuidId = (id: string) => GUID_RE.test(id);
+
+// LIVE MODE gate — a subscription-less external-store read of the backend
+// token so SSR and the first client render agree (server snapshot: no token),
+// same contract as the sibling pages' effect-resolved gates.
+const subscribeToNothing = () => () => {};
+const readBackendToken = () => typeof window !== "undefined" && !!localStorage.getItem("dosi-token");
+const serverHasNoToken = () => false;
 
 interface LiveProjectInfo {
   id: string;
@@ -118,8 +126,9 @@ function ActivitiesPageInner() {
   const [selected, setSelected] = useState<Activity | null>(null);
   const [view, setView] = useState<ViewMode>(searchParams.get("view") === "screens" ? "screens" : "sessions");
 
-  const { data: apiActivities, isLoading } = useApi<any[]>('/api/app/activity?MaxResultCount=200');
+  const { data: apiActivities, error, isLoading, refetch } = useApi<any[]>('/api/app/activity?MaxResultCount=200');
   const [liveProjects, setLiveProjects] = useState<LiveProjectInfo[]>([]);
+  const isLive = useSyncExternalStore(subscribeToNothing, readBackendToken, serverHasNoToken);
 
   useEffect(() => {
     setView(searchParams.get("view") === "screens" ? "screens" : "sessions");
@@ -150,8 +159,11 @@ function ActivitiesPageInner() {
     [liveProjectById],
   );
 
-  const backendActivities: Activity[] = useMemo(() => {
-    if (!apiActivities) return [];
+  // Live activity when the API call succeeded; otherwise null so the page
+  // falls back to the seeded demo dataset — the same idiom as /projects,
+  // /team and /dashboard.
+  const liveActivities: Activity[] | null = useMemo(() => {
+    if (!isLive || !apiActivities) return null;
     return apiActivities.map(a => ({
       id: a.id,
       userId: a.userId,
@@ -168,20 +180,27 @@ function ActivitiesPageInner() {
       hasWebcam: false,
       online: false,
     }));
-  }, [apiActivities]);
+  }, [isLive, apiActivities]);
+
+  const list = liveActivities ?? demoActivities;
+  const liveLoading = isLive && isLoading && !liveActivities;
+  const liveError = isLive && !!error && !liveActivities;
 
   function setViewMode(mode: ViewMode) {
     setView(mode);
     router.replace(mode === "screens" ? "/activities?view=screens" : "/activities", { scroll: false });
   }
 
-  const base = useMemo(() => scopeActivities(user, backendActivities), [user, backendActivities]);
+  const base = useMemo(() => scopeActivities(user, list), [user, list]);
   // Live activity is timestamped on the real clock, but the shared date presets pivot on the
   // frozen demo NOW (2026-07-14). Convert the selected preset to explicit real-clock bounds so
-  // real rows are not silently filtered out.
-  const effectiveFilters = useMemo(() => liveEffectiveFilters(filters), [filters]);
+  // real rows are not silently filtered out; demo rows keep the frozen presets.
+  const effectiveFilters = useMemo(
+    () => (liveActivities ? liveEffectiveFilters(filters) : filters),
+    [liveActivities, filters]
+  );
   const filtered = useMemo(() => applyActivityFilters(base, effectiveFilters), [base, effectiveFilters]);
-  const updatedAt = backendActivities[0]?.endedAt;
+  const updatedAt = liveActivities?.[0]?.endedAt;
 
   return (
     <PageStack>
@@ -216,7 +235,20 @@ function ActivitiesPageInner() {
         showMemberFilter={user.role === "owner" || user.role === "admin"}
       />
 
-      {filtered.length === 0 && (
+      {liveError && (
+        <p className="text-xs text-muted-foreground">
+          Couldn’t load live activity — showing demo data.{" "}
+          <button
+            type="button"
+            onClick={() => void refetch()}
+            className="underline underline-offset-2 hover:text-foreground"
+          >
+            Retry
+          </button>
+        </p>
+      )}
+
+      {!liveLoading && filtered.length === 0 && (
         <Card className="flex flex-col items-center justify-center gap-3 py-16 text-center">
           <div className="flex h-12 w-12 items-center justify-center rounded-full bg-muted text-muted-foreground">
             <SearchX className="h-6 w-6" />
@@ -231,16 +263,27 @@ function ActivitiesPageInner() {
         </Card>
       )}
 
-      {view === "sessions" ? (
+      {liveLoading ? (
+        <p className="py-16 text-center text-sm text-muted-foreground">Loading activity…</p>
+      ) : view === "sessions" ? (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
           {filtered.map((a) => {
             const u = userById(a.userId);
             const p = resolveProject(a.projectId);
             return (
-              <Card
+              // A real <button>, not a clickable <div>: opening a session is
+              // this page's primary action and must be reachable by keyboard.
+              // Mirrors the Screens view below.
+              <button
                 key={a.id}
+                type="button"
                 onClick={() => setSelected(a)}
-                className="group cursor-pointer overflow-hidden p-0 transition-all hover:-translate-y-0.5 hover:card-elev-lg"
+                aria-label={`Open session: ${u?.name ?? "Unknown member"}, ${a.description}, ${timeRange(a)}`}
+                className={cn(
+                  surfaceVariants.default,
+                  "group cursor-pointer overflow-hidden p-0 text-left transition-all hover:-translate-y-0.5 hover:card-elev-lg",
+                  "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background",
+                )}
               >
                 <div className="relative">
                   <ScreenMockView screen={a.screen} title={a.activeWindows[0]?.windowTitle} className="aspect-video w-full rounded-none" />
@@ -278,7 +321,7 @@ function ActivitiesPageInner() {
                     </div>
                   </div>
                 </CardContent>
-              </Card>
+              </button>
             );
           })}
         </div>

@@ -48,6 +48,12 @@ export function CreateProjectModal({
     setPerms({ screenshot: true, webcam: false, keyboard: true, mouse: true, activeWindow: true, runningPrograms: true });
   }
 
+  /** Abandoning the wizard discards the draft — reopening starts clean. */
+  function cancel() {
+    reset();
+    onClose();
+  }
+
   function finish() {
     onCreate({
       id: `p${Date.now()}`,
@@ -68,7 +74,7 @@ export function CreateProjectModal({
   const canNext = step === 0 ? title.trim().length > 0 : true;
 
   return (
-    <Modal open={open} onClose={onClose} title="Create project" description="Set up tracking for a new project.">
+    <Modal open={open} onClose={cancel} title="Create project" description="Set up tracking for a new project.">
       {/* Stepper */}
       <div className="mb-6 flex items-center">
         {steps.map((s, i) => (
@@ -180,7 +186,7 @@ export function CreateProjectModal({
 
       {/* Footer */}
       <div className="mt-6 flex items-center justify-between">
-        <Button variant="ghost" onClick={step === 0 ? onClose : () => setStep((s) => s - 1)}>
+        <Button variant="ghost" onClick={step === 0 ? cancel : () => setStep((s) => s - 1)}>
           {step === 0 ? "Cancel" : (<><ChevronLeft className="h-4 w-4" /> Back</>)}
         </Button>
         {step < steps.length - 1 ? (

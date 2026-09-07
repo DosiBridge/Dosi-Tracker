@@ -458,7 +458,10 @@ function getLocalStorageProjects(workspaceId: string): Project[] {
   if (typeof window === "undefined") return [];
   try {
     const val = localStorage.getItem(`dosi-projects-created-${workspaceId}`);
-    return val ? JSON.parse(val) : [];
+    // Guard the parse: a corrupted value (e.g. "null" or "{}") must fall back
+    // to "no local projects" instead of crashing `datasetFor` on `.length`.
+    const parsed: unknown = val ? JSON.parse(val) : [];
+    return Array.isArray(parsed) ? (parsed as Project[]) : [];
   } catch {
     return [];
   }
@@ -531,9 +534,7 @@ export function activeWorkspaceId(): string {
   return active.workspaceId;
 }
 
-export function setActiveWorkspace(workspaceId: string): void {
-  const ds = datasetFor(workspaceId);
-  if (ds === active) return;
+function applyActive(ds: Dataset): void {
   active = ds;
   users = ds.users;
   projects = ds.projects;
@@ -547,6 +548,12 @@ export function setActiveWorkspace(workspaceId: string): void {
   attendance = ds.attendance;
   billing = ds.billing;
   notifications = ds.notifications;
+}
+
+export function setActiveWorkspace(workspaceId: string): void {
+  const ds = datasetFor(workspaceId);
+  if (ds === active) return;
+  applyActive(ds);
 }
 
 export function hydrateLiveBackendData(liveProjects: Project[], liveActivities: Activity[]) {
@@ -625,4 +632,38 @@ export function insights(): Insight[] {
   out.push({ id: "i5", tone: focusRatio >= 60 ? "success" : "warning", title: `Team focus is ${focusRatio}%`, detail: `Share of time spent in productive apps this week.` });
   out.push({ id: "i6", tone: "danger", title: `${Math.round(cats.unproductive / 60)}h on distractions`, detail: `Time in unproductive apps this week across the team.` });
   return out;
+}
+
+/* ============================================================================
+ * Test-only reset
+ * ========================================================================== */
+
+// Pristine deep-copies of every seed roster, captured at module load — i.e.
+// before any runtime mutation (hydration and invite flows push into these
+// shared arrays in place).
+const seedArrays: unknown[][] = [
+  primaryUsers,
+  primaryProjects,
+  primaryActivities,
+  PRIMARY_NOTIFICATIONS, // topbar mark-as-read flips `read` in place
+  acmeUsers,
+  acmeProjects,
+  nimbusUsers,
+  nimbusProjects,
+];
+const seedSnapshots = seedArrays.map((a) => structuredClone(a));
+
+/**
+ * Restore the demo-data layer to its pristine state: undo in-place seed-array
+ * mutations, drop every cached per-workspace dataset (including projects
+ * seeded from localStorage) and re-point the live bindings at the primary
+ * workspace. Imported ONLY by the test harness — never by app code.
+ */
+export function resetTenantDataForTests(): void {
+  seedArrays.forEach((arr, i) => {
+    arr.length = 0;
+    arr.push(...structuredClone(seedSnapshots[i]));
+  });
+  cache.clear();
+  applyActive(datasetFor("w1"));
 }
