@@ -172,9 +172,10 @@ fails below this — the ratcheting floor), low 85, high 90. Runs nightly
 (`.github/workflows/mutation.yml`) and on demand, not per-PR — mutation is minutes-slow and the
 PR loop must stay fast.
 
-**Measured: 87.76%** (764 killed, 68 timeout, 91 survived, 25 no-coverage; 24 min). Per file:
-`reports-data.ts` 100%, `saas-data.ts` 98.1%, `roles.ts` 97.4%, `export.ts` 93.6%, `utils.ts` 85.7%,
-`middleware.ts` 84.2%, `scope.ts` 81.8%, `activity-filters.ts` 77.0% ← the remaining weak spot.
+**Measured: 95.78%** (961 killed, 38 timeout, 36 survived, 8 no-coverage; 1043 mutants, 48 min).
+Per file: `brand.ts` and `reports-data.ts` 100%, `activity-filters.ts` 98.1%, `roles.ts` 97.4%,
+`metrics.ts` 97.1%, `saas-data.ts` 94.9%, `export.ts` 93.6%, `utils.ts` 85.7%, `middleware.ts` 84.2%,
+`scope.ts` 81.8%. Trajectory: 77.7% → 87.8% → 95.8% as weak assertions were replaced with real ones.
 
 This gate has already earned its keep. `reports-data.ts` sat at **91% line coverage and a 20.5%
 mutation score**: its date-preset logic (`today`/`yesterday`/`7d`/`30d`/`month`) was executed by

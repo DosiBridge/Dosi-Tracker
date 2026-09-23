@@ -1,4 +1,5 @@
 import { NOW } from "./mock-data";
+import { reconcileSegmentProductivity, trimSegmentsToTarget } from "./metrics";
 import { projects, userById } from "./tenant-data";
 import type { ScreenMock } from "./types";
 import type { AppCategory } from "./reports-data";
@@ -242,11 +243,15 @@ export function buildDayTimeline(userId: string, iso: string): DaySegment[] {
   const isWeekend = weekday === 0 || weekday === 6;
   const dayIndex = dayIndexFromIso(iso);
 
-  // Target tracked minutes for the day.
+  // Target tracked minutes for the day. TODAY is not a free variable: it must
+  // equal the member's canonical `trackedToday`, which every other surface
+  // reports. (A previous 0.55 haircut for "offline" members made this page
+  // disagree with /team by nearly half a day — `offline` describes presence
+  // right now, not how much time the member logged.) Earlier days have no such
+  // canonical figure, so they scale off it.
   let target = user.trackedToday;
   if (dayIndex > 0) target = Math.round(user.trackedToday * (0.85 + rand() * 0.3));
   if (isWeekend) target = rand() > 0.5 ? Math.round(user.trackedToday * (0.2 + rand() * 0.25)) : 0;
-  if (user.status === "offline" && dayIndex === 0) target = Math.round(target * 0.55);
   if (target <= 0) return [];
 
   const apps = appsByDesignation[user.designation] ?? defaultApps;
@@ -307,7 +312,33 @@ export function buildDayTimeline(userId: string, iso: string): DaySegment[] {
     }
   }
 
-  return segments;
+  // Reconcile the generated day with the member's canonical figures.
+  //
+  // The loop above exits on the first segment that crosses the target, so the
+  // day overshoots by part of a segment; and per-segment productivity is drawn
+  // BELOW the member's score on purpose (meetings are less focused, some apps
+  // are unproductive), which drags the duration-weighted average down. Left
+  // alone, /monitor reports several minutes more time and 4-10 points less
+  // productivity than /team and /dashboard for the same person on the same day.
+  // The per-segment texture is worth keeping — the totals are what must agree.
+  // The reconciliation itself lives in metrics.ts with the other definitions.
+  const reconcilable = segments.map((s) => ({
+    minutes: s.minutes,
+    endMin: s.endMin,
+    productivity: s.productivity,
+    counts: s.type === "work" || s.type === "meeting",
+    ref: s,
+  }));
+  trimSegmentsToTarget(reconcilable, target);
+  reconcileSegmentProductivity(reconcilable, user.productivity);
+
+  const kept = new Set(reconcilable.map((r) => r.ref));
+  for (const r of reconcilable) {
+    r.ref.minutes = r.minutes;
+    r.ref.endMin = r.endMin;
+    r.ref.productivity = r.productivity;
+  }
+  return segments.filter((s) => kept.has(s));
 
   function seg(
     type: SegmentType,

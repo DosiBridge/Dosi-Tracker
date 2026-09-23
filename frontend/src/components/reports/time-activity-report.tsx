@@ -8,8 +8,9 @@ import { Progress } from "@/components/ui/progress";
 import { DataTable, type Column } from "@/components/ui/data-table";
 import { ActivityTrendChart } from "@/components/dashboard/charts";
 import { ReportShell, FilterBar, ExportMenu, Kpi, KpiGrid } from "./report-shell";
-import { activities, projects, userById, users } from "@/lib/tenant-data";
+import { activities, userById, users } from "@/lib/tenant-data";
 import { trackedMembers } from "@/lib/roles";
+import { averageProductivity, dayKey, durationMinutes, minutesForUser } from "@/lib/metrics";
 import { filterActivitiesByRange, rangeForKey, type RangeKey } from "@/lib/reports-data";
 import { exportRecords } from "@/lib/export";
 import { cn, formatDuration } from "@/lib/utils";
@@ -169,15 +170,14 @@ export function TimeActivityReport() {
     }
     
     acts.forEach((a) => {
-      const iso = a.endedAt.slice(0, 10);
+      const iso = dayKey(a);
       if (days[iso]) {
-        const p = projects.find((pr) => pr.id === a.projectId);
-        const mins = p?.intervalMinutes ?? 10;
+        const mins = durationMinutes(a);
         days[iso].tracked += mins;
         days[iso].productive += Math.round((mins * a.productivity) / 100);
       }
     });
-    
+
     return Object.values(days);
   }, [acts, range]);
 
@@ -188,11 +188,8 @@ export function TimeActivityReport() {
 
     return members.map((u) => {
       const ua = acts.filter((a) => a.userId === u.id);
-      const tracked = ua.reduce((s, a) => {
-        const p = projects.find((pr) => pr.id === a.projectId);
-        return s + (p?.intervalMinutes ?? 10);
-      }, 0);
-      const activity = ua.length ? Math.round(ua.reduce((s, a) => s + a.productivity, 0) / ua.length) : u.productivity;
+      const tracked = minutesForUser(acts, u.id);
+      const activity = ua.length ? averageProductivity(ua) : u.productivity;
       const appCount = new Map<string, number>();
       ua.forEach((a) => appCount.set(a.screen.app, (appCount.get(a.screen.app) ?? 0) + 1));
       const topApp = [...appCount.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? "—";

@@ -7,6 +7,7 @@ vi.mock("next/navigation", () => import("@/test/next-navigation-stub"));
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import ActivitiesPage from "@/app/(dashboard)/activities/page";
 import { activities as seededActivities, projectById, userById } from "@/lib/tenant-data";
 import { renderAsRole, resetPrototypeState } from "@/test/harness";
@@ -21,6 +22,13 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllGlobals();
 });
+
+// The page paints one card per matching row and does not paginate, so an owner
+// on the default 7-day range mounts ~160 cards. That is fast in a browser but
+// slow in jsdom, and slower again under v8 coverage instrumentation — enough to
+// overrun vitest's 5s default. The budget below is a HARNESS allowance, not a
+// relaxed assertion: every expectation still runs and still fails on regression.
+const RENDER_BUDGET_MS = 20_000;
 
 describe("activities page — demo-mode fallback", () => {
   it("lists the seeded team activity for an owner instead of the empty state", () => {
@@ -38,9 +46,34 @@ describe("activities page — demo-mode fallback", () => {
     expect(screen.getAllByText(userById(latest.userId)!.name).length).toBeGreaterThan(1);
     expect(screen.getAllByText(projectById(latest.projectId)!.title).length).toBeGreaterThan(1);
 
+    // The sort control is a controlled <select>: it can only render a label if
+    // the DEFAULT sort is one of the options it offers. Anything else leaves the
+    // user staring at a blank sort box on first paint.
+    expect(screen.getByDisplayValue("Most recent")).toBeInTheDocument();
+
     // The page keeps its demo honesty notice.
     expect(screen.getByText("previews are mock placeholders")).toBeInTheDocument();
-  });
+  }, RENDER_BUDGET_MS);
+
+  it("pages the session list instead of painting every card, and reveals the rest on demand", async () => {
+    // A busy team produces hundreds of sessions; rendering them all at once
+    // made this page the slowest in the app and gave the user an endless wall.
+    const user = userEvent.setup();
+    renderAsRole(<ActivitiesPage />, "owner", { route: "/activities" });
+
+    const countShown = () => screen.getAllByRole("button", { name: /^Open session:/ }).length;
+    const firstPage = countShown();
+    expect(firstPage).toBeLessThanOrEqual(24);
+
+    // The user is told what they are seeing, and nothing is silently dropped.
+    const status = screen.getByText(/Showing \d+ of \d+ sessions/);
+    expect(status).toBeInTheDocument();
+    const total = Number(status.textContent!.match(/of (\d+)/)![1]);
+    expect(total).toBeGreaterThan(firstPage);
+
+    await user.click(screen.getByRole("button", { name: /show \d+ more/i }));
+    expect(countShown()).toBeGreaterThan(firstPage);
+  }, RENDER_BUDGET_MS);
 
   it("scopes the demo fallback to a worker's own rows", () => {
     renderAsRole(<ActivitiesPage />, "worker", { route: "/activities" }); // u2 · Tanvir Hasan
@@ -52,5 +85,5 @@ describe("activities page — demo-mode fallback", () => {
     for (const other of ["Ayesha Rahman", "Nusrat Jahan", "Rafiq Islam", "Sadia Akter", "Imran Kabir", "David Chen"]) {
       expect(screen.queryByText(other)).not.toBeInTheDocument();
     }
-  });
+  }, RENDER_BUDGET_MS);
 });

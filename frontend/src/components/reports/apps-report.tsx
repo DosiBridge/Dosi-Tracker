@@ -9,7 +9,8 @@ import { Progress } from "@/components/ui/progress";
 import { Select } from "@/components/ui/input";
 import { DataTable, type Column } from "@/components/ui/data-table";
 import { ReportShell, FilterBar, ExportMenu, Kpi, KpiGrid } from "./report-shell";
-import { activities, appCatalog, projects } from "@/lib/tenant-data";
+import { activities, appCatalog } from "@/lib/tenant-data";
+import { durationMinutes } from "@/lib/metrics";
 import { categoryColor, filterActivitiesByRange, rangeForKey, type AppCategory, type AppUsage, type RangeKey } from "@/lib/reports-data";
 
 const APP_PALETTE: { app: string; category: AppCategory; color: string }[] = [
@@ -124,9 +125,9 @@ export function AppsReport() {
     acts.forEach((a) => {
       const appName = a.screen.app;
       const meta = appMetaMap.get(appName) || { category: "neutral" as AppCategory, color: "#64748b" };
-      const p = projects.find((pr) => pr.id === a.projectId);
-      const mins = p?.intervalMinutes ?? 10;
-      
+      const mins = durationMinutes(a);
+
+
       const cur = appMinutes.get(appName) ?? {
         app: appName,
         category: meta.category,

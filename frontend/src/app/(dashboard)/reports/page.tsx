@@ -20,6 +20,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { PageHeader, PageStack, SectionLabel } from "@/components/ui/page-header";
+import { toast } from "@/components/toast";
 import { reportCatalog } from "@/lib/reports-data";
 
 const icons: Record<string, LucideIcon> = {
@@ -49,7 +50,15 @@ export default function ReportsHubPage() {
         title="Reports"
         description="Generate, schedule, and export detailed reports across your team."
         actions={
-          <Button>
+          <Button
+            onClick={() =>
+              toast({
+                tone: "info",
+                title: "Scheduling isn't available yet",
+                description: "Open any report below and use Export to download it now.",
+              })
+            }
+          >
             <Plus className="h-4 w-4" /> Schedule report
           </Button>
         }

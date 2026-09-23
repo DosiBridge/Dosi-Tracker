@@ -112,24 +112,26 @@ test("the attendance presence matrix renders one row per member with a mark per 
   await expect(bodyRows.first().getByText(/Present|Absent/).first()).toBeAttached();
 });
 
-test("dark theme has no serious or critical contrast failures on the core screens", async ({
-  page,
-  context,
-}, testInfo) => {
-  // Dark mode was never scanned: primary buttons were white-on-teal at 2.47:1
-  // and success/info/primary had collapsed into one indistinguishable color.
-  await primeSession(context, { userId: "u1", workspaceId: "w1" });
-  await context.addInitScript(() => localStorage.setItem("dosi-theme", "dark"));
+// Dark mode was never scanned before this: primary buttons were white-on-teal
+// at 2.47:1, and success/info/primary had collapsed into one indistinguishable
+// color. One test per route — a single test walking all four ran long enough to
+// time out when the browser projects execute in parallel.
+for (const route of ["/dashboard", "/projects", "/team", "/settings"]) {
+  test(`dark theme has no serious or critical contrast failures on ${route}`, async ({
+    page,
+    context,
+  }, testInfo) => {
+    await primeSession(context, { userId: "u1", workspaceId: "w1" });
+    await context.addInitScript(() => localStorage.setItem("dosi-theme", "dark"));
 
-  for (const route of ["/dashboard", "/projects", "/team", "/settings"]) {
     await page.goto(route);
     await expect(page.locator("html.dark")).toBeAttached();
 
     const results = await new AxeBuilder({ page }).withRules(["color-contrast"]).analyze();
     const serious = results.violations
       .filter((v) => v.impact === "serious" || v.impact === "critical")
-      .flatMap((v) => v.nodes.map((n) => `${route} ${v.id}: ${n.html.slice(0, 90)}`));
+      .flatMap((v) => v.nodes.map((n) => `${v.id}: ${n.html.slice(0, 90)}`));
     testInfo.annotations.push({ type: "dark-scan", description: `${route}: ${serious.length} nodes` });
     expect(serious).toEqual([]);
-  }
-});
+  });
+}

@@ -18,7 +18,8 @@ import { Avatar } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { DataTable, type Column } from "@/components/ui/data-table";
 import { ReportShell, FilterBar, ExportMenu, Kpi, KpiGrid } from "./report-shell";
-import { activities, projects, userById, users } from "@/lib/tenant-data";
+import { activities, userById, users } from "@/lib/tenant-data";
+import { durationMinutes } from "@/lib/metrics";
 import { categoryColor, filterActivitiesByRange, rangeForKey, type RangeKey } from "@/lib/reports-data";
 import { exportRecords } from "@/lib/export";
 import { cn, formatDuration } from "@/lib/utils";
@@ -163,8 +164,7 @@ export function ProductivityReport() {
       let idle = 0;
 
       ua.forEach((a) => {
-        const p = projects.find((pr) => pr.id === a.projectId);
-        const mins = p?.intervalMinutes ?? 10;
+        const mins = durationMinutes(a);
         const prod = Math.round((mins * a.productivity) / 100);
         const rem = mins - prod;
         const unprod = Math.round(rem * 0.35);

@@ -7,7 +7,8 @@ import { Avatar } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { DataTable, type Column } from "@/components/ui/data-table";
 import { ReportShell, FilterBar, ExportMenu, Kpi, KpiGrid } from "./report-shell";
-import { activities, billing, projects, userById, users } from "@/lib/tenant-data";
+import { activities, billing, userById } from "@/lib/tenant-data";
+import { minutesForUser } from "@/lib/metrics";
 import { filterActivitiesByRange, rangeForKey, type RangeKey } from "@/lib/reports-data";
 import { exportRecords } from "@/lib/export";
 import { cn, formatDuration } from "@/lib/utils";
@@ -171,11 +172,7 @@ export function PayrollReport() {
       .filter((b) => memberId === "all" || b.userId === memberId)
       .map((b) => {
         const u = userById(b.userId)!;
-        const ua = acts.filter((a) => a.userId === b.userId);
-        const minutes = ua.reduce((s, a) => {
-          const p = projects.find((pr) => pr.id === a.projectId);
-          return s + (p?.intervalMinutes ?? 10);
-        }, 0);
+        const minutes = minutesForUser(acts, b.userId);
         const hours = Math.round((minutes / 60) * 10) / 10;
         return {
           userId: b.userId,

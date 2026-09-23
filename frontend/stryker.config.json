@@ -21,8 +21,8 @@
   "htmlReporter": { "fileName": "reports/mutation/mutation.html" },
   "jsonReporter": { "fileName": "reports/mutation/mutation.json" },
   "thresholds": {
-    "high": 90,
-    "low": 85,
-    "break": 85
+    "high": 95,
+    "low": 92,
+    "break": 92
   }
 }

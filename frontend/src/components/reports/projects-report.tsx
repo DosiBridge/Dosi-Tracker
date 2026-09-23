@@ -9,6 +9,7 @@ import { Avatar } from "@/components/ui/avatar";
 import { DataTable, type Column } from "@/components/ui/data-table";
 import { ReportShell, FilterBar, ExportMenu, Kpi, KpiGrid } from "./report-shell";
 import { activities, projects, userById } from "@/lib/tenant-data";
+import { minutesByProject } from "@/lib/metrics";
 import { filterActivitiesByRange, rangeForKey, type RangeKey } from "@/lib/reports-data";
 import { exportRecords } from "@/lib/export";
 import { formatDuration } from "@/lib/utils";
@@ -138,16 +139,10 @@ export function ProjectsReport() {
 
   const mockRows = useMemo(() => projects.filter((p) => !p.archived), []);
 
-  const mockMinutes = useMemo(() => {
-    const acts = filterActivitiesByRange(activities, range.from, range.to);
-    const map = new Map<string, number>();
-    acts.forEach((a) => {
-      const p = projects.find((pr) => pr.id === a.projectId);
-      const mins = p?.intervalMinutes ?? 10;
-      map.set(a.projectId, (map.get(a.projectId) ?? 0) + mins);
-    });
-    return map;
-  }, [range]);
+  const mockMinutes = useMemo(
+    () => minutesByProject(filterActivitiesByRange(activities, range.from, range.to)),
+    [range],
+  );
 
   const liveMinutes = useMemo<Map<string, number> | null>(() => {
     if (!liveSummary) return null;

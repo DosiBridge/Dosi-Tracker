@@ -23,6 +23,13 @@ export default defineConfig({
     setupFiles: ["./src/test/setup.ts"],
     include: ["src/**/*.{test,spec}.{ts,tsx}"],
     css: false,
+    // Vitest's 5s default has no headroom for the user-event-driven page tests:
+    // a full page render plus a typing sequence in jsdom runs comfortably under
+    // a second idle, but blows past 5s on a loaded machine (a CI runner, or a
+    // laptop also running the mutation suite), producing failures that look
+    // like flakes but are pure starvation. This is a time allowance, not a
+    // relaxed assertion — every expectation still executes and must pass.
+    testTimeout: 15_000,
     coverage: {
       provider: "v8",
       reporter: ["text-summary", "cobertura", "html"],
@@ -36,13 +43,14 @@ export default defineConfig({
         "src/lib/monitor-data.ts",
         "src/lib/host-data.ts",
       ],
-      // Measured baseline on this (widened) denominator: lines/statements 95.1%, functions 86.7%,
-      // branches 92.8%. Floors sit just below so the gate is green today but any regression fails.
+      // Measured baseline on this denominator: lines/statements 96.4%, functions 89.7%,
+      // branches 96.3%. Floors sit just below so the gate is green today but any regression fails.
+      // Ratcheted up after the metrics-consistency work; raise, never lower.
       thresholds: {
-        lines: 94,
-        functions: 85,
-        statements: 94,
-        branches: 91,
+        lines: 95,
+        functions: 88,
+        statements: 95,
+        branches: 95,
       },
     },
   },

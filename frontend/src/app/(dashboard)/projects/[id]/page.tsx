@@ -28,6 +28,7 @@ import { ScreenMockView } from "@/components/screen-mock";
 import { useSession } from "@/components/session-provider";
 import { toast } from "@/components/toast";
 import { activitiesForProject, projectById, userById } from "@/lib/tenant-data";
+import { averageProductivity, minutesForUser } from "@/lib/metrics";
 import { canViewProject } from "@/lib/scope";
 import { formatDuration } from "@/lib/utils";
 import { getApi, postApi } from "@/hooks/useApi";
@@ -223,10 +224,8 @@ export default function ProjectDetailPage() {
     const acts = activitiesForProject(view.id);
     memberRows = members.map((u) => {
       const ua = acts.filter((a) => a.userId === u!.id);
-      const minutes = ua.length * view.intervalMinutes;
-      const prod = ua.length
-        ? Math.round(ua.reduce((s, a) => s + a.productivity, 0) / ua.length)
-        : u!.productivity;
+      const minutes = minutesForUser(acts, u!.id);
+      const prod = ua.length ? averageProductivity(ua) : u!.productivity;
       return {
         id: u!.id,
         name: u!.name,

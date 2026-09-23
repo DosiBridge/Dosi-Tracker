@@ -2,6 +2,19 @@ import { useState, useEffect, useCallback } from 'react';
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'https://localhost:44342';
 
+/**
+ * The request never reached the server (offline, DNS, TLS, server down) — as
+ * opposed to the server answering with a rejection. Callers must tell users
+ * these apart: "check your password" is wrong and misleading when the real
+ * problem is that nothing is listening.
+ */
+export class ApiUnreachableError extends Error {
+  constructor() {
+    super("Couldn't reach the server");
+    this.name = "ApiUnreachableError";
+  }
+}
+
 const getAuthHeaders = () => {
   const token = typeof window !== 'undefined' ? localStorage.getItem('dosi-token') : null;
   return {
@@ -155,13 +168,18 @@ export const loginApi = async (username: string, password: string, tenant?: stri
     ? `${API_BASE_URL}/connect/token?__tenant=${encodeURIComponent(tenant)}`
     : `${API_BASE_URL}/connect/token`;
 
-  const res = await fetch(tokenUrl, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-    },
-    body: params.toString(),
-  });
+  let res: Response;
+  try {
+    res = await fetch(tokenUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: params.toString(),
+    });
+  } catch {
+    throw new ApiUnreachableError();
+  }
 
   if (!res.ok) {
     throw new Error('Invalid credentials or login failed');
@@ -201,13 +219,18 @@ export const registerWorkspaceApi = async (
   adminPassword: string,
   planName?: string,
 ) => {
-  const res = await fetch(`${API_BASE_URL}/api/app/workspace/register`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ name, adminEmail, adminPassword, planName }),
-  });
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE_URL}/api/app/workspace/register`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ name, adminEmail, adminPassword, planName }),
+    });
+  } catch {
+    throw new ApiUnreachableError();
+  }
 
   if (!res.ok) {
     const errorText = await res.text();

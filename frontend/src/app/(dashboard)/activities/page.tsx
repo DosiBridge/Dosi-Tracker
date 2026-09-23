@@ -13,6 +13,7 @@ import {
   SearchX,
 } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
 import { surfaceVariants } from "@/components/ui/surface";
 import { Badge } from "@/components/ui/badge";
 import { Avatar } from "@/components/ui/avatar";
@@ -39,6 +40,9 @@ const isGuidId = (id: string) => GUID_RE.test(id);
 // LIVE MODE gate — a subscription-less external-store read of the backend
 // token so SSR and the first client render agree (server snapshot: no token),
 // same contract as the sibling pages' effect-resolved gates.
+/** Cards rendered per page on the activity list (see visibleCount below). */
+const PAGE_SIZE = 24;
+
 const subscribeToNothing = () => () => {};
 const readBackendToken = () => typeof window !== "undefined" && !!localStorage.getItem("dosi-token");
 const serverHasNoToken = () => false;
@@ -202,6 +206,16 @@ function ActivitiesPageInner() {
   const filtered = useMemo(() => applyActivityFilters(base, effectiveFilters), [base, effectiveFilters]);
   const updatedAt = liveActivities?.[0]?.endedAt;
 
+  // A busy team produces hundreds of sessions a day. Render a page at a time
+  // rather than every card at once, and reset the window whenever the result
+  // set changes so a new filter always starts at the top.
+  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
+  useEffect(() => {
+    setVisibleCount(PAGE_SIZE);
+  }, [effectiveFilters, view, base]);
+  const visible = useMemo(() => filtered.slice(0, visibleCount), [filtered, visibleCount]);
+  const remaining = filtered.length - visible.length;
+
   return (
     <PageStack>
       <PageHeader
@@ -267,7 +281,7 @@ function ActivitiesPageInner() {
         <p className="py-16 text-center text-sm text-muted-foreground">Loading activity…</p>
       ) : view === "sessions" ? (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-          {filtered.map((a) => {
+          {visible.map((a) => {
             const u = userById(a.userId);
             const p = resolveProject(a.projectId);
             return (
@@ -327,7 +341,7 @@ function ActivitiesPageInner() {
         </div>
       ) : (
         <div className="grid grid-cols-2 gap-4 md:grid-cols-3 lg:grid-cols-4">
-          {filtered.map((a) => {
+          {visible.map((a) => {
             const u = userById(a.userId);
             const p = resolveProject(a.projectId);
             return (
@@ -349,6 +363,17 @@ function ActivitiesPageInner() {
               </button>
             );
           })}
+        </div>
+      )}
+
+      {remaining > 0 && (
+        <div className="flex flex-col items-center gap-2 pt-2">
+          <p className="text-xs text-muted-foreground">
+            Showing {visible.length} of {filtered.length} sessions
+          </p>
+          <Button variant="outline" onClick={() => setVisibleCount((n) => n + PAGE_SIZE)}>
+            Show {Math.min(remaining, PAGE_SIZE)} more
+          </Button>
         </div>
       )}
 

@@ -123,10 +123,28 @@ describe("login page — sign-in form", () => {
     await fillSignIn(user, { workspace: "acme", password: "wrong-pass" });
     await user.click(signInButton());
 
-    expect(await screen.findByText("Invalid username, password or workspace")).toBeInTheDocument();
+    // Names the fields the form actually has (email, not "username") and
+    // blames the credentials only because the server really did reject them.
+    expect(await screen.findByText(/that email, password or workspace didn't match/i)).toBeInTheDocument();
     expect(signInButton()).toBeEnabled(); // no longer stuck in "Signing in…"
     expect(localStorage.getItem("dosi-token")).toBeNull();
     expect(document.cookie).not.toContain("dosi-token=1");
+    expect(__router.push).not.toHaveBeenCalled();
+  });
+
+  it("says the server is unreachable rather than blaming the password when the request never lands", async () => {
+    // A network failure previously produced "Invalid username, password or
+    // workspace", sending users to re-check credentials that were fine.
+    fetchMock.mockRejectedValue(new TypeError("Failed to fetch"));
+    const user = userEvent.setup();
+    renderWithProviders(<LoginPage />, { route: "/login" });
+
+    await fillSignIn(user, { workspace: "acme", password: "correct-horse" });
+    await user.click(signInButton());
+
+    expect(await screen.findByText(/can't reach the server/i)).toBeInTheDocument();
+    expect(screen.queryByText(/didn't match/i)).not.toBeInTheDocument();
+    expect(signInButton()).toBeEnabled();
     expect(__router.push).not.toHaveBeenCalled();
   });
 

@@ -474,6 +474,9 @@ describe("architecture spec: secret scanning", () => {
       "Show password", // aria-label on the reveal toggle
       "Hide password", // aria-label on the reveal toggle
       "Forgot password?", // link copy
+      // Sign-in error copy. Names the fields, carries no credential value.
+      "That email, password or workspace didn't match. Check them and try again.",
+      "Ask your workspace administrator to reset your password — self-service reset isn't available yet.",
     ]);
     const violations: string[] = [];
     let hitsSeen = 0;

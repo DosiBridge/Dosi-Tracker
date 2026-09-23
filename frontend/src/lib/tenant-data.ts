@@ -9,8 +9,14 @@ import type {
   ProductivitySplit,
 } from "./reports-data";
 import { trackedMembers, countSeats } from "./roles";
+import { activitiesOnDay, averageProductivity, minutesByUser, minutesOnDay } from "./metrics";
 import {
+  DAY_MS,
   NOW,
+  TODAY,
+  TRACKED_DAY_SPAN,
+  planDaySessions,
+  syncProjectTotals,
   users as primaryUsers,
   projects as primaryProjects,
   activities as primaryActivities,
@@ -123,6 +129,11 @@ function makeWindows(primary: ScreenMock, rand: () => number): { active: WindowI
 
 /* ----------------------------- Generators ----------------------------- */
 
+/**
+ * Same contract as the primary tenant's generator (and the same session
+ * planner): every member's rows for today sum to exactly their intended
+ * `trackedToday`, so `syncTrackedToday` below can derive the roster from them.
+ */
 function genActivities(users: User[], projects: Project[], seedNum: number): Activity[] {
   const rand = mulberry32(seedNum);
   const pick = <T>(arr: T[]) => arr[Math.floor(rand() * arr.length)];
@@ -132,38 +143,49 @@ function genActivities(users: User[], projects: Project[], seedNum: number): Act
   if (!projects.length || !trackingUsers.length) return list;
   let id = 0;
 
-  for (let day = 0; day < 5; day++) {
+  for (let day = 0; day < TRACKED_DAY_SPAN; day++) {
+    const anchor = new Date(NOW.getTime() - day * DAY_MS);
     for (const user of trackingUsers) {
-      const blocks = day === 0 ? between(2, 4) : between(1, 3);
-      for (let b = 0; b < blocks; b++) {
+      const target =
+        day === 0 ? user.trackedToday : Math.round(user.trackedToday * (0.55 + rand() * 0.6));
+
+      planDaySessions(target, anchor, rand).forEach((session, index) => {
         const template = pick(screenTemplates);
         const mine = projects.filter((p) => !p.archived && p.memberIds.includes(user.id));
-        const project = (mine.length ? pick(mine) : projects[0]);
-        const minutesAgo = day * 24 * 60 + b * between(35, 90) + between(5, 25);
-        const ended = new Date(NOW.getTime() - minutesAgo * 60000);
-        const started = new Date(ended.getTime() - project.intervalMinutes * 60000);
+        const project = mine.length ? pick(mine) : projects[0];
         const { active, running } = makeWindows(template, rand);
         id++;
         list.push({
           id: `${user.id}-a${id}`,
           userId: user.id,
           projectId: project.id,
-          startedAt: started.toISOString(),
-          endedAt: ended.toISOString(),
+          startedAt: session.startedAt.toISOString(),
+          endedAt: session.endedAt.toISOString(),
           description: pick(descriptions),
-          productivity: between(48, 97),
-          mouseClicks: between(60, 640),
-          keyboardHits: between(200, 3200),
+          productivity: Math.min(99, Math.max(30, user.productivity + between(-10, 8))),
+          mouseClicks: Math.round(session.minutes * between(3, 11)),
+          keyboardHits: Math.round(session.minutes * between(12, 60)),
           activeWindows: active,
           runningPrograms: running,
           screen: template,
           hasWebcam: project.permissions.webcam && rand() > 0.5,
-          online: day === 0 && b === 0 ? true : rand() > 0.25,
+          online: day === 0 && index === 0 ? true : rand() > 0.25,
         });
-      }
+      });
     }
   }
   return list.sort((a, b) => +new Date(b.endedAt) - +new Date(a.endedAt));
+}
+
+/**
+ * Rewrite each member's `trackedToday` from their own activity rows. The
+ * authored roster value is the generator's target; the rows are the truth.
+ */
+function syncTrackedToday(users: User[], activities: Activity[]): void {
+  const today = minutesByUser(activitiesOnDay(activities, TODAY));
+  for (const user of users) {
+    user.trackedToday = today.get(user.id) ?? 0;
+  }
 }
 
 function genWeekly(users: User[], seedNum: number) {
@@ -293,14 +315,14 @@ function genNotifications(users: User[], projects: Project[]): AppNotification[]
   return out;
 }
 
-function computeSummary(users: User[], projects: Project[]): Summary {
-  const active = users.filter((u) => u.productivity > 0);
+/** Time figures come off the activity rows via metrics.ts — same as every report. */
+function computeSummary(users: User[], projects: Project[], activities: Activity[]): Summary {
   return {
-    totalTrackedToday: users.reduce((s, u) => s + u.trackedToday, 0),
+    totalTrackedToday: minutesOnDay(activities, TODAY),
     activeMembers: users.filter((u) => u.status === "active").length,
     totalMembers: countSeats(users),
     activeProjects: projects.filter((p) => !p.archived).length,
-    avgProductivity: active.length ? Math.round(active.reduce((s, u) => s + u.productivity, 0) / active.length) : 0,
+    avgProductivity: averageProductivity(activitiesOnDay(activities, TODAY)),
     screenshotsToday: countSeats(users) * 40,
   };
 }
@@ -369,6 +391,10 @@ interface Roster {
 function buildGenerated(roster: Roster): Dataset {
   const seed = hashStr(roster.id);
   const activities = genActivities(roster.users, roster.projects, seed);
+  // Derive the roster and the project totals from the rows before anything
+  // else reads `trackedToday` / `loggedThisWeek`.
+  syncTrackedToday(roster.users, activities);
+  syncProjectTotals(roster.projects, activities);
   const appCatalog = genAppCatalog(roster.users, seed);
   return {
     workspaceId: roster.id,
@@ -378,7 +404,7 @@ function buildGenerated(roster: Roster): Dataset {
     weeklyTrend: genWeekly(roster.users, seed),
     hourlyToday: genHourly(seed),
     topApps: genTopApps(appCatalog),
-    summary: computeSummary(roster.users, roster.projects),
+    summary: computeSummary(roster.users, roster.projects, activities),
     projectDistribution: computeProjectDistribution(roster.projects),
     appCatalog,
     productivitySplit: deriveSplit(roster.users),
@@ -601,14 +627,9 @@ export function billingRow(userId: string) {
   return billing.find((b) => b.userId === userId);
 }
 
+/** Minutes per member. Delegates to metrics.ts — the one definition of "tracked". */
 export function trackedMinutesByUser(list: Activity[] = activities) {
-  const map = new Map<string, number>();
-  for (const a of list) {
-    const p = projects.find((pr) => pr.id === a.projectId);
-    const inc = p?.intervalMinutes ?? 10;
-    map.set(a.userId, (map.get(a.userId) ?? 0) + inc);
-  }
-  return map;
+  return minutesByUser(list);
 }
 
 export function insights(): Insight[] {

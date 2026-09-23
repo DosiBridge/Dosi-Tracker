@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Input, Select } from "@/components/ui/input";
 import { ThemeToggle } from "@/components/ui/theme-toggle";
 import { LoginHero } from "@/components/motion/login-hero";
-import { loginApi, registerWorkspaceApi } from "@/hooks/useApi";
+import { ApiUnreachableError, loginApi, registerWorkspaceApi } from "@/hooks/useApi";
 import type { PlanId } from "@/lib/saas-data";
 
 // Backend plan names (seeded by PlanDataSeedContributor).
@@ -41,8 +41,14 @@ export default function LoginPage() {
       // A host sign-in (no tenant) lands on the platform console; tenant users on the dashboard.
       const destination = tenant ? "/dashboard" : "/host";
       setTimeout(() => router.push(destination), 500);
-    } catch {
-      setErrorMsg("Invalid username, password or workspace");
+    } catch (err) {
+      // Distinguish "the server said no" from "there was no server" — blaming
+      // the user's password for an outage sends them down the wrong path.
+      setErrorMsg(
+        err instanceof ApiUnreachableError
+          ? "Can't reach the server right now. Check your connection, then try again."
+          : "That email, password or workspace didn't match. Check them and try again.",
+      );
       setLoading(null);
     }
   }
@@ -58,7 +64,13 @@ export default function LoginPage() {
       await loginApi(email, password, result.name);
       setTimeout(() => router.push("/dashboard"), 600);
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "Registration failed");
+      setErrorMsg(
+        err instanceof ApiUnreachableError
+          ? "Can't reach the server right now. Check your connection, then try again."
+          : err instanceof Error
+            ? err.message
+            : "We couldn't create your workspace. Please try again.",
+      );
       setLoading(null);
     }
   }
@@ -152,7 +164,15 @@ export default function LoginPage() {
                 <div className="space-y-1.5">
                   <div className="flex items-center justify-between">
                     <label htmlFor="login-password" className="text-sm font-medium">Password</label>
-                    <button type="button" className="text-xs text-primary-strong hover:underline">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setErrorMsg(
+                          "Ask your workspace administrator to reset your password — self-service reset isn't available yet.",
+                        )
+                      }
+                      className="text-xs text-primary-strong hover:underline"
+                    >
                       Forgot password?
                     </button>
                   </div>
