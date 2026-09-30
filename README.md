@@ -93,7 +93,7 @@ Each component has its own README with setup details:
 dotnet publish backend/src/Dosi.Tracker.DbMigrator -c Release
 dotnet publish backend/src/Dosi.Tracker.HttpApi.Host -c Release
 docker compose up --build
-# API on http://localhost:8080 · dashboard on http://localhost:3000
+# API on http://localhost:6006 · dashboard on http://localhost:6005
 ```
 
 ### Tests & CI

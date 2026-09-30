@@ -11,7 +11,7 @@
 // the app persists (localStorage) dies with the context. Never chain tests.
 import { test as base, expect } from "@playwright/test";
 
-export const API_ORIGINS = ["https://localhost:44342", "http://localhost:8080"];
+export const API_ORIGINS = ["https://localhost:6006", "http://localhost:6006"];
 
 export const test = base.extend({
   context: async ({ context, baseURL }, use) => {

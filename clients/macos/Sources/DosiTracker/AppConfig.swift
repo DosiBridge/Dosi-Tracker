@@ -9,7 +9,7 @@ struct AppConfig: Codable {
     var capture: CapturePermissions
 
     static let `default` = AppConfig(
-        apiBaseURL: "https://localhost:44342", // matches HttpApi.Host App:SelfUrl
+        apiBaseURL: "https://localhost:6006", // matches HttpApi.Host App:SelfUrl
         intervalMinutes: 10,
         capture: CapturePermissions(
             screenshot: true,

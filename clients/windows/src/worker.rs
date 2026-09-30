@@ -83,6 +83,10 @@ const UPLOAD_BATCH: u32 = 20;
 /// of stalling them for minutes.
 const MAX_UPLOADS_PER_PASS: u32 = 100;
 
+/// "Sync now" only ends the current block once it has run this long; before
+/// that it uploads the queue and leaves the block accumulating.
+const MIN_MANUAL_BLOCK: chrono::TimeDelta = chrono::TimeDelta::seconds(60);
+
 async fn run(
     state: StateHandle,
     cfg: AppConfig,
@@ -253,12 +257,18 @@ async fn run(
                     Command::SyncNow => {
                         if let Some(api) = client.as_mut() {
                             match session.as_ref() {
-                                Some(active) if !paused => {
+                                Some(active) if !paused && Utc::now() - block_started_at >= MIN_MANUAL_BLOCK => {
                                     block_started_at =
                                         capture_and_sync(&tracker, api, &store, active, &state, block_started_at).await;
+                                    // The next automatic block runs a full interval from
+                                    // this cut, instead of a sliver up to the old tick.
+                                    ticker.reset();
                                 }
                                 // Paused means nothing is captured, not even on
                                 // demand: only already-queued rows are uploaded.
+                                // So is a block under a minute old: it keeps
+                                // running rather than becoming a seconds-long
+                                // session scored 100% from a single click.
                                 _ => sync_pending(api, &store, &state).await,
                             }
                             refresh_totals(api, &state).await;
@@ -509,14 +519,18 @@ async fn refresh_totals(client: &mut ApiClient, state: &StateHandle) {
     let now = Utc::now();
     let (today_start, week_start) = local_day_and_week_start(now, &Local);
 
-    if let Ok(today) = client.summary(today_start, now).await {
-        state.update(|s| {
+    // Failures keep the previous values on screen, but are logged: a silently
+    // failing request once left these cards at zero with no trace of why.
+    match client.summary(today_start, now).await {
+        Ok(today) => state.update(|s| {
             s.tracked_today_minutes = today.total_tracked_minutes.max(0.0) as u64;
             s.last_productivity = today.average_productivity.clamp(0.0, 100.0) as u8;
-        });
+        }),
+        Err(e) => tracing::warn!(?e, "could not load today's totals"),
     }
-    if let Ok(week) = client.summary(week_start, now).await {
-        state.update(|s| s.tracked_week_minutes = week.total_tracked_minutes.max(0.0) as u64);
+    match client.summary(week_start, now).await {
+        Ok(week) => state.update(|s| s.tracked_week_minutes = week.total_tracked_minutes.max(0.0) as u64),
+        Err(e) => tracing::warn!(?e, "could not load this week's totals"),
     }
 }
 

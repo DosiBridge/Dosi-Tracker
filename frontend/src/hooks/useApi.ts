@@ -3,7 +3,7 @@ import { isLiveSession } from '@/lib/live-session';
 
 export { isLiveSession };
 
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'https://localhost:44342';
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'https://localhost:6006';
 
 /**
  * The request never reached the server (offline, DNS, TLS, server down) — as

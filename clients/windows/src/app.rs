@@ -327,7 +327,7 @@ impl TrackerApp {
                                 ),
                             );
                         } else if let Some(synced) = snapshot.last_sync {
-                            meta(ui, &format!("Synced {}", synced.format("%H:%M UTC")));
+                            meta(ui, &format!("Synced {}", synced.with_timezone(&chrono::Local).format("%H:%M")));
                         }
                     });
                 });

@@ -182,7 +182,7 @@ cargo clippy --all-targets -- -D warnings   # lints (CI enforces this)
 - **TLS:** certificates are always verified. The agent (rustls) trusts the
   **Windows certificate store** plus the bundled Mozilla roots, so a corporate
   CA deployed to Windows works without extra setup. Dev: the backend's
-  `https://localhost:44342` uses the ASP.NET dev certificate — run
+  `https://localhost:6006` uses the ASP.NET dev certificate — run
   `dotnet dev-certs https --trust` once (as the same Windows user) and restart
   the agent. Untrusted or self-signed certificates that are not in the store
   are refused.

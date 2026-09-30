@@ -18,7 +18,7 @@
     "Dosi.Tracker.HttpApi.Host": {
       "commandName": "Project",
       "launchBrowser": true,
-      "applicationUrl": "https://localhost:44342",
+      "applicationUrl": "https://localhost:6006",
       "environmentVariables": {
         "ASPNETCORE_ENVIRONMENT": "Development"
       }

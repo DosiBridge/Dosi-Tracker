@@ -2,7 +2,7 @@
   "applications": {
     "Dosi.Tracker.HttpApi.Host": {
       "type": "dotnet-project",
-      "launchUrl": "https://localhost:44342",
+      "launchUrl": "https://localhost:6006",
       "path": "../../../src/Dosi.Tracker.HttpApi.Host/Dosi.Tracker.HttpApi.Host.csproj",
       "kubernetesService": ".*-httpapihost$",
       "healthCheckEndpoint": "/health-status",

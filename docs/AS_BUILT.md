@@ -72,7 +72,7 @@ Present: `Users`, `Roles`, `ClaimTypes`, `OrganizationUnits`, `SecurityLogs`, `L
 ### Auth (as-built)
 
 - **Server:** OpenIddict validation on HttpApi.Host (not a hand-rolled JWT-only stack).
-- **Default Host URL:** `https://localhost:44342` (`App:SelfUrl`).
+- **Default Host URL:** `https://localhost:6006` (`App:SelfUrl`).
 - Agents default to `https://localhost:44300` in examples — **port mismatch** with Host.
 
 ### Config keys (Host)

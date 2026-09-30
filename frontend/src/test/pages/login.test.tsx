@@ -17,7 +17,7 @@ import LoginPage from "@/app/login/page";
 import { renderWithProviders, resetPrototypeState } from "@/test/harness";
 import { __router } from "@/test/next-navigation-stub";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "https://localhost:44342";
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "https://localhost:6006";
 
 type UserSession = ReturnType<typeof userEvent.setup>;
 

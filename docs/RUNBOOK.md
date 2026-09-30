@@ -53,8 +53,8 @@ dotnet run --project src/Dosi.Tracker.HttpApi.Host
 
 | Check | URL / note |
 |-------|------------|
-| Self URL | `https://localhost:44342` (default) |
-| Health | `https://localhost:44342/health-status` |
+| Self URL | `https://localhost:6006` (default) |
+| Health | `https://localhost:6006/health-status` |
 | Swagger | Host Swagger UI (when enabled in env) |
 | Logs | `Logs/logs.txt` under Host output |
 
@@ -82,7 +82,7 @@ Session is **localStorage** — Host can be down.
 ```powershell
 cd "D:\Github Projects\DosiBridge\Open Source\Dosi-Tracker\clients\windows"
 copy config.example.toml config.toml
-# set api_base_url to https://localhost:44342 when Host is up
+# set api_base_url to https://localhost:6006 when Host is up
 cargo run --release
 ```
 
@@ -117,7 +117,7 @@ No Grafana / alert manager in repo yet.
 | Host won’t start | Postgres down / wrong connection string | Fix `ConnectionStrings:Default`, retry |
 | Migration fail | Permissions / DB missing | Create DB, re-run DbMigrator |
 | Agent login 404 | Product login route missing | Expected today — use offline queue only |
-| Agent TLS / connection refused | Wrong port (`44300` vs `44342`) or untrusted cert | Match `SelfUrl`; trust cert |
+| Agent TLS / connection refused | Wrong port (must match `SelfUrl`, default `6006`) or untrusted cert | Match `SelfUrl`; trust cert |
 | Frontend “wrong” data | Mock seed | Expected — not API-backed |
 | CORS errors (once FE wired) | Origin not in Host CORS | Add Next origin to Host CORS config |
 

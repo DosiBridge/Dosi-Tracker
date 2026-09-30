@@ -88,7 +88,7 @@ three things per test context:
    (`src/middleware.ts`) gates routes only on cookie *presence*, so navigation works. But the app's
    live-backend path (`src/hooks/useApi.ts`) reads the JWT from `localStorage["dosi-token"]`, which
    the fixture never sets — so every page takes its demo-data branch.
-2. **Every request to the real API origins (`https://localhost:44342`, `http://localhost:8080`) is
+2. **Every request to the real API origins (`https://localhost:6006`, `http://localhost:6006`) is
    aborted** via `context.route(...).abort()`. A backend that happens to be running on the dev
    machine can never leak nondeterministic data into a test run.
 3. **The demo clock is frozen**: `NOW = 2026-07-14T15:30:00Z` (`src/lib/mock-data.ts`). "Today",

@@ -88,7 +88,7 @@ swift run
 
 - `DOSI_USERNAME` / `DOSI_PASSWORD` are required — without credentials the
   agent exits immediately.
-- Dev TLS: the backend's `https://localhost:44342` uses the ASP.NET dev
+- Dev TLS: the backend's `https://localhost:6006` uses the ASP.NET dev
   certificate; trust it in the login keychain or front the API with a real
   certificate, otherwise App Transport Security refuses the connection.
 - For true background operation, package as a **Launch Agent** (a `.plist` in

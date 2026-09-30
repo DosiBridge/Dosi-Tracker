@@ -29,6 +29,16 @@ pub struct ReportSummary {
     pub average_productivity: f64,
 }
 
+/// Query parameters for `GET /api/app/reporting/summary`.
+///
+/// Passed through `RequestBuilder::query` so they are percent-encoded: a raw
+/// `+00:00` offset in a hand-built URL is decoded by the server as a space,
+/// which fails model binding (HTTP 400) and left the status cards at zero.
+fn summary_query(from: DateTime<Utc>, to: DateTime<Utc>) -> [(&'static str, String); 2] {
+    let iso = |t: DateTime<Utc>| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    [("From", iso(from)), ("To", iso(to))]
+}
+
 /// OpenIddict client id seeded by the backend (`Tracker_App`, password grant enabled).
 const CLIENT_ID: &str = "Tracker_App";
 const SCOPE: &str = "Tracker";
@@ -213,15 +223,11 @@ impl ApiClient {
         to: DateTime<Utc>,
     ) -> Result<ReportSummary> {
         let token = self.ensure_token().await?;
-        let url = format!(
-            "{}/api/app/reporting/summary?From={}&To={}",
-            self.base_url,
-            from.to_rfc3339(),
-            to.to_rfc3339()
-        );
+        let url = format!("{}/api/app/reporting/summary", self.base_url);
         let summary = self
             .http
             .get(url)
+            .query(&summary_query(from, to))
             .bearer_auth(token)
             .send()
             .await?
@@ -289,6 +295,23 @@ mod tests {
             "Acme".into(),
         );
         assert_eq!(client.owner_key(), crate::storage::owner_key("acme", "alice@acme.com"));
+    }
+
+    #[test]
+    fn summary_query_survives_url_encoding() {
+        let from = DateTime::parse_from_rfc3339("2026-09-29T18:00:00+00:00").unwrap().with_timezone(&Utc);
+        let to = DateTime::parse_from_rfc3339("2026-09-30T10:29:24.976+00:00").unwrap().with_timezone(&Utc);
+        let request = reqwest::Client::new()
+            .get("https://example.invalid/api/app/reporting/summary")
+            .query(&summary_query(from, to))
+            .build()
+            .unwrap();
+
+        // What the server sees after decoding must still parse to the same instants.
+        let pairs: std::collections::HashMap<_, _> = request.url().query_pairs().into_owned().collect();
+        let parse = |key: &str| DateTime::parse_from_rfc3339(&pairs[key]).unwrap().with_timezone(&Utc);
+        assert_eq!(parse("From"), from);
+        assert_eq!(parse("To"), to);
     }
 
     #[test]

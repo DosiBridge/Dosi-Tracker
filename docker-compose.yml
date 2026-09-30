@@ -46,16 +46,16 @@ services:
       # guard that (correctly) refuses template secrets, and uses OpenIddict development certificates.
       ASPNETCORE_ENVIRONMENT: Development
       ASPNETCORE_URLS: "http://+:8080"
-      App__SelfUrl: ${TRACKER_SELF_URL:-http://localhost:8080}
-      App__CorsOrigins: ${TRACKER_CORS_ORIGINS:-http://localhost:3000}
+      App__SelfUrl: ${TRACKER_SELF_URL:-http://localhost:6006}
+      App__CorsOrigins: ${TRACKER_CORS_ORIGINS:-http://localhost:6005}
       App__DisablePII: "true"
-      AuthServer__Authority: ${TRACKER_SELF_URL:-http://localhost:8080}
+      AuthServer__Authority: ${TRACKER_SELF_URL:-http://localhost:6006}
       AuthServer__RequireHttpsMetadata: "false"
       AuthServer__CertificatePassPhrase: ${TRACKER_CERT_PASSPHRASE:-3f027835-7c52-4bf7-bc1f-77582ca37aef}
       StringEncryption__DefaultPassPhrase: ${TRACKER_ENCRYPTION_PASSPHRASE:-5pGzpfXjidNXJVDa}
       ConnectionStrings__Default: "Host=postgres;Port=5432;Database=Tracker;User ID=${TRACKER_DB_USER:-root};Password=${TRACKER_DB_PASSWORD:-myPassword};"
     ports:
-      - "8080:8080"
+      - "6006:8080"
     depends_on:
       postgres:
         condition: service_healthy
@@ -68,10 +68,10 @@ services:
     volumes:
       - ./frontend:/app
     environment:
-      NEXT_PUBLIC_API_URL: ${TRACKER_SELF_URL:-http://localhost:8080}
-    command: sh -c "npm ci && npm run build && npm run start -- -p 3000"
+      NEXT_PUBLIC_API_URL: ${TRACKER_SELF_URL:-http://localhost:6006}
+    command: sh -c "npm ci && npm run build && npm run start"
     ports:
-      - "3000:3000"
+      - "6005:6005"
     depends_on:
       - api
 

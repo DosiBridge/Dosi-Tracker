@@ -726,7 +726,7 @@ Per-component setup (each has its own README):
 # Frontend (web app)
 cd frontend
 npm install
-npm run dev          # http://localhost:3000
+npm run dev          # http://localhost:6005
 npm run build        # production build
 
 # Backend (.NET 10 + ABP)

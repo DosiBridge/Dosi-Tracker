@@ -14,7 +14,7 @@ import { axe } from "jest-axe";
 import SettingsPage from "@/app/(dashboard)/settings/page";
 import { renderAsRole, resetPrototypeState } from "@/test/harness";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "https://localhost:44342";
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "https://localhost:6006";
 
 function jsonResponse(body: unknown, init: { status?: number; statusText?: string } = {}): Response {
   const { status = 200, statusText = "OK" } = init;
