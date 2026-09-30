@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
@@ -22,9 +22,11 @@ import { Avatar } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { useSession } from "@/components/session-provider";
 import { roleLabels } from "@/lib/roles";
-import { planById, statusLabel } from "@/lib/saas-data";
+import { planNameFor, statusLabel } from "@/lib/saas-data";
 import { notifications as seedNotifications } from "@/lib/tenant-data";
-import { type NotificationType } from "@/lib/reports-data";
+import { type AppNotification, type NotificationType } from "@/lib/reports-data";
+import { mapApiNotifications } from "@/lib/live-dataset";
+import { getApi, postApi } from "@/hooks/useApi";
 import { cn, timeAgo } from "@/lib/utils";
 
 const titles: Record<string, string> = {
@@ -39,6 +41,7 @@ const titles: Record<string, string> = {
   settings: "Settings",
   billing: "Billing",
   monitor: "Member Monitor",
+  download: "Desktop agent",
 };
 
 const notifIcon: Record<NotificationType, LucideIcon> = {
@@ -66,16 +69,55 @@ function openPalette() {
 
 export function Topbar({ onMenuClick }: { onMenuClick: () => void }) {
   const pathname = usePathname();
-  const { user: currentUser, logout, workspace } = useSession();
-  const plan = planById(workspace.planId);
+  const { user: currentUser, logout, workspace, isLive, status } = useSession();
+  // Load live notifications once the real identity is in (not for the placeholder session).
+  const liveReady = isLive && status === "ready";
+  const planName = planNameFor(workspace);
   const [menuOpen, setMenuOpen] = useState(false);
   const [notifOpen, setNotifOpen] = useState(false);
-  const [notifs, setNotifs] = useState(seedNotifications);
+  // Demo: the seeded notifications. Live: the user's REAL notifications from
+  // the backend — never the demo ones (which name demo people).
+  const [notifs, setNotifs] = useState<AppNotification[]>(isLive ? [] : seedNotifications);
+  const [notifLoading, setNotifLoading] = useState(false);
+  const [notifError, setNotifError] = useState(false);
+
+  const loadNotifications = useCallback(async () => {
+    setNotifLoading(true);
+    setNotifError(false);
+    try {
+      setNotifs(mapApiNotifications(await getApi("/api/app/notification/my-notifications")));
+    } catch {
+      setNotifs([]);
+      setNotifError(true);
+    } finally {
+      setNotifLoading(false);
+    }
+  }, []);
 
   useEffect(() => {
-    setNotifs(seedNotifications);
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- resets the feed when the workspace/session changes
     setNotifOpen(false);
-  }, [workspace.id]);
+    if (liveReady) {
+      void loadNotifications();
+    } else if (isLive) {
+      setNotifs([]);
+    } else {
+      setNotifs(seedNotifications);
+    }
+  }, [workspace.id, isLive, liveReady, loadNotifications]);
+
+  /** Mark read locally at once; persist to the backend in a live session. */
+  function markRead(ids: string[]) {
+    if (ids.length === 0) return;
+    setNotifs((prev) => prev.map((n) => (ids.includes(n.id) ? { ...n, read: true } : n)));
+    if (isLive) {
+      void Promise.allSettled(ids.map((id) => postApi(`/api/app/notification/mark-as-read/${encodeURIComponent(id)}`, {})));
+    } else {
+      seedNotifications.forEach((n) => {
+        if (ids.includes(n.id)) n.read = true;
+      });
+    }
+  }
 
   const segments = pathname.split("/").filter(Boolean);
   const section = segments[0] ?? "dashboard";
@@ -130,14 +172,14 @@ export function Topbar({ onMenuClick }: { onMenuClick: () => void }) {
             title="Billing & plan"
           >
             <Crown className="h-3.5 w-3.5 opacity-70" />
-            <span>{plan.name}</span>
+            <span>{planName}</span>
             {workspace.status === "trialing" && (
               <span className="text-[10px] opacity-80">· {statusLabel[workspace.status]}</span>
             )}
           </Link>
         ) : (
           <span className="hidden h-8 items-center gap-1.5 rounded-lg px-2 text-xs font-medium text-muted-foreground sm:inline-flex">
-            <Crown className="h-3.5 w-3.5 opacity-70" /> {plan.name}
+            <Crown className="h-3.5 w-3.5 opacity-70" /> {planName}
           </span>
         )}
 
@@ -166,10 +208,7 @@ export function Topbar({ onMenuClick }: { onMenuClick: () => void }) {
                     <div className="text-sm font-semibold">Notifications</div>
                     {unread > 0 && (
                       <button
-                        onClick={() => {
-                          setNotifs((prev) => prev.map((n) => ({ ...n, read: true })));
-                          seedNotifications.forEach((n) => { n.read = true; });
-                        }}
+                        onClick={() => markRead(notifs.filter((n) => !n.read).map((n) => n.id))}
                         className="flex items-center gap-1 text-xs text-primary hover:underline"
                       >
                         <CheckCheck className="h-3.5 w-3.5" /> Mark all read
@@ -177,15 +216,27 @@ export function Topbar({ onMenuClick }: { onMenuClick: () => void }) {
                     )}
                   </div>
                   <div className="max-h-96 overflow-y-auto">
+                    {notifLoading && notifs.length === 0 && (
+                      <p className="p-4 text-center text-sm text-muted-foreground">Loading notifications…</p>
+                    )}
+                    {notifError && (
+                      <div className="flex flex-col items-center gap-2 p-4 text-center text-sm text-muted-foreground">
+                        <span>Couldn&apos;t load notifications.</span>
+                        <button onClick={() => void loadNotifications()} className="text-xs font-medium text-primary hover:underline">
+                          Try again
+                        </button>
+                      </div>
+                    )}
+                    {!notifLoading && !notifError && notifs.length === 0 && (
+                      <p className="p-4 text-center text-sm text-muted-foreground">You&apos;re all caught up — no notifications yet.</p>
+                    )}
                     {notifs.map((n) => {
                       const Icon = notifIcon[n.type];
                       return (
                         <button
                           key={n.id}
                           onClick={() => {
-                            setNotifs((prev) => prev.map((x) => (x.id === n.id ? { ...x, read: true } : x)));
-                            const found = seedNotifications.find((x) => x.id === n.id);
-                            if (found) found.read = true;
+                            if (!n.read) markRead([n.id]);
                           }}
                           className={cn(
                             "flex w-full items-start gap-3 border-b border-border/60 p-3 text-left last:border-0 hover:bg-muted/60",
@@ -203,8 +254,8 @@ export function Topbar({ onMenuClick }: { onMenuClick: () => void }) {
                               <span className="truncate text-sm font-medium">{n.title}</span>
                               {!n.read && <span className="h-2 w-2 shrink-0 rounded-full bg-primary" />}
                             </span>
-                            <span className="mt-0.5 block text-xs text-muted-foreground">{n.body}</span>
-                            <span className="mt-1 block text-[11px] text-muted-foreground/70">{timeAgo(new Date(n.at))}</span>
+                            {n.body && <span className="mt-0.5 block text-xs text-muted-foreground">{n.body}</span>}
+                            <span className="mt-1 block text-[11px] text-muted-foreground">{timeAgo(new Date(n.at))}</span>
                           </span>
                         </button>
                       );

@@ -18,6 +18,23 @@ import { cn } from "@/lib/utils";
 
 const axisColor = "#94a3b8";
 
+/**
+ * The honest "nothing to chart" placeholder. A live workspace with no rows must
+ * say so, not draw an empty axis (or, worse, demo bars).
+ */
+export function ChartEmpty({ message, className }: { message: string; className?: string }) {
+  return (
+    <div
+      className={cn(
+        "flex h-[200px] w-full items-center justify-center rounded-xl border border-dashed border-border px-4 text-center text-sm text-muted-foreground",
+        className
+      )}
+    >
+      {message}
+    </div>
+  );
+}
+
 const tooltipStyle = {
   borderRadius: 12,
   border: "1px solid var(--border)",

@@ -381,7 +381,20 @@ impl TrackerApp {
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             let half = (ui.available_width() - 8.0) / 2.0;
-            if theme::ghost_button(ui, "Sync now", half).clicked() {
+            // While paused the button never captures — it only uploads what is
+            // already queued — so it says so rather than promising a sync.
+            let (sync_label, sync_hint) = if paused {
+                (
+                    "Upload queued",
+                    "Paused: uploads activity already recorded. Nothing new is captured.",
+                )
+            } else {
+                ("Sync now", "Record the current block now and upload it.")
+            };
+            if theme::ghost_button(ui, sync_label, half)
+                .on_hover_text(sync_hint)
+                .clicked()
+            {
                 self.send(Command::SyncNow);
             }
             if theme::ghost_button(ui, "Settings", half).clicked() {

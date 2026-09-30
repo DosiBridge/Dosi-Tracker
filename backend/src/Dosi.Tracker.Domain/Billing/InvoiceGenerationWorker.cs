@@ -14,7 +14,8 @@ using Volo.Abp.Uow;
 namespace Dosi.Tracker.Billing;
 
 /// <summary>Generates the monthly per-seat invoice for every billable subscription (daily sweep;
-/// idempotent — at most one invoice per tenant per calendar month).</summary>
+/// idempotent — at most one invoice per tenant per calendar month). Only <c>active</c> subscriptions
+/// are billable: a <c>trialing</c> workspace is never invoiced during its trial.</summary>
 public class InvoiceGenerationWorker : AsyncPeriodicBackgroundWorkerBase
 {
     public InvoiceGenerationWorker(
@@ -25,9 +26,17 @@ public class InvoiceGenerationWorker : AsyncPeriodicBackgroundWorkerBase
         Timer.Period = (int)TimeSpan.FromDays(1).TotalMilliseconds;
     }
 
-    protected override async Task DoWorkAsync(PeriodicBackgroundWorkerContext workerContext)
+    /// <summary>Subscription status that is invoiced; every other status (trialing, past_due, …) is skipped.</summary>
+    public const string BillableStatus = "active";
+
+    protected override Task DoWorkAsync(PeriodicBackgroundWorkerContext workerContext)
     {
-        var serviceProvider = workerContext.ServiceProvider;
+        return GenerateInvoicesAsync(workerContext.ServiceProvider);
+    }
+
+    /// <summary>One sweep over every tenant's billable subscription (the body of the daily run).</summary>
+    public virtual async Task GenerateInvoicesAsync(IServiceProvider serviceProvider)
+    {
         var uowManager = serviceProvider.GetRequiredService<IUnitOfWorkManager>();
         var dataFilter = serviceProvider.GetRequiredService<IDataFilter>();
         var currentTenant = serviceProvider.GetRequiredService<ICurrentTenant>();
@@ -39,7 +48,7 @@ public class InvoiceGenerationWorker : AsyncPeriodicBackgroundWorkerBase
         using (dataFilter.Disable<IMultiTenant>())
         {
             billable = (await subscriptionRepository.GetListAsync(
-                s => s.Status == "active" || s.Status == "trialing")).ToArray();
+                s => s.Status == BillableStatus)).ToArray();
             await readUow.CompleteAsync();
         }
 

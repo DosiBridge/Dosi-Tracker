@@ -34,7 +34,7 @@ public class PlanDataSeedContributor : IDataSeedContributor, ITransientDependenc
             return;
         }
 
-        await _planRepository.InsertAsync(new Plan(_guidGenerator.Create(), "Free", 0m, maxSeats: 3, trialDays: 0));
+        await _planRepository.InsertAsync(new Plan(_guidGenerator.Create(), Plan.FreePlanName, 0m, maxSeats: 3, trialDays: 0));
         await _planRepository.InsertAsync(new Plan(_guidGenerator.Create(), "Starter", 6m, maxSeats: 25, trialDays: 14));
         await _planRepository.InsertAsync(new Plan(_guidGenerator.Create(), "Business", 12m, maxSeats: 100, trialDays: 14));
     }

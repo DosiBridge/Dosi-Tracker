@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useId, useState } from "react";
 import { User, ShieldCheck, Palette, Bell, Check, Monitor, Moon, Sun, Eye } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -8,6 +8,7 @@ import { Input, Select } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { Avatar } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
+import { toast } from "@/components/toast";
 import { useTheme } from "@/components/theme-provider";
 import { useSession } from "@/components/session-provider";
 import { getApi, putApi } from "@/hooks/useApi";
@@ -35,13 +36,12 @@ interface ProfileForm {
 }
 
 export default function SettingsPage() {
-  const { user: currentUser } = useSession();
+  const { user: currentUser, isLive: live, refreshSession } = useSession();
   const tabs = allTabs.filter((t) => (t.roles as readonly string[]).includes(currentUser.role));
   const [tab, setTab] = useState<TabKey>("profile");
   const [saved, setSaved] = useState(false);
 
   // Live profile (only when a real backend session exists; otherwise demo mode).
-  const [live, setLive] = useState(false);
   const [profileRaw, setProfileRaw] = useState<Record<string, unknown> | null>(null);
   const [profileForm, setProfileForm] = useState<ProfileForm | null>(null);
   const [profileLoading, setProfileLoading] = useState(false);
@@ -50,8 +50,8 @@ export default function SettingsPage() {
   const [saveError, setSaveError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (typeof window !== "undefined" && localStorage.getItem("dosi-token")) {
-      setLive(true);
+    if (live) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- data fetch defers its own setState; see docs/QUALITY.md §10
       setProfileLoading(true);
       getApi("/api/account/my-profile")
         .then((p) => {
@@ -66,13 +66,12 @@ export default function SettingsPage() {
           setProfileError(null);
         })
         .catch(() => {
-          // Fall back to the demo profile rendering below.
-          setProfileError("Couldn't load your profile from the server — showing demo data.");
+          setProfileError("Couldn't load your profile from the server. Try again later.");
           setProfileForm(null);
         })
         .finally(() => setProfileLoading(false));
     }
-  }, []);
+  }, [live]);
 
   const setProfileField = (key: keyof ProfileForm, value: string) =>
     setProfileForm((f) => (f ? { ...f, [key]: value } : f));
@@ -98,6 +97,9 @@ export default function SettingsPage() {
         await putApi("/api/account/my-profile", { ...(profileRaw ?? {}), ...profileForm });
         setSaved(true);
         setTimeout(() => setSaved(false), 1600);
+        toast({ tone: "success", title: "Profile saved", description: "Your changes are live." });
+        // The name shown in the sidebar/topbar comes from the session: refresh it.
+        void refreshSession({ silent: true });
       } catch (err) {
         setSaveError(err instanceof Error ? err.message : "Failed to save profile.");
       } finally {
@@ -105,8 +107,14 @@ export default function SettingsPage() {
       }
       return;
     }
-    setSaved(true);
-    setTimeout(() => setSaved(false), 1600);
+    // Preferences below (privacy, tracking, appearance, notifications) are
+    // local-only in this build. Saying "Saved" would claim a round-trip that
+    // never happened, so be explicit about what actually persisted.
+    toast({
+      tone: "info",
+      title: "Preferences applied on this device",
+      description: "These settings aren't synced to your account yet.",
+    });
   }
 
   return (
@@ -163,22 +171,22 @@ export default function SettingsPage() {
                     <Field label="Username" value={profileForm.userName} onChange={(v) => setProfileField("userName", v)} />
                     <Field label="Phone number" value={profileForm.phoneNumber} onChange={(v) => setProfileField("phoneNumber", v)} />
                     <div className="space-y-1.5">
-                      <label className="text-sm font-medium">Timezone</label>
-                      <Select defaultValue={currentUser.timezone}>
+                      <label htmlFor="profile-timezone" className="text-sm font-medium">Timezone</label>
+                      <Select id="profile-timezone" defaultValue={currentUser.timezone}>
                         <option value="Asia/Dhaka">Asia/Dhaka (GMT+6)</option>
                         <option value="Europe/Madrid">Europe/Madrid</option>
                         <option value="America/Los_Angeles">America/Los Angeles</option>
                       </Select>
                     </div>
                   </div>
-                ) : !profileLoading ? (
+                ) : !profileLoading && !live ? (
                   <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
                     <Field label="Full name" defaultValue={currentUser.name} />
                     <Field label="Email" defaultValue={currentUser.email} />
                     <Field label="Designation" defaultValue={currentUser.designation} />
                     <div className="space-y-1.5">
-                      <label className="text-sm font-medium">Timezone</label>
-                      <Select defaultValue={currentUser.timezone}>
+                      <label htmlFor="profile-timezone" className="text-sm font-medium">Timezone</label>
+                      <Select id="profile-timezone" defaultValue={currentUser.timezone}>
                         <option value="Asia/Dhaka">Asia/Dhaka (GMT+6)</option>
                         <option value="Europe/Madrid">Europe/Madrid</option>
                         <option value="America/Los_Angeles">America/Los Angeles</option>
@@ -319,13 +327,16 @@ function Field({
   value?: string;
   onChange?: (value: string) => void;
 }) {
+  // Generated id keeps the label programmatically associated with its input,
+  // so assistive tech announces the field by name.
+  const id = useId();
   return (
     <div className="space-y-1.5">
-      <label className="text-sm font-medium">{label}</label>
+      <label htmlFor={id} className="text-sm font-medium">{label}</label>
       {onChange ? (
-        <Input value={value ?? ""} onChange={(e) => onChange(e.target.value)} />
+        <Input id={id} value={value ?? ""} onChange={(e) => onChange(e.target.value)} />
       ) : (
-        <Input defaultValue={defaultValue} />
+        <Input id={id} defaultValue={defaultValue} />
       )}
     </div>
   );

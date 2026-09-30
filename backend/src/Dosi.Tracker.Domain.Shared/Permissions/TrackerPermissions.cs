@@ -1,5 +1,8 @@
 namespace Dosi.Tracker.Permissions;
 
+/// <summary>Permission names. Lives in Domain.Shared (not Application.Contracts) so domain-layer
+/// data seeders — e.g. the tenant "manager" role — can grant them. The definitions themselves
+/// are still declared by <c>TrackerPermissionDefinitionProvider</c> in Application.Contracts.</summary>
 public static class TrackerPermissions
 {
     public const string GroupName = "Tracker";
@@ -39,5 +42,12 @@ public static class TrackerPermissions
     public static class Reporting
     {
         public const string Default = GroupName + ".Reporting";
+    }
+
+    /// <summary>Platform-owner (host) console: cross-tenant metrics, revenue and plan management.
+    /// Host-side only — never grantable inside a tenant.</summary>
+    public static class Platform
+    {
+        public const string Default = GroupName + ".Platform";
     }
 }

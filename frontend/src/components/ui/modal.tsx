@@ -1,9 +1,11 @@
 "use client";
 
 import { useEffect } from "react";
+import { createPortal } from "react-dom";
 import { X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "./button";
+import { useDialogFocus } from "./use-dialog-focus";
 
 export function Modal({
   open,
@@ -20,6 +22,8 @@ export function Modal({
   children: React.ReactNode;
   className?: string;
 }) {
+  const dialogRef = useDialogFocus<HTMLDivElement>(open);
+
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
@@ -33,16 +37,22 @@ export function Modal({
 
   if (!open) return null;
 
-  return (
+  // Portal to <body>: an ancestor with a transform (the page-transition wrapper)
+  // would otherwise become the containing block for `fixed`, so the backdrop
+  // covered only the main column, not the sidebar/topbar.
+  return createPortal(
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
       <div className="absolute inset-0 bg-black/50 backdrop-blur-sm animate-fade-in" onClick={onClose} />
       <div
+        ref={dialogRef}
+        tabIndex={-1}
         className={cn(
-          "relative z-10 w-full max-w-lg rounded-2xl border border-border bg-card card-elev-lg animate-scale-in",
+          "relative z-10 w-full max-w-lg rounded-2xl border border-border bg-card card-elev-lg animate-scale-in outline-none",
           className
         )}
         role="dialog"
         aria-modal="true"
+        aria-label={title}
       >
         <div className="flex items-start justify-between gap-4 border-b border-border p-5">
           <div>
@@ -55,6 +65,7 @@ export function Modal({
         </div>
         <div className="max-h-[70vh] overflow-y-auto p-5">{children}</div>
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }

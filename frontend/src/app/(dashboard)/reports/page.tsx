@@ -20,6 +20,8 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { PageHeader, PageStack, SectionLabel } from "@/components/ui/page-header";
+import { toast } from "@/components/toast";
+import { useSession } from "@/components/session-provider";
 import { reportCatalog } from "@/lib/reports-data";
 
 const icons: Record<string, LucideIcon> = {
@@ -33,6 +35,7 @@ const categoryTone: Record<string, "primary" | "success" | "info" | "warning"> =
   Finance: "warning",
 };
 
+/** DEMO ONLY: illustrative schedules. Scheduled delivery has no backend yet, so a live workspace never sees these. */
 const scheduled = [
   { name: "Weekly team summary", cadence: "Every Monday · 9:00 AM", recipients: 3, report: "Weekly Summary" },
   { name: "Payroll export", cadence: "1st of month", recipients: 1, report: "Payroll & Billing" },
@@ -40,6 +43,7 @@ const scheduled = [
 ];
 
 export default function ReportsHubPage() {
+  const { isLive } = useSession();
   const categories = ["Time", "Productivity", "People", "Finance"] as const;
 
   return (
@@ -49,7 +53,15 @@ export default function ReportsHubPage() {
         title="Reports"
         description="Generate, schedule, and export detailed reports across your team."
         actions={
-          <Button>
+          <Button
+            onClick={() =>
+              toast({
+                tone: "info",
+                title: "Scheduling isn't available yet",
+                description: "Open any report below and use Export to download it now.",
+              })
+            }
+          >
             <Plus className="h-4 w-4" /> Schedule report
           </Button>
         }
@@ -89,26 +101,45 @@ export default function ReportsHubPage() {
 
       <div className="space-y-3">
         <SectionLabel>Scheduled</SectionLabel>
-        <Card>
-          <CardHeader>
-            <CardTitle>Upcoming deliveries</CardTitle>
-            <Badge tone="muted" className="gap-1"><Repeat className="h-3 w-3" /> Auto</Badge>
-          </CardHeader>
-          <CardContent className="space-y-2">
-            {scheduled.map((s) => (
-              <div key={s.name} className="flex flex-wrap items-center gap-3 rounded-xl border border-border/70 bg-muted/30 px-3 py-2.5">
-                <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-accent text-accent-foreground">
+        {isLive ? (
+          <Card>
+            <CardHeader>
+              <CardTitle>Upcoming deliveries</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="flex flex-col items-center gap-2 rounded-xl border border-dashed border-border px-4 py-8 text-center">
+                <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-muted text-muted-foreground">
                   <Mail className="h-4 w-4" />
                 </div>
-                <div className="min-w-0 flex-1">
-                  <div className="truncate text-sm font-medium">{s.name}</div>
-                  <div className="truncate text-xs text-muted-foreground">{s.cadence} · {s.report}</div>
-                </div>
-                <span className="text-xs text-muted-foreground">{s.recipients} recipients</span>
+                <p className="text-sm font-medium">Scheduled delivery isn&apos;t available yet</p>
+                <p className="max-w-sm text-xs text-muted-foreground">
+                  Nothing is scheduled. Open any report above and use Export to download it now.
+                </p>
               </div>
-            ))}
-          </CardContent>
-        </Card>
+            </CardContent>
+          </Card>
+        ) : (
+          <Card>
+            <CardHeader>
+              <CardTitle>Upcoming deliveries</CardTitle>
+              <Badge tone="muted" className="gap-1"><Repeat className="h-3 w-3" /> Auto</Badge>
+            </CardHeader>
+            <CardContent className="space-y-2">
+              {scheduled.map((s) => (
+                <div key={s.name} className="flex flex-wrap items-center gap-3 rounded-xl border border-border/70 bg-muted/30 px-3 py-2.5">
+                  <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-accent text-accent-foreground">
+                    <Mail className="h-4 w-4" />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-sm font-medium">{s.name}</div>
+                    <div className="truncate text-xs text-muted-foreground">{s.cadence} · {s.report}</div>
+                  </div>
+                  <span className="text-xs text-muted-foreground">{s.recipients} recipients</span>
+                </div>
+              ))}
+            </CardContent>
+          </Card>
+        )}
       </div>
     </PageStack>
   );

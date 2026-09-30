@@ -1,5 +1,7 @@
 import { NOW } from "./mock-data";
-import { projects, userById } from "./tenant-data";
+import { reconcileSegmentProductivity, trimSegmentsToTarget } from "./metrics";
+import { isLiveDataset, projects, userById } from "./tenant-data";
+import { colorFromString } from "./utils";
 import type { ScreenMock } from "./types";
 import type { AppCategory } from "./reports-data";
 
@@ -199,11 +201,14 @@ function mulberry32(seed: number) {
 
 const DAY = 24 * 60 * 60 * 1000;
 
-/** Last N days (most recent first) as selectable options, deterministic from NOW. */
-export function availableDays(count = 7) {
+/**
+ * Last N UTC days (most recent first) as selectable options. Deterministic from
+ * the demo's frozen NOW by default; a live session passes the real clock.
+ */
+export function availableDays(count = 7, now: Date = NOW) {
   const out: { iso: string; label: string; weekday: string; isToday: boolean }[] = [];
   for (let d = 0; d < count; d++) {
-    const date = new Date(NOW.getTime() - d * DAY);
+    const date = new Date(now.getTime() - d * DAY);
     const iso = date.toISOString().slice(0, 10);
     out.push({
       iso,
@@ -230,28 +235,46 @@ function weekdayOfIso(iso: string): number {
 export const DAY_START_MIN = 8 * 60; // 08:00
 export const DAY_END_MIN = 20 * 60; // 20:00
 
+/**
+ * The DEMO day generator: a plausible, seeded timeline for a demo member.
+ *
+ * It must never run against a real tenant — a live session's timeline comes
+ * only from real activity rows (monitor-live.ts) — so it returns [] for a live
+ * dataset. Every lookup is guarded: an unknown member, a malformed day key, a
+ * member on no project, or a workspace with no projects at all yields an empty
+ * or project-less day instead of throwing ("reading 'id'" of a missing project).
+ */
 export function buildDayTimeline(userId: string, iso: string): DaySegment[] {
+  if (isLiveDataset()) return [];
+  if (typeof iso !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(iso)) return [];
   const user = userById(userId);
   if (!user || user.role === "client") return [];
 
   const rand = mulberry32(hashStr(`${userId}:${iso}`));
   const between = (min: number, max: number) => Math.floor(rand() * (max - min + 1)) + min;
-  const pick = <T,>(arr: T[]) => arr[Math.floor(rand() * arr.length)];
+  // Always draws exactly once (keeps the seeded sequence stable); an empty pool yields undefined.
+  const pick = <T,>(arr: T[]): T | undefined => arr[Math.floor(rand() * arr.length)];
 
   const weekday = weekdayOfIso(iso);
   const isWeekend = weekday === 0 || weekday === 6;
   const dayIndex = dayIndexFromIso(iso);
 
-  // Target tracked minutes for the day.
+  // Target tracked minutes for the day. TODAY is not a free variable: it must
+  // equal the member's canonical `trackedToday`, which every other surface
+  // reports. (A previous 0.55 haircut for "offline" members made this page
+  // disagree with /team by nearly half a day — `offline` describes presence
+  // right now, not how much time the member logged.) Earlier days have no such
+  // canonical figure, so they scale off it.
   let target = user.trackedToday;
   if (dayIndex > 0) target = Math.round(user.trackedToday * (0.85 + rand() * 0.3));
   if (isWeekend) target = rand() > 0.5 ? Math.round(user.trackedToday * (0.2 + rand() * 0.25)) : 0;
-  if (user.status === "offline" && dayIndex === 0) target = Math.round(target * 0.55);
   if (target <= 0) return [];
 
   const apps = appsByDesignation[user.designation] ?? defaultApps;
-  const userProjects = projects.filter((p) => !p.archived && p.memberIds.includes(userId));
-  const projPool = userProjects.length ? userProjects : [projects[0]];
+  const userProjects = projects.filter((p) => !!p && !p.archived && (p.memberIds ?? []).includes(userId));
+  // Fall back to the workspace's first project — or to no project at all when
+  // the workspace has none (the old `[projects[0]]` put `undefined` in the pool).
+  const projPool = userProjects.length ? userProjects : projects.slice(0, 1).filter(Boolean);
 
   const segments: DaySegment[] = [];
   let cursor = DAY_START_MIN + between(0, 45); // arrives shortly after 08:00–08:45
@@ -283,7 +306,8 @@ export function buildDayTimeline(userId: string, iso: string): DaySegment[] {
       const prod = Math.min(96, Math.max(35, user.productivity - between(5, 20)));
       const kb = Math.round((dur * prod * (5 + rand() * 6)) / 100);
       const ms = Math.round((dur * prod * (2 + rand() * 3)) / 100);
-      segments.push(seg("meeting", cursor, dur, pick(appMeta.Zoom.titles), proj.id, prod, ms, kb, makeScreen("Zoom"), "Zoom"));
+      const title = pick(appMeta.Zoom.titles) ?? "Meeting";
+      segments.push(seg("meeting", cursor, dur, title, proj?.id ?? null, prod, ms, kb, makeScreen("Zoom"), "Zoom"));
       cursor += dur;
       tracked += dur;
     } else if (roll < 0.24) {
@@ -294,20 +318,47 @@ export function buildDayTimeline(userId: string, iso: string): DaySegment[] {
     } else {
       // Work block
       const dur = between(12, 45);
-      const app = pick(apps);
+      const app = pick(apps) ?? defaultApps[0];
       const meta = appMeta[app] ?? appMeta["Google Chrome"];
       const proj = pick(projPool);
       const base = user.productivity + between(-18, 12);
       const prod = Math.min(99, Math.max(28, meta.category === "unproductive" ? between(20, 45) : base));
       const kb = Math.round((dur * prod * (18 + rand() * 26)) / 100);
       const ms = Math.round((dur * prod * (5 + rand() * 12)) / 100);
-      segments.push(seg("work", cursor, dur, pick(meta.titles), proj.id, prod, ms, kb, makeScreen(app), app));
+      const title = pick(meta.titles) ?? app;
+      segments.push(seg("work", cursor, dur, title, proj?.id ?? null, prod, ms, kb, makeScreen(app), app));
       cursor += dur;
       tracked += dur;
     }
   }
 
-  return segments;
+  // Reconcile the generated day with the member's canonical figures.
+  //
+  // The loop above exits on the first segment that crosses the target, so the
+  // day overshoots by part of a segment; and per-segment productivity is drawn
+  // BELOW the member's score on purpose (meetings are less focused, some apps
+  // are unproductive), which drags the duration-weighted average down. Left
+  // alone, /monitor reports several minutes more time and 4-10 points less
+  // productivity than /team and /dashboard for the same person on the same day.
+  // The per-segment texture is worth keeping — the totals are what must agree.
+  // The reconciliation itself lives in metrics.ts with the other definitions.
+  const reconcilable = segments.map((s) => ({
+    minutes: s.minutes,
+    endMin: s.endMin,
+    productivity: s.productivity,
+    counts: s.type === "work" || s.type === "meeting",
+    ref: s,
+  }));
+  trimSegmentsToTarget(reconcilable, target);
+  reconcileSegmentProductivity(reconcilable, user.productivity);
+
+  const kept = new Set(reconcilable.map((r) => r.ref));
+  for (const r of reconcilable) {
+    r.ref.minutes = r.minutes;
+    r.ref.endMin = r.endMin;
+    r.ref.productivity = r.productivity;
+  }
+  return segments.filter((s) => kept.has(s));
 
   function seg(
     type: SegmentType,
@@ -343,6 +394,9 @@ export function buildDayTimeline(userId: string, iso: string): DaySegment[] {
 
 /* ----------------------------- Summaries ----------------------------- */
 
+/** The largest gap (minutes) between two work blocks that still counts as one focus run. */
+const FOCUS_GAP_MIN = 2;
+
 export function daySummary(segments: DaySegment[]): DaySummary {
   const active = segments.filter((s) => s.type === "work" || s.type === "meeting");
   const tracked = active.reduce((s, x) => s + x.minutes, 0);
@@ -350,15 +404,21 @@ export function daySummary(segments: DaySegment[]): DaySummary {
   const productive = active.reduce((s, x) => s + (x.minutes * x.productivity) / 100, 0);
   const productivityAvg = tracked ? Math.round((productive / tracked) * 100) : 0;
 
+  // A focus run is back-to-back work. Generated days are contiguous (an idle or
+  // break segment ends a run); real agents report discrete blocks, so a gap
+  // between two blocks ends the run too.
   let longestFocus = 0;
   let run = 0;
+  let prevEnd: number | null = null;
   for (const s of segments) {
     if (s.type === "work") {
+      if (prevEnd !== null && s.startMin - prevEnd > FOCUS_GAP_MIN) run = 0;
       run += s.minutes;
       longestFocus = Math.max(longestFocus, run);
     } else {
       run = 0;
     }
+    prevEnd = s.endMin;
   }
 
   return {
@@ -375,9 +435,10 @@ export function daySummary(segments: DaySegment[]): DaySummary {
   };
 }
 
-export function hourlyBuckets(segments: DaySegment[]) {
-  const startH = DAY_START_MIN / 60;
-  const endH = DAY_END_MIN / 60;
+/** Active minutes per hour across [startMin, endMin) — the working day by default. */
+export function hourlyBuckets(segments: DaySegment[], startMin = DAY_START_MIN, endMin = DAY_END_MIN) {
+  const startH = Math.floor(startMin / 60);
+  const endH = Math.ceil(endMin / 60);
   const buckets: { hour: string; minutes: number }[] = [];
   for (let h = startH; h < endH; h++) {
     const lo = h * 60;
@@ -397,7 +458,9 @@ export function appBreakdown(segments: DaySegment[]) {
   const map = new Map<string, { app: string; minutes: number; accent: string; category: AppCategory }>();
   for (const s of segments) {
     if (s.type === "idle" || s.type === "break") continue;
-    const meta = appMeta[s.app] ?? { accent: "#94a3b8", category: "neutral" as AppCategory };
+    // Apps outside the demo catalog (real agents report any app) get a stable per-app color.
+    const known = Object.prototype.hasOwnProperty.call(appMeta, s.app) ? appMeta[s.app] : undefined;
+    const meta = known ?? { accent: colorFromString(s.app, 60, 50), category: "neutral" as AppCategory };
     const cur = map.get(s.app) ?? { app: s.app, minutes: 0, accent: meta.accent, category: meta.category };
     cur.minutes += s.minutes;
     map.set(s.app, cur);
@@ -407,6 +470,7 @@ export function appBreakdown(segments: DaySegment[]) {
 
 /** "09:35" from minutes-from-midnight. */
 export function fmtMin(min: number): string {
+  if (min === 24 * 60) return "24:00"; // the end of the day, not the next midnight
   const h = Math.floor(min / 60) % 24;
   const m = Math.round(min % 60);
   return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;

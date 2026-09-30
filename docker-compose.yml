@@ -38,7 +38,13 @@ services:
     build:
       context: backend/src/Dosi.Tracker.HttpApi.Host
       dockerfile: Dockerfile.local
+      args:
+        # Baked into openiddict.pfx at build time; must equal AuthServer__CertificatePassPhrase below.
+        TRACKER_CERT_PASSPHRASE: ${TRACKER_CERT_PASSPHRASE:-3f027835-7c52-4bf7-bc1f-77582ca37aef}
     environment:
+      # This compose file is a local evaluation stack: Development skips the Production start-up
+      # guard that (correctly) refuses template secrets, and uses OpenIddict development certificates.
+      ASPNETCORE_ENVIRONMENT: Development
       ASPNETCORE_URLS: "http://+:8080"
       App__SelfUrl: ${TRACKER_SELF_URL:-http://localhost:8080}
       App__CorsOrigins: ${TRACKER_CORS_ORIGINS:-http://localhost:3000}

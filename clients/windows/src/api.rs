@@ -33,6 +33,38 @@ pub struct ReportSummary {
 const CLIENT_ID: &str = "Tracker_App";
 const SCOPE: &str = "Tracker";
 
+/// Give up on a TCP/TLS connect that has not completed by then, so a dead or
+/// black-holed server can never hang the worker (and with it the UI's
+/// pause/sync commands) indefinitely.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Whole-request budget. Generous because an upload carries a base64
+/// screenshot (and possibly a webcam frame) over what may be a slow uplink.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Build the shared HTTP client.
+///
+/// TLS trusts the Windows certificate store (so corporate CAs and the ASP.NET
+/// dev certificate installed by `dotnet dev-certs https --trust` work) *in
+/// addition to* the bundled Mozilla roots (so public CAs Windows has not
+/// fetched yet still work). Certificate verification is always on.
+fn build_http_client() -> reqwest::Client {
+    let builder = || {
+        reqwest::Client::builder()
+            .user_agent(concat!("dosi-tracker/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
+    };
+    builder().build().unwrap_or_else(|e| {
+        // An unreadable Windows store must not take tracking down: fall back to
+        // the bundled roots only (still fully verified).
+        tracing::warn!(?e, "could not load the Windows certificate store; using bundled roots");
+        builder()
+            .tls_built_in_native_certs(false)
+            .build()
+            .expect("failed to build http client")
+    })
+}
+
 /// Thin HTTP client wrapping the Dosi-Tracker backend REST API.
 ///
 /// Authentication uses the backend's OpenIddict token endpoint
@@ -81,16 +113,19 @@ impl ApiClient {
         tenant: String,
     ) -> Self {
         Self {
-            http: reqwest::Client::builder()
-                .user_agent(concat!("dosi-tracker/", env!("CARGO_PKG_VERSION")))
-                .build()
-                .expect("failed to build http client"),
+            http: build_http_client(),
             base_url: base_url.into(),
             username,
             password,
             tenant,
             token: None,
         }
+    }
+
+    /// The account this client acts as, in the form the offline queue tags rows
+    /// with — so rows are only ever uploaded under their owner's token.
+    pub fn owner_key(&self) -> String {
+        crate::storage::owner_key(&self.tenant, &self.username)
     }
 
     /// Authenticate against the OpenIddict token endpoint and cache the bearer token.
@@ -232,5 +267,33 @@ impl ApiClient {
         }
 
         Err(SubmitError::Transient(anyhow!("HTTP {status}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_client_builds_with_native_roots_and_timeouts() {
+        // Loads the Windows certificate store; must never panic on a normal machine.
+        let _client = build_http_client();
+    }
+
+    #[test]
+    fn owner_key_matches_the_queue_tagging() {
+        let client = ApiClient::new(
+            "https://example.invalid",
+            "Alice@Acme.com".into(),
+            "secret".into(),
+            "Acme".into(),
+        );
+        assert_eq!(client.owner_key(), crate::storage::owner_key("acme", "alice@acme.com"));
+    }
+
+    #[test]
+    fn workspace_names_are_percent_encoded() {
+        assert_eq!(urlencode("Acme Corp/EU"), "Acme%20Corp%2FEU");
+        assert_eq!(urlencode("plain-name_1.x~"), "plain-name_1.x~");
     }
 }

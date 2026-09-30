@@ -1,12 +1,15 @@
 "use client";
 
-import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
 import {
+  AlertTriangle,
   ChevronLeft,
   ChevronRight,
   Clock,
   Gauge,
   Coffee,
+  Download,
   Video,
   Pause,
   MousePointerClick,
@@ -36,20 +39,20 @@ import {
   DayNav,
   MiniDayStrip,
   MonitorKpi,
-  RANGE,
+  ProductivityLegend,
   TypeLegend,
   prodColor,
   typeColor,
 } from "@/components/monitor/shared";
 import { HourlyChart } from "@/components/dashboard/charts";
-import { ScreenMockView } from "@/components/screen-mock";
+import { AppGlyph, ScreenMockView } from "@/components/screen-mock";
 import { useSession } from "@/components/session-provider";
 import { getApi, getAuthedBlobUrl } from "@/hooks/useApi";
 import { brand } from "@/lib/brand";
-import { projectById, users } from "@/lib/tenant-data";
+import { mapApiActivities } from "@/lib/live-dataset";
+import { referenceNow } from "@/lib/live-session";
+import { activities as sessionActivities, projectById, users } from "@/lib/tenant-data";
 import {
-  DAY_END_MIN,
-  DAY_START_MIN,
   appBreakdown,
   availableDays,
   browserSummary,
@@ -61,10 +64,19 @@ import {
   type DaySegment,
   type SegmentType,
 } from "@/lib/monitor-data";
+import {
+  DEFAULT_DAY_WINDOW,
+  dayActivityEndpoint,
+  lastSeenByUser,
+  liveRoster,
+  segmentsByUser,
+  timelineWindow,
+  type DayWindow,
+} from "@/lib/monitor-live";
 import { categoryColor, type AppCategory } from "@/lib/reports-data";
 import { roleLabels } from "@/lib/roles";
 import { cn, formatDuration } from "@/lib/utils";
-import type { ScreenMock, User, UserStatus } from "@/lib/types";
+import type { Activity, User, UserStatus } from "@/lib/types";
 
 const catLabel: Record<AppCategory, string> = {
   productive: "Productive",
@@ -104,114 +116,23 @@ function sortRoster<T extends { user: { status: UserStatus }; summary: { tracked
   });
 }
 
-/* ── Live mode helpers (real backend) ─────────────────────────────────────
- * With a bearer token present the page fetches the selected day's real
- * activity blocks and renders them through the exact same components as the
- * synthetic demo data. Any failure falls back wholesale to the mock path. */
+/* ── Live mode (real backend session) ─────────────────────────────────────
+ * A live session shows ONLY real data: the selected day's activity blocks
+ * are fetched and mapped by src/lib/monitor-live.ts, the roster is the real
+ * team (a worker sees only themselves), and a failed call shows an error
+ * with Retry — never the generated demo timeline. Demo mode is unchanged. */
 
-interface LiveActivity {
-  id: string;
-  userId: string;
-  projectId: string | null;
-  startedAt: string;
-  endedAt: string;
-  productivity: number;
-  mouseClicks: number;
-  keyboardHits: number;
-  description?: string | null;
-  activeWindowsJson?: string | null;
-}
+/** The selected day's rows, keyed by `${iso}#${reloadKey}` so a Retry re-fetches. */
+type LiveFetch =
+  | { key: string; ok: true; rows: Activity[]; fetchedAt: number }
+  | { key: string; ok: false };
 
 interface LiveShot {
   id: string;
   url: string;
-  capturedAt: string;
+  /** "09:35" (UTC) */
+  time: string;
   app: string;
-}
-
-interface LiveWindow {
-  appName?: string;
-  windowTitle?: string;
-  seconds?: number;
-}
-
-/** Token presence read via useSyncExternalStore so SSR/hydration stay in sync. */
-const noopSubscribe = () => () => {};
-const readLiveToken = () => typeof window !== "undefined" && !!localStorage.getItem("dosi-token");
-const readLiveTokenServer = () => false;
-
-/** Last N real days (most recent first), same shape as availableDays(). */
-function liveDayList(count = 7) {
-  const out: { iso: string; label: string; weekday: string; isToday: boolean }[] = [];
-  const now = new Date();
-  for (let d = 0; d < count; d++) {
-    const date = new Date(now.getTime() - d * 24 * 60 * 60 * 1000);
-    out.push({
-      iso: date.toISOString().slice(0, 10),
-      label: date.toLocaleDateString("en", { month: "short", day: "numeric", timeZone: "UTC" }),
-      weekday: date.toLocaleDateString("en", { weekday: "short", timeZone: "UTC" }),
-      isToday: d === 0,
-    });
-  }
-  return out;
-}
-
-/** Synthesize a screen descriptor for a real app so ScreenMockView can render it. */
-function liveScreen(app: string): ScreenMock {
-  const a = app.toLowerCase();
-  const kind: ScreenMock["kind"] =
-    /chrome|edge|firefox|safari|brave|opera/.test(a)
-      ? "browser"
-      : /code|studio|intellij|rider|pycharm|webstorm|vim|sublime/.test(a)
-        ? "editor"
-        : /terminal|powershell|cmd|iterm|console/.test(a)
-          ? "terminal"
-          : /figma|sketch|photoshop|illustrator/.test(a)
-            ? "design"
-            : /slack|teams|zoom|discord|meet|telegram/.test(a)
-              ? "chat"
-              : "docs";
-  return { app, kind, accent: brand.primary };
-}
-
-/** Map a real activity block onto the mock DaySegment shape (times in UTC). */
-function liveSegment(a: LiveActivity, iso: string): DaySegment | null {
-  const dayStart = Date.parse(`${iso}T00:00:00Z`);
-  const started = Date.parse(a.startedAt);
-  const ended = Date.parse(a.endedAt);
-  if (Number.isNaN(started) || Number.isNaN(ended)) return null;
-  // Map to true minutes-of-day within [0, 1440] so tracked-time/productivity KPIs stay
-  // accurate for any timezone. (The timeline axis is fixed to 08:00–20:00, so blocks
-  // outside business hours clip visually on the bar but are never dropped or miscounted.)
-  const startMin = Math.min(Math.max(Math.round((started - dayStart) / 60000), 0), 1440);
-  const endMin = Math.min(Math.max(Math.round((ended - dayStart) / 60000), 0), 1440);
-  if (endMin <= startMin) return null;
-
-  let windows: LiveWindow[] = [];
-  try {
-    const parsed: unknown = a.activeWindowsJson ? JSON.parse(a.activeWindowsJson) : [];
-    if (Array.isArray(parsed)) windows = parsed as LiveWindow[];
-  } catch {
-    windows = [];
-  }
-  const top = [...windows].sort((x, y) => (y.seconds ?? 0) - (x.seconds ?? 0))[0];
-  const app = top?.appName || "Tracked activity";
-  const windowTitle = top?.windowTitle || a.description || "Activity block";
-
-  return {
-    id: a.id,
-    type: "work",
-    startMin,
-    endMin,
-    minutes: endMin - startMin,
-    app,
-    windowTitle,
-    projectId: a.projectId ?? null,
-    productivity: Math.round(a.productivity ?? 0),
-    mouseClicks: a.mouseClicks ?? 0,
-    keyboardHits: a.keyboardHits ?? 0,
-    screen: liveScreen(app),
-  };
 }
 
 /** "09:35" (UTC) from an ISO timestamp. */
@@ -220,16 +141,22 @@ function fmtIsoTime(ts: string): string {
   return Number.isNaN(t) ? "—" : new Date(t).toISOString().slice(11, 16);
 }
 
-export default function MonitorPage() {
-  const { user } = useSession();
+/** Two-hourly tick marks across a timeline axis. */
+function axisTicks(span: DayWindow): number[] {
+  return Array.from({ length: Math.floor((span.end - span.start) / 120) + 1 }, (_, i) => span.start + i * 120);
+}
 
-  /* ── Live mode state (demo data below stays the untouched default) ── */
-  const liveEnabled = useSyncExternalStore(noopSubscribe, readLiveToken, readLiveTokenServer);
-  const [liveData, setLiveData] = useState<{ iso: string; acts: LiveActivity[]; fetchedAt: number } | null>(null);
-  const [liveErrorIso, setLiveErrorIso] = useState<string | null>(null);
+export default function MonitorPage() {
+  const router = useRouter();
+  const { user, isLive } = useSession();
+
+  /* ── Live mode state (demo mode never reads it) ── */
+  const [liveFetch, setLiveFetch] = useState<LiveFetch | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
   const [shotState, setShotState] = useState<{ key: string; shots: LiveShot[]; done: boolean } | null>(null);
 
-  const days = useMemo(() => (liveEnabled ? liveDayList(7) : availableDays(7)), [liveEnabled]);
+  // Live days pivot on the real clock; demo days on the demo's frozen instant.
+  const days = useMemo(() => availableDays(7, isLive ? referenceNow() : undefined), [isLive]);
   const monitorable = useMemo(() => users.filter((u) => u.role !== "client"), []);
   const isSelfOnly = user.role === "worker";
 
@@ -243,133 +170,103 @@ export default function MonitorPage() {
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
 
   const activeUserId = isSelfOnly ? user.id : userId;
-  const iso = days[dayIdx].iso;
-  const day = days[dayIdx];
+  const day = days[dayIdx] ?? days[0];
+  const iso = day.iso;
 
   useEffect(() => {
     window.scrollTo({ top: 0, behavior: "smooth" });
   }, [panel, activeUserId]);
 
   /* ── Live mode: fetch the selected day's real activity blocks ── */
+  const fetchKey = `${iso}#${reloadKey}`;
+  const selfFilter = isSelfOnly ? user.id : undefined;
   useEffect(() => {
-    if (!liveEnabled) return;
+    if (!isLive) return;
     let cancelled = false;
-    const from = `${iso}T00:00:00.000Z`;
-    const to = new Date(Date.parse(from) + 24 * 60 * 60 * 1000).toISOString();
-    getApi(`/api/app/activity?From=${encodeURIComponent(from)}&To=${encodeURIComponent(to)}&MaxResultCount=500`)
-      .then((items) => {
+    const key = `${iso}#${reloadKey}`;
+    getApi(dayActivityEndpoint(iso, selfFilter))
+      .then((items: unknown) => {
         if (cancelled) return;
-        setLiveErrorIso(null);
-        setLiveData({ iso, acts: Array.isArray(items) ? items : [], fetchedAt: Date.now() });
+        if (!Array.isArray(items)) throw new Error("Unexpected activity payload");
+        setLiveFetch({ key, ok: true, rows: mapApiActivities(items), fetchedAt: referenceNow().getTime() });
       })
       .catch(() => {
-        if (!cancelled) setLiveErrorIso(iso); // fall back wholesale to the demo timeline
+        // An honest error state with Retry — never the demo timeline.
+        if (!cancelled) setLiveFetch({ key, ok: false });
       });
     return () => {
       cancelled = true;
     };
-  }, [liveEnabled, iso]);
+  }, [isLive, iso, reloadKey, selfFilter]);
 
-  const liveFailed = liveEnabled && liveErrorIso === iso;
-  const liveActs = liveEnabled && !liveFailed && liveData?.iso === iso ? liveData.acts : null;
-  const liveFetchedAt = liveData?.iso === iso ? liveData.fetchedAt : 0;
-  const liveMode = liveEnabled && !liveFailed && liveActs !== null;
-  const livePending = liveEnabled && !liveFailed && liveActs === null;
+  const liveResult = isLive && liveFetch?.key === fetchKey ? liveFetch : null;
+  const livePending = isLive && liveResult === null;
+  const liveFailed = liveResult?.ok === false;
+  const liveRows = liveResult?.ok === true ? liveResult.rows : null;
+  const liveFetchedAt = liveResult?.ok === true ? liveResult.fetchedAt : 0;
 
-  /** Real blocks grouped per user + a synthesized roster for the member selector. */
-  const liveDay = useMemo(() => {
-    const byUser = new Map<string, DaySegment[]>();
-    const lastSeen = new Map<string, number>();
-    for (const a of liveActs ?? []) {
-      const end = Date.parse(a.endedAt);
-      if (!Number.isNaN(end)) lastSeen.set(a.userId, Math.max(lastSeen.get(a.userId) ?? 0, end));
-      const s = liveSegment(a, iso);
-      if (!s) continue;
-      const list = byUser.get(a.userId) ?? [];
-      list.push(s);
-      byUser.set(a.userId, list);
-    }
-    for (const list of byUser.values()) list.sort((x, y) => x.startMin - y.startMin);
+  /** The real day: blocks per member, the roster (workers: only themselves) and whether anything was ever tracked. */
+  const liveModel = useMemo(() => {
+    if (!liveRows) return null;
+    const byUser = segmentsByUser(liveRows, iso);
+    const lastSeen = lastSeenByUser([...sessionActivities, ...liveRows]);
+    const roster = isSelfOnly
+      ? liveRoster([user], [], lastSeen, liveFetchedAt)
+      : liveRoster(users, byUser.keys(), lastSeen, liveFetchedAt);
+    return { byUser, roster, hasAny: sessionActivities.length > 0 || liveRows.length > 0 };
+  }, [liveRows, liveFetchedAt, iso, isSelfOnly, user]);
 
-    const ids = new Set<string>([...byUser.keys(), ...lastSeen.keys()]);
-    if (liveActs) ids.add(user.id); // your own (possibly empty) day is always openable
-    const roster: User[] = [...ids].map((id) => {
-      const seen = lastSeen.get(id) ?? 0;
-      const status: UserStatus = liveFetchedAt - seen < 15 * 60 * 1000 ? "active" : "offline";
-      if (id === user.id) return { ...user, status };
-      const known = users.find((u) => u.id === id);
-      if (known) return { ...known, status };
-      return {
-        id,
-        name: `Member ${id.slice(0, 8)}`,
-        email: "",
-        role: "worker" as const,
-        designation: "Member",
-        status,
-        timezone: "UTC",
-        trackedToday: 0,
-        productivity: 0,
-        joinedAt: "",
-      };
-    });
-    return { byUser, roster };
-  }, [liveActs, liveFetchedAt, iso, user]);
-
-  const member = liveMode
-    ? (liveDay.roster.find((u) => u.id === activeUserId) ?? { ...user, status: "offline" as UserStatus })
-    : users.find((u) => u.id === activeUserId)!;
+  const member: User = isLive
+    ? (liveModel?.roster.find((u) => u.id === activeUserId) ?? { ...user, status: "offline" })
+    : (users.find((u) => u.id === activeUserId) ?? user);
 
   const segments = useMemo(
-    () => (liveMode ? (liveDay.byUser.get(activeUserId) ?? []) : buildDayTimeline(activeUserId, iso)),
-    [liveMode, liveDay, activeUserId, iso]
+    () => (isLive ? (liveModel?.byUser.get(activeUserId) ?? []) : buildDayTimeline(activeUserId, iso)),
+    [isLive, liveModel, activeUserId, iso]
   );
+  // Live work can sit anywhere in the UTC day; widen the axis so none of it is clipped.
+  const axis = useMemo(() => (isLive ? timelineWindow(segments) : DEFAULT_DAY_WINDOW), [isLive, segments]);
   const summary = useMemo(() => daySummary(segments), [segments]);
-  const hourly = useMemo(() => hourlyBuckets(segments), [segments]);
+  const hourly = useMemo(() => hourlyBuckets(segments, axis.start, axis.end), [segments, axis]);
   const apps = useMemo(() => appBreakdown(segments), [segments]);
   const browser = useMemo(() => browserSummary(segments), [segments]);
   const shots = segments.filter((s) => s.type === "work" || s.type === "meeting");
+  const memberHasActivity =
+    !isLive || segments.length > 0 || sessionActivities.some((a) => a.userId === member.id);
 
   const shotKey = `${activeUserId}:${iso}`;
   const liveShots = shotState?.key === shotKey ? shotState.shots : [];
-  const liveShotsLoading =
-    liveMode &&
-    (liveDay.byUser.get(activeUserId)?.length ?? 0) > 0 &&
-    !(shotState?.key === shotKey && shotState.done);
+  const liveShotsLoading = isLive && segments.length > 0 && !(shotState?.key === shotKey && shotState.done);
 
-  /* ── Live mode: thumbnails for the shown activities (≤12, bearer-authed blobs) ── */
+  /* ── Live mode: real captures for the shown blocks (≤12, bearer-authed blobs; webcam never shown) ── */
   useEffect(() => {
-    if (!liveMode || !liveActs) return;
+    if (!isLive || segments.length === 0) return;
     const key = `${activeUserId}:${iso}`;
-    const shown = liveActs
-      .filter((a) => a.userId === activeUserId)
-      .sort((x, y) => Date.parse(x.startedAt) - Date.parse(y.startedAt))
-      .map((a) => ({ act: a, seg: liveSegment(a, iso) }))
-      .filter((x): x is { act: LiveActivity; seg: DaySegment } => x.seg !== null);
-    if (shown.length === 0) return;
     let cancelled = false;
     const urls: string[] = [];
     (async () => {
       const collected: LiveShot[] = [];
-      for (const { act, seg } of shown) {
+      for (const seg of segments) {
         if (cancelled || collected.length >= 12) break;
         let metas: { id: string; kind?: string; capturedAt?: string }[] = [];
         try {
-          const res = await getApi(`/api/app/activity/screenshots?activityId=${act.id}`);
+          const res = await getApi(`/api/app/activity/screenshots?activityId=${encodeURIComponent(seg.id)}`);
           if (Array.isArray(res)) metas = res;
         } catch {
           continue; // block without readable captures — keep going
         }
         for (const m of metas) {
           if (cancelled || collected.length >= 12) break;
-          if (m.kind === "webcam") continue;
+          if (!m || typeof m.id !== "string" || m.kind === "webcam") continue;
           try {
-            const url = await getAuthedBlobUrl(`/api/app/activity/screenshot/${m.id}/content`);
+            const url = await getAuthedBlobUrl(`/api/app/activity/screenshot/${encodeURIComponent(m.id)}/content`);
             if (cancelled) {
               URL.revokeObjectURL(url);
               return;
             }
             urls.push(url);
-            collected.push({ id: m.id, url, capturedAt: m.capturedAt ?? act.startedAt, app: seg.app });
+            const time = m.capturedAt ? fmtIsoTime(m.capturedAt) : fmtMin(seg.startMin);
+            collected.push({ id: m.id, url, time, app: seg.app });
             setShotState({ key, shots: [...collected], done: false });
           } catch {
             /* skip unreadable capture */
@@ -382,12 +279,12 @@ export default function MonitorPage() {
       cancelled = true;
       for (const u of urls) URL.revokeObjectURL(u);
     };
-  }, [liveMode, liveActs, activeUserId, iso]);
+  }, [isLive, segments, activeUserId, iso]);
 
   const rosterRows = useMemo(() => {
-    if (liveMode) {
-      return liveDay.roster.map((u) => {
-        const segs = liveDay.byUser.get(u.id) ?? [];
+    if (isLive) {
+      return (liveModel?.roster ?? []).map((u) => {
+        const segs = liveModel?.byUser.get(u.id) ?? [];
         return { user: u, segments: segs, summary: daySummary(segs) };
       });
     }
@@ -395,7 +292,13 @@ export default function MonitorPage() {
       const segs = buildDayTimeline(u.id, iso);
       return { user: u, segments: segs, summary: daySummary(segs) };
     });
-  }, [liveMode, liveDay, monitorable, iso]);
+  }, [isLive, liveModel, monitorable, iso]);
+  // One shared axis so every member's strip is comparable.
+  const rosterAxis = useMemo(
+    () => (isLive ? timelineWindow(rosterRows.flatMap((r) => r.segments)) : DEFAULT_DAY_WINDOW),
+    [isLive, rosterRows]
+  );
+  const noLiveActivity = isLive && liveModel !== null && !liveModel.hasAny;
 
   const navList = useMemo(() => sortRoster(rosterRows), [rosterRows]);
 
@@ -424,7 +327,8 @@ export default function MonitorPage() {
     return { tracked, activeNow, avgProd, withTime: withTime.length, count: rosterRows.length };
   }, [rosterRows]);
 
-  const hourTicks = Array.from({ length: RANGE / 60 / 2 + 1 }, (_, i) => DAY_START_MIN + i * 120);
+  const range = axis.end - axis.start;
+  const hourTicks = axisTicks(axis);
   const navIndex = navList.findIndex((r) => r.user.id === activeUserId);
 
   function openMember(id: string) {
@@ -450,11 +354,10 @@ export default function MonitorPage() {
     />
   );
 
-  const liveNotice = liveFailed ? (
-    <p className="px-0.5 text-xs text-muted-foreground">
-      Live data is unavailable right now — showing demo activity instead.
-    </p>
-  ) : null;
+  // Live blocks are placed on the UTC day the agents report in.
+  const utcNote = isLive ? " · times in UTC" : "";
+  const legend = isLive ? <ProductivityLegend /> : <TypeLegend />;
+  const installAgent = { label: "Get the desktop agent", onClick: () => router.push("/download") };
 
   const focusCard = (
     <Card>
@@ -506,10 +409,30 @@ export default function MonitorPage() {
           actions={dayNav}
         />
         <Card>
-          <CardContent className="py-10 text-center text-sm text-muted-foreground">
+          <CardContent className="py-10 text-center text-sm text-muted-foreground" role="status">
             Loading live activity for {dayLabel.toLowerCase()}…
           </CardContent>
         </Card>
+      </PageStack>
+    );
+  }
+
+  /* ── Live mode: the day's activity could not be loaded ── */
+  if (liveFailed) {
+    return (
+      <PageStack>
+        <PageHeader
+          eyebrow="Monitor"
+          title={isSelfOnly ? "My day" : "Member Monitor"}
+          description={`Activity for ${dayLabel.toLowerCase()} is unavailable right now.`}
+          actions={dayNav}
+        />
+        <EmptyState
+          icon={AlertTriangle}
+          title="Couldn't load activity"
+          description="The tracker backend didn't return this day's activity. Check your connection and try again."
+          action={{ label: "Retry", onClick: () => setReloadKey((k) => k + 1) }}
+        />
       </PageStack>
     );
   }
@@ -521,11 +444,9 @@ export default function MonitorPage() {
         <PageHeader
           eyebrow="Monitor"
           title="Member Monitor"
-          description={`${teamTotals.activeNow} active now · ${formatDuration(teamTotals.tracked)} tracked · ${dayLabel.toLowerCase()}`}
+          description={`${teamTotals.activeNow} active now · ${formatDuration(teamTotals.tracked)} tracked · ${dayLabel.toLowerCase()}${utcNote}`}
           actions={dayNav}
         />
-
-        {liveNotice}
 
         <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
           <MonitorKpi icon={Users} tone={brand.primary} label="Team size" value={String(teamTotals.count)} />
@@ -539,28 +460,39 @@ export default function MonitorPage() {
           />
         </div>
 
-        <Toolbar>
-          <SearchField value={query} onChange={setQuery} placeholder="Search by name, role, or email…" />
-          <SegmentedControl
-            value={statusFilter}
-            onChange={setStatusFilter}
-            options={[
-              { value: "all", label: "All" },
-              { value: "active", label: "Active" },
-              { value: "idle", label: "Idle" },
-              { value: "offline", label: "Offline" },
-            ]}
+        {!noLiveActivity && (
+          <>
+            <Toolbar>
+              <SearchField value={query} onChange={setQuery} placeholder="Search by name, role, or email…" />
+              <SegmentedControl
+                value={statusFilter}
+                onChange={setStatusFilter}
+                options={[
+                  { value: "all", label: "All" },
+                  { value: "active", label: "Active" },
+                  { value: "idle", label: "Idle" },
+                  { value: "offline", label: "Offline" },
+                ]}
+              />
+            </Toolbar>
+
+            <div className="flex flex-wrap items-center justify-between gap-2 px-0.5">
+              {legend}
+              <p className="text-xs text-muted-foreground">
+                {filteredRoster.length} of {rosterRows.length} members · click a row for the full day
+              </p>
+            </div>
+          </>
+        )}
+
+        {noLiveActivity ? (
+          <EmptyState
+            icon={Download}
+            title="No activity yet"
+            description="Install the desktop agent to start tracking — each member's day appears here as soon as it reports activity."
+            action={installAgent}
           />
-        </Toolbar>
-
-        <div className="flex flex-wrap items-center justify-between gap-2 px-0.5">
-          <TypeLegend />
-          <p className="text-xs text-muted-foreground">
-            {filteredRoster.length} of {rosterRows.length} members · click a row for the full day
-          </p>
-        </div>
-
-        {filteredRoster.length === 0 ? (
+        ) : filteredRoster.length === 0 ? (
           <EmptyState
             icon={Search}
             title={query || statusFilter !== "all" ? "No members match" : "No members to monitor"}
@@ -635,7 +567,7 @@ export default function MonitorPage() {
                     </div>
 
                     <div className="min-w-0">
-                      <MiniDayStrip segments={segs} />
+                      <MiniDayStrip segments={segs} span={rosterAxis} />
                       <div className="mt-1 text-[10px] text-muted-foreground">
                         {sum.firstMin !== null
                           ? `${fmtMin(sum.firstMin)} – ${fmtMin(sum.lastMin!)}`
@@ -700,8 +632,8 @@ export default function MonitorPage() {
         title={isSelfOnly ? "My day" : member.name}
         description={
           isSelfOnly
-            ? `Your activity for ${dayLabel.toLowerCase()}.`
-            : `${member.designation} · ${statusCopy[member.status]} · ${dayLabel}`
+            ? `Your activity for ${dayLabel.toLowerCase()}${isLive ? " (times in UTC)" : ""}.`
+            : `${member.designation} · ${statusCopy[member.status]} · ${dayLabel}${utcNote}`
         }
         actions={
           <div className="flex items-center gap-2.5">
@@ -710,8 +642,6 @@ export default function MonitorPage() {
           </div>
         }
       />
-
-      {liveNotice}
 
       <Toolbar>
         <SegmentedControl
@@ -725,11 +655,28 @@ export default function MonitorPage() {
         <div className="w-full sm:ml-auto sm:w-auto">{dayNav}</div>
       </Toolbar>
 
-      {segments.length === 0 ? (
+      {segments.length === 0 && !memberHasActivity ? (
+        <EmptyState
+          icon={Download}
+          title="No activity yet"
+          description={
+            member.id === user.id
+              ? "Install the desktop agent to start tracking — your day appears here as soon as it reports activity."
+              : `Install the desktop agent to start tracking — ${member.name.split(" ")[0] || "this member"}'s day appears here as soon as it reports activity.`
+          }
+          action={
+            member.id === user.id
+              ? installAgent
+              : !isSelfOnly
+                ? { label: "Back to team", onClick: () => setPanel("roster") }
+                : undefined
+          }
+        />
+      ) : segments.length === 0 ? (
         <EmptyState
           icon={Pause}
           title="No activity tracked"
-          description={`${member.name.split(" ")[0]} did not record any time on ${dayLabel.toLowerCase()}.`}
+          description={`${member.name.split(" ")[0] || "This member"} did not record any time on ${dayLabel.toLowerCase()}.`}
           action={
             dayIdx !== 0
               ? { label: "Jump to today", onClick: () => setDayIdx(0) }
@@ -749,12 +696,17 @@ export default function MonitorPage() {
               value={`${summary.productivityAvg}%`}
             />
             <MonitorKpi icon={Zap} tone={brand.success} label="Longest focus" value={formatDuration(summary.longestFocus)} />
-            <MonitorKpi
-              icon={Pause}
-              tone="#94a3b8"
-              label="Idle + breaks"
-              value={formatDuration(summary.idle + summary.breakMinutes)}
-            />
+            {isLive ? (
+              // Agents report activity blocks, not idle time — count the blocks instead of claiming zero idle.
+              <MonitorKpi icon={Layers} tone="#94a3b8" label="Activity blocks" value={String(segments.length)} />
+            ) : (
+              <MonitorKpi
+                icon={Pause}
+                tone="#94a3b8"
+                label="Idle + breaks"
+                value={formatDuration(summary.idle + summary.breakMinutes)}
+              />
+            )}
             <MonitorKpi
               icon={LogIn}
               tone={brand.info}
@@ -772,7 +724,7 @@ export default function MonitorPage() {
           <Card>
             <CardHeader>
               <CardTitle>Activity overview</CardTitle>
-              <TypeLegend />
+              {legend}
             </CardHeader>
             <CardContent>
               <div className="-mx-1 overflow-x-auto overscroll-x-contain px-1">
@@ -781,12 +733,12 @@ export default function MonitorPage() {
                     <div
                       key={t}
                       className="absolute top-0 bottom-5 border-l border-border/70"
-                      style={{ left: `${((t - DAY_START_MIN) / RANGE) * 100}%` }}
+                      style={{ left: `${((t - axis.start) / range) * 100}%` }}
                     />
                   ))}
                   {segments.map((s) => {
-                    const left = ((s.startMin - DAY_START_MIN) / RANGE) * 100;
-                    const width = (s.minutes / RANGE) * 100;
+                    const left = ((s.startMin - axis.start) / range) * 100;
+                    const width = (s.minutes / range) * 100;
                     const color = s.type === "work" ? prodColor(s.productivity) : typeColor[s.type];
                     return (
                       <div
@@ -806,7 +758,7 @@ export default function MonitorPage() {
                     <span
                       key={`l-${t}`}
                       className="absolute bottom-0 -translate-x-1/2 text-[9px] text-muted-foreground sm:text-[10px]"
-                      style={{ left: `${((t - DAY_START_MIN) / RANGE) * 100}%` }}
+                      style={{ left: `${((t - axis.start) / range) * 100}%` }}
                     >
                       {fmtMin(t)}
                     </span>
@@ -826,7 +778,7 @@ export default function MonitorPage() {
                 <CardContent>
                   <div className="relative space-y-0 before:absolute before:left-[52px] before:top-2 before:bottom-2 before:w-px before:bg-border">
                     {segments.map((s) => (
-                      <TimelineRow key={s.id} seg={s} />
+                      <TimelineRow key={s.id} seg={s} live={isLive} />
                     ))}
                   </div>
                 </CardContent>
@@ -838,7 +790,7 @@ export default function MonitorPage() {
             </div>
           ) : (
             <>
-              <DayScheduleView segments={segments} />
+              <DayScheduleView segments={segments} span={axis} live={isLive} legend={legend} />
               <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
                 {focusCard}
                 {appsCard}
@@ -848,7 +800,7 @@ export default function MonitorPage() {
 
           {browser.tabInstances > 0 && <BrowserActivity data={browser} />}
 
-          {liveMode
+          {isLive
             ? (liveShots.length > 0 || liveShotsLoading) && (
                 <Card>
                   <CardHeader>
@@ -870,11 +822,11 @@ export default function MonitorPage() {
                             {/* eslint-disable-next-line @next/next/no-img-element */}
                             <img
                               src={s.url}
-                              alt={`Screenshot at ${fmtIsoTime(s.capturedAt)}`}
+                              alt={`Screenshot at ${s.time}`}
                               className="aspect-video w-full rounded-lg border border-border object-cover"
                             />
                             <div className="mt-1.5 flex items-center justify-between text-xs">
-                              <span className="font-medium tabular-nums">{fmtIsoTime(s.capturedAt)}</span>
+                              <span className="font-medium tabular-nums">{s.time}</span>
                               <span className="truncate pl-2 text-muted-foreground">{s.app}</span>
                             </div>
                           </div>
@@ -944,20 +896,34 @@ function MetricCell({
   );
 }
 
-function DayScheduleView({ segments }: { segments: DaySegment[] }) {
+function DayScheduleView({
+  segments,
+  span,
+  live = false,
+  legend,
+}: {
+  segments: DaySegment[];
+  span: DayWindow;
+  live?: boolean;
+  legend: React.ReactNode;
+}) {
   const PX_PER_MIN = 1.1;
-  const height = RANGE * PX_PER_MIN;
-  const hours = Array.from({ length: RANGE / 60 + 1 }, (_, i) => DAY_START_MIN + i * 60);
+  const start = span.start;
+  const range = span.end - span.start;
+  const height = range * PX_PER_MIN;
+  const hours = Array.from({ length: Math.floor(range / 60) + 1 }, (_, i) => start + i * 60);
   const [selected, setSelected] = useState<DaySegment | null>(null);
 
   return (
     <Card>
       <CardHeader>
         <CardTitle>Day schedule</CardTitle>
-        <TypeLegend />
+        {legend}
       </CardHeader>
       <CardContent>
-        <p className="mb-3 text-xs text-muted-foreground">Tap any block for details and open tabs.</p>
+        <p className="mb-3 text-xs text-muted-foreground">
+          {live ? "Tap any block for details." : "Tap any block for details and open tabs."}
+        </p>
         <div className="-mx-1 overflow-x-auto overscroll-x-contain px-1">
           <div className="flex min-w-[280px]">
             <div className="relative w-12 shrink-0 sm:w-14" style={{ height }}>
@@ -965,7 +931,7 @@ function DayScheduleView({ segments }: { segments: DaySegment[] }) {
                 <span
                   key={h}
                   className="absolute right-1 -translate-y-1/2 text-[10px] font-medium text-muted-foreground sm:right-2 sm:text-[11px]"
-                  style={{ top: (h - DAY_START_MIN) * PX_PER_MIN }}
+                  style={{ top: (h - start) * PX_PER_MIN }}
                 >
                   {fmtMin(h)}
                 </span>
@@ -980,39 +946,41 @@ function DayScheduleView({ segments }: { segments: DaySegment[] }) {
                 <div
                   key={h}
                   className="absolute left-0 right-0 border-t border-border/60"
-                  style={{ top: (h - DAY_START_MIN) * PX_PER_MIN }}
+                  style={{ top: (h - start) * PX_PER_MIN }}
                 />
               ))}
               {hours.slice(0, -1).map((h) => (
                 <div
                   key={`half-${h}`}
                   className="absolute left-0 right-0 border-t border-dashed border-border/30"
-                  style={{ top: (h + 30 - DAY_START_MIN) * PX_PER_MIN }}
+                  style={{ top: (h + 30 - start) * PX_PER_MIN }}
                 />
               ))}
               {segments.map((s) => (
-                <ScheduleBlock key={s.id} seg={s} pxPerMin={PX_PER_MIN} onSelect={setSelected} />
+                <ScheduleBlock key={s.id} seg={s} axisStart={start} pxPerMin={PX_PER_MIN} onSelect={setSelected} />
               ))}
             </div>
           </div>
         </div>
       </CardContent>
 
-      <SegmentDetailModal seg={selected} onClose={() => setSelected(null)} />
+      <SegmentDetailModal seg={selected} live={live} onClose={() => setSelected(null)} />
     </Card>
   );
 }
 
 function ScheduleBlock({
   seg,
+  axisStart,
   pxPerMin,
   onSelect,
 }: {
   seg: DaySegment;
+  axisStart: number;
   pxPerMin: number;
   onSelect: (seg: DaySegment) => void;
 }) {
-  const top = (seg.startMin - DAY_START_MIN) * pxPerMin;
+  const top = (seg.startMin - axisStart) * pxPerMin;
   const height = Math.max(18, seg.minutes * pxPerMin);
   const isPassive = seg.type === "idle" || seg.type === "break";
   const color = seg.type === "work" ? prodColor(seg.productivity) : typeColor[seg.type];
@@ -1058,7 +1026,15 @@ function ScheduleBlock({
   );
 }
 
-function SegmentDetailModal({ seg, onClose }: { seg: DaySegment | null; onClose: () => void }) {
+function SegmentDetailModal({
+  seg,
+  live = false,
+  onClose,
+}: {
+  seg: DaySegment | null;
+  live?: boolean;
+  onClose: () => void;
+}) {
   if (!seg) return null;
   const isPassive = seg.type === "idle" || seg.type === "break";
   const p = seg.projectId ? projectById(seg.projectId) : null;
@@ -1092,7 +1068,12 @@ function SegmentDetailModal({ seg, onClose }: { seg: DaySegment | null; onClose:
 
         {!isPassive && (
           <div className="flex items-start gap-3">
-            <ScreenMockView screen={seg.screen} className="hidden h-20 w-32 shrink-0 rounded-lg sm:block" />
+            {live ? (
+              // A real block has no synthetic screen to draw: show the focused app, not a fake capture.
+              <AppGlyph app={seg.app} color={seg.screen.accent} className="hidden h-20 w-32 shrink-0 sm:flex" />
+            ) : (
+              <ScreenMockView screen={seg.screen} className="hidden h-20 w-32 shrink-0 rounded-lg sm:block" />
+            )}
             <div className="min-w-0 flex-1 space-y-1.5 text-sm">
               <div className="truncate text-muted-foreground">{seg.windowTitle}</div>
               {p && (
@@ -1267,7 +1248,7 @@ function MiniStat({
   );
 }
 
-function TimelineRow({ seg }: { seg: DaySegment }) {
+function TimelineRow({ seg, live = false }: { seg: DaySegment; live?: boolean }) {
   const p = seg.projectId ? projectById(seg.projectId) : null;
   const Icon = typeIcon[seg.type];
   const isPassive = seg.type === "idle" || seg.type === "break";
@@ -1298,7 +1279,11 @@ function TimelineRow({ seg }: { seg: DaySegment }) {
         </div>
       ) : (
         <div className="flex flex-1 items-start gap-3 rounded-xl border border-border p-2.5 transition-colors hover:bg-muted/30">
-          <ScreenMockView screen={seg.screen} className="hidden h-14 w-24 shrink-0 sm:block" />
+          {live ? (
+            <AppGlyph app={seg.app} color={seg.screen.accent} className="hidden h-14 w-24 shrink-0 sm:flex" />
+          ) : (
+            <ScreenMockView screen={seg.screen} className="hidden h-14 w-24 shrink-0 sm:block" />
+          )}
           <div className="min-w-0 flex-1">
             <div className="flex flex-wrap items-center gap-2">
               <span className="truncate text-sm font-semibold">{seg.app}</span>

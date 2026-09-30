@@ -10,9 +10,18 @@ import { ToastViewport } from "@/components/toast";
 import { RoleGuard } from "@/components/role-guard";
 import { PageEnter } from "@/components/motion/reveal";
 import { useSession } from "@/components/session-provider";
+import { LiveWarningBanner, SessionGate } from "@/components/session-gate";
 import { cn } from "@/lib/utils";
 
 export default function DashboardLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <SessionGate area="tenant">
+      <DashboardShell>{children}</DashboardShell>
+    </SessionGate>
+  );
+}
+
+function DashboardShell({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const pathname = usePathname();
   const [collapsed, setCollapsed] = useState(false);
@@ -21,6 +30,14 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
 
   return (
     <div className="min-h-screen">
+      {/* Keyboard users otherwise tab through ~16 nav stops on every page
+          before reaching content. Visible only while focused. */}
+      <a
+        href="#main-content"
+        className="sr-only rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground focus:not-sr-only focus:absolute focus:left-4 focus:top-4 focus:z-[100]"
+      >
+        Skip to main content
+      </a>
       <Sidebar
         collapsed={collapsed}
         onToggle={() => setCollapsed((c) => !c)}
@@ -47,7 +64,8 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
           </div>
         )}
         <Topbar onMenuClick={() => setMobileOpen(true)} />
-        <main key={workspace.id} className="app-canvas mx-auto max-w-[1400px] p-4 lg:p-6">
+        <LiveWarningBanner />
+        <main id="main-content" tabIndex={-1} key={workspace.id} className="app-canvas mx-auto max-w-[1400px] p-4 lg:p-6 outline-none">
           <PageEnter motionKey={`${workspace.id}:${pathname}`}>
             <RoleGuard>{children}</RoleGuard>
           </PageEnter>

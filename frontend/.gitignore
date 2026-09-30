@@ -40,6 +40,11 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 
-# Stryker mutation testing
+# Stryker mutation testing (anchored: an unanchored "reports/" also ignored src/components/reports/)
 .stryker-tmp/
-reports/
+/reports/
+
+# Playwright
+/playwright-report/
+/test-results/
+/blob-report/

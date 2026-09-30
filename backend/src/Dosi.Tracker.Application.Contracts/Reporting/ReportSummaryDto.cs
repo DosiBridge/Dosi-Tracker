@@ -4,8 +4,12 @@ using System.ComponentModel.DataAnnotations;
 
 namespace Dosi.Tracker.Reporting;
 
+/// <summary>Report range [From, To) in UTC. To must be after From and the range may span at most
+/// <see cref="MaxRangeDays"/> days (otherwise Tracker:ReportRangeInvalid).</summary>
 public class GetReportSummaryInput
 {
+    public const int MaxRangeDays = 366;
+
     [Required]
     public DateTime From { get; set; }
 
@@ -13,6 +17,10 @@ public class GetReportSummaryInput
     public DateTime To { get; set; }
 
     public Guid? ProjectId { get; set; }
+
+    /// <summary>Report on a single member. Only honored for callers with Tracker.Activities.ViewAll;
+    /// everyone else is always scoped to their own data regardless of this value.</summary>
+    public Guid? UserId { get; set; }
 }
 
 public class ReportSummaryDto
@@ -58,4 +66,17 @@ public class DailyReportRowDto
     public double AverageProductivity { get; set; }
     public long MouseClicks { get; set; }
     public long KeyboardHits { get; set; }
+}
+
+/// <summary>One member's tracked work on one UTC calendar day (only days with activity are returned).</summary>
+public class UserDailyReportRowDto
+{
+    public Guid UserId { get; set; }
+    public string UserName { get; set; } = string.Empty;
+
+    /// <summary>The UTC day (00:00, Kind=Utc).</summary>
+    public DateTime Date { get; set; }
+
+    public double TrackedMinutes { get; set; }
+    public int ActivityCount { get; set; }
 }

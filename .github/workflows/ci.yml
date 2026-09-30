@@ -73,9 +73,22 @@ jobs:
         run: npm run lint
 
       # Vitest enforces the coverage floor itself (docs/QUALITY.md §4) — a drop fails this step.
-      - name: Unit tests + coverage gate
+      # The run includes unit, property, component, integration, acceptance and a11y (jest-axe) suites.
+      - name: Unit/component/integration tests + coverage gate
         working-directory: frontend
         run: npm run test:coverage
+
+      # Layering rules (dependency-cruiser) + source-constraint spec (localStorage allowlist,
+      # API contract conformance, no hardcoded tenant ids, secret scan, route↔permission parity).
+      - name: Architecture gate
+        working-directory: frontend
+        run: npm run test:arch
+
+      # Known-vuln floor. Currently 8 high findings inherited from next@16.2.10 (sharp) — gate at
+      # critical until the Next upgrade lands, then ratchet to --audit-level=high.
+      - name: Dependency audit (critical = fail)
+        working-directory: frontend
+        run: npm audit --audit-level=critical
 
       - name: Upload coverage
         if: always()
@@ -87,6 +100,50 @@ jobs:
       - name: Build
         working-directory: frontend
         run: npm run build
+
+      # Ratcheting size gate — fails on a ballooned chunk or total-JS creep (scripts/bundle-budget.mjs).
+      - name: Bundle budget
+        working-directory: frontend
+        run: npm run build:budget
+
+  frontend-e2e:
+    name: Frontend E2E (Playwright, demo mode)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install
+        working-directory: frontend
+        run: npm ci
+
+      - name: Install Playwright browsers
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium firefox webkit
+
+      - name: Build
+        working-directory: frontend
+        run: npm run build
+
+      # Runs every configured project: chromium (full functional + a11y), firefox/webkit (@smoke),
+      # mobile (@mobile). @visual is skipped in CI: baselines are win32-local until linux baselines
+      # are generated and committed from a CI run (see docs/testing/TEST_STRATEGY.md).
+      - name: E2E (all projects, no visual)
+        working-directory: frontend
+        run: npx playwright test --grep-invert "@visual"
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-playwright-report
+          path: frontend/playwright-report
 
   windows-agent:
     name: Windows agent (build, lint, installer)

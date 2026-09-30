@@ -1,4 +1,5 @@
 import { NOW } from "./mock-data";
+import { inRange } from "./metrics";
 import type { Activity } from "./types";
 
 /* ============================================================================
@@ -113,11 +114,9 @@ export function rangeForKey(key: RangeKey): { from: Date; to: Date; label: strin
   }
 }
 
+/** Rows landing inside [from, to]. Membership is metrics.ts's definition — one rule, everywhere. */
 export function filterActivitiesByRange(list: Activity[], from: Date, to: Date) {
-  return list.filter((a) => {
-    const t = new Date(a.endedAt).getTime();
-    return t >= from.getTime() && t <= to.getTime();
-  });
+  return list.filter((a) => inRange(a, from, to));
 }
 
 /* ----------------------------- Report catalog ----------------------------- */

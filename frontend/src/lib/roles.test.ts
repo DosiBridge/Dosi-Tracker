@@ -93,6 +93,7 @@ describe("navAccess (the authorization matrix itself — pinned exactly)", () =>
     "/insights": ["owner", "admin"],
     "/billing": ["owner"],
     "/settings": ["owner", "admin", "worker", "client"],
+    "/download": ["owner", "admin", "worker"],
   };
 
   it("maps exactly the expected routes", () => {

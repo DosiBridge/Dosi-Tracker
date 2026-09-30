@@ -90,6 +90,22 @@ export interface Workspace {
   projectsUsed: number;
   storageUsedGb: number;
   isPrimary?: boolean;
+  /**
+   * Present only for a LIVE (backend) workspace: the real plan as the backend
+   * defines it. When set, it wins over the demo plan table below — a paying
+   * tenant must be quoted its real seat limit and price, not the demo's.
+   */
+  live?: LivePlanInfo;
+}
+
+export interface LivePlanInfo {
+  /** The subscription's plan was found in the backend plan list. */
+  known: boolean;
+  planName: string | null;
+  pricePerUser: number | null;
+  /** Infinity = unlimited; null = unknown. */
+  seatLimit: number | null;
+  trialEndsAt: string | null;
 }
 
 const activeMembers = countSeats(users);
@@ -140,6 +156,16 @@ export const workspaces: Workspace[] = [
 
 export const primaryWorkspace = workspaces.find((w) => w.isPrimary) ?? workspaces[0];
 
+/** Seat ceiling for a workspace: the backend's plan for a live tenant, else the plan table. */
+export function seatLimitFor(ws: Workspace): number {
+  return ws.live?.seatLimit ?? planById(ws.planId).seats;
+}
+
+/** Display name of a workspace's plan (the backend's own name for a live tenant). */
+export function planNameFor(ws: Workspace): string {
+  return ws.live?.planName ?? planById(ws.planId).name;
+}
+
 /* ----------------------------- Usage ----------------------------- */
 
 export interface UsageMetric {
@@ -149,8 +175,13 @@ export interface UsageMetric {
   unit: string;
 }
 
-/** Live seat count from the tenant dataset (single source of truth). */
+/**
+ * Seats in use. A live tenant reports the backend's own count (members holding
+ * a project membership, as billing counts them); a demo workspace counts its
+ * dataset roster (single source of truth).
+ */
 export function liveSeatsUsed(ws: Workspace): number {
+  if (ws.live) return ws.seatsUsed;
   return countSeats(datasetFor(ws.id).users);
 }
 
@@ -160,6 +191,15 @@ export function liveProjectsUsed(ws: Workspace): number {
 
 export function workspaceUsage(ws: Workspace): UsageMetric[] {
   const plan = planById(ws.planId);
+  if (ws.live) {
+    // Only what the backend actually meters: seats against the real plan limit
+    // and the projects that exist. Storage/retention are not metered yet, so
+    // they are not shown rather than invented.
+    return [
+      { label: "Seats", used: liveSeatsUsed(ws), limit: seatLimitFor(ws), unit: "members" },
+      { label: "Projects", used: liveProjectsUsed(ws), limit: Number.POSITIVE_INFINITY, unit: "projects" },
+    ];
+  }
   return [
     { label: "Seats", used: liveSeatsUsed(ws), limit: plan.seats, unit: "members" },
     { label: "Projects", used: liveProjectsUsed(ws), limit: plan.projects, unit: "projects" },
@@ -169,6 +209,11 @@ export function workspaceUsage(ws: Workspace): UsageMetric[] {
 }
 
 export function monthlyCost(ws: Workspace): number | null {
+  if (ws.live) {
+    // Unknown plan → no price rather than the demo table's guess.
+    if (ws.live.pricePerUser === null) return null;
+    return ws.live.pricePerUser * Math.max(1, liveSeatsUsed(ws));
+  }
   const plan = planById(ws.planId);
   if (plan.pricePerUser === null) return null;
   return plan.pricePerUser * liveSeatsUsed(ws);
@@ -222,6 +267,7 @@ export function fmtLimit(n: number): string {
 
 export function usagePct(used: number, limit: number): number {
   if (limit === INF) return 0;
+  if (limit <= 0) return used > 0 ? 100 : 0; // guard 0/0 → NaN and n/0 → Infinity
   return Math.min(100, Math.round((used / limit) * 100));
 }
 

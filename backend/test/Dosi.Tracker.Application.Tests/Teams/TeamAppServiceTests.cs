@@ -272,4 +272,153 @@ public abstract class TeamAppServiceTests<TStartupModule> : TrackerApplicationTe
         });
         again.UserId.ShouldBe(existingMemberId);
     }
+
+    // ---- Manager role, members endpoint, update-member ----
+
+    private Task<Volo.Abp.Identity.IdentityUser> CreateUserAsync(string userName)
+    {
+        return WithUnitOfWorkAsync(async () =>
+        {
+            var user = new Volo.Abp.Identity.IdentityUser(_guidGenerator.Create(), userName, $"{userName}@acme.test")
+            {
+                Name = userName.ToUpperInvariant()
+            };
+            (await GetRequiredService<Volo.Abp.Identity.IdentityUserManager>().CreateAsync(user)).Succeeded.ShouldBeTrue();
+            return user;
+        });
+    }
+
+    private Task<bool> IsManagerAsync(Guid userId)
+    {
+        return WithUnitOfWorkAsync(async () =>
+        {
+            var roles = await GetRequiredService<Volo.Abp.Identity.IIdentityUserRepository>().GetRoleNamesAsync(userId);
+            return roles.Contains(Dosi.Tracker.Identity.TrackerRoles.Manager);
+        });
+    }
+
+    [Theory]
+    [InlineData("Admin")]
+    [InlineData("manager")]
+    [InlineData(" MANAGER ")]
+    public async Task AddMember_As_Admin_Or_Manager_Should_Grant_The_Manager_Role(string role)
+    {
+        var projectId = await CreateProjectAsync();
+        var user = await CreateUserAsync("lead");
+
+        await _teamAppService.AddMemberAsync(new CreateProjectMemberDto { ProjectId = projectId, UserId = user.Id, Role = role });
+
+        (await IsManagerAsync(user.Id)).ShouldBeTrue();
+
+        // The role was provisioned on demand with the team-lead permission set.
+        await WithUnitOfWorkAsync(async () =>
+        {
+            var grants = await GetRequiredService<Volo.Abp.PermissionManagement.IPermissionGrantRepository>()
+                .GetListAsync(Volo.Abp.Authorization.Permissions.RolePermissionValueProvider.ProviderName,
+                    Dosi.Tracker.Identity.TrackerRoles.Manager);
+            grants.Select(g => g.Name).ShouldBe(Dosi.Tracker.Identity.TrackerRoles.ManagerPermissions, ignoreOrder: true);
+        });
+    }
+
+    [Theory]
+    [InlineData("Worker")]
+    [InlineData("Employee")]
+    [InlineData("member")]
+    public async Task AddMember_As_Worker_Should_Not_Grant_Any_Role(string role)
+    {
+        var projectId = await CreateProjectAsync();
+        var user = await CreateUserAsync("worker");
+
+        await _teamAppService.AddMemberAsync(new CreateProjectMemberDto { ProjectId = projectId, UserId = user.Id, Role = role });
+
+        (await IsManagerAsync(user.Id)).ShouldBeFalse();
+    }
+
+    [Fact]
+    public async Task Invite_As_Manager_Should_Grant_The_Manager_Role()
+    {
+        var projectId = await CreateProjectAsync();
+
+        var result = await _teamAppService.InviteMemberAsync(new InviteMemberDto
+        {
+            ProjectId = projectId,
+            Email = "lead@acme.test",
+            Role = "Manager"
+        });
+
+        (await IsManagerAsync(result.Member.UserId)).ShouldBeTrue();
+    }
+
+    [Fact]
+    public async Task GetMembers_Should_List_Tenant_Users_With_Roles_And_Projects()
+    {
+        var projectId = await CreateProjectAsync();
+        var lead = await CreateUserAsync("lead");
+        var worker = await CreateUserAsync("worker");
+        await _teamAppService.AddMemberAsync(new CreateProjectMemberDto { ProjectId = projectId, UserId = lead.Id, Role = "Manager" });
+        await _teamAppService.AddMemberAsync(new CreateProjectMemberDto { ProjectId = projectId, UserId = worker.Id, Role = "Worker" });
+
+        var members = await _teamAppService.GetMembersAsync();
+
+        var leadRow = members.Items.Single(m => m.UserId == lead.Id);
+        leadRow.UserName.ShouldBe("lead");
+        leadRow.Name.ShouldBe("LEAD");
+        leadRow.Email.ShouldBe("lead@acme.test");
+        leadRow.IsActive.ShouldBeTrue();
+        leadRow.IsManager.ShouldBeTrue();
+        leadRow.IsOwner.ShouldBeFalse();
+        leadRow.ProjectIds.ShouldBe(new[] { projectId });
+
+        var workerRow = members.Items.Single(m => m.UserId == worker.Id);
+        workerRow.IsManager.ShouldBeFalse();
+        workerRow.ProjectIds.ShouldBe(new[] { projectId });
+
+        // The seeded host administrator holds the "admin" role and no projects.
+        var owner = members.Items.Single(m => m.UserName == "admin");
+        owner.IsOwner.ShouldBeTrue();
+        owner.ProjectIds.ShouldBeEmpty();
+    }
+
+    [Fact]
+    public async Task UpdateMember_Should_Change_Role_And_Rate_And_Sync_The_Manager_Role()
+    {
+        var projectId = await CreateProjectAsync();
+        var user = await CreateUserAsync("promoted");
+        await _teamAppService.AddMemberAsync(new CreateProjectMemberDto { ProjectId = projectId, UserId = user.Id, Role = "Worker", HourlyRate = 10m });
+
+        var promoted = await _teamAppService.UpdateMemberAsync(projectId, user.Id, new UpdateProjectMemberDto { Role = "Manager", HourlyRate = 55m });
+
+        promoted.Role.ShouldBe("Manager");
+        promoted.HourlyRate.ShouldBe(55m);
+        (await IsManagerAsync(user.Id)).ShouldBeTrue();
+        (await _teamAppService.GetProjectMembersAsync(projectId)).Items
+            .Single(m => m.UserId == user.Id).HourlyRate.ShouldBe(55m);
+
+        await _teamAppService.UpdateMemberAsync(projectId, user.Id, new UpdateProjectMemberDto { Role = "Worker", HourlyRate = 55m });
+
+        (await IsManagerAsync(user.Id)).ShouldBeFalse(); // no Admin/Manager membership left
+    }
+
+    [Fact]
+    public async Task UpdateMember_Demotion_Should_Keep_The_Role_While_Another_Project_Still_Needs_It()
+    {
+        var projectA = await CreateProjectAsync();
+        var projectB = await CreateProjectAsync();
+        var user = await CreateUserAsync("twohats");
+        await _teamAppService.AddMemberAsync(new CreateProjectMemberDto { ProjectId = projectA, UserId = user.Id, Role = "Manager" });
+        await _teamAppService.AddMemberAsync(new CreateProjectMemberDto { ProjectId = projectB, UserId = user.Id, Role = "Admin" });
+
+        await _teamAppService.UpdateMemberAsync(projectA, user.Id, new UpdateProjectMemberDto { Role = "Worker" });
+
+        (await IsManagerAsync(user.Id)).ShouldBeTrue();
+    }
+
+    [Fact]
+    public async Task UpdateMember_Should_Reject_An_Unknown_Membership()
+    {
+        var projectId = await CreateProjectAsync();
+
+        await Should.ThrowAsync<EntityNotFoundException>(() =>
+            _teamAppService.UpdateMemberAsync(projectId, Guid.NewGuid(), new UpdateProjectMemberDto { Role = "Worker" }));
+    }
 }

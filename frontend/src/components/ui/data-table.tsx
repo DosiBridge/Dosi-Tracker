@@ -105,8 +105,15 @@ export function DataTable<T>({
             ))
           )}
           {footer && sorted.length > 0 && (
-            <div className="rounded-xl border border-border bg-muted/40 px-3.5 py-3 text-sm font-semibold">
-              {footer}
+            // \`footer\` is a row of <td> cells (it also closes the desktop
+            // table), so it needs a real table around it here: <td> directly
+            // inside a <div> is invalid nesting and breaks hydration.
+            <div className="overflow-x-auto rounded-xl border border-border bg-muted/40 px-3.5 py-3 text-sm font-semibold">
+              <table className="w-full">
+                <tbody>
+                  <tr>{footer}</tr>
+                </tbody>
+              </table>
             </div>
           )}
         </div>

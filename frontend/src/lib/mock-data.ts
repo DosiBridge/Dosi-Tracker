@@ -1,5 +1,6 @@
 import type { Activity, Project, ScreenMock, User, WindowInfo } from "./types";
 import { countSeats } from "./roles";
+import { activitiesOnDay, averageProductivity, minutesForProject, minutesOnDay } from "./metrics";
 
 /** Fixed reference time so SSR and client render identically (no hydration drift). */
 export const NOW = new Date("2026-07-14T15:30:00.000Z");
@@ -159,47 +160,138 @@ const descriptions = [
   "Polishing dark mode tokens",
 ];
 
+export const DAY_MS = 24 * 60 * 60 * 1000;
+/** How many days back the demo generates activity for. */
+export const TRACKED_DAY_SPAN = 5;
+
+export interface PlannedSession {
+  startedAt: Date;
+  endedAt: Date;
+  minutes: number;
+}
+
+/**
+ * Lay out one member's work for one day as realistic back-to-back SESSIONS —
+ * roughly 35-75 minutes each, separated by short breaks, the most recent one
+ * finishing a little before `anchor`.
+ *
+ * The sum of the returned sessions is EXACTLY `targetMinutes`: the last session
+ * absorbs whatever the jitter left over. That exactness is the whole point —
+ * it is what lets `user.trackedToday` be *derived* from these rows instead of
+ * authored alongside them, so the dashboard and the reports cannot disagree.
+ *
+ * Deterministic: it draws only from the seeded `rand` it is handed.
+ */
+export function planDaySessions(
+  targetMinutes: number,
+  anchor: Date,
+  rand: () => number,
+): PlannedSession[] {
+  const draw = (min: number, max: number) => Math.floor(rand() * (max - min + 1)) + min;
+  const target = Math.max(0, Math.round(targetMinutes));
+  if (target === 0) return [];
+
+  const TYPICAL_SESSION = 55;
+  const MIN_SESSION = 20;
+  const sessions: PlannedSession[] = [];
+  let left = Math.max(1, Math.round(target / TYPICAL_SESSION));
+  let remaining = target;
+  let cursor = anchor.getTime() - draw(5, 25) * 60_000; // clocked off a little while ago
+
+  while (left > 0) {
+    // Never spend so much that the sessions still to come fall under the floor;
+    // the final session takes exactly what is left, so the total always lands.
+    const headroom = remaining - (left - 1) * MIN_SESSION;
+    const minutes =
+      left === 1
+        ? remaining
+        : Math.max(MIN_SESSION, Math.min(Math.round(remaining / left) + draw(-12, 12), headroom));
+    const endedAt = new Date(cursor);
+    const startedAt = new Date(cursor - minutes * 60_000);
+    sessions.push({ startedAt, endedAt, minutes });
+    remaining -= minutes;
+    left -= 1;
+    cursor = startedAt.getTime() - draw(4, 14) * 60_000; // short break between blocks
+  }
+  return sessions;
+}
+
 function buildActivities(): Activity[] {
   const list: Activity[] = [];
   const trackingUsers = users.filter((u) => u.role === "worker" || u.role === "owner" || u.role === "admin");
   let id = 0;
 
-  // Spread activities across the last 5 days, most recent first.
-  for (let day = 0; day < 5; day++) {
+  // Spread activities across the last few days, most recent first.
+  for (let day = 0; day < TRACKED_DAY_SPAN; day++) {
+    const anchor = new Date(NOW.getTime() - day * DAY_MS);
     for (const user of trackingUsers) {
-      const blocks = day === 0 ? between(2, 4) : between(1, 3);
-      for (let b = 0; b < blocks; b++) {
+      // Today must account for exactly the member's intended day; earlier days
+      // vary plausibly around it.
+      const target =
+        day === 0 ? user.trackedToday : Math.round(user.trackedToday * (0.55 + rand() * 0.6));
+
+      planDaySessions(target, anchor, rand).forEach((session, index) => {
         const template = pick(screenTemplates);
         const project = pick(projects.filter((p) => !p.archived && p.memberIds.includes(user.id))) ?? projects[0];
-        const minutesAgo = day * 24 * 60 + b * between(35, 90) + between(5, 25);
-        const ended = new Date(NOW.getTime() - minutesAgo * 60000);
-        const durationMin = project.intervalMinutes;
-        const started = new Date(ended.getTime() - durationMin * 60000);
         const { active, running } = makeWindows(template);
         id++;
         list.push({
           id: `a${id}`,
           userId: user.id,
           projectId: project.id,
-          startedAt: started.toISOString(),
-          endedAt: ended.toISOString(),
+          startedAt: session.startedAt.toISOString(),
+          endedAt: session.endedAt.toISOString(),
           description: pick(descriptions),
-          productivity: between(48, 97),
-          mouseClicks: between(60, 640),
-          keyboardHits: between(200, 3200),
+          // Centered on the member's own score so the per-member "activity %"
+          // a report computes from these rows matches what /team shows.
+          productivity: Math.min(99, Math.max(30, user.productivity + between(-10, 8))),
+          // Input volume scales with how long the block actually ran.
+          mouseClicks: Math.round(session.minutes * between(3, 11)),
+          keyboardHits: Math.round(session.minutes * between(12, 60)),
           activeWindows: active,
           runningPrograms: running,
           screen: template,
           hasWebcam: project.permissions.webcam && rand() > 0.5,
-          online: day === 0 && b === 0 ? true : rand() > 0.25,
+          online: day === 0 && index === 0 ? true : rand() > 0.25,
         });
-      }
+      });
     }
   }
   return list.sort((a, b) => +new Date(b.endedAt) - +new Date(a.endedAt));
 }
 
 export const activities: Activity[] = buildActivities();
+
+/** The demo's "today" as a UTC day key — the bucket day totals group by. */
+export const TODAY = NOW.toISOString().slice(0, 10);
+
+// DERIVE, never duplicate. The `trackedToday` values authored on the roster
+// above are the generator's TARGET; from here on the activity rows are the
+// single source of truth and the roster is recomputed from them. Previously the
+// two were written independently and drifted by 12-19x.
+for (const user of users) {
+  user.trackedToday = minutesOnDay(activities, TODAY, user.id);
+}
+
+/**
+ * Same treatment for a project's "this week": the /projects list, the project
+ * detail page and the dashboard's project-distribution pie all read
+ * `loggedThisWeek`, while the project report aggregates the rows — so the week
+ * figure is derived from the rows too.
+ *
+ * The month and all-time figures reach further back than the generated activity
+ * window, so they stay authored; they are only widened when the derived week
+ * would otherwise exceed the period that contains it.
+ */
+export function syncProjectTotals(projectList: Project[], activityList: Activity[]): void {
+  const weekAgo = new Date(NOW.getTime() - 7 * DAY_MS);
+  for (const project of projectList) {
+    project.loggedThisWeek = minutesForProject(activityList, project.id, weekAgo, NOW);
+    project.loggedThisMonth = Math.max(project.loggedThisMonth, project.loggedThisWeek);
+    project.loggedTotal = Math.max(project.loggedTotal, project.loggedThisMonth);
+  }
+}
+syncProjectTotals(projects, activities);
 
 /* ----------------------------- Derived / chart data ----------------------------- */
 
@@ -249,14 +341,14 @@ export function activitiesForUser(userId: string) {
 
 /* ----------------------------- Global summary ----------------------------- */
 
+// Both time figures come straight off the activity rows via metrics.ts — the
+// same derivation every report runs — so the dashboard KPI and the reports are
+// arithmetically the same number, not two independent guesses at it.
 export const summary = {
-  totalTrackedToday: users.reduce((s, u) => s + u.trackedToday, 0),
+  totalTrackedToday: minutesOnDay(activities, TODAY),
   activeMembers: users.filter((u) => u.status === "active").length,
   totalMembers: countSeats(users),
   activeProjects: projects.filter((p) => !p.archived).length,
-  avgProductivity: Math.round(
-    users.filter((u) => u.productivity > 0).reduce((s, u) => s + u.productivity, 0) /
-      users.filter((u) => u.productivity > 0).length
-  ),
+  avgProductivity: averageProductivity(activitiesOnDay(activities, TODAY)),
   screenshotsToday: 284,
 };

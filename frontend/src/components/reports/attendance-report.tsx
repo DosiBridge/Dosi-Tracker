@@ -1,77 +1,117 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { CalendarCheck, Clock, UserCheck, UserX } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Avatar } from "@/components/ui/avatar";
-import { Badge } from "@/components/ui/badge";
 import { DataTable, type Column } from "@/components/ui/data-table";
-import { ReportShell, FilterBar, ExportMenu, Kpi, KpiGrid } from "./report-shell";
-import { attendance, attendanceSummary, userById, users } from "@/lib/tenant-data";
+import { ReportShell, FilterBar, ExportMenu, Kpi, KpiGrid, LiveReportNotice, useLiveReport } from "./report-shell";
+import { attendance, userById, users } from "@/lib/tenant-data";
 import { trackedMembers } from "@/lib/roles";
-import { rangeForKey, type AttendanceStatus, type RangeKey } from "@/lib/reports-data";
+import type { RangeKey } from "@/lib/reports-data";
+import { asArray, memberName, reportQuery, safePercent } from "@/lib/report-math";
 import { exportRecords } from "@/lib/export";
-import { formatDuration } from "@/lib/utils";
-import { cn } from "@/lib/utils";
-import type { ResolvedRange } from "./date-range-picker";
+import { formatDuration, cn } from "@/lib/utils";
+import { getApi } from "@/hooks/useApi";
+import { useSession } from "@/components/session-provider";
+import { resolveRange, type ResolvedRange } from "./date-range-picker";
 
-const statusMeta: Record<AttendanceStatus, { label: string; cell: string; tone: "success" | "warning" | "danger" | "info" }> = {
-  present: { label: "Present", cell: "bg-success/80 text-white", tone: "success" },
-  late: { label: "Late", cell: "bg-warning/80 text-white", tone: "warning" },
-  absent: { label: "Absent", cell: "bg-danger/70 text-white", tone: "danger" },
-  remote: { label: "Remote", cell: "bg-info/70 text-white", tone: "info" },
-};
+/**
+ * Presence & worked-time, derived honestly from tracked activity. The tracker does not record
+ * shifts, clock-in/out, lateness or on-site/remote, so those concepts are intentionally absent —
+ * a member is "present" on a day they tracked any activity, "absent" on a working day they didn't.
+ */
 
 interface Row {
   userId: string;
   name: string;
   present: number;
-  late: number;
   absent: number;
-  remote: number;
-  worked: number;
+  worked: number; // minutes
+  presentDays: Set<string>;
 }
 
+interface LiveRow {
+  userId: string;
+  daysPresent: number;
+  daysAbsent: number;
+  workedMinutes: number;
+  presentDays: string[]; // ISO datetimes
+}
+interface LiveAttendance {
+  days: string[];
+  rows: LiveRow[];
+}
+
+const dayKey = (iso: string) => iso.slice(0, 10);
+
 export function AttendanceReport() {
+  const { isLive } = useSession();
   const [rangeKey, setRangeKey] = useState<RangeKey>("7d");
-  const [range, setRange] = useState<ResolvedRange>(() => ({ key: "7d", ...rangeForKey("7d") }));
+  const [range, setRange] = useState<ResolvedRange>(() => resolveRange("7d"));
   const [memberId, setMemberId] = useState("all");
 
-  const filteredAttendance = useMemo(() => {
-    const fromStr = range.from.toISOString().slice(0, 10);
-    const toStr = range.to.toISOString().slice(0, 10);
-    return attendance.filter((a) => a.date >= fromStr && a.date <= toStr);
+  // LIVE: presence straight from /reporting/attendance; a selected member is filtered server-side.
+  const loadLive = useCallback(async (): Promise<LiveAttendance> => {
+    const report = (await getApi(
+      `/api/app/reporting/attendance?${reportQuery({ from: range.from, to: range.to, userId: memberId })}`,
+    )) as Partial<LiveAttendance> | null;
+    return { days: asArray<string>(report?.days), rows: asArray<LiveRow>(report?.rows) };
+  }, [range, memberId]);
+
+  const live = useLiveReport(isLive, loadLive);
+
+  // --- Demo mode (seeded attendance): present = any non-absent day. ---
+  const demoDates = useMemo(() => {
+    const from = range.from.toISOString().slice(0, 10);
+    const to = range.to.toISOString().slice(0, 10);
+    const inRange = attendance.filter((a) => a.date >= from && a.date <= to);
+    return [...new Set(inRange.map((a) => a.date))].sort();
   }, [range]);
 
-  const dates = useMemo(() => [...new Set(filteredAttendance.map((a) => a.date))].sort(), [filteredAttendance]);
-  const members = trackedMembers(users).filter((u) => memberId === "all" || u.id === memberId);
-
-  const rows = useMemo<Row[]>(
-    () =>
-      members.map((u) => {
-        const ua = filteredAttendance.filter((a) => a.userId === u.id);
+  const demoRows = useMemo<Row[]>(() => {
+    const from = range.from.toISOString().slice(0, 10);
+    const to = range.to.toISOString().slice(0, 10);
+    const inRange = attendance.filter((a) => a.date >= from && a.date <= to);
+    return trackedMembers(users)
+      .filter((u) => memberId === "all" || u.id === memberId)
+      .map((u) => {
+        const ua = inRange.filter((a) => a.userId === u.id);
+        const presentDays = new Set(ua.filter((a) => a.status !== "absent").map((a) => a.date));
         return {
           userId: u.id,
           name: u.name,
-          present: ua.filter((a) => a.status === "present").length,
-          late: ua.filter((a) => a.status === "late").length,
+          present: presentDays.size,
           absent: ua.filter((a) => a.status === "absent").length,
-          remote: ua.filter((a) => a.status === "remote").length,
           worked: ua.reduce((s, a) => s + a.worked, 0),
+          presentDays,
         };
-      }),
-    [members, filteredAttendance]
+      });
+  }, [range, memberId]);
+
+  const liveRows = useMemo<Row[]>(
+    () =>
+      (live.data?.rows ?? [])
+        .filter((r) => memberId === "all" || r.userId === memberId)
+        .map((r) => ({
+          userId: r.userId,
+          name: memberName(r.userId, userById(r.userId)),
+          present: r.daysPresent,
+          absent: r.daysAbsent,
+          worked: Math.round(r.workedMinutes),
+          presentDays: new Set(asArray<string>(r.presentDays).map(dayKey)),
+        })),
+    [live.data, memberId],
   );
 
-  const s = useMemo(() => {
-    const counts = { present: 0, late: 0, absent: 0, remote: 0 };
-    for (const r of filteredAttendance) counts[r.status]++;
-    return counts;
-  }, [filteredAttendance]);
+  // A live session shows only real presence (or nothing) — never the seeded attendance sheet.
+  const rows = isLive ? liveRows : demoRows;
+  const dates = isLive ? (live.data?.days ?? []).map(dayKey) : demoDates;
 
-  const totalDays = s.present + s.late + s.absent + s.remote;
-  const attendanceRate = totalDays ? Math.round(((s.present + s.late + s.remote) / totalDays) * 100) : 0;
-  const onTimeRate = totalDays ? Math.round(((s.present + s.remote) / totalDays) * 100) : 0;
+  const totalPresent = rows.reduce((s, r) => s + r.present, 0);
+  const totalAbsent = rows.reduce((s, r) => s + r.absent, 0);
+  const totalWorked = rows.reduce((s, r) => s + r.worked, 0);
+  const attendanceRate = safePercent(totalPresent, totalPresent + totalAbsent);
 
   const columns: Column<Row>[] = [
     { key: "name", header: "Member", sortValue: (r) => r.name, render: (r) => (
@@ -81,8 +121,6 @@ export function AttendanceReport() {
       </div>
     )},
     { key: "present", header: "Present", align: "right", sortValue: (r) => r.present, render: (r) => <span className="text-success">{r.present}</span> },
-    { key: "remote", header: "Remote", align: "right", sortValue: (r) => r.remote, render: (r) => <span className="text-info">{r.remote}</span> },
-    { key: "late", header: "Late", align: "right", sortValue: (r) => r.late, render: (r) => <span className="text-warning">{r.late}</span> },
     { key: "absent", header: "Absent", align: "right", sortValue: (r) => r.absent, render: (r) => <span className="text-danger">{r.absent}</span> },
     { key: "worked", header: "Total worked", align: "right", sortValue: (r) => r.worked, render: (r) => <span className="font-medium">{formatDuration(r.worked)}</span> },
   ];
@@ -91,109 +129,95 @@ export function AttendanceReport() {
   function doExport() {
     exportRecords(`attendance-${range.key}`, rows, [
       { header: "Member", value: (r) => r.name },
-      { header: "Present", value: (r) => r.present },
-      { header: "Remote", value: (r) => r.remote },
-      { header: "Late", value: (r) => r.late },
-      { header: "Absent", value: (r) => r.absent },
+      { header: "Present days", value: (r) => r.present },
+      { header: "Absent days", value: (r) => r.absent },
       { header: "Total worked (min)", value: (r) => r.worked },
     ]);
   }
 
   return (
     <ReportShell
-      title="Attendance & Shifts"
-      description="Clock in/out, late arrivals, remote days, and absences."
+      title="Attendance"
+      description="Presence and worked time, derived from tracked activity per working day."
       actions={<ExportMenu onExportCSV={doExport} />}
     >
       <FilterBar rangeKey={rangeKey} onRange={onRange} memberId={memberId} onMember={setMemberId} />
 
+      {isLive && <LiveReportNotice loading={live.loading} error={live.error} onRetry={live.retry} />}
+
       <KpiGrid>
         <Kpi label="Attendance rate" value={`${attendanceRate}%`} icon={CalendarCheck} tone="#22c55e" sub={range.label} />
-        <Kpi label="On-time rate" value={`${onTimeRate}%`} icon={UserCheck} tone="#6d5efc" />
-        <Kpi label="Late arrivals" value={String(s.late)} icon={Clock} tone="#f59e0b" />
-        <Kpi label="Absences" value={String(s.absent)} icon={UserX} tone="#ef4444" />
+        <Kpi label="Present days" value={String(totalPresent)} icon={UserCheck} tone="#6d5efc" />
+        <Kpi label="Absent days" value={String(totalAbsent)} icon={UserX} tone="#ef4444" />
+        <Kpi label="Total worked" value={formatDuration(totalWorked)} icon={Clock} tone="#0ea5e9" />
       </KpiGrid>
 
-      {/* Matrix */}
       <Card>
         <CardHeader>
-          <CardTitle>Daily attendance</CardTitle>
+          <CardTitle>Daily presence</CardTitle>
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 text-xs text-muted-foreground">
-            {(Object.keys(statusMeta) as AttendanceStatus[]).map((k) => (
-              <span key={k} className="flex items-center gap-1.5">
-                <span className={cn("h-2.5 w-2.5 rounded", statusMeta[k].cell)} /> {statusMeta[k].label}
-              </span>
-            ))}
+            <span className="flex items-center gap-1.5"><span className="h-2.5 w-2.5 rounded bg-success/80" /> Present</span>
+            <span className="flex items-center gap-1.5"><span className="h-2.5 w-2.5 rounded bg-danger/60" /> Absent</span>
           </div>
         </CardHeader>
         <CardContent>
-          {/* Mobile: chip rows per member */}
-          <div className="space-y-3 md:hidden">
-            {members.map((u) => (
-              <div key={u.id} className="rounded-xl border border-border p-3">
-                <div className="mb-2.5 flex items-center gap-2">
-                  <Avatar name={u.name} size="sm" />
-                  <span className="truncate text-sm font-medium">{u.name}</span>
-                </div>
-                <div className="flex gap-1.5 overflow-x-auto overscroll-x-contain pb-1">
-                  {dates.map((d) => {
-                    const rec = filteredAttendance.find((a) => a.userId === u.id && a.date === d);
-                    const meta = rec ? statusMeta[rec.status] : null;
-                    return (
-                      <div
-                        key={d}
-                        title={rec ? `${meta?.label}${rec.clockIn ? ` · ${rec.clockIn}–${rec.clockOut}` : ""}` : ""}
-                        className={cn(
-                          "flex h-12 w-11 shrink-0 flex-col items-center justify-center rounded-lg text-[9px] font-semibold",
-                          meta ? meta.cell : "bg-muted"
-                        )}
+          {/* A real table: this is tabular data (members x days), so screen
+              readers can announce "Tanvir, Wed: Present" from the row and
+              column headers. It also avoids `display: contents`, which
+              silently collapsed every row into a single grid cell here. */}
+          <div className="overflow-x-auto overscroll-x-contain">
+            <table className="w-full min-w-[640px] border-separate border-spacing-1 text-left">
+              <caption className="sr-only">
+                Daily presence by member. Each cell shows whether the member was present or absent on that day.
+              </caption>
+              <thead>
+                <tr>
+                  <th scope="col" className="sticky left-0 z-10 w-[180px] bg-card text-xs font-medium text-muted-foreground">
+                    Member
+                  </th>
+                  {dates.map((d) => (
+                    <th key={d} scope="col" className="text-center text-xs font-medium text-muted-foreground">
+                      <abbr
+                        className="no-underline"
+                        title={new Date(d + "T00:00:00Z").toLocaleDateString("en", { dateStyle: "full", timeZone: "UTC" })}
                       >
-                        <span className="opacity-70">{new Date(d + "T00:00:00Z").toLocaleDateString("en", { weekday: "narrow", timeZone: "UTC" })}</span>
-                        <span>{rec?.clockIn?.slice(0, 5) ?? "—"}</span>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            ))}
-          </div>
-
-          {/* Desktop matrix */}
-          <div className="hidden overflow-x-auto overscroll-x-contain md:block">
-            <div className="min-w-[640px]">
-              <div className="grid gap-2" style={{ gridTemplateColumns: `180px repeat(${dates.length}, minmax(48px, 1fr))` }}>
-                <div className="sticky left-0 z-10 bg-card text-xs font-medium text-muted-foreground">Member</div>
-                {dates.map((d) => (
-                  <div key={d} className="text-center text-xs font-medium text-muted-foreground">
-                    {new Date(d + "T00:00:00Z").toLocaleDateString("en", { weekday: "short", timeZone: "UTC" })}
-                  </div>
-                ))}
-                {members.map((u) => (
-                  <div key={u.id} className="contents">
-                    <div className="sticky left-0 z-10 flex items-center gap-2 bg-card py-1">
-                      <Avatar name={u.name} size="sm" />
-                      <span className="truncate text-sm font-medium">{u.name.split(" ")[0]}</span>
-                    </div>
+                        {new Date(d + "T00:00:00Z").toLocaleDateString("en", { weekday: "short", timeZone: "UTC" })}
+                      </abbr>
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((r) => (
+                  <tr key={r.userId}>
+                    <th scope="row" className="sticky left-0 z-10 bg-card py-1 font-normal">
+                      <span className="flex items-center gap-2">
+                        <Avatar name={r.name} size="sm" />
+                        <span className="truncate text-sm font-medium">{r.name.split(" ")[0]}</span>
+                      </span>
+                    </th>
                     {dates.map((d) => {
-                      const rec = filteredAttendance.find((a) => a.userId === u.id && a.date === d);
-                      const meta = rec ? statusMeta[rec.status] : null;
+                      const present = r.presentDays.has(d);
                       return (
-                        <div
-                          key={d}
-                          title={rec ? `${meta?.label}${rec.clockIn ? ` · ${rec.clockIn}–${rec.clockOut}` : ""}` : ""}
-                          className={cn(
-                            "flex h-10 items-center justify-center rounded-lg text-[10px] font-semibold",
-                            meta ? meta.cell : "bg-muted"
-                          )}
-                        >
-                          {rec?.clockIn ?? "—"}
-                        </div>
+                        <td key={d} className="p-0">
+                          <span
+                            title={`${r.name} — ${present ? "Present" : "Absent"} (${d})`}
+                            className={cn(
+                              "flex h-9 min-w-[40px] items-center justify-center rounded-lg text-[10px] font-semibold text-white",
+                              present ? "bg-success/80" : "bg-danger/50",
+                            )}
+                          >
+                            {/* Glyph as well as color, so presence is not conveyed by color alone. */}
+                            <span aria-hidden="true">{present ? "✓" : "—"}</span>
+                            <span className="sr-only">{present ? "Present" : "Absent"}</span>
+                          </span>
+                        </td>
                       );
                     })}
-                  </div>
+                  </tr>
                 ))}
-              </div>
-            </div>
+              </tbody>
+            </table>
           </div>
         </CardContent>
       </Card>
@@ -201,7 +225,12 @@ export function AttendanceReport() {
       <Card>
         <CardHeader><CardTitle>Summary</CardTitle></CardHeader>
         <CardContent>
-          <DataTable columns={columns} rows={rows} initialSort={{ key: "worked", dir: "desc" }} />
+          <DataTable
+            columns={columns}
+            rows={rows}
+            initialSort={{ key: "worked", dir: "desc" }}
+            emptyText={isLive ? "No tracked activity in this range." : undefined}
+          />
         </CardContent>
       </Card>
     </ReportShell>

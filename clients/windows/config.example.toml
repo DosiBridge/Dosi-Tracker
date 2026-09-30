@@ -1,4 +1,6 @@
-# Copy to `config.toml` next to the executable and edit.
+# Copy to `config.toml` next to the executable and edit (the working directory
+# is only checked when there is none next to the executable).
+# Every key is optional: anything left out keeps the default shown here.
 # Any value can also be set via env vars, e.g. DOSI__API_BASE_URL=...
 
 api_base_url = "https://localhost:44342"

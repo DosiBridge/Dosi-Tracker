@@ -24,13 +24,16 @@ import { Badge } from "@/components/ui/badge";
 import { Avatar } from "@/components/ui/avatar";
 import { Ring } from "@/components/ui/ring";
 import { PageStack } from "@/components/ui/page-header";
-import { ScreenMockView } from "@/components/screen-mock";
+import { AppGlyph, ScreenMockView } from "@/components/screen-mock";
 import { useSession } from "@/components/session-provider";
+import { toast } from "@/components/toast";
 import { activitiesForProject, projectById, userById } from "@/lib/tenant-data";
+import { averageProductivity, minutesForUser } from "@/lib/metrics";
 import { canViewProject } from "@/lib/scope";
 import { formatDuration } from "@/lib/utils";
 import { getApi, postApi } from "@/hooks/useApi";
-import type { TrackingPermissions, UserStatus } from "@/lib/types";
+import { mapApiActivities, type ApiProjectDto } from "@/lib/live-dataset";
+import type { Activity, TrackingPermissions, UserStatus } from "@/lib/types";
 
 const permMeta: { key: keyof TrackingPermissions; label: string; icon: typeof Camera }[] = [
   { key: "screenshot", label: "Screenshots", icon: Camera },
@@ -79,43 +82,53 @@ function agoLabel(iso: string, now: Date) {
   return `${Math.floor(h / 24)}d ago`;
 }
 
-const minutesBetween = (start: string, end: string) =>
-  Math.max(0, (new Date(end).getTime() - new Date(start).getTime()) / 60000);
+/** GET /api/app/team/project-members/{projectId} item. */
+interface ApiProjectMember {
+  userId: string;
+  role?: string | null;
+}
 
 export default function ProjectDetailPage() {
   const { id } = useParams<{ id: string }>();
-  const { user } = useSession();
+  const { user, isLive } = useSession();
 
-  const [apiProject, setApiProject] = useState<any | null>(null);
-  const [apiMembers, setApiMembers] = useState<any[]>([]);
-  const [apiActivities, setApiActivities] = useState<any[]>([]);
+  const [apiProject, setApiProject] = useState<ApiProjectDto | null>(null);
+  const [apiMembers, setApiMembers] = useState<ApiProjectMember[]>([]);
+  const [apiActivities, setApiActivities] = useState<Activity[]>([]);
   const [apiChecked, setApiChecked] = useState(false);
+  const [apiError, setApiError] = useState(false);
   const [busy, setBusy] = useState(false);
 
   const loadFromApi = useCallback(async () => {
+    setApiError(false);
     try {
-      const project = await getApi(`/api/app/project/${id}`);
+      const project = (await getApi(`/api/app/project/${encodeURIComponent(id)}`)) as ApiProjectDto;
       const [members, activities] = await Promise.all([
-        getApi(`/api/app/team/project-members?projectId=${id}`).catch(() => []),
-        getApi(`/api/app/activity?ProjectId=${id}&MaxResultCount=200`).catch(() => []),
+        getApi(`/api/app/team/project-members/${encodeURIComponent(id)}`).catch(() => []),
+        getApi(`/api/app/activity?ProjectId=${encodeURIComponent(id)}&MaxResultCount=500`).catch(() => []),
       ]);
-      setApiProject(project);
-      setApiMembers(Array.isArray(members) ? members : []);
-      setApiActivities(Array.isArray(activities) ? activities : []);
+      setApiProject(project && typeof project === "object" ? project : null);
+      setApiMembers(
+        (Array.isArray(members) ? (members as ApiProjectMember[]) : []).filter((m) => m && typeof m.userId === "string"),
+      );
+      // Guarded mapping: malformed window JSON or timestamps never crash the page.
+      setApiActivities(mapApiActivities(activities));
     } catch {
-      setApiProject(null); // fall back to the demo dataset below
+      setApiProject(null);
+      setApiError(true);
     } finally {
       setApiChecked(true);
     }
   }, [id]);
 
   useEffect(() => {
-    if (typeof window !== "undefined" && localStorage.getItem("dosi-token")) {
-      loadFromApi();
+    if (isLive) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- data fetch defers its own setState; see docs/QUALITY.md §10
+      void loadFromApi();
     } else {
       setApiChecked(true);
     }
-  }, [loadFromApi]);
+  }, [isLive, loadFromApi]);
 
   const mockProject = projectById(id);
   const now = useMemo(() => new Date(), []);
@@ -123,7 +136,7 @@ export default function ProjectDetailPage() {
   const view: ProjectView | null = apiProject
     ? {
         id: apiProject.id,
-        title: apiProject.title,
+        title: apiProject.title ?? "Untitled project",
         description: apiProject.description ?? "",
         color: apiProject.color ?? "#006bff",
         intervalMinutes: apiProject.intervalMinutes ?? 10,
@@ -138,7 +151,7 @@ export default function ProjectDetailPage() {
         },
         live: true,
       }
-    : mockProject && canViewProject(user, mockProject)
+    : !isLive && mockProject && canViewProject(user, mockProject)
       ? {
           id: mockProject.id,
           title: mockProject.title,
@@ -153,6 +166,22 @@ export default function ProjectDetailPage() {
 
   if (!apiChecked) {
     return <p className="py-20 text-center text-sm text-muted-foreground">Loading project…</p>;
+  }
+
+  if (!view && isLive && apiError) {
+    return (
+      <div className="flex flex-col items-center gap-4 py-20 text-center">
+        <p className="text-muted-foreground">Couldn’t load this project from the server.</p>
+        <div className="flex gap-2">
+          <Button onClick={() => void loadFromApi()}>Try again</Button>
+          <Link href="/projects">
+            <Button variant="outline">
+              <ArrowLeft className="h-4 w-4" /> Back to projects
+            </Button>
+          </Link>
+        </div>
+      </div>
+    );
   }
 
   if (!view) {
@@ -176,56 +205,47 @@ export default function ProjectDetailPage() {
   let weekMinutes: number, monthMinutes: number, totalMinutes: number;
 
   if (view.live) {
+    // Real names from the session roster; never a demo person.
     const nameFor = (userId: string) =>
-      userId === user.id ? user.name : `Member ${userId.slice(0, 8)}`;
+      userId === user.id ? user.name : (userById(userId)?.name ?? `Member ${userId.slice(0, 8)}`);
 
     memberRows = apiMembers.map((m) => {
       const acts = apiActivities.filter((a) => a.userId === m.userId);
-      const minutes = Math.round(acts.reduce((s, a) => s + minutesBetween(a.startedAt, a.endedAt), 0));
-      const prod = acts.length
-        ? Math.round(acts.reduce((s, a) => s + (a.productivity ?? 0), 0) / acts.length)
-        : 0;
       return {
         id: m.userId,
         name: nameFor(m.userId),
         designation: m.role ?? "Member",
-        minutes,
-        prod,
+        minutes: Math.round(minutesForUser(acts, m.userId)),
+        prod: averageProductivity(acts),
         sessions: acts.length,
+        status: userById(m.userId)?.status,
       };
     });
 
-    activityRows = apiActivities.slice(0, 8).map((a) => {
-      const win = a.activeWindowsJson ? JSON.parse(a.activeWindowsJson) : [];
-      return {
-        id: a.id,
-        userName: nameFor(a.userId),
-        windowTitle: win[0]?.windowTitle,
-        endedAt: a.endedAt,
-        screen: { app: win[0]?.appName ?? "Desktop", kind: "desktop", accent: view.color },
-      };
-    });
+    activityRows = apiActivities.slice(0, 8).map((a) => ({
+      id: a.id,
+      userName: nameFor(a.userId),
+      windowTitle: a.activeWindows[0]?.windowTitle,
+      endedAt: a.endedAt,
+      screen: a.screen,
+    }));
 
-    const sumSince = (since: Date) =>
+    const sumSince = (since?: Date) =>
       Math.round(
         apiActivities
-          .filter((a) => new Date(a.startedAt) >= since)
-          .reduce((s, a) => s + minutesBetween(a.startedAt, a.endedAt), 0),
+          .filter((a) => !since || Date.parse(a.endedAt) >= since.getTime())
+          .reduce((s, a) => s + minutesForUser([a], a.userId), 0),
       );
     weekMinutes = sumSince(new Date(now.getTime() - 7 * 86400_000));
     monthMinutes = sumSince(new Date(now.getTime() - 30 * 86400_000));
-    totalMinutes = Math.round(
-      apiActivities.reduce((s, a) => s + minutesBetween(a.startedAt, a.endedAt), 0),
-    );
+    totalMinutes = sumSince();
   } else {
     const members = (mockProject?.memberIds ?? []).map((mid) => userById(mid)).filter(Boolean);
     const acts = activitiesForProject(view.id);
     memberRows = members.map((u) => {
       const ua = acts.filter((a) => a.userId === u!.id);
-      const minutes = ua.length * view.intervalMinutes;
-      const prod = ua.length
-        ? Math.round(ua.reduce((s, a) => s + a.productivity, 0) / ua.length)
-        : u!.productivity;
+      const minutes = minutesForUser(acts, u!.id);
+      const prod = ua.length ? averageProductivity(ua) : u!.productivity;
       return {
         id: u!.id,
         name: u!.name,
@@ -252,12 +272,25 @@ export default function ProjectDetailPage() {
 
   async function toggleArchive() {
     if (!view || !view.live) return;
+    const wasArchived = view.archived;
     setBusy(true);
     try {
-      await postApi(`/api/app/project/${view.id}/${view.archived ? "unarchive" : "archive"}`, {});
+      await postApi(`/api/app/project/${view.id}/${wasArchived ? "unarchive" : "archive"}`, {});
       await loadFromApi();
-    } catch (err) {
-      console.error("Failed to toggle archive state", err);
+      toast({
+        title: wasArchived ? "Project restored" : "Project archived",
+        description: wasArchived
+          ? "It's active again and back in the projects list."
+          : "It's hidden from the active list. You can restore it any time.",
+      });
+    } catch {
+      // Previously swallowed into console.error: the button appeared to do
+      // nothing at all when the request failed.
+      toast({
+        tone: "danger",
+        title: wasArchived ? "Couldn't restore this project" : "Couldn't archive this project",
+        description: "The change wasn't saved. Check your connection and try again.",
+      });
     } finally {
       setBusy(false);
     }
@@ -379,7 +412,11 @@ export default function ProjectDetailPage() {
             <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4">
               {activityRows.map((a) => (
                 <div key={a.id} className="space-y-2">
-                  <ScreenMockView screen={a.screen as any} title={a.windowTitle} className="aspect-video w-full" />
+                  {view.live ? (
+                    <AppGlyph app={a.screen.app} color={a.screen.accent} className="aspect-video w-full" />
+                  ) : (
+                    <ScreenMockView screen={a.screen as Activity["screen"]} title={a.windowTitle} className="aspect-video w-full" />
+                  )}
                   <div className="flex items-center gap-2">
                     <Avatar name={a.userName} size="sm" />
                     <div className="min-w-0">

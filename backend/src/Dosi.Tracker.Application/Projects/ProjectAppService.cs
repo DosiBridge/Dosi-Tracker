@@ -6,6 +6,7 @@ using Microsoft.AspNetCore.Authorization;
 using Dosi.Tracker.Permissions;
 using Volo.Abp.Application.Dtos;
 using Volo.Abp.Application.Services;
+using Volo.Abp.Domain.Entities;
 using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Users;
 
@@ -49,6 +50,42 @@ public class ProjectAppService :
         ));
 
         return dto;
+    }
+
+    /// <summary>Managers (Projects.Edit or Activities.ViewAll) see every project of the workspace;
+    /// anyone else only the projects they are a member of.</summary>
+    protected override async Task<IQueryable<Project>> CreateFilteredQueryAsync(PagedAndSortedResultRequestDto input)
+    {
+        var query = await base.CreateFilteredQueryAsync(input);
+        if (await CanSeeAllProjectsAsync())
+        {
+            return query;
+        }
+
+        var userId = CurrentUser.GetId();
+        var memberQuery = await _memberRepository.GetQueryableAsync();
+        return query.Where(p => memberQuery.Any(m => m.ProjectId == p.Id && m.UserId == userId));
+    }
+
+    public override async Task<ProjectDto> GetAsync(Guid id)
+    {
+        if (!await CanSeeAllProjectsAsync())
+        {
+            var userId = CurrentUser.GetId();
+            if (!await _memberRepository.AnyAsync(m => m.ProjectId == id && m.UserId == userId))
+            {
+                // Indistinguishable from a missing project: don't reveal other teams' projects exist.
+                throw new EntityNotFoundException(typeof(Project), id);
+            }
+        }
+
+        return await base.GetAsync(id);
+    }
+
+    private async Task<bool> CanSeeAllProjectsAsync()
+    {
+        return await AuthorizationService.IsGrantedAsync(TrackerPermissions.Projects.Edit) ||
+               await AuthorizationService.IsGrantedAsync(TrackerPermissions.Activities.ViewAll);
     }
 
     [Authorize] // member-scoped: any authenticated user sees only their own projects

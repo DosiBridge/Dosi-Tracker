@@ -21,6 +21,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input, Select } from "@/components/ui/input";
 import { Modal } from "@/components/ui/modal";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Drawer } from "@/components/ui/drawer";
 import { Avatar } from "@/components/ui/avatar";
 import { Progress } from "@/components/ui/progress";
@@ -39,6 +40,7 @@ import {
 import {
   fmtLimit,
   invoicesFor,
+  liveSeatsUsed,
   planById,
   plans,
   usagePct,
@@ -91,7 +93,7 @@ const hostStatusLabel: Record<SubscriptionStatus, string> = {
 
 export default function HostTenantsPage() {
   const router = useRouter();
-  const { workspaces, createWorkspace, updateWorkspace, deleteWorkspace, impersonate } = useSession();
+  const { workspaces, createWorkspace, updateWorkspace, deleteWorkspace, impersonate, isLive: liveSession } = useSession();
 
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState<"all" | SubscriptionStatus>("all");
@@ -117,7 +119,7 @@ export default function HostTenantsPage() {
       setLiveTenants(Array.isArray(items) ? items : []);
       setLiveFailed(false);
     } catch {
-      // Non-host users get a 403 here — fall back to the mock dataset.
+      // Live: show an error with retry — never the demo tenants.
       setLiveTenants(null);
       setLiveFailed(true);
     } finally {
@@ -126,14 +128,15 @@ export default function HostTenantsPage() {
   }, []);
 
   useEffect(() => {
-    if (typeof window !== "undefined" && localStorage.getItem("dosi-token")) {
-      fetchTenants();
+    if (liveSession) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- data fetch defers its own setState; see docs/QUALITY.md §10
+      void fetchTenants();
     }
-  }, [fetchTenants]);
+  }, [fetchTenants, liveSession]);
 
-  const isLive = liveTenants !== null;
+  const isLive = liveSession;
   // liveLoading only ever turns on when a token exists, so this stays false in demo mode.
-  const initialLiveLoading = liveLoading && !isLive && !liveFailed;
+  const initialLiveLoading = liveLoading && liveTenants === null && !liveFailed;
 
   const liveWorkspaces = useMemo<Workspace[]>(
     () => (liveTenants ?? []).map(toWorkspace),
@@ -213,7 +216,7 @@ export default function HostTenantsPage() {
           </span>
           <span className="min-w-0">
             <span className="block truncate font-medium hover:text-primary">{r.ws.name}</span>
-            <span className="block truncate text-xs text-muted-foreground">{r.ws.slug}.dositracker.app</span>
+            <span className="block truncate text-xs text-muted-foreground">{r.live ? `Sign-in name: ${r.ws.name}` : `${r.ws.slug}.dositracker.app`}</span>
           </span>
         </button>
       ),
@@ -286,8 +289,9 @@ export default function HostTenantsPage() {
       />
 
       {liveFailed && (
-        <p className="text-xs text-muted-foreground">
-          Live tenant data is unavailable for this account — showing demo data.
+        <p className="flex items-center gap-2 text-xs text-danger">
+          Couldn&apos;t load tenants from the server.
+          <button onClick={() => void fetchTenants()} className="font-medium text-primary hover:underline">Try again</button>
         </p>
       )}
 
@@ -420,6 +424,8 @@ function TenantDrawer({
 }) {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  // Suspending cuts off every member of a paying workspace, so it asks first.
+  const [confirmSuspend, setConfirmSuspend] = useState(false);
 
   if (!ws) return null;
   const m = tenantMetrics(ws);
@@ -439,7 +445,7 @@ function TenantDrawer({
           <div className="min-w-0 flex-1">
             <div className="truncate text-lg font-semibold">{ws.name}</div>
             <div className="truncate text-xs text-muted-foreground">
-              {ws.slug}.dositracker.app{ws.createdAt ? ` · since ${ws.createdAt}` : ""}
+              {live ? `Sign-in name: ${ws.name}` : `${ws.slug}.dositracker.app`}{ws.createdAt ? ` · since ${ws.createdAt}` : ""}
             </div>
           </div>
           <Badge tone={statusTone[ws.status]}>{hostStatusLabel[ws.status]}</Badge>
@@ -454,11 +460,19 @@ function TenantDrawer({
           </div>
           <div title={live ? "Not available yet" : undefined}>
             {suspended ? (
-              <Button variant="outline" className="w-full" disabled={live} onClick={() => onUpdate(ws.id, { status: "active" })}>
+              <Button
+                variant="outline"
+                className="w-full"
+                disabled={live}
+                onClick={() => {
+                  onUpdate(ws.id, { status: "active" });
+                  toast({ title: `${ws.name} reactivated`, description: "Members can sign in and track time again." });
+                }}
+              >
                 <CheckCircle2 className="h-4 w-4" /> Reactivate
               </Button>
             ) : (
-              <Button variant="outline" className="w-full" disabled={live} onClick={() => onUpdate(ws.id, { status: "past_due" })}>
+              <Button variant="outline" className="w-full" disabled={live} onClick={() => setConfirmSuspend(true)}>
                 <Ban className="h-4 w-4" /> Suspend
               </Button>
             )}
@@ -500,7 +514,16 @@ function TenantDrawer({
         {/* Plan */}
         <div>
           <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Subscription plan</div>
-          <Select value={ws.planId} onChange={(e) => onUpdate(ws.id, { planId: e.target.value as PlanId })}>
+          <Select
+            value={ws.planId}
+            onChange={(e) => {
+              const next = e.target.value as PlanId;
+              onUpdate(ws.id, { planId: next });
+              // Changing a customer's plan changes what they are billed —
+              // say so rather than letting the select shift in silence.
+              toast({ title: `${ws.name} moved to ${planById(next).name}`, description: "Seat limits and billing update immediately." });
+            }}
+          >
             {plans.map((p) => (
               <option key={p.id} value={p.id}>
                 {p.name} — {p.pricePerUser === null ? "Custom" : `$${p.pricePerUser}/user/mo`}
@@ -568,6 +591,23 @@ function TenantDrawer({
           )}
         </div>
       </div>
+
+      <ConfirmDialog
+        open={confirmSuspend}
+        onCancel={() => setConfirmSuspend(false)}
+        onConfirm={() => {
+          onUpdate(ws.id, { status: "past_due" });
+          setConfirmSuspend(false);
+          toast({
+            tone: "warning",
+            title: `${ws.name} suspended`,
+            description: "Members can no longer sign in. Reactivate any time from this panel.",
+          });
+        }}
+        title={`Suspend ${ws.name}?`}
+        description={`All ${liveSeatsUsed(ws)} members lose access until you reactivate the workspace. Tracking stops and their data is retained.`}
+        confirmLabel="Suspend workspace"
+      />
     </Drawer>
   );
 }

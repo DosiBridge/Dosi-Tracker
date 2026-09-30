@@ -1,6 +1,22 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { isLiveSession } from '@/lib/live-session';
+
+export { isLiveSession };
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'https://localhost:44342';
+
+/**
+ * The request never reached the server (offline, DNS, TLS, server down) — as
+ * opposed to the server answering with a rejection. Callers must tell users
+ * these apart: "check your password" is wrong and misleading when the real
+ * problem is that nothing is listening.
+ */
+export class ApiUnreachableError extends Error {
+  constructor() {
+    super("Couldn't reach the server");
+    this.name = "ApiUnreachableError";
+  }
+}
 
 const getAuthHeaders = () => {
   const token = typeof window !== 'undefined' ? localStorage.getItem('dosi-token') : null;
@@ -26,35 +42,64 @@ interface ApiState<T> {
   isLoading: boolean;
 }
 
-export function useApi<T>(endpoint: string) {
+export interface UseApiOptions {
+  /**
+   * Skip the request entirely (default true). Pass `enabled: isLive` so a
+   * demo session never touches the network.
+   */
+  enabled?: boolean;
+}
+
+/**
+ * Declarative GET. Mirrors getApi: 401 ends the session (handleUnauthorized),
+ * `items` is unwrapped. The in-flight request is aborted when the component
+ * unmounts or the endpoint changes, so a late response can never set state on
+ * an unmounted tree or overwrite a newer request's result.
+ */
+export function useApi<T>(endpoint: string, options: UseApiOptions = {}) {
+  const enabled = options.enabled ?? true;
   const [state, setState] = useState<ApiState<T>>({
     data: null,
     error: null,
-    isLoading: true,
+    isLoading: enabled,
   });
+  const controllerRef = useRef<AbortController | null>(null);
 
   const fetchData = useCallback(async () => {
+    if (!enabled) {
+      setState({ data: null, error: null, isLoading: false });
+      return;
+    }
+    controllerRef.current?.abort();
+    const controller = new AbortController();
+    controllerRef.current = controller;
     setState(prev => ({ ...prev, isLoading: true, error: null }));
     try {
       const res = await fetch(`${API_BASE_URL}${endpoint}`, {
         headers: getAuthHeaders(),
+        signal: controller.signal,
       });
       if (!res.ok) {
+        handleUnauthorized(res);
         throw new Error(`API Error: ${res.statusText}`);
       }
       const json = await res.json();
-      setState({ data: json.items || json, error: null, isLoading: false });
+      if (controller.signal.aborted) return;
+      setState({ data: json?.items || json, error: null, isLoading: false });
     } catch (err) {
+      if (controller.signal.aborted) return; // superseded or unmounted: stay silent
       setState({
         data: null,
         error: err instanceof Error ? err : new Error(String(err)),
         isLoading: false,
       });
     }
-  }, [endpoint]);
+  }, [endpoint, enabled]);
 
   useEffect(() => {
-    fetchData();
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- data fetch defers its own setState; see docs/QUALITY.md §10
+    void fetchData();
+    return () => controllerRef.current?.abort();
   }, [fetchData]);
 
   return { ...state, refetch: fetchData };
@@ -155,13 +200,18 @@ export const loginApi = async (username: string, password: string, tenant?: stri
     ? `${API_BASE_URL}/connect/token?__tenant=${encodeURIComponent(tenant)}`
     : `${API_BASE_URL}/connect/token`;
 
-  const res = await fetch(tokenUrl, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-    },
-    body: params.toString(),
-  });
+  let res: Response;
+  try {
+    res = await fetch(tokenUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: params.toString(),
+    });
+  } catch {
+    throw new ApiUnreachableError();
+  }
 
   if (!res.ok) {
     throw new Error('Invalid credentials or login failed');
@@ -201,13 +251,18 @@ export const registerWorkspaceApi = async (
   adminPassword: string,
   planName?: string,
 ) => {
-  const res = await fetch(`${API_BASE_URL}/api/app/workspace/register`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ name, adminEmail, adminPassword, planName }),
-  });
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE_URL}/api/app/workspace/register`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ name, adminEmail, adminPassword, planName }),
+    });
+  } catch {
+    throw new ApiUnreachableError();
+  }
 
   if (!res.ok) {
     const errorText = await res.text();

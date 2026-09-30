@@ -9,8 +9,15 @@ import type {
   ProductivitySplit,
 } from "./reports-data";
 import { trackedMembers, countSeats } from "./roles";
+import { activitiesOnDay, averageProductivity, minutesByUser, minutesOnDay } from "./metrics";
+import { applyProjectTotals, deriveAppCatalog, deriveDailyTrend, deriveHourly, deriveTopApps } from "./live-dataset";
 import {
+  DAY_MS,
   NOW,
+  TODAY,
+  TRACKED_DAY_SPAN,
+  planDaySessions,
+  syncProjectTotals,
   users as primaryUsers,
   projects as primaryProjects,
   activities as primaryActivities,
@@ -52,6 +59,8 @@ export interface Dataset {
   attendance: AttendanceRecord[];
   billing: BillingRow[];
   notifications: AppNotification[];
+  /** True for a dataset built from the real backend (see buildLiveDataset). */
+  live?: boolean;
 }
 
 /* ----------------------------- Seeded RNG ----------------------------- */
@@ -123,6 +132,11 @@ function makeWindows(primary: ScreenMock, rand: () => number): { active: WindowI
 
 /* ----------------------------- Generators ----------------------------- */
 
+/**
+ * Same contract as the primary tenant's generator (and the same session
+ * planner): every member's rows for today sum to exactly their intended
+ * `trackedToday`, so `syncTrackedToday` below can derive the roster from them.
+ */
 function genActivities(users: User[], projects: Project[], seedNum: number): Activity[] {
   const rand = mulberry32(seedNum);
   const pick = <T>(arr: T[]) => arr[Math.floor(rand() * arr.length)];
@@ -132,38 +146,49 @@ function genActivities(users: User[], projects: Project[], seedNum: number): Act
   if (!projects.length || !trackingUsers.length) return list;
   let id = 0;
 
-  for (let day = 0; day < 5; day++) {
+  for (let day = 0; day < TRACKED_DAY_SPAN; day++) {
+    const anchor = new Date(NOW.getTime() - day * DAY_MS);
     for (const user of trackingUsers) {
-      const blocks = day === 0 ? between(2, 4) : between(1, 3);
-      for (let b = 0; b < blocks; b++) {
+      const target =
+        day === 0 ? user.trackedToday : Math.round(user.trackedToday * (0.55 + rand() * 0.6));
+
+      planDaySessions(target, anchor, rand).forEach((session, index) => {
         const template = pick(screenTemplates);
         const mine = projects.filter((p) => !p.archived && p.memberIds.includes(user.id));
-        const project = (mine.length ? pick(mine) : projects[0]);
-        const minutesAgo = day * 24 * 60 + b * between(35, 90) + between(5, 25);
-        const ended = new Date(NOW.getTime() - minutesAgo * 60000);
-        const started = new Date(ended.getTime() - project.intervalMinutes * 60000);
+        const project = mine.length ? pick(mine) : projects[0];
         const { active, running } = makeWindows(template, rand);
         id++;
         list.push({
           id: `${user.id}-a${id}`,
           userId: user.id,
           projectId: project.id,
-          startedAt: started.toISOString(),
-          endedAt: ended.toISOString(),
+          startedAt: session.startedAt.toISOString(),
+          endedAt: session.endedAt.toISOString(),
           description: pick(descriptions),
-          productivity: between(48, 97),
-          mouseClicks: between(60, 640),
-          keyboardHits: between(200, 3200),
+          productivity: Math.min(99, Math.max(30, user.productivity + between(-10, 8))),
+          mouseClicks: Math.round(session.minutes * between(3, 11)),
+          keyboardHits: Math.round(session.minutes * between(12, 60)),
           activeWindows: active,
           runningPrograms: running,
           screen: template,
           hasWebcam: project.permissions.webcam && rand() > 0.5,
-          online: day === 0 && b === 0 ? true : rand() > 0.25,
+          online: day === 0 && index === 0 ? true : rand() > 0.25,
         });
-      }
+      });
     }
   }
   return list.sort((a, b) => +new Date(b.endedAt) - +new Date(a.endedAt));
+}
+
+/**
+ * Rewrite each member's `trackedToday` from their own activity rows. The
+ * authored roster value is the generator's target; the rows are the truth.
+ */
+function syncTrackedToday(users: User[], activities: Activity[]): void {
+  const today = minutesByUser(activitiesOnDay(activities, TODAY));
+  for (const user of users) {
+    user.trackedToday = today.get(user.id) ?? 0;
+  }
 }
 
 function genWeekly(users: User[], seedNum: number) {
@@ -293,14 +318,14 @@ function genNotifications(users: User[], projects: Project[]): AppNotification[]
   return out;
 }
 
-function computeSummary(users: User[], projects: Project[]): Summary {
-  const active = users.filter((u) => u.productivity > 0);
+/** Time figures come off the activity rows via metrics.ts — same as every report. */
+function computeSummary(users: User[], projects: Project[], activities: Activity[]): Summary {
   return {
-    totalTrackedToday: users.reduce((s, u) => s + u.trackedToday, 0),
+    totalTrackedToday: minutesOnDay(activities, TODAY),
     activeMembers: users.filter((u) => u.status === "active").length,
     totalMembers: countSeats(users),
     activeProjects: projects.filter((p) => !p.archived).length,
-    avgProductivity: active.length ? Math.round(active.reduce((s, u) => s + u.productivity, 0) / active.length) : 0,
+    avgProductivity: averageProductivity(activitiesOnDay(activities, TODAY)),
     screenshotsToday: countSeats(users) * 40,
   };
 }
@@ -369,6 +394,10 @@ interface Roster {
 function buildGenerated(roster: Roster): Dataset {
   const seed = hashStr(roster.id);
   const activities = genActivities(roster.users, roster.projects, seed);
+  // Derive the roster and the project totals from the rows before anything
+  // else reads `trackedToday` / `loggedThisWeek`.
+  syncTrackedToday(roster.users, activities);
+  syncProjectTotals(roster.projects, activities);
   const appCatalog = genAppCatalog(roster.users, seed);
   return {
     workspaceId: roster.id,
@@ -378,7 +407,7 @@ function buildGenerated(roster: Roster): Dataset {
     weeklyTrend: genWeekly(roster.users, seed),
     hourlyToday: genHourly(seed),
     topApps: genTopApps(appCatalog),
-    summary: computeSummary(roster.users, roster.projects),
+    summary: computeSummary(roster.users, roster.projects, activities),
     projectDistribution: computeProjectDistribution(roster.projects),
     appCatalog,
     productivitySplit: deriveSplit(roster.users),
@@ -454,11 +483,17 @@ function buildEmpty(id: string): Dataset {
 
 const cache = new Map<string, Dataset>();
 
+/** Live workspace ids (see live-identity.ts) all start with this prefix. */
+const LIVE_ID_PREFIX = "live-";
+
 function getLocalStorageProjects(workspaceId: string): Project[] {
   if (typeof window === "undefined") return [];
   try {
     const val = localStorage.getItem(`dosi-projects-created-${workspaceId}`);
-    return val ? JSON.parse(val) : [];
+    // Guard the parse: a corrupted value (e.g. "null" or "{}") must fall back
+    // to "no local projects" instead of crashing `datasetFor` on `.length`.
+    const parsed: unknown = val ? JSON.parse(val) : [];
+    return Array.isArray(parsed) ? (parsed as Project[]) : [];
   } catch {
     return [];
   }
@@ -472,7 +507,12 @@ export function datasetFor(workspaceId: string): Dataset {
   if (workspaceId === "w1") ds = buildPrimary();
   else if (workspaceId === "w2") ds = buildGenerated({ id: "w2", users: acmeUsers, projects: acmeProjects });
   else if (workspaceId === "w3") ds = buildGenerated({ id: "w3", users: nimbusUsers, projects: nimbusProjects });
-  else ds = buildEmpty(workspaceId);
+  // A live workspace not hydrated yet reads as EMPTY — never as a demo tenant.
+  else if (workspaceId.startsWith(LIVE_ID_PREFIX)) {
+    ds = buildLiveDataset({ workspaceId, users: [], projects: [], activities: [], now: new Date() });
+    cache.set(workspaceId, ds);
+    return ds;
+  } else ds = buildEmpty(workspaceId);
 
   const localProjects = getLocalStorageProjects(workspaceId);
   if (localProjects.length > 0) {
@@ -493,8 +533,9 @@ export function createTenantProject(workspaceId: string, project: Project): void
     try {
       const key = `dosi-projects-created-${workspaceId}`;
       const existing = localStorage.getItem(key);
-      const list = existing ? JSON.parse(existing) : [];
-      if (!list.some((p: any) => p.id === project.id)) {
+      const parsed: unknown = existing ? JSON.parse(existing) : [];
+      const list: Project[] = Array.isArray(parsed) ? (parsed as Project[]) : [];
+      if (!list.some((p) => p.id === project.id)) {
         list.unshift(project);
         localStorage.setItem(key, JSON.stringify(list));
       }
@@ -531,9 +572,7 @@ export function activeWorkspaceId(): string {
   return active.workspaceId;
 }
 
-export function setActiveWorkspace(workspaceId: string): void {
-  const ds = datasetFor(workspaceId);
-  if (ds === active) return;
+function applyActive(ds: Dataset): void {
   active = ds;
   users = ds.users;
   projects = ds.projects;
@@ -547,6 +586,89 @@ export function setActiveWorkspace(workspaceId: string): void {
   attendance = ds.attendance;
   billing = ds.billing;
   notifications = ds.notifications;
+}
+
+export function setActiveWorkspace(workspaceId: string): void {
+  const ds = datasetFor(workspaceId);
+  if (ds === active) return;
+  applyActive(ds);
+}
+
+/* ============================================================================
+ * LIVE datasets — a real tenant's data, built from the backend by the session
+ * provider. Nothing here is generated: every series is derived from the real
+ * rows (live-dataset.ts) and anything the backend does not provide is EMPTY —
+ * no demo people, notifications, attendance, billing rates or app categories.
+ * ========================================================================== */
+
+export interface LiveDatasetInput {
+  workspaceId: string;
+  users: User[];
+  projects: Project[];
+  activities: Activity[];
+  /** The real clock ("today" for live data is today, not the demo's frozen NOW). */
+  now: Date;
+}
+
+export function buildLiveDataset({ workspaceId, users: liveUsers, projects: liveProjects, activities: liveActivities, now }: LiveDatasetInput): Dataset {
+  const projectsCopy = liveProjects.map((p) => ({ ...p, memberIds: Array.isArray(p.memberIds) ? [...p.memberIds] : [] }));
+  applyProjectTotals(projectsCopy, liveActivities, now);
+  const today = now.toISOString().slice(0, 10);
+  const todays = activitiesOnDay(liveActivities, today);
+  const appCatalog = deriveAppCatalog(liveActivities);
+  return {
+    workspaceId,
+    users: liveUsers,
+    projects: projectsCopy,
+    activities: liveActivities,
+    weeklyTrend: deriveDailyTrend(liveActivities, now, 7),
+    hourlyToday: deriveHourly(liveActivities, now),
+    topApps: deriveTopApps(appCatalog),
+    summary: {
+      totalTrackedToday: Math.round(minutesOnDay(liveActivities, today)),
+      activeMembers: liveUsers.filter((u) => u.status === "active").length,
+      totalMembers: countSeats(liveUsers),
+      activeProjects: projectsCopy.filter((p) => !p.archived).length,
+      avgProductivity: averageProductivity(todays),
+      screenshotsToday: todays.length,
+    },
+    projectDistribution: computeProjectDistribution(projectsCopy),
+    appCatalog,
+    productivitySplit: [],
+    attendance: [],
+    billing: [],
+    notifications: [],
+    live: true,
+  };
+}
+
+/** Register a live dataset under its workspace id and make it the active one. */
+export function installLiveDataset(input: LiveDatasetInput): Dataset {
+  const ds = buildLiveDataset(input);
+  cache.set(ds.workspaceId, ds);
+  applyActive(ds);
+  return ds;
+}
+
+/**
+ * An EMPTY live dataset (identity still loading, or the backend failed). Keeps
+ * every page's reads valid without ever falling back to demo rows.
+ */
+export function installEmptyLiveDataset(workspaceId: string, now: Date = new Date()): Dataset {
+  return installLiveDataset({ workspaceId, users: [], projects: [], activities: [], now });
+}
+
+/** Whether the ACTIVE dataset is a real tenant's (vs the demo). */
+export function isLiveDataset(): boolean {
+  return active.live === true;
+}
+
+/** Forget every live dataset (sign-out) and fall back to the primary demo workspace. */
+export function dropLiveDatasets(): void {
+  for (const [id, ds] of cache) {
+    if (ds.live) cache.delete(id);
+  }
+  if (active.live) applyActive(datasetFor("w1"));
 }
 
 export function hydrateLiveBackendData(liveProjects: Project[], liveActivities: Activity[]) {
@@ -594,14 +716,9 @@ export function billingRow(userId: string) {
   return billing.find((b) => b.userId === userId);
 }
 
+/** Minutes per member. Delegates to metrics.ts — the one definition of "tracked". */
 export function trackedMinutesByUser(list: Activity[] = activities) {
-  const map = new Map<string, number>();
-  for (const a of list) {
-    const p = projects.find((pr) => pr.id === a.projectId);
-    const inc = p?.intervalMinutes ?? 10;
-    map.set(a.userId, (map.get(a.userId) ?? 0) + inc);
-  }
-  return map;
+  return minutesByUser(list);
 }
 
 export function insights(): Insight[] {
@@ -625,4 +742,38 @@ export function insights(): Insight[] {
   out.push({ id: "i5", tone: focusRatio >= 60 ? "success" : "warning", title: `Team focus is ${focusRatio}%`, detail: `Share of time spent in productive apps this week.` });
   out.push({ id: "i6", tone: "danger", title: `${Math.round(cats.unproductive / 60)}h on distractions`, detail: `Time in unproductive apps this week across the team.` });
   return out;
+}
+
+/* ============================================================================
+ * Test-only reset
+ * ========================================================================== */
+
+// Pristine deep-copies of every seed roster, captured at module load — i.e.
+// before any runtime mutation (hydration and invite flows push into these
+// shared arrays in place).
+const seedArrays: unknown[][] = [
+  primaryUsers,
+  primaryProjects,
+  primaryActivities,
+  PRIMARY_NOTIFICATIONS, // topbar mark-as-read flips `read` in place
+  acmeUsers,
+  acmeProjects,
+  nimbusUsers,
+  nimbusProjects,
+];
+const seedSnapshots = seedArrays.map((a) => structuredClone(a));
+
+/**
+ * Restore the demo-data layer to its pristine state: undo in-place seed-array
+ * mutations, drop every cached per-workspace dataset (including projects
+ * seeded from localStorage) and re-point the live bindings at the primary
+ * workspace. Imported ONLY by the test harness — never by app code.
+ */
+export function resetTenantDataForTests(): void {
+  seedArrays.forEach((arr, i) => {
+    arr.length = 0;
+    arr.push(...structuredClone(seedSnapshots[i]));
+  });
+  cache.clear();
+  applyActive(datasetFor("w1"));
 }

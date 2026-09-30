@@ -23,6 +23,7 @@ using OpenIddict.Server.AspNetCore;
 using Dosi.Tracker.EntityFrameworkCore;
 using Dosi.Tracker.MultiTenancy;
 using Dosi.Tracker.HealthChecks;
+using Dosi.Tracker.Security;
 using Microsoft.OpenApi;
 using Volo.Abp;
 using Volo.Abp.Studio;
@@ -167,31 +168,17 @@ public class TrackerHttpApiHostModule : AbpModule
         }
     }
 
-    /// <summary>Refuses to start in Production while any well-known template secret is still active.</summary>
+    /// <summary>Refuses to start in Production while a secret is still a well-known template value or is
+    /// still read from the tracked appsettings.json (see <see cref="ProductionSecretsGuard"/>).</summary>
     private static void RejectDefaultDevSecrets(IConfiguration configuration)
     {
-        var leaks = new List<string>();
-
-        if (configuration.GetConnectionString("Default")?.Contains("Password=myPassword") == true)
-        {
-            leaks.Add("ConnectionStrings:Default uses the template database password");
-        }
-
-        if (configuration["AuthServer:CertificatePassPhrase"] == "3f027835-7c52-4bf7-bc1f-77582ca37aef")
-        {
-            leaks.Add("AuthServer:CertificatePassPhrase is the template default");
-        }
-
-        if (configuration["StringEncryption:DefaultPassPhrase"] == "5pGzpfXjidNXJVDa")
-        {
-            leaks.Add("StringEncryption:DefaultPassPhrase is the template default");
-        }
-
-        if (leaks.Any())
+        var problems = ProductionSecretsGuard.FindProblems(configuration);
+        if (problems.Any())
         {
             throw new AbpInitializationException(
-                "Refusing to start in Production with template dev secrets. Fix: " + string.Join("; ", leaks) +
-                ". Override them via environment variables or a secret store.");
+                "Refusing to start in Production with repository/template secrets. Fix: " + string.Join("; ", problems) +
+                ". Supply them via environment variables (e.g. ConnectionStrings__Default), appsettings.secrets.json " +
+                "or a secret store.");
         }
     }
 
@@ -288,9 +275,18 @@ public class TrackerHttpApiHostModule : AbpModule
 
         if (hostingEnvironment.IsDevelopment())
         {
+            // Hot-reload embedded resources from the source tree — only when running from a checkout.
+            // A published build (e.g. the docker-compose image run as Development) has no ../src folders,
+            // and PhysicalFileProvider throws on a missing root.
+            var domainSharedPath = Path.Combine(hostingEnvironment.ContentRootPath, $"..{Path.DirectorySeparatorChar}Dosi.Tracker.Domain.Shared");
+            if (!Directory.Exists(domainSharedPath))
+            {
+                return;
+            }
+
             Configure<AbpVirtualFileSystemOptions>(options =>
             {
-                options.FileSets.ReplaceEmbeddedByPhysical<TrackerDomainSharedModule>(Path.Combine(hostingEnvironment.ContentRootPath, $"..{Path.DirectorySeparatorChar}Dosi.Tracker.Domain.Shared"));
+                options.FileSets.ReplaceEmbeddedByPhysical<TrackerDomainSharedModule>(domainSharedPath);
                 options.FileSets.ReplaceEmbeddedByPhysical<TrackerDomainModule>(Path.Combine(hostingEnvironment.ContentRootPath, $"..{Path.DirectorySeparatorChar}Dosi.Tracker.Domain"));
                 options.FileSets.ReplaceEmbeddedByPhysical<TrackerApplicationContractsModule>(Path.Combine(hostingEnvironment.ContentRootPath, $"..{Path.DirectorySeparatorChar}Dosi.Tracker.Application.Contracts"));
                 options.FileSets.ReplaceEmbeddedByPhysical<TrackerApplicationModule>(Path.Combine(hostingEnvironment.ContentRootPath, $"..{Path.DirectorySeparatorChar}Dosi.Tracker.Application"));

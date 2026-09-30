@@ -24,9 +24,12 @@ export function CardHeader({ className, ...props }: React.HTMLAttributes<HTMLDiv
   );
 }
 
+// h2, not h3: cards are the top-level sections beneath a page's single h1, so
+// an h3 here skips a level and trips axe's heading-order rule. Visual size is
+// carried by the classes, not the tag.
 export function CardTitle({ className, ...props }: React.HTMLAttributes<HTMLHeadingElement>) {
   return (
-    <h3
+    <h2
       className={cn("font-display text-sm font-semibold tracking-tight", className)}
       {...props}
     />

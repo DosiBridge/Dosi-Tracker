@@ -28,6 +28,28 @@ export function ScreenMockView({
   );
 }
 
+/**
+ * A plain app tile for a REAL activity: the focused app's initial and name.
+ * Live rows have no synthetic screen to draw, and faking one would be dishonest;
+ * the real capture (when the project allows screenshots) is on the activity page.
+ */
+export function AppGlyph({ app, color, className }: { app: string; color: string; className?: string }) {
+  return (
+    <div
+      className={cn("flex items-center justify-center gap-1.5 overflow-hidden rounded-lg border border-border bg-muted/50 px-1.5", className)}
+      title={app}
+    >
+      <span
+        className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-[11px] font-bold text-white"
+        style={{ background: color }}
+      >
+        {(app.trim()[0] ?? "?").toUpperCase()}
+      </span>
+      <span className="min-w-0 truncate text-[10px] text-muted-foreground">{app}</span>
+    </div>
+  );
+}
+
 function bar(w: string, c: string, h = "h-1.5") {
   return <div className={cn("rounded-sm", h)} style={{ width: w, background: c }} />;
 }

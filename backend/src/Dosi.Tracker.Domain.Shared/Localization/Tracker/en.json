@@ -17,12 +17,20 @@
     "Permission:Team.Manage": "Manage team members",
     "Permission:Billing": "Billing",
     "Permission:Reporting": "Reporting",
+    "Permission:Platform": "Platform administration (host console)",
     "Tracker:ActivityTimeRangeInvalid": "The activity's end time must be after its start time.",
     "Tracker:ActivityClientIdRequired": "The activity must carry the client-generated activity id (idempotency key).",
+    "Tracker:ActivityClientIdConflict": "This client activity id is already used by another member.",
+    "Tracker:ActivityInFuture": "The activity ends in the future. Check the device clock.",
+    "Tracker:ActivityTooLong": "The activity lasts {durationMinutes} minutes, longer than the {maxMinutes}-minute maximum for this project.",
+    "Tracker:ActivityOverlaps": "The activity overlaps time you have already tracked.",
+    "Tracker:ProjectArchived": "The project is archived; time can no longer be tracked against it.",
     "Tracker:DuplicateProjectMember": "This user is already a member of the project.",
     "Tracker:InvalidCaptureData": "The uploaded capture is not valid base64 image data.",
     "Tracker:CaptureTooLarge": "The uploaded capture exceeds the maximum allowed size.",
     "Tracker:PlanNotFound": "The requested plan does not exist.",
-    "Tracker:SeatLimitReached": "Your plan's seat limit has been reached. Upgrade the plan to add more members."
+    "Tracker:PlanInUse": "The plan cannot be deleted while subscriptions still use it.",
+    "Tracker:SeatLimitReached": "Your plan's seat limit has been reached. Upgrade the plan to add more members.",
+    "Tracker:ReportRangeInvalid": "The report range must end after it starts and span at most {maxDays} days."
   }
 }

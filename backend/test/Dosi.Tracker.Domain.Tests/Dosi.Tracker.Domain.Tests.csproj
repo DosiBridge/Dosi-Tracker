@@ -17,4 +17,11 @@
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- The production-secrets guard is pure logic that lives in HttpApi.Host. Test projects do not reference
+         the host (it would drag the untested web-host wiring into the coverage gate), so its single source
+         file is compiled into this test assembly instead. -->
+    <Compile Include="..\..\src\Dosi.Tracker.HttpApi.Host\Security\ProductionSecretsGuard.cs" Link="Security\ProductionSecretsGuard.cs" />
+  </ItemGroup>
+
 </Project>

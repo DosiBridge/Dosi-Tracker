@@ -14,8 +14,10 @@ path = "src/main.rs"
 # Async runtime (kept minimal: current-thread scheduler for low overhead)
 tokio = { version = "1", features = ["rt", "macros", "time", "signal", "sync"] }
 
-# HTTP client for syncing activity to the backend API
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# HTTP client for syncing activity to the backend API.
+# TLS roots: the Windows certificate store (corporate CAs, `dotnet dev-certs`)
+# plus the bundled Mozilla roots. Verification is never disabled.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

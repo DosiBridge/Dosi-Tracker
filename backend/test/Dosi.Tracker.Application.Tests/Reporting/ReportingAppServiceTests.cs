@@ -43,7 +43,7 @@ public abstract class ReportingAppServiceTests<TStartupModule> : TrackerApplicat
             await WithUnitOfWorkAsync(async () =>
             {
                 await _projectRepository.InsertAsync(
-                    new Project(projectId, null, "Seeded Project"));
+                    new Project(projectId, null, "Seeded Project", intervalMinutes: 60));
                 await _memberRepository.InsertAsync(
                     new ProjectMember(_guidGenerator.Create(), null, projectId, CurrentUserId));
             });
@@ -67,7 +67,7 @@ public abstract class ReportingAppServiceTests<TStartupModule> : TrackerApplicat
         {
             await WithUnitOfWorkAsync(async () =>
             {
-                await _projectRepository.InsertAsync(new Project(projectId, null, "Seeded Project"));
+                await _projectRepository.InsertAsync(new Project(projectId, null, "Seeded Project", intervalMinutes: 60));
                 await _memberRepository.InsertAsync(
                     new ProjectMember(_guidGenerator.Create(), null, projectId, CurrentUserId));
             });
@@ -190,7 +190,7 @@ public abstract class ReportingAppServiceTests<TStartupModule> : TrackerApplicat
         var projectB = Guid.NewGuid();
 
         await TrackAsync(projectA, Day.AddHours(9), 30, 80);
-        await TrackAsync(projectB, Day.AddHours(9), 15, 40);
+        await TrackAsync(projectB, Day.AddHours(10), 15, 40); // same user: must not overlap the 9:00 block
         await TrackAsync(projectA, Day.AddDays(5), 60, 90); // outside range
 
         var summary = await _reportingAppService.GetSummaryAsync(new GetReportSummaryInput
@@ -250,5 +250,116 @@ public abstract class ReportingAppServiceTests<TStartupModule> : TrackerApplicat
         summary.AverageProductivity.ShouldBe(0);
         summary.PerUser.ShouldBeEmpty();
         summary.PerProject.ShouldBeEmpty();
+    }
+
+    // ---- Range cap, per-user filter, per-user daily series ----
+
+    private static readonly Guid OtherUserId = Guid.Parse("7a1b2c3d-0000-4000-8000-000000000002");
+
+    /// <summary>Inserts another member's block directly (the app service only records the caller's own time).</summary>
+    private Task InsertForOtherUserAsync(Guid projectId, DateTime start, int minutes)
+    {
+        return WithUnitOfWorkAsync(() => GetRequiredService<IRepository<Activity, Guid>>().InsertAsync(
+            new Activity(_guidGenerator.Create(), null, OtherUserId, projectId, Guid.NewGuid(), start, start.AddMinutes(minutes))
+            {
+                Productivity = 50
+            }));
+    }
+
+    [Fact]
+    public async Task Reports_Should_Reject_A_Range_That_Ends_Before_It_Starts()
+    {
+        var exception = await Should.ThrowAsync<Volo.Abp.BusinessException>(() =>
+            _reportingAppService.GetSummaryAsync(new GetReportSummaryInput { From = Day, To = Day }));
+        exception.Code.ShouldBe(TrackerDomainErrorCodes.ReportRangeInvalid);
+
+        await Should.ThrowAsync<Volo.Abp.BusinessException>(() =>
+            _reportingAppService.GetDailySeriesAsync(new GetReportSummaryInput { From = Day, To = Day.AddDays(-1) }));
+    }
+
+    [Fact]
+    public async Task Reports_Should_Cap_The_Range_At_366_Days()
+    {
+        var tooLong = new GetReportSummaryInput { From = Day, To = Day.AddDays(GetReportSummaryInput.MaxRangeDays + 1) };
+
+        var exception = await Should.ThrowAsync<Volo.Abp.BusinessException>(() => _reportingAppService.GetAttendanceAsync(tooLong));
+        exception.Code.ShouldBe(TrackerDomainErrorCodes.ReportRangeInvalid);
+        await Should.ThrowAsync<Volo.Abp.BusinessException>(() => _reportingAppService.GetAppUsageAsync(tooLong));
+        await Should.ThrowAsync<Volo.Abp.BusinessException>(() => _reportingAppService.GetUserDailySeriesAsync(tooLong));
+
+        var fullYear = await _reportingAppService.GetDailySeriesAsync(
+            new GetReportSummaryInput { From = Day, To = Day.AddDays(GetReportSummaryInput.MaxRangeDays) });
+        fullYear.Count.ShouldBe(GetReportSummaryInput.MaxRangeDays);
+    }
+
+    [Fact]
+    public async Task Summary_Should_Filter_To_One_Member_For_Callers_Who_Can_View_All()
+    {
+        var projectId = Guid.NewGuid();
+        await TrackAsync(projectId, Day.AddHours(9), 30, 80);
+        await InsertForOtherUserAsync(projectId, Day.AddHours(9), 20);
+
+        var everyone = await _reportingAppService.GetSummaryAsync(new GetReportSummaryInput { From = Day, To = Day.AddDays(1) });
+        everyone.PerUser.Count.ShouldBe(2);
+
+        var onlyOther = await _reportingAppService.GetSummaryAsync(new GetReportSummaryInput
+        {
+            From = Day,
+            To = Day.AddDays(1),
+            UserId = OtherUserId
+        });
+        onlyOther.TotalActivities.ShouldBe(1);
+        onlyOther.TotalTrackedMinutes.ShouldBe(20);
+        onlyOther.PerUser.ShouldHaveSingleItem().UserId.ShouldBe(OtherUserId);
+    }
+
+    [Fact]
+    public async Task UserDailySeries_Should_Return_Minutes_Per_Member_Per_Day_With_Data_Only()
+    {
+        await WithUnitOfWorkAsync(async () =>
+        {
+            var userManager = GetRequiredService<Volo.Abp.Identity.IdentityUserManager>();
+            (await userManager.CreateAsync(new Volo.Abp.Identity.IdentityUser(OtherUserId, "bob", "bob@acme.test")))
+                .Succeeded.ShouldBeTrue();
+        });
+
+        var projectId = Guid.NewGuid();
+        await TrackAsync(projectId, Day.AddHours(9), 30, 80);
+        await TrackAsync(projectId, Day.AddHours(10), 15, 80);
+        await InsertForOtherUserAsync(projectId, Day.AddHours(9), 20);
+        await InsertForOtherUserAsync(projectId, Day.AddDays(2).AddHours(9), 40);
+
+        var rows = await _reportingAppService.GetUserDailySeriesAsync(new GetReportSummaryInput
+        {
+            From = Day,
+            To = Day.AddDays(3)
+        });
+
+        rows.Count.ShouldBe(3); // day 1 is idle for both members -> no rows
+
+        var mineDay0 = rows.Single(r => r.UserId == CurrentUserId);
+        mineDay0.Date.ShouldBe(Day);
+        mineDay0.Date.Kind.ShouldBe(DateTimeKind.Utc);
+        mineDay0.TrackedMinutes.ShouldBe(45);
+        mineDay0.ActivityCount.ShouldBe(2);
+
+        var bobRows = rows.Where(r => r.UserId == OtherUserId).OrderBy(r => r.Date).ToList();
+        bobRows.Count.ShouldBe(2);
+        bobRows.ShouldAllBe(r => r.UserName == "bob");
+        bobRows[0].TrackedMinutes.ShouldBe(20);
+        bobRows[1].Date.ShouldBe(Day.AddDays(2));
+        bobRows[1].TrackedMinutes.ShouldBe(40);
+
+        // Ordered by day first.
+        rows.Select(r => r.Date).ShouldBe(rows.Select(r => r.Date).OrderBy(d => d));
+
+        var onlyBob = await _reportingAppService.GetUserDailySeriesAsync(new GetReportSummaryInput
+        {
+            From = Day,
+            To = Day.AddDays(3),
+            UserId = OtherUserId
+        });
+        onlyBob.ShouldAllBe(r => r.UserId == OtherUserId);
+        onlyBob.Count.ShouldBe(2);
     }
 }

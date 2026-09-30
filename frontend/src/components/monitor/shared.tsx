@@ -42,10 +42,44 @@ export function TypeLegend({ className }: { className?: string }) {
   );
 }
 
-export function MiniDayStrip({ segments }: { segments: DaySegment[] }) {
+/**
+ * Legend for a live day: real agents report activity blocks only (no meetings,
+ * breaks or idle), and each block is colored by its productivity.
+ */
+export function ProductivityLegend({ className }: { className?: string }) {
+  const bands = [
+    { label: "≥ 75% productive", color: prodColor(75) },
+    { label: "50–74%", color: prodColor(50) },
+    { label: "< 50%", color: prodColor(0) },
+  ];
+  return (
+    <div className={cn("flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground", className)}>
+      {bands.map((b) => (
+        <span key={b.label} className="flex items-center gap-1.5">
+          <span className="h-2.5 w-2.5 rounded-sm" style={{ background: b.color }} />
+          {b.label}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * A compact day bar. `span` is the minutes-of-day axis it draws (the 08:00–20:00
+ * working day by default); live views widen it so real work outside business
+ * hours is not clipped away.
+ */
+export function MiniDayStrip({
+  segments,
+  span = { start: DAY_START_MIN, end: DAY_END_MIN },
+}: {
+  segments: DaySegment[];
+  span?: { start: number; end: number };
+}) {
   if (segments.length === 0) {
     return <div className="h-2.5 w-full rounded-full bg-muted" aria-hidden />;
   }
+  const range = Math.max(1, span.end - span.start);
   return (
     <div
       className="relative h-2.5 w-full overflow-hidden rounded-full bg-muted/70"
@@ -54,8 +88,8 @@ export function MiniDayStrip({ segments }: { segments: DaySegment[] }) {
         .join(" · ")}
     >
       {segments.map((s) => {
-        const left = ((s.startMin - DAY_START_MIN) / RANGE) * 100;
-        const width = Math.max(0.8, (s.minutes / RANGE) * 100);
+        const left = ((s.startMin - span.start) / range) * 100;
+        const width = Math.max(0.8, (s.minutes / range) * 100);
         const color = s.type === "work" ? prodColor(s.productivity) : typeColor[s.type];
         const muted = s.type === "idle" || s.type === "break";
         return (

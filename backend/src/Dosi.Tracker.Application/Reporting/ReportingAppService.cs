@@ -6,8 +6,10 @@ using System.Threading.Tasks;
 using Microsoft.AspNetCore.Authorization;
 using Dosi.Tracker.Activities;
 using Dosi.Tracker.Permissions;
+using Volo.Abp;
 using Volo.Abp.Application.Services;
 using Volo.Abp.Domain.Repositories;
+using Volo.Abp.Identity;
 using Volo.Abp.Users;
 
 namespace Dosi.Tracker.Reporting;
@@ -16,29 +18,19 @@ namespace Dosi.Tracker.Reporting;
 public class ReportingAppService : TrackerAppService, IReportingAppService
 {
     private readonly IRepository<Activity, Guid> _activityRepository;
+    private readonly IIdentityUserRepository _userRepository;
 
-    public ReportingAppService(IRepository<Activity, Guid> activityRepository)
+    public ReportingAppService(
+        IRepository<Activity, Guid> activityRepository,
+        IIdentityUserRepository userRepository)
     {
         _activityRepository = activityRepository;
+        _userRepository = userRepository;
     }
 
     public async Task<ReportSummaryDto> GetSummaryAsync(GetReportSummaryInput input)
     {
-        var query = await _activityRepository.GetQueryableAsync();
-
-        query = query.Where(a => a.StartedAt >= input.From && a.StartedAt < input.To);
-
-        if (input.ProjectId.HasValue)
-        {
-            query = query.Where(a => a.ProjectId == input.ProjectId.Value);
-        }
-
-        if (!await AuthorizationService.IsGrantedAsync(TrackerPermissions.Activities.ViewAll))
-        {
-            // Regular members only report on themselves.
-            var userId = CurrentUser.GetId();
-            query = query.Where(a => a.UserId == userId);
-        }
+        var query = await ScopedQueryAsync(input);
 
         // Aggregate on a slim projection; block counts per range are modest (one per 5-60 min per user).
         var rows = await AsyncExecuter.ToListAsync(query.Select(a => new
@@ -95,20 +87,7 @@ public class ReportingAppService : TrackerAppService, IReportingAppService
 
     public async Task<List<DailyReportRowDto>> GetDailySeriesAsync(GetReportSummaryInput input)
     {
-        var query = await _activityRepository.GetQueryableAsync();
-
-        query = query.Where(a => a.StartedAt >= input.From && a.StartedAt < input.To);
-
-        if (input.ProjectId.HasValue)
-        {
-            query = query.Where(a => a.ProjectId == input.ProjectId.Value);
-        }
-
-        if (!await AuthorizationService.IsGrantedAsync(TrackerPermissions.Activities.ViewAll))
-        {
-            var userId = CurrentUser.GetId();
-            query = query.Where(a => a.UserId == userId);
-        }
+        var query = await ScopedQueryAsync(input);
 
         var rows = await AsyncExecuter.ToListAsync(query.Select(a => new
         {
@@ -243,9 +222,43 @@ public class ReportingAppService : TrackerAppService, IReportingAppService
         return new AttendanceReportDto { Days = weekdays, Rows = perUser };
     }
 
-    /// <summary>The range + project + own-vs-all filter shared by every report query.</summary>
+    public async Task<List<UserDailyReportRowDto>> GetUserDailySeriesAsync(GetReportSummaryInput input)
+    {
+        var query = await ScopedQueryAsync(input);
+        var rows = await AsyncExecuter.ToListAsync(query.Select(a => new
+        {
+            a.UserId,
+            a.StartedAt,
+            a.EndedAt
+        }));
+
+        var userIds = rows.Select(r => r.UserId).Distinct().ToList();
+        var userNames = userIds.Count == 0
+            ? new Dictionary<Guid, string>()
+            : (await _userRepository.GetListByIdsAsync(userIds)).ToDictionary(u => u.Id, u => u.UserName);
+
+        return rows
+            .GroupBy(r => new { r.UserId, Day = r.StartedAt.Date })
+            .Select(g => new UserDailyReportRowDto
+            {
+                UserId = g.Key.UserId,
+                UserName = userNames.GetValueOrDefault(g.Key.UserId) ?? string.Empty,
+                Date = DateTime.SpecifyKind(g.Key.Day, DateTimeKind.Utc),
+                ActivityCount = g.Count(),
+                TrackedMinutes = Math.Round(g.Sum(r => (r.EndedAt - r.StartedAt).TotalMinutes), 2)
+            })
+            .OrderBy(r => r.Date)
+            .ThenBy(r => r.UserName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(r => r.UserId)
+            .ToList();
+    }
+
+    /// <summary>The range + project + user filter shared by every report query. Validates the range, and
+    /// scopes callers without Tracker.Activities.ViewAll to their own data (their UserId input is ignored).</summary>
     private async Task<IQueryable<Activity>> ScopedQueryAsync(GetReportSummaryInput input)
     {
+        EnsureValidRange(input);
+
         var query = await _activityRepository.GetQueryableAsync();
         query = query.Where(a => a.StartedAt >= input.From && a.StartedAt < input.To);
 
@@ -254,13 +267,34 @@ public class ReportingAppService : TrackerAppService, IReportingAppService
             query = query.Where(a => a.ProjectId == input.ProjectId.Value);
         }
 
-        if (!await AuthorizationService.IsGrantedAsync(TrackerPermissions.Activities.ViewAll))
+        if (await AuthorizationService.IsGrantedAsync(TrackerPermissions.Activities.ViewAll))
         {
+            if (input.UserId.HasValue)
+            {
+                query = query.Where(a => a.UserId == input.UserId.Value);
+            }
+        }
+        else
+        {
+            // Regular members only ever report on themselves.
             var userId = CurrentUser.GetId();
             query = query.Where(a => a.UserId == userId);
         }
 
         return query;
+    }
+
+    /// <summary>To must be after From, and the span is capped so a single request cannot scan (or, for the
+    /// day-by-day reports, enumerate) an unbounded history.</summary>
+    private static void EnsureValidRange(GetReportSummaryInput input)
+    {
+        if (input.To <= input.From || (input.To - input.From).TotalDays > GetReportSummaryInput.MaxRangeDays)
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.ReportRangeInvalid)
+                .WithData("maxDays", GetReportSummaryInput.MaxRangeDays)
+                .WithData("from", input.From)
+                .WithData("to", input.To);
+        }
     }
 
     /// <summary>Extract distinct application names from a stored window-info JSON array; tolerant of bad data.</summary>

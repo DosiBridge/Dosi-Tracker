@@ -10,6 +10,9 @@ export const brand = {
   pink: "#db2777",
 } as const;
 
+/** Where tenants reach the platform team (plan changes, owner password resets). */
+export const SUPPORT_EMAIL = "support@dositracker.app";
+
 export function greeting(name: string, hour = new Date().getHours()): string {
   const first = name.split(" ")[0] ?? name;
   if (hour < 12) return `Good morning, ${first}`;

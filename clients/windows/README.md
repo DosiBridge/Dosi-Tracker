@@ -10,7 +10,11 @@ presence and a small desktop window.
   password is never stored in clear text or in environment variables.
 - **Status view** — tracked today / this week / activity %, the current project
   (switchable), snapshot interval and pending-upload count.
-- **Pause / Resume / Sync now** from the window or the tray menu.
+- **Pause / Resume / Sync now** from the window or the tray menu. Pausing ends
+  the current block (the partial block is discarded) and nothing is captured
+  while paused — the window's button becomes **Upload queued**, which only
+  uploads what was already recorded. Input made while paused or signed out never
+  counts towards the next block.
 - **Settings** — "Start when I sign in to Windows" toggle and sign-out. Capture
   permissions are set per project by the workspace admin, not here.
 - **Closing the window hides to the tray**; tracking continues until you choose
@@ -44,6 +48,9 @@ Once per interval (5–60 min) it captures a snapshot for the active project:
 - Active window (app + title)
 - Running programs
 - Keyboard / mouse **counts** (never keystroke content)
+- **Activity %** (sent as `productivity`, 0–100): the share of the block's
+  whole minutes, counted from the block start, that had any keyboard or mouse
+  input (clicks, movement, wheel). Only input kinds the project allows count.
 
 Snapshots are stored locally first (SQLite, offline-first) and then synced to
 the backend REST API. Unsynced snapshots survive restarts and network outages.
@@ -59,10 +66,20 @@ the backend REST API. Unsynced snapshots survive restarts and network outages.
   and the snapshot interval. The user picks the project in the window (the choice
   is remembered); without any project it captures nothing and retries next interval.
 - **Totals:** `GET /api/app/reporting/summary` powers the today / this-week cards.
+  "Today" and "this week" (Monday-based) start at **local** midnight.
 - **Upload:** `POST /api/app/activity`. Rows the server permanently rejects
   (validation, unknown project) are parked locally (`synced = 2`, with the
   server's reason) so they never block the queue; transient errors are retried.
-  Successfully synced rows are deleted, so the local DB stays small.
+  Successfully synced rows are deleted, so the local DB stays small. The queue
+  is read 20 rows at a time (at most 100 uploads per pass, so a large backlog
+  never stalls Pause/Quit for long).
+- **Per-account queue:** every queued row is tagged with the account that
+  captured it (workspace + email). Only the signed-in account's rows are ever
+  uploaded; another account's rows wait for it to sign in again and are purged
+  after 14 days. Rows queued by older builds are assigned to the account that
+  was signed in when the new build first starts (or, if nobody was, are never
+  uploaded and expire after 14 days).
+- **Timeouts:** 10 s to connect, 60 s per request (uploads carry screenshots).
 
 ## Project layout
 
@@ -74,13 +91,13 @@ src/
 ├── state.rs             # shared snapshot + command channel types
 ├── credentials.rs       # DPAPI-encrypted sign-in persistence
 ├── autostart.rs         # "start with Windows" (HKCU Run key)
-├── config.rs            # config.toml + DOSI_* env vars
+├── config.rs            # config.toml + DOSI__* env vars
 ├── model.rs             # shared data types (Project, Activity, ...)
 ├── api.rs               # backend REST client (token, projects, submit, summary)
 ├── storage.rs           # local SQLite queue (offline-first)
 └── tracking/
     ├── mod.rs           # Tracker: builds one Activity snapshot
-    ├── input.rs         # event-driven keyboard/mouse counters
+    ├── input.rs         # event-driven keyboard/mouse counters + activity %
     ├── screenshot.rs    # primary-monitor PNG capture
     ├── webcam.rs        # single webcam JPEG frame
     └── active_window.rs # foreground window + running programs (Win32)
@@ -125,6 +142,12 @@ cargo run --release
 
 Then sign in through the window — no environment variables required.
 
+`config.toml` is read from **next to the executable** first (the installed
+location — the agent autostarts with an arbitrary working directory) and only
+then from the working directory, which is what `cargo run` picks up. Every key
+is optional: a file that sets only `api_base_url` keeps the defaults for the
+rest. Any key can also be set as an env var, e.g. `DOSI__API_BASE_URL`.
+
 ```powershell
 cargo clippy --all-targets -- -D warnings   # lints (CI enforces this)
 ```
@@ -145,14 +168,24 @@ cargo clippy --all-targets -- -D warnings   # lints (CI enforces this)
   timed from the previous capture, clamped to one interval. A slow sync or a
   machine suspend can therefore never burst-fire and invent tracked time.
 - **Rejected uploads** are parked for 14 days (visible in the window), then purged
-  so the local queue cannot grow without bound.
+  so the local queue cannot grow without bound. Parked rows keep their time data
+  and the server's reason, but not their screenshot/webcam images.
+- **Offline queue bounds:** screenshots are the bulk of the queue, so they go
+  first. Pending rows older than 30 days, or beyond the newest 500 (~80 h of
+  tracking at a 10-minute interval), lose their screenshot/webcam images but
+  keep their time data (start/end, counts, activity %, windows). Beyond 10,000
+  pending rows the oldest are dropped outright.
 - If the background worker ever panics, the window shows a red **Stopped** state
   instead of a green "Tracking" pill that captures nothing.
 - `running_programs` enumerates visible top-level windows (`EnumWindows`),
   deduplicated by owning process.
-- Dev TLS: the backend's `https://localhost:44342` uses the ASP.NET dev
-  certificate. Trust it (`dotnet dev-certs https --trust`) or front the API
-  with a real certificate; the agent (rustls) will refuse untrusted certs.
+- **TLS:** certificates are always verified. The agent (rustls) trusts the
+  **Windows certificate store** plus the bundled Mozilla roots, so a corporate
+  CA deployed to Windows works without extra setup. Dev: the backend's
+  `https://localhost:44342` uses the ASP.NET dev certificate — run
+  `dotnet dev-certs https --trust` once (as the same Windows user) and restart
+  the agent. Untrusted or self-signed certificates that are not in the store
+  are refused.
 
 ## Known gaps
 

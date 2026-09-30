@@ -7,21 +7,14 @@ import { Badge } from "@/components/ui/badge";
 import { Avatar } from "@/components/ui/avatar";
 import { Select } from "@/components/ui/input";
 import { StatCard } from "@/components/dashboard/stat-card";
-import { activitiesForProject, NOW, projects, userById } from "@/lib/tenant-data";
+import { activitiesForProject, projects, userById } from "@/lib/tenant-data";
+import { agoLabel } from "@/lib/live-session";
 import { brand } from "@/lib/brand";
 import { formatDuration } from "@/lib/utils";
 import type { User } from "@/lib/types";
 
-function agoLabel(iso: string) {
-  const mins = Math.round((NOW.getTime() - new Date(iso).getTime()) / 60000);
-  if (mins < 60) return `${mins}m ago`;
-  const h = Math.floor(mins / 60);
-  if (h < 24) return `${h}h ago`;
-  return `${Math.floor(h / 24)}d ago`;
-}
-
 export function ClientDashboard({ user }: { user: User }) {
-  const myProjects = projects.filter((p) => p.memberIds.includes(user.id));
+  const myProjects = projects.filter((p) => (p.memberIds ?? []).includes(user.id));
   const [projectId, setProjectId] = useState(myProjects[0]?.id ?? "");
   const project = myProjects.find((p) => p.id === projectId) ?? myProjects[0];
 
@@ -40,7 +33,7 @@ export function ClientDashboard({ user }: { user: User }) {
   }
 
   const sessions = activitiesForProject(project.id);
-  const members = project.memberIds
+  const members = (project.memberIds ?? [])
     .map((id) => userById(id))
     .filter((u): u is User => !!u && u.role !== "client");
 

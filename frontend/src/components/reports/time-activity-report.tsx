@@ -1,20 +1,23 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { Clock, Gauge, Camera, CalendarCheck } from "lucide-react";
+import { useCallback, useMemo, useState } from "react";
+import { Clock, Gauge, Camera, CalendarCheck, Users } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Avatar } from "@/components/ui/avatar";
 import { Progress } from "@/components/ui/progress";
 import { DataTable, type Column } from "@/components/ui/data-table";
 import { ActivityTrendChart } from "@/components/dashboard/charts";
-import { ReportShell, FilterBar, ExportMenu, Kpi, KpiGrid } from "./report-shell";
-import { activities, projects, userById, users } from "@/lib/tenant-data";
+import { ReportShell, FilterBar, ExportMenu, Kpi, KpiGrid, LiveReportNotice, useLiveReport } from "./report-shell";
+import { activities, userById, users } from "@/lib/tenant-data";
 import { trackedMembers } from "@/lib/roles";
-import { filterActivitiesByRange, rangeForKey, type RangeKey } from "@/lib/reports-data";
+import { averageProductivity, dayKey, durationMinutes, minutesForUser } from "@/lib/metrics";
+import { filterActivitiesByRange, type RangeKey } from "@/lib/reports-data";
+import { asArray, memberName, reportQuery } from "@/lib/report-math";
 import { exportRecords } from "@/lib/export";
 import { cn, formatDuration } from "@/lib/utils";
 import { getApi } from "@/hooks/useApi";
-import type { ResolvedRange } from "./date-range-picker";
+import { useSession } from "@/components/session-provider";
+import { resolveRange, type ResolvedRange } from "./date-range-picker";
 
 interface Row {
   userId: string;
@@ -37,10 +40,10 @@ interface LivePerUser {
 }
 
 interface LiveSummary {
-  totalActivities: number;
-  totalTrackedMinutes: number;
-  averageProductivity: number;
-  perUser: LivePerUser[];
+  totalActivities?: number;
+  totalTrackedMinutes?: number;
+  averageProductivity?: number;
+  perUser?: LivePerUser[];
 }
 
 interface LiveDailyPoint {
@@ -50,104 +53,33 @@ interface LiveDailyPoint {
   averageProductivity: number;
 }
 
-interface LiveIdentityUser {
-  id: string;
-  userName: string;
-  name?: string | null;
-  surname?: string | null;
-}
-
-const GUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
-
-/**
- * The shared range presets pivot on the demo NOW constant so mock data stays
- * stable; live queries must pivot on the real clock instead. Mirrors
- * rangeForKey's per-preset logic exactly.
- */
-function liveRangeFor(key: RangeKey): { from: Date; to: Date } {
-  const to = new Date();
-  const from = new Date();
-  switch (key) {
-    case "today":
-      from.setHours(0, 0, 0, 0);
-      break;
-    case "yesterday":
-      from.setDate(from.getDate() - 1);
-      from.setHours(0, 0, 0, 0);
-      to.setDate(to.getDate() - 1);
-      to.setHours(23, 59, 59, 999);
-      break;
-    case "30d":
-      from.setDate(from.getDate() - 30);
-      break;
-    case "month":
-      from.setDate(1);
-      from.setHours(0, 0, 0, 0);
-      break;
-    default: // "7d" and "custom" both fall back to the last 7 days
-      from.setDate(from.getDate() - 7);
-      break;
-  }
-  return { from, to };
+interface LiveTimeActivity {
+  summary: LiveSummary;
+  series: LiveDailyPoint[];
 }
 
 export function TimeActivityReport() {
+  const { isLive } = useSession();
   const [rangeKey, setRangeKey] = useState<RangeKey>("7d");
-  const [range, setRange] = useState<ResolvedRange>(() => ({ key: "7d", ...rangeForKey("7d") }));
+  const [range, setRange] = useState<ResolvedRange>(() => resolveRange("7d"));
   const [projectId, setProjectId] = useState("all");
   const [memberId, setMemberId] = useState("all");
   const [viewMode, setViewMode] = useState<"table" | "grid">("table");
 
-  const [liveSummary, setLiveSummary] = useState<LiveSummary | null>(null);
-  const [liveSeries, setLiveSeries] = useState<LiveDailyPoint[] | null>(null);
-  const [liveUsers, setLiveUsers] = useState<LiveIdentityUser[]>([]);
-  const [liveLoading, setLiveLoading] = useState(false);
-  const [liveError, setLiveError] = useState(false);
+  // LIVE: the project and member filters are real ids, applied server-side.
+  const loadLive = useCallback(async (): Promise<LiveTimeActivity> => {
+    const qs = reportQuery({ from: range.from, to: range.to, projectId, userId: memberId });
+    const [summary, series] = await Promise.all([
+      getApi(`/api/app/reporting/summary?${qs}`),
+      getApi(`/api/app/reporting/daily-series?${qs}`),
+    ]);
+    return {
+      summary: summary && typeof summary === "object" ? (summary as LiveSummary) : {},
+      series: asArray<LiveDailyPoint>(series),
+    };
+  }, [range, projectId, memberId]);
 
-  // The filter selects list demo entities (non-GUID ids) — the backend can only
-  // filter by real GUIDs, so anything else keeps the mock rendering below.
-  const liveApplicable =
-    (projectId === "all" || GUID_RE.test(projectId)) &&
-    (memberId === "all" || GUID_RE.test(memberId));
-
-  const loadLive = useCallback(async () => {
-    setLiveLoading(true);
-    setLiveError(false);
-    try {
-      const { from, to } = liveRangeFor(range.key);
-      const qs = new URLSearchParams({ From: from.toISOString(), To: to.toISOString() });
-      if (projectId !== "all") qs.set("ProjectId", projectId);
-      const [summary, series] = await Promise.all([
-        getApi(`/api/app/reporting/summary?${qs.toString()}`),
-        getApi(`/api/app/reporting/daily-series?${qs.toString()}`),
-      ]);
-      setLiveSummary(summary && typeof summary === "object" ? (summary as LiveSummary) : null);
-      setLiveSeries(Array.isArray(series) ? (series as LiveDailyPoint[]) : []);
-      // Best effort: admins resolve member names, workers get a 403 -> keep ids.
-      const identityUsers = await getApi("/api/identity/users?MaxResultCount=100").catch(() => []);
-      setLiveUsers(Array.isArray(identityUsers) ? (identityUsers as LiveIdentityUser[]) : []);
-    } catch {
-      setLiveSummary(null); // fall back to the demo dataset below
-      setLiveSeries(null);
-      setLiveError(true);
-    } finally {
-      setLiveLoading(false);
-    }
-  }, [range, projectId]);
-
-  useEffect(() => {
-    if (typeof window === "undefined" || !localStorage.getItem("dosi-token")) return;
-    if (!liveApplicable) return;
-    loadLive();
-  }, [loadLive, liveApplicable]);
-
-  // Live data only counts while the backend could honor the current filters;
-  // demo-only selections render the mock aggregation below instead.
-  const activeSummary = liveApplicable ? liveSummary : null;
-  const activeSeries = liveApplicable ? liveSeries : null;
-  const live = activeSummary !== null && activeSeries !== null;
-  const showLiveLoading = liveApplicable && liveLoading && !live;
-  const showLiveError = liveApplicable && liveError;
+  const live = useLiveReport(isLive, loadLive);
 
   const acts = useMemo(() => {
     let list = filterActivitiesByRange(activities, range.from, range.to);
@@ -169,15 +101,14 @@ export function TimeActivityReport() {
     }
     
     acts.forEach((a) => {
-      const iso = a.endedAt.slice(0, 10);
+      const iso = dayKey(a);
       if (days[iso]) {
-        const p = projects.find((pr) => pr.id === a.projectId);
-        const mins = p?.intervalMinutes ?? 10;
+        const mins = durationMinutes(a);
         days[iso].tracked += mins;
         days[iso].productive += Math.round((mins * a.productivity) / 100);
       }
     });
-    
+
     return Object.values(days);
   }, [acts, range]);
 
@@ -188,11 +119,8 @@ export function TimeActivityReport() {
 
     return members.map((u) => {
       const ua = acts.filter((a) => a.userId === u.id);
-      const tracked = ua.reduce((s, a) => {
-        const p = projects.find((pr) => pr.id === a.projectId);
-        return s + (p?.intervalMinutes ?? 10);
-      }, 0);
-      const activity = ua.length ? Math.round(ua.reduce((s, a) => s + a.productivity, 0) / ua.length) : u.productivity;
+      const tracked = minutesForUser(acts, u.id);
+      const activity = ua.length ? averageProductivity(ua) : u.productivity;
       const appCount = new Map<string, number>();
       ua.forEach((a) => appCount.set(a.screen.app, (appCount.get(a.screen.app) ?? 0) + 1));
       const topApp = [...appCount.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? "—";
@@ -209,57 +137,51 @@ export function TimeActivityReport() {
     });
   }, [acts, memberId]);
 
-  const liveTrend = useMemo(() => {
-    if (!activeSeries) return null;
-    return activeSeries.map((d) => ({
-      day: new Date(d.date).toLocaleDateString("en", { weekday: "short", timeZone: "UTC" }),
-      tracked: Math.round(d.trackedMinutes),
-      productive: Math.round((d.trackedMinutes * d.averageProductivity) / 100),
-    }));
-  }, [activeSeries]);
+  const liveTrend = useMemo(
+    () =>
+      (live.data?.series ?? []).map((d) => ({
+        day: new Date(d.date).toLocaleDateString("en", { weekday: "short", timeZone: "UTC" }),
+        tracked: Math.round(d.trackedMinutes),
+        productive: Math.round((d.trackedMinutes * d.averageProductivity) / 100),
+      })),
+    [live.data],
+  );
 
-  const liveRows = useMemo<Row[] | null>(() => {
-    if (!activeSummary) return null;
-    const perUserList = Array.isArray(activeSummary.perUser) ? activeSummary.perUser : [];
-    const filtered = memberId === "all" ? perUserList : perUserList.filter((u) => u.userId === memberId);
-    return filtered.map((u) => {
-      const identity = liveUsers.find((x) => x.id === u.userId);
-      const identityName = identity ? `${identity.name ?? ""} ${identity.surname ?? ""}`.trim() : "";
-      const mockUser = userById(u.userId);
-      const tracked = Math.round(u.trackedMinutes);
-      const activity = Math.round(u.averageProductivity);
-      return {
-        userId: u.userId,
-        name: identityName || identity?.userName || mockUser?.name || u.userId.slice(0, 8),
-        designation: mockUser?.designation ?? "Member",
-        tracked,
-        activity,
-        sessions: u.activityCount,
-        productive: Math.round((tracked * activity) / 100),
-        topApp: "—",
-      };
-    });
-  }, [activeSummary, liveUsers, memberId]);
+  const liveRows = useMemo<Row[]>(
+    () =>
+      asArray<LivePerUser>(live.data?.summary.perUser)
+        .filter((u) => memberId === "all" || u.userId === memberId)
+        .map((u) => {
+          const member = userById(u.userId);
+          const tracked = Math.round(u.trackedMinutes);
+          const activity = Math.round(u.averageProductivity);
+          return {
+            userId: u.userId,
+            name: memberName(u.userId, member),
+            designation: member?.designation ?? "Member",
+            tracked,
+            activity,
+            sessions: u.activityCount,
+            productive: Math.round((tracked * activity) / 100),
+            topApp: "—",
+          };
+        }),
+    [live.data, memberId],
+  );
 
-  const rows = liveRows ?? mockRows;
-  const trendData = liveTrend ?? dynamicTrend;
+  // A live session shows only real rows (or nothing) — never the demo team.
+  const rows = isLive ? liveRows : mockRows;
+  const trendData = isLive ? liveTrend : dynamicTrend;
 
   let totalTracked: number;
   let avgActivity: number;
   let totalSessions: number;
-  if (activeSummary && liveRows) {
-    if (memberId === "all") {
-      totalTracked = Math.round(activeSummary.totalTrackedMinutes);
-      avgActivity = Math.round(activeSummary.averageProductivity);
-      totalSessions = activeSummary.totalActivities;
-    } else {
-      totalTracked = liveRows.reduce((s, r) => s + r.tracked, 0);
-      avgActivity =
-        totalTracked > 0
-          ? Math.round(liveRows.reduce((s, r) => s + r.tracked * r.activity, 0) / totalTracked)
-          : 0;
-      totalSessions = liveRows.reduce((s, r) => s + r.sessions, 0);
-    }
+  if (isLive) {
+    // The summary is already scoped by the ProjectId/UserId filters.
+    const s = live.data?.summary;
+    totalTracked = Math.round(Number(s?.totalTrackedMinutes) || 0);
+    avgActivity = Math.round(Number(s?.averageProductivity) || 0);
+    totalSessions = Number(s?.totalActivities) || 0;
   } else {
     totalTracked = rows.reduce((s, r) => s + r.tracked, 0);
     avgActivity = rows.length ? Math.round(rows.reduce((s, r) => s + r.activity, 0) / rows.length) : 0;
@@ -334,25 +256,18 @@ export function TimeActivityReport() {
         onMember={setMemberId}
       />
 
-      {showLiveLoading ? (
-        <Card>
-          <CardContent className="py-16 text-center text-sm text-muted-foreground">
-            Loading live report data…
-          </CardContent>
-        </Card>
-      ) : (
-        <>
-      {showLiveError && (
-        <div className="rounded-lg border border-border bg-muted px-3 py-2 text-xs text-muted-foreground">
-          Live data unavailable right now — showing demo data.
-        </div>
-      )}
+      {isLive && <LiveReportNotice loading={live.loading} error={live.error} onRetry={live.retry} />}
 
       <KpiGrid>
         <Kpi label="Total tracked" value={formatDuration(totalTracked)} icon={Clock} tone="#6d5efc" />
         <Kpi label="Avg activity" value={`${avgActivity}%`} icon={Gauge} tone="#22c55e" />
         <Kpi label="Sessions" value={String(totalSessions)} icon={CalendarCheck} tone="#0ea5e9" />
-        <Kpi label="Screenshots" value={String(totalSessions)} icon={Camera} tone="#ec4899" sub="auto-captured" />
+        {isLive ? (
+          // The summary carries no screenshot count; don't restate sessions as screenshots.
+          <Kpi label="Members tracked" value={String(rows.length)} icon={Users} tone="#ec4899" />
+        ) : (
+          <Kpi label="Screenshots" value={String(totalSessions)} icon={Camera} tone="#ec4899" sub="auto-captured" />
+        )}
       </KpiGrid>
 
       <Card>
@@ -388,7 +303,12 @@ export function TimeActivityReport() {
         </CardHeader>
         <CardContent>
           {viewMode === "table" ? (
-            <DataTable columns={columns} rows={rows} initialSort={{ key: "tracked", dir: "desc" }} />
+            <DataTable
+              columns={columns}
+              rows={rows}
+              initialSort={{ key: "tracked", dir: "desc" }}
+              emptyText={isLive ? "No tracked time for these filters." : undefined}
+            />
           ) : (
             <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
               {rows.map((r) => {
@@ -430,8 +350,6 @@ export function TimeActivityReport() {
           )}
         </CardContent>
       </Card>
-        </>
-      )}
     </ReportShell>
   );
 }
