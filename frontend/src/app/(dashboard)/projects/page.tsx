@@ -22,7 +22,7 @@ import { SearchField, SegmentedControl, Toolbar } from "@/components/ui/toolbar"
 import { CreateProjectModal } from "@/components/projects/create-project-modal";
 import { EmptyState } from "@/components/ui/empty-state";
 import { useSession } from "@/components/session-provider";
-import { createTenantProject, userById } from "@/lib/tenant-data";
+import { createTenantProject, projectById, userById } from "@/lib/tenant-data";
 import { scopeProjects } from "@/lib/scope";
 import { useApi, getApi, postApi } from "@/hooks/useApi";
 import type { Project } from "@/lib/types";
@@ -53,7 +53,7 @@ interface ApiProject {
   creationTime?: string;
 }
 
-/** Shape returned by GET /api/app/team/project-members. */
+/** Shape returned by GET /api/app/team/project-members/{projectId}. */
 interface ApiProjectMember {
   id: string;
   projectId: string;
@@ -64,8 +64,13 @@ interface ApiProjectMember {
 /** Card view-model: a demo Project plus a flag telling us it came from the real API. */
 type ProjectView = Project & { live: boolean };
 
-/** Map a real backend project onto the card view-model the markup expects. */
+/**
+ * Map a real backend project onto the card view-model the markup expects.
+ * Membership and tracked totals come from the session's live dataset (built
+ * from the real roster and rows) when it knows the project.
+ */
 function toProjectView(p: ApiProject): ProjectView {
+  const known = projectById(p.id);
   return {
     id: p.id,
     title: p.title,
@@ -81,25 +86,31 @@ function toProjectView(p: ApiProject): ProjectView {
       activeWindow: !!p.allowActiveWindow,
       runningPrograms: !!p.allowRunningPrograms,
     },
-    memberIds: [], // real members are fetched lazily per project (see membersByProject)
+    // Real members are also fetched lazily per project (see membersByProject);
+    // the roster-derived list is used for scoping and is always an array.
+    memberIds: [...(known?.memberIds ?? [])],
     createdAt: (p.creationTime ?? "").slice(0, 10),
-    loggedThisWeek: 0,
-    loggedThisMonth: 0,
-    loggedTotal: 0,
+    loggedThisWeek: known?.loggedThisWeek ?? 0,
+    loggedThisMonth: known?.loggedThisMonth ?? 0,
+    loggedTotal: known?.loggedTotal ?? 0,
     live: true,
   };
 }
 
-/** Generic two-character initials derived from a userId GUID (no mock lookup). */
+/**
+ * Avatar name for a real member: their roster name, else a neutral label.
+ * Workers only receive their own roster row, so teammates are unknown here —
+ * initials derived from a GUID ("3A") read as a broken name.
+ */
 function memberAvatarName(userId: string): string {
-  const clean = userId.replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
-  return `${clean.charAt(0) || "U"} ${clean.charAt(1)}`.trim();
+  return userById(userId)?.name ?? "Team member";
 }
 
 export default function ProjectsPage() {
-  const { user, workspace } = useSession();
+  const { user, workspace, isLive, refreshSession } = useSession();
   const canManage = user.role === "owner" || user.role === "admin";
-  const { data: apiProjects, error, isLoading, refetch } = useApi<ApiProject[]>('/api/app/project');
+  // Demo mode never touches the network.
+  const { data: apiProjects, error, isLoading, refetch } = useApi<ApiProject[]>('/api/app/project?MaxResultCount=1000', { enabled: isLive });
   const [query, setQuery] = useState("");
   const [tab, setTab] = useState<"active" | "archived">("active");
   const [open, setOpen] = useState(false);
@@ -107,21 +118,17 @@ export default function ProjectsPage() {
   const [createError, setCreateError] = useState<string | null>(null);
   // Demo-mode projects created locally through the modal (mock path only).
   const [created, setCreated] = useState<Project[]>([]);
-  // LIVE MODE gate — resolved in an effect so SSR and the first client render match.
-  const [isLive, setIsLive] = useState(false);
   // projectId -> members, lazily filled for visible REAL projects. undefined = not loaded yet.
   const [membersByProject, setMembersByProject] = useState<Record<string, ApiProjectMember[]>>({});
   const requestedMembersRef = useRef<Set<string>>(new Set());
 
-  useEffect(() => {
-    setIsLive(typeof window !== "undefined" && !!localStorage.getItem("dosi-token"));
-  }, []);
-
-  // Live projects when the API call succeeded; otherwise fall back to the demo dataset.
-  const liveProjects = useMemo<ProjectView[] | null>(
-    () => (isLive && apiProjects ? apiProjects.map(toProjectView) : null),
-    [isLive, apiProjects]
-  );
+  // Live projects when the API call succeeded. A member (worker/client) only
+  // sees the projects they belong to, exactly as in demo mode.
+  const liveProjects = useMemo<ProjectView[] | null>(() => {
+    if (!isLive || !Array.isArray(apiProjects)) return null;
+    const views = apiProjects.filter((p) => p && typeof p.id === "string").map(toProjectView);
+    return canManage ? views : views.filter((p) => p.memberIds.includes(user.id));
+  }, [isLive, apiProjects, canManage, user.id]);
 
   const mockProjects = useMemo<ProjectView[]>(() => {
     let scoped: Project[] = [];
@@ -137,7 +144,8 @@ export default function ProjectsPage() {
     return [...created, ...scoped.filter((p) => !createdIds.has(p.id))].map((p) => ({ ...p, live: false }));
   }, [created, user]);
 
-  const list = liveProjects ?? mockProjects;
+  // Live: real projects only — a failed load shows an error, never the demo list.
+  const list = useMemo(() => (isLive ? (liveProjects ?? []) : mockProjects), [isLive, liveProjects, mockProjects]);
   const liveLoading = isLive && isLoading && !liveProjects;
   const liveError = isLive && !!error && !liveProjects;
 
@@ -157,7 +165,7 @@ export default function ProjectsPage() {
     for (const p of filtered) {
       if (!p.live || requestedMembersRef.current.has(p.id)) continue;
       requestedMembersRef.current.add(p.id);
-      getApi(`/api/app/team/project-members?projectId=${p.id}`)
+      getApi(`/api/app/team/project-members/${encodeURIComponent(p.id)}`)
         .then((rows) => {
           setMembersByProject((prev) => ({
             ...prev,
@@ -203,7 +211,7 @@ export default function ProjectsPage() {
 
       {createError && (
         <div className="flex items-start justify-between gap-3 rounded-lg border border-danger/40 bg-danger/10 px-3 py-2 text-sm text-danger">
-          <span>Couldn’t create the project — {createError}</span>
+          <span>{createError}</span>
           <button
             type="button"
             onClick={() => setCreateError(null)}
@@ -215,8 +223,8 @@ export default function ProjectsPage() {
       )}
 
       {liveError && (
-        <p className="text-xs text-muted-foreground">
-          Couldn’t load live projects — showing demo data.{" "}
+        <p className="text-xs text-danger">
+          Couldn’t load your projects from the server.{" "}
           <button
             type="button"
             onClick={() => void refetch()}
@@ -247,7 +255,7 @@ export default function ProjectsPage() {
             </Card>
           ))}
         </div>
-      ) : filtered.length === 0 ? (
+      ) : liveError ? null : filtered.length === 0 ? (
         <EmptyState
           icon={Archive}
           title={query ? "No matching projects" : `No ${tab} projects`}
@@ -343,17 +351,17 @@ export default function ProjectsPage() {
                     ) : (
                       <>
                         <div className="flex -space-x-2">
-                          {p.memberIds.slice(0, 4).map((id) => {
+                          {(p.memberIds ?? []).slice(0, 4).map((id) => {
                             const u = userById(id);
                             return u ? <Avatar key={id} name={u.name} size="sm" /> : null;
                           })}
-                          {p.memberIds.length > 4 && (
+                          {(p.memberIds ?? []).length > 4 && (
                             <span className="flex h-8 w-8 items-center justify-center rounded-full bg-muted text-xs font-medium ring-2 ring-card">
-                              +{p.memberIds.length - 4}
+                              +{(p.memberIds ?? []).length - 4}
                             </span>
                           )}
                         </div>
-                        <span className="text-xs text-muted-foreground">{p.memberIds.length} members</span>
+                        <span className="text-xs text-muted-foreground">{(p.memberIds ?? []).length} members</span>
                       </>
                     )}
                   </div>
@@ -379,7 +387,7 @@ export default function ProjectsPage() {
           }
           setIsCreating(true);
           try {
-            await postApi('/api/app/project', {
+            const createdProject = (await postApi('/api/app/project', {
               title: p.title,
               description: p.description,
               color: p.color,
@@ -390,10 +398,27 @@ export default function ProjectsPage() {
               allowMouse: p.permissions.mouse,
               allowActiveWindow: p.permissions.activeWindow,
               allowRunningPrograms: p.permissions.runningPrograms,
-            });
+            })) as { id?: string } | null;
+            // The backend adds the creator; add everyone else picked in the
+            // wizard (real roster members) so the selection isn't silently lost.
+            const others = (p.memberIds ?? []).filter((mid) => mid !== user.id);
+            if (createdProject?.id && others.length > 0) {
+              const results = await Promise.allSettled(
+                others.map((userId) =>
+                  postApi('/api/app/team/member', { projectId: createdProject.id, userId, role: 'Worker', hourlyRate: 0 }),
+                ),
+              );
+              const failed = results.filter((r) => r.status === 'rejected').length;
+              if (failed > 0) {
+                setCreateError(`The project was created, but ${failed} member${failed === 1 ? '' : 's'} couldn’t be added (check your plan’s seat limit).`);
+              }
+            }
             await refetch();
+            // The creator is now a member: refresh the session's live dataset
+            // so pickers, the checklist and scoping see the new project.
+            void refreshSession({ silent: true });
           } catch (e) {
-            setCreateError(e instanceof Error ? e.message : "Something went wrong. Please try again.");
+            setCreateError(`Couldn’t create the project — ${e instanceof Error ? e.message : "Something went wrong. Please try again."}`);
           } finally {
             setIsCreating(false);
           }

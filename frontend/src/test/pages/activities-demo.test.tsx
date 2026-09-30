@@ -15,7 +15,7 @@ import { renderAsRole, resetPrototypeState } from "@/test/harness";
 beforeEach(() => {
   resetPrototypeState();
   // Never-settling fetch keeps the test deterministic and forces the demo path
-  // (the page's useApi always fires one request on mount).
+  // (demo mode must not call it at all — the page's useApi is disabled offline).
   vi.stubGlobal("fetch", vi.fn<typeof fetch>().mockImplementation(() => new Promise<Response>(() => {})));
 });
 

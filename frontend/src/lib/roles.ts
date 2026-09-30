@@ -17,6 +17,8 @@ export const navAccess: Record<string, Role[]> = {
   "/insights": ["owner", "admin"],
   "/billing": ["owner"],
   "/settings": ["owner", "admin", "worker", "client"],
+  // Desktop agent downloads (onboarding) — anyone who is tracked
+  "/download": ["owner", "admin", "worker"],
 };
 
 export function canAccess(role: Role, href: string): boolean {

@@ -19,6 +19,7 @@ function Probe() {
   const session = useSession();
   return (
     <div>
+      <span data-testid="status">{session.status}</span>
       <span data-testid="user-name">{session.user.name}</span>
       <span data-testid="workspace-name">{session.workspace.name}</span>
     </div>
@@ -37,7 +38,11 @@ const hostilePayloads: ReadonlyArray<readonly [string, string]> = [
   ["a 100KB string", HUGE],
 ];
 
-/** Every dosi-* key read by the app (dosi-projects-created-* is tested below). */
+/**
+ * Every dosi-* demo-session key read by the app (dosi-projects-created-* is
+ * tested below). dosi-token is special: ANY value is a bearer token and starts
+ * a live session, so it has its own contract further down.
+ */
 const storageKeys = [
   "dosi-user",
   "dosi-workspace",
@@ -46,7 +51,6 @@ const storageKeys = [
   "dosi-workspaces-deleted",
   "dosi-impersonating",
   "dosi-theme",
-  "dosi-token",
   "dosi-tenant",
 ] as const;
 
@@ -78,6 +82,22 @@ describe("corrupted session storage never crashes the app", () => {
 
       expect(screen.getByTestId("user-name")).toHaveTextContent("Ayesha Rahman");
       expect(screen.getByTestId("workspace-name")).toHaveTextContent("Dosi Labs");
+    },
+  );
+});
+
+describe("a garbage dosi-token never crashes the app — and never shows demo data", () => {
+  it.each(hostilePayloads.map(([label, value]) => ({ label, value })))(
+    "lands in the live error state (backend unreachable) when dosi-token holds $label",
+    async ({ value }) => {
+      localStorage.setItem("dosi-token", value);
+
+      expect(() => renderWithProviders(<Probe />)).not.toThrow();
+      await act(async () => {});
+
+      expect(screen.getByTestId("status")).toHaveTextContent("error");
+      expect(screen.getByTestId("user-name")).not.toHaveTextContent("Ayesha Rahman");
+      expect(screen.getByTestId("workspace-name")).not.toHaveTextContent("Dosi Labs");
     },
   );
 });

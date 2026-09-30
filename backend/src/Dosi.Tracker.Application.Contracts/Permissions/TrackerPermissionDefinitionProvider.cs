@@ -1,6 +1,7 @@
 using Dosi.Tracker.Localization;
 using Volo.Abp.Authorization.Permissions;
 using Volo.Abp.Localization;
+using Volo.Abp.MultiTenancy;
 
 namespace Dosi.Tracker.Permissions;
 
@@ -24,6 +25,12 @@ public class TrackerPermissionDefinitionProvider : PermissionDefinitionProvider
 
         group.AddPermission(TrackerPermissions.Billing.Default, L("Permission:Billing"));
         group.AddPermission(TrackerPermissions.Reporting.Default, L("Permission:Reporting"));
+
+        // Host-only: a tenant admin (who is granted every tenant-side permission on seed) never gets it.
+        group.AddPermission(
+            TrackerPermissions.Platform.Default,
+            L("Permission:Platform"),
+            multiTenancySide: MultiTenancySides.Host);
     }
 
     private static LocalizableString L(string name)

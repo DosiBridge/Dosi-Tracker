@@ -10,9 +10,18 @@ import { ToastViewport } from "@/components/toast";
 import { RoleGuard } from "@/components/role-guard";
 import { PageEnter } from "@/components/motion/reveal";
 import { useSession } from "@/components/session-provider";
+import { LiveWarningBanner, SessionGate } from "@/components/session-gate";
 import { cn } from "@/lib/utils";
 
 export default function DashboardLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <SessionGate area="tenant">
+      <DashboardShell>{children}</DashboardShell>
+    </SessionGate>
+  );
+}
+
+function DashboardShell({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const pathname = usePathname();
   const [collapsed, setCollapsed] = useState(false);
@@ -55,6 +64,7 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
           </div>
         )}
         <Topbar onMenuClick={() => setMobileOpen(true)} />
+        <LiveWarningBanner />
         <main id="main-content" tabIndex={-1} key={workspace.id} className="app-canvas mx-auto max-w-[1400px] p-4 lg:p-6 outline-none">
           <PageEnter motionKey={`${workspace.id}:${pathname}`}>
             <RoleGuard>{children}</RoleGuard>

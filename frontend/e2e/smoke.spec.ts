@@ -18,7 +18,7 @@ test("login page renders its sign-in form @smoke", async ({ browser, baseURL }) 
   const page = await context.newPage();
   await page.goto(`${baseURL}/login`);
   await expect(page.getByRole("heading", { name: "Welcome back" })).toBeVisible();
-  await expect(page.getByPlaceholder("acme (leave empty for host sign-in)")).toBeVisible();
+  await expect(page.getByPlaceholder("Your workspace name")).toBeVisible();
   await expect(page.getByText("Email", { exact: true })).toBeVisible();
   await expect(page.getByText("Password", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Sign in" })).toBeEnabled();

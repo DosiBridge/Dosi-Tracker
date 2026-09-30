@@ -59,3 +59,35 @@ public class InviteMemberResultDto
     /// user already existed.</summary>
     public string? InitialPassword { get; set; }
 }
+
+/// <summary>Change an existing project membership. The role is a free-form label ("Worker", "Admin",
+/// "Manager", …); Admin/Manager (case-insensitive) also confer the Identity "manager" role.</summary>
+public class UpdateProjectMemberDto
+{
+    [System.ComponentModel.DataAnnotations.Required]
+    [System.ComponentModel.DataAnnotations.MaxLength(64)]
+    public string Role { get; set; } = "Worker";
+
+    [System.ComponentModel.DataAnnotations.Range(0, 10000)]
+    public decimal HourlyRate { get; set; }
+}
+
+/// <summary>A person in the workspace (an Identity user of the current tenant) with their tracker roles.</summary>
+public class TeamMemberDto
+{
+    public Guid UserId { get; set; }
+    public string UserName { get; set; } = string.Empty;
+    public string? Name { get; set; }
+    public string? Surname { get; set; }
+    public string? Email { get; set; }
+    public bool IsActive { get; set; }
+
+    /// <summary>Holds the Identity "manager" role (team lead).</summary>
+    public bool IsManager { get; set; }
+
+    /// <summary>Holds the Identity "admin" role (workspace owner/administrator).</summary>
+    public bool IsOwner { get; set; }
+
+    /// <summary>Projects the user is a member of.</summary>
+    public System.Collections.Generic.List<Guid> ProjectIds { get; set; } = new();
+}

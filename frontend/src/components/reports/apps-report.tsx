@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { Bar, BarChart, Cell, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { AppWindow, Clock, TrendingUp, TrendingDown } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -8,10 +8,11 @@ import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 import { Select } from "@/components/ui/input";
 import { DataTable, type Column } from "@/components/ui/data-table";
-import { ReportShell, FilterBar, ExportMenu, Kpi, KpiGrid } from "./report-shell";
-import { activities, appCatalog } from "@/lib/tenant-data";
+import { ReportShell, FilterBar, ExportMenu, Kpi, KpiGrid, LiveReportNotice, useLiveReport } from "./report-shell";
+import { activities } from "@/lib/tenant-data";
 import { durationMinutes } from "@/lib/metrics";
-import { categoryColor, filterActivitiesByRange, rangeForKey, type AppCategory, type AppUsage, type RangeKey } from "@/lib/reports-data";
+import { categoryColor, filterActivitiesByRange, type AppCategory, type AppUsage, type RangeKey } from "@/lib/reports-data";
+import { asArray, reportQuery, safePercent } from "@/lib/report-math";
 
 const APP_PALETTE: { app: string; category: AppCategory; color: string }[] = [
   { app: "Visual Studio Code", category: "productive", color: "#3b82f6" },
@@ -33,7 +34,8 @@ import { exportRecords } from "@/lib/export";
 import { formatDuration, colorFromString } from "@/lib/utils";
 import { getApi } from "@/hooks/useApi";
 import { useIsMdUp } from "@/hooks/use-media-query";
-import type { ResolvedRange } from "./date-range-picker";
+import { useSession } from "@/components/session-provider";
+import { resolveRange, type ResolvedRange } from "./date-range-picker";
 
 /* ---- Live (API) shape: /api/app/reporting/app-usage ---- */
 interface LiveAppUsage {
@@ -41,34 +43,6 @@ interface LiveAppUsage {
   trackedMinutes: number;
   activityCount: number;
   userCount: number;
-}
-
-/** Live queries pivot on the real clock; mirrors rangeForKey's per-preset logic. */
-function liveRangeFor(key: RangeKey): { from: Date; to: Date } {
-  const to = new Date();
-  const from = new Date();
-  switch (key) {
-    case "today":
-      from.setHours(0, 0, 0, 0);
-      break;
-    case "yesterday":
-      from.setDate(from.getDate() - 1);
-      from.setHours(0, 0, 0, 0);
-      to.setDate(to.getDate() - 1);
-      to.setHours(23, 59, 59, 999);
-      break;
-    case "30d":
-      from.setDate(from.getDate() - 30);
-      break;
-    case "month":
-      from.setDate(1);
-      from.setHours(0, 0, 0, 0);
-      break;
-    default: // "7d" and "custom" fall back to the last 7 days
-      from.setDate(from.getDate() - 7);
-      break;
-  }
-  return { from, to };
 }
 
 const tooltipStyle = {
@@ -87,35 +61,17 @@ const catTone: Record<AppCategory, "success" | "info" | "danger"> = {
 
 export function AppsReport() {
   const md = useIsMdUp();
+  const { isLive } = useSession();
   const [rangeKey, setRangeKey] = useState<RangeKey>("7d");
-  const [range, setRange] = useState<ResolvedRange>(() => ({ key: "7d", ...rangeForKey("7d") }));
+  const [range, setRange] = useState<ResolvedRange>(() => resolveRange("7d"));
   const [category, setCategory] = useState<AppCategory | "all">("all");
 
-  const [liveUsage, setLiveUsage] = useState<LiveAppUsage[] | null>(null);
-  const [liveLoading, setLiveLoading] = useState(false);
-  const [liveError, setLiveError] = useState(false);
-
-  const loadLive = useCallback(async () => {
-    setLiveLoading(true);
-    setLiveError(false);
-    try {
-      const { from, to } = liveRangeFor(range.key);
-      const qs = new URLSearchParams({ From: from.toISOString(), To: to.toISOString() });
-      const usage = await getApi(`/api/app/reporting/app-usage?${qs.toString()}`);
-      setLiveUsage(Array.isArray(usage) ? (usage as LiveAppUsage[]) : []);
-    } catch {
-      setLiveUsage(null); // fall back to the demo dataset below
-      setLiveError(true);
-    } finally {
-      setLiveLoading(false);
-    }
+  const loadLive = useCallback(async (): Promise<LiveAppUsage[]> => {
+    const usage = await getApi(`/api/app/reporting/app-usage?${reportQuery({ from: range.from, to: range.to })}`);
+    return asArray<LiveAppUsage>(usage);
   }, [range]);
 
-  useEffect(() => {
-    if (typeof window === "undefined" || !localStorage.getItem("dosi-token")) return;
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- data fetch defers its own setState; see docs/QUALITY.md §10
-    loadLive();
-  }, [loadLive]);
+  const live = useLiveReport(isLive, loadLive);
 
   const mockAllApps = useMemo<AppUsage[]>(() => {
     const acts = filterActivitiesByRange(activities, range.from, range.to);
@@ -150,12 +106,11 @@ export function AppsReport() {
       }));
   }, [range]);
 
-  const liveAllApps = useMemo<AppUsage[] | null>(() => {
-    if (!liveUsage) return null;
+  const liveAllApps = useMemo<AppUsage[]>(() => {
     const meta = new Map(APP_PALETTE.map((a) => [a.app, { category: a.category, color: a.color }]));
     // The backend tracks usage, not classification, and reports process names (code.exe). Category is
     // a client heuristic: known apps keep their palette tone, everything else reads as neutral.
-    return liveUsage.map((u) => {
+    return (live.data ?? []).map((u) => {
       const m = meta.get(u.appName);
       return {
         app: u.appName,
@@ -165,11 +120,10 @@ export function AppsReport() {
         activeUsers: u.userCount,
       };
     });
-  }, [liveUsage]);
+  }, [live.data]);
 
-  const allApps = liveAllApps ?? mockAllApps;
-  const showLiveLoading = liveLoading && liveAllApps === null;
-  const showLiveError = liveError && liveAllApps === null;
+  // A live session shows only real usage (or nothing) — never the demo app mix.
+  const allApps = isLive ? liveAllApps : mockAllApps;
 
   const rows = useMemo<AppUsage[]>(() => {
     return allApps
@@ -203,7 +157,7 @@ export function AppsReport() {
     { key: "share", header: "Share", align: "right", sortValue: (r) => r.minutes, render: (r) => (
       <div className="ml-auto flex w-28 items-center gap-2">
         <Progress value={(r.minutes / (topApp?.minutes || 1)) * 100} color={r.color} />
-        <span className="w-9 text-right text-xs">{Math.round((r.minutes / total) * 100)}%</span>
+        <span className="w-9 text-right text-xs">{safePercent(r.minutes, total)}%</span>
       </div>
     )},
     { key: "activeUsers", header: "Users", align: "right", sortValue: (r) => r.activeUsers, render: (r) => r.activeUsers },
@@ -215,7 +169,7 @@ export function AppsReport() {
       { header: "Application", value: (r) => r.app },
       { header: "Category", value: (r) => r.category },
       { header: "Time (min)", value: (r) => r.minutes },
-      { header: "Share %", value: (r) => Math.round((r.minutes / total) * 100) },
+      { header: "Share %", value: (r) => safePercent(r.minutes, total) },
       { header: "Active users", value: (r) => r.activeUsers },
     ]);
   }
@@ -239,16 +193,7 @@ export function AppsReport() {
         }
       />
 
-      {showLiveLoading && (
-        <div className="rounded-lg border border-border bg-muted px-3 py-2 text-xs text-muted-foreground">
-          Loading live report data…
-        </div>
-      )}
-      {showLiveError && (
-        <div className="rounded-lg border border-border bg-muted px-3 py-2 text-xs text-muted-foreground">
-          Live data unavailable right now — showing demo data.
-        </div>
-      )}
+      {isLive && <LiveReportNotice loading={live.loading} error={live.error} onRetry={live.retry} />}
 
       <KpiGrid>
         <Kpi label="Total app time" value={formatDuration(total)} icon={Clock} tone="#6d5efc" sub={range.label} />
@@ -277,7 +222,7 @@ export function AppsReport() {
                   <span className="flex items-center gap-2">
                     <span className="h-2.5 w-2.5 rounded-full" style={{ background: d.color }} /> {d.name}
                   </span>
-                  <span className="font-medium">{total ? Math.round((d.value / total) * 100) : 0}%</span>
+                  <span className="font-medium">{safePercent(d.value, total)}%</span>
                 </div>
               ))}
             </div>
@@ -327,7 +272,12 @@ export function AppsReport() {
       <Card>
         <CardHeader><CardTitle>All applications</CardTitle><span className="text-xs text-muted-foreground">{rows.length} apps</span></CardHeader>
         <CardContent>
-          <DataTable columns={columns} rows={rows} initialSort={{ key: "minutes", dir: "desc" }} />
+          <DataTable
+            columns={columns}
+            rows={rows}
+            initialSort={{ key: "minutes", dir: "desc" }}
+            emptyText={isLive ? "No app usage tracked in this range." : undefined}
+          />
         </CardContent>
       </Card>
     </ReportShell>

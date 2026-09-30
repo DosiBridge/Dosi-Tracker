@@ -28,6 +28,7 @@ const expectedAccess: Record<string, Record<Role, boolean>> = {
   "/insights": { host: false, owner: true, admin: true, worker: false, client: false },
   "/billing": { host: false, owner: true, admin: false, worker: false, client: false },
   "/settings": { host: false, owner: true, admin: true, worker: true, client: true },
+  "/download": { host: false, owner: true, admin: true, worker: true, client: false },
 };
 
 describe("canAccess — exhaustive role × route matrix", () => {

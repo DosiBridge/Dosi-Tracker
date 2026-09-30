@@ -23,6 +23,11 @@
     "/api/app/platform/overview",
     "/api/app/platform/users",
     "/api/app/platform/invoices",
-    "/api/app/platform/plans"
+    "/api/app/platform/plans",
+    "/api/app/reporting/user-daily-series",
+    "/api/app/team/members",
+    "/api/app/team/member",
+    "/api/app/notification/my-notifications",
+    "/api/app/notification/mark-as-read"
   ]
 }

@@ -13,6 +13,7 @@ import { useSession } from "@/components/session-provider";
 import { brand } from "@/lib/brand";
 import { platformInvoices, platformOverview } from "@/lib/host-data";
 import { getApi } from "@/hooks/useApi";
+import { asItems } from "@/lib/live-dataset";
 
 const usd = (n: number) => `$${Math.round(n).toLocaleString()}`;
 
@@ -37,7 +38,7 @@ const statusTone = (s: string): "success" | "warning" | "muted" =>
   s === "paid" ? "success" : s === "pending" || s === "due" ? "warning" : "muted";
 
 export default function HostBillingPage() {
-  const { workspaces } = useSession();
+  const { workspaces, isLive } = useSession();
 
   const [live, setLive] = useState<{ rows: Row[]; mrr: number } | null>(null);
   const [loading, setLoading] = useState(false);
@@ -49,9 +50,10 @@ export default function HostBillingPage() {
     try {
       const [overview, invoices] = await Promise.all([
         getApi("/api/app/platform/overview") as Promise<{ mrr?: number }>,
-        getApi("/api/app/platform/invoices?MaxResultCount=500") as Promise<{ items?: ApiInvoice[] }>,
+        getApi("/api/app/platform/invoices?MaxResultCount=500"),
       ]);
-      const items = Array.isArray(invoices?.items) ? invoices.items : [];
+      // getApi already unwrapped `items` — read the rows, not `.items` again.
+      const items = asItems<ApiInvoice>(invoices);
       setLive({
         mrr: overview?.mrr ?? 0,
         rows: items.map((i) => ({
@@ -63,7 +65,7 @@ export default function HostBillingPage() {
         })),
       });
     } catch {
-      setLive(null); // fall back to demo
+      setLive(null);
       setError(true);
     } finally {
       setLoading(false);
@@ -71,10 +73,10 @@ export default function HostBillingPage() {
   }, []);
 
   useEffect(() => {
-    if (typeof window === "undefined" || !localStorage.getItem("dosi-token")) return;
+    if (!isLive) return;
     // eslint-disable-next-line react-hooks/set-state-in-effect -- data fetch defers its own setState; see docs/QUALITY.md §10
     loadLive();
-  }, [loadLive]);
+  }, [loadLive, isLive]);
 
   const mockRows = useMemo<Row[]>(
     () =>
@@ -89,8 +91,9 @@ export default function HostBillingPage() {
   );
   const mockMrr = useMemo(() => platformOverview(workspaces).mrr, [workspaces]);
 
-  const rows = live?.rows ?? mockRows;
-  const mrr = live?.mrr ?? mockMrr;
+  // Live: real invoices only; a failed load shows an error, never demo revenue.
+  const rows = isLive ? (live?.rows ?? []) : mockRows;
+  const mrr = isLive ? (live?.mrr ?? 0) : mockMrr;
   const collected = rows.filter((i) => i.status === "paid").reduce((s, i) => s + i.amount, 0);
   const outstanding = rows.filter((i) => i.status === "pending").reduce((s, i) => s + i.amount, 0);
 
@@ -131,8 +134,9 @@ export default function HostBillingPage() {
         <div className="rounded-lg border border-border bg-muted px-3 py-2 text-xs text-muted-foreground">Loading billing…</div>
       )}
       {error && live === null && (
-        <div className="rounded-lg border border-border bg-muted px-3 py-2 text-xs text-muted-foreground">
-          Live billing unavailable right now — showing demo data.
+        <div className="flex items-center gap-3 rounded-lg border border-danger/30 bg-danger/5 px-3 py-2 text-xs text-danger">
+          <span className="flex-1">Couldn&apos;t load billing from the server.</span>
+          <button onClick={() => void loadLive()} className="font-medium text-primary hover:underline">Try again</button>
         </div>
       )}
 

@@ -3,13 +3,23 @@
 import { useEffect, useRef, useState } from "react";
 import { Calendar, Check, ChevronDown } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { rangeForKey, rangePresets, type RangeKey } from "@/lib/reports-data";
+import { rangePresets, type RangeKey } from "@/lib/reports-data";
+import { referenceNow } from "@/lib/live-session";
+import { rangeForKeyAt } from "@/lib/report-math";
 
 export interface ResolvedRange {
   key: RangeKey;
   from: Date;
   to: Date;
   label: string;
+}
+
+/**
+ * A preset's bounds on the session's clock: the frozen demo instant in demo
+ * mode (so the seeded rows line up), the real clock in a live session.
+ */
+export function resolveRange(key: RangeKey, now: Date = referenceNow()): ResolvedRange {
+  return { key, ...rangeForKeyAt(key, now) };
 }
 
 export function DateRangePicker({
@@ -32,8 +42,7 @@ export function DateRangePicker({
   }, []);
 
   function choose(key: RangeKey) {
-    const r = rangeForKey(key);
-    onChange({ key, ...r });
+    onChange(resolveRange(key));
     if (key !== "custom") setOpen(false);
   }
 

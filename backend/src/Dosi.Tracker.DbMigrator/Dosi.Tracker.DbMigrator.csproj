@@ -34,9 +34,12 @@
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </Content>
+    <!-- Git-ignored, developer-local overrides (e.g. the local DB password). Optional, and never
+         published: AddAppSettingsSecretsJson() is registered AFTER environment variables, so a
+         published copy would silently override the container's ConnectionStrings__Default. -->
     <None Remove="appsettings.secrets.json" />
-    <Content Include="appsettings.secrets.json">
-      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    <Content Include="appsettings.secrets.json" Condition="Exists('appsettings.secrets.json')">
+      <CopyToPublishDirectory>Never</CopyToPublishDirectory>
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </Content>
   </ItemGroup>

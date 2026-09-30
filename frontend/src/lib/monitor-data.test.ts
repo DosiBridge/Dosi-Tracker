@@ -8,10 +8,20 @@
 // productive on /monitor than on /team and /dashboard — the audit measured
 // Tanvir at 82 vs 76 and Sadia at 64 vs 54. Per-segment texture is intentional
 // and preserved; the day's TOTALS are what must reconcile.
-import { describe, it, expect } from "vitest";
+import { afterEach, describe, it, expect } from "vitest";
 import { users, NOW } from "./mock-data";
-import { buildDayTimeline, daySummary, availableDays } from "./monitor-data";
-import type { Role } from "./types";
+import {
+  appBreakdown,
+  availableDays,
+  buildDayTimeline,
+  daySummary,
+  fmtMin,
+  hourlyBuckets,
+  type DaySegment,
+} from "./monitor-data";
+import { installLiveDataset, projects, resetTenantDataForTests } from "./tenant-data";
+import type { Project, Role } from "./types";
+import { colorFromString } from "./utils";
 
 const TRACKED: Role[] = ["owner", "admin", "worker"];
 const trackedUsers = users.filter((u) => TRACKED.includes(u.role));
@@ -82,5 +92,101 @@ describe("Member Monitor on earlier days", () => {
     const a = buildDayTimeline(trackedUsers[0].id, today);
     const b = buildDayTimeline(trackedUsers[0].id, today);
     expect(a).toEqual(b);
+  });
+
+  it("anchors the day list on the clock it is given (a live session passes the real one)", () => {
+    const days = availableDays(3, new Date("2026-09-23T10:00:00.000Z"));
+    expect(days.map((d) => d.iso)).toEqual(["2026-09-23", "2026-09-22", "2026-09-21"]);
+    expect(days.map((d) => d.isToday)).toEqual([true, false, false]);
+    expect(availableDays(1)[0].iso).toBe(today);
+  });
+});
+
+// Regression: "Cannot read properties of undefined (reading 'id')". With real
+// (or partial) tenant data the generator's project fallback was `[projects[0]]`
+// — `[undefined]` in a workspace with no projects — and `p.memberIds.includes`
+// threw for a project without a member list. Every lookup is now guarded.
+describe("buildDayTimeline guards (never throws on partial data)", () => {
+  afterEach(() => resetTenantDataForTests());
+
+  const member = trackedUsers.find((u) => u.trackedToday > 0)!;
+
+  it("builds a project-less day instead of crashing when the workspace has no projects", () => {
+    projects.length = 0;
+    let segments: DaySegment[] = [];
+    expect(() => {
+      segments = buildDayTimeline(member.id, today);
+    }).not.toThrow();
+    expect(segments.length).toBeGreaterThan(0);
+    expect(segments.every((s) => s.projectId === null)).toBe(true);
+    expect(daySummary(segments).tracked).toBe(member.trackedToday);
+  });
+
+  it("tolerates projects without a member list", () => {
+    for (const p of projects) (p as Partial<Project>).memberIds = undefined;
+    expect(() => buildDayTimeline(member.id, today)).not.toThrow();
+    expect(daySummary(buildDayTimeline(member.id, today)).tracked).toBe(member.trackedToday);
+  });
+
+  it("returns an empty day for an unknown member or a malformed day key", () => {
+    expect(buildDayTimeline("nobody", today)).toEqual([]);
+    expect(buildDayTimeline(member.id, "")).toEqual([]);
+    expect(buildDayTimeline(member.id, undefined as unknown as string)).toEqual([]);
+  });
+
+  it("never generates a day for a real (live) tenant, even for a member with tracked time", () => {
+    installLiveDataset({
+      workspaceId: "live-monitor-test",
+      users: [{ ...member }],
+      projects: [],
+      activities: [],
+      now: NOW,
+    });
+    expect(buildDayTimeline(member.id, today)).toEqual([]);
+  });
+});
+
+describe("day roll-ups over an arbitrary axis", () => {
+  const block = (startMin: number, endMin: number, app = "Code"): DaySegment => ({
+    id: `b${startMin}`,
+    type: "work",
+    startMin,
+    endMin,
+    minutes: endMin - startMin,
+    app,
+    windowTitle: "",
+    projectId: null,
+    productivity: 50,
+    mouseClicks: 0,
+    keyboardHits: 0,
+    screen: { app, kind: "docs", accent: "#000" },
+  });
+
+  it("buckets the working day by default and any wider window on request", () => {
+    const early = [block(150, 210)];
+    expect(hourlyBuckets(early)).toHaveLength(12);
+    expect(hourlyBuckets(early).every((b) => b.minutes === 0)).toBe(true);
+    const wide = hourlyBuckets(early, 120, 1200);
+    expect(wide[0]).toEqual({ hour: "02:00", minutes: 30 });
+    expect(wide[1]).toEqual({ hour: "03:00", minutes: 30 });
+    expect(wide).toHaveLength(18);
+  });
+
+  it("ends a focus run at a gap between real blocks, but not at a sub-2-minute seam", () => {
+    expect(daySummary([block(540, 600), block(602, 660)]).longestFocus).toBe(118);
+    expect(daySummary([block(540, 600), block(603, 660)]).longestFocus).toBe(60);
+    expect(daySummary([block(540, 600), block(700, 790)]).longestFocus).toBe(90);
+  });
+
+  it("formats the end of the day as 24:00", () => {
+    expect(fmtMin(1440)).toBe("24:00");
+    expect(fmtMin(0)).toBe("00:00");
+    expect(fmtMin(605)).toBe("10:05");
+  });
+
+  it("gives apps outside the demo catalog a stable color of their own", () => {
+    const [row] = appBreakdown([block(600, 630, "Obscure Tool")]);
+    expect(row).toEqual({ app: "Obscure Tool", minutes: 30, accent: colorFromString("Obscure Tool", 60, 50), category: "neutral" });
+    expect(appBreakdown([block(600, 630, "constructor")])[0].accent).toBe(colorFromString("constructor", 60, 50));
   });
 });

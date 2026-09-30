@@ -1,9 +1,9 @@
 // ProjectsPage behavior in demo mode (no backend token): the create-project
 // wizard, title enforcement, cancel, active/archived segregation, and
 // persistence of demo-created projects, all through the real page + modal +
-// session wiring. Only global fetch is stubbed (the page's useApi always fires
-// one request on mount); a never-settling promise keeps the test deterministic
-// and forces the demo-data path.
+// session wiring. Only global fetch is stubbed — demo mode must never call it
+// (the page's useApi is disabled without a live session); a never-settling
+// promise would hang any accidental request.
 //
 // Persistence contract: demo-mode creation goes through createTenantProject()
 // in src/lib/tenant-data.ts, which writes localStorage
@@ -78,7 +78,7 @@ describe("projects page — create project (owner, demo mode)", () => {
     expect(screen.getByText("Orbital Launch")).toBeInTheDocument();
     expect(screen.getByText(/6 active/)).toBeInTheDocument();
     // No network write in demo mode — creation is purely local.
-    expect(fetchMock).toHaveBeenCalledTimes(1); // only the page's initial GET
+    expect(fetchMock).not.toHaveBeenCalled(); // demo mode never touches the network (not even a list GET)
   });
 
   it("a demo-created project is persisted and survives a remount (simulated reload)", async () => {

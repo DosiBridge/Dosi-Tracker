@@ -6,14 +6,14 @@
 
 use std::time::Duration;
 
-use chrono::{Datelike, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone, Utc};
 use tokio::sync::mpsc;
 
 use crate::api::{ApiClient, SubmitError};
 use crate::config::{AppConfig, CapturePermissions};
 use crate::credentials::{self, Credentials};
 use crate::state::{Command, ProjectOption, StateHandle, TrackerStatus};
-use crate::storage::Storage;
+use crate::storage::{self, QueueLimits, Storage};
 use crate::tracking::Tracker;
 
 /// Server-resolved tracking session: which project, which permissions, how often.
@@ -70,8 +70,18 @@ pub fn spawn(state: StateHandle, cfg: AppConfig, repaint: impl Fn() + Send + 'st
 }
 
 /// How long parked (server-rejected) rows are kept for diagnostics before the
-/// queue reclaims their space.
+/// queue reclaims their space. Queued rows of an account that is not signed in
+/// wait this long for it to come back, then are purged too.
 const REJECTED_RETENTION_DAYS: u32 = 14;
+
+/// Rows read from the queue per round trip — each can embed a base64
+/// screenshot, so the backlog is never loaded into memory at once.
+const UPLOAD_BATCH: u32 = 20;
+
+/// Upper bound on uploads per sync pass. Commands (Pause, Quit) wait while a
+/// pass runs, so a large offline backlog drains over a few intervals instead
+/// of stalling them for minutes.
+const MAX_UPLOADS_PER_PASS: u32 = 100;
 
 async fn run(
     state: StateHandle,
@@ -79,7 +89,14 @@ async fn run(
     mut rx: mpsc::UnboundedReceiver<Command>,
     repaint: &(impl Fn() + Send),
 ) {
-    let store = match Storage::open(&storage_path()) {
+    // The saved sign-in decides whose queued rows are shown and uploadable, and
+    // claims rows queued by builds that predate per-account tagging.
+    let saved = credentials::load();
+    let saved_owner = saved
+        .as_ref()
+        .map(|c| storage::owner_key(&c.workspace, &c.username));
+
+    let store = match Storage::open(&storage_path(), saved_owner.as_deref()) {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(?e, "failed to open the local queue");
@@ -89,15 +106,10 @@ async fn run(
         }
     };
 
-    // Reclaim space from rows the server rejected long ago, and show the rest.
-    match store.purge_rejected_older_than(REJECTED_RETENTION_DAYS) {
-        Ok(n) if n > 0 => tracing::info!(purged = n, "removed old rejected activities"),
-        Err(e) => tracing::warn!(?e, "could not purge rejected activities"),
-        _ => {}
-    }
-    if let Ok(rejected) = store.rejected_count() {
-        state.update(|s| s.rejected_uploads = rejected);
-    }
+    // Reclaim space (old rejects, other accounts' expired rows, over-limit
+    // images), and show what is left.
+    maintain_queue(&store, saved_owner.as_deref());
+    refresh_queue_counts(&store, &state, saved_owner.as_deref());
 
     let tracker = Tracker::new();
     let mut client: Option<ApiClient> = None;
@@ -108,7 +120,7 @@ async fn run(
     let mut block_started_at = Utc::now();
 
     // Restore a previous sign-in so a relaunch (e.g. at login) resumes silently.
-    if let Some(saved) = credentials::load() {
+    if let Some(saved) = saved {
         state.update(|s| s.status = TrackerStatus::Connecting);
         repaint();
         let mut restored = ApiClient::new(
@@ -168,8 +180,13 @@ async fn run(
                                 if let Some(active) = &session {
                                     ticker = new_ticker(active.interval);
                                     ticker.tick().await;
-                                    block_started_at = Utc::now();
                                 }
+                                // Nothing from before this sign-in (signed-out
+                                // time, another account) belongs to this block.
+                                block_started_at = start_new_block(&tracker);
+                                let owner = candidate.owner_key();
+                                maintain_queue(&store, Some(&owner));
+                                refresh_queue_counts(&store, &state, Some(&owner));
                                 client = Some(candidate);
                                 paused = false;
                             }
@@ -186,6 +203,12 @@ async fn run(
                         let _ = credentials::clear();
                         client = None;
                         session = None;
+                        // Input made while signed out must not reach the next
+                        // account's first block.
+                        block_started_at = start_new_block(&tracker);
+                        // This account's queued rows stay (owner-tagged) until it
+                        // signs in again; they are just not shown to anyone else.
+                        refresh_queue_counts(&store, &state, None);
                         state.update(|s| {
                             s.display_name.clear();
                             s.projects.clear();
@@ -201,8 +224,9 @@ async fn run(
                             if let Some(active) = &session {
                                 ticker = new_ticker(active.interval);
                                 ticker.tick().await;
-                                block_started_at = Utc::now();
                             }
+                            // The new project starts a fresh block.
+                            block_started_at = start_new_block(&tracker);
                             // Remember the choice across restarts.
                             if let Some(mut saved) = credentials::load() {
                                 saved.project_id = Some(project_id);
@@ -210,16 +234,33 @@ async fn run(
                             }
                         }
                     }
-                    Command::Pause => paused = true,
-                    Command::Resume => {
-                        paused = false;
-                        // Do not bill the paused stretch: start a fresh block.
-                        block_started_at = Utc::now();
+                    // Both are guarded: the tray offers Pause and Resume at all
+                    // times, and a stray Resume while tracking must not throw
+                    // away the block in progress.
+                    Command::Pause if !paused => {
+                        paused = true;
+                        // End the block here: the partial block is discarded, so
+                        // no paused time can ever be attributed to it.
+                        block_started_at = start_new_block(&tracker);
                     }
+                    Command::Resume if paused => {
+                        paused = false;
+                        // Do not bill the paused stretch (or input made during
+                        // it): start a fresh block.
+                        block_started_at = start_new_block(&tracker);
+                    }
+                    Command::Pause | Command::Resume => {}
                     Command::SyncNow => {
-                        if let (Some(api), Some(active)) = (client.as_mut(), session.as_ref()) {
-                            block_started_at =
-                                capture_and_sync(&tracker, api, &store, active, &state, block_started_at).await;
+                        if let Some(api) = client.as_mut() {
+                            match session.as_ref() {
+                                Some(active) if !paused => {
+                                    block_started_at =
+                                        capture_and_sync(&tracker, api, &store, active, &state, block_started_at).await;
+                                }
+                                // Paused means nothing is captured, not even on
+                                // demand: only already-queued rows are uploaded.
+                                _ => sync_pending(api, &store, &state).await,
+                            }
                             refresh_totals(api, &state).await;
                         }
                     }
@@ -266,6 +307,56 @@ fn new_ticker(period: Duration) -> tokio::time::Interval {
     let mut ticker = tokio::time::interval(period);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ticker
+}
+
+/// Begin a new block now, discarding input counted before it (while paused,
+/// signed out, or on another project). Returns the block's start.
+fn start_new_block(tracker: &Tracker) -> DateTime<Utc> {
+    tracker.discard_input();
+    Utc::now()
+}
+
+/// Housekeeping that bounds the local queue: expire parked rows and other
+/// accounts' stale rows, then shed images/rows beyond [`QueueLimits::DEFAULT`].
+fn maintain_queue(store: &Storage, owner: Option<&str>) {
+    match store.purge_rejected_older_than(REJECTED_RETENTION_DAYS) {
+        Ok(n) if n > 0 => tracing::info!(purged = n, "removed old rejected activities"),
+        Err(e) => tracing::warn!(?e, "could not purge rejected activities"),
+        _ => {}
+    }
+    match store.purge_foreign_pending_older_than(owner, REJECTED_RETENTION_DAYS) {
+        Ok(n) if n > 0 => tracing::info!(purged = n, "removed expired activities of other accounts"),
+        Err(e) => tracing::warn!(?e, "could not purge other accounts' activities"),
+        _ => {}
+    }
+    enforce_queue_limits(store);
+}
+
+fn enforce_queue_limits(store: &Storage) {
+    match store.enforce_limits(&QueueLimits::DEFAULT) {
+        Ok(report) if report.stripped > 0 || report.dropped > 0 => tracing::warn!(
+            stripped = report.stripped,
+            dropped = report.dropped,
+            "offline queue over its limits; shed images / oldest activities"
+        ),
+        Err(e) => tracing::warn!(?e, "could not enforce offline queue limits"),
+        _ => {}
+    }
+}
+
+/// Show the signed-in account's pending / rejected counts (zero when signed out).
+fn refresh_queue_counts(store: &Storage, state: &StateHandle, owner: Option<&str>) {
+    let (pending, rejected) = match owner {
+        Some(owner) => (
+            store.pending_count(owner).unwrap_or(0),
+            store.rejected_count(owner).unwrap_or(0),
+        ),
+        None => (0, 0),
+    };
+    state.update(|s| {
+        s.pending_uploads = pending;
+        s.rejected_uploads = rejected;
+    });
 }
 
 /// Keep the local queue next to the per-user config, not the working directory —
@@ -394,15 +485,18 @@ async fn capture_and_sync(
         return now;
     }
 
-    let activity = tracker.snapshot(&session.perms, &session.project_id, started_at);
+    // The block ends exactly where the next one starts, so consecutive blocks
+    // never overlap by the time a capture takes.
+    let activity = tracker.snapshot(&session.perms, &session.project_id, started_at, now);
 
-    match store.enqueue(&activity) {
+    match store.enqueue(&activity, &client.owner_key()) {
         Ok(id) => tracing::debug!(id, "activity queued"),
         Err(e) => {
             tracing::error!(?e, "failed to queue activity");
             state.update(|s| s.last_error = Some(format!("Could not save locally: {e}")));
         }
     }
+    enforce_queue_limits(store);
 
     sync_pending(client, store, state).await;
 
@@ -413,13 +507,7 @@ async fn capture_and_sync(
 /// Refresh the today / this-week totals shown in the window.
 async fn refresh_totals(client: &mut ApiClient, state: &StateHandle) {
     let now = Utc::now();
-    let today_start = Utc
-        .with_ymd_and_hms(now.year(), now.month(), now.day(), 0, 0, 0)
-        .single()
-        .unwrap_or(now);
-    // Monday-anchored week.
-    let week_start = today_start
-        - chrono::Duration::days(now.weekday().num_days_from_monday() as i64);
+    let (today_start, week_start) = local_day_and_week_start(now, &Local);
 
     if let Ok(today) = client.summary(today_start, now).await {
         state.update(|s| {
@@ -432,41 +520,107 @@ async fn refresh_totals(client: &mut ApiClient, state: &StateHandle) {
     }
 }
 
-/// Upload queued activities. Permanently-rejected payloads are parked so they
-/// never block the queue; transient failures are retried next interval.
-async fn sync_pending(client: &mut ApiClient, store: &Storage, state: &StateHandle) {
-    let pending = match store.pending() {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::error!(?e, "failed to read pending activities");
-            return;
-        }
-    };
+/// Local midnight today and on this week's Monday, as UTC instants for the
+/// API. "Today" follows the user's wall clock, not UTC — otherwise the cards
+/// would reset mid-day (at 06:00 in UTC+6, at 19:00 the day before in UTC-5).
+fn local_day_and_week_start<Tz: TimeZone>(now: DateTime<Utc>, tz: &Tz) -> (DateTime<Utc>, DateTime<Utc>) {
+    let today = now.with_timezone(tz).date_naive();
+    // Monday-anchored week.
+    let monday = today - chrono::Days::new(u64::from(today.weekday().num_days_from_monday()));
+    (
+        local_midnight(today, tz).unwrap_or(now),
+        local_midnight(monday, tz).unwrap_or(now),
+    )
+}
 
-    let mut remaining = pending.len() as u32;
-    for (id, activity) in pending {
-        match client.submit_activity(&activity).await {
-            Ok(()) => {
-                let _ = store.remove_synced(id);
-                remaining = remaining.saturating_sub(1);
-                state.update(|s| { s.last_sync = Some(Utc::now()); s.last_error = None; });
-                tracing::debug!(id, "activity synced");
-            }
-            Err(SubmitError::Rejected(reason)) => {
-                tracing::warn!(id, %reason, "server rejected activity; parking it");
-                let _ = store.mark_rejected(id, &reason);
-                remaining = remaining.saturating_sub(1);
-                if let Ok(rejected) = store.rejected_count() {
-                    state.update(|s| s.rejected_uploads = rejected);
-                }
-            }
-            Err(SubmitError::Transient(e)) => {
-                tracing::warn!(?e, id, "sync failed; will retry next interval");
-                state.update(|s| s.last_error = Some("Offline — uploads will retry.".into()));
+/// The first instant of `date` in `tz`. Where a DST jump skips midnight, the
+/// day starts at the first hour that exists.
+fn local_midnight<Tz: TimeZone>(date: NaiveDate, tz: &Tz) -> Option<DateTime<Utc>> {
+    (0..3)
+        .find_map(|hour| tz.from_local_datetime(&date.and_hms_opt(hour, 0, 0)?).earliest())
+        .map(|start| start.with_timezone(&Utc))
+}
+
+/// Upload the signed-in account's queued activities, oldest first, in batches.
+/// Permanently-rejected payloads are parked so they never block the queue;
+/// transient failures are retried next interval. Rows queued by any other
+/// account are never read, let alone sent under this account's token.
+async fn sync_pending(client: &mut ApiClient, store: &Storage, state: &StateHandle) {
+    let owner = client.owner_key();
+    let mut cursor = 0;
+    let mut attempted = 0;
+
+    'pass: while attempted < MAX_UPLOADS_PER_PASS {
+        let limit = UPLOAD_BATCH.min(MAX_UPLOADS_PER_PASS - attempted);
+        let batch = match store.pending_batch(&owner, cursor, limit) {
+            Ok(batch) => batch,
+            Err(e) => {
+                tracing::error!(?e, "failed to read pending activities");
                 break;
+            }
+        };
+        if batch.is_empty() {
+            break;
+        }
+
+        for (id, activity) in batch {
+            // Paging by id: a row that fails to leave the queue is never
+            // retried within the same pass.
+            cursor = id;
+            attempted += 1;
+            match client.submit_activity(&activity).await {
+                Ok(()) => {
+                    let _ = store.remove_synced(id);
+                    state.update(|s| { s.last_sync = Some(Utc::now()); s.last_error = None; });
+                    tracing::debug!(id, "activity synced");
+                }
+                Err(SubmitError::Rejected(reason)) => {
+                    tracing::warn!(id, %reason, "server rejected activity; parking it");
+                    let _ = store.mark_rejected(id, &reason);
+                }
+                Err(SubmitError::Transient(e)) => {
+                    tracing::warn!(?e, id, "sync failed; will retry next interval");
+                    state.update(|s| s.last_error = Some("Offline — uploads will retry.".into()));
+                    break 'pass;
+                }
             }
         }
     }
 
-    state.update(|s| s.pending_uploads = remaining);
+    refresh_queue_counts(store, state, Some(&owner));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::FixedOffset;
+
+    fn utc(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    #[test]
+    fn today_starts_at_local_midnight_ahead_of_utc() {
+        // 02:00 on Thursday 24 Sep in UTC+6 is still Wednesday in UTC.
+        let dhaka = FixedOffset::east_opt(6 * 3600).unwrap();
+        let (today, week) = local_day_and_week_start(utc("2026-09-23T20:00:00Z"), &dhaka);
+        assert_eq!(today, utc("2026-09-23T18:00:00Z")); // Thu 24 Sep 00:00 +06
+        assert_eq!(week, utc("2026-09-20T18:00:00Z")); // Mon 21 Sep 00:00 +06
+    }
+
+    #[test]
+    fn today_starts_at_local_midnight_behind_utc() {
+        // 22:00 on Sunday 27 Sep in UTC-5 is already Monday in UTC.
+        let bogota = FixedOffset::west_opt(5 * 3600).unwrap();
+        let (today, week) = local_day_and_week_start(utc("2026-09-28T03:00:00Z"), &bogota);
+        assert_eq!(today, utc("2026-09-27T05:00:00Z")); // Sun 27 Sep 00:00 -05
+        assert_eq!(week, utc("2026-09-21T05:00:00Z")); // Mon 21 Sep 00:00 -05
+    }
+
+    #[test]
+    fn utc_zone_keeps_utc_midnights() {
+        let (today, week) = local_day_and_week_start(utc("2026-09-23T12:34:56Z"), &Utc);
+        assert_eq!(today, utc("2026-09-23T00:00:00Z"));
+        assert_eq!(week, utc("2026-09-21T00:00:00Z"));
+    }
 }

@@ -30,6 +30,7 @@ public class TrackerDbContextFactory : IDesignTimeDbContextFactory<TrackerDbCont
         var builder = new ConfigurationBuilder()
             .SetBasePath(Path.Combine(Directory.GetCurrentDirectory(), "../Dosi.Tracker.DbMigrator/"))
             .AddJsonFile("appsettings.json", optional: false)
+            .AddJsonFile("appsettings.secrets.json", optional: true) // git-ignored local DB credentials
             .AddEnvironmentVariables();
 
         return builder.Build();

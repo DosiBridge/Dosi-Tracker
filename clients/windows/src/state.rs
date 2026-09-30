@@ -125,6 +125,7 @@ pub enum Command {
     Pause,
     Resume,
     /// Capture + sync immediately instead of waiting for the next interval.
+    /// While paused it only uploads already-queued rows and never captures.
     SyncNow,
     Shutdown,
 }

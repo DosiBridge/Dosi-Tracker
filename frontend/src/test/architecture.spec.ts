@@ -252,10 +252,10 @@ describe("architecture spec: persistence boundaries", () => {
    *  - Designed persistence layer: session-provider (dosi-user/-workspace/…),
    *    useApi (dosi-token/-tenant), tenant-data (dosi-projects-created-*),
    *    theme-provider + the static pre-hydration theme script in app/layout.
-   *  - KNOWN TECH DEBT: 22 pages/dashboards/report widgets re-implement the
-   *    same `localStorage.getItem("dosi-token")` live-mode probe inline. Do NOT
-   *    add a 23rd — extract a shared `hasLiveSession()` helper instead, and
-   *    shrink this list as callers migrate.
+   *  - lib/live-session: THE single live-mode probe (`isLiveSession()` reads
+   *    dosi-token). The 22 pages/dashboards/report widgets that used to
+   *    re-implement `localStorage.getItem("dosi-token")` inline now call it or
+   *    read `useSession().isLive`. Do NOT reintroduce an inline probe.
    */
   const STORAGE_ALLOWLIST = new Set<string>([
     // designed persistence layer
@@ -264,29 +264,7 @@ describe("architecture spec: persistence boundaries", () => {
     "src/hooks/useApi.ts",
     "src/lib/tenant-data.ts",
     "src/app/layout.tsx", // static theme script (pre-hydration, reads dosi-theme)
-    // tech debt: inline dosi-token live-mode probes (shrink, never grow)
-    "src/app/(dashboard)/activities/page.tsx",
-    "src/app/(dashboard)/billing/page.tsx",
-    "src/app/(dashboard)/monitor/page.tsx",
-    "src/app/(dashboard)/projects/[id]/page.tsx",
-    "src/app/(dashboard)/projects/page.tsx",
-    "src/app/(dashboard)/settings/page.tsx",
-    "src/app/(dashboard)/team/page.tsx",
-    "src/app/(dashboard)/timesheet/page.tsx",
-    "src/app/(host)/host/billing/page.tsx",
-    "src/app/(host)/host/page.tsx",
-    "src/app/(host)/host/plans/page.tsx",
-    "src/app/(host)/host/tenants/page.tsx",
-    "src/app/(host)/host/users/page.tsx",
-    "src/components/dashboard/admin-dashboard.tsx",
-    "src/components/dashboard/worker-dashboard.tsx",
-    "src/components/reports/apps-report.tsx",
-    "src/components/reports/attendance-report.tsx",
-    "src/components/reports/payroll-report.tsx",
-    "src/components/reports/productivity-report.tsx",
-    "src/components/reports/projects-report.tsx",
-    "src/components/reports/time-activity-report.tsx",
-    "src/components/reports/weekly-report.tsx",
+    "src/lib/live-session.ts", // the one shared live-mode probe (reads dosi-token)
   ]);
 
   it("confines localStorage/sessionStorage access to the reviewed persistence allowlist", () => {
@@ -419,11 +397,10 @@ describe("architecture spec: hygiene", () => {
   it("keeps console.log out of production code (shrinking allowlist, target: zero)", () => {
     /**
      * RULE 5 — console.warn/error are fine; console.log is debug residue.
-     * TODO(to-zero): src/components/session-provider.tsx:~137 logs a hydration
-     * success message — drop it (or demote behind a debug flag) and empty this
-     * list. It must never grow.
+     * The allowlist reached zero when the session provider's hydration log was
+     * removed. It must never grow.
      */
-    const CONSOLE_LOG_ALLOWLIST = new Set<string>(["src/components/session-provider.tsx"]);
+    const CONSOLE_LOG_ALLOWLIST = new Set<string>([]);
     const offenders = filesMatching(/console\.log\s*\(/);
     const { added, stale } = diff(offenders, CONSOLE_LOG_ALLOWLIST);
     expect(added, "New console.log in production code — remove it (console.warn/error are allowed).").toEqual([]);
@@ -476,7 +453,8 @@ describe("architecture spec: secret scanning", () => {
       "Forgot password?", // link copy
       // Sign-in error copy. Names the fields, carries no credential value.
       "That email, password or workspace didn't match. Check them and try again.",
-      "Ask your workspace administrator to reset your password — self-service reset isn't available yet.",
+      // "Forgot password?" guidance; \u0000 is the support-address placeholder.
+      "Contact your workspace owner to reset your password. Workspace owners: email \u0000.",
     ]);
     const violations: string[] = [];
     let hitsSeen = 0;

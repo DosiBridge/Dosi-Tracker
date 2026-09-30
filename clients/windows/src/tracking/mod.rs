@@ -35,14 +35,27 @@ impl Tracker {
         Self { input }
     }
 
-    /// Build an activity for the elapsed interval, then reset counters.
+    /// Drop the input counts accumulated so far. Called whenever a new block
+    /// starts outside the normal capture cycle (resume, sign-in, project
+    /// switch, pause) so input made while paused or signed out is never
+    /// attributed to tracked time.
+    pub fn discard_input(&self) {
+        let _ = self.input.take();
+    }
+
+    /// Build an activity for the block `started_at ..= ended_at`, then reset
+    /// counters.
     pub fn snapshot(
         &self,
         perms: &CapturePermissions,
         project_id: &str,
         started_at: chrono::DateTime<Utc>,
+        ended_at: chrono::DateTime<Utc>,
     ) -> Activity {
         let (keyboard_hits, mouse_clicks) = self.input.take();
+        let productivity =
+            self.input
+                .activity_percent(started_at, ended_at, perms.keyboard, perms.mouse);
 
         let active_windows: Vec<WindowInfo> = if perms.active_window {
             active_window::current().into_iter().collect()
@@ -72,8 +85,9 @@ impl Tracker {
             client_activity_id: uuid::Uuid::new_v4().to_string(),
             project_id: project_id.to_string(),
             started_at,
-            ended_at: Utc::now(),
+            ended_at,
             description: None,
+            productivity,
             mouse_clicks: if perms.mouse { mouse_clicks } else { 0 },
             keyboard_hits: if perms.keyboard { keyboard_hits } else { 0 },
             active_windows,

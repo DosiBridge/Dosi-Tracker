@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect } from "react";
+import { createPortal } from "react-dom";
 import { X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "./button";
@@ -36,7 +37,10 @@ export function Modal({
 
   if (!open) return null;
 
-  return (
+  // Portal to <body>: an ancestor with a transform (the page-transition wrapper)
+  // would otherwise become the containing block for `fixed`, so the backdrop
+  // covered only the main column, not the sidebar/topbar.
+  return createPortal(
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
       <div className="absolute inset-0 bg-black/50 backdrop-blur-sm animate-fade-in" onClick={onClose} />
       <div
@@ -61,6 +65,7 @@ export function Modal({
         </div>
         <div className="max-h-[70vh] overflow-y-auto p-5">{children}</div>
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }

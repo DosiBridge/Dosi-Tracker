@@ -6,6 +6,9 @@ namespace Dosi.Tracker.SaaS;
 
 public class Plan : FullAuditedAggregateRoot<Guid>
 {
+    /// <summary>The default plan: workspace sign-up without a plan name, and tenants created from the host console.</summary>
+    public const string FreePlanName = "Free";
+
     public string Name { get; set; }
     public decimal PricePerUser { get; set; }
     public int MaxSeats { get; set; }

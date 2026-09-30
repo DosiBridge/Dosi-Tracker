@@ -2,12 +2,15 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { Radar, Eye, EyeOff, Loader2, ArrowLeft, Building2 } from "lucide-react";
+import { Radar, Eye, EyeOff, Loader2, ArrowLeft, Building2, CheckCircle2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input, Select } from "@/components/ui/input";
 import { ThemeToggle } from "@/components/ui/theme-toggle";
 import { LoginHero } from "@/components/motion/login-hero";
 import { ApiUnreachableError, loginApi, registerWorkspaceApi } from "@/hooks/useApi";
+import { useSession } from "@/components/session-provider";
+import { landingFor } from "@/lib/roles";
+import { SUPPORT_EMAIL } from "@/lib/brand";
 import type { PlanId } from "@/lib/saas-data";
 
 // Backend plan names (seeded by PlanDataSeedContributor).
@@ -20,7 +23,8 @@ const PLAN_NAME: Record<PlanId, string> = {
 
 export default function LoginPage() {
   const router = useRouter();
-  const [mode, setMode] = useState<"signin" | "signup">("signin");
+  const { refreshSession } = useSession();
+  const [mode, setModeState] = useState<"signin" | "signup">("signin");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [workspace, setWorkspace] = useState("");
@@ -29,18 +33,33 @@ export default function LoginPage() {
   const [wsName, setWsName] = useState("");
   const [wsPlan, setWsPlan] = useState<PlanId>("free");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [infoMsg, setInfoMsg] = useState<string | null>(null);
+  /** Set after a successful signup: the exact workspace name to sign in with. */
+  const [createdWorkspace, setCreatedWorkspace] = useState<string | null>(null);
+
+  // Switching between sign-in and signup starts clean: an error from one form
+  // must not linger over the other.
+  function setMode(next: "signin" | "signup") {
+    setModeState(next);
+    setErrorMsg(null);
+    setInfoMsg(null);
+  }
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
     setLoading("signin");
     setErrorMsg(null);
+    setInfoMsg(null);
     try {
       const tenant = workspace.trim();
-      // Workspace (tenant) name scopes the login; leave empty for the host account.
+      // Workspace (tenant) name scopes the login; the platform account signs in without one.
       await loginApi(email, password, tenant || undefined);
-      // A host sign-in (no tenant) lands on the platform console; tenant users on the dashboard.
-      const destination = tenant ? "/dashboard" : "/host";
-      setTimeout(() => router.push(destination), 500);
+      // Build the real session (identity, workspace, data) BEFORE navigating,
+      // so the first page after sign-in already shows this account, not a
+      // stale or demo one. The role decides where they land.
+      const signedIn = await refreshSession();
+      const destination = signedIn ? landingFor(signedIn.role) : tenant ? "/dashboard" : "/host";
+      router.push(destination);
     } catch (err) {
       // Distinguish "the server said no" from "there was no server" — blaming
       // the user's password for an outage sends them down the wrong path.
@@ -58,11 +77,15 @@ export default function LoginPage() {
     if (!wsName.trim() || !password) return;
     setLoading("__signup__");
     setErrorMsg(null);
+    setInfoMsg(null);
     try {
       const result = await registerWorkspaceApi(wsName.trim(), email, password, PLAN_NAME[wsPlan]);
       // Log straight into the freshly created tenant as its admin.
       await loginApi(email, password, result.name);
-      setTimeout(() => router.push("/dashboard"), 600);
+      await refreshSession();
+      // Show the exact name they will type at the next sign-in before moving on.
+      setCreatedWorkspace(result.name || wsName.trim());
+      setLoading(null);
     } catch (err) {
       setErrorMsg(
         err instanceof ApiUnreachableError
@@ -91,7 +114,28 @@ export default function LoginPage() {
             <span className="font-display text-lg font-bold tracking-tight">Dosi-Tracker</span>
           </div>
 
-          {mode === "signup" ? (
+          {createdWorkspace ? (
+            <div className="space-y-5">
+              <div className="flex h-12 w-12 items-center justify-center rounded-full bg-success/15 text-success">
+                <CheckCircle2 className="h-6 w-6" />
+              </div>
+              <div>
+                <h2 className="font-display text-2xl font-bold tracking-tight">Your workspace is ready</h2>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  You&apos;re signed in as its owner. Next time you sign in, enter this in the Workspace field:
+                </p>
+              </div>
+              <div className="rounded-xl border border-border bg-muted/40 p-3">
+                <div className="text-xs text-muted-foreground">Workspace</div>
+                <div className="mt-0.5 break-all font-mono text-base font-semibold" data-testid="created-workspace-name">
+                  {createdWorkspace}
+                </div>
+              </div>
+              <Button size="lg" className="w-full" onClick={() => router.push("/dashboard")}>
+                Continue to your dashboard
+              </Button>
+            </div>
+          ) : mode === "signup" ? (
             <>
               <button
                 onClick={() => setMode("signin")}
@@ -116,9 +160,9 @@ export default function LoginPage() {
                 <div className="space-y-1.5">
                   <label htmlFor="signup-workspace-name" className="text-sm font-medium">Workspace name</label>
                   <Input id="signup-workspace-name" value={wsName} onChange={(e) => setWsName(e.target.value)} placeholder="Acme Corp" required />
-                  {wsName && (
+                  {wsName.trim() && (
                     <p className="text-xs text-muted-foreground">
-                      {wsName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "") || "workspace"}.dositracker.app
+                      You&apos;ll sign in with the workspace name <span className="font-medium text-foreground">{wsName.trim()}</span>.
                     </p>
                   )}
                 </div>
@@ -154,8 +198,10 @@ export default function LoginPage() {
                     id="login-workspace"
                     value={workspace}
                     onChange={(e) => setWorkspace(e.target.value)}
-                    placeholder="acme (leave empty for host sign-in)"
+                    placeholder="Your workspace name"
+                    autoComplete="organization"
                   />
+                  <p className="text-xs text-muted-foreground">The name your workspace was created with.</p>
                 </div>
                 <div className="space-y-1.5">
                   <label htmlFor="login-email" className="text-sm font-medium">Email</label>
@@ -166,11 +212,12 @@ export default function LoginPage() {
                     <label htmlFor="login-password" className="text-sm font-medium">Password</label>
                     <button
                       type="button"
-                      onClick={() =>
-                        setErrorMsg(
-                          "Ask your workspace administrator to reset your password — self-service reset isn't available yet.",
-                        )
-                      }
+                      onClick={() => {
+                        setErrorMsg(null);
+                        setInfoMsg(
+                          `Contact your workspace owner to reset your password. Workspace owners: email ${SUPPORT_EMAIL}.`,
+                        );
+                      }}
                       className="text-xs text-primary-strong hover:underline"
                     >
                       Forgot password?
@@ -196,6 +243,9 @@ export default function LoginPage() {
                   </div>
                 </div>
 
+                {infoMsg && (
+                  <p role="status" className="rounded-lg bg-muted px-3 py-2 text-sm text-muted-foreground">{infoMsg}</p>
+                )}
                 {errorMsg && <p className="text-sm text-red-500 font-medium">{errorMsg}</p>}
                 <Button type="submit" size="lg" className="w-full" disabled={!!loading}>
                   {loading && <Loader2 className="h-4 w-4 animate-spin" />}

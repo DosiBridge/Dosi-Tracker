@@ -60,10 +60,10 @@ describe("Drawer", () => {
 
   it("clicking the backdrop closes; clicking inside the drawer does not", async () => {
     const user = userEvent.setup();
-    const { container } = render(<DrawerHost />);
+    render(<DrawerHost />);
     await user.click(screen.getByText("Drawer body content"));
     expect(screen.getByRole("dialog")).toBeInTheDocument();
-    await user.click(backdropOf(container));
+    await user.click(backdropOf(document.body));
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
@@ -76,7 +76,7 @@ describe("Drawer", () => {
   });
 
   it("a11y: the open drawer has no axe violations", async () => {
-    const { container } = render(<DrawerHost />);
-    expect(await axe(container)).toHaveNoViolations();
+    render(<DrawerHost />);
+    expect(await axe(document.body)).toHaveNoViolations();
   });
 });

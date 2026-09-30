@@ -4,6 +4,7 @@ using Dosi.Tracker.Localization;
 using Dosi.Tracker.MultiTenancy;
 using System;
 using Volo.Abp.Localization;
+using Volo.Abp.Timing;
 using Volo.Abp.Modularity;
 using Volo.Abp.MultiTenancy;
 using Volo.Abp.PermissionManagement.Identity;
@@ -47,6 +48,13 @@ public class TrackerDomainModule : AbpModule
             options.IsEnabled = MultiTenancyConsts.IsEnabled;
         });
 
+        // Agents submit UTC and reports bucket by UTC day, so the server clock must be UTC too:
+        // otherwise CreationTime / TrialEndsAt are stored in the host's local time and serialized
+        // without an offset, and browsers misread them by the server's UTC offset.
+        Configure<AbpClockOptions>(options =>
+        {
+            options.Kind = DateTimeKind.Utc;
+        });
 
 #if DEBUG
         context.Services.Replace(ServiceDescriptor.Singleton<IEmailSender, NullEmailSender>());

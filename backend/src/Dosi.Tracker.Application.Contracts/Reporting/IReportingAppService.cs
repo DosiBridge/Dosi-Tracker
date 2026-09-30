@@ -18,4 +18,8 @@ public interface IReportingAppService : IApplicationService
 
     /// <summary>Presence and worked-time per member, derived from tracked activity (same scoping rules).</summary>
     Task<AttendanceReportDto> GetAttendanceAsync(GetReportSummaryInput input);
+
+    /// <summary>GET /api/app/reporting/user-daily-series — tracked minutes per member per UTC day
+    /// (same scoping rules; only member-days with activity are returned, ordered by day then user).</summary>
+    Task<System.Collections.Generic.List<UserDailyReportRowDto>> GetUserDailySeriesAsync(GetReportSummaryInput input);
 }

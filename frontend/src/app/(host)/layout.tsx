@@ -11,9 +11,18 @@ import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { PageEnter } from "@/components/motion/reveal";
 import { useSession } from "@/components/session-provider";
+import { SessionGate } from "@/components/session-gate";
 import { cn } from "@/lib/utils";
 
 export default function HostLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <SessionGate area="host">
+      <HostShell>{children}</HostShell>
+    </SessionGate>
+  );
+}
+
+function HostShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const [collapsed, setCollapsed] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);

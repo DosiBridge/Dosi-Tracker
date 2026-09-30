@@ -93,7 +93,7 @@ const hostStatusLabel: Record<SubscriptionStatus, string> = {
 
 export default function HostTenantsPage() {
   const router = useRouter();
-  const { workspaces, createWorkspace, updateWorkspace, deleteWorkspace, impersonate } = useSession();
+  const { workspaces, createWorkspace, updateWorkspace, deleteWorkspace, impersonate, isLive: liveSession } = useSession();
 
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState<"all" | SubscriptionStatus>("all");
@@ -119,7 +119,7 @@ export default function HostTenantsPage() {
       setLiveTenants(Array.isArray(items) ? items : []);
       setLiveFailed(false);
     } catch {
-      // Non-host users get a 403 here — fall back to the mock dataset.
+      // Live: show an error with retry — never the demo tenants.
       setLiveTenants(null);
       setLiveFailed(true);
     } finally {
@@ -128,14 +128,15 @@ export default function HostTenantsPage() {
   }, []);
 
   useEffect(() => {
-    if (typeof window !== "undefined" && localStorage.getItem("dosi-token")) {
-      fetchTenants();
+    if (liveSession) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- data fetch defers its own setState; see docs/QUALITY.md §10
+      void fetchTenants();
     }
-  }, [fetchTenants]);
+  }, [fetchTenants, liveSession]);
 
-  const isLive = liveTenants !== null;
+  const isLive = liveSession;
   // liveLoading only ever turns on when a token exists, so this stays false in demo mode.
-  const initialLiveLoading = liveLoading && !isLive && !liveFailed;
+  const initialLiveLoading = liveLoading && liveTenants === null && !liveFailed;
 
   const liveWorkspaces = useMemo<Workspace[]>(
     () => (liveTenants ?? []).map(toWorkspace),
@@ -215,7 +216,7 @@ export default function HostTenantsPage() {
           </span>
           <span className="min-w-0">
             <span className="block truncate font-medium hover:text-primary">{r.ws.name}</span>
-            <span className="block truncate text-xs text-muted-foreground">{r.ws.slug}.dositracker.app</span>
+            <span className="block truncate text-xs text-muted-foreground">{r.live ? `Sign-in name: ${r.ws.name}` : `${r.ws.slug}.dositracker.app`}</span>
           </span>
         </button>
       ),
@@ -288,8 +289,9 @@ export default function HostTenantsPage() {
       />
 
       {liveFailed && (
-        <p className="text-xs text-muted-foreground">
-          Live tenant data is unavailable for this account — showing demo data.
+        <p className="flex items-center gap-2 text-xs text-danger">
+          Couldn&apos;t load tenants from the server.
+          <button onClick={() => void fetchTenants()} className="font-medium text-primary hover:underline">Try again</button>
         </p>
       )}
 
@@ -443,7 +445,7 @@ function TenantDrawer({
           <div className="min-w-0 flex-1">
             <div className="truncate text-lg font-semibold">{ws.name}</div>
             <div className="truncate text-xs text-muted-foreground">
-              {ws.slug}.dositracker.app{ws.createdAt ? ` · since ${ws.createdAt}` : ""}
+              {live ? `Sign-in name: ${ws.name}` : `${ws.slug}.dositracker.app`}{ws.createdAt ? ` · since ${ws.createdAt}` : ""}
             </div>
           </div>
           <Badge tone={statusTone[ws.status]}>{hostStatusLabel[ws.status]}</Badge>

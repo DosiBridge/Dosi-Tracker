@@ -10,6 +10,7 @@ import type {
 } from "./reports-data";
 import { trackedMembers, countSeats } from "./roles";
 import { activitiesOnDay, averageProductivity, minutesByUser, minutesOnDay } from "./metrics";
+import { applyProjectTotals, deriveAppCatalog, deriveDailyTrend, deriveHourly, deriveTopApps } from "./live-dataset";
 import {
   DAY_MS,
   NOW,
@@ -58,6 +59,8 @@ export interface Dataset {
   attendance: AttendanceRecord[];
   billing: BillingRow[];
   notifications: AppNotification[];
+  /** True for a dataset built from the real backend (see buildLiveDataset). */
+  live?: boolean;
 }
 
 /* ----------------------------- Seeded RNG ----------------------------- */
@@ -480,6 +483,9 @@ function buildEmpty(id: string): Dataset {
 
 const cache = new Map<string, Dataset>();
 
+/** Live workspace ids (see live-identity.ts) all start with this prefix. */
+const LIVE_ID_PREFIX = "live-";
+
 function getLocalStorageProjects(workspaceId: string): Project[] {
   if (typeof window === "undefined") return [];
   try {
@@ -501,7 +507,12 @@ export function datasetFor(workspaceId: string): Dataset {
   if (workspaceId === "w1") ds = buildPrimary();
   else if (workspaceId === "w2") ds = buildGenerated({ id: "w2", users: acmeUsers, projects: acmeProjects });
   else if (workspaceId === "w3") ds = buildGenerated({ id: "w3", users: nimbusUsers, projects: nimbusProjects });
-  else ds = buildEmpty(workspaceId);
+  // A live workspace not hydrated yet reads as EMPTY — never as a demo tenant.
+  else if (workspaceId.startsWith(LIVE_ID_PREFIX)) {
+    ds = buildLiveDataset({ workspaceId, users: [], projects: [], activities: [], now: new Date() });
+    cache.set(workspaceId, ds);
+    return ds;
+  } else ds = buildEmpty(workspaceId);
 
   const localProjects = getLocalStorageProjects(workspaceId);
   if (localProjects.length > 0) {
@@ -522,8 +533,9 @@ export function createTenantProject(workspaceId: string, project: Project): void
     try {
       const key = `dosi-projects-created-${workspaceId}`;
       const existing = localStorage.getItem(key);
-      const list = existing ? JSON.parse(existing) : [];
-      if (!list.some((p: any) => p.id === project.id)) {
+      const parsed: unknown = existing ? JSON.parse(existing) : [];
+      const list: Project[] = Array.isArray(parsed) ? (parsed as Project[]) : [];
+      if (!list.some((p) => p.id === project.id)) {
         list.unshift(project);
         localStorage.setItem(key, JSON.stringify(list));
       }
@@ -580,6 +592,83 @@ export function setActiveWorkspace(workspaceId: string): void {
   const ds = datasetFor(workspaceId);
   if (ds === active) return;
   applyActive(ds);
+}
+
+/* ============================================================================
+ * LIVE datasets — a real tenant's data, built from the backend by the session
+ * provider. Nothing here is generated: every series is derived from the real
+ * rows (live-dataset.ts) and anything the backend does not provide is EMPTY —
+ * no demo people, notifications, attendance, billing rates or app categories.
+ * ========================================================================== */
+
+export interface LiveDatasetInput {
+  workspaceId: string;
+  users: User[];
+  projects: Project[];
+  activities: Activity[];
+  /** The real clock ("today" for live data is today, not the demo's frozen NOW). */
+  now: Date;
+}
+
+export function buildLiveDataset({ workspaceId, users: liveUsers, projects: liveProjects, activities: liveActivities, now }: LiveDatasetInput): Dataset {
+  const projectsCopy = liveProjects.map((p) => ({ ...p, memberIds: Array.isArray(p.memberIds) ? [...p.memberIds] : [] }));
+  applyProjectTotals(projectsCopy, liveActivities, now);
+  const today = now.toISOString().slice(0, 10);
+  const todays = activitiesOnDay(liveActivities, today);
+  const appCatalog = deriveAppCatalog(liveActivities);
+  return {
+    workspaceId,
+    users: liveUsers,
+    projects: projectsCopy,
+    activities: liveActivities,
+    weeklyTrend: deriveDailyTrend(liveActivities, now, 7),
+    hourlyToday: deriveHourly(liveActivities, now),
+    topApps: deriveTopApps(appCatalog),
+    summary: {
+      totalTrackedToday: Math.round(minutesOnDay(liveActivities, today)),
+      activeMembers: liveUsers.filter((u) => u.status === "active").length,
+      totalMembers: countSeats(liveUsers),
+      activeProjects: projectsCopy.filter((p) => !p.archived).length,
+      avgProductivity: averageProductivity(todays),
+      screenshotsToday: todays.length,
+    },
+    projectDistribution: computeProjectDistribution(projectsCopy),
+    appCatalog,
+    productivitySplit: [],
+    attendance: [],
+    billing: [],
+    notifications: [],
+    live: true,
+  };
+}
+
+/** Register a live dataset under its workspace id and make it the active one. */
+export function installLiveDataset(input: LiveDatasetInput): Dataset {
+  const ds = buildLiveDataset(input);
+  cache.set(ds.workspaceId, ds);
+  applyActive(ds);
+  return ds;
+}
+
+/**
+ * An EMPTY live dataset (identity still loading, or the backend failed). Keeps
+ * every page's reads valid without ever falling back to demo rows.
+ */
+export function installEmptyLiveDataset(workspaceId: string, now: Date = new Date()): Dataset {
+  return installLiveDataset({ workspaceId, users: [], projects: [], activities: [], now });
+}
+
+/** Whether the ACTIVE dataset is a real tenant's (vs the demo). */
+export function isLiveDataset(): boolean {
+  return active.live === true;
+}
+
+/** Forget every live dataset (sign-out) and fall back to the primary demo workspace. */
+export function dropLiveDatasets(): void {
+  for (const [id, ds] of cache) {
+    if (ds.live) cache.delete(id);
+  }
+  if (active.live) applyActive(datasetFor("w1"));
 }
 
 export function hydrateLiveBackendData(liveProjects: Project[], liveActivities: Activity[]) {

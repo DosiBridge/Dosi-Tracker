@@ -4,8 +4,10 @@ using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Authorization;
 using Dosi.Tracker.Billing;
+using Dosi.Tracker.Permissions;
 using Dosi.Tracker.Projects;
 using Dosi.Tracker.SaaS;
+using Volo.Abp;
 using Volo.Abp.Application.Dtos;
 using Volo.Abp.Authorization;
 using Volo.Abp.Data;
@@ -17,7 +19,9 @@ using Volo.Abp.TenantManagement;
 
 namespace Dosi.Tracker.Platform;
 
-[Authorize]
+/// <summary>Host console. Requires the host-only <see cref="TrackerPermissions.Platform.Default"/> permission
+/// (granted to the host "admin" role by ABP's permission seeding) AND a host-side caller.</summary>
+[Authorize(TrackerPermissions.Platform.Default)]
 public class PlatformAppService : TrackerAppService, IPlatformAppService
 {
     private readonly ITenantRepository _tenantRepository;
@@ -70,7 +74,8 @@ public class PlatformAppService : TrackerAppService, IPlatformAppService
 
             decimal mrr = 0m;
             var paidSeats = 0;
-            foreach (var sub in subscriptions.Where(s => s.Status == "active" || s.Status == "trialing"))
+            // Only paying (active) subscriptions count as recurring revenue; a trial pays nothing yet.
+            foreach (var sub in subscriptions.Where(s => s.Status == InvoiceGenerationWorker.BillableStatus))
             {
                 var plan = plans.FirstOrDefault(p => p.Id == sub.PlanId);
                 if (plan is null)
@@ -109,14 +114,19 @@ public class PlatformAppService : TrackerAppService, IPlatformAppService
     {
         EnsureHost();
 
-        var tenantNames = (await _tenantRepository.GetListAsync()).ToDictionary(t => t.Id, t => t.Name);
-
         using (_dataFilter.Disable<IMultiTenant>())
         {
-            var all = (await _invoiceRepository.GetListAsync()).OrderByDescending(i => i.DueDate).ToList();
-            var page = all
-                .Skip(input.SkipCount)
-                .Take(input.MaxResultCount)
+            // Count and page in the database; only the requested page is materialized.
+            var query = await _invoiceRepository.GetQueryableAsync();
+            var totalCount = await AsyncExecuter.CountAsync(query);
+            var page = await AsyncExecuter.ToListAsync(query
+                .OrderByDescending(i => i.DueDate)
+                .ThenBy(i => i.Id) // stable order across pages
+                .PageBy(input.SkipCount, input.MaxResultCount));
+
+            var tenantNames = await GetTenantNamesAsync();
+
+            var items = page
                 .Select(i => new PlatformInvoiceDto
                 {
                     Id = i.Id,
@@ -128,7 +138,7 @@ public class PlatformAppService : TrackerAppService, IPlatformAppService
                 })
                 .ToList();
 
-            return new PagedResultDto<PlatformInvoiceDto>(all.Count, page);
+            return new PagedResultDto<PlatformInvoiceDto>(totalCount, items);
         }
     }
 
@@ -191,7 +201,28 @@ public class PlatformAppService : TrackerAppService, IPlatformAppService
     public async Task DeletePlanAsync(Guid id)
     {
         EnsureHost();
+
+        // A plan still referenced by any tenant's subscription cannot be removed (it would orphan
+        // seat limits, billing and the overview's plan counts). Check across every tenant.
+        long inUse;
+        using (_dataFilter.Disable<IMultiTenant>())
+        {
+            inUse = await _subscriptionRepository.CountAsync(s => s.PlanId == id);
+        }
+
+        if (inUse > 0)
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.PlanInUse)
+                .WithData("planId", id)
+                .WithData("subscriptions", inUse);
+        }
+
         await _planRepository.DeleteAsync(id);
+    }
+
+    private async Task<Dictionary<Guid, string>> GetTenantNamesAsync()
+    {
+        return (await _tenantRepository.GetListAsync()).ToDictionary(t => t.Id, t => t.Name);
     }
 
     /// <summary>The platform console is for host administrators; a tenant-scoped caller is refused.</summary>

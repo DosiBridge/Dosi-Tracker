@@ -15,7 +15,7 @@ namespace Dosi.Tracker.SaaS;
 [Authorize]
 public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
 {
-    public const string DefaultPlanName = "Free";
+    public const string DefaultPlanName = Plan.FreePlanName;
 
     private readonly IRepository<Subscription, Guid> _subscriptionRepository;
     private readonly IRepository<Plan, Guid> _planRepository;

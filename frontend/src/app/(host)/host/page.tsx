@@ -44,7 +44,7 @@ interface ApiOverview {
 }
 
 export default function HostOverviewPage() {
-  const { workspaces } = useSession();
+  const { workspaces, isLive } = useSession();
 
   const [live, setLive] = useState<Overview | null>(null);
   const [loading, setLoading] = useState(false);
@@ -74,10 +74,10 @@ export default function HostOverviewPage() {
   }, []);
 
   useEffect(() => {
-    if (typeof window === "undefined" || !localStorage.getItem("dosi-token")) return;
+    if (!isLive) return;
     // eslint-disable-next-line react-hooks/set-state-in-effect -- data fetch defers its own setState; see docs/QUALITY.md §10
     loadLive();
-  }, [loadLive]);
+  }, [loadLive, isLive]);
 
   const demo = useMemo<Overview>(() => {
     const o = platformOverview(workspaces);
@@ -94,7 +94,10 @@ export default function HostOverviewPage() {
     };
   }, [workspaces]);
 
-  const o = live ?? demo;
+  // Live: real platform metrics only; while loading or on failure the figures
+  // read zero (with a notice) rather than showing the demo platform.
+  const empty: Overview = { tenants: 0, activeSubs: 0, trialing: 0, mrr: 0, paidSeats: 0, totalInvoiced: 0, pendingInvoices: 0, plans: [] };
+  const o = isLive ? (live ?? empty) : demo;
   const donut = o.plans.filter((p) => p.subscribers > 0).map((p) => ({ name: p.name, value: p.subscribers, color: p.color }));
 
   return (
@@ -125,8 +128,9 @@ export default function HostOverviewPage() {
         <div className="rounded-lg border border-border bg-muted px-3 py-2 text-xs text-muted-foreground">Loading platform metrics…</div>
       )}
       {error && live === null && (
-        <div className="rounded-lg border border-border bg-muted px-3 py-2 text-xs text-muted-foreground">
-          Live metrics unavailable right now — showing demo data.
+        <div className="flex items-center gap-3 rounded-lg border border-danger/30 bg-danger/5 px-3 py-2 text-xs text-danger">
+          <span className="flex-1">Couldn&apos;t load platform metrics from the server.</span>
+          <button onClick={() => void loadLive()} className="font-medium text-primary hover:underline">Try again</button>
         </div>
       )}
 

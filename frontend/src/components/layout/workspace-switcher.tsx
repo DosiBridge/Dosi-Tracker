@@ -7,12 +7,15 @@ import { Input, Select } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { useSession } from "@/components/session-provider";
-import { planById, statusLabel, type PlanId } from "@/lib/saas-data";
+import { planById, planNameFor, statusLabel, type PlanId } from "@/lib/saas-data";
 import { toast } from "@/components/toast";
 import { cn } from "@/lib/utils";
 
 export function WorkspaceSwitcher({ collapsed }: { collapsed: boolean }) {
-  const { workspace, workspaces, setWorkspaceById, createWorkspace, setUserById } = useSession();
+  // In a live session `workspaces` is exactly the signed-in tenant: no demo
+  // tenants to switch to and no browser-side workspace creation (new
+  // workspaces are created through signup).
+  const { workspace, workspaces, setWorkspaceById, createWorkspace, setUserById, isLive } = useSession();
   const [open, setOpen] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
   const [name, setName] = useState("");
@@ -27,7 +30,6 @@ export function WorkspaceSwitcher({ collapsed }: { collapsed: boolean }) {
     return () => document.removeEventListener("mousedown", onDoc);
   }, []);
 
-  const plan = planById(workspace.planId);
 
   function submitCreate(e: React.FormEvent) {
     e.preventDefault();
@@ -60,7 +62,7 @@ export function WorkspaceSwitcher({ collapsed }: { collapsed: boolean }) {
             <span className="min-w-0 flex-1 text-left">
               <span className="block truncate text-sm font-semibold">{workspace.name}</span>
               <span className="block truncate text-[11px] text-muted-foreground">
-                {plan.name} · {statusLabel[workspace.status]}
+                {planNameFor(workspace)} · {statusLabel[workspace.status]}
               </span>
             </span>
             <ChevronsUpDown className="h-4 w-4 shrink-0 text-muted-foreground" />
@@ -74,7 +76,6 @@ export function WorkspaceSwitcher({ collapsed }: { collapsed: boolean }) {
             Workspaces
           </div>
           {workspaces.map((w) => {
-            const wp = planById(w.planId);
             return (
               <button
                 key={w.id}
@@ -86,22 +87,26 @@ export function WorkspaceSwitcher({ collapsed }: { collapsed: boolean }) {
                 </span>
                 <span className="min-w-0 flex-1">
                   <span className="block truncate text-sm font-medium">{w.name}</span>
-                  <span className="block truncate text-[11px] text-muted-foreground">{wp.name} · {statusLabel[w.status]}</span>
+                  <span className="block truncate text-[11px] text-muted-foreground">{planNameFor(w)} · {statusLabel[w.status]}</span>
                 </span>
                 {w.id === workspace.id && <Check className="h-4 w-4 shrink-0 text-primary" />}
               </button>
             );
           })}
-          <div className="my-1 h-px bg-border" />
-          <button
-            onClick={() => { setOpen(false); setCreateOpen(true); }}
-            className="flex w-full items-center gap-2.5 rounded-lg px-2 py-2 text-sm hover:bg-muted"
-          >
-            <span className="flex h-7 w-7 items-center justify-center rounded-md border border-dashed border-border text-muted-foreground">
-              <Plus className="h-4 w-4" />
-            </span>
-            Create workspace
-          </button>
+          {!isLive && (
+            <>
+              <div className="my-1 h-px bg-border" />
+              <button
+                onClick={() => { setOpen(false); setCreateOpen(true); }}
+                className="flex w-full items-center gap-2.5 rounded-lg px-2 py-2 text-sm hover:bg-muted"
+              >
+                <span className="flex h-7 w-7 items-center justify-center rounded-md border border-dashed border-border text-muted-foreground">
+                  <Plus className="h-4 w-4" />
+                </span>
+                Create workspace
+              </button>
+            </>
+          )}
         </div>
       )}
 

@@ -9,8 +9,11 @@ import { Ring } from "@/components/ui/ring";
 import { Progress } from "@/components/ui/progress";
 import { Button } from "@/components/ui/button";
 import { StatCard } from "@/components/dashboard/stat-card";
-import { ScreenMockView } from "@/components/screen-mock";
-import { activitiesForUser, NOW, productivitySplit, projectById, projects } from "@/lib/tenant-data";
+import { AppGlyph, ScreenMockView } from "@/components/screen-mock";
+import { useSession } from "@/components/session-provider";
+import { activitiesForUser, productivitySplit, projectById, projects } from "@/lib/tenant-data";
+import { agoLabel, referenceNow } from "@/lib/live-session";
+import { deriveDailyTrend } from "@/lib/live-dataset";
 import { brand, greeting } from "@/lib/brand";
 import { formatDuration } from "@/lib/utils";
 import { Reveal, Stagger } from "@/components/motion/reveal";
@@ -28,14 +31,6 @@ function summaryEndpoint(from: Date, to: Date) {
   return `/api/app/reporting/summary?From=${encodeURIComponent(from.toISOString())}&To=${encodeURIComponent(to.toISOString())}`;
 }
 
-function agoLabel(iso: string) {
-  const mins = Math.round((NOW.getTime() - new Date(iso).getTime()) / 60000);
-  if (mins < 60) return `${mins}m ago`;
-  const h = Math.floor(mins / 60);
-  if (h < 24) return `${h}h ago`;
-  return `${Math.floor(h / 24)}d ago`;
-}
-
 /** Personal weekly shape derived from this member's trackedToday — not team aggregates. */
 function personalWeek(trackedToday: number) {
   const factors = [0.95, 1.05, 0.88, 1.1, 1.0, 0.3, 0.12];
@@ -48,15 +43,17 @@ function personalWeek(trackedToday: number) {
 
 export function WorkerDashboard({ user }: { user: User }) {
   // LIVE MODE: with a token, headline stats come from the reporting summary
-  // (non-admins are auto-scoped server-side). Without one, the mock path below
+  // (non-admins are auto-scoped server-side) and everything else from the
+  // member's REAL rows in the live dataset. Without one, the mock path below
   // renders exactly as before.
+  const { isLive } = useSession();
   const [liveToday, setLiveToday] = useState<ReportingSummary | null>(null);
   const [liveWeek, setLiveWeek] = useState<ReportingSummary | null>(null);
   const [liveLoading, setLiveLoading] = useState(false);
   const [liveError, setLiveError] = useState(false);
 
   useEffect(() => {
-    if (typeof window === "undefined" || !localStorage.getItem("dosi-token")) return;
+    if (!isLive) return;
     let cancelled = false;
     const now = new Date();
     const todayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
@@ -72,7 +69,7 @@ export function WorkerDashboard({ user }: { user: User }) {
         setLiveWeek(week);
       })
       .catch(() => {
-        if (!cancelled) setLiveError(true); // fall back to the demo dataset below
+        if (!cancelled) setLiveError(true); // figures below come from the rows already loaded
       })
       .finally(() => {
         if (!cancelled) setLiveLoading(false);
@@ -80,14 +77,16 @@ export function WorkerDashboard({ user }: { user: User }) {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [isLive]);
 
   const myActivities = activitiesForUser(user.id);
-  const myProjects = projects.filter((p) => !p.archived && p.memberIds.includes(user.id));
+  const myProjects = projects.filter((p) => !p.archived && (p.memberIds ?? []).includes(user.id));
   const feed = myActivities.slice(0, 6);
   const split = productivitySplit.find((s) => s.userId === user.id);
   const splitTotal = split ? split.productive + split.neutral + split.unproductive : 0;
-  const week = personalWeek(user.trackedToday);
+  // Live: the member's real last 7 days. Demo: a shape derived from trackedToday.
+  const week = isLive ? deriveDailyTrend(myActivities, referenceNow(), 7) : personalWeek(user.trackedToday);
+  const weekMax = isLive ? Math.max(1, ...week.map((d) => d.tracked)) : Math.max(user.trackedToday * 1.2, 1);
 
   // Top apps from this user's own sessions
   const appMins = new Map<string, number>();
@@ -157,7 +156,7 @@ export function WorkerDashboard({ user }: { user: User }) {
         />
       </Stagger>
       {liveError && (
-        <p className="text-xs text-muted-foreground">Live stats unavailable — showing demo data.</p>
+        <p className="text-xs text-danger">Couldn&apos;t load your latest stats from the server — showing the activity already loaded.</p>
       )}
 
       <Reveal delay={100}>
@@ -174,7 +173,7 @@ export function WorkerDashboard({ user }: { user: User }) {
                 <div className="h-2 flex-1 overflow-hidden rounded-full bg-muted">
                   <div
                     className="h-full rounded-full bg-primary"
-                    style={{ width: `${Math.min(100, (d.tracked / Math.max(user.trackedToday * 1.2, 1)) * 100)}%` }}
+                    style={{ width: `${Math.min(100, (d.tracked / weekMax) * 100)}%` }}
                   />
                 </div>
                 <span className="w-14 text-right tabular-nums text-xs text-muted-foreground">{formatDuration(d.tracked)}</span>
@@ -249,7 +248,11 @@ export function WorkerDashboard({ user }: { user: User }) {
             const p = projectById(a.projectId);
             return (
               <div key={a.id} className="flex items-center gap-3">
-                <ScreenMockView screen={a.screen} className="h-12 w-20 shrink-0" />
+                {isLive ? (
+                  <AppGlyph app={a.screen.app} color={a.screen.accent} className="h-12 w-20 shrink-0" />
+                ) : (
+                  <ScreenMockView screen={a.screen} className="h-12 w-20 shrink-0" />
+                )}
                 <div className="min-w-0 flex-1">
                   <div className="truncate text-sm font-medium">{a.description}</div>
                   <div className="mt-0.5 flex items-center gap-2 text-xs text-muted-foreground">

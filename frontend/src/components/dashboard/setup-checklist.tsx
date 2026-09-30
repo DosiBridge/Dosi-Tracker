@@ -5,14 +5,16 @@ import { CheckCircle2, Circle, Download, FolderPlus, UserPlus, ArrowRight } from
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { projects, users, activities } from "@/lib/tenant-data";
-import { countSeats } from "@/lib/roles";
+import { isTrackedMember } from "@/lib/roles";
 
 /**
  * Shown when a workspace has no real product data yet.
  * Guides owners/admins toward value before billing.
  */
 export function SetupChecklist({ isOwner }: { isOwner: boolean }) {
-  const hasTeam = countSeats(users) > 1;
+  // "Invite your team" is done only once someone besides the owner is on the
+  // roster — a workspace of one has not invited anybody yet.
+  const hasTeam = users.filter(isTrackedMember).length > 1;
   const hasProject = projects.some((p) => !p.archived);
   const hasActivity = activities.length > 0;
   const steps = [
@@ -38,9 +40,9 @@ export function SetupChecklist({ isOwner }: { isOwner: boolean }) {
       id: "agent",
       done: hasActivity,
       title: "Install a desktop agent",
-      body: "Windows (Rust) or macOS (Swift) — offline queue until sync is live.",
-      href: "/settings",
-      cta: "Privacy & tracking",
+      body: "Install the Windows or macOS agent on each computer you want to track.",
+      href: "/download",
+      cta: "Get the agent",
       icon: Download,
     },
   ];
@@ -71,23 +73,27 @@ export function SetupChecklist({ isOwner }: { isOwner: boolean }) {
           return (
             <div
               key={s.id}
-              className="flex flex-wrap items-center gap-3 rounded-xl border border-border bg-card p-3"
+              className="flex flex-col gap-3 rounded-xl border border-border bg-card p-3 sm:flex-row sm:items-center"
             >
-              {s.done ? (
-                <CheckCircle2 className="h-5 w-5 shrink-0 text-success" />
-              ) : (
-                <Circle className="h-5 w-5 shrink-0 text-muted-foreground" />
-              )}
-              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground">
-                <Icon className="h-4 w-4" />
-              </div>
-              <div className="min-w-0 flex-1">
-                <div className={`text-sm font-medium ${s.done ? "text-muted-foreground line-through" : ""}`}>{s.title}</div>
-                <div className="text-xs text-muted-foreground">{s.body}</div>
+              {/* Mobile: status + text on one row, the action full-width below it,
+                  so the copy never gets squeezed into a sliver next to the button. */}
+              <div className="flex min-w-0 flex-1 items-start gap-3 sm:items-center">
+                {s.done ? (
+                  <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-success sm:mt-0" />
+                ) : (
+                  <Circle className="mt-0.5 h-5 w-5 shrink-0 text-muted-foreground sm:mt-0" />
+                )}
+                <div className="hidden h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground sm:flex">
+                  <Icon className="h-4 w-4" />
+                </div>
+                <div className="min-w-0 flex-1">
+                  <div className={`text-sm font-medium ${s.done ? "text-muted-foreground line-through" : ""}`}>{s.title}</div>
+                  <div className="text-xs text-muted-foreground">{s.body}</div>
+                </div>
               </div>
               {!s.done && (
-                <Link href={s.href}>
-                  <Button size="sm" variant="outline">
+                <Link href={s.href} className="w-full sm:w-auto">
+                  <Button size="sm" variant="outline" className="w-full sm:w-auto">
                     {s.cta} <ArrowRight className="h-3.5 w-3.5" />
                   </Button>
                 </Link>

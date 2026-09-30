@@ -2,11 +2,9 @@
 // and in live mode (token present — loads GET /api/account/my-profile, saves
 // via PUT). Only global fetch is stubbed.
 //
-// NOTE: success feedback on this page is the inline "Saved" indicator next to
-// the save button — the page does not use the toast() system at all (verified:
-// no toast import). ToastViewport is still mounted (withToasts) so if a toast
-// ever WERE fired these queries would see it; assertions target the real
-// inline feedback.
+// NOTE: success feedback on this page is BOTH the inline "Saved" indicator next
+// to the save button and a success toast ("Profile saved"); ToastViewport is
+// mounted (withToasts) so the toast is visible to queries.
 vi.mock("next/navigation", () => import("@/test/next-navigation-stub"));
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
@@ -67,13 +65,25 @@ function stubLiveBackend(opts: { putStatus?: number } = {}): void {
       }
       return jsonResponse({ ...profile, ...JSON.parse(String(init?.body)) });
     }
-    // SessionProvider hydration fires these when a token exists.
-    if (url.includes("/api/app/project") || url.includes("/api/app/activity")) {
-      return jsonResponse([]);
-    }
+    // SessionProvider builds the live session from these when a token exists.
     if (url.includes("/api/abp/application-configuration")) {
-      return jsonResponse({});
+      return jsonResponse({
+        currentUser: {
+          isAuthenticated: true,
+          id: "live-owner",
+          tenantId: "t-1",
+          userName: "ayesha",
+          name: "Ayesha",
+          surName: "Rahman",
+          email: "ayesha@dosi.dev",
+          roles: ["admin"],
+        },
+        currentTenant: { id: "t-1", name: "Dosi Real", isAvailable: true },
+        auth: { grantedPolicies: {} },
+      });
     }
+    if (url.includes("/api/app/workspace/current-subscription")) return jsonResponse({});
+    if (url.includes("/api/app/")) return jsonResponse({ items: [] });
     throw new Error(`unexpected fetch: ${method} ${url}`);
   });
 }
@@ -120,6 +130,7 @@ describe("settings page — live mode (backend token present)", () => {
     await user.click(saveButton());
 
     expect(await screen.findByText("Saved")).toBeInTheDocument();
+    expect(await screen.findByText("Profile saved")).toBeInTheDocument(); // success toast
 
     const putCall = fetchMock.mock.calls.find(([, init]) => init?.method === "PUT");
     expect(putCall).toBeDefined();

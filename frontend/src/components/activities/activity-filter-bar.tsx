@@ -4,7 +4,6 @@ import { useState } from "react";
 import { Search, SlidersHorizontal, X, RotateCcw } from "lucide-react";
 import { Card } from "@/components/ui/card";
 import { Select } from "@/components/ui/input";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";

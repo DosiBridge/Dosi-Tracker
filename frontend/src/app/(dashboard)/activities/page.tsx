@@ -1,6 +1,7 @@
 "use client";
 
-import { Suspense, useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
+import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
   MousePointerClick,
@@ -19,13 +20,15 @@ import { Badge } from "@/components/ui/badge";
 import { Avatar } from "@/components/ui/avatar";
 import { Ring } from "@/components/ui/ring";
 import { Drawer } from "@/components/ui/drawer";
-import { ScreenMockView } from "@/components/screen-mock";
+import { AppGlyph, ScreenMockView } from "@/components/screen-mock";
 import { PageHeader, PageStack } from "@/components/ui/page-header";
 import { SegmentedControl } from "@/components/ui/toolbar";
 import { ActivityFilterBar } from "@/components/activities/activity-filter-bar";
 import { useSession } from "@/components/session-provider";
 import { activities as demoActivities, projectById, userById } from "@/lib/tenant-data";
-import { getApi, getAuthedBlobUrl, useApi } from "@/hooks/useApi";
+import { getApi, getAuthedBlobUrl, isLiveSession, useApi } from "@/hooks/useApi";
+import { agoLabel } from "@/lib/live-session";
+import { mapApiActivities } from "@/lib/live-dataset";
 import { applyActivityFilters, defaultActivityFilters, type ActivityFilters } from "@/lib/activity-filters";
 import { scopeActivities } from "@/lib/scope";
 import type { Activity } from "@/lib/types";
@@ -37,21 +40,11 @@ type ViewMode = "sessions" | "screens";
 const GUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 const isGuidId = (id: string) => GUID_RE.test(id);
 
-// LIVE MODE gate — a subscription-less external-store read of the backend
-// token so SSR and the first client render agree (server snapshot: no token),
-// same contract as the sibling pages' effect-resolved gates.
 /** Cards rendered per page on the activity list (see visibleCount below). */
 const PAGE_SIZE = 24;
 
-const subscribeToNothing = () => () => {};
-const readBackendToken = () => typeof window !== "undefined" && !!localStorage.getItem("dosi-token");
-const serverHasNoToken = () => false;
-
-interface LiveProjectInfo {
-  id: string;
-  title: string;
-  color?: string | null;
-}
+/** Live rows loaded for the page: enough for every preset (the widest is 30 days / this month). */
+const LIVE_WINDOW_DAYS = 31;
 
 interface ProjectLabel {
   title: string;
@@ -68,14 +61,6 @@ function timeRange(a: Activity) {
   const fmt = (iso: string) =>
     new Date(iso).toLocaleTimeString("en", { hour: "2-digit", minute: "2-digit" });
   return `${fmt(a.startedAt)} – ${fmt(a.endedAt)}`;
-}
-function agoLabel(iso: string) {
-  const mins = Math.round((Date.now() - new Date(iso).getTime()) / 60000);
-  if (mins < 1) return "just now";
-  if (mins < 60) return `${mins}m ago`;
-  const h = Math.floor(mins / 60);
-  if (h < 24) return `${h}h ago`;
-  return `${Math.floor(h / 24)}d ago`;
 }
 
 /**
@@ -123,70 +108,41 @@ export default function ActivitiesPage() {
 }
 
 function ActivitiesPageInner() {
-  const { user } = useSession();
+  const { user, isLive } = useSession();
   const router = useRouter();
   const searchParams = useSearchParams();
   const [filters, setFilters] = useState<ActivityFilters>(defaultActivityFilters);
   const [selected, setSelected] = useState<Activity | null>(null);
   const [view, setView] = useState<ViewMode>(searchParams.get("view") === "screens" ? "screens" : "sessions");
 
-  const { data: apiActivities, error, isLoading, refetch } = useApi<any[]>('/api/app/activity?MaxResultCount=200');
-  const [liveProjects, setLiveProjects] = useState<LiveProjectInfo[]>([]);
-  const isLive = useSyncExternalStore(subscribeToNothing, readBackendToken, serverHasNoToken);
+  // Demo mode never touches the network. The window start is fixed per mount
+  // so the endpoint (and therefore the request) is stable across renders.
+  const [liveFrom] = useState(() => new Date(Date.now() - LIVE_WINDOW_DAYS * 86_400_000).toISOString());
+  const { data: apiActivities, error, isLoading, refetch } = useApi<unknown[]>(
+    `/api/app/activity?From=${encodeURIComponent(liveFrom)}&MaxResultCount=1000`,
+    { enabled: isLive },
+  );
 
   useEffect(() => {
     setView(searchParams.get("view") === "screens" ? "screens" : "sessions");
   }, [searchParams]);
 
-  // LIVE MODE: resolve project names/colors from the real API; demo mode keeps the mock lookup.
-  useEffect(() => {
-    if (typeof window !== "undefined" && localStorage.getItem("dosi-token")) {
-      getApi("/api/app/project")
-        .then((list) => setLiveProjects(Array.isArray(list) ? list : []))
-        .catch(() => setLiveProjects([]));
-    }
+  // Project names/colors: the session's dataset holds the tenant's REAL
+  // projects in a live session and the seeded ones in demo mode.
+  const resolveProject = useCallback((projectId: string): ProjectLabel | undefined => {
+    const p = projectById(projectId);
+    return p ? { title: p.title, color: p.color } : undefined;
   }, []);
 
-  const liveProjectById = useMemo(() => {
-    const map = new Map<string, LiveProjectInfo>();
-    for (const p of liveProjects) map.set(p.id, p);
-    return map;
-  }, [liveProjects]);
-
-  const resolveProject = useCallback(
-    (projectId: string): ProjectLabel | undefined => {
-      const live = liveProjectById.get(projectId);
-      if (live) return { title: live.title, color: live.color || "#006bff" };
-      const mock = projectById(projectId);
-      return mock ? { title: mock.title, color: mock.color } : undefined;
-    },
-    [liveProjectById],
-  );
-
-  // Live activity when the API call succeeded; otherwise null so the page
-  // falls back to the seeded demo dataset — the same idiom as /projects,
-  // /team and /dashboard.
+  // Live activity, mapped with guarded JSON parsing (a malformed window list
+  // from an agent must never crash the page).
   const liveActivities: Activity[] | null = useMemo(() => {
     if (!isLive || !apiActivities) return null;
-    return apiActivities.map(a => ({
-      id: a.id,
-      userId: a.userId,
-      projectId: a.projectId,
-      startedAt: a.startedAt,
-      endedAt: a.endedAt,
-      description: a.description || "Activity block",
-      productivity: a.productivity || 0,
-      mouseClicks: a.mouseClicks || 0,
-      keyboardHits: a.keyboardHits || 0,
-      activeWindows: a.activeWindowsJson ? JSON.parse(a.activeWindowsJson) : [],
-      runningPrograms: a.runningProgramsJson ? JSON.parse(a.runningProgramsJson) : [],
-      screen: { app: "System", kind: "desktop" as any, accent: "#1e293b" }, // Fallback for UI
-      hasWebcam: false,
-      online: false,
-    }));
+    return mapApiActivities(apiActivities);
   }, [isLive, apiActivities]);
 
-  const list = liveActivities ?? demoActivities;
+  // Live: real rows only. A failed load shows an error, never the demo rows.
+  const list = useMemo(() => (isLive ? (liveActivities ?? []) : demoActivities), [isLive, liveActivities]);
   const liveLoading = isLive && isLoading && !liveActivities;
   const liveError = isLive && !!error && !liveActivities;
 
@@ -225,8 +181,12 @@ function ActivitiesPageInner() {
           <>
             {filtered.length} tracked sessions
             {updatedAt ? ` · updated ${agoLabel(updatedAt)}` : ""}
-            {" · "}
-            <span className="text-muted-foreground/80">previews are mock placeholders</span>
+            {!isLive && (
+              <>
+                {" · "}
+                <span className="text-muted-foreground/80">previews are mock placeholders</span>
+              </>
+            )}
           </>
         }
         actions={
@@ -250,8 +210,8 @@ function ActivitiesPageInner() {
       />
 
       {liveError && (
-        <p className="text-xs text-muted-foreground">
-          Couldn’t load live activity — showing demo data.{" "}
+        <p className="text-xs text-danger">
+          Couldn’t load activity from the server.{" "}
           <button
             type="button"
             onClick={() => void refetch()}
@@ -262,7 +222,24 @@ function ActivitiesPageInner() {
         </p>
       )}
 
-      {!liveLoading && filtered.length === 0 && (
+      {isLive && !liveLoading && !liveError && base.length === 0 && (
+        <Card className="flex flex-col items-center justify-center gap-3 py-16 text-center">
+          <div className="flex h-12 w-12 items-center justify-center rounded-full bg-muted text-muted-foreground">
+            <SearchX className="h-6 w-6" />
+          </div>
+          <div>
+            <p className="font-medium">No activity yet — install the desktop agent to start tracking</p>
+            <p className="mt-1 text-sm text-muted-foreground">
+              Sessions appear here a few minutes after the agent uploads its first block.
+            </p>
+          </div>
+          <Link href="/download" className="text-sm text-primary hover:underline">
+            Get the desktop agent
+          </Link>
+        </Card>
+      )}
+
+      {!liveLoading && !liveError && base.length > 0 && filtered.length === 0 && (
         <Card className="flex flex-col items-center justify-center gap-3 py-16 text-center">
           <div className="flex h-12 w-12 items-center justify-center rounded-full bg-muted text-muted-foreground">
             <SearchX className="h-6 w-6" />
@@ -300,7 +277,11 @@ function ActivitiesPageInner() {
                 )}
               >
                 <div className="relative">
-                  <ScreenMockView screen={a.screen} title={a.activeWindows[0]?.windowTitle} className="aspect-video w-full rounded-none" />
+                  {isLive ? (
+                    <AppGlyph app={a.screen.app} color={a.screen.accent} className="aspect-video w-full rounded-none border-0" />
+                  ) : (
+                    <ScreenMockView screen={a.screen} title={a.activeWindows[0]?.windowTitle} className="aspect-video w-full rounded-none" />
+                  )}
                   <div className="absolute right-2 top-2 flex gap-1">
                     {a.hasWebcam && (
                       <span className="flex h-6 w-6 items-center justify-center rounded-md bg-black/60 text-white backdrop-blur" title="Webcam opt-in">
@@ -351,7 +332,11 @@ function ActivitiesPageInner() {
                 onClick={() => setSelected(a)}
                 className="group overflow-hidden rounded-xl border border-border text-left transition-all hover:-translate-y-0.5 hover:border-primary/40"
               >
-                <ScreenMockView screen={a.screen} title={a.activeWindows[0]?.windowTitle} className="aspect-video w-full rounded-none" />
+                {isLive ? (
+                  <AppGlyph app={a.screen.app} color={a.screen.accent} className="aspect-video w-full rounded-none border-0" />
+                ) : (
+                  <ScreenMockView screen={a.screen} title={a.activeWindows[0]?.windowTitle} className="aspect-video w-full rounded-none" />
+                )}
                 <div className="space-y-1 p-3">
                   <div className="flex items-center gap-2">
                     <Avatar name={u?.name ?? ""} size="sm" status={u?.status} />
@@ -411,7 +396,7 @@ function ActivityDrawer({
     setCapturesError(false);
     setCapturesLoading(false);
     if (!activityId || !isGuidId(activityId)) return;
-    if (typeof window === "undefined" || !localStorage.getItem("dosi-token")) return;
+    if (!isLiveSession()) return;
 
     let cancelled = false;
     const urls: string[] = [];

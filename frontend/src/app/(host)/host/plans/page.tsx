@@ -10,6 +10,7 @@ import { useSession } from "@/components/session-provider";
 import { planBreakdown } from "@/lib/host-data";
 import { colorFromString } from "@/lib/utils";
 import { getApi } from "@/hooks/useApi";
+import { asItems } from "@/lib/live-dataset";
 
 const usd = (n: number) => `$${Math.round(n).toLocaleString()}`;
 
@@ -37,7 +38,7 @@ interface ApiPlanSubs {
 }
 
 export default function HostPlansPage() {
-  const { workspaces } = useSession();
+  const { workspaces, isLive } = useSession();
 
   const [live, setLive] = useState<Row[] | null>(null);
   const [loading, setLoading] = useState(false);
@@ -48,10 +49,11 @@ export default function HostPlansPage() {
     setError(false);
     try {
       const [plansRes, overview] = await Promise.all([
-        getApi("/api/app/platform/plans") as Promise<{ items?: ApiPlan[] }>,
+        getApi("/api/app/platform/plans"),
         getApi("/api/app/platform/overview") as Promise<{ plans?: ApiPlanSubs[] }>,
       ]);
-      const plans = Array.isArray(plansRes?.items) ? plansRes.items : [];
+      // getApi already unwrapped `items` — read the rows, not `.items` again.
+      const plans = asItems<ApiPlan>(plansRes);
       const subs = new Map((overview?.plans ?? []).map((p) => [p.planId, p.subscriberCount]));
       setLive(
         plans.map((p) => ({
@@ -73,10 +75,10 @@ export default function HostPlansPage() {
   }, []);
 
   useEffect(() => {
-    if (typeof window === "undefined" || !localStorage.getItem("dosi-token")) return;
+    if (!isLive) return;
     // eslint-disable-next-line react-hooks/set-state-in-effect -- data fetch defers its own setState; see docs/QUALITY.md §10
     loadLive();
-  }, [loadLive]);
+  }, [loadLive, isLive]);
 
   const mockRows = useMemo<Row[]>(
     () =>
@@ -92,7 +94,8 @@ export default function HostPlansPage() {
     [workspaces]
   );
 
-  const rows = live ?? mockRows;
+  // Live: the backend's plans only; a failed load shows an error, never demo plans.
+  const rows = isLive ? (live ?? []) : mockRows;
 
   const columns: Column<Row>[] = [
     { key: "name", header: "Plan", render: (b) => (
@@ -118,8 +121,9 @@ export default function HostPlansPage() {
         <div className="rounded-lg border border-border bg-muted px-3 py-2 text-xs text-muted-foreground">Loading plans…</div>
       )}
       {error && live === null && (
-        <div className="rounded-lg border border-border bg-muted px-3 py-2 text-xs text-muted-foreground">
-          Live plans unavailable right now — showing demo data.
+        <div className="flex items-center gap-3 rounded-lg border border-danger/30 bg-danger/5 px-3 py-2 text-xs text-danger">
+          <span className="flex-1">Couldn&apos;t load plans from the server.</span>
+          <button onClick={() => void loadLive()} className="font-medium text-primary hover:underline">Try again</button>
         </div>
       )}
 

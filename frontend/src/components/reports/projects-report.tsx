@@ -1,33 +1,40 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { Bar, BarChart, Cell, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { FolderKanban, Clock, Users, DollarSign } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Avatar } from "@/components/ui/avatar";
 import { DataTable, type Column } from "@/components/ui/data-table";
-import { ReportShell, FilterBar, ExportMenu, Kpi, KpiGrid } from "./report-shell";
-import { activities, projects, userById } from "@/lib/tenant-data";
+import { ReportShell, FilterBar, ExportMenu, Kpi, KpiGrid, LiveReportNotice, useLiveReport } from "./report-shell";
+import { activities, projectById, projects, userById } from "@/lib/tenant-data";
 import { minutesByProject } from "@/lib/metrics";
-import { filterActivitiesByRange, rangeForKey, type RangeKey } from "@/lib/reports-data";
+import { filterActivitiesByRange, type RangeKey } from "@/lib/reports-data";
+import {
+  asArray,
+  laborCost,
+  ratesByMember,
+  reportQuery,
+  safePercent,
+  type MemberRate,
+  type MinutesRow,
+} from "@/lib/report-math";
 import { exportRecords } from "@/lib/export";
 import { formatDuration } from "@/lib/utils";
 import { getApi } from "@/hooks/useApi";
+import { useSession } from "@/components/session-provider";
 import type { Project } from "@/lib/types";
-import type { ResolvedRange } from "./date-range-picker";
+import { resolveRange, type ResolvedRange } from "./date-range-picker";
 
-const BLENDED_RATE = 48; // $/hr for cost estimate
+/** DEMO ONLY: the seeded dataset has no per-project rates, so its cost is a flat illustrative rate. */
+const DEMO_BLENDED_RATE = 48; // $/hr
 
 /* ---- Live (API) shapes ---- */
 
-interface LivePerProject {
-  projectId: string;
-  trackedMinutes: number;
-}
-
 interface LiveSummary {
-  perProject: LivePerProject[];
+  perProject?: { projectId: string; trackedMinutes: number }[];
+  perUser?: MinutesRow[];
 }
 
 interface ApiProject {
@@ -38,10 +45,18 @@ interface ApiProject {
   isArchived?: boolean;
 }
 
-/** Map a real backend project onto the demo Project view-model the report markup expects.
- *  Members and all-time totals aren't carried by these endpoints, so they degrade to empty in
- *  live mode (loggedTotal reflects the queried window). */
-function toProjectView(p: ApiProject, trackedMinutes: number): Project {
+interface LiveProjectsReport {
+  projects: ApiProject[];
+  /** projectId → minutes tracked in the range. */
+  minutes: Map<string, number>;
+  /** projectId → labour cost from real rates; null when the rates couldn't be read. */
+  costs: Map<string, number> | null;
+}
+
+/** Map a real backend project onto the Project view-model the report markup expects.
+ *  Team avatars come from the session roster; all-time totals aren't carried by these
+ *  endpoints, so that column is not shown in live mode. */
+function toProjectView(p: ApiProject): Project {
   return {
     id: p.id,
     title: p.title,
@@ -57,40 +72,12 @@ function toProjectView(p: ApiProject, trackedMinutes: number): Project {
       activeWindow: false,
       runningPrograms: false,
     },
-    memberIds: [],
+    memberIds: projectById(p.id)?.memberIds ?? [],
     createdAt: "",
     loggedThisWeek: 0,
     loggedThisMonth: 0,
-    loggedTotal: trackedMinutes,
+    loggedTotal: 0,
   };
-}
-
-/** Live queries pivot on the real clock; mirrors rangeForKey's per-preset logic. */
-function liveRangeFor(key: RangeKey): { from: Date; to: Date } {
-  const to = new Date();
-  const from = new Date();
-  switch (key) {
-    case "today":
-      from.setHours(0, 0, 0, 0);
-      break;
-    case "yesterday":
-      from.setDate(from.getDate() - 1);
-      from.setHours(0, 0, 0, 0);
-      to.setDate(to.getDate() - 1);
-      to.setHours(23, 59, 59, 999);
-      break;
-    case "7d":
-      from.setDate(from.getDate() - 7);
-      break;
-    case "month":
-      from.setDate(1);
-      from.setHours(0, 0, 0, 0);
-      break;
-    default: // "30d" and "custom" fall back to the last 30 days
-      from.setDate(from.getDate() - 30);
-      break;
-  }
-  return { from, to };
 }
 
 const tooltipStyle = {
@@ -102,40 +89,44 @@ const tooltipStyle = {
 } as const;
 
 export function ProjectsReport() {
+  const { isLive } = useSession();
   const [rangeKey, setRangeKey] = useState<RangeKey>("30d");
-  const [range, setRange] = useState<ResolvedRange>(() => ({ key: "30d", ...rangeForKey("30d") }));
+  const [range, setRange] = useState<ResolvedRange>(() => resolveRange("30d"));
 
-  const [liveSummary, setLiveSummary] = useState<LiveSummary | null>(null);
-  const [liveProjects, setLiveProjects] = useState<ApiProject[] | null>(null);
-  const [liveLoading, setLiveLoading] = useState(false);
-  const [liveError, setLiveError] = useState(false);
-
-  const loadLive = useCallback(async () => {
-    setLiveLoading(true);
-    setLiveError(false);
-    try {
-      const { from, to } = liveRangeFor(range.key);
-      const qs = new URLSearchParams({ From: from.toISOString(), To: to.toISOString() });
-      const [summary, projectList] = await Promise.all([
-        getApi(`/api/app/reporting/summary?${qs.toString()}`),
-        getApi("/api/app/project"),
-      ]);
-      setLiveSummary(summary && typeof summary === "object" ? (summary as LiveSummary) : null);
-      setLiveProjects(Array.isArray(projectList) ? (projectList as ApiProject[]) : []);
-    } catch {
-      setLiveSummary(null); // fall back to the demo dataset below
-      setLiveProjects(null);
-      setLiveError(true);
-    } finally {
-      setLiveLoading(false);
+  const loadLive = useCallback(async (): Promise<LiveProjectsReport> => {
+    const span = { from: range.from, to: range.to };
+    const [summary, projectList] = await Promise.all([
+      getApi(`/api/app/reporting/summary?${reportQuery(span)}`) as Promise<LiveSummary | null>,
+      getApi("/api/app/project?MaxResultCount=1000"),
+    ]);
+    const minutes = new Map<string, number>();
+    for (const p of asArray<{ projectId: string; trackedMinutes: number }>(summary?.perProject)) {
+      minutes.set(p.projectId, Math.round(Number(p.trackedMinutes) || 0));
     }
+
+    // Labour cost only from REAL rates: per tracked project, its memberships'
+    // hourly rates × each member's minutes on it. Rates are secondary to the
+    // hours, so a failure here hides the cost instead of failing the report.
+    let costs: Map<string, number> | null;
+    try {
+      const entries = await Promise.all(
+        [...minutes].filter(([, m]) => m > 0).map(async ([projectId]) => {
+          const [members, projectSummary] = await Promise.all([
+            getApi(`/api/app/team/project-members/${encodeURIComponent(projectId)}`),
+            getApi(`/api/app/reporting/summary?${reportQuery({ ...span, projectId })}`) as Promise<LiveSummary | null>,
+          ]);
+          const { cost } = laborCost(asArray<MinutesRow>(projectSummary?.perUser), ratesByMember(asArray<MemberRate>(members)));
+          return [projectId, cost] as const;
+        }),
+      );
+      costs = new Map(entries);
+    } catch {
+      costs = null;
+    }
+    return { projects: asArray<ApiProject>(projectList), minutes, costs };
   }, [range]);
 
-  useEffect(() => {
-    if (typeof window === "undefined" || !localStorage.getItem("dosi-token")) return;
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- data fetch defers its own setState; see docs/QUALITY.md §10
-    loadLive();
-  }, [loadLive]);
+  const live = useLiveReport(isLive, loadLive);
 
   const mockRows = useMemo(() => projects.filter((p) => !p.archived), []);
 
@@ -144,38 +135,34 @@ export function ProjectsReport() {
     [range],
   );
 
-  const liveMinutes = useMemo<Map<string, number> | null>(() => {
-    if (!liveSummary) return null;
-    const map = new Map<string, number>();
-    (Array.isArray(liveSummary.perProject) ? liveSummary.perProject : []).forEach((p) => {
-      map.set(p.projectId, Math.round(p.trackedMinutes));
-    });
-    return map;
-  }, [liveSummary]);
+  const liveRows = useMemo<Project[]>(
+    () => (live.data?.projects ?? []).filter((p) => !p.isArchived).map(toProjectView),
+    [live.data],
+  );
 
-  const liveRows = useMemo<Project[] | null>(() => {
-    if (!liveProjects || !liveMinutes) return null;
-    return liveProjects
-      .filter((p) => !p.isArchived)
-      .map((p) => toProjectView(p, liveMinutes.get(p.id) ?? 0));
-  }, [liveProjects, liveMinutes]);
-
-  const rows = liveRows ?? mockRows;
-  const projectMinutes = liveMinutes ?? mockMinutes;
-  const showLiveLoading = liveLoading && liveRows === null;
-  const showLiveError = liveError && liveRows === null;
+  // A live session shows only real projects (or nothing) — never the demo portfolio.
+  const rows = isLive ? liveRows : mockRows;
+  const projectMinutes = isLive ? (live.data?.minutes ?? new Map<string, number>()) : mockMinutes;
+  const liveCosts = live.data?.costs ?? null;
+  // Money is shown in live mode only when real hourly rates produced some.
+  const hasRates = !!liveCosts && [...liveCosts.values()].some((c) => c > 0);
+  const showCost = !isLive || hasRates;
 
   const minutesOf = (p: Project) => projectMinutes.get(p.id) ?? 0;
+  const costOf = (p: Project) =>
+    isLive ? (liveCosts?.get(p.id) ?? 0) : Math.round((minutesOf(p) / 60) * DEMO_BLENDED_RATE);
 
   const totalMinutes = rows.reduce((s, p) => s + minutesOf(p), 0);
-  const totalCost = Math.round((totalMinutes / 60) * BLENDED_RATE);
+  const totalCost = isLive
+    ? Math.round(rows.reduce((s, p) => s + costOf(p), 0) * 100) / 100
+    : Math.round((totalMinutes / 60) * DEMO_BLENDED_RATE);
   const topProject = [...rows].sort((a, b) => minutesOf(b) - minutesOf(a))[0];
 
   const chartData = [...rows]
     .sort((a, b) => minutesOf(b) - minutesOf(a))
-    .map((p) => ({ name: p.title, minutes: minutesOf(p), color: p.color }));
+    .map((p) => ({ id: p.id, name: p.title, minutes: minutesOf(p), color: p.color }));
 
-  const columns: Column<Project>[] = [
+  const allColumns: Column<Project>[] = [
     { key: "title", header: "Project", sortValue: (r) => r.title, render: (r) => (
       <span className="flex items-center gap-2 font-medium">
         <span className="h-3 w-3 rounded" style={{ background: r.color }} /> {r.title}
@@ -194,20 +181,37 @@ export function ProjectsReport() {
     )},
     { key: "time", header: range.label, align: "right", sortValue: (r) => minutesOf(r), render: (r) => <span className="font-medium">{formatDuration(minutesOf(r))}</span> },
     { key: "total", header: "Total logged", align: "right", sortValue: (r) => r.loggedTotal, render: (r) => formatDuration(r.loggedTotal) },
-    { key: "share", header: "Share", align: "right", sortValue: (r) => minutesOf(r), render: (r) => <Badge tone="muted">{totalMinutes ? Math.round((minutesOf(r) / totalMinutes) * 100) : 0}%</Badge> },
-    { key: "cost", header: "Est. cost", align: "right", sortValue: (r) => minutesOf(r), render: (r) => <span className="font-medium">${Math.round((minutesOf(r) / 60) * BLENDED_RATE).toLocaleString()}</span> },
+    { key: "share", header: "Share", align: "right", sortValue: (r) => minutesOf(r), render: (r) => <Badge tone="muted">{safePercent(minutesOf(r), totalMinutes)}%</Badge> },
+    { key: "cost", header: isLive ? "Labor cost" : "Est. cost", align: "right", sortValue: (r) => costOf(r), render: (r) => <span className="font-medium">${costOf(r).toLocaleString()}</span> },
   ];
+  // Live: no all-time totals from these endpoints, and no cost column without real rates.
+  const columns = allColumns.filter((c) => !(isLive && c.key === "total") && !(c.key === "cost" && !showCost));
 
   function onRange(r: ResolvedRange) { setRange(r); setRangeKey(r.key); }
   function doExport() {
+    if (isLive) {
+      exportRecords(`projects-${range.key}`, rows, [
+        { header: "Project", value: (r) => r.title },
+        { header: "Members", value: (r) => r.memberIds.length },
+        { header: `${range.label} (min)`, value: (r) => minutesOf(r) },
+        ...(hasRates ? [{ header: "Labor cost USD", value: (r: Project) => costOf(r) }] : []),
+      ]);
+      return;
+    }
     exportRecords(`projects-${range.key}`, rows, [
       { header: "Project", value: (r) => r.title },
       { header: "Members", value: (r) => r.memberIds.length },
       { header: `${range.label} (min)`, value: (r) => minutesOf(r) },
       { header: "Total (min)", value: (r) => r.loggedTotal },
-      { header: "Est. cost USD", value: (r) => Math.round((minutesOf(r) / 60) * BLENDED_RATE) },
+      { header: "Est. cost USD", value: (r) => costOf(r) },
     ]);
   }
+
+  const liveCostSub = hasRates
+    ? "from members' hourly rates"
+    : liveCosts === null && live.data
+      ? "Rates couldn't be loaded"
+      : "No hourly rates set";
 
   return (
     <ReportShell
@@ -217,22 +221,17 @@ export function ProjectsReport() {
     >
       <FilterBar rangeKey={rangeKey} onRange={onRange} />
 
-      {showLiveLoading && (
-        <div className="rounded-lg border border-border bg-muted px-3 py-2 text-xs text-muted-foreground">
-          Loading live report data…
-        </div>
-      )}
-      {showLiveError && (
-        <div className="rounded-lg border border-border bg-muted px-3 py-2 text-xs text-muted-foreground">
-          Live data unavailable right now — showing demo data.
-        </div>
-      )}
+      {isLive && <LiveReportNotice loading={live.loading} error={live.error} onRetry={live.retry} />}
 
       <KpiGrid>
         <Kpi label="Total time" value={formatDuration(totalMinutes)} icon={Clock} tone="#6d5efc" sub={range.label} />
         <Kpi label="Active projects" value={String(rows.length)} icon={FolderKanban} tone="#0ea5e9" />
         <Kpi label="Most active" value={topProject?.title ?? "—"} icon={Users} tone="#ec4899" sub={topProject ? formatDuration(minutesOf(topProject)) : ""} />
-        <Kpi label="Est. labor cost" value={`$${totalCost.toLocaleString()}`} icon={DollarSign} tone="#22c55e" sub={`@ $${BLENDED_RATE}/hr blended`} />
+        {isLive ? (
+          <Kpi label="Labor cost" value={hasRates ? `$${totalCost.toLocaleString()}` : "—"} icon={DollarSign} tone="#22c55e" sub={liveCostSub} />
+        ) : (
+          <Kpi label="Est. labor cost" value={`$${totalCost.toLocaleString()}`} icon={DollarSign} tone="#22c55e" sub={`@ $${DEMO_BLENDED_RATE}/hr blended`} />
+        )}
       </KpiGrid>
 
       <Card>
@@ -245,7 +244,7 @@ export function ProjectsReport() {
                 <YAxis tickLine={false} axisLine={false} tick={{ fill: "#94a3b8", fontSize: 11 }} width={36} />
                 <Tooltip contentStyle={tooltipStyle} cursor={{ fill: "var(--muted)" }} formatter={(v) => formatDuration(Number(v))} />
                 <Bar dataKey="minutes" radius={[6, 6, 0, 0]} barSize={36}>
-                  {chartData.map((d) => <Cell key={d.name} fill={d.color} />)}
+                  {chartData.map((d) => <Cell key={d.id} fill={d.color} />)}
                 </Bar>
               </BarChart>
             </ResponsiveContainer>
@@ -256,7 +255,12 @@ export function ProjectsReport() {
       <Card>
         <CardHeader><CardTitle>Details</CardTitle></CardHeader>
         <CardContent>
-          <DataTable columns={columns} rows={rows} initialSort={{ key: "time", dir: "desc" }} />
+          <DataTable
+            columns={columns}
+            rows={rows}
+            initialSort={{ key: "time", dir: "desc" }}
+            emptyText={isLive ? "No active projects." : undefined}
+          />
         </CardContent>
       </Card>
     </ReportShell>

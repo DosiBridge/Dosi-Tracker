@@ -12,15 +12,12 @@ import { useSession } from "@/components/session-provider";
 import { trackedMembers } from "@/lib/roles";
 import { cn, formatDuration } from "@/lib/utils";
 import { getApi } from "@/hooks/useApi";
+import { buildWeekMatrix, type UserDailyPoint } from "@/lib/timesheet";
+import type { User } from "@/lib/types";
 
 const days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
 const DAY_MS = 24 * 60 * 60 * 1000;
-
-interface DailySeriesPoint {
-  date: string;
-  trackedMinutes: number;
-}
 
 /** Mon 00:00:00 UTC → Sun 23:59:59.999 UTC for the week `offset` weeks from now. */
 function weekRangeUtc(offset: number): { from: Date; to: Date } {
@@ -48,41 +45,36 @@ function cellTone(minutes: number): string {
 }
 
 export default function TimesheetPage() {
-  const { user } = useSession();
+  const { user, isLive } = useSession();
   const [weekOffset, setWeekOffset] = useState(0);
 
-  // LIVE MODE: real per-day minutes for the displayed week (Mon–Sun, UTC).
-  // The server scopes non-admin callers to their own data automatically.
-  const [hasToken, setHasToken] = useState(false);
-  const [liveWeek, setLiveWeek] = useState<number[] | null>(null);
+  // LIVE MODE: real per-member, per-day minutes for the displayed week
+  // (Mon–Sun, UTC) from GET /api/app/reporting/user-daily-series — ONE ROW PER
+  // MEMBER. (The tenant-wide daily series summed everyone's time under the
+  // viewer's own name.) The server scopes non-managers to their own rows.
+  const [liveRows, setLiveRows] = useState<UserDailyPoint[] | null>(null);
   const [liveLoading, setLiveLoading] = useState(false);
   const [liveError, setLiveError] = useState<string | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
 
   useEffect(() => {
-    if (typeof window === "undefined" || !localStorage.getItem("dosi-token")) return;
-    setHasToken(true);
+    if (!isLive) return;
     const { from, to } = weekRangeUtc(weekOffset);
     let cancelled = false;
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- data fetch defers its own setState; see docs/QUALITY.md §10
     setLiveLoading(true);
     setLiveError(null);
     getApi(
-      `/api/app/reporting/daily-series?From=${encodeURIComponent(from.toISOString())}&To=${encodeURIComponent(to.toISOString())}`
+      `/api/app/reporting/user-daily-series?From=${encodeURIComponent(from.toISOString())}&To=${encodeURIComponent(to.toISOString())}`
     )
       .then((series) => {
         if (cancelled) return;
-        const week = Array<number>(7).fill(0);
-        for (const point of (Array.isArray(series) ? series : []) as DailySeriesPoint[]) {
-          // Anchor on the calendar date only — the backend may serialize without a zone suffix.
-          const dayUtc = Date.parse(`${String(point.date).slice(0, 10)}T00:00:00Z`);
-          const di = Math.floor((dayUtc - from.getTime()) / DAY_MS);
-          if (di >= 0 && di < 7) week[di] = Math.max(0, Math.round(point.trackedMinutes ?? 0));
-        }
-        setLiveWeek(week);
+        setLiveRows(Array.isArray(series) ? (series as UserDailyPoint[]) : []);
       })
       .catch(() => {
         if (cancelled) return;
-        setLiveWeek(null); // fall back to the demo grid below
-        setLiveError("Couldn't load tracked time from the server — showing demo data.");
+        setLiveRows(null);
+        setLiveError("Couldn't load tracked time from the server.");
       })
       .finally(() => {
         if (!cancelled) setLiveLoading(false);
@@ -90,7 +82,7 @@ export default function TimesheetPage() {
     return () => {
       cancelled = true;
     };
-  }, [weekOffset]);
+  }, [weekOffset, isLive, reloadKey]);
 
   const trackingUsers = useMemo(() => {
     const all = trackedMembers(users);
@@ -98,15 +90,23 @@ export default function TimesheetPage() {
     return all;
   }, [user]);
 
-  const liveMatrix = hasToken && liveWeek ? [liveWeek] : null;
-  const live = liveMatrix !== null;
-  const gridUsers = live ? [user] : trackingUsers;
-  const matrix =
-    liveMatrix ?? trackingUsers.map((u, ui) => days.map((_, di) => minutesFor(u.trackedToday, ui, di)));
+  const liveGrid = useMemo(() => {
+    if (!isLive) return null;
+    const { from } = weekRangeUtc(weekOffset);
+    // Roster order first (so a member with no time still gets a row), then
+    // anyone the series knows that the roster doesn't.
+    const roster = user.role === "worker" ? [user] : trackingUsers.length ? trackingUsers : [user];
+    return buildWeekMatrix(liveRows ?? [], from, roster);
+  }, [isLive, liveRows, weekOffset, trackingUsers, user]);
+
+  const gridUsers: Pick<User, "id" | "name" | "designation" | "status">[] = liveGrid ? liveGrid.members : trackingUsers;
+  const matrix = liveGrid
+    ? liveGrid.matrix
+    : trackingUsers.map((u, ui) => days.map((_, di) => minutesFor(u.trackedToday, ui, di)));
   const dayTotals = days.map((_, di) => matrix.reduce((s, row) => s + row[di], 0));
   const grandTotal = dayTotals.reduce((s, v) => s + v, 0);
-  const busiestDay = days[dayTotals.indexOf(Math.max(...dayTotals))];
-  const selfOnly = user.role === "worker" || live;
+  const busiestDay = grandTotal > 0 ? days[dayTotals.indexOf(Math.max(...dayTotals))] : "—";
+  const selfOnly = user.role === "worker";
 
   return (
     <PageStack>
@@ -177,11 +177,16 @@ export default function TimesheetPage() {
           <CardTitle className="text-base">{selfOnly ? "Your week" : "Team heatmap"}</CardTitle>
         </CardHeader>
         <CardContent>
-          {hasToken && liveLoading && (
+          {isLive && liveLoading && (
             <p className="mb-3 text-xs text-muted-foreground">Loading tracked time…</p>
           )}
-          {hasToken && !liveLoading && liveError && (
-            <p className="mb-3 text-xs text-danger">{liveError}</p>
+          {isLive && !liveLoading && liveError && (
+            <p className="mb-3 flex items-center gap-2 text-xs text-danger">
+              {liveError}
+              <button onClick={() => setReloadKey((k) => k + 1)} className="font-medium text-primary hover:underline">
+                Try again
+              </button>
+            </p>
           )}
           {/* Mobile: per-member week cards */}
           <div className="space-y-3 md:hidden">

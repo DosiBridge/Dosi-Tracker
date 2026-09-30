@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect } from "react";
+import { createPortal } from "react-dom";
 import { X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "./button";
@@ -34,7 +35,8 @@ export function Drawer({
 
   if (!open) return null;
 
-  return (
+  // Portal to <body> so a transformed ancestor can't clip the `fixed` overlay (see Modal).
+  return createPortal(
     <div className="fixed inset-0 z-50">
       <div className="absolute inset-0 bg-black/50 backdrop-blur-sm animate-fade-in" onClick={onClose} />
       <div
@@ -56,6 +58,7 @@ export function Drawer({
         </div>
         <div className="p-5">{children}</div>
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }

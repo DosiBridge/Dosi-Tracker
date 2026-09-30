@@ -12,6 +12,7 @@ import { DataTable, type Column } from "@/components/ui/data-table";
 import { useSession } from "@/components/session-provider";
 import { globalUsers } from "@/lib/host-data";
 import { getApi } from "@/hooks/useApi";
+import { asItems } from "@/lib/live-dataset";
 
 /** Unified row shape for both the live (API) and demo (fallback) views. */
 interface Row {
@@ -32,7 +33,7 @@ interface ApiUser {
 }
 
 export default function HostUsersPage() {
-  const { workspaces } = useSession();
+  const { workspaces, isLive } = useSession();
   const [query, setQuery] = useState("");
   const [tenant, setTenant] = useState<"all" | string>("all");
 
@@ -44,8 +45,8 @@ export default function HostUsersPage() {
     setLoading(true);
     setError(false);
     try {
-      const res = (await getApi("/api/app/platform/users?MaxResultCount=500")) as { items?: ApiUser[] };
-      const items = Array.isArray(res?.items) ? res.items : [];
+      // getApi already unwrapped `items` — read the rows, not `.items` again.
+      const items = asItems<ApiUser>(await getApi("/api/app/platform/users?MaxResultCount=500"));
       setLive(
         items.map((u) => ({
           id: u.id,
@@ -55,7 +56,7 @@ export default function HostUsersPage() {
         }))
       );
     } catch {
-      setLive(null); // fall back to the demo dataset
+      setLive(null);
       setError(true);
     } finally {
       setLoading(false);
@@ -63,10 +64,10 @@ export default function HostUsersPage() {
   }, []);
 
   useEffect(() => {
-    if (typeof window === "undefined" || !localStorage.getItem("dosi-token")) return;
+    if (!isLive) return;
     // eslint-disable-next-line react-hooks/set-state-in-effect -- data fetch defers its own setState; see docs/QUALITY.md §10
     loadLive();
-  }, [loadLive]);
+  }, [loadLive, isLive]);
 
   const mockRows = useMemo<Row[]>(
     () =>
@@ -79,7 +80,8 @@ export default function HostUsersPage() {
     [workspaces]
   );
 
-  const all = live ?? mockRows;
+  // Live: real users only; a failed load shows an error, never demo people.
+  const all = useMemo(() => (isLive ? (live ?? []) : mockRows), [isLive, live, mockRows]);
   const tenants = useMemo(() => [...new Set(all.map((r) => r.tenant))].sort(), [all]);
 
   const rows = useMemo(
@@ -130,8 +132,9 @@ export default function HostUsersPage() {
         <div className="rounded-lg border border-border bg-muted px-3 py-2 text-xs text-muted-foreground">Loading users…</div>
       )}
       {error && live === null && (
-        <div className="rounded-lg border border-border bg-muted px-3 py-2 text-xs text-muted-foreground">
-          Live users unavailable right now — showing demo data.
+        <div className="flex items-center gap-3 rounded-lg border border-danger/30 bg-danger/5 px-3 py-2 text-xs text-danger">
+          <span className="flex-1">Couldn&apos;t load users from the server.</span>
+          <button onClick={() => void loadLive()} className="font-medium text-primary hover:underline">Try again</button>
         </div>
       )}
 

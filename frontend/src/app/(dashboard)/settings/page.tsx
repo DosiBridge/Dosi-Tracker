@@ -36,13 +36,12 @@ interface ProfileForm {
 }
 
 export default function SettingsPage() {
-  const { user: currentUser } = useSession();
+  const { user: currentUser, isLive: live, refreshSession } = useSession();
   const tabs = allTabs.filter((t) => (t.roles as readonly string[]).includes(currentUser.role));
   const [tab, setTab] = useState<TabKey>("profile");
   const [saved, setSaved] = useState(false);
 
   // Live profile (only when a real backend session exists; otherwise demo mode).
-  const [live, setLive] = useState(false);
   const [profileRaw, setProfileRaw] = useState<Record<string, unknown> | null>(null);
   const [profileForm, setProfileForm] = useState<ProfileForm | null>(null);
   const [profileLoading, setProfileLoading] = useState(false);
@@ -51,8 +50,8 @@ export default function SettingsPage() {
   const [saveError, setSaveError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (typeof window !== "undefined" && localStorage.getItem("dosi-token")) {
-      setLive(true);
+    if (live) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- data fetch defers its own setState; see docs/QUALITY.md §10
       setProfileLoading(true);
       getApi("/api/account/my-profile")
         .then((p) => {
@@ -67,13 +66,12 @@ export default function SettingsPage() {
           setProfileError(null);
         })
         .catch(() => {
-          // Fall back to the demo profile rendering below.
-          setProfileError("Couldn't load your profile from the server — showing demo data.");
+          setProfileError("Couldn't load your profile from the server. Try again later.");
           setProfileForm(null);
         })
         .finally(() => setProfileLoading(false));
     }
-  }, []);
+  }, [live]);
 
   const setProfileField = (key: keyof ProfileForm, value: string) =>
     setProfileForm((f) => (f ? { ...f, [key]: value } : f));
@@ -99,6 +97,9 @@ export default function SettingsPage() {
         await putApi("/api/account/my-profile", { ...(profileRaw ?? {}), ...profileForm });
         setSaved(true);
         setTimeout(() => setSaved(false), 1600);
+        toast({ tone: "success", title: "Profile saved", description: "Your changes are live." });
+        // The name shown in the sidebar/topbar comes from the session: refresh it.
+        void refreshSession({ silent: true });
       } catch (err) {
         setSaveError(err instanceof Error ? err.message : "Failed to save profile.");
       } finally {
@@ -178,7 +179,7 @@ export default function SettingsPage() {
                       </Select>
                     </div>
                   </div>
-                ) : !profileLoading ? (
+                ) : !profileLoading && !live ? (
                   <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
                     <Field label="Full name" defaultValue={currentUser.name} />
                     <Field label="Email" defaultValue={currentUser.email} />

@@ -44,6 +44,13 @@ describe("Modal", () => {
     expect(screen.queryByText("Modal body content")).not.toBeInTheDocument();
   });
 
+  it("portals to <body>, so a transformed page wrapper can't clip the full-screen backdrop", () => {
+    const { container } = render(<ModalHost />);
+    const dialog = screen.getByRole("dialog", { name: "Remove member" });
+    expect(container.contains(dialog)).toBe(false);
+    expect(document.body.contains(dialog)).toBe(true);
+  });
+
   it("when open, shows a named dialog with title, description and body", () => {
     render(<ModalHost />);
     const dialog = screen.getByRole("dialog", { name: "Remove member" });
@@ -70,10 +77,10 @@ describe("Modal", () => {
 
   it("clicking the backdrop closes; clicking inside the dialog does not", async () => {
     const user = userEvent.setup();
-    const { container } = render(<ModalHost />);
+    render(<ModalHost />);
     await user.click(screen.getByText("Modal body content"));
     expect(screen.getByRole("dialog")).toBeInTheDocument();
-    await user.click(backdropOf(container));
+    await user.click(backdropOf(document.body));
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
@@ -86,7 +93,7 @@ describe("Modal", () => {
   });
 
   it("a11y: the open modal has no axe violations", async () => {
-    const { container } = render(<ModalHost />);
-    expect(await axe(container)).toHaveNoViolations();
+    render(<ModalHost />);
+    expect(await axe(document.body)).toHaveNoViolations();
   });
 });

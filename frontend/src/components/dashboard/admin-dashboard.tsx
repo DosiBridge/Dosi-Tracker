@@ -10,12 +10,12 @@ import { Ring } from "@/components/ui/ring";
 import { Button } from "@/components/ui/button";
 import { StatCard } from "@/components/dashboard/stat-card";
 import { SetupChecklist } from "@/components/dashboard/setup-checklist";
-import { ActivityTrendChart, HourlyChart, ProjectDonut, TopAppsChart } from "@/components/dashboard/charts";
-import { ScreenMockView } from "@/components/screen-mock";
+import { ActivityTrendChart, ChartEmpty, HourlyChart, ProjectDonut, TopAppsChart } from "@/components/dashboard/charts";
+import { AppGlyph, ScreenMockView } from "@/components/screen-mock";
+import { useSession } from "@/components/session-provider";
 import {
   activities,
   hourlyToday,
-  NOW,
   projectById,
   projectDistribution,
   summary,
@@ -28,6 +28,7 @@ import { brand, greeting } from "@/lib/brand";
 import { formatDuration } from "@/lib/utils";
 import { Reveal, Stagger } from "@/components/motion/reveal";
 import { getApi } from "@/hooks/useApi";
+import { agoLabel } from "@/lib/live-session";
 
 /** Shapes returned by /api/app/reporting (live mode). */
 interface LiveReportSummary {
@@ -49,23 +50,18 @@ interface LiveDailyPoint {
   keyboardHits: number;
 }
 
-function agoLabel(iso: string) {
-  const mins = Math.round((NOW.getTime() - new Date(iso).getTime()) / 60000);
-  if (mins < 60) return `${mins}m ago`;
-  const h = Math.floor(mins / 60);
-  if (h < 24) return `${h}h ago`;
-  return `${Math.floor(h / 24)}d ago`;
-}
-
 export function AdminDashboard({ userName, isOwner }: { userName: string; isOwner: boolean }) {
-  // LIVE MODE: only when a real session token exists; otherwise the mock
-  // dataset below renders exactly as before (demo mode).
+  // LIVE MODE: headline figures come from the reporting API; every chart and
+  // list below reads the session's live dataset, which is built from the
+  // tenant's REAL rows (see tenant-data installLiveDataset). Demo mode renders
+  // the seeded dataset exactly as before.
+  const { isLive } = useSession();
   const [live, setLive] = useState<{ summary: LiveReportSummary; series: LiveDailyPoint[] } | null>(null);
   const [liveLoading, setLiveLoading] = useState(false);
   const [liveError, setLiveError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (typeof window === "undefined" || !localStorage.getItem("dosi-token")) return;
+    if (!isLive) return;
     let cancelled = false;
     setLiveLoading(true);
     setLiveError(null);
@@ -81,7 +77,7 @@ export function AdminDashboard({ userName, isOwner }: { userName: string; isOwne
         setLive({ summary: summaryRes, series: Array.isArray(seriesRes) ? seriesRes : [] });
       })
       .catch(() => {
-        if (!cancelled) setLiveError("Couldn't load live team stats — showing demo data.");
+        if (!cancelled) setLiveError("Couldn't load this week's team stats from the server. Figures below come from the activity already loaded.");
       })
       .finally(() => {
         if (!cancelled) setLiveLoading(false);
@@ -89,7 +85,7 @@ export function AdminDashboard({ userName, isOwner }: { userName: string; isOwne
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [isLive]);
 
   const liveSummary = live?.summary ?? null;
   const trendData =
@@ -107,6 +103,9 @@ export function AdminDashboard({ userName, isOwner }: { userName: string; isOwne
     .sort((a, b) => b.trackedToday - a.trackedToday)
     .slice(0, 5);
   const feed = activities.slice(0, 6);
+  const hasHourly = hourlyToday.some((h) => h.minutes > 0);
+  const hasDist = dist.some((d) => d.value > 0);
+  const noActivityCopy = "No activity yet — install the desktop agent to start tracking.";
 
   return (
     <div className="space-y-6">
@@ -124,7 +123,7 @@ export function AdminDashboard({ userName, isOwner }: { userName: string; isOwne
             {isOwner ? "Organization overview for today." : "What your team is working on today."}
           </p>
           {liveLoading && <p className="mt-1 text-xs text-muted-foreground">Loading live team stats…</p>}
-          {liveError && <p className="mt-1 text-xs text-muted-foreground">{liveError}</p>}
+          {liveError && <p className="mt-1 text-xs text-danger">{liveError}</p>}
         </div>
         <div className="flex items-center gap-2">
           <Link href="/reports/weekly">
@@ -192,6 +191,10 @@ export function AdminDashboard({ userName, isOwner }: { userName: string; isOwne
         <Card>
           <CardHeader><CardTitle>Time by project</CardTitle></CardHeader>
           <CardContent>
+            {isLive && !hasDist ? (
+              <ChartEmpty message="No time tracked on projects this week." />
+            ) : (
+            <>
             <ProjectDonut data={dist} />
             <div className="mt-3 space-y-2">
               {dist.slice(0, 4).map((d) => (
@@ -204,6 +207,8 @@ export function AdminDashboard({ userName, isOwner }: { userName: string; isOwne
                 </div>
               ))}
             </div>
+            </>
+            )}
           </CardContent>
         </Card>
       </div>
@@ -213,11 +218,15 @@ export function AdminDashboard({ userName, isOwner }: { userName: string; isOwne
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
         <Card className="card-quiet">
           <CardHeader><CardTitle>Most used apps</CardTitle><Badge tone="muted">This week</Badge></CardHeader>
-          <CardContent><TopAppsChart data={topApps} /></CardContent>
+          <CardContent>
+            {isLive && topApps.length === 0 ? <ChartEmpty message="No app usage recorded this week." /> : <TopAppsChart data={topApps} />}
+          </CardContent>
         </Card>
         <Card className="card-quiet">
           <CardHeader><CardTitle>Today&apos;s focus by hour</CardTitle><Badge tone="muted">Minutes tracked</Badge></CardHeader>
-          <CardContent><HourlyChart data={hourlyToday} /></CardContent>
+          <CardContent>
+            {isLive && !hasHourly ? <ChartEmpty message="Nothing tracked yet today." /> : <HourlyChart data={hourlyToday} />}
+          </CardContent>
         </Card>
       </div>
       </Reveal>
@@ -230,6 +239,9 @@ export function AdminDashboard({ userName, isOwner }: { userName: string; isOwne
             <Link href="/team" className="text-xs text-primary hover:underline">View all</Link>
           </CardHeader>
           <CardContent className="space-y-1">
+            {leaderboard.length === 0 && (
+              <p className="py-6 text-center text-sm text-muted-foreground">No one has tracked time today yet.</p>
+            )}
             {leaderboard.map((u, i) => (
               <div key={u.id} className="flex items-center gap-3 rounded-lg p-2 hover:bg-muted/60">
                 <span className="w-5 text-center text-sm font-semibold text-muted-foreground">{i + 1}</span>
@@ -251,15 +263,25 @@ export function AdminDashboard({ userName, isOwner }: { userName: string; isOwne
             <Link href="/activities" className="text-xs text-primary hover:underline">View all</Link>
           </CardHeader>
           <CardContent className="space-y-3">
+            {feed.length === 0 && (
+              <p className="py-6 text-center text-sm text-muted-foreground">
+                {noActivityCopy}{" "}
+                <Link href="/download" className="text-primary hover:underline">Get the agent</Link>
+              </p>
+            )}
             {feed.map((a) => {
               const u = userById(a.userId);
               const p = projectById(a.projectId);
               return (
                 <div key={a.id} className="flex items-center gap-3">
-                  <ScreenMockView screen={a.screen} className="h-12 w-20 shrink-0" />
+                  {isLive ? (
+                    <AppGlyph app={a.screen.app} color={a.screen.accent} className="h-12 w-20 shrink-0" />
+                  ) : (
+                    <ScreenMockView screen={a.screen} className="h-12 w-20 shrink-0" />
+                  )}
                   <div className="min-w-0 flex-1">
                     <div className="truncate text-sm">
-                      <span className="font-medium">{u?.name}</span>{" "}
+                      <span className="font-medium">{u?.name ?? "Member"}</span>{" "}
                       <span className="text-muted-foreground">— {a.description}</span>
                     </div>
                     <div className="mt-0.5 flex items-center gap-2 text-xs text-muted-foreground">

@@ -11,11 +11,11 @@ public class PlatformOverviewDto
     public int ActiveSubscriptions { get; set; }
     public int TrialingSubscriptions { get; set; }
 
-    /// <summary>Monthly recurring revenue: sum over active/trialing subscriptions of the plan's
-    /// per-user price times that tenant's occupied seats (min one seat).</summary>
+    /// <summary>Monthly recurring revenue: sum over ACTIVE subscriptions of the plan's per-user price
+    /// times that tenant's occupied seats (min one seat). Trialing subscriptions pay nothing and are excluded.</summary>
     public decimal Mrr { get; set; }
 
-    /// <summary>Total occupied (billable) seats across active/trialing subscriptions.</summary>
+    /// <summary>Total occupied (billable) seats across active subscriptions.</summary>
     public int PaidSeats { get; set; }
 
     /// <summary>Sum of every invoice ever raised, across all tenants.</summary>

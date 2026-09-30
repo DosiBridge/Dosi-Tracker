@@ -19,9 +19,18 @@
 
 ## 2. Start PostgreSQL + migrate
 
-1. Create DB matching `ConnectionStrings:Default` in:
-   - `backend/src/Dosi.Tracker.HttpApi.Host/appsettings.json`
-   - `backend/src/Dosi.Tracker.DbMigrator/appsettings.json`
+1. Create a DB and point `ConnectionStrings:Default` at it. The tracked `appsettings.json` files only carry the
+   template placeholder (`root` / `myPassword`); put your real local credentials in the **git-ignored**
+   `appsettings.secrets.json` next to them (loaded automatically, never published):
+   - `backend/src/Dosi.Tracker.HttpApi.Host/appsettings.secrets.json`
+   - `backend/src/Dosi.Tracker.DbMigrator/appsettings.secrets.json`
+
+   ```json
+   { "ConnectionStrings": { "Default": "Host=localhost;Port=5432;Database=Tracker;User ID=postgres;Password=<yours>;" } }
+   ```
+
+   In Production the host refuses to start if the connection string or either passphrase still comes from the
+   tracked `appsettings.json` (supply them via environment variables / a secret store).
 2. Run migrator:
 
 ```powershell

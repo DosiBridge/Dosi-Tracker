@@ -1,19 +1,20 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { CalendarCheck, Clock, UserCheck, UserX } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Avatar } from "@/components/ui/avatar";
-import { Badge } from "@/components/ui/badge";
 import { DataTable, type Column } from "@/components/ui/data-table";
-import { ReportShell, FilterBar, ExportMenu, Kpi, KpiGrid } from "./report-shell";
+import { ReportShell, FilterBar, ExportMenu, Kpi, KpiGrid, LiveReportNotice, useLiveReport } from "./report-shell";
 import { attendance, userById, users } from "@/lib/tenant-data";
 import { trackedMembers } from "@/lib/roles";
-import { rangeForKey, type RangeKey } from "@/lib/reports-data";
+import type { RangeKey } from "@/lib/reports-data";
+import { asArray, memberName, reportQuery, safePercent } from "@/lib/report-math";
 import { exportRecords } from "@/lib/export";
 import { formatDuration, cn } from "@/lib/utils";
 import { getApi } from "@/hooks/useApi";
-import type { ResolvedRange } from "./date-range-picker";
+import { useSession } from "@/components/session-provider";
+import { resolveRange, type ResolvedRange } from "./date-range-picker";
 
 /**
  * Presence & worked-time, derived honestly from tracked activity. The tracker does not record
@@ -41,65 +42,26 @@ interface LiveAttendance {
   days: string[];
   rows: LiveRow[];
 }
-interface LiveIdentityUser {
-  id: string;
-  userName: string;
-  name?: string | null;
-  surname?: string | null;
-}
 
 const dayKey = (iso: string) => iso.slice(0, 10);
 
-function liveRangeFor(key: RangeKey): { from: Date; to: Date } {
-  const to = new Date();
-  const from = new Date();
-  switch (key) {
-    case "today": from.setHours(0, 0, 0, 0); break;
-    case "yesterday":
-      from.setDate(from.getDate() - 1); from.setHours(0, 0, 0, 0);
-      to.setDate(to.getDate() - 1); to.setHours(23, 59, 59, 999); break;
-    case "30d": from.setDate(from.getDate() - 30); break;
-    case "month": from.setDate(1); from.setHours(0, 0, 0, 0); break;
-    default: from.setDate(from.getDate() - 7); break;
-  }
-  return { from, to };
-}
-
 export function AttendanceReport() {
+  const { isLive } = useSession();
   const [rangeKey, setRangeKey] = useState<RangeKey>("7d");
-  const [range, setRange] = useState<ResolvedRange>(() => ({ key: "7d", ...rangeForKey("7d") }));
+  const [range, setRange] = useState<ResolvedRange>(() => resolveRange("7d"));
   const [memberId, setMemberId] = useState("all");
 
-  const [live, setLive] = useState<LiveAttendance | null>(null);
-  const [liveUsers, setLiveUsers] = useState<LiveIdentityUser[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState(false);
+  // LIVE: presence straight from /reporting/attendance; a selected member is filtered server-side.
+  const loadLive = useCallback(async (): Promise<LiveAttendance> => {
+    const report = (await getApi(
+      `/api/app/reporting/attendance?${reportQuery({ from: range.from, to: range.to, userId: memberId })}`,
+    )) as Partial<LiveAttendance> | null;
+    return { days: asArray<string>(report?.days), rows: asArray<LiveRow>(report?.rows) };
+  }, [range, memberId]);
 
-  const loadLive = useCallback(async () => {
-    setLoading(true);
-    setError(false);
-    try {
-      const { from, to } = liveRangeFor(range.key);
-      const qs = new URLSearchParams({ From: from.toISOString(), To: to.toISOString() });
-      const report = (await getApi(`/api/app/reporting/attendance?${qs.toString()}`)) as LiveAttendance;
-      setLive(report && Array.isArray(report.rows) ? report : { days: [], rows: [] });
-      const identity = await getApi("/api/identity/users?MaxResultCount=200").catch(() => []);
-      setLiveUsers(Array.isArray(identity) ? (identity as LiveIdentityUser[]) : []);
-    } catch {
-      setLive(null);
-      setError(true);
-    } finally {
-      setLoading(false);
-    }
-  }, [range]);
+  const live = useLiveReport(isLive, loadLive);
 
-  useEffect(() => {
-    if (typeof window === "undefined" || !localStorage.getItem("dosi-token")) return;
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- data fetch defers its own setState; see docs/QUALITY.md §10
-    loadLive();
-  }, [loadLive]);
-
-  // --- Demo fallback (mock attendance): present = any non-absent day. ---
+  // --- Demo mode (seeded attendance): present = any non-absent day. ---
   const demoDates = useMemo(() => {
     const from = range.from.toISOString().slice(0, 10);
     const to = range.to.toISOString().slice(0, 10);
@@ -127,33 +89,29 @@ export function AttendanceReport() {
       });
   }, [range, memberId]);
 
-  const liveRows = useMemo<Row[] | null>(() => {
-    if (!live) return null;
-    return live.rows
-      .filter((r) => memberId === "all" || r.userId === memberId)
-      .map((r) => {
-        const id = liveUsers.find((x) => x.id === r.userId);
-        const nm = id ? `${id.name ?? ""} ${id.surname ?? ""}`.trim() : "";
-        return {
+  const liveRows = useMemo<Row[]>(
+    () =>
+      (live.data?.rows ?? [])
+        .filter((r) => memberId === "all" || r.userId === memberId)
+        .map((r) => ({
           userId: r.userId,
-          name: nm || id?.userName || userById(r.userId)?.name || r.userId.slice(0, 8),
+          name: memberName(r.userId, userById(r.userId)),
           present: r.daysPresent,
           absent: r.daysAbsent,
           worked: Math.round(r.workedMinutes),
-          presentDays: new Set(r.presentDays.map(dayKey)),
-        };
-      });
-  }, [live, liveUsers, memberId]);
+          presentDays: new Set(asArray<string>(r.presentDays).map(dayKey)),
+        })),
+    [live.data, memberId],
+  );
 
-  const rows = liveRows ?? demoRows;
-  const dates = live ? live.days.map(dayKey) : demoDates;
-  const showLoading = loading && liveRows === null;
-  const showError = error && liveRows === null;
+  // A live session shows only real presence (or nothing) — never the seeded attendance sheet.
+  const rows = isLive ? liveRows : demoRows;
+  const dates = isLive ? (live.data?.days ?? []).map(dayKey) : demoDates;
 
   const totalPresent = rows.reduce((s, r) => s + r.present, 0);
   const totalAbsent = rows.reduce((s, r) => s + r.absent, 0);
   const totalWorked = rows.reduce((s, r) => s + r.worked, 0);
-  const attendanceRate = totalPresent + totalAbsent ? Math.round((totalPresent / (totalPresent + totalAbsent)) * 100) : 0;
+  const attendanceRate = safePercent(totalPresent, totalPresent + totalAbsent);
 
   const columns: Column<Row>[] = [
     { key: "name", header: "Member", sortValue: (r) => r.name, render: (r) => (
@@ -185,12 +143,7 @@ export function AttendanceReport() {
     >
       <FilterBar rangeKey={rangeKey} onRange={onRange} memberId={memberId} onMember={setMemberId} />
 
-      {showLoading && (
-        <div className="rounded-lg border border-border bg-muted px-3 py-2 text-xs text-muted-foreground">Loading live report data…</div>
-      )}
-      {showError && (
-        <div className="rounded-lg border border-border bg-muted px-3 py-2 text-xs text-muted-foreground">Live data unavailable right now — showing demo data.</div>
-      )}
+      {isLive && <LiveReportNotice loading={live.loading} error={live.error} onRetry={live.retry} />}
 
       <KpiGrid>
         <Kpi label="Attendance rate" value={`${attendanceRate}%`} icon={CalendarCheck} tone="#22c55e" sub={range.label} />
@@ -272,7 +225,12 @@ export function AttendanceReport() {
       <Card>
         <CardHeader><CardTitle>Summary</CardTitle></CardHeader>
         <CardContent>
-          <DataTable columns={columns} rows={rows} initialSort={{ key: "worked", dir: "desc" }} />
+          <DataTable
+            columns={columns}
+            rows={rows}
+            initialSort={{ key: "worked", dir: "desc" }}
+            emptyText={isLive ? "No tracked activity in this range." : undefined}
+          />
         </CardContent>
       </Card>
     </ReportShell>
