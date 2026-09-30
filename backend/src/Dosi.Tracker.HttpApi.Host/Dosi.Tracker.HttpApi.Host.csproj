@@ -51,12 +51,6 @@
   </ItemGroup>
 
   <ItemGroup>
-    <!-- Git-ignored, developer-local overrides (loaded by AddAppSettingsSecretsJson()). Never published:
-         it is registered AFTER environment variables, so a published copy would override container env. -->
-    <Content Update="appsettings.secrets.json" CopyToPublishDirectory="Never" />
-  </ItemGroup>
-
-  <ItemGroup>
     <Compile Remove="Logs\**" />
     <Content Remove="Logs\**" />
     <EmbeddedResource Remove="Logs\**" />
