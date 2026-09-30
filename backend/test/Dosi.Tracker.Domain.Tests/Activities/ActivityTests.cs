@@ -49,6 +49,7 @@ public class ActivityTests
         // Window/program captures default to an empty JSON array, never null or "".
         activity.ActiveWindowsJson.ShouldBe("[]");
         activity.RunningProgramsJson.ShouldBe("[]");
+        activity.TimelineJson.ShouldBe("[]");
     }
 
     [Fact]

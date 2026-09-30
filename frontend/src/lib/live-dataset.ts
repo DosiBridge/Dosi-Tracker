@@ -1,5 +1,6 @@
-import type { Activity, Project, Role, ScreenMock, User, WindowInfo } from "./types";
+import type { Activity, ActivityMinute, CaptureKind, CaptureRef, Project, Role, ScreenMock, User, WindowInfo } from "./types";
 import type { AppNotification, AppUsage, NotificationType } from "./reports-data";
+import { mainAppOf } from "./activity-report";
 import { activitiesOnDay, averageProductivity, durationMinutes, minutesForProject, minutesOnDay } from "./metrics";
 import { colorFromString } from "./utils";
 
@@ -28,8 +29,20 @@ export interface ApiActivityDto {
   mouseClicks?: number | null;
   keyboardHits?: number | null;
   description?: string | null;
+  /**
+   * JSON string of per-(app, window title) focus over the whole block, sorted
+   * by seconds desc: `{ AppName, WindowTitle, Seconds, KeyboardHits, MouseClicks }`.
+   * Legacy rows: a single entry with no seconds or counts.
+   */
   activeWindowsJson?: unknown;
   runningProgramsJson?: unknown;
+  /**
+   * JSON string of 1-minute buckets `{ Minute, KeyboardHits, MouseClicks, Active, AppName }`
+   * (Minute is 0-based from startedAt). Missing or "[]" on legacy rows.
+   */
+  timelineJson?: unknown;
+  /** The block's stored captures `[{ id, kind: "screen" | "webcam" | "thumb" }]`; absent on older backends. */
+  captures?: unknown;
 }
 
 /** GET /api/app/project item (ProjectDto). */
@@ -91,14 +104,36 @@ function num(value: unknown, fallback = 0): number {
   return Number.isFinite(n) ? n : fallback;
 }
 
+/** Case- and separator-insensitive key: "appName" = "AppName" = "app_name". */
+const normalizedKey = (key: string) => key.replace(/[_\-\s]/g, "").toLowerCase();
+
 /**
- * Parse an agent window list. The backend stores whatever the desktop agent
- * sent as a JSON string (camelCase from the agents, PascalCase when re-serialized
- * by .NET), so this accepts a JSON string OR an already-parsed array, either
- * casing, and silently drops anything malformed. Corrupt JSON yields [] — it
+ * Read one field of an agent/backend record whatever its casing: the agents
+ * send camelCase, .NET re-serializes PascalCase, older builds used snake_case.
+ * The first non-null value under a matching key wins.
+ */
+function field(rec: Record<string, unknown>, name: string): unknown {
+  if (rec[name] !== undefined && rec[name] !== null) return rec[name];
+  const want = normalizedKey(name);
+  for (const key of Object.keys(rec)) {
+    if (normalizedKey(key) === want && rec[key] !== undefined && rec[key] !== null) return rec[key];
+  }
+  return undefined;
+}
+
+/** A reported, non-negative whole count — or undefined when the field is absent or not a number. */
+function optionalCount(value: unknown): number | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  const n = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(n) ? Math.max(0, Math.round(n)) : undefined;
+}
+
+/**
+ * The object entries of a JSON-string-or-array payload. Corrupt JSON, a
+ * non-array, and non-object entries all drop out silently — agent payloads
  * must never crash a page.
  */
-export function parseWindowList(raw: unknown): WindowInfo[] {
+function recordsOf(raw: unknown): Record<string, unknown>[] {
   let value: unknown = raw;
   if (typeof raw === "string") {
     if (raw.trim() === "") return [];
@@ -109,32 +144,161 @@ export function parseWindowList(raw: unknown): WindowInfo[] {
     }
   }
   if (!Array.isArray(value)) return [];
+  return value.filter(
+    (item): item is Record<string, unknown> => !!item && typeof item === "object" && !Array.isArray(item),
+  );
+}
+
+/**
+ * Parse an agent window list. The backend stores whatever the desktop agent
+ * sent as a JSON string (camelCase from the agents, PascalCase when re-serialized
+ * by .NET), so this accepts a JSON string OR an already-parsed array, any key
+ * casing, and silently drops anything malformed. Corrupt JSON yields [] — it
+ * must never crash a page. Per-window input counts are kept only when the
+ * agent reported them (newer agents), so "not reported" never reads as zero.
+ */
+export function parseWindowList(raw: unknown): WindowInfo[] {
   const out: WindowInfo[] = [];
-  for (const item of value) {
-    if (!item || typeof item !== "object") continue;
-    const rec = item as Record<string, unknown>;
-    const appName = str(rec.appName ?? rec.AppName ?? rec.app_name).trim();
+  for (const rec of recordsOf(raw)) {
+    const appName = str(field(rec, "appName")).trim();
     if (!appName) continue;
-    out.push({
+    const win: WindowInfo = {
       appName,
-      windowTitle: str(rec.windowTitle ?? rec.WindowTitle ?? rec.window_title),
-      seconds: Math.max(0, num(rec.seconds ?? rec.Seconds, 0)),
-    });
+      windowTitle: str(field(rec, "windowTitle")),
+      seconds: Math.max(0, num(field(rec, "seconds"), 0)),
+    };
+    const keyboardHits = optionalCount(field(rec, "keyboardHits"));
+    const mouseClicks = optionalCount(field(rec, "mouseClicks"));
+    if (keyboardHits !== undefined) win.keyboardHits = keyboardHits;
+    if (mouseClicks !== undefined) win.mouseClicks = mouseClicks;
+    out.push(win);
   }
   return out;
 }
 
-/** A neutral, honest stand-in for the screenshot tile of a real activity. */
+/** A block lasts minutes; more than a day of buckets is not a real timeline. */
+const MAX_TIMELINE_MINUTES = 24 * 60;
+
+/**
+ * Parse a block's per-minute timeline (`timelineJson`), any key casing, sorted
+ * by minute. Buckets without a valid minute index are dropped, a duplicated
+ * minute keeps its last bucket, and a missing `Active` flag is inferred from
+ * the counts. Missing, "[]" or corrupt input → [].
+ */
+export function parseTimeline(raw: unknown): ActivityMinute[] {
+  const byMinute = new Map<number, ActivityMinute>();
+  for (const rec of recordsOf(raw)) {
+    const minute = num(field(rec, "minute"), Number.NaN);
+    if (!Number.isInteger(minute) || minute < 0 || minute >= MAX_TIMELINE_MINUTES) continue;
+    const keyboardHits = optionalCount(field(rec, "keyboardHits")) ?? 0;
+    const mouseClicks = optionalCount(field(rec, "mouseClicks")) ?? 0;
+    const flag = field(rec, "active");
+    const bucket: ActivityMinute = {
+      minute,
+      keyboardHits,
+      mouseClicks,
+      active: typeof flag === "boolean" ? flag : keyboardHits + mouseClicks > 0,
+    };
+    const appName = str(field(rec, "appName")).trim();
+    if (appName) bucket.appName = appName;
+    byMinute.set(minute, bucket);
+  }
+  return [...byMinute.values()].sort((a, b) => a.minute - b.minute);
+}
+
+const CAPTURE_KINDS: readonly CaptureKind[] = ["screen", "webcam", "thumb"];
+
+/**
+ * Parse a block's capture refs. Entries need an id and a known kind; anything
+ * else — including the property older backends never send — yields [].
+ */
+export function parseCaptures(raw: unknown): CaptureRef[] {
+  const out: CaptureRef[] = [];
+  const seen = new Set<string>();
+  for (const rec of recordsOf(raw)) {
+    const rawId = field(rec, "id");
+    const id = typeof rawId === "number" && Number.isFinite(rawId) ? String(rawId) : str(rawId).trim();
+    const kind = str(field(rec, "kind")).trim().toLowerCase() as CaptureKind;
+    if (!id || seen.has(id) || !CAPTURE_KINDS.includes(kind)) continue;
+    seen.add(id);
+    out.push({ id, kind });
+  }
+  return out;
+}
+
+/**
+ * Capture ids to try for a list tile, best first: the small "thumb" rendition,
+ * then the full screen capture. [] when the block has neither.
+ */
+export function thumbnailCaptureIds(activity: Pick<Activity, "captures">): string[] {
+  const captures = Array.isArray(activity.captures) ? activity.captures : [];
+  const thumb = captures.find((c) => c.kind === "thumb");
+  const screen = captures.find((c) => c.kind === "screen");
+  return [thumb?.id, screen?.id].filter((id): id is string => !!id);
+}
+
+/** GET /api/app/activity/screenshots/{activityId} item (capture metadata; no bytes). */
+export interface ApiCaptureDto {
+  id: string;
+  activityId?: string | null;
+  kind?: string | null;
+  blurred?: boolean | null;
+  capturedAt?: string | null;
+  sizeBytes?: number | null;
+  contentType?: string | null;
+  creationTime?: string | null;
+}
+
+/** A full-size capture of a block, ready to download and show. */
+export interface CaptureMeta {
+  id: string;
+  kind: "screen" | "webcam";
+  capturedAt: string | null;
+  blurred: boolean;
+  sizeBytes: number | null;
+  contentType: string | null;
+}
+
+/**
+ * Map the screenshots endpoint's metadata list, oldest capture first. Entries
+ * without an id are dropped, and so are "thumb" renditions — the detail view
+ * shows the full capture. An unknown kind is treated as a screen capture.
+ */
+export function mapApiCaptureMetas(list: unknown): CaptureMeta[] {
+  const out: CaptureMeta[] = [];
+  for (const rec of asItems<unknown>(list).filter((x): x is Record<string, unknown> => !!x && typeof x === "object")) {
+    const id = str(field(rec, "id")).trim();
+    const kind = str(field(rec, "kind")).trim().toLowerCase();
+    if (!id || kind === "thumb") continue;
+    const size = optionalCount(field(rec, "sizeBytes"));
+    out.push({
+      id,
+      kind: kind === "webcam" ? "webcam" : "screen",
+      capturedAt: normalizeUtcIso(field(rec, "capturedAt") ?? field(rec, "creationTime")),
+      blurred: field(rec, "blurred") === true,
+      sizeBytes: size ?? null,
+      contentType: str(field(rec, "contentType")).trim() || null,
+    });
+  }
+  const at = (c: CaptureMeta) => (c.capturedAt ? Date.parse(c.capturedAt) : Number.POSITIVE_INFINITY);
+  return out.map((c, i) => ({ c, i })).sort((a, b) => at(a.c) - at(b.c) || a.i - b.i).map(({ c }) => c);
+}
+
+/**
+ * A neutral, honest stand-in for the screenshot tile of a real activity,
+ * labelled with the block's main app (the one with the most focused time).
+ */
 function screenFor(active: WindowInfo[]): ScreenMock {
-  const app = active[0]?.appName ?? "Desktop";
+  const app = mainAppOf(active) ?? "Desktop";
   return { app, kind: "editor", accent: colorFromString(app, 55, 45) };
 }
 
 /**
  * Map one backend activity. Rows without a usable id/time range are dropped
- * (null) rather than rendered as NaN. The agents do not report per-window
- * seconds, so — exactly like the backend's app-usage report — the focused app
- * (first active window) is credited with the block's whole duration.
+ * (null) rather than rendered as NaN. Newer agents report focused seconds per
+ * window; a legacy row reports none, so — exactly like the backend's app-usage
+ * report — its focused app (first active window) is credited with the block's
+ * whole duration and flagged `credited`.
  */
 export function mapApiActivity(dto: ApiActivityDto | null | undefined): Activity | null {
   if (!dto || typeof dto !== "object" || !dto.id) return null;
@@ -146,8 +310,9 @@ export function mapApiActivity(dto: ApiActivityDto | null | undefined): Activity
   const running = parseWindowList(dto.runningProgramsJson);
   const blockSeconds = Math.max(0, Math.round((Date.parse(endedAt) - Date.parse(startedAt)) / 1000));
   if (active.length > 0 && active.every((w) => w.seconds === 0)) {
-    active[0] = { ...active[0], seconds: blockSeconds };
+    active[0] = { ...active[0], seconds: blockSeconds, credited: true };
   }
+  const captures = parseCaptures(dto.captures);
 
   return {
     id: String(dto.id),
@@ -162,8 +327,10 @@ export function mapApiActivity(dto: ApiActivityDto | null | undefined): Activity
     activeWindows: active,
     runningPrograms: running,
     screen: screenFor(active),
-    hasWebcam: false,
+    hasWebcam: captures.some((c) => c.kind === "webcam"),
     online: false,
+    timeline: parseTimeline(dto.timelineJson),
+    captures,
   };
 }
 

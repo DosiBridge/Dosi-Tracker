@@ -14,6 +14,16 @@ export function formatDuration(minutes: number): string {
   return `${h}h ${m}m`;
 }
 
+/** Format seconds as "4m 58s" ("45s", "5m", or "1h 2m" past an hour). */
+export function formatSeconds(seconds: number): string {
+  const total = Number.isFinite(seconds) ? Math.max(0, Math.round(seconds)) : 0;
+  if (total >= 3600) return formatDuration(Math.round(total / 60));
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  if (m === 0) return `${s}s`;
+  return s === 0 ? `${m}m` : `${m}m ${s}s`;
+}
+
 /** Compact number formatting: 1.2k, 3.4M. */
 export function formatCompact(n: number): string {
   return new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 }).format(n);

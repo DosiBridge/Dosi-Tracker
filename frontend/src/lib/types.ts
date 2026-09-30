@@ -47,6 +47,36 @@ export interface WindowInfo {
   windowTitle: string;
   /** seconds spent focused in the block */
   seconds: number;
+  /** keyboard presses while this window was focused (newer agents only; absent = not reported) */
+  keyboardHits?: number;
+  /** mouse clicks while this window was focused (newer agents only; absent = not reported) */
+  mouseClicks?: number;
+  /**
+   * True when `seconds` was not measured: a legacy row reported no per-window
+   * time, so its focused window is credited with the whole block.
+   */
+  credited?: boolean;
+}
+
+/** One minute of a block's input timeline (newer agents only). */
+export interface ActivityMinute {
+  /** 0-based bucket index from `startedAt` (the last bucket may run slightly long) */
+  minute: number;
+  keyboardHits: number;
+  mouseClicks: number;
+  /** false when the member was idle for the whole minute */
+  active: boolean;
+  /** the app focused for most of the minute, when known */
+  appName?: string;
+}
+
+/** "thumb" is a small JPEG rendition of the "screen" capture, meant for list tiles. */
+export type CaptureKind = "screen" | "webcam" | "thumb";
+
+/** A stored capture of a block; its bytes come from the authed content endpoint. */
+export interface CaptureRef {
+  id: string;
+  kind: CaptureKind;
 }
 
 export interface Activity {
@@ -65,6 +95,10 @@ export interface Activity {
   screen: ScreenMock;
   hasWebcam: boolean;
   online: boolean;
+  /** per-minute input timeline (live rows from newer agents; absent or empty otherwise) */
+  timeline?: ActivityMinute[];
+  /** the block's stored captures (live rows only; absent in demo data and on older backends) */
+  captures?: CaptureRef[];
 }
 
 export interface ScreenMock {

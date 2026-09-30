@@ -9,13 +9,17 @@ import {
   displayName,
   mapApiActivities,
   mapApiActivity,
+  mapApiCaptureMetas,
   mapApiNotifications,
   mapApiProject,
   mapTeamMember,
   memberIdsByProject,
   memberRole,
   normalizeUtcIso,
+  parseCaptures,
+  parseTimeline,
   parseWindowList,
+  thumbnailCaptureIds,
   type ApiActivityDto,
 } from "./live-dataset";
 import type { Activity } from "./types";
@@ -84,14 +88,181 @@ describe("parseWindowList — guarded against whatever an agent sent", () => {
       { appName: "Ok", windowTitle: "", seconds: 0 },
     ]);
   });
+  it("keeps per-window input counts only when reported, whatever the key casing", () => {
+    const list = parseWindowList(
+      '[{"AppName":"code.exe","WindowTitle":"main.rs","Seconds":240,"KeyboardHits":310,"MouseClicks":12},' +
+        '{"appName":"slack","keyboardHits":"7","mouse_clicks":2.6},' +
+        '{"appName":"term","KeyboardHits":-4,"MouseClicks":"lots"}]',
+    );
+    expect(list[0]).toEqual({ appName: "code.exe", windowTitle: "main.rs", seconds: 240, keyboardHits: 310, mouseClicks: 12 });
+    expect(list[1]).toEqual({ appName: "slack", windowTitle: "", seconds: 0, keyboardHits: 7, mouseClicks: 3 });
+    // Negative clamps to 0; a non-number is "not reported", never 0.
+    expect(list[2]).toEqual({ appName: "term", windowTitle: "", seconds: 0, keyboardHits: 0 });
+    expect("mouseClicks" in list[2]).toBe(false);
+  });
+  it("a null camelCase key falls through to its PascalCase twin", () => {
+    expect(parseWindowList([{ appName: null, AppName: "Rider" }])).toEqual([{ appName: "Rider", windowTitle: "", seconds: 0 }]);
+  });
+});
+
+describe("parseTimeline — per-minute buckets", () => {
+  it("parses PascalCase buckets, sorted by minute, dropping a null AppName", () => {
+    expect(
+      parseTimeline('[{"Minute":1,"KeyboardHits":4,"MouseClicks":1,"Active":true,"AppName":"code.exe"},{"Minute":0,"KeyboardHits":12,"MouseClicks":3,"Active":true,"AppName":null}]'),
+    ).toEqual([
+      { minute: 0, keyboardHits: 12, mouseClicks: 3, active: true },
+      { minute: 1, keyboardHits: 4, mouseClicks: 1, active: true, appName: "code.exe" },
+    ]);
+  });
+  it("accepts camelCase arrays, infers a missing Active flag from the counts, keeps the last duplicate", () => {
+    expect(
+      parseTimeline([
+        { minute: 0, keyboardHits: 0, mouseClicks: 0 },
+        { minute: 1, keyboardHits: 3 },
+        { minute: 2, active: false, keyboardHits: 1 },
+        { minute: 2, active: true, keyboardHits: 9 },
+      ]),
+    ).toEqual([
+      { minute: 0, keyboardHits: 0, mouseClicks: 0, active: false },
+      { minute: 1, keyboardHits: 3, mouseClicks: 0, active: true },
+      { minute: 2, keyboardHits: 9, mouseClicks: 0, active: true },
+    ]);
+  });
+  it("drops buckets without a valid minute index", () => {
+    expect(
+      parseTimeline([{ KeyboardHits: 1 }, { Minute: -1 }, { Minute: 1.5 }, { Minute: "x" }, { Minute: 24 * 60 }, null, [1], { Minute: "3", Active: true }]),
+    ).toEqual([{ minute: 3, keyboardHits: 0, mouseClicks: 0, active: true }]);
+  });
+  it.each([[undefined], [null], [""], ["[]"], ["{broken"], ['{"Minute":0}'], [42]])("returns [] for %j (never throws)", (raw) => {
+    expect(parseTimeline(raw)).toEqual([]);
+  });
+});
+
+describe("capture refs", () => {
+  it("parseCaptures keeps known kinds with an id, once each", () => {
+    expect(
+      parseCaptures([
+        { id: "s1", kind: "screen" },
+        { Id: "t1", Kind: "THUMB" },
+        { id: "w1", kind: "webcam" },
+        { id: "s1", kind: "screen" },
+        { id: "x1", kind: "audio" },
+        { kind: "screen" },
+        { id: 7, kind: "screen" },
+        null,
+      ]),
+    ).toEqual([
+      { id: "s1", kind: "screen" },
+      { id: "t1", kind: "thumb" },
+      { id: "w1", kind: "webcam" },
+      { id: "7", kind: "screen" },
+    ]);
+  });
+  it.each([[undefined], [null], ["nope"], [{}], [[]]])("parseCaptures(%j) → [] (older backends omit the property)", (raw) => {
+    expect(parseCaptures(raw)).toEqual([]);
+  });
+  it("thumbnailCaptureIds prefers the thumb, then the full screen capture, never the webcam", () => {
+    expect(thumbnailCaptureIds({ captures: [{ id: "s", kind: "screen" }, { id: "w", kind: "webcam" }, { id: "t", kind: "thumb" }] })).toEqual(["t", "s"]);
+    expect(thumbnailCaptureIds({ captures: [{ id: "s", kind: "screen" }] })).toEqual(["s"]);
+    expect(thumbnailCaptureIds({ captures: [{ id: "w", kind: "webcam" }] })).toEqual([]);
+    expect(thumbnailCaptureIds({})).toEqual([]);
+  });
+  it("mapApiCaptureMetas: oldest first, thumbs dropped, unknown kinds read as screen, bad input → []", () => {
+    const metas = mapApiCaptureMetas({
+      items: [
+        { id: "b", kind: "screen", capturedAt: "2026-09-23T14:03:00", blurred: true, sizeBytes: 2048, contentType: "image/png" },
+        { id: "t", kind: "thumb", capturedAt: "2026-09-23T14:01:00Z" },
+        { id: "a", kind: "webcam", capturedAt: "2026-09-23T14:02:00Z" },
+        { id: "c", kind: "mystery" },
+        { kind: "screen" },
+        null,
+      ],
+    });
+    expect(metas).toEqual([
+      { id: "a", kind: "webcam", capturedAt: "2026-09-23T14:02:00.000Z", blurred: false, sizeBytes: null, contentType: null },
+      { id: "b", kind: "screen", capturedAt: "2026-09-23T14:03:00.000Z", blurred: true, sizeBytes: 2048, contentType: "image/png" },
+      { id: "c", kind: "screen", capturedAt: null, blurred: false, sizeBytes: null, contentType: null },
+    ]);
+    expect(mapApiCaptureMetas("nope")).toEqual([]);
+    expect(mapApiCaptureMetas(null)).toEqual([]);
+  });
 });
 
 describe("mapApiActivity", () => {
   it("maps a real row and credits the focused app with the block's duration", () => {
     const a = mapApiActivity(dto());
     expect(a).toMatchObject({ id: "a1", userId: "u1", projectId: "p1", productivity: 80, description: "Work", online: false, hasWebcam: false });
-    expect(a?.activeWindows[0]).toEqual({ appName: "Code", windowTitle: "main.ts", seconds: 1800 });
+    // Flagged, so the detail view can say the time was credited rather than measured.
+    expect(a?.activeWindows[0]).toEqual({ appName: "Code", windowTitle: "main.ts", seconds: 1800, credited: true });
     expect(a?.screen.app).toBe("Code");
+  });
+
+  it("maps a legacy row (no timeline, no captures property) to empty timeline/captures", () => {
+    const a = mapApiActivity(dto());
+    expect(a?.timeline).toEqual([]);
+    expect(a?.captures).toEqual([]);
+    expect(a?.activeWindows[0].keyboardHits).toBeUndefined();
+    expect(a?.activeWindows[0].mouseClicks).toBeUndefined();
+  });
+
+  it("maps the new per-window usage, timeline and capture refs (PascalCase JSON from .NET)", () => {
+    const a = mapApiActivity(
+      dto({
+        startedAt: "2026-09-23T14:00:00Z",
+        endedAt: "2026-09-23T14:04:58Z",
+        activeWindowsJson: JSON.stringify([
+          { AppName: "chrome.exe", WindowTitle: "Docs", Seconds: 100, KeyboardHits: 5, MouseClicks: 9 },
+          { AppName: "code.exe", WindowTitle: "main.rs", Seconds: 240, KeyboardHits: 310, MouseClicks: 12 },
+          { AppName: "chrome.exe", WindowTitle: "Mail", Seconds: 90, KeyboardHits: 1, MouseClicks: 3 },
+        ]),
+        timelineJson: JSON.stringify([
+          { Minute: 1, KeyboardHits: 40, MouseClicks: 2, Active: true, AppName: "code.exe" },
+          { Minute: 0, KeyboardHits: 12, MouseClicks: 3, Active: true, AppName: null },
+          { Minute: 2, KeyboardHits: 0, MouseClicks: 0, Active: false },
+        ]),
+        captures: [
+          { id: "s1", kind: "screen" },
+          { id: "t1", kind: "thumb" },
+          { id: "w1", kind: "webcam" },
+        ],
+      }),
+    );
+    expect(a?.activeWindows[1]).toEqual({ appName: "code.exe", windowTitle: "main.rs", seconds: 240, keyboardHits: 310, mouseClicks: 12 });
+    // Measured seconds are never overwritten by the legacy credit.
+    expect(a?.activeWindows.some((w) => w.credited)).toBe(false);
+    // Main app = most focused time per app: code 240s vs chrome 100 + 90 = 190s.
+    expect(a?.screen.app).toBe("code.exe");
+    expect(a?.timeline).toEqual([
+      { minute: 0, keyboardHits: 12, mouseClicks: 3, active: true },
+      { minute: 1, keyboardHits: 40, mouseClicks: 2, active: true, appName: "code.exe" },
+      { minute: 2, keyboardHits: 0, mouseClicks: 0, active: false },
+    ]);
+    expect(a?.captures).toEqual([
+      { id: "s1", kind: "screen" },
+      { id: "t1", kind: "thumb" },
+      { id: "w1", kind: "webcam" },
+    ]);
+    expect(a?.hasWebcam).toBe(true);
+  });
+
+  it("names the block after the app with the most focused time summed over its windows", () => {
+    const a = mapApiActivity(
+      dto({
+        activeWindowsJson: JSON.stringify([
+          { appName: "code.exe", windowTitle: "main.rs", seconds: 200 },
+          { appName: "chrome.exe", windowTitle: "Docs", seconds: 150 },
+          { appName: "Chrome.exe", windowTitle: "Mail", seconds: 150 },
+        ]),
+      }),
+    );
+    expect(a?.screen.app).toBe("chrome.exe");
+  });
+
+  it("survives a corrupt timeline and captures payload", () => {
+    const a = mapApiActivity(dto({ timelineJson: "{not json", captures: "nope" }));
+    expect(a?.timeline).toEqual([]);
+    expect(a?.captures).toEqual([]);
+    expect(a?.hasWebcam).toBe(false);
   });
 
   it("keeps agent-reported seconds when present", () => {

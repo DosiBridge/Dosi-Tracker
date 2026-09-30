@@ -3,32 +3,25 @@
 import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import {
-  MousePointerClick,
-  Keyboard,
-  Video,
-  Clock,
-  AppWindow,
-  ListTree,
-  Camera,
-  SearchX,
-} from "lucide-react";
+import { MousePointerClick, Keyboard, Video, SearchX } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { surfaceVariants } from "@/components/ui/surface";
 import { Badge } from "@/components/ui/badge";
 import { Avatar } from "@/components/ui/avatar";
 import { Ring } from "@/components/ui/ring";
-import { Drawer } from "@/components/ui/drawer";
-import { AppGlyph, ScreenMockView } from "@/components/screen-mock";
+import { ScreenMockView } from "@/components/screen-mock";
 import { PageHeader, PageStack } from "@/components/ui/page-header";
 import { SegmentedControl } from "@/components/ui/toolbar";
+import { ActivityDrawer, type ProjectLabel } from "@/components/activities/activity-drawer";
 import { ActivityFilterBar } from "@/components/activities/activity-filter-bar";
+import { CaptureThumb } from "@/components/activities/capture-thumb";
 import { useSession } from "@/components/session-provider";
 import { activities as demoActivities, projectById, userById } from "@/lib/tenant-data";
-import { getApi, getAuthedBlobUrl, isLiveSession, useApi } from "@/hooks/useApi";
+import { useApi } from "@/hooks/useApi";
 import { agoLabel } from "@/lib/live-session";
-import { mapApiActivities } from "@/lib/live-dataset";
+import { formatTimeRange as timeRange } from "@/lib/activity-report";
+import { mapApiActivities, thumbnailCaptureIds } from "@/lib/live-dataset";
 import { applyActivityFilters, defaultActivityFilters, type ActivityFilters } from "@/lib/activity-filters";
 import { scopeActivities } from "@/lib/scope";
 import type { Activity } from "@/lib/types";
@@ -36,32 +29,11 @@ import { cn, formatCompact } from "@/lib/utils";
 
 type ViewMode = "sessions" | "screens";
 
-/** Real backend rows have GUID ids; mock demo rows use short slugs. */
-const GUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
-const isGuidId = (id: string) => GUID_RE.test(id);
-
 /** Cards rendered per page on the activity list (see visibleCount below). */
 const PAGE_SIZE = 24;
 
 /** Live rows loaded for the page: enough for every preset (the widest is 30 days / this month). */
 const LIVE_WINDOW_DAYS = 31;
-
-interface ProjectLabel {
-  title: string;
-  color: string;
-}
-
-interface CaptureView {
-  id: string;
-  kind: "screen" | "webcam";
-  url: string;
-}
-
-function timeRange(a: Activity) {
-  const fmt = (iso: string) =>
-    new Date(iso).toLocaleTimeString("en", { hour: "2-digit", minute: "2-digit" });
-  return `${fmt(a.startedAt)} – ${fmt(a.endedAt)}`;
-}
 
 /**
  * Rewrite a NOW-relative date preset into explicit UTC bounds on the REAL clock.
@@ -278,7 +250,7 @@ function ActivitiesPageInner() {
               >
                 <div className="relative">
                   {isLive ? (
-                    <AppGlyph app={a.screen.app} color={a.screen.accent} className="aspect-video w-full rounded-none border-0" />
+                    <LiveCaptureTile activity={a} />
                   ) : (
                     <ScreenMockView screen={a.screen} title={a.activeWindows[0]?.windowTitle} className="aspect-video w-full rounded-none" />
                   )}
@@ -333,7 +305,9 @@ function ActivitiesPageInner() {
                 className="group overflow-hidden rounded-xl border border-border text-left transition-all hover:-translate-y-0.5 hover:border-primary/40"
               >
                 {isLive ? (
-                  <AppGlyph app={a.screen.app} color={a.screen.accent} className="aspect-video w-full rounded-none border-0" />
+                  <div className="relative">
+                    <LiveCaptureTile activity={a} />
+                  </div>
                 ) : (
                   <ScreenMockView screen={a.screen} title={a.activeWindows[0]?.windowTitle} className="aspect-video w-full rounded-none" />
                 )}
@@ -371,220 +345,29 @@ function ActivitiesPageInner() {
   );
 }
 
-function ActivityDrawer({
-  activity,
-  project,
-  onClose,
-}: {
-  activity: Activity | null;
-  project: ProjectLabel | null;
-  onClose: () => void;
-}) {
-  const a = activity;
-  const u = a ? userById(a.userId) : null;
-  const p = project;
-
-  // LIVE MODE: real (GUID) activities load their actual captures from the backend.
-  const activityId = a?.id ?? null;
-  const live = !!activityId && isGuidId(activityId);
-  const [captures, setCaptures] = useState<CaptureView[]>([]);
-  const [capturesLoading, setCapturesLoading] = useState(false);
-  const [capturesError, setCapturesError] = useState(false);
-
-  useEffect(() => {
-    setCaptures([]);
-    setCapturesError(false);
-    setCapturesLoading(false);
-    if (!activityId || !isGuidId(activityId)) return;
-    if (!isLiveSession()) return;
-
-    let cancelled = false;
-    const urls: string[] = [];
-    setCapturesLoading(true);
-
-    (async () => {
-      try {
-        const metas = await getApi(`/api/app/activity/screenshots?activityId=${activityId}`);
-        const list: Array<{ id: string; kind?: string }> = Array.isArray(metas) ? metas : [];
-        const loaded: CaptureView[] = [];
-        for (const meta of list) {
-          const url = await getAuthedBlobUrl(`/api/app/activity/screenshot/${meta.id}/content`);
-          if (cancelled) {
-            URL.revokeObjectURL(url);
-            return;
-          }
-          urls.push(url);
-          loaded.push({ id: meta.id, kind: meta.kind === "webcam" ? "webcam" : "screen", url });
-        }
-        if (!cancelled) setCaptures(loaded);
-      } catch {
-        if (!cancelled) setCapturesError(true);
-      } finally {
-        if (!cancelled) setCapturesLoading(false);
-      }
-    })();
-
-    // Revoke object URLs when the drawer closes, switches activity, or unmounts.
-    return () => {
-      cancelled = true;
-      urls.forEach((url) => URL.revokeObjectURL(url));
-    };
-  }, [activityId]);
-
-  const screenCaptures = captures.filter((c) => c.kind === "screen");
-  const webcamCaptures = captures.filter((c) => c.kind === "webcam");
-
+/**
+ * A live card's media: the block's real screenshot (thumb first, then the full
+ * capture), or the app glyph when it has none. The main app is named over a
+ * screenshot, since the image alone doesn't say what was focused. Sits inside a
+ * `relative` wrapper so the card's other overlays stack on top.
+ */
+function LiveCaptureTile({ activity: a }: { activity: Activity }) {
+  const captureIds = thumbnailCaptureIds(a);
   return (
-    <Drawer open={!!a} onClose={onClose} title="Activity detail">
-      {a && (
-        <div className="space-y-6">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-3">
-              <Avatar name={u?.name ?? ""} size="lg" status={u?.status} />
-              <div>
-                <div className="font-semibold">{u?.name}</div>
-                <div className="text-xs text-muted-foreground">{u?.designation}</div>
-              </div>
-            </div>
-            <Badge tone="primary">{p?.title}</Badge>
-          </div>
-
-          <div>
-            <div className="mb-2 flex items-center gap-2 text-sm font-medium">
-              <Camera className="h-4 w-4 text-muted-foreground" /> Screen capture
-              {!live && <Badge tone="muted">Mock preview</Badge>}
-            </div>
-            {live ? (
-              capturesLoading ? (
-                <div className="flex aspect-video w-full items-center justify-center rounded-xl border border-border bg-muted/40 text-sm text-muted-foreground">
-                  Loading captures…
-                </div>
-              ) : capturesError ? (
-                <div className="flex aspect-video w-full items-center justify-center rounded-xl border border-border bg-muted/40 text-sm text-muted-foreground">
-                  Couldn&apos;t load captures.
-                </div>
-              ) : screenCaptures.length > 0 ? (
-                <div className="space-y-2">
-                  {screenCaptures.map((c) => (
-                    // eslint-disable-next-line @next/next/no-img-element
-                    <img
-                      key={c.id}
-                      src={c.url}
-                      alt="Screen capture"
-                      className="aspect-video w-full rounded-xl border border-border object-cover"
-                    />
-                  ))}
-                </div>
-              ) : (
-                <div className="flex aspect-video w-full items-center justify-center rounded-xl border border-border bg-muted/40 text-sm text-muted-foreground">
-                  No screenshot captured
-                </div>
-              )
-            ) : (
-              <ScreenMockView screen={a.screen} title={a.activeWindows[0]?.windowTitle} className="aspect-video w-full" />
-            )}
-          </div>
-
-          <div className="grid grid-cols-2 gap-3">
-            <Metric icon={Clock} label="Time range" value={timeRange(a)} />
-            <Metric icon={AppWindow} label="Description" value={a.description} />
-            <Metric icon={MousePointerClick} label="Mouse clicks" value={a.mouseClicks.toLocaleString()} />
-            <Metric icon={Keyboard} label="Keyboard hits (count only)" value={a.keyboardHits.toLocaleString()} />
-          </div>
-
-          <div className="flex items-center gap-4 rounded-xl border border-border p-4">
-            <Ring value={a.productivity} size={64} stroke={7} />
-            <div>
-              <div className="text-sm font-medium">Activity level</div>
-              <div className="text-xs text-muted-foreground">
-                Based on focused apps and input counts during this block — not a judgment score.
-              </div>
-            </div>
-          </div>
-
-          {live ? (
-            webcamCaptures.length > 0 && (
-              <div>
-                <div className="mb-2 flex items-center gap-2 text-sm font-medium">
-                  <Video className="h-4 w-4 text-muted-foreground" /> Webcam (opt-in)
-                </div>
-                <div className="flex flex-wrap gap-2">
-                  {webcamCaptures.map((c) => (
-                    // eslint-disable-next-line @next/next/no-img-element
-                    <img
-                      key={c.id}
-                      src={c.url}
-                      alt="Webcam frame"
-                      className="aspect-video w-40 rounded-lg border border-border object-cover"
-                    />
-                  ))}
-                </div>
-              </div>
-            )
-          ) : (
-            a.hasWebcam && (
-              <div>
-                <div className="mb-2 flex items-center gap-2 text-sm font-medium">
-                  <Video className="h-4 w-4 text-muted-foreground" /> Webcam (opt-in)
-                </div>
-                <div
-                  className="flex aspect-video w-40 items-center justify-center rounded-lg text-white/70"
-                  style={{ background: `radial-gradient(circle at 50% 35%, ${a.screen.accent}, #0f1320)` }}
-                >
-                  <Video className="h-8 w-8" />
-                </div>
-              </div>
-            )
-          )}
-
-          <div>
-            <div className="mb-2 flex items-center gap-2 text-sm font-medium">
-              <AppWindow className="h-4 w-4 text-muted-foreground" /> Active windows
-            </div>
-            <div className="space-y-1.5">
-              {a.activeWindows.map((w, i) => (
-                <div key={i} className="flex items-center justify-between rounded-lg bg-muted/50 px-3 py-2 text-sm">
-                  <div className="min-w-0">
-                    <div className="truncate font-medium">{w.appName}</div>
-                    <div className="truncate text-xs text-muted-foreground">{w.windowTitle}</div>
-                  </div>
-                  <span className="text-xs text-muted-foreground">{Math.round(w.seconds / 60)}m</span>
-                </div>
-              ))}
-            </div>
-          </div>
-
-          <div>
-            <div className="mb-2 flex items-center gap-2 text-sm font-medium">
-              <ListTree className="h-4 w-4 text-muted-foreground" /> Running programs
-            </div>
-            <div className="flex flex-wrap gap-1.5">
-              {a.runningPrograms.map((w, i) => (
-                <Badge key={i} tone="muted">{w.appName}</Badge>
-              ))}
-            </div>
-          </div>
+    <>
+      <CaptureThumb
+        captureIds={captureIds}
+        app={a.screen.app}
+        color={a.screen.accent}
+        className="aspect-video w-full rounded-none border-0"
+      />
+      {captureIds.length > 0 && (
+        <div className="absolute left-2 top-2 max-w-[60%]">
+          <Badge className="max-w-full bg-black/60 text-white backdrop-blur" title={a.screen.app}>
+            <span className="truncate">{a.screen.app}</span>
+          </Badge>
         </div>
       )}
-    </Drawer>
-  );
-}
-
-function Metric({
-  icon: Icon,
-  label,
-  value,
-}: {
-  icon: typeof Clock;
-  label: string;
-  value: string;
-}) {
-  return (
-    <div className="rounded-lg border border-border p-3">
-      <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-        <Icon className="h-3.5 w-3.5" /> {label}
-      </div>
-      <div className={cn("mt-1 truncate text-sm font-medium")}>{value}</div>
-    </div>
+    </>
   );
 }

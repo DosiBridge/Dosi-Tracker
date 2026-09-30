@@ -4,6 +4,7 @@
 //! with a single-threaded tokio runtime, so the UI thread never blocks. The UI
 //! talks to it only through a command channel and reads a shared state snapshot.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone, Utc};
@@ -23,11 +24,17 @@ struct Session {
     interval: Duration,
 }
 
-/// Spawn the worker thread and return the channel the UI uses to control it.
-pub fn spawn(state: StateHandle, cfg: AppConfig, repaint: impl Fn() + Send + 'static) -> mpsc::UnboundedSender<Command> {
+/// Spawn the worker thread. Returns the channel the UI uses to control it and
+/// the thread's handle, so quitting can wait for the last block to be saved.
+pub fn spawn(
+    state: StateHandle,
+    cfg: AppConfig,
+    tracker: Arc<Tracker>,
+    repaint: impl Fn() + Send + 'static,
+) -> (mpsc::UnboundedSender<Command>, std::thread::JoinHandle<()>) {
     let (tx, rx) = mpsc::unbounded_channel();
 
-    std::thread::Builder::new()
+    let handle = std::thread::Builder::new()
         .name("dosi-worker".into())
         .spawn(move || {
             let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -51,7 +58,7 @@ pub fn spawn(state: StateHandle, cfg: AppConfig, repaint: impl Fn() + Send + 'st
             // Catch it and surface the failure instead of faking success.
             let state_for_run = state.clone();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                runtime.block_on(run(state_for_run, cfg, rx, &repaint));
+                runtime.block_on(run(state_for_run, cfg, tracker, rx, &repaint));
             }));
 
             if result.is_err() {
@@ -66,7 +73,7 @@ pub fn spawn(state: StateHandle, cfg: AppConfig, repaint: impl Fn() + Send + 'st
         })
         .expect("failed to spawn worker thread");
 
-    tx
+    (tx, handle)
 }
 
 /// How long parked (server-rejected) rows are kept for diagnostics before the
@@ -83,13 +90,66 @@ const UPLOAD_BATCH: u32 = 20;
 /// of stalling them for minutes.
 const MAX_UPLOADS_PER_PASS: u32 = 100;
 
-/// "Sync now" only ends the current block once it has run this long; before
-/// that it uploads the queue and leaves the block accumulating.
-const MIN_MANUAL_BLOCK: chrono::TimeDelta = chrono::TimeDelta::seconds(60);
+/// A block shorter than this is not a session of its own: "Sync now" leaves it
+/// running, and pausing, switching project, signing out or quitting drops it
+/// instead of recording a seconds-long block scored 100% from a single click.
+const MIN_BLOCK: chrono::TimeDelta = chrono::TimeDelta::seconds(60);
+
+/// Stand-in wait for the auto-resume branch while no timed pause is armed
+/// (the branch is disabled then; the value only has to be valid).
+const NO_AUTO_RESUME: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The worker's clocks: whether and until when tracking is paused, and where
+/// the current stretch and block began. Published to the window by
+/// [`apply_status`], which animates the timers from them.
+struct Clocks {
+    /// `Some` while paused.
+    paused_since: Option<DateTime<Utc>>,
+    /// When a timed pause ends by itself.
+    pause_until: Option<DateTime<Utc>>,
+    /// Start of the uninterrupted tracking stretch (the session timer).
+    tracking_since: DateTime<Utc>,
+    /// Real start of the block currently being accumulated. Captures are timed
+    /// from this, never from an assumed "exactly one interval ago".
+    block_started_at: DateTime<Utc>,
+    next_capture_at: DateTime<Utc>,
+}
+
+impl Clocks {
+    fn new() -> Self {
+        let now = Utc::now();
+        Self {
+            paused_since: None,
+            pause_until: None,
+            tracking_since: now,
+            block_started_at: now,
+            next_capture_at: now,
+        }
+    }
+
+    fn paused(&self) -> bool {
+        self.paused_since.is_some()
+    }
+
+    /// Begin a fresh tracking stretch now (sign-in, resume, project switch):
+    /// a new block, the session timer from zero, and a full interval until the
+    /// first automatic snapshot. Input made before now never counts, because
+    /// every capture only reads input inside its own block.
+    fn start_tracking(&mut self, ticker: &mut tokio::time::Interval) {
+        let now = Utc::now();
+        self.paused_since = None;
+        self.pause_until = None;
+        self.tracking_since = now;
+        self.block_started_at = now;
+        ticker.reset();
+        self.next_capture_at = next_capture(ticker);
+    }
+}
 
 async fn run(
     state: StateHandle,
     cfg: AppConfig,
+    tracker: Arc<Tracker>,
     mut rx: mpsc::UnboundedReceiver<Command>,
     repaint: &(impl Fn() + Send),
 ) {
@@ -115,13 +175,9 @@ async fn run(
     maintain_queue(&store, saved_owner.as_deref());
     refresh_queue_counts(&store, &state, saved_owner.as_deref());
 
-    let tracker = Tracker::new();
     let mut client: Option<ApiClient> = None;
     let mut session: Option<Session> = None;
-    let mut paused = false;
-    // Real start of the block currently being accumulated. Captures are timed
-    // from this, never from an assumed "exactly one interval ago".
-    let mut block_started_at = Utc::now();
+    let mut clocks = Clocks::new();
 
     // Restore a previous sign-in so a relaunch (e.g. at login) resumes silently.
     if let Some(saved) = saved {
@@ -140,6 +196,7 @@ async fn run(
                     s.selected_project = saved.project_id.clone();
                 });
                 session = resolve_session(&mut restored, &cfg, saved.project_id.as_deref(), &state).await;
+                refresh_totals(&mut restored, &state).await;
                 client = Some(restored);
             }
             Err(e) => {
@@ -147,16 +204,23 @@ async fn run(
                 state.update(|s| s.status = TrackerStatus::SignedOut);
             }
         }
-        apply_status(&state, &client, &session, paused);
-        repaint();
     }
 
     let mut ticker = new_ticker(
         session.as_ref().map(|s| s.interval).unwrap_or_else(|| cfg.interval()),
     );
     ticker.tick().await; // skip the immediate first tick
+    clocks.start_tracking(&mut ticker);
+    apply_status(&state, &client, &session, &clocks);
+    repaint();
 
     loop {
+        // A timed pause resumes by itself; otherwise this branch stays disabled.
+        let auto_resume_in = clocks
+            .pause_until
+            .filter(|_| clocks.paused())
+            .map(|at| (at - Utc::now()).to_std().unwrap_or_default());
+
         tokio::select! {
             Some(command) = rx.recv() => {
                 match command {
@@ -181,18 +245,18 @@ async fn run(
                                 });
                                 state.update(|s| { s.display_name = username; s.signing_in = false; });
                                 session = resolve_session(&mut candidate, &cfg, None, &state).await;
-                                if let Some(active) = &session {
-                                    ticker = new_ticker(active.interval);
-                                    ticker.tick().await;
-                                }
+                                ticker = new_ticker(
+                                    session.as_ref().map(|s| s.interval).unwrap_or_else(|| cfg.interval()),
+                                );
+                                ticker.tick().await;
                                 // Nothing from before this sign-in (signed-out
                                 // time, another account) belongs to this block.
-                                block_started_at = start_new_block(&tracker);
+                                clocks.start_tracking(&mut ticker);
                                 let owner = candidate.owner_key();
                                 maintain_queue(&store, Some(&owner));
                                 refresh_queue_counts(&store, &state, Some(&owner));
+                                refresh_totals(&mut candidate, &state).await;
                                 client = Some(candidate);
-                                paused = false;
                             }
                             Err(e) => {
                                 state.update(|s| {
@@ -204,12 +268,20 @@ async fn run(
                         }
                     }
                     Command::SignOut => {
+                        if let Some(api) = client.as_mut() {
+                            // The work so far is this account's: queue and upload
+                            // it before letting go.
+                            if let Some(active) = session.as_ref().filter(|_| !clocks.paused()) {
+                                save_block_in_progress(&tracker, api, &store, active, &state, clocks.block_started_at);
+                            }
+                            sync_pending(api, &store, &state).await;
+                        }
                         let _ = credentials::clear();
                         client = None;
                         session = None;
-                        // Input made while signed out must not reach the next
-                        // account's first block.
-                        block_started_at = start_new_block(&tracker);
+                        // A pause belongs to this sign-in, not the next one.
+                        clocks.paused_since = None;
+                        clocks.pause_until = None;
                         // This account's queued rows stay (owner-tagged) until it
                         // signs in again; they are just not shown to anyone else.
                         refresh_queue_counts(&store, &state, None);
@@ -217,52 +289,77 @@ async fn run(
                             s.display_name.clear();
                             s.projects.clear();
                             s.selected_project = None;
-                            s.tracked_today_minutes = 0;
-                            s.tracked_week_minutes = 0;
+                            s.tracked_today_secs = 0.0;
+                            s.tracked_week_secs = 0.0;
+                            s.last_productivity = 0;
                             s.status = TrackerStatus::SignedOut;
                         });
                     }
                     Command::SelectProject(project_id) => {
                         if let Some(api) = client.as_mut() {
+                            // The work so far belongs to the project it was done on.
+                            if let Some(active) = session.as_ref().filter(|_| !clocks.paused()) {
+                                save_block_in_progress(&tracker, api, &store, active, &state, clocks.block_started_at);
+                            }
                             session = resolve_session(api, &cfg, Some(&project_id), &state).await;
                             if let Some(active) = &session {
                                 ticker = new_ticker(active.interval);
                                 ticker.tick().await;
                             }
-                            // The new project starts a fresh block.
-                            block_started_at = start_new_block(&tracker);
+                            // The new project starts a fresh block (and, unless
+                            // paused, a fresh session timer).
+                            if !clocks.paused() {
+                                clocks.start_tracking(&mut ticker);
+                            }
                             // Remember the choice across restarts.
                             if let Some(mut saved) = credentials::load() {
                                 saved.project_id = Some(project_id);
                                 let _ = credentials::save(&saved);
                             }
+                            sync_pending(api, &store, &state).await;
+                            refresh_totals(api, &state).await;
                         }
                     }
-                    // Both are guarded: the tray offers Pause and Resume at all
-                    // times, and a stray Resume while tracking must not throw
-                    // away the block in progress.
-                    Command::Pause if !paused => {
-                        paused = true;
-                        // End the block here: the partial block is discarded, so
-                        // no paused time can ever be attributed to it.
-                        block_started_at = start_new_block(&tracker);
+                    Command::Pause { resume_after } => {
+                        let now = Utc::now();
+                        clocks.pause_until = resume_after
+                            .and_then(|d| chrono::Duration::from_std(d).ok())
+                            .map(|d| now + d);
+                        if !clocks.paused() {
+                            // Keep the work done so far instead of discarding it:
+                            // the block ends here and is queued at once...
+                            if let (Some(api), Some(active)) = (client.as_ref(), session.as_ref()) {
+                                save_block_in_progress(&tracker, api, &store, active, &state, clocks.block_started_at);
+                            }
+                            clocks.paused_since = Some(Utc::now());
+                            // ...the window shows the pause immediately...
+                            state.update(|s| s.pending_action = None);
+                            apply_status(&state, &client, &session, &clocks);
+                            repaint();
+                            // ...and the upload happens while already paused.
+                            if let Some(api) = client.as_mut() {
+                                sync_pending(api, &store, &state).await;
+                                refresh_totals(api, &state).await;
+                            }
+                        }
                     }
-                    Command::Resume if paused => {
-                        paused = false;
-                        // Do not bill the paused stretch (or input made during
-                        // it): start a fresh block.
-                        block_started_at = start_new_block(&tracker);
+                    Command::Resume => {
+                        if clocks.paused() {
+                            // Not a second of the paused stretch (or input made
+                            // during it) is billed: a fresh block starts now.
+                            clocks.start_tracking(&mut ticker);
+                        }
                     }
-                    Command::Pause | Command::Resume => {}
                     Command::SyncNow => {
                         if let Some(api) = client.as_mut() {
                             match session.as_ref() {
-                                Some(active) if !paused && Utc::now() - block_started_at >= MIN_MANUAL_BLOCK => {
-                                    block_started_at =
-                                        capture_and_sync(&tracker, api, &store, active, &state, block_started_at).await;
+                                Some(active) if !clocks.paused() && Utc::now() - clocks.block_started_at >= MIN_BLOCK => {
+                                    clocks.block_started_at =
+                                        capture_and_sync(&tracker, api, &store, active, &state, clocks.block_started_at).await;
                                     // The next automatic block runs a full interval from
                                     // this cut, instead of a sliver up to the old tick.
                                     ticker.reset();
+                                    clocks.next_capture_at = next_capture(&ticker);
                                 }
                                 // Paused means nothing is captured, not even on
                                 // demand: only already-queued rows are uploaded.
@@ -276,17 +373,25 @@ async fn run(
                     }
                     Command::Shutdown => {
                         if let Some(api) = client.as_mut() {
+                            // Quitting must not throw the block in progress away.
+                            // It is queued locally first, so even if the upload
+                            // is cut short it goes up on the next launch.
+                            if let Some(active) = session.as_ref().filter(|_| !clocks.paused()) {
+                                save_block_in_progress(&tracker, api, &store, active, &state, clocks.block_started_at);
+                            }
                             sync_pending(api, &store, &state).await;
                         }
                         return;
                     }
                 }
-                apply_status(&state, &client, &session, paused);
+                state.update(|s| s.pending_action = None);
+                apply_status(&state, &client, &session, &clocks);
                 repaint();
             }
 
             _ = ticker.tick() => {
-                if client.is_some() && !paused {
+                clocks.next_capture_at = next_capture(&ticker);
+                if client.is_some() && !clocks.paused() {
                     if session.is_none() {
                         if let Some(api) = client.as_mut() {
                             // Backend was unreachable (or no project yet) — keep retrying.
@@ -295,12 +400,19 @@ async fn run(
                     }
 
                     if let (Some(api), Some(active)) = (client.as_mut(), session.as_ref()) {
-                        block_started_at =
-                            capture_and_sync(&tracker, api, &store, active, &state, block_started_at).await;
+                        clocks.block_started_at =
+                            capture_and_sync(&tracker, api, &store, active, &state, clocks.block_started_at).await;
                         refresh_totals(api, &state).await;
                     }
                 }
-                apply_status(&state, &client, &session, paused);
+                apply_status(&state, &client, &session, &clocks);
+                repaint();
+            }
+
+            _ = tokio::time::sleep(auto_resume_in.unwrap_or(NO_AUTO_RESUME)), if auto_resume_in.is_some() => {
+                tracing::info!("timed pause is over; resuming tracking");
+                clocks.start_tracking(&mut ticker);
+                apply_status(&state, &client, &session, &clocks);
                 repaint();
             }
         }
@@ -319,11 +431,9 @@ fn new_ticker(period: Duration) -> tokio::time::Interval {
     ticker
 }
 
-/// Begin a new block now, discarding input counted before it (while paused,
-/// signed out, or on another project). Returns the block's start.
-fn start_new_block(tracker: &Tracker) -> DateTime<Utc> {
-    tracker.discard_input();
-    Utc::now()
+/// When the ticker, just ticked or reset, fires next.
+fn next_capture(ticker: &tokio::time::Interval) -> DateTime<Utc> {
+    Utc::now() + chrono::Duration::from_std(ticker.period()).unwrap_or_else(|_| chrono::Duration::minutes(10))
 }
 
 /// Housekeeping that bounds the local queue: expire parked rows and other
@@ -392,22 +502,33 @@ fn friendly_login_error(e: &anyhow::Error) -> String {
     }
 }
 
+/// Publish the status and the clocks the window animates. Clocks that do not
+/// apply to the status (e.g. the session timer while paused) are cleared.
 fn apply_status(
     state: &StateHandle,
     client: &Option<ApiClient>,
     session: &Option<Session>,
-    paused: bool,
+    clocks: &Clocks,
 ) {
     let status = if client.is_none() {
         TrackerStatus::SignedOut
-    } else if paused {
+    } else if clocks.paused() {
         TrackerStatus::Paused
     } else if session.is_some() {
         TrackerStatus::Tracking
     } else {
         TrackerStatus::Offline
     };
-    state.update(|s| s.status = status);
+    let tracking = status == TrackerStatus::Tracking;
+    let paused = status == TrackerStatus::Paused;
+    state.update(|s| {
+        s.status = status;
+        s.tracking_since = tracking.then_some(clocks.tracking_since);
+        s.block_started_at = tracking.then_some(clocks.block_started_at);
+        s.next_capture_at = tracking.then_some(clocks.next_capture_at);
+        s.paused_since = if paused { clocks.paused_since } else { None };
+        s.resume_at = if paused { clocks.pause_until } else { None };
+    });
 }
 
 /// Log in (if needed) and pick a project — the requested one, the remembered one,
@@ -459,6 +580,8 @@ async fn resolve_session(
     state.update(|s| {
         s.selected_project = Some(chosen.id.clone());
         s.interval_minutes = interval_minutes;
+        s.counts_keyboard = perms.keyboard;
+        s.counts_mouse = perms.mouse;
     });
     tracing::info!(project = %chosen.title, "tracking session resolved");
 
@@ -469,16 +592,18 @@ async fn resolve_session(
     })
 }
 
-/// Capture one block covering `block_started_at .. now`, then sync.
-/// Returns the instant the next block starts from.
-async fn capture_and_sync(
+/// Record the block covering `block_started_at .. now` into the local queue
+/// and count it in the displayed totals at once (the backend's totals,
+/// refreshed after the upload, replace that estimate). Returns the instant the
+/// next block starts from.
+fn record_block(
     tracker: &Tracker,
-    client: &mut ApiClient,
+    client: &ApiClient,
     store: &Storage,
     session: &Session,
     state: &StateHandle,
-    block_started_at: chrono::DateTime<Utc>,
-) -> chrono::DateTime<Utc> {
+    block_started_at: DateTime<Utc>,
+) -> DateTime<Utc> {
     let now = Utc::now();
 
     // Use the real elapsed window, but never claim more than one interval: after
@@ -500,7 +625,19 @@ async fn capture_and_sync(
     let activity = tracker.snapshot(&session.perms, &session.project_id, started_at, now);
 
     match store.enqueue(&activity, &client.owner_key()) {
-        Ok(id) => tracing::debug!(id, "activity queued"),
+        Ok(id) => {
+            tracing::debug!(id, "activity queued");
+            let (today_start, week_start) = local_day_and_week_start(now, &Local);
+            state.update(|s| {
+                s.tracked_today_secs += tracked_secs_since(started_at, now, today_start);
+                s.tracked_week_secs += tracked_secs_since(started_at, now, week_start);
+                // Moved in the same update, so the live total never counts
+                // this block twice.
+                if s.block_started_at.is_some() {
+                    s.block_started_at = Some(now);
+                }
+            });
+        }
         Err(e) => {
             tracing::error!(?e, "failed to queue activity");
             state.update(|s| s.last_error = Some(format!("Could not save locally: {e}")));
@@ -508,10 +645,39 @@ async fn capture_and_sync(
     }
     enforce_queue_limits(store);
 
-    sync_pending(client, store, state).await;
-
     // The next block starts where this one ended.
     now
+}
+
+/// Capture one block covering `block_started_at .. now`, then sync.
+/// Returns the instant the next block starts from.
+async fn capture_and_sync(
+    tracker: &Tracker,
+    client: &mut ApiClient,
+    store: &Storage,
+    session: &Session,
+    state: &StateHandle,
+    block_started_at: DateTime<Utc>,
+) -> DateTime<Utc> {
+    let next = record_block(tracker, client, store, session, state, block_started_at);
+    sync_pending(client, store, state).await;
+    next
+}
+
+/// Queue the block in progress when tracking stops (pause, project switch,
+/// sign-out, quit), so stopping never throws worked time away. A block under
+/// [`MIN_BLOCK`] is dropped instead. The caller uploads.
+fn save_block_in_progress(
+    tracker: &Tracker,
+    client: &ApiClient,
+    store: &Storage,
+    session: &Session,
+    state: &StateHandle,
+    block_started_at: DateTime<Utc>,
+) {
+    if Utc::now() - block_started_at >= MIN_BLOCK {
+        record_block(tracker, client, store, session, state, block_started_at);
+    }
 }
 
 /// Refresh the today / this-week totals shown in the window.
@@ -523,21 +689,33 @@ async fn refresh_totals(client: &mut ApiClient, state: &StateHandle) {
     // failing request once left these cards at zero with no trace of why.
     match client.summary(today_start, now).await {
         Ok(today) => state.update(|s| {
-            s.tracked_today_minutes = today.total_tracked_minutes.max(0.0) as u64;
+            s.tracked_today_secs = today.total_tracked_minutes.max(0.0) * 60.0;
             s.last_productivity = today.average_productivity.clamp(0.0, 100.0) as u8;
         }),
         Err(e) => tracing::warn!(?e, "could not load today's totals"),
     }
     match client.summary(week_start, now).await {
-        Ok(week) => state.update(|s| s.tracked_week_minutes = week.total_tracked_minutes.max(0.0) as u64),
+        Ok(week) => state.update(|s| s.tracked_week_secs = week.total_tracked_minutes.max(0.0) * 60.0),
         Err(e) => tracing::warn!(?e, "could not load this week's totals"),
+    }
+}
+
+/// Seconds of `started_at .. ended_at` that fall on or after `since` (e.g.
+/// today's local midnight), so a block spanning midnight only adds today's
+/// part to "today".
+pub fn tracked_secs_since(started_at: DateTime<Utc>, ended_at: DateTime<Utc>, since: DateTime<Utc>) -> f64 {
+    let from = started_at.max(since);
+    if ended_at <= from {
+        0.0
+    } else {
+        (ended_at - from).num_milliseconds() as f64 / 1000.0
     }
 }
 
 /// Local midnight today and on this week's Monday, as UTC instants for the
 /// API. "Today" follows the user's wall clock, not UTC — otherwise the cards
 /// would reset mid-day (at 06:00 in UTC+6, at 19:00 the day before in UTC-5).
-fn local_day_and_week_start<Tz: TimeZone>(now: DateTime<Utc>, tz: &Tz) -> (DateTime<Utc>, DateTime<Utc>) {
+pub fn local_day_and_week_start<Tz: TimeZone>(now: DateTime<Utc>, tz: &Tz) -> (DateTime<Utc>, DateTime<Utc>) {
     let today = now.with_timezone(tz).date_naive();
     // Monday-anchored week.
     let monday = today - chrono::Days::new(u64::from(today.weekday().num_days_from_monday()));
@@ -636,5 +814,33 @@ mod tests {
         let (today, week) = local_day_and_week_start(utc("2026-09-23T12:34:56Z"), &Utc);
         assert_eq!(today, utc("2026-09-23T00:00:00Z"));
         assert_eq!(week, utc("2026-09-21T00:00:00Z"));
+    }
+
+    #[test]
+    fn only_the_part_of_a_block_after_the_cutoff_is_counted() {
+        let midnight = utc("2026-09-30T18:00:00Z");
+        // Entirely after: all of it.
+        assert_eq!(tracked_secs_since(utc("2026-09-30T18:10:00Z"), utc("2026-09-30T18:15:00Z"), midnight), 300.0);
+        // Spanning midnight: only the part after it.
+        assert_eq!(tracked_secs_since(utc("2026-09-30T17:58:00Z"), utc("2026-09-30T18:03:30Z"), midnight), 210.0);
+        // Entirely before: nothing.
+        assert_eq!(tracked_secs_since(utc("2026-09-30T17:00:00Z"), utc("2026-09-30T17:05:00Z"), midnight), 0.0);
+    }
+
+    #[tokio::test]
+    async fn starting_a_stretch_resets_the_clocks_and_clears_a_pause() {
+        let mut ticker = new_ticker(Duration::from_secs(300));
+        ticker.tick().await;
+        let mut clocks = Clocks::new();
+        clocks.paused_since = Some(utc("2026-09-30T10:00:00Z"));
+        clocks.pause_until = Some(utc("2026-09-30T10:30:00Z"));
+
+        let before = Utc::now();
+        clocks.start_tracking(&mut ticker);
+        assert!(!clocks.paused());
+        assert!(clocks.pause_until.is_none());
+        assert!(clocks.tracking_since >= before && clocks.block_started_at == clocks.tracking_since);
+        let until_next = clocks.next_capture_at - clocks.block_started_at;
+        assert!((until_next - chrono::Duration::seconds(300)).num_seconds().abs() <= 1);
     }
 }

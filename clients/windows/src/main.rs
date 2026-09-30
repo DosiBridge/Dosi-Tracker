@@ -31,6 +31,7 @@ mod worker;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use eframe::egui;
@@ -38,10 +39,16 @@ use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
 use config::AppConfig;
-use state::{Command, StateHandle};
+use state::{Command, PendingAction, SharedState, StateHandle, TrackerStatus};
+use tracking::Tracker;
 
 /// Window title, also used to find an existing instance.
 const WINDOW_TITLE: &str = "Dosi Tracker";
+
+/// How long quitting waits for the worker to queue and upload the block in
+/// progress. The block is saved locally first, so a slow network only delays
+/// its upload to the next launch.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(20);
 
 fn main() -> Result<()> {
     // Keep the log guard alive for the whole process, or buffered lines are lost.
@@ -60,6 +67,9 @@ fn main() -> Result<()> {
 
     let state = StateHandle::new();
     let quit_requested = Arc::new(AtomicBool::new(false));
+    // Starts the input listener and the foreground-window sampler.
+    let tracker = Arc::new(Tracker::new());
+    let input = tracker.input();
 
     // The worker needs a way to wake the UI when state changes; the egui context
     // only exists once the window is created, so it is injected here.
@@ -74,7 +84,7 @@ fn main() -> Result<()> {
         }
     };
 
-    let commands = worker::spawn(state.clone(), cfg, repaint);
+    let (commands, worker) = worker::spawn(state.clone(), cfg, tracker, repaint);
 
     // Debug-only: `DOSI_UI_PREVIEW=main|settings` seeds demo state so the
     // signed-in views can be laid out and reviewed without a live backend.
@@ -89,8 +99,8 @@ fn main() -> Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([380.0, 460.0])
-            .with_min_inner_size([340.0, 420.0])
+            .with_inner_size([380.0, 640.0])
+            .with_min_inner_size([340.0, 600.0])
             .with_resizable(false)
             .with_title(WINDOW_TITLE),
         ..Default::default()
@@ -118,13 +128,15 @@ fn main() -> Result<()> {
 
             spawn_tray_event_pump(
                 cc.egui_ctx.clone(),
+                state_for_app.clone(),
                 commands_for_app.clone(),
                 quit_for_app.clone(),
             );
 
             Ok(Box::new(TrayHolder {
-                _tray: tray,
-                app: app::TrackerApp::new(state_for_app, commands_for_app, quit_for_app),
+                tray,
+                state: state_for_app.clone(),
+                app: app::TrackerApp::new(state_for_app, commands_for_app, input, quit_for_app),
             }) as Box<dyn eframe::App>)
         }),
     );
@@ -134,11 +146,27 @@ fn main() -> Result<()> {
         // Without a window there is nothing the user can do, so exit rather than
         // leaving an invisible process tracking in the background.
         let _ = commands.send(Command::Shutdown);
+        wait_for_worker(worker);
         return Err(anyhow::anyhow!("failed to start the UI: {e}"));
     }
 
     let _ = commands.send(Command::Shutdown);
+    wait_for_worker(worker);
     Ok(())
+}
+
+/// Give the worker [`SHUTDOWN_GRACE`] to save and upload the block in
+/// progress. Returning from `main` would otherwise kill it mid-way.
+fn wait_for_worker(worker: std::thread::JoinHandle<()>) {
+    let deadline = Instant::now() + SHUTDOWN_GRACE;
+    while !worker.is_finished() {
+        if Instant::now() >= deadline {
+            tracing::warn!("worker did not finish in time; queued work uploads on the next launch");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = worker.join();
 }
 
 /// Set up logging to a rolling file under `%APPDATA%\DosiTracker\logs`.
@@ -192,19 +220,29 @@ fn seed_ui_preview(state: &StateHandle) {
     if std::env::var("DOSI_UI_PREVIEW").is_err() {
         return;
     }
+    let now = chrono::Utc::now();
+    let paused = std::env::var("DOSI_UI_PREVIEW").is_ok_and(|v| v == "paused");
     state.update(|s| {
-        s.status = state::TrackerStatus::Tracking;
+        s.status = if paused { TrackerStatus::Paused } else { TrackerStatus::Tracking };
         s.display_name = "ayesha@acme.com".into();
         s.projects = vec![
             state::ProjectOption { id: "p1".into(), title: "Website Redesign".into() },
             state::ProjectOption { id: "p2".into(), title: "Mobile App".into() },
         ];
         s.selected_project = Some("p1".into());
-        s.tracked_today_minutes = 222;
-        s.tracked_week_minutes = 1085;
+        s.tracked_today_secs = 222.0 * 60.0;
+        s.tracked_week_secs = 1085.0 * 60.0;
         s.last_productivity = 72;
         s.interval_minutes = 10;
         s.pending_uploads = 2;
+        if paused {
+            s.paused_since = Some(now - chrono::Duration::seconds(252));
+            s.resume_at = Some(now + chrono::Duration::minutes(12));
+        } else {
+            s.tracking_since = Some(now - chrono::Duration::seconds(4_997));
+            s.block_started_at = Some(now - chrono::Duration::seconds(197));
+            s.next_capture_at = Some(now + chrono::Duration::seconds(403));
+        }
     });
 }
 
@@ -231,9 +269,11 @@ fn debug_auto_signin(commands: &tokio::sync::mpsc::UnboundedSender<Command>) {
     }
 }
 
-/// Keeps the tray icon alive for the lifetime of the app and forwards `eframe::App`.
+/// Keeps the tray icon alive for the lifetime of the app, keeps it in step
+/// with the tracker, and forwards `eframe::App`.
 struct TrayHolder {
-    _tray: Option<TrayIcon>,
+    tray: Option<Tray>,
+    state: StateHandle,
     app: app::TrackerApp,
 }
 
@@ -244,31 +284,102 @@ impl eframe::App for TrayHolder {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.app.ui(ui, frame);
+        if let Some(tray) = &mut self.tray {
+            tray.sync(&self.state.snapshot());
+        }
     }
 }
 
 // Menu item ids, matched in the event pump.
 const MENU_SHOW: &str = "show";
 const MENU_PAUSE: &str = "pause";
+const MENU_PAUSE_30: &str = "pause-30";
+const MENU_PAUSE_60: &str = "pause-60";
 const MENU_RESUME: &str = "resume";
 const MENU_QUIT: &str = "quit";
 
-fn build_tray() -> Result<TrayIcon> {
+/// The tray icon and the menu items whose state follows the tracker.
+struct Tray {
+    icon: TrayIcon,
+    pause: [MenuItem; 3],
+    resume: MenuItem,
+    /// What was last applied, so the icon is only touched on a change.
+    applied: Option<(bool, bool, String)>,
+}
+
+impl Tray {
+    /// Enable only the actions that apply now, and show the status (with the
+    /// session time, to the minute) in the tooltip.
+    fn sync(&mut self, snapshot: &SharedState) {
+        let idle = snapshot.pending_action.is_none();
+        let can_pause = idle && app::can_pause(snapshot.status);
+        let can_resume = idle && snapshot.status == TrackerStatus::Paused;
+        let tooltip = tray_tooltip(snapshot, chrono::Utc::now());
+        let wanted = (can_pause, can_resume, tooltip);
+        if self.applied.as_ref() == Some(&wanted) {
+            return;
+        }
+        for item in &self.pause {
+            item.set_enabled(wanted.0);
+        }
+        self.resume.set_enabled(wanted.1);
+        if let Err(e) = self.icon.set_tooltip(Some(&wanted.2)) {
+            tracing::debug!(?e, "could not update the tray tooltip");
+        }
+        self.applied = Some(wanted);
+    }
+}
+
+fn tray_tooltip(snapshot: &SharedState, now: chrono::DateTime<chrono::Utc>) -> String {
+    let minutes = |since: Option<chrono::DateTime<chrono::Utc>>| {
+        let total = since.map_or(0, |at| (now - at).num_minutes().max(0));
+        if total >= 60 {
+            format!("{}h {:02}m", total / 60, total % 60)
+        } else {
+            format!("{total}m")
+        }
+    };
+    let detail = match (snapshot.pending_action, snapshot.status) {
+        (Some(PendingAction::Pausing), _) => "Pausing…".to_string(),
+        (Some(PendingAction::Resuming), _) => "Resuming…".to_string(),
+        (None, TrackerStatus::Tracking) => format!("Tracking · {}", minutes(snapshot.tracking_since)),
+        (None, TrackerStatus::Paused) => match snapshot.resume_at {
+            Some(at) => format!(
+                "Paused · resumes at {}",
+                at.with_timezone(&chrono::Local).format("%H:%M")
+            ),
+            None => format!("Paused · {}", minutes(snapshot.paused_since)),
+        },
+        (None, status) => status.label().to_string(),
+    };
+    format!("Dosi Tracker — {detail}")
+}
+
+fn build_tray() -> Result<Tray> {
+    let pause = [
+        MenuItem::with_id(MENU_PAUSE, "Pause tracking", true, None),
+        MenuItem::with_id(MENU_PAUSE_30, "Pause for 30 minutes", true, None),
+        MenuItem::with_id(MENU_PAUSE_60, "Pause for 1 hour", true, None),
+    ];
+    let resume = MenuItem::with_id(MENU_RESUME, "Resume tracking", false, None);
+
     let menu = Menu::new();
     menu.append(&MenuItem::with_id(MENU_SHOW, "Open Dosi Tracker", true, None))?;
     menu.append(&PredefinedMenuItem::separator())?;
-    menu.append(&MenuItem::with_id(MENU_PAUSE, "Pause tracking", true, None))?;
-    menu.append(&MenuItem::with_id(MENU_RESUME, "Resume tracking", true, None))?;
+    for item in &pause {
+        menu.append(item)?;
+    }
+    menu.append(&resume)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&MenuItem::with_id(MENU_QUIT, "Quit", true, None))?;
 
-    let tray = TrayIconBuilder::new()
+    let icon = TrayIconBuilder::new()
         .with_tooltip("Dosi Tracker")
         .with_menu(Box::new(menu))
         .with_icon(brand_icon())
         .build()?;
 
-    Ok(tray)
+    Ok(Tray { icon, pause, resume, applied: None })
 }
 
 /// A small solid-brand icon drawn in code, so the binary stays self-contained
@@ -301,6 +412,7 @@ fn brand_icon() -> tray_icon::Icon {
 /// window actions, then wake the UI.
 fn spawn_tray_event_pump(
     ctx: egui::Context,
+    state: StateHandle,
     commands: tokio::sync::mpsc::UnboundedSender<Command>,
     quit_requested: Arc<AtomicBool>,
 ) {
@@ -308,17 +420,20 @@ fn spawn_tray_event_pump(
         .name("tray-events".into())
         .spawn(move || {
             let receiver = MenuEvent::receiver();
+            let pause = |resume_after: Option<Duration>| {
+                app::request_action(&state, &commands, PendingAction::Pausing, Command::Pause { resume_after });
+            };
             while let Ok(event) = receiver.recv() {
                 match event.id.0.as_str() {
                     MENU_SHOW => {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     }
-                    MENU_PAUSE => {
-                        let _ = commands.send(Command::Pause);
-                    }
+                    MENU_PAUSE => pause(None),
+                    MENU_PAUSE_30 => pause(Some(Duration::from_secs(30 * 60))),
+                    MENU_PAUSE_60 => pause(Some(Duration::from_secs(60 * 60))),
                     MENU_RESUME => {
-                        let _ = commands.send(Command::Resume);
+                        app::request_action(&state, &commands, PendingAction::Resuming, Command::Resume);
                     }
                     MENU_QUIT => {
                         quit_requested.store(true, Ordering::Relaxed);

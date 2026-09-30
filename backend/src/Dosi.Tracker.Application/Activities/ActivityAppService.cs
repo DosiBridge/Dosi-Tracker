@@ -79,7 +79,7 @@ public class ActivityAppService : ApplicationService, IActivityAppService
             x => x.UserId == userId && x.ClientActivityId == input.ClientActivityId);
         if (existingActivity != null)
         {
-            return MapToDto(existingActivity);
+            return await MapToDtoWithCapturesAsync(existingActivity);
         }
 
         var project = await _projectRepository.FindAsync(input.ProjectId);
@@ -93,6 +93,8 @@ public class ActivityAppService : ApplicationService, IActivityAppService
             throw new BusinessException(TrackerDomainErrorCodes.ProjectArchived)
                 .WithData("projectId", project.Id);
         }
+
+        var blockLength = input.EndedAt - input.StartedAt;
 
         // The constructor enforces a non-empty client id and EndedAt > StartedAt.
         var activity = new Activity(
@@ -111,22 +113,25 @@ public class ActivityAppService : ApplicationService, IActivityAppService
             MouseClicks = project.AllowMouse ? Math.Max(0, input.MouseClicks) : 0,
             KeyboardHits = project.AllowKeyboard ? Math.Max(0, input.KeyboardHits) : 0,
             Description = input.Description,
-            ActiveWindowsJson = project.AllowActiveWindow ? SerializeWindows(input.ActiveWindows) : "[]",
-            RunningProgramsJson = project.AllowRunningPrograms ? SerializeWindows(input.RunningPrograms) : "[]"
+            ActiveWindowsJson = project.AllowActiveWindow ? SerializeWindows(input.ActiveWindows, project, blockLength) : "[]",
+            RunningProgramsJson = project.AllowRunningPrograms ? SerializeWindows(input.RunningPrograms, project, blockLength) : "[]",
+            TimelineJson = SerializeTimeline(input.Timeline, project, blockLength)
         };
 
         await ValidateTimeRangeAsync(userId, project, input);
 
         // Decode captures BEFORE the durable write: invalid/oversized/disallowed captures are skipped
         // (logged), never committed-then-lost, and never fatal to the activity.
-        var captures = new List<PendingCapture>(2);
+        var captures = new List<PendingCapture>(3);
         if (project.AllowScreenshot)
         {
             AddCaptureIfValid(captures, input.ScreenshotPngBase64, Screenshot.ScreenKind, "image/png", "screen.png");
+            AddCaptureIfValid(captures, input.ScreenshotThumbJpgBase64, Screenshot.ThumbKind, "image/jpeg", "thumb.jpg");
         }
         else
         {
             LogDisallowedCapture(input.ScreenshotPngBase64, Screenshot.ScreenKind, project.Id);
+            LogDisallowedCapture(input.ScreenshotThumbJpgBase64, Screenshot.ThumbKind, project.Id);
         }
 
         if (project.AllowWebcam)
@@ -138,6 +143,7 @@ public class ActivityAppService : ApplicationService, IActivityAppService
             LogDisallowedCapture(input.WebcamJpgBase64, Screenshot.WebcamKind, project.Id);
         }
 
+        var storedCaptures = new List<ActivityCaptureRefDto>(captures.Count);
         try
         {
             // Separate UoW so a unique-index violation cannot poison the ambient unit of work,
@@ -150,7 +156,7 @@ public class ActivityAppService : ApplicationService, IActivityAppService
             {
                 var blobName = $"activities/{activity.Id}/{capture.FileName}";
                 await _blobContainer.SaveAsync(blobName, capture.Bytes, overrideExisting: true);
-                await _screenshotRepository.InsertAsync(new Screenshot(
+                var screenshot = await _screenshotRepository.InsertAsync(new Screenshot(
                     GuidGenerator.Create(),
                     CurrentTenant.Id,
                     activity.Id,
@@ -159,6 +165,7 @@ public class ActivityAppService : ApplicationService, IActivityAppService
                     capture.Bytes.Length,
                     capture.ContentType,
                     capture.Kind));
+                storedCaptures.Add(new ActivityCaptureRefDto { Id = screenshot.Id, Kind = screenshot.Kind });
             }
 
             await uow.CompleteAsync();
@@ -177,13 +184,15 @@ public class ActivityAppService : ApplicationService, IActivityAppService
                         .WithData("clientActivityId", input.ClientActivityId);
                 }
 
-                return MapToDto(winner);
+                return await MapToDtoWithCapturesAsync(winner);
             }
 
             throw;
         }
 
-        return MapToDto(activity);
+        var dto = MapToDto(activity);
+        dto.Captures = OrderCaptures(storedCaptures);
+        return dto;
     }
 
     public async Task<PagedResultDto<ActivityDto>> GetListAsync(GetActivitiesInput input)
@@ -197,17 +206,20 @@ public class ActivityAppService : ApplicationService, IActivityAppService
                 .PageBy(input.SkipCount, input.MaxResultCount)
         );
 
-        return new PagedResultDto<ActivityDto>(
-            totalCount,
-            activities.Select(MapToDto).ToList()
-        );
+        var items = activities.Select(MapToDto).ToList();
+        await AttachCapturesAsync(items);
+
+        return new PagedResultDto<ActivityDto>(totalCount, items);
     }
 
+    /// <summary>The block's full-size captures (screen/webcam). Thumbnails are a derived rendition of the screen
+    /// capture and are excluded here; they are listed in <see cref="ActivityDto.Captures"/> instead.</summary>
     public async Task<List<ScreenshotDto>> GetScreenshotsAsync(Guid activityId)
     {
         await EnsureCanReadActivityAsync(activityId);
 
-        var screenshots = await _screenshotRepository.GetListAsync(s => s.ActivityId == activityId);
+        var screenshots = await _screenshotRepository.GetListAsync(
+            s => s.ActivityId == activityId && s.Kind != Screenshot.ThumbKind);
 
         return screenshots
             .OrderBy(s => s.Kind)
@@ -339,19 +351,60 @@ public class ActivityAppService : ApplicationService, IActivityAppService
     };
 
     /// <summary>Serializes window info with over-long names/titles truncated (the list length itself is
-    /// capped by validation on the DTO).</summary>
-    private static string SerializeWindows(List<WindowInfoDto>? windows)
+    /// capped by validation on the DTO). Per-window usage is sanitized: seconds are clamped to the block's
+    /// length, counts to non-negative, and input counts the project does not allow are dropped (stored as
+    /// absent — "not captured" — rather than 0). Absent usage fields are omitted from the JSON.</summary>
+    private static string SerializeWindows(List<WindowInfoDto>? windows, Project project, TimeSpan blockLength)
     {
         if (windows == null || windows.Count == 0)
         {
             return "[]";
         }
 
-        return JsonSerializer.Serialize(windows.Select(w => new WindowInfoDto
+        var maxSeconds = Math.Max(0, (int)Math.Ceiling(blockLength.TotalSeconds));
+
+        return JsonSerializer.Serialize(windows
+            .Where(w => w != null)
+            .Select(w => new WindowInfoDto
+            {
+                AppName = Truncate(w.AppName, MaxAppNameLength),
+                WindowTitle = Truncate(w.WindowTitle, MaxWindowTitleLength),
+                Seconds = w.Seconds.HasValue ? Math.Clamp(w.Seconds.Value, 0, maxSeconds) : null,
+                KeyboardHits = project.AllowKeyboard && w.KeyboardHits.HasValue ? Math.Max(0, w.KeyboardHits.Value) : null,
+                MouseClicks = project.AllowMouse && w.MouseClicks.HasValue ? Math.Max(0, w.MouseClicks.Value) : null
+            })
+            .ToList());
+    }
+
+    /// <summary>Serializes the per-minute timeline: buckets outside the block (minute &lt; 0, or past its last
+    /// minute plus one bucket of slack for a partial trailing minute) are dropped, duplicates keep the first
+    /// entry, counts are clamped to non-negative, and data the project does not allow is blanked (counts
+    /// zeroed, app name removed). The minute/active flags themselves are time data and always kept.</summary>
+    private static string SerializeTimeline(List<ActivityMinuteDto>? timeline, Project project, TimeSpan blockLength)
+    {
+        if (timeline == null || timeline.Count == 0)
         {
-            AppName = Truncate(w.AppName, MaxAppNameLength),
-            WindowTitle = Truncate(w.WindowTitle, MaxWindowTitleLength)
-        }).ToList());
+            return "[]";
+        }
+
+        var lastMinute = Math.Max(0, (int)Math.Ceiling(blockLength.TotalMinutes));
+
+        var minutes = timeline
+            .Where(m => m != null && m.Minute >= 0 && m.Minute <= lastMinute)
+            .GroupBy(m => m.Minute)
+            .Select(g => g.First())
+            .OrderBy(m => m.Minute)
+            .Select(m => new ActivityMinuteDto
+            {
+                Minute = m.Minute,
+                KeyboardHits = project.AllowKeyboard ? Math.Max(0, m.KeyboardHits) : 0,
+                MouseClicks = project.AllowMouse ? Math.Max(0, m.MouseClicks) : 0,
+                Active = m.Active,
+                AppName = project.AllowActiveWindow ? Truncate(m.AppName, MaxAppNameLength) : null
+            })
+            .ToList();
+
+        return minutes.Count == 0 ? "[]" : JsonSerializer.Serialize(minutes);
     }
 
     private static string? Truncate(string? value, int maxLength) =>
@@ -421,7 +474,46 @@ public class ActivityAppService : ApplicationService, IActivityAppService
             Description = activity.Description,
             ActiveWindowsJson = activity.ActiveWindowsJson,
             RunningProgramsJson = activity.RunningProgramsJson,
+            TimelineJson = activity.TimelineJson,
             CreationTime = activity.CreationTime
         };
     }
+
+    private async Task<ActivityDto> MapToDtoWithCapturesAsync(Activity activity)
+    {
+        var dto = MapToDto(activity);
+        await AttachCapturesAsync(new[] { dto });
+        return dto;
+    }
+
+    /// <summary>Fills <see cref="ActivityDto.Captures"/> for the given blocks with a single query over their
+    /// screenshot rows (id + kind only; blob content is never loaded).</summary>
+    private async Task AttachCapturesAsync(IReadOnlyCollection<ActivityDto> dtos)
+    {
+        if (dtos.Count == 0)
+        {
+            return;
+        }
+
+        var activityIds = dtos.Select(d => d.Id).ToList();
+        var screenshots = await _screenshotRepository.GetQueryableAsync();
+        var refs = await AsyncExecuter.ToListAsync(
+            screenshots
+                .Where(s => activityIds.Contains(s.ActivityId))
+                .Select(s => new { s.Id, s.ActivityId, s.Kind }));
+
+        var byActivity = refs.ToLookup(r => r.ActivityId);
+        foreach (var dto in dtos)
+        {
+            dto.Captures = OrderCaptures(
+                byActivity[dto.Id].Select(r => new ActivityCaptureRefDto { Id = r.Id, Kind = r.Kind }));
+        }
+    }
+
+    /// <summary>Stable order for capture references: by kind ("screen", "thumb", "webcam"), then id.</summary>
+    private static List<ActivityCaptureRefDto> OrderCaptures(IEnumerable<ActivityCaptureRefDto> captures) =>
+        captures
+            .OrderBy(c => c.Kind, StringComparer.Ordinal)
+            .ThenBy(c => c.Id)
+            .ToList();
 }

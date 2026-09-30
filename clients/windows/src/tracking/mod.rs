@@ -1,12 +1,14 @@
 //! Tracking subsystem.
 //!
 //! Design goal: keep idle CPU near zero. Input listening is event-driven
-//! (the OS pushes events; we only increment atomic counters). Heavy work
-//! (screenshot, webcam) happens once per interval and then the agent sleeps.
+//! (the OS pushes events; we only record timestamps), the foreground window
+//! is sampled every few seconds with a couple of Win32 calls, and heavy work
+//! (screenshot, webcam) happens once per interval, then the agent sleeps.
 
 pub mod active_window;
 pub mod input;
 pub mod screenshot;
+pub mod usage;
 pub mod webcam;
 
 use std::sync::Arc;
@@ -16,6 +18,7 @@ use chrono::Utc;
 use crate::config::CapturePermissions;
 use crate::model::{Activity, WindowInfo};
 use input::InputCounter;
+use usage::UsageRecorder;
 
 /// Collects one activity snapshot for the given project time block.
 ///
@@ -24,6 +27,7 @@ use input::InputCounter;
 /// the first successful sync with the backend.
 pub struct Tracker {
     input: Arc<InputCounter>,
+    usage: Arc<UsageRecorder>,
 }
 
 impl Tracker {
@@ -32,19 +36,22 @@ impl Tracker {
         // Start the global input listener once; it runs on its own thread and
         // is fully event-driven, so it costs ~0% CPU while idle.
         input::spawn_listener(input.clone());
-        Self { input }
+        let usage = Arc::new(UsageRecorder::new());
+        usage::spawn_sampler(usage.clone());
+        Self { input, usage }
     }
 
-    /// Drop the input counts accumulated so far. Called whenever a new block
-    /// starts outside the normal capture cycle (resume, sign-in, project
-    /// switch, pause) so input made while paused or signed out is never
-    /// attributed to tracked time.
-    pub fn discard_input(&self) {
-        let _ = self.input.take();
+    /// Read-only access to input for the live view (counts and activity % of
+    /// the block in progress).
+    pub fn input(&self) -> Arc<InputCounter> {
+        self.input.clone()
     }
 
-    /// Build an activity for the block `started_at ..= ended_at`, then reset
-    /// counters.
+    /// Build an activity for the block `started_at ..= ended_at`.
+    ///
+    /// Everything is taken over that window, so input and window usage from
+    /// before the block (while paused, signed out, or on another project) can
+    /// never be attributed to it.
     pub fn snapshot(
         &self,
         perms: &CapturePermissions,
@@ -52,16 +59,52 @@ impl Tracker {
         started_at: chrono::DateTime<Utc>,
         ended_at: chrono::DateTime<Utc>,
     ) -> Activity {
-        let (keyboard_hits, mouse_clicks) = self.input.take();
-        let productivity =
-            self.input
-                .activity_percent(started_at, ended_at, perms.keyboard, perms.mouse);
+        // Credit the stretch since the last sample, so usage runs right up to
+        // the end of the block.
+        let now_window = active_window::current();
+        self.usage.record(ended_at.timestamp_millis(), now_window.clone());
 
-        let active_windows: Vec<WindowInfo> = if perms.active_window {
-            active_window::current().into_iter().collect()
+        let key_presses = if perms.keyboard {
+            self.input.key_presses_between(started_at, ended_at)
         } else {
             Vec::new()
         };
+        let clicks = if perms.mouse {
+            self.input.clicks_between(started_at, ended_at)
+        } else {
+            Vec::new()
+        };
+        let active_seconds =
+            self.input
+                .active_seconds(started_at, ended_at, perms.keyboard, perms.mouse);
+        let productivity = input::activity_percent(
+            &active_seconds,
+            started_at.timestamp(),
+            ended_at.timestamp(),
+        );
+
+        let slices = if perms.active_window {
+            self.usage
+                .slices_between(started_at.timestamp_millis(), ended_at.timestamp_millis())
+        } else {
+            Vec::new()
+        };
+        let active_windows: Vec<WindowInfo> = if !perms.active_window {
+            Vec::new()
+        } else if slices.is_empty() {
+            // Too short for a single sample: fall back to the window in front.
+            now_window.into_iter().collect()
+        } else {
+            usage::app_usage(&slices, &key_presses, &clicks)
+        };
+        let timeline = usage::minute_timeline(
+            started_at.timestamp(),
+            ended_at.timestamp(),
+            &slices,
+            &key_presses,
+            &clicks,
+            &active_seconds,
+        );
 
         let running_programs: Vec<WindowInfo> = if perms.running_programs {
             active_window::running_programs().unwrap_or_default()
@@ -69,10 +112,20 @@ impl Tracker {
             Vec::new()
         };
 
-        let screenshot_png_base64 = if perms.screenshot {
-            screenshot::capture_primary_png_base64().ok()
+        let screen = if perms.screenshot {
+            match screenshot::capture_primary() {
+                Ok(capture) => Some(capture),
+                Err(e) => {
+                    tracing::warn!(?e, "screenshot capture failed");
+                    None
+                }
+            }
         } else {
             None
+        };
+        let (screenshot_png_base64, screenshot_thumb_jpg_base64) = match screen {
+            Some(capture) => (Some(capture.png_base64), capture.thumb_jpg_base64),
+            None => (None, None),
         };
 
         let webcam_jpg_base64 = if perms.webcam {
@@ -88,11 +141,13 @@ impl Tracker {
             ended_at,
             description: None,
             productivity,
-            mouse_clicks: if perms.mouse { mouse_clicks } else { 0 },
-            keyboard_hits: if perms.keyboard { keyboard_hits } else { 0 },
+            mouse_clicks: clicks.len() as u64,
+            keyboard_hits: key_presses.len() as u64,
             active_windows,
             running_programs,
+            timeline,
             screenshot_png_base64,
+            screenshot_thumb_jpg_base64,
             webcam_jpg_base64,
         }
     }

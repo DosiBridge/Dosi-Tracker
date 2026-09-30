@@ -118,6 +118,72 @@ public abstract class ReportingAppServiceTests<TStartupModule> : TrackerApplicat
         chrome.ActivityCount.ShouldBe(2);         // running in block 1, focused in block 2
     }
 
+    private async Task TrackWithWindowsAsync(Guid projectId, DateTime start, int minutes, List<WindowInfoDto> active)
+    {
+        await EnsureProjectAsync(projectId);
+        await _activityAppService.CreateAsync(new CreateActivityDto
+        {
+            ProjectId = projectId,
+            ClientActivityId = Guid.NewGuid(),
+            StartedAt = start,
+            EndedAt = start.AddMinutes(minutes),
+            Productivity = 80,
+            ActiveWindows = active
+        });
+    }
+
+    [Fact]
+    public async Task AppUsage_Should_Credit_Per_Window_Seconds_When_Reported_And_Fall_Back_For_Legacy_Blocks()
+    {
+        var projectId = Guid.NewGuid();
+        // New agent, 30-minute block: code.exe 15m + 5m across two titles, chrome.exe 10m.
+        await TrackWithWindowsAsync(projectId, Day.AddHours(9), 30, new List<WindowInfoDto>
+        {
+            new() { AppName = "code.exe", WindowTitle = "A.cs", Seconds = 900 },
+            new() { AppName = "chrome.exe", WindowTitle = "Docs", Seconds = 600 },
+            new() { AppName = "code.exe", WindowTitle = "B.cs", Seconds = 300 },
+            new() { AppName = "notepad.exe", WindowTitle = "todo", Seconds = 0 } // seen, but no foreground time
+        });
+        // Legacy agent, 20-minute block: only the focused window, no seconds -> credited the whole block.
+        await TrackWithAppsAsync(projectId, Day.AddHours(10), 20, new[] { "chrome.exe" }, new[] { "chrome.exe", "slack.exe" });
+
+        var apps = await _reportingAppService.GetAppUsageAsync(new GetReportSummaryInput { From = Day, To = Day.AddDays(1) });
+
+        apps.Count.ShouldBe(4);
+        apps[0].AppName.ShouldBe("chrome.exe"); // most credited minutes first
+        apps[1].AppName.ShouldBe("code.exe");
+
+        var chrome = apps.Single(a => a.AppName == "chrome.exe");
+        chrome.TrackedMinutes.ShouldBe(30); // 10 (seconds) + 20 (legacy block)
+        chrome.ActivityCount.ShouldBe(2);
+        chrome.UserCount.ShouldBe(1);
+
+        var code = apps.Single(a => a.AppName == "code.exe");
+        code.TrackedMinutes.ShouldBe(20); // 900 s + 300 s, not the whole 30-minute block
+        code.ActivityCount.ShouldBe(1);   // two titles in one block still count once
+
+        apps.Single(a => a.AppName == "notepad.exe").TrackedMinutes.ShouldBe(0);
+        apps.Single(a => a.AppName == "notepad.exe").ActivityCount.ShouldBe(1);
+        apps.Single(a => a.AppName == "slack.exe").TrackedMinutes.ShouldBe(0); // running only
+    }
+
+    [Fact]
+    public async Task AppUsage_Should_Never_Credit_A_Block_More_Minutes_Than_It_Lasted()
+    {
+        var projectId = Guid.NewGuid();
+        // A misbehaving agent reports 10 + 10 minutes of foreground time inside a 10-minute block.
+        await TrackWithWindowsAsync(projectId, Day.AddHours(9), 10, new List<WindowInfoDto>
+        {
+            new() { AppName = "code.exe", WindowTitle = "A.cs", Seconds = 600 },
+            new() { AppName = "chrome.exe", WindowTitle = "Docs", Seconds = 600 }
+        });
+
+        var apps = await _reportingAppService.GetAppUsageAsync(new GetReportSummaryInput { From = Day, To = Day.AddDays(1) });
+
+        apps.Sum(a => a.TrackedMinutes).ShouldBe(10);
+        apps.ShouldAllBe(a => a.TrackedMinutes == 5);
+    }
+
     [Fact]
     public async Task Attendance_Should_Derive_Present_Absent_Weekdays_And_Worked_Minutes()
     {

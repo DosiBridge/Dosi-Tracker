@@ -294,8 +294,9 @@ describe("architecture spec: XSS surface", () => {
 
   it('gives every target="_blank" link rel="noopener" (or noreferrer)', () => {
     // RULE 7 — without rel, the opened page gets window.opener and can navigate
-    // us (reverse tabnabbing). Currently ZERO target="_blank" links exist; the
-    // rule is here so the first one added ships safe.
+    // us (reverse tabnabbing). The only target="_blank" link today is the
+    // activity drawer's "open full size" screen capture; every new one must
+    // ship with rel too.
     const violations: string[] = [];
     for (const [file, content] of prodFiles) {
       let idx = content.indexOf("_blank");

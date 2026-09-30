@@ -250,7 +250,8 @@ export default function MonitorPage() {
         if (cancelled || collected.length >= 12) break;
         let metas: { id: string; kind?: string; capturedAt?: string }[] = [];
         try {
-          const res = await getApi(`/api/app/activity/screenshots?activityId=${encodeURIComponent(seg.id)}`);
+          // The activity id is a PATH parameter (ABP: GET screenshots/{activityId}); a query string 404s.
+          const res = await getApi(`/api/app/activity/screenshots/${encodeURIComponent(seg.id)}`);
           if (Array.isArray(res)) metas = res;
         } catch {
           continue; // block without readable captures — keep going

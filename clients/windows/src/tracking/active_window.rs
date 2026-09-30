@@ -60,6 +60,7 @@ pub fn current() -> Option<WindowInfo> {
         Some(WindowInfo {
             app_name: app_name_for_pid(pid),
             window_title,
+            ..Default::default()
         })
     }
 }
@@ -119,6 +120,7 @@ pub fn running_programs() -> anyhow::Result<Vec<WindowInfo>> {
             programs.push(WindowInfo {
                 app_name: app_name_for_pid(pid),
                 window_title: title,
+                ..Default::default()
             });
         }
     }

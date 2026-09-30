@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
@@ -8,15 +8,23 @@ use chrono::{DateTime, Utc};
 /// (the interval is clamped to 60 minutes) plus slack for a slow capture.
 const ACTIVITY_RETENTION_SECS: i64 = 65 * 60;
 
-/// Thread-safe counters for keyboard hits and mouse clicks, plus a per-second
-/// record of *when* there was input (for the activity %).
+/// Hard cap on remembered key presses / clicks per kind. Normal typing stays
+/// far below it (~10k/hour); it only bounds memory under an auto-clicker.
+const MAX_EVENTS: usize = 200_000;
+
+/// Keyboard and mouse input, recorded as *when* it happened (never keystroke
+/// content): a millisecond timestamp per key press and click, plus a
+/// per-second record of any input for the activity %.
 ///
-/// We only keep counts and timestamps (never keystroke content) to respect
-/// privacy and to keep the footprint tiny.
+/// Every count is taken over an explicit time window rather than from
+/// counters reset at block boundaries, so block totals, the per-minute
+/// timeline and the per-app breakdown always agree, and input made before a
+/// block (while paused, signed out, or on another project) can never leak
+/// into it.
 #[derive(Default)]
 pub struct InputCounter {
-    keyboard: AtomicU64,
-    mouse: AtomicU64,
+    key_presses: EventLog,
+    mouse_clicks: EventLog,
     keyboard_activity: ActivityLog,
     mouse_activity: ActivityLog,
 }
@@ -27,13 +35,15 @@ impl InputCounter {
     }
 
     pub fn inc_keyboard(&self) {
-        self.keyboard.fetch_add(1, Ordering::Relaxed);
-        self.keyboard_activity.mark(Utc::now().timestamp());
+        let now = Utc::now();
+        self.key_presses.record(now.timestamp_millis());
+        self.keyboard_activity.mark(now.timestamp());
     }
 
     pub fn inc_mouse(&self) {
-        self.mouse.fetch_add(1, Ordering::Relaxed);
-        self.mouse_activity.mark(Utc::now().timestamp());
+        let now = Utc::now();
+        self.mouse_clicks.record(now.timestamp_millis());
+        self.mouse_activity.mark(now.timestamp());
     }
 
     /// Mouse movement / wheel: counts as activity (reading and scrolling is
@@ -42,12 +52,42 @@ impl InputCounter {
         self.mouse_activity.mark(Utc::now().timestamp());
     }
 
-    /// Read counts and reset them to zero. Returns (keyboard_hits, mouse_clicks).
-    pub fn take(&self) -> (u64, u64) {
-        (
-            self.keyboard.swap(0, Ordering::Relaxed),
-            self.mouse.swap(0, Ordering::Relaxed),
-        )
+    /// Timestamps (Unix ms) of key presses in `[start, end)`.
+    pub fn key_presses_between(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> Vec<i64> {
+        self.key_presses.between(start.timestamp_millis(), end.timestamp_millis())
+    }
+
+    /// Timestamps (Unix ms) of mouse clicks in `[start, end)`.
+    pub fn clicks_between(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> Vec<i64> {
+        self.mouse_clicks.between(start.timestamp_millis(), end.timestamp_millis())
+    }
+
+    /// (key presses, clicks) in `[start, end)` — cheap enough to call every
+    /// frame for the live view.
+    pub fn counts_between(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> (u64, u64) {
+        let (start, end) = (start.timestamp_millis(), end.timestamp_millis());
+        (self.key_presses.count(start, end), self.mouse_clicks.count(start, end))
+    }
+
+    /// Unix seconds inside `started_at ..= ended_at` that had input of an
+    /// allowed kind — what the activity % and the timeline's active minutes
+    /// are computed from.
+    pub fn active_seconds(
+        &self,
+        started_at: DateTime<Utc>,
+        ended_at: DateTime<Utc>,
+        keyboard: bool,
+        mouse: bool,
+    ) -> Vec<i64> {
+        let (start, end) = (started_at.timestamp(), ended_at.timestamp());
+        let mut seconds = Vec::new();
+        if keyboard {
+            seconds.extend(self.keyboard_activity.seconds_between(start, end));
+        }
+        if mouse {
+            seconds.extend(self.mouse_activity.seconds_between(start, end));
+        }
+        seconds
     }
 
     /// Activity % (0-100) of the block `started_at ..= ended_at`, counting only
@@ -60,15 +100,45 @@ impl InputCounter {
         keyboard: bool,
         mouse: bool,
     ) -> u8 {
-        let (start, end) = (started_at.timestamp(), ended_at.timestamp());
-        let mut seconds = Vec::new();
-        if keyboard {
-            seconds.extend(self.keyboard_activity.seconds_between(start, end));
+        let seconds = self.active_seconds(started_at, ended_at, keyboard, mouse);
+        activity_percent(&seconds, started_at.timestamp(), ended_at.timestamp())
+    }
+}
+
+/// Millisecond timestamps of discrete input events (key presses or clicks),
+/// oldest first, bounded by [`ACTIVITY_RETENTION_SECS`] and [`MAX_EVENTS`].
+#[derive(Default)]
+struct EventLog {
+    events: Mutex<VecDeque<i64>>,
+}
+
+impl EventLog {
+    fn record(&self, at_ms: i64) {
+        let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());
+        // Keep the log sorted: a clock stepping backwards files the event
+        // with the newest one instead of out of order.
+        let at_ms = events.back().map_or(at_ms, |&last| at_ms.max(last));
+        events.push_back(at_ms);
+        let horizon = at_ms - ACTIVITY_RETENTION_SECS * 1000;
+        while events.front().is_some_and(|&oldest| oldest < horizon) || events.len() > MAX_EVENTS {
+            events.pop_front();
         }
-        if mouse {
-            seconds.extend(self.mouse_activity.seconds_between(start, end));
-        }
-        activity_percent(&seconds, start, end)
+    }
+
+    fn range(events: &VecDeque<i64>, start_ms: i64, end_ms: i64) -> std::ops::Range<usize> {
+        let from = events.partition_point(|&t| t < start_ms);
+        let to = events.partition_point(|&t| t < end_ms).max(from);
+        from..to
+    }
+
+    fn count(&self, start_ms: i64, end_ms: i64) -> u64 {
+        let events = self.events.lock().unwrap_or_else(|e| e.into_inner());
+        Self::range(&events, start_ms, end_ms).len() as u64
+    }
+
+    fn between(&self, start_ms: i64, end_ms: i64) -> Vec<i64> {
+        let events = self.events.lock().unwrap_or_else(|e| e.into_inner());
+        events.range(Self::range(&events, start_ms, end_ms)).copied().collect()
     }
 }
 
@@ -120,22 +190,49 @@ impl ActivityLog {
 /// is shorter than 30 s — a sliver of a minute can never cost a fully active
 /// user a percentage point.
 pub fn activity_percent(active_seconds: &[i64], start: i64, end: i64) -> u8 {
-    let span = end - start;
-    if span <= 0 {
+    let minutes = minute_buckets(start, end);
+    if minutes == 0 {
         return 0;
     }
-    let minutes = ((span + 30) / 60).max(1);
+    let active = active_minutes(active_seconds, start, end);
+    let active_minutes = active.iter().filter(|&&a| a).count() as i64;
+    // Round to the nearest whole percent.
+    ((active_minutes * 100 + minutes / 2) / minutes) as u8
+}
+
+/// Number of minute buckets in the block `start ..= end` (Unix seconds): the
+/// length rounded to the nearest minute, at least one; zero for an empty or
+/// inverted block.
+pub fn minute_buckets(start: i64, end: i64) -> i64 {
+    let span = end - start;
+    if span <= 0 {
+        0
+    } else {
+        ((span + 30) / 60).max(1)
+    }
+}
+
+/// The bucket a second inside the block falls into (a trailing sliver joins
+/// the last bucket).
+pub fn bucket_of(second: i64, start: i64, minutes: i64) -> usize {
+    ((second - start) / 60).clamp(0, minutes - 1) as usize
+}
+
+/// Which minute buckets of the block had any input — the activity % is the
+/// share of `true`s.
+pub fn active_minutes(active_seconds: &[i64], start: i64, end: i64) -> Vec<bool> {
+    let minutes = minute_buckets(start, end);
+    if minutes == 0 {
+        return Vec::new();
+    }
     let mut active = vec![false; minutes as usize];
     for &second in active_seconds {
         if second < start || second > end {
             continue;
         }
-        let index = ((second - start) / 60).min(minutes - 1);
-        active[index as usize] = true;
+        active[bucket_of(second, start, minutes)] = true;
     }
-    let active_minutes = active.iter().filter(|&&a| a).count() as i64;
-    // Round to the nearest whole percent.
-    ((active_minutes * 100 + minutes / 2) / minutes) as u8
+    active
 }
 
 /// Spawn a background thread with a global, event-driven input hook.
@@ -253,12 +350,52 @@ mod tests {
     }
 
     #[test]
-    fn take_resets_counts() {
+    fn counts_are_taken_over_a_window() {
         let counter = InputCounter::new();
+        let before = Utc::now() - chrono::Duration::seconds(1);
         counter.inc_keyboard();
         counter.inc_keyboard();
         counter.inc_mouse();
-        assert_eq!(counter.take(), (2, 1));
-        assert_eq!(counter.take(), (0, 0));
+        let after = Utc::now() + chrono::Duration::seconds(1);
+        assert_eq!(counter.counts_between(before, after), (2, 1));
+        assert_eq!(counter.key_presses_between(before, after).len(), 2);
+        assert_eq!(counter.clicks_between(before, after).len(), 1);
+        // Nothing before the window counts in it.
+        assert_eq!(counter.counts_between(after, after + chrono::Duration::seconds(5)), (0, 0));
+    }
+
+    #[test]
+    fn event_windows_are_half_open_so_blocks_never_share_an_event() {
+        let log = EventLog::default();
+        for t in [1_000, 2_000, 3_000] {
+            log.record(t);
+        }
+        // Back-to-back blocks [1000, 2000) and [2000, 3001): each event once.
+        assert_eq!(log.between(1_000, 2_000), vec![1_000]);
+        assert_eq!(log.between(2_000, 3_001), vec![2_000, 3_000]);
+        assert_eq!(log.count(3_001, 9_000), 0);
+        assert_eq!(log.count(5_000, 1_000), 0); // inverted window
+    }
+
+    #[test]
+    fn event_log_stays_sorted_and_bounded() {
+        let log = EventLog::default();
+        log.record(10_000);
+        log.record(9_000); // clock stepped back: filed with the newest
+        assert_eq!(log.between(0, 20_000), vec![10_000, 10_000]);
+
+        // Far in the future: everything older than the retention window goes.
+        let later = 10_000 + ACTIVITY_RETENTION_SECS * 1000 + 1;
+        log.record(later);
+        assert_eq!(log.between(0, i64::MAX), vec![later]);
+    }
+
+    #[test]
+    fn active_minutes_match_the_activity_percent() {
+        // 3 buckets; input in the first and the trailing sliver of the last.
+        let active = active_minutes(&[T0 + 5, T0 + 185], T0, T0 + 190);
+        assert_eq!(active, vec![true, false, true]);
+        assert_eq!(activity_percent(&[T0 + 5, T0 + 185], T0, T0 + 190), 67);
+        assert!(active_minutes(&[T0], T0, T0).is_empty());
     }
 }

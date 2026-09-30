@@ -120,11 +120,13 @@ export const getApi = async (endpoint: string) => {
 /**
  * Fetch a protected binary (e.g. screenshot content) with the bearer token and
  * return an object URL for <img src>. Callers should revoke it when done.
+ * Pass a `signal` to abandon the download (e.g. its card unmounted).
  */
-export const getAuthedBlobUrl = async (endpoint: string): Promise<string> => {
+export const getAuthedBlobUrl = async (endpoint: string, init: { signal?: AbortSignal } = {}): Promise<string> => {
   const token = typeof window !== 'undefined' ? localStorage.getItem('dosi-token') : null;
   const res = await fetch(`${API_BASE_URL}${endpoint}`, {
     headers: token ? { Authorization: `Bearer ${token}` } : {},
+    signal: init.signal,
   });
   if (!res.ok) {
     handleUnauthorized(res);

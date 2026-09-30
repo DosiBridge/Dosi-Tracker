@@ -147,18 +147,35 @@ public class ReportingAppService : TrackerAppService, IReportingAppService
         foreach (var r in rows)
         {
             var duration = (r.EndedAt - r.StartedAt).TotalMinutes;
-            var active = ParseApps(r.ActiveWindowsJson);
-            var running = ParseApps(r.RunningProgramsJson);
+            var active = ParseWindows(r.ActiveWindowsJson);
+            var running = ParseWindows(r.RunningProgramsJson);
 
-            // The focused app (first active window) is credited with the block's time; other apps
-            // present in the block count towards its reach but not its minutes (avoids double-counting).
-            var focused = active.FirstOrDefault();
-            if (!string.IsNullOrWhiteSpace(focused))
+            var timed = active.Where(w => w.Seconds > 0).ToList();
+            if (timed.Count > 0)
             {
-                minutes[focused] = minutes.GetValueOrDefault(focused) + duration;
+                // Newer agents report per-window foreground seconds: each app is credited with its own share
+                // of the block. Over-reported totals are scaled down so the block is never credited more
+                // minutes than it lasted.
+                var reportedMinutes = timed.Sum(w => w.Seconds!.Value / 60.0);
+                var scale = reportedMinutes > duration ? duration / reportedMinutes : 1;
+                foreach (var window in timed)
+                {
+                    minutes[window.AppName!] = minutes.GetValueOrDefault(window.AppName!) + window.Seconds!.Value / 60.0 * scale;
+                }
+            }
+            else
+            {
+                // Legacy blocks only carry the window focused at capture time: that app (first active window) is
+                // credited with the block's time; other apps present in the block count towards their reach but
+                // not their minutes (avoids double-counting).
+                var focused = active.FirstOrDefault()?.AppName;
+                if (!string.IsNullOrWhiteSpace(focused))
+                {
+                    minutes[focused] = minutes.GetValueOrDefault(focused) + duration;
+                }
             }
 
-            foreach (var app in active.Concat(running).Distinct(StringComparer.OrdinalIgnoreCase))
+            foreach (var app in active.Concat(running).Select(w => w.AppName!).Distinct(StringComparer.OrdinalIgnoreCase))
             {
                 activityCounts[app] = activityCounts.GetValueOrDefault(app) + 1;
                 if (!users.TryGetValue(app, out var set))
@@ -297,12 +314,13 @@ public class ReportingAppService : TrackerAppService, IReportingAppService
         }
     }
 
-    /// <summary>Extract distinct application names from a stored window-info JSON array; tolerant of bad data.</summary>
-    private static List<string> ParseApps(string? json)
+    /// <summary>Extract the entries that name an application from a stored window-info JSON array (in stored
+    /// order; per-window seconds when the agent reported them); tolerant of bad data.</summary>
+    private static List<WindowInfoDto> ParseWindows(string? json)
     {
         if (string.IsNullOrWhiteSpace(json))
         {
-            return new List<string>();
+            return new List<WindowInfoDto>();
         }
 
         try
@@ -310,13 +328,12 @@ public class ReportingAppService : TrackerAppService, IReportingAppService
             var windows = JsonSerializer.Deserialize<List<WindowInfoDto>>(
                 json, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
             return windows?
-                .Where(w => !string.IsNullOrWhiteSpace(w.AppName))
-                .Select(w => w.AppName!)
-                .ToList() ?? new List<string>();
+                .Where(w => w != null && !string.IsNullOrWhiteSpace(w.AppName))
+                .ToList() ?? new List<WindowInfoDto>();
         }
         catch (JsonException)
         {
-            return new List<string>();
+            return new List<WindowInfoDto>();
         }
     }
 

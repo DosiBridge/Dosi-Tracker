@@ -478,4 +478,191 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
 
         await Should.ThrowAsync<Volo.Abp.Validation.AbpValidationException>(() => SubmitAsync(input));
     }
+
+    // ---- Rich block detail: per-window usage, per-minute timeline, thumbnails, capture refs ----
+
+    private static readonly byte[] ScreenBytes = { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x01 };
+    private static readonly byte[] ThumbBytes = { 0xFF, 0xD8, 0xFF, 0xE0, 0x0A, 0x0B, 0xFF, 0xD9 };
+    private static readonly byte[] WebcamBytes = { 0xFF, 0xD8, 0xFF, 0xE0, 0x01, 0x02, 0xFF, 0xD9 };
+
+    [Fact]
+    public async Task Create_Should_Accept_A_Legacy_Payload_Without_The_New_Fields()
+    {
+        var created = await SubmitAsync(NewInput());
+
+        // Old agents: one focused window, no usage fields -> the original stored shape, untouched.
+        created.ActiveWindowsJson.ShouldBe("[{\"AppName\":\"code.exe\",\"WindowTitle\":\"ActivityAppService.cs\"}]");
+        created.TimelineJson.ShouldBe("[]");
+        created.Captures.ShouldBeEmpty();
+    }
+
+    [Fact]
+    public async Task Create_Should_Store_Sanitized_Per_Window_Usage()
+    {
+        var input = NewInput(); // 10-minute block = 600 s
+        input.ActiveWindows = new List<WindowInfoDto>
+        {
+            new() { AppName = "code.exe", WindowTitle = "A.cs", Seconds = 400, KeyboardHits = 300, MouseClicks = 20 },
+            new() { AppName = "chrome.exe", WindowTitle = "Docs", Seconds = -5, KeyboardHits = -1, MouseClicks = -2 },
+            new() { AppName = "slack.exe", WindowTitle = "General", Seconds = 5000 },
+            new() { AppName = new string('a', 300), WindowTitle = "legacy" }
+        };
+
+        var created = await SubmitAsync(input);
+
+        created.ActiveWindowsJson.ShouldBe(
+            "[{\"AppName\":\"code.exe\",\"WindowTitle\":\"A.cs\",\"Seconds\":400,\"KeyboardHits\":300,\"MouseClicks\":20}," +
+            "{\"AppName\":\"chrome.exe\",\"WindowTitle\":\"Docs\",\"Seconds\":0,\"KeyboardHits\":0,\"MouseClicks\":0}," + // negatives clamped
+            "{\"AppName\":\"slack.exe\",\"WindowTitle\":\"General\",\"Seconds\":600}," + // capped at the block length
+            "{\"AppName\":\"" + new string('a', 256) + "\",\"WindowTitle\":\"legacy\"}]"); // absent usage stays absent
+    }
+
+    [Fact]
+    public async Task Create_Should_Drop_Per_Window_Input_Counts_The_Project_Does_Not_Allow()
+    {
+        var input = NewInput();
+        input.ActiveWindows = new List<WindowInfoDto>
+        {
+            new() { AppName = "code.exe", WindowTitle = "A.cs", Seconds = 400, KeyboardHits = 300, MouseClicks = 20 }
+        };
+
+        var created = await SubmitAsync(input, p =>
+        {
+            p.AllowKeyboard = false;
+            p.AllowMouse = false;
+        });
+
+        // Seconds are active-window data (still allowed); the input counts are not stored at all.
+        created.ActiveWindowsJson.ShouldBe("[{\"AppName\":\"code.exe\",\"WindowTitle\":\"A.cs\",\"Seconds\":400}]");
+    }
+
+    [Fact]
+    public async Task Create_Should_Store_A_Sanitized_Timeline()
+    {
+        var input = NewInput(); // 10-minute block: buckets 0..9, plus one bucket of slack (10)
+        input.Timeline = new List<ActivityMinuteDto>
+        {
+            new() { Minute = 10, KeyboardHits = 1, MouseClicks = 1, Active = true },
+            new() { Minute = -1, KeyboardHits = 7, MouseClicks = 7, Active = true },
+            new() { Minute = 0, KeyboardHits = 5, MouseClicks = 2, Active = true, AppName = "code.exe" },
+            new() { Minute = 3, KeyboardHits = -4, MouseClicks = -1, Active = false, AppName = new string('b', 300) },
+            new() { Minute = 3, KeyboardHits = 99, MouseClicks = 99, Active = true }, // duplicate bucket: first wins
+            new() { Minute = 11, KeyboardHits = 8, MouseClicks = 8, Active = true }   // past the block
+        };
+
+        var created = await SubmitAsync(input);
+
+        created.TimelineJson.ShouldBe(
+            "[{\"Minute\":0,\"KeyboardHits\":5,\"MouseClicks\":2,\"Active\":true,\"AppName\":\"code.exe\"}," +
+            "{\"Minute\":3,\"KeyboardHits\":0,\"MouseClicks\":0,\"Active\":false,\"AppName\":\"" + new string('b', 256) + "\"}," +
+            "{\"Minute\":10,\"KeyboardHits\":1,\"MouseClicks\":1,\"Active\":true}]");
+
+        var listed = await _activityAppService.GetListAsync(new GetActivitiesInput { ProjectId = input.ProjectId });
+        listed.Items.ShouldHaveSingleItem().TimelineJson.ShouldBe(created.TimelineJson);
+    }
+
+    [Fact]
+    public async Task Create_Should_Blank_Timeline_Data_The_Project_Does_Not_Allow()
+    {
+        var input = NewInput();
+        input.Timeline = new List<ActivityMinuteDto>
+        {
+            new() { Minute = 0, KeyboardHits = 5, MouseClicks = 2, Active = true, AppName = "code.exe" }
+        };
+
+        var created = await SubmitAsync(input, p =>
+        {
+            p.AllowKeyboard = false;
+            p.AllowMouse = false;
+            p.AllowActiveWindow = false;
+        });
+
+        // The minute and its active flag are time data and always kept.
+        created.TimelineJson.ShouldBe("[{\"Minute\":0,\"KeyboardHits\":0,\"MouseClicks\":0,\"Active\":true}]");
+    }
+
+    [Fact]
+    public async Task Create_Should_Reject_An_Oversized_Timeline()
+    {
+        var input = NewInput();
+        input.Timeline = Enumerable.Range(0, CreateActivityDto.MaxTimelineEntries + 1)
+            .Select(i => new ActivityMinuteDto { Minute = i })
+            .ToList();
+
+        await Should.ThrowAsync<Volo.Abp.Validation.AbpValidationException>(() => SubmitAsync(input));
+    }
+
+    [Fact]
+    public async Task Create_Should_Store_The_Thumbnail_But_Keep_It_Out_Of_The_Screenshot_List()
+    {
+        var input = NewInput();
+        input.ScreenshotPngBase64 = Convert.ToBase64String(ScreenBytes);
+        input.ScreenshotThumbJpgBase64 = Convert.ToBase64String(ThumbBytes);
+
+        var created = await SubmitAsync(input);
+
+        created.Captures.Select(c => c.Kind).ShouldBe(new[] { Screenshot.ScreenKind, Screenshot.ThumbKind });
+
+        // Thumbnails are a derived rendition: the full-size capture list only has the screen.
+        var screenshots = await _activityAppService.GetScreenshotsAsync(created.Id);
+        screenshots.ShouldHaveSingleItem().Kind.ShouldBe(Screenshot.ScreenKind);
+        screenshots[0].Id.ShouldBe(created.Captures[0].Id);
+
+        // ... but it is still served by id.
+        var thumb = await _activityAppService.GetScreenshotContentAsync(created.Captures[1].Id);
+        thumb.Bytes.ShouldBe(ThumbBytes);
+        thumb.ContentType.ShouldBe("image/jpeg");
+
+        // An idempotent retry hands back the same capture references.
+        var replayed = await SubmitAsync(input);
+        replayed.Id.ShouldBe(created.Id);
+        replayed.Captures.Select(c => c.Id).ShouldBe(created.Captures.Select(c => c.Id));
+    }
+
+    [Fact]
+    public async Task Create_Should_Drop_The_Thumbnail_When_Screenshots_Are_Not_Allowed()
+    {
+        var input = NewInput();
+        input.ScreenshotPngBase64 = Convert.ToBase64String(ScreenBytes);
+        input.ScreenshotThumbJpgBase64 = Convert.ToBase64String(ThumbBytes);
+
+        var created = await SubmitAsync(input, p => p.AllowScreenshot = false);
+
+        created.Captures.ShouldBeEmpty();
+        await WithUnitOfWorkAsync(async () =>
+        {
+            var stored = await GetRequiredService<IRepository<Screenshot, Guid>>()
+                .CountAsync(s => s.ActivityId == created.Id);
+            stored.ShouldBe(0);
+        });
+    }
+
+    [Fact]
+    public async Task GetList_Should_Return_The_Capture_References_Of_Each_Activity()
+    {
+        var baseTime = new DateTime(2026, 7, 22, 9, 0, 0, DateTimeKind.Utc);
+        var withCaptures = NewInput(startedAt: baseTime, endedAt: baseTime.AddMinutes(10));
+        withCaptures.ScreenshotPngBase64 = Convert.ToBase64String(ScreenBytes);
+        withCaptures.ScreenshotThumbJpgBase64 = Convert.ToBase64String(ThumbBytes);
+        withCaptures.WebcamJpgBase64 = Convert.ToBase64String(WebcamBytes);
+        var withoutCaptures = NewInput(startedAt: baseTime.AddMinutes(10), endedAt: baseTime.AddMinutes(20));
+        withoutCaptures.ProjectId = withCaptures.ProjectId;
+
+        var created = await SubmitAsync(withCaptures, p => p.AllowWebcam = true);
+        await SubmitAsync(withoutCaptures);
+
+        var page = await _activityAppService.GetListAsync(new GetActivitiesInput { ProjectId = withCaptures.ProjectId });
+
+        page.Items.Count.ShouldBe(2);
+        page.Items[0].ClientActivityId.ShouldBe(withoutCaptures.ClientActivityId); // newest first
+        page.Items[0].Captures.ShouldBeEmpty();
+
+        var captures = page.Items[1].Captures;
+        captures.Select(c => c.Kind).ShouldBe(new[] { Screenshot.ScreenKind, Screenshot.ThumbKind, Screenshot.WebcamKind });
+        captures.Select(c => c.Id).ShouldBe(created.Captures.Select(c => c.Id));
+
+        var fullSize = await _activityAppService.GetScreenshotsAsync(created.Id);
+        fullSize.Select(s => s.Id).ShouldBe(
+            captures.Where(c => c.Kind != Screenshot.ThumbKind).Select(c => c.Id), ignoreOrder: true);
+    }
 }

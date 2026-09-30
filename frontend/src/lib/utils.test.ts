@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { cn, formatDuration, formatCompact, colorFromString, initials, scoreTone, timeAgo } from "./utils";
+import { cn, formatDuration, formatSeconds, formatCompact, colorFromString, initials, scoreTone, timeAgo } from "./utils";
 
 describe("cn (class merge)", () => {
   it("joins truthy classes and drops falsy ones", () => {
@@ -20,6 +20,23 @@ describe("formatDuration", () => {
     [600, "10h"],
   ])("formats %i minutes as %s", (mins, expected) => {
     expect(formatDuration(mins)).toBe(expected);
+  });
+});
+
+describe("formatSeconds", () => {
+  it.each([
+    [0, "0s"],
+    [45, "45s"],
+    [60, "1m"],
+    [134, "2m 14s"],
+    [298, "4m 58s"],
+    [298.6, "4m 59s"],
+    [3600, "1h"],
+    [3725, "1h 2m"],
+    [-5, "0s"],
+    [Number.NaN, "0s"],
+  ])("formats %d seconds as %s", (secs, expected) => {
+    expect(formatSeconds(secs)).toBe(expected);
   });
 });
 

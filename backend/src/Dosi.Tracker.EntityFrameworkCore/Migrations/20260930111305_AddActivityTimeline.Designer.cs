@@ -3,6 +3,7 @@ using System;
 using Dosi.Tracker.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 using Volo.Abp.EntityFrameworkCore;
@@ -12,9 +13,11 @@ using Volo.Abp.EntityFrameworkCore;
 namespace Dosi.Tracker.Migrations
 {
     [DbContext(typeof(TrackerDbContext))]
-    partial class TrackerDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260930111305_AddActivityTimeline")]
+    partial class AddActivityTimeline
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder

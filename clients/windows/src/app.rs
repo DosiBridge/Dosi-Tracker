@@ -4,12 +4,25 @@
 //! the UI stays responsive while the worker does network/capture work.
 //! Visual language mirrors the web dashboard — see `theme.rs`.
 
+use std::sync::Arc;
+use std::time::Duration;
+
+use chrono::{DateTime, Local, Utc};
 use eframe::egui;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::autostart;
-use crate::state::{Command, SharedState, StateHandle, TrackerStatus};
+use crate::state::{Command, PendingAction, SharedState, StateHandle, TrackerStatus};
 use crate::theme;
+use crate::tracking::input::InputCounter;
+use crate::worker::{local_day_and_week_start, tracked_secs_since};
+
+/// The timed pauses offered next to the pause button (and in the tray).
+pub const PAUSE_CHOICES: [(&str, Duration); 3] = [
+    ("15 min", Duration::from_secs(15 * 60)),
+    ("30 min", Duration::from_secs(30 * 60)),
+    ("1 hour", Duration::from_secs(60 * 60)),
+];
 
 #[derive(PartialEq, Eq)]
 enum View {
@@ -20,6 +33,8 @@ enum View {
 pub struct TrackerApp {
     state: StateHandle,
     commands: UnboundedSender<Command>,
+    /// Live input of the block in progress (read-only), for the session card.
+    input: Arc<InputCounter>,
     view: View,
     themed: bool,
 
@@ -41,11 +56,13 @@ impl TrackerApp {
     pub fn new(
         state: StateHandle,
         commands: UnboundedSender<Command>,
+        input: Arc<InputCounter>,
         quit_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
             state,
             commands,
+            input,
             view: View::Main,
             themed: false,
             workspace: String::new(),
@@ -61,6 +78,24 @@ impl TrackerApp {
     fn send(&self, command: Command) {
         let _ = self.commands.send(command);
     }
+
+    /// Pause or resume, showing it in the window at once (see
+    /// [`PendingAction`]); the worker confirms when it has applied it.
+    fn request(&self, action: PendingAction, command: Command) {
+        request_action(&self.state, &self.commands, action, command);
+    }
+}
+
+/// Mark `action` as pending and send `command` — shared by the window and the
+/// tray so both give the same instant feedback.
+pub fn request_action(
+    state: &StateHandle,
+    commands: &UnboundedSender<Command>,
+    action: PendingAction,
+    command: Command,
+) {
+    state.update(|s| s.pending_action = Some(action));
+    let _ = commands.send(command);
 }
 
 fn format_minutes(total: u64) -> String {
@@ -73,8 +108,42 @@ fn format_minutes(total: u64) -> String {
     }
 }
 
-/// Colour + label for the current tracker status.
-fn status_visual(status: TrackerStatus) -> (egui::Color32, &'static str) {
+/// A stopwatch reading: `1:05:09`, or `05:09` under an hour.
+fn format_clock(elapsed: chrono::Duration) -> String {
+    let total = elapsed.num_seconds().max(0);
+    let (hours, minutes, seconds) = (total / 3600, total % 3600 / 60, total % 60);
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes:02}:{seconds:02}")
+    }
+}
+
+/// Today / this week including the block in progress, in seconds. The worker
+/// publishes the saved totals; the running block is added here every frame.
+fn live_totals(snapshot: &SharedState, now: DateTime<Utc>) -> (f64, f64) {
+    let (mut today, mut week) = (snapshot.tracked_today_secs, snapshot.tracked_week_secs);
+    if let Some(block) = snapshot.block_started_at {
+        let (today_start, week_start) = local_day_and_week_start(now, &Local);
+        today += tracked_secs_since(block, now, today_start);
+        week += tracked_secs_since(block, now, week_start);
+    }
+    (today, week)
+}
+
+/// Pausing applies while signed in and not already paused — including while
+/// offline, so a flaky connection never stops someone from taking a break.
+pub fn can_pause(status: TrackerStatus) -> bool {
+    matches!(status, TrackerStatus::Tracking | TrackerStatus::Offline)
+}
+
+/// Colour + label for the status pill; a pause/resume in flight shows first.
+fn status_visual(status: TrackerStatus, pending: Option<PendingAction>) -> (egui::Color32, &'static str) {
+    match pending {
+        Some(PendingAction::Pausing) => return (theme::WARNING, "Pausing…"),
+        Some(PendingAction::Resuming) => return (theme::SUCCESS, "Resuming…"),
+        None => {}
+    }
     match status {
         TrackerStatus::Tracking => (theme::SUCCESS, status.label()),
         TrackerStatus::Paused => (theme::WARNING, status.label()),
@@ -141,7 +210,11 @@ impl eframe::App for TrackerApp {
         } else if self.view == View::Settings {
             self.settings_view(ui);
         } else {
-            self.main_view(ui, &snapshot);
+            // Warning banners can push the content past the fixed window
+            // height; scroll rather than clip the controls.
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| self.main_view(ui, &snapshot));
         }
 
         ctx.request_repaint_after(std::time::Duration::from_secs(1));
@@ -162,7 +235,7 @@ impl TrackerApp {
 
             if snapshot.status != TrackerStatus::SignedOut {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let (color, label) = status_visual(snapshot.status);
+                    let (color, label) = status_visual(snapshot.status, snapshot.pending_action);
                     theme::status_pill(ui, color, label);
                 });
             }
@@ -264,13 +337,18 @@ impl TrackerApp {
     }
 
     fn main_view(&mut self, ui: &mut egui::Ui, snapshot: &SharedState) {
-        // Stat cards
+        let now = Utc::now();
+        self.session_card(ui, snapshot, now);
+        ui.add_space(12.0);
+
+        // Stat cards — live: the block in progress is added every second.
+        let (today_secs, week_secs) = live_totals(snapshot, now);
         let gap = 8.0;
         let card_w = (ui.available_width() - gap * 2.0) / 3.0;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = gap;
-            stat_card(ui, card_w, "Today", &format_minutes(snapshot.tracked_today_minutes), theme::INK);
-            stat_card(ui, card_w, "This week", &format_minutes(snapshot.tracked_week_minutes), theme::INK);
+            stat_card(ui, card_w, "Today", &format_minutes((today_secs / 60.0) as u64), theme::INK);
+            stat_card(ui, card_w, "This week", &format_minutes((week_secs / 60.0) as u64), theme::INK);
             stat_card(
                 ui,
                 card_w,
@@ -280,7 +358,7 @@ impl TrackerApp {
             );
         });
 
-        ui.add_space(14.0);
+        ui.add_space(12.0);
 
         theme::card(14).show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -364,19 +442,9 @@ impl TrackerApp {
             );
         }
 
-        ui.add_space(14.0);
-
-        // Primary action: pause / resume. Plain text only — egui's bundled font
-        // has no play/pause glyphs and would render tofu boxes.
+        ui.add_space(12.0);
+        self.pause_controls(ui, snapshot);
         let paused = snapshot.status == TrackerStatus::Paused;
-        let (label, fill) = if paused {
-            ("Resume tracking", theme::SUCCESS)
-        } else {
-            ("Pause tracking", theme::WARNING)
-        };
-        if theme::filled_button(ui, label, fill, true).clicked() {
-            self.send(if paused { Command::Resume } else { Command::Pause });
-        }
 
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -413,6 +481,153 @@ impl TrackerApp {
                 );
             });
         }
+    }
+
+    /// The live card at the top: a stopwatch for the current tracking stretch
+    /// and what the block in progress holds so far, or — while paused — how
+    /// long the pause has lasted and when it ends.
+    fn session_card(&self, ui: &mut egui::Ui, snapshot: &SharedState, now: DateTime<Utc>) {
+        theme::card(14).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.vertical(|ui| match snapshot.status {
+                TrackerStatus::Paused => {
+                    let since = snapshot.paused_since.unwrap_or(now);
+                    card_heading(ui, "Paused", theme::WARNING, &format!("since {}", local_hm(since)));
+                    ui.add_space(2.0);
+                    timer_text(ui, &format_clock(now - since), theme::WARNING);
+                    ui.add_space(4.0);
+                    meta(
+                        ui,
+                        &match snapshot.resume_at {
+                            Some(at) => format!(
+                                "Resumes automatically at {} · in {}",
+                                local_hm(at),
+                                format_clock(at - now)
+                            ),
+                            None => "Nothing is recorded until you resume.".to_string(),
+                        },
+                    );
+                }
+                TrackerStatus::Tracking => {
+                    let started = snapshot.tracking_since.unwrap_or(now);
+                    let next = snapshot
+                        .next_capture_at
+                        .map(|at| format!("next snapshot in {}", format_clock(at - now)))
+                        .unwrap_or_default();
+                    card_heading(ui, "Current session", theme::MUTED_FG, &next);
+                    ui.add_space(2.0);
+                    timer_text(ui, &format_clock(now - started), theme::INK);
+                    ui.add_space(4.0);
+                    let block = snapshot.block_started_at.unwrap_or(now);
+                    meta(ui, &self.block_summary(snapshot, block, now));
+                }
+                other => {
+                    card_heading(ui, "Current session", theme::MUTED_FG, "");
+                    ui.add_space(2.0);
+                    timer_text(ui, "--:--", theme::MUTED_FG);
+                    ui.add_space(4.0);
+                    meta(
+                        ui,
+                        match other {
+                            TrackerStatus::Connecting => "Connecting to your workspace…",
+                            TrackerStatus::Stopped => "Tracking has stopped.",
+                            _ => "Not tracking — waiting for the server or a project.",
+                        },
+                    );
+                }
+            });
+        });
+    }
+
+    /// "72% active · 120 keys · 45 clicks since 16:40" for the block in
+    /// progress, counting only the input kinds the project records.
+    fn block_summary(&self, snapshot: &SharedState, block: DateTime<Utc>, now: DateTime<Utc>) -> String {
+        let (keys, clicks) = self.input.counts_between(block, now);
+        let mut parts = Vec::new();
+        if snapshot.counts_keyboard || snapshot.counts_mouse {
+            let percent = self
+                .input
+                .activity_percent(block, now, snapshot.counts_keyboard, snapshot.counts_mouse);
+            parts.push(format!("{percent}% active"));
+        }
+        if snapshot.counts_keyboard {
+            parts.push(format!("{keys} keys"));
+        }
+        if snapshot.counts_mouse {
+            parts.push(format!("{clicks} clicks"));
+        }
+        parts.push(format!("since {}", local_hm(block)));
+        parts.join(" · ")
+    }
+
+    /// Pause / resume, plus timed pauses. A request in flight disables the
+    /// buttons and is shown at once, so a click never looks ignored.
+    fn pause_controls(&mut self, ui: &mut egui::Ui, snapshot: &SharedState) {
+        let pending = snapshot.pending_action;
+        let paused = snapshot.status == TrackerStatus::Paused;
+        let idle = pending.is_none();
+
+        // Primary action. Plain text only — egui's bundled font has no
+        // play/pause glyphs and would render tofu boxes.
+        if paused {
+            let label = if pending == Some(PendingAction::Resuming) { "Resuming…" } else { "Resume tracking" };
+            if theme::filled_button(ui, label, theme::SUCCESS, idle).clicked() {
+                self.request(PendingAction::Resuming, Command::Resume);
+            }
+        } else {
+            let can_pause = idle && can_pause(snapshot.status);
+            let label = if pending == Some(PendingAction::Pausing) { "Pausing…" } else { "Pause tracking" };
+            if theme::filled_button(ui, label, theme::WARNING, can_pause).clicked() {
+                self.request(PendingAction::Pausing, Command::Pause { resume_after: None });
+            }
+        }
+
+        if !paused && !can_pause(snapshot.status) {
+            return;
+        }
+
+        // Timed pauses. While paused the same choices re-arm the auto-resume
+        // from now, and "Never" turns it off.
+        ui.add_space(8.0);
+        meta(ui, if paused { "Resume automatically in" } else { "Or take a break for" });
+        ui.add_space(4.0);
+        let show_never = paused && snapshot.resume_at.is_some();
+        let count = PAUSE_CHOICES.len() + usize::from(show_never);
+        let gap = 6.0;
+        let width = (ui.available_width() - gap * (count as f32 - 1.0)) / count as f32;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            for (label, duration) in PAUSE_CHOICES {
+                let hint = if paused {
+                    format!("Stay paused, then resume automatically in {label}")
+                } else {
+                    format!("Pause now and resume automatically in {label}")
+                };
+                if ui
+                    .add_enabled_ui(idle, |ui| theme::ghost_button(ui, label, width))
+                    .inner
+                    .on_hover_text(hint)
+                    .clicked()
+                {
+                    let command = Command::Pause { resume_after: Some(duration) };
+                    if paused {
+                        // Already paused: only the deadline changes.
+                        self.send(command);
+                    } else {
+                        self.request(PendingAction::Pausing, command);
+                    }
+                }
+            }
+            if show_never
+                && ui
+                    .add_enabled_ui(idle, |ui| theme::ghost_button(ui, "Never", width))
+                    .inner
+                    .on_hover_text("Stay paused until you resume")
+                    .clicked()
+            {
+                self.send(Command::Pause { resume_after: None });
+            }
+        });
     }
 
     fn settings_view(&mut self, ui: &mut egui::Ui) {
@@ -532,4 +747,63 @@ fn banner(ui: &mut egui::Ui, color: egui::Color32, message: &str) {
 /// Small muted metadata text.
 fn meta(ui: &mut egui::Ui, text: &str) {
     ui.label(egui::RichText::new(text).size(11.0).color(theme::MUTED_FG));
+}
+
+/// A card's small-caps heading, with an optional muted note on the right.
+fn card_heading(ui: &mut egui::Ui, title: &str, color: egui::Color32, note: &str) {
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(title.to_uppercase())
+                .size(9.5)
+                .color(color)
+                .strong(),
+        );
+        if !note.is_empty() {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| meta(ui, note));
+        }
+    });
+}
+
+/// The session card's big stopwatch digits (monospace, so they do not jitter
+/// as they tick).
+fn timer_text(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
+    ui.label(egui::RichText::new(text).size(30.0).color(color).strong().monospace());
+}
+
+/// Wall-clock `HH:MM` in the user's time zone.
+fn local_hm(at: DateTime<Utc>) -> String {
+    at.with_timezone(&Local).format("%H:%M").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clock_reads_like_a_stopwatch() {
+        assert_eq!(format_clock(chrono::Duration::seconds(0)), "00:00");
+        assert_eq!(format_clock(chrono::Duration::seconds(309)), "05:09");
+        assert_eq!(format_clock(chrono::Duration::seconds(3_909)), "1:05:09");
+        // A deadline already passed never shows a negative time.
+        assert_eq!(format_clock(chrono::Duration::seconds(-4)), "00:00");
+    }
+
+    #[test]
+    fn live_totals_add_the_running_block() {
+        let now = Utc::now();
+        let mut snapshot = SharedState {
+            tracked_today_secs: 600.0,
+            tracked_week_secs: 3_600.0,
+            ..SharedState::default()
+        };
+        assert_eq!(live_totals(&snapshot, now), (600.0, 3_600.0));
+
+        // A block that began 90 s ago (and today, locally) is added to both.
+        snapshot.block_started_at = Some(now - chrono::Duration::seconds(90));
+        let (today_start, _) = local_day_and_week_start(now, &Local);
+        let expected_today = 600.0 + tracked_secs_since(now - chrono::Duration::seconds(90), now, today_start);
+        let (today, week) = live_totals(&snapshot, now);
+        assert_eq!(today, expected_today);
+        assert!(week > 3_600.0 && week <= 3_690.0);
+    }
 }

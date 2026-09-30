@@ -31,19 +31,51 @@ pub struct Activity {
     pub productivity: u8,
     pub mouse_clicks: u64,
     pub keyboard_hits: u64,
+    /// Foreground usage over the whole block, one entry per (app, window
+    /// title), most-used first.
     pub active_windows: Vec<WindowInfo>,
     pub running_programs: Vec<WindowInfo>,
+    /// Per-minute breakdown of the block. Defaulted so rows queued by older
+    /// builds still load.
+    #[serde(default)]
+    pub timeline: Vec<ActivityMinute>,
     /// Base64-encoded PNG, if screenshots are allowed.
     pub screenshot_png_base64: Option<String>,
+    /// Base64-encoded small JPEG of the same screenshot, for list thumbnails.
+    #[serde(default)]
+    pub screenshot_thumb_jpg_base64: Option<String>,
     /// Base64-encoded JPEG, if webcam is allowed.
     pub webcam_jpg_base64: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A window (app + title). For foreground usage it also carries how long it
+/// was in front during the block and the input made while it was; running
+/// programs leave those out.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WindowInfo {
     pub app_name: String,
     pub window_title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyboard_hits: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mouse_clicks: Option<u64>,
+}
+
+/// One minute of a block: input counts, whether there was any activity, and
+/// the app mostly in front. Buckets match the activity % minutes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityMinute {
+    /// 0-based minute of the block.
+    pub minute: u32,
+    pub keyboard_hits: u64,
+    pub mouse_clicks: u64,
+    pub active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_name: Option<String>,
 }
 
 #[cfg(test)]
@@ -64,11 +96,33 @@ mod tests {
             keyboard_hits: 0,
             active_windows: Vec::new(),
             running_programs: Vec::new(),
+            timeline: Vec::new(),
             screenshot_png_base64: None,
+            screenshot_thumb_jpg_base64: None,
             webcam_jpg_base64: None,
         };
         let json = serde_json::to_value(&activity).unwrap();
         assert_eq!(json["productivity"], 73);
+    }
+
+    #[test]
+    fn window_usage_is_sent_in_camel_case_and_bare_windows_stay_bare() {
+        let used = WindowInfo {
+            app_name: "code.exe".into(),
+            window_title: "main.rs".into(),
+            seconds: Some(240),
+            keyboard_hits: Some(310),
+            mouse_clicks: Some(12),
+        };
+        let json = serde_json::to_value(&used).unwrap();
+        assert_eq!(json["seconds"], 240);
+        assert_eq!(json["keyboardHits"], 310);
+        assert_eq!(json["mouseClicks"], 12);
+
+        let bare = WindowInfo { app_name: "slack.exe".into(), ..Default::default() };
+        let json = serde_json::to_value(&bare).unwrap();
+        assert!(json.get("seconds").is_none());
+        assert!(json.get("keyboardHits").is_none());
     }
 
     #[test]
@@ -80,5 +134,7 @@ mod tests {
             "screenshotPngBase64":null,"webcamJpgBase64":null}"#;
         let activity: Activity = serde_json::from_str(legacy).unwrap();
         assert_eq!(activity.productivity, 0);
+        assert!(activity.timeline.is_empty());
+        assert!(activity.screenshot_thumb_jpg_base64.is_none());
     }
 }

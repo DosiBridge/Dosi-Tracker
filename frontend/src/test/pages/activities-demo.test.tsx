@@ -6,7 +6,7 @@
 vi.mock("next/navigation", () => import("@/test/next-navigation-stub"));
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { screen } from "@testing-library/react";
+import { screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import ActivitiesPage from "@/app/(dashboard)/activities/page";
 import { activities as seededActivities, projectById, userById } from "@/lib/tenant-data";
@@ -73,6 +73,22 @@ describe("activities page — demo-mode fallback", () => {
 
     await user.click(screen.getByRole("button", { name: /show \d+ more/i }));
     expect(countShown()).toBeGreaterThan(firstPage);
+  }, RENDER_BUDGET_MS);
+
+  it("opens the demo drawer with a mock preview and the apps table — no timeline, no network", async () => {
+    const user = userEvent.setup();
+    renderAsRole(<ActivitiesPage />, "owner", { route: "/activities" });
+
+    await user.click(screen.getAllByRole("button", { name: /^Open session:/ })[0]);
+    const dialog = screen.getByRole("dialog", { name: "Activity detail" });
+
+    expect(within(dialog).getByText("Mock preview")).toBeInTheDocument();
+    const apps = within(dialog).getByRole("table", { name: /per app and window/ });
+    expect(within(apps).getAllByRole("row").length).toBeGreaterThan(1);
+    // Demo rows carry no per-minute timeline, so the section is simply absent.
+    expect(within(dialog).queryByRole("heading", { name: "Activity timeline" })).not.toBeInTheDocument();
+    expect(within(dialog).getByRole("heading", { name: "Running programs" })).toBeInTheDocument();
+    expect(fetch).not.toHaveBeenCalled();
   }, RENDER_BUDGET_MS);
 
   it("scopes the demo fallback to a worker's own rows", () => {

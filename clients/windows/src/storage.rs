@@ -51,10 +51,12 @@ pub struct LimitReport {
     pub dropped: usize,
 }
 
-/// SQL expression that nulls out both image payloads of a row, leaving the
-/// time data intact. Corrupt JSON is left as-is rather than failing the update.
+/// SQL expression that nulls out every image payload of a row (screenshot,
+/// its thumbnail, webcam), leaving the time data intact. Corrupt JSON is left
+/// as-is rather than failing the update.
 const STRIP_CAPTURES: &str = "CASE WHEN json_valid(payload) \
-     THEN json_set(payload, '$.screenshotPngBase64', NULL, '$.webcamJpgBase64', NULL) \
+     THEN json_set(payload, '$.screenshotPngBase64', NULL, \
+     '$.screenshotThumbJpgBase64', NULL, '$.webcamJpgBase64', NULL) \
      ELSE payload END";
 
 /// Offline-first local store. Activities are persisted here first, then synced
@@ -296,7 +298,9 @@ mod tests {
             keyboard_hits: 2,
             active_windows: Vec::new(),
             running_programs: Vec::new(),
+            timeline: Vec::new(),
             screenshot_png_base64: None,
+            screenshot_thumb_jpg_base64: None,
             webcam_jpg_base64: None,
         }
     }
@@ -304,6 +308,7 @@ mod tests {
     fn with_captures(project: &str) -> Activity {
         Activity {
             screenshot_png_base64: Some("c2NyZWVu".into()),
+            screenshot_thumb_jpg_base64: Some("dGh1bWI=".into()),
             webcam_jpg_base64: Some("d2ViY2Ft".into()),
             ..sample(project)
         }
@@ -436,6 +441,7 @@ mod tests {
         // The images are dropped; the time data stays for diagnostics.
         let parked = raw_payload(&s, id);
         assert!(parked.screenshot_png_base64.is_none());
+        assert!(parked.screenshot_thumb_jpg_base64.is_none());
         assert!(parked.webcam_jpg_base64.is_none());
         assert_eq!(parked.project_id, "p1");
     }
@@ -553,6 +559,7 @@ mod tests {
         for (i, &id) in ids.iter().enumerate() {
             let row = raw_payload(&s, id);
             assert_eq!(row.screenshot_png_base64.is_some(), i == 2, "row {i}");
+            assert_eq!(row.screenshot_thumb_jpg_base64.is_some(), i == 2, "row {i}");
             assert_eq!(row.webcam_jpg_base64.is_some(), i == 2, "row {i}");
             assert_eq!(row.project_id, format!("p{i}"));
             assert_eq!(row.productivity, 40);

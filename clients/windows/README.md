@@ -8,13 +8,20 @@ presence and a small desktop window.
 - **Sign-in window** — email/password against your workspace. The sign-in is
   persisted **encrypted with Windows DPAPI** (keyed to your Windows user), so the
   password is never stored in clear text or in environment variables.
-- **Status view** — tracked today / this week / activity %, the current project
-  (switchable), snapshot interval and pending-upload count.
+- **Status view** — a live session stopwatch with the countdown to the next
+  snapshot and the block in progress so far (activity %, key presses, clicks);
+  tracked today / this week (ticking live) / today's activity %, the current
+  project (switchable), snapshot interval and pending-upload count.
 - **Pause / Resume / Sync now** from the window or the tray menu. Pausing ends
-  the current block (the partial block is discarded) and nothing is captured
-  while paused — the window's button becomes **Upload queued**, which only
-  uploads what was already recorded. Input made while paused or signed out never
-  counts towards the next block.
+  the current block and **saves it** (queued and uploaded), so no worked time is
+  lost; nothing is captured while paused — the window's button becomes
+  **Upload queued**, which only uploads what was already recorded. Input made
+  while paused or signed out never counts towards the next block.
+- **Timed pauses** — "take a break for" 15 min / 30 min / 1 hour (also in the
+  tray: 30 min / 1 hour) resume tracking automatically; while paused the same
+  buttons re-arm the auto-resume and **Never** turns it off. The window shows
+  how long the pause has lasted and when it ends. Pause/resume show at once
+  ("Pausing…") even while an upload is still running.
 - **Settings** — "Start when I sign in to Windows" toggle and sign-out. Capture
   permissions are set per project by the workspace admin, not here.
 - **Closing the window hides to the tray**; tracking continues until you choose
@@ -43,14 +50,20 @@ snapshot (`state::SharedState`).
 
 Once per interval (5–60 min) it captures a snapshot for the active project:
 
-- Screenshot (primary monitor)
+- Screenshot (primary monitor), plus a small JPEG thumbnail (480 px wide) for
+  the dashboard's lists
 - Webcam frame (optional)
-- Active window (app + title)
+- **App & window usage** — the foreground window is sampled every 3 s, so each
+  block reports every (app, window title) that was in front with its seconds
+  and the key presses / clicks made while it was, most-used first (≤ 50)
+- **Per-minute timeline** — for each minute: key presses, clicks, active or
+  idle, and the app in front the longest
 - Running programs
 - Keyboard / mouse **counts** (never keystroke content)
 - **Activity %** (sent as `productivity`, 0–100): the share of the block's
   whole minutes, counted from the block start, that had any keyboard or mouse
   input (clicks, movement, wheel). Only input kinds the project allows count.
+  The timeline's active minutes use the same buckets, so they always agree.
 
 Snapshots are stored locally first (SQLite, offline-first) and then synced to
 the backend REST API. Unsynced snapshots survive restarts and network outages.
@@ -97,8 +110,9 @@ src/
 ├── storage.rs           # local SQLite queue (offline-first)
 └── tracking/
     ├── mod.rs           # Tracker: builds one Activity snapshot
-    ├── input.rs         # event-driven keyboard/mouse counters + activity %
-    ├── screenshot.rs    # primary-monitor PNG capture
+    ├── input.rs         # event-driven keyboard/mouse event log + activity %
+    ├── usage.rs         # foreground-window sampler, per-app usage + minute timeline
+    ├── screenshot.rs    # primary-monitor PNG capture + JPEG thumbnail
     ├── webcam.rs        # single webcam JPEG frame
     └── active_window.rs # foreground window + running programs (Win32)
 ```
@@ -167,6 +181,13 @@ cargo clippy --all-targets -- -D warnings   # lints (CI enforces this)
 - **Capture timing:** the tick uses `MissedTickBehavior::Delay` and each block is
   timed from the previous capture, clamped to one interval. A slow sync or a
   machine suspend can therefore never burst-fire and invent tracked time.
+- **Short blocks:** a block under one minute is never recorded on its own —
+  **Sync now** leaves it running (and only uploads the queue), while pausing,
+  switching project, signing out or quitting drops it. Longer blocks are always
+  saved at those moments, and after a manual sync the next automatic snapshot
+  is a full interval away.
+- **Quitting** queues the block in progress and waits up to 20 s for the upload;
+  anything not uploaded by then goes up on the next launch.
 - **Rejected uploads** are parked for 14 days (visible in the window), then purged
   so the local queue cannot grow without bound. Parked rows keep their time data
   and the server's reason, but not their screenshot/webcam images.

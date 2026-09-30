@@ -23,6 +23,7 @@ public class Activity : CreationAuditedAggregateRoot<Guid>, IMultiTenant
     public string? Description { get; set; } // Optional: agents typically send no description
     public string ActiveWindowsJson { get; set; } = "[]"; // JSON array of active windows
     public string RunningProgramsJson { get; set; } = "[]"; // JSON array of running apps
+    public string TimelineJson { get; set; } = "[]"; // JSON array of per-minute input/activity buckets
 
     // Navigation property: screen + webcam captures taken during this block
     public ICollection<Screenshot> Screenshots { get; set; } = new List<Screenshot>();

@@ -47,19 +47,46 @@ pub struct ProjectOption {
     pub title: String,
 }
 
+/// A pause/resume the user asked for that the worker has not applied yet. The
+/// window reflects it at once, so the buttons never feel unresponsive while
+/// the worker finishes an upload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingAction {
+    Pausing,
+    Resuming,
+}
+
 /// Snapshot the UI renders. Updated by the worker, read by the UI each frame.
+///
+/// The clocks are published as instants rather than elapsed values, so the
+/// window can animate timers every second without any help from the worker.
 #[derive(Debug, Clone)]
 pub struct SharedState {
     pub status: TrackerStatus,
+    pub pending_action: Option<PendingAction>,
     pub display_name: String,
     pub projects: Vec<ProjectOption>,
     pub selected_project: Option<String>,
-    /// Minutes tracked today / this week, as reported by the backend.
-    pub tracked_today_minutes: u64,
-    pub tracked_week_minutes: u64,
-    /// Activity level of the most recent interval (0-100).
+    /// Seconds tracked today / this week: the backend's totals, plus blocks
+    /// recorded since they were fetched. The block in progress is added live.
+    pub tracked_today_secs: f64,
+    pub tracked_week_secs: f64,
+    /// Today's average activity level (0-100), from the backend.
     pub last_productivity: u8,
     pub interval_minutes: u64,
+    /// Which input kinds the project counts (the live view hides the rest).
+    pub counts_keyboard: bool,
+    pub counts_mouse: bool,
+    /// While tracking: when this uninterrupted stretch began (sign-in,
+    /// resume, project switch), when the unsaved block began, and when the
+    /// next automatic snapshot is due.
+    pub tracking_since: Option<DateTime<Utc>>,
+    pub block_started_at: Option<DateTime<Utc>>,
+    pub next_capture_at: Option<DateTime<Utc>>,
+    /// While paused: since when, and when tracking resumes by itself (a
+    /// timed pause) — `None` means until the user resumes.
+    pub paused_since: Option<DateTime<Utc>>,
+    pub resume_at: Option<DateTime<Utc>>,
     pub last_sync: Option<DateTime<Utc>>,
     pub pending_uploads: u32,
     /// Uploads the server permanently rejected. Kept visible so silently dropped
@@ -75,13 +102,21 @@ impl Default for SharedState {
     fn default() -> Self {
         Self {
             status: TrackerStatus::SignedOut,
+            pending_action: None,
             display_name: String::new(),
             projects: Vec::new(),
             selected_project: None,
-            tracked_today_minutes: 0,
-            tracked_week_minutes: 0,
+            tracked_today_secs: 0.0,
+            tracked_week_secs: 0.0,
             last_productivity: 0,
             interval_minutes: 10,
+            counts_keyboard: true,
+            counts_mouse: true,
+            tracking_since: None,
+            block_started_at: None,
+            next_capture_at: None,
+            paused_since: None,
+            resume_at: None,
             last_sync: None,
             pending_uploads: 0,
             rejected_uploads: 0,
@@ -122,7 +157,10 @@ pub enum Command {
     SignIn { workspace: String, username: String, password: String },
     SignOut,
     SelectProject(String),
-    Pause,
+    /// Stop tracking. The work recorded so far is saved first. With a
+    /// duration, tracking resumes by itself when it runs out; sent while
+    /// already paused, it just changes when (or whether) that happens.
+    Pause { resume_after: Option<std::time::Duration> },
     Resume,
     /// Capture + sync immediately instead of waiting for the next interval.
     /// While paused it only uploads already-queued rows and never captures.

@@ -17,7 +17,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import MonitorPage from "@/app/(dashboard)/monitor/page";
-import { getApi } from "@/hooks/useApi";
+import { getApi, getAuthedBlobUrl } from "@/hooks/useApi";
 import { mapApiActivities, type ApiActivityDto } from "@/lib/live-dataset";
 import { installLiveDataset } from "@/lib/tenant-data";
 import type { User } from "@/lib/types";
@@ -63,10 +63,16 @@ function row(over: Partial<ApiActivityDto> = {}): ApiActivityDto {
   };
 }
 
-/** Route getApi by endpoint: the day's rows, and no screenshots. */
-function serveDay(rows: ApiActivityDto[] | Error) {
+/**
+ * Route getApi by endpoint: the day's rows, and no screenshots. Captures are
+ * served ONLY at the backend's real route — the activity id as a PATH segment
+ * (`screenshots/{activityId}`); the old `?activityId=` query 404s like prod.
+ */
+function serveDay(rows: ApiActivityDto[] | Error, captures: Record<string, unknown[]> = {}) {
   vi.mocked(getApi).mockImplementation(async (endpoint: string) => {
-    if (endpoint.startsWith("/api/app/activity/screenshots")) return [];
+    const byPath = /^\/api\/app\/activity\/screenshots\/([^/?]+)$/.exec(endpoint);
+    if (byPath) return captures[decodeURIComponent(byPath[1])] ?? [];
+    if (endpoint.startsWith("/api/app/activity/screenshots")) throw new Error("API GET Error: Not Found");
     if (endpoint.startsWith("/api/app/activity?")) {
       if (rows instanceof Error) throw rows;
       return rows;
@@ -120,6 +126,31 @@ describe("monitor — live session", () => {
     expect(dayCall).toContain(`From=${encodeURIComponent(`${today}T00:00:00.000Z`)}`);
     expect(dayCall).toContain(`UserId=${worker.id}`);
     expect(dayCall).toContain("MaxResultCount=1000");
+  }, RENDER_BUDGET_MS);
+
+  it("loads each block's real screenshots by path id (the query form 404'd) and never shows webcam frames", async () => {
+    goLive(worker, [worker]);
+    serveDay([row()], {
+      "act-1": [
+        { id: "shot-1", activityId: "act-1", kind: "screen", capturedAt: `${today}T09:04:00Z` },
+        { id: "cam-1", activityId: "act-1", kind: "webcam", capturedAt: `${today}T09:05:00Z` },
+      ],
+    });
+    vi.mocked(getAuthedBlobUrl).mockImplementation(async (endpoint: string) => `blob:${endpoint}`);
+    const originalRevoke = URL.revokeObjectURL; // jsdom has none; the page revokes on unmount
+    const revoke = vi.fn();
+    URL.revokeObjectURL = revoke;
+
+    const { unmount } = render(<MonitorPage />);
+
+    const shot = await screen.findByRole("img", { name: /^Screenshot at / });
+    expect(shot).toHaveAttribute("src", "blob:/api/app/activity/screenshot/shot-1/content");
+    const shotCalls = vi.mocked(getApi).mock.calls.map(([e]) => e).filter((e) => e.includes("/screenshots"));
+    expect(shotCalls).toEqual(["/api/app/activity/screenshots/act-1"]);
+    expect(vi.mocked(getAuthedBlobUrl).mock.calls.map(([e]) => e)).not.toContain("/api/app/activity/screenshot/cam-1/content");
+    unmount();
+    expect(revoke).toHaveBeenCalledWith("blob:/api/app/activity/screenshot/shot-1/content");
+    URL.revokeObjectURL = originalRevoke;
   }, RENDER_BUDGET_MS);
 
   it("tells a member with no activity at all to install the desktop agent", async () => {
