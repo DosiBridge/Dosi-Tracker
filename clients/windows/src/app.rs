@@ -339,7 +339,7 @@ impl TrackerApp {
     fn main_view(&mut self, ui: &mut egui::Ui, snapshot: &SharedState) {
         let now = Utc::now();
         self.session_card(ui, snapshot, now);
-        ui.add_space(12.0);
+        ui.add_space(10.0);
 
         // Stat cards — live: the block in progress is added every second.
         let (today_secs, week_secs) = live_totals(snapshot, now);
@@ -358,10 +358,11 @@ impl TrackerApp {
             );
         });
 
-        ui.add_space(12.0);
+        ui.add_space(10.0);
 
-        theme::card(14).show(ui, |ui| {
+        theme::card(12).show(ui, |ui| {
             ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 4.0;
             ui.vertical(|ui| {
                 theme::field_label(ui, "Project");
 
@@ -390,25 +391,6 @@ impl TrackerApp {
                             }
                         }
                     });
-
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    meta(ui, &format!("Snapshot every {} min", snapshot.interval_minutes));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if snapshot.pending_uploads > 0 {
-                            meta(
-                                ui,
-                                &format!(
-                                    "{} pending upload{}",
-                                    snapshot.pending_uploads,
-                                    if snapshot.pending_uploads == 1 { "" } else { "s" }
-                                ),
-                            );
-                        } else if let Some(synced) = snapshot.last_sync {
-                            meta(ui, &format!("Synced {}", synced.with_timezone(&chrono::Local).format("%H:%M")));
-                        }
-                    });
-                });
             });
         });
 
@@ -442,7 +424,7 @@ impl TrackerApp {
             );
         }
 
-        ui.add_space(12.0);
+        ui.add_space(10.0);
         self.pause_controls(ui, snapshot);
         let paused = snapshot.status == TrackerStatus::Paused;
 
@@ -473,9 +455,22 @@ impl TrackerApp {
 
         if !snapshot.display_name.is_empty() {
             ui.add_space(10.0);
+            // Upload state rides along with the account line: it matters at a
+            // glance, but not enough for a row of its own.
+            let upload_state = if snapshot.pending_uploads > 0 {
+                format!(
+                    " · {} pending upload{}",
+                    snapshot.pending_uploads,
+                    if snapshot.pending_uploads == 1 { "" } else { "s" }
+                )
+            } else if let Some(synced) = snapshot.last_sync {
+                format!(" · synced {}", local_hm(synced))
+            } else {
+                String::new()
+            };
             ui.vertical_centered(|ui| {
                 ui.label(
-                    egui::RichText::new(format!("Signed in as {}", snapshot.display_name))
+                    egui::RichText::new(format!("Signed in as {}{upload_state}", snapshot.display_name))
                         .size(11.0)
                         .color(theme::MUTED_FG),
                 );
@@ -487,8 +482,9 @@ impl TrackerApp {
     /// and what the block in progress holds so far, or — while paused — how
     /// long the pause has lasted and when it ends.
     fn session_card(&self, ui: &mut egui::Ui, snapshot: &SharedState, now: DateTime<Utc>) {
-        theme::card(14).show(ui, |ui| {
+        theme::card(12).show(ui, |ui| {
             ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 3.0;
             ui.vertical(|ui| match snapshot.status {
                 TrackerStatus::Paused => {
                     let since = snapshot.paused_since.unwrap_or(now);
@@ -510,10 +506,14 @@ impl TrackerApp {
                 }
                 TrackerStatus::Tracking => {
                     let started = snapshot.tracking_since.unwrap_or(now);
-                    let next = snapshot
-                        .next_capture_at
-                        .map(|at| format!("next snapshot in {}", format_clock(at - now)))
-                        .unwrap_or_default();
+                    let next = match snapshot.next_capture_at {
+                        Some(at) => format!(
+                            "every {} min · next in {}",
+                            snapshot.interval_minutes,
+                            format_clock(at - now)
+                        ),
+                        None => format!("snapshot every {} min", snapshot.interval_minutes),
+                    };
                     card_heading(ui, "Current session", theme::MUTED_FG, &next);
                     ui.add_space(2.0);
                     timer_text(ui, &format_clock(now - started), theme::INK);
@@ -587,16 +587,29 @@ impl TrackerApp {
         }
 
         // Timed pauses. While paused the same choices re-arm the auto-resume
-        // from now, and "Never" turns it off.
+        // from now, and "Never" turns it off. The label sits inline when three
+        // buttons leave room for it, and above the row when "Never" makes four.
         ui.add_space(8.0);
-        meta(ui, if paused { "Resume automatically in" } else { "Or take a break for" });
-        ui.add_space(4.0);
         let show_never = paused && snapshot.resume_at.is_some();
         let count = PAUSE_CHOICES.len() + usize::from(show_never);
+        let caption = if paused { "Auto-resume" } else { "Pause for" };
+        let inline_label = count <= PAUSE_CHOICES.len();
+        if !inline_label {
+            meta(ui, caption);
+            ui.add_space(2.0);
+        }
         let gap = 6.0;
-        let width = (ui.available_width() - gap * (count as f32 - 1.0)) / count as f32;
+        let label_w = if inline_label { 74.0 } else { 0.0 };
+        let gaps = if inline_label { count } else { count - 1 };
+        let width = (ui.available_width() - label_w - gap * gaps as f32) / count as f32;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = gap;
+            if inline_label {
+                ui.add_sized(
+                    [label_w, 36.0],
+                    egui::Label::new(egui::RichText::new(caption).size(11.0).color(theme::MUTED_FG)),
+                );
+            }
             for (label, duration) in PAUSE_CHOICES {
                 let hint = if paused {
                     format!("Stay paused, then resume automatically in {label}")
@@ -767,7 +780,7 @@ fn card_heading(ui: &mut egui::Ui, title: &str, color: egui::Color32, note: &str
 /// The session card's big stopwatch digits (monospace, so they do not jitter
 /// as they tick).
 fn timer_text(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
-    ui.label(egui::RichText::new(text).size(30.0).color(color).strong().monospace());
+    ui.label(egui::RichText::new(text).size(28.0).color(color).strong().monospace());
 }
 
 /// Wall-clock `HH:MM` in the user's time zone.

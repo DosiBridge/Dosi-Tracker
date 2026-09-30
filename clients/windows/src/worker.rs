@@ -211,8 +211,12 @@ async fn run(
     );
     ticker.tick().await; // skip the immediate first tick
     clocks.start_tracking(&mut ticker);
-    apply_status(&state, &client, &session, &clocks);
-    repaint();
+    // Only a restored sign-in has anything to show; otherwise the window
+    // stays on its initial (signed-out, or debug preview) state.
+    if client.is_some() {
+        apply_status(&state, &client, &session, &clocks);
+        repaint();
+    }
 
     loop {
         // A timed pause resumes by itself; otherwise this branch stays disabled.
@@ -825,6 +829,136 @@ mod tests {
         assert_eq!(tracked_secs_since(utc("2026-09-30T17:58:00Z"), utc("2026-09-30T18:03:30Z"), midnight), 210.0);
         // Entirely before: nothing.
         assert_eq!(tracked_secs_since(utc("2026-09-30T17:00:00Z"), utc("2026-09-30T17:05:00Z"), midnight), 0.0);
+    }
+
+    /// End-to-end against a live backend: real input + window sampling and
+    /// screenshot → local queue → upload → today/week totals. Run with
+    /// `DOSI_E2E_URL`, `DOSI_E2E_WORKSPACE`, `DOSI_E2E_USER`,
+    /// `DOSI_E2E_PASSWORD`, `DOSI_E2E_PROJECT` set:
+    /// `cargo test e2e_ -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore = "needs a running backend and a desktop session"]
+    async fn e2e_capture_upload_and_totals() {
+        let env = |key: &str| std::env::var(key).unwrap_or_else(|_| panic!("{key} is not set"));
+        let cfg = AppConfig { api_base_url: env("DOSI_E2E_URL"), ..AppConfig::default() };
+        let mut client = ApiClient::new(
+            cfg.api_base_url.clone(),
+            env("DOSI_E2E_USER"),
+            env("DOSI_E2E_PASSWORD"),
+            env("DOSI_E2E_WORKSPACE"),
+        );
+        client.login().await.expect("sign-in");
+
+        let state = StateHandle::new();
+        let session = resolve_session(&mut client, &cfg, Some(&env("DOSI_E2E_PROJECT")), &state)
+            .await
+            .expect("project resolved");
+        let tracker = Tracker::new();
+        let store = Storage::open(":memory:", None).unwrap();
+        let owner = client.owner_key();
+
+        // Two minute buckets' worth of real sampling.
+        let started = Utc::now();
+        state.update(|s| s.block_started_at = Some(started));
+        tokio::time::sleep(Duration::from_secs(125)).await;
+
+        record_block(&tracker, &client, &store, &session, &state, started);
+        assert_eq!(store.pending_count(&owner).unwrap(), 1, "block queued locally");
+        let queued = store.pending_batch(&owner, 0, 1).unwrap().remove(0).1;
+        println!(
+            "queued: {} windows, {} timeline minutes, screenshot {}, thumb {}, keys {}, clicks {}, {}%",
+            queued.active_windows.len(),
+            queued.timeline.len(),
+            queued.screenshot_png_base64.is_some(),
+            queued.screenshot_thumb_jpg_base64.is_some(),
+            queued.keyboard_hits,
+            queued.mouse_clicks,
+            queued.productivity,
+        );
+        assert_eq!(queued.timeline.len(), 2);
+        assert!(queued.active_windows.iter().all(|w| w.seconds.is_some()));
+        assert!(queued.screenshot_thumb_jpg_base64.is_some());
+
+        sync_pending(&mut client, &store, &state).await;
+        assert_eq!(store.pending_count(&owner).unwrap(), 0, "uploaded");
+        assert_eq!(store.rejected_count(&owner).unwrap(), 0, "not rejected");
+
+        state.update(|s| s.tracked_today_secs = 0.0);
+        refresh_totals(&mut client, &state).await;
+        let totals = state.snapshot();
+        println!("server totals: today {:.0}s, week {:.0}s", totals.tracked_today_secs, totals.tracked_week_secs);
+        assert!(totals.tracked_today_secs >= 120.0, "today's total includes the block");
+    }
+
+    /// End-to-end drive of the worker loop through the commands the window and
+    /// tray send: sign-in, a timed pause that saves the block and resumes by
+    /// itself, an open-ended pause + resume, a too-short "Sync now", and quit.
+    /// Uses the per-user queue and saved sign-in, so run it only on a machine
+    /// whose tracker data may be replaced. Same env vars as
+    /// [`e2e_capture_upload_and_totals`].
+    #[test]
+    #[ignore = "needs a running backend; replaces the saved sign-in"]
+    fn e2e_pause_resume_flow() {
+        use std::time::Instant;
+        let env = |key: &str| std::env::var(key).unwrap_or_else(|_| panic!("{key} is not set"));
+        let cfg = AppConfig { api_base_url: env("DOSI_E2E_URL"), ..AppConfig::default() };
+        let state = StateHandle::new();
+        let (tx, worker) = spawn(state.clone(), cfg, Arc::new(Tracker::new()), || {});
+        let wait_for = |what: &str, secs: u64, done: &dyn Fn(&crate::state::SharedState) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(secs);
+            loop {
+                let s = state.snapshot();
+                if done(&s) {
+                    return s;
+                }
+                assert!(Instant::now() < deadline, "timed out waiting for {what}: {:?}", s.status);
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        };
+
+        tx.send(Command::SignIn {
+            workspace: env("DOSI_E2E_WORKSPACE"),
+            username: env("DOSI_E2E_USER"),
+            password: env("DOSI_E2E_PASSWORD"),
+        })
+        .unwrap();
+        let s = wait_for("tracking", 30, &|s| s.status == TrackerStatus::Tracking);
+        println!("signed in, tracking since {:?}, next capture {:?}", s.tracking_since, s.next_capture_at);
+
+        // Work for over a minute, then take a 5-second timed pause.
+        std::thread::sleep(Duration::from_secs(65));
+        let synced_before = state.snapshot().last_sync;
+        tx.send(Command::Pause { resume_after: Some(Duration::from_secs(5)) }).unwrap();
+        let s = wait_for("paused", 20, &|s| s.status == TrackerStatus::Paused);
+        assert!(s.resume_at.is_some() && s.tracking_since.is_none());
+        let s = wait_for("the paused block uploaded", 60, &|s| s.last_sync != synced_before && s.pending_uploads == 0);
+        println!("paused; block saved and uploaded; today {:.0}s", s.tracked_today_secs);
+        let s = wait_for("auto-resume", 20, &|s| s.status == TrackerStatus::Tracking);
+        assert!(s.resume_at.is_none() && s.paused_since.is_none());
+        println!("auto-resumed");
+
+        // Open-ended pause, then an explicit resume.
+        tx.send(Command::Pause { resume_after: None }).unwrap();
+        let s = wait_for("paused again", 20, &|s| s.status == TrackerStatus::Paused);
+        assert!(s.resume_at.is_none());
+        tx.send(Command::Resume).unwrap();
+        wait_for("resumed", 20, &|s| s.status == TrackerStatus::Tracking);
+        println!("paused and resumed");
+
+        // A block under a minute is not cut by "Sync now".
+        let block = state.snapshot().block_started_at;
+        tx.send(Command::SyncNow).unwrap();
+        std::thread::sleep(Duration::from_secs(3));
+        assert_eq!(state.snapshot().block_started_at, block, "short block kept running");
+        println!("short sync kept the block");
+
+        tx.send(Command::Shutdown).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !worker.is_finished() {
+            assert!(Instant::now() < deadline, "worker did not shut down");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        println!("shut down cleanly");
     }
 
     #[tokio::test]

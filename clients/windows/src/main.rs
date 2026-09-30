@@ -99,7 +99,7 @@ fn main() -> Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([380.0, 640.0])
+            .with_inner_size([380.0, 660.0])
             .with_min_inner_size([340.0, 600.0])
             .with_resizable(false)
             .with_title(WINDOW_TITLE),
