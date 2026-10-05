@@ -4,6 +4,12 @@
     "AppName": "Tracker",
     "Menu:Home": "Home",
     "LongWelcomeMessage": "Welcome to the application. This is a startup project based on the ABP framework. For more information visit",
-    "Welcome": "Welcome"
+    "Welcome": "Welcome",
+    "Tracker:ActivityTooOld": "Aktivita začala příliš dávno a již ji nelze zaznamenat.",
+    "Tracker:NotProjectMember": "Nejste členem tohoto projektu.",
+    "Tracker:SubscriptionInactive": "Předplatné pracovního prostoru není aktivní. Požádejte vlastníka pracovního prostoru o jeho obnovení.",
+    "Tracker:InvalidUser": "Uživatel v tomto pracovním prostoru neexistuje.",
+    "Tracker:CannotModifySelf": "Tuto změnu nemůžete provést u vlastního účtu nebo členství.",
+    "Tracker:RoleNotAllowed": "Pouze vlastník pracovního prostoru může přidělit tuto roli, měnit hodinové sazby nebo spravovat účet vlastníka."
   }
 }

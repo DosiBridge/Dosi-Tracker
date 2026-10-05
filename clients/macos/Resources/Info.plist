@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Info.plist of Dosi Tracker.app, copied into the bundle by scripts/build-app.sh
+  (which sets the version keys and, when given, the server addresses).
+
+  * com.dosibridge.tracker is the bundle identifier, the Keychain service, the
+    UserDefaults / MDM preference domain and the unified-log subsystem.
+  * LSUIElement: a menu-bar agent, no Dock icon.
+  * NSCameraUsageDescription: required before the camera may be used at all
+    (macOS ends a process that touches the camera without it).
+  * NSAppTransportSecurity / NSAllowsLocalNetworking: http:// is allowed only
+    to local servers (localhost, IP addresses, .local and unqualified names);
+    Config.validateServerURL refuses http:// to other hosts.
+  * Screen Recording, Input Monitoring and Accessibility take no usage string;
+    macOS asks for them by the app's name.
+  * DosiApiBaseURL / DosiDashboardURL may be added at build time
+    (DOSI_API_BASE_URL / DOSI_DASHBOARD_URL); `defaults write` and MDM
+    profiles override them.
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>Dosi Tracker</string>
+	<key>CFBundleExecutable</key>
+	<string>DosiTracker</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.dosibridge.tracker</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Dosi Tracker</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.2.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.productivity</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>LSMultipleInstancesProhibited</key>
+	<true/>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSCameraUsageDescription</key>
+	<string>Your workspace's project takes a webcam photo once per tracked time block. Dosi Tracker uses the camera only for that, and only when the project requires it.</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>Copyright © DosiBridge. Open source.</string>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<key>NSSupportsAutomaticTermination</key>
+	<false/>
+	<key>NSSupportsSuddenTermination</key>
+	<false/>
+</dict>
+</plist>

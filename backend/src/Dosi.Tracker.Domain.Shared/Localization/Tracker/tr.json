@@ -37,6 +37,12 @@
     "Unspecified": "Sistem",
     "SeeAllUsers": "Tüm Kullanıcıları Gör",
     "TakePhoto": "Fotoğraf Çek",
-    "ChoosePhoto": "Fotoğraf Seç"
+    "ChoosePhoto": "Fotoğraf Seç",
+    "Tracker:ActivityTooOld": "Etkinlik çok uzun zaman önce başladı ve artık kaydedilemez.",
+    "Tracker:NotProjectMember": "Bu projenin üyesi değilsiniz.",
+    "Tracker:SubscriptionInactive": "Çalışma alanı aboneliği etkin değil. Çalışma alanı sahibinden aboneliği yenilemesini isteyin.",
+    "Tracker:InvalidUser": "Kullanıcı bu çalışma alanında mevcut değil.",
+    "Tracker:CannotModifySelf": "Bu değişikliği kendi hesabınızda veya üyeliğinizde yapamazsınız.",
+    "Tracker:RoleNotAllowed": "Bu rolü yalnızca çalışma alanının sahibi atayabilir, saatlik ücretleri değiştirebilir veya bir sahibin hesabını yönetebilir."
   }
 }

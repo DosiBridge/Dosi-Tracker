@@ -10,6 +10,7 @@ using Shouldly;
 using Volo.Abp;
 using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Guids;
+using Volo.Abp.Identity;
 
 namespace Dosi.Tracker.Acceptance.Features;
 
@@ -25,10 +26,23 @@ public sealed class ProjectsAndTeamSteps
         _state = state;
     }
 
+    /// <summary>A person with an account in the workspace (members must be existing users of it).</summary>
+    private async Task<Guid> CreateUserAsync()
+    {
+        var userId = Guid.NewGuid();
+        var userName = "member-" + userId.ToString("N")[..8];
+        await _app.WithUow(async () =>
+        {
+            var userManager = _app.Resolve<IdentityUserManager>();
+            (await userManager.CreateAsync(new IdentityUser(userId, userName, userName + "@acme.test"))).Succeeded.ShouldBeTrue();
+        });
+        return userId;
+    }
+
     private async Task<Guid> AddWorkerAsync()
     {
         var team = _app.Resolve<ITeamAppService>();
-        var userId = Guid.NewGuid();
+        var userId = await CreateUserAsync();
         var member = await team.AddMemberAsync(new CreateProjectMemberDto
         {
             ProjectId = _state.ProjectId,
@@ -79,7 +93,7 @@ public sealed class ProjectsAndTeamSteps
     public async Task WhenIAddAToTheProject(string role)
     {
         var team = _app.Resolve<ITeamAppService>();
-        var userId = Guid.NewGuid();
+        var userId = await CreateUserAsync();
         var member = await team.AddMemberAsync(new CreateProjectMemberDto
         {
             ProjectId = _state.ProjectId,

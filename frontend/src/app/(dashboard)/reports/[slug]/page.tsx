@@ -8,8 +8,13 @@ import { ProjectsReport } from "@/components/reports/projects-report";
 import { AttendanceReport } from "@/components/reports/attendance-report";
 import { PayrollReport } from "@/components/reports/payroll-report";
 import { WeeklyReport } from "@/components/reports/weekly-report";
+import { WorkReport } from "@/components/reports/work-report";
+import { AnalyticsReport } from "@/components/reports/analytics-report";
+import { DevicesReport } from "@/components/reports/devices-report";
 
 const map: Record<string, ComponentType> = {
+  "work-report": WorkReport,
+  analytics: AnalyticsReport,
   "time-activity": TimeActivityReport,
   productivity: ProductivityReport,
   "apps-urls": AppsReport,
@@ -17,6 +22,7 @@ const map: Record<string, ComponentType> = {
   attendance: AttendanceReport,
   payroll: PayrollReport,
   weekly: WeeklyReport,
+  devices: DevicesReport,
 };
 
 export function generateStaticParams() {

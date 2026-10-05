@@ -1,9 +1,10 @@
 // The LIVE side of the tenant data layer: a real tenant's dataset is built only
 // from its real rows, registered under its own id, and never mixes with (or
 // overwrites) the demo workspaces.
-import { afterAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   activities,
+  activityCoverage,
   appCatalog,
   attendance,
   billing,
@@ -65,7 +66,8 @@ describe("buildLiveDataset", () => {
       avgProductivity: 50,
       screenshotsToday: 1,
     });
-    expect(ds.topApps).toEqual([{ app: "Code", minutes: 60, color: expect.any(String) }]);
+    // Canonical app identity (lib/apps): the agent's "Code" is Visual Studio Code everywhere.
+    expect(ds.topApps).toEqual([{ app: "Visual Studio Code", minutes: 60, color: expect.any(String) }]);
     expect(ds.weeklyTrend).toHaveLength(7);
     expect(ds.weeklyTrend[6]).toMatchObject({ tracked: 60, productive: 30 });
     expect(ds.projectDistribution).toEqual([{ name: "Apollo", value: 60, color: project.color }]);
@@ -74,6 +76,60 @@ describe("buildLiveDataset", () => {
     expect(ds.attendance).toEqual([]);
     expect(ds.billing).toEqual([]);
     expect(ds.notifications).toEqual([]);
+  });
+
+  it("'Most used apps — this week' covers the last 7 days, never the whole preloaded window", () => {
+    const { owner, project, rows } = sample();
+    const monthOld = buildActivity({
+      id: "r-old",
+      userId: "live-u1",
+      projectId: "live-p1",
+      startedAt: "2026-09-02T09:00:00.000Z",
+      endedAt: "2026-09-02T13:00:00.000Z",
+      activeWindows: [{ appName: "zoom.exe", windowTitle: "", seconds: 4 * 3600 }],
+    });
+    const ds = buildLiveDataset({ workspaceId: "live-x", users: [owner], projects: [project], activities: [...rows, monthOld], now: NOW });
+    expect(ds.appCatalog.map((a) => a.app)).toEqual(["Visual Studio Code"]);
+    expect(ds.topApps.map((a) => a.app)).toEqual(["Visual Studio Code"]);
+  });
+
+  it("prefers the server's exact totals over sums of rows that may be partial", () => {
+    const { owner, worker, project, rows } = sample();
+    const coverage = {
+      from: "2026-08-24T15:00:00.000Z",
+      to: NOW.toISOString(),
+      loaded: 1,
+      total: 7200,
+      truncated: true,
+      completeFrom: "2026-09-23T13:00:00.000Z",
+    };
+    const ds = buildLiveDataset({
+      workspaceId: "live-tenant-t1",
+      users: [owner, worker],
+      projects: [project],
+      activities: rows,
+      now: NOW,
+      coverage,
+      totals: {
+        projects: { week: new Map([["live-p1", 3360]]), month: new Map([["live-p1", 12000]]), window: new Map([["live-p1", 14400]]) },
+        today: { projects: new Map(), users: new Map(), totalMinutes: 480, activity: null },
+      },
+    });
+    expect(ds.projects[0]).toMatchObject({ loggedThisWeek: 3360, loggedThisMonth: 12000, loggedTotal: 14400 });
+    expect(ds.projectDistribution).toEqual([{ name: "Apollo", value: 3360, color: project.color }]);
+    expect(ds.summary.totalTrackedToday).toBe(480);
+    expect(ds.summary.avgProductivity).toBe(0); // nothing measured today: the server said null
+    expect(ds.activityCoverage).toEqual(coverage);
+  });
+
+  it("counts 'today' in the reporting zone when one is given", () => {
+    const { owner } = sample();
+    // 20:00-21:00 UTC on the 22nd is the 23rd in Dhaka, the 22nd in UTC.
+    const late = buildActivity({ id: "late", userId: "live-u1", projectId: "live-p1", startedAt: "2026-09-22T20:00:00.000Z", endedAt: "2026-09-22T21:00:00.000Z" });
+    expect(buildLiveDataset({ workspaceId: "live-z", users: [owner], projects: [], activities: [late], now: NOW }).summary.totalTrackedToday).toBe(0);
+    const zoned = buildLiveDataset({ workspaceId: "live-z", users: [owner], projects: [], activities: [late], now: NOW, timeZone: "Asia/Dhaka" });
+    expect(zoned.summary.totalTrackedToday).toBe(60);
+    expect(zoned.timeZone).toBe("Asia/Dhaka");
   });
 
   it("guards a project whose memberIds is missing", () => {
@@ -95,8 +151,8 @@ describe("installing a live dataset", () => {
     expect(projects.map((p) => p.title)).toEqual(["Apollo"]);
     expect(activities).toHaveLength(1);
     expect(summary.totalTrackedToday).toBe(60);
-    expect(topApps[0].app).toBe("Code");
-    expect(appCatalog[0].app).toBe("Code");
+    expect(topApps[0].app).toBe("Visual Studio Code");
+    expect(appCatalog[0].app).toBe("Visual Studio Code");
     expect(weeklyTrend).toHaveLength(7);
     expect([productivitySplit, attendance, billing, notifications].every((l) => l.length === 0)).toBe(true);
     expect(datasetFor("live-tenant-t1").users).toHaveLength(2);
@@ -121,6 +177,16 @@ describe("installing a live dataset", () => {
     expect(datasetFor("w-demo-created").users.map((u) => u.name)).toEqual(["You"]);
   });
 
+  it("activityCoverage() reports the live rows' coverage, and nothing for demo data", () => {
+    expect(activityCoverage()).toBeNull();
+    const { owner, rows } = sample();
+    const coverage = { from: "a", to: "b", loaded: 1, total: 1, truncated: false, completeFrom: "a" };
+    installLiveDataset({ workspaceId: "live-tenant-t1", users: [owner], projects: [], activities: rows, now: NOW, coverage });
+    expect(activityCoverage()).toEqual(coverage);
+    dropLiveDatasets();
+    expect(activityCoverage()).toBeNull();
+  });
+
   it("dropLiveDatasets forgets the tenant and returns to the primary demo workspace", () => {
     const { owner, project, rows } = sample();
     installLiveDataset({ workspaceId: "live-tenant-t1", users: [owner], projects: [project], activities: rows, now: NOW });
@@ -138,6 +204,20 @@ describe("installing a live dataset", () => {
 });
 
 describe("createTenantProject — storage robustness", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("still adds the project for this page view when the browser blocks site data", () => {
+    vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+      throw new DOMException("denied", "SecurityError");
+    });
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new DOMException("denied", "SecurityError");
+    });
+    const p = buildProject({ id: "t-blocked", title: "Kept in memory" });
+    expect(() => createTenantProject("w1", p)).not.toThrow();
+    expect(datasetFor("w1").projects.some((x) => x.id === "t-blocked")).toBe(true);
+  });
+
   it("replaces a corrupted persisted list instead of throwing", () => {
     localStorage.setItem("dosi-projects-created-w1", "{\"not\":\"a list\"}");
     const p = buildProject({ id: "t-new", title: "Recovered" });

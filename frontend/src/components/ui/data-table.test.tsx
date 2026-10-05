@@ -87,6 +87,30 @@ describe("DataTable", () => {
     expect(firstColumnTexts(container)).toEqual(["Zoe", "Mia", "Ana"]);
   });
 
+  it("sorts from the keyboard and announces the order on the header (aria-sort)", async () => {
+    const user = userEvent.setup();
+    const { container } = render(<DataTable columns={columns} rows={crew()} mobileLayout="scroll" />);
+    const member = screen.getByRole("columnheader", { name: "Member" });
+    expect(member).toHaveAttribute("aria-sort", "none");
+    // A column that can't sort says nothing about order, and offers no button.
+    const designation = screen.getByRole("columnheader", { name: "Designation" });
+    expect(designation).not.toHaveAttribute("aria-sort");
+    expect(within(designation).queryByRole("button")).toBeNull();
+
+    // Tab reaches the first sort button; Enter and Space sort, once per press.
+    await user.tab();
+    const button = within(member).getByRole("button", { name: "Member" });
+    expect(button).toHaveFocus();
+    await user.keyboard("{Enter}");
+    expect(member).toHaveAttribute("aria-sort", "descending");
+    expect(firstColumnTexts(container)).toEqual(["Zoe", "Mia", "Ana"]);
+    await user.keyboard(" ");
+    expect(member).toHaveAttribute("aria-sort", "ascending");
+    expect(firstColumnTexts(container)).toEqual(["Ana", "Mia", "Zoe"]);
+    // Only the sorted column carries a direction.
+    expect(screen.getByRole("columnheader", { name: "Tracked" })).toHaveAttribute("aria-sort", "none");
+  });
+
   it("clicking a column without sortValue leaves the order untouched", async () => {
     const user = userEvent.setup();
     const { container } = render(

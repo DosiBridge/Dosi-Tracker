@@ -10,9 +10,9 @@ Feature: Role-gated module access
   Scenario: Client's restricted workspace view
     Given a signed-in client
     When the workspace sidebar renders
-    Then only the Dashboard and Settings modules are offered
-    And no monitoring, reporting, team or billing module is visible
-    When the client navigates directly to /reports
+    Then only the Dashboard, Reports and Settings modules are offered
+    And no monitoring, project, team, billing or desktop-agent module is visible
+    When the client navigates directly to a report about members' pay
     Then the "Restricted area" notice replaces the report content
     And the reduced sidebar has no accessibility violations
 
@@ -26,7 +26,7 @@ Feature: Role-gated module access
   Scenario Outline: Sidebar and route guard agree
     Given a signed-in <role>
     When sidebar visibility is compared with direct navigation for every module
-    Then both enforcement points agree on every one of the nine modules
+    Then both enforcement points agree on every one of the ten modules
 
     Examples:
       | role   |

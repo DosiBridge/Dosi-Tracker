@@ -37,7 +37,7 @@ test("an owner sees the real billing page on /billing", async ({ page, context }
   await expect(page.getByRole("heading", { name: "Restricted area" })).toHaveCount(0);
 });
 
-test("a client only gets the permitted nav entries (Dashboard and Settings)", async ({
+test("a client only gets the permitted nav entries (Dashboard, Reports and Settings)", async ({
   page,
   context,
 }) => {
@@ -46,6 +46,8 @@ test("a client only gets the permitted nav entries (Dashboard and Settings)", as
 
   const nav = page.getByRole("navigation");
   await expect(nav.getByRole("link", { name: "Dashboard" })).toBeVisible();
+  // Reports: the Work Report of the projects shared with them (contract §6).
+  await expect(nav.getByRole("link", { name: "Reports" })).toBeVisible();
   await expect(nav.getByRole("link", { name: "Settings" })).toBeVisible();
   // Everything else is hidden for the read-only client role.
   await expect(nav.getByRole("link", { name: "Projects" })).toHaveCount(0);
@@ -53,14 +55,17 @@ test("a client only gets the permitted nav entries (Dashboard and Settings)", as
   await expect(nav.getByRole("link", { name: "Member Monitor" })).toHaveCount(0);
   await expect(nav.getByRole("link", { name: "Activity" })).toHaveCount(0);
   await expect(nav.getByRole("link", { name: "Timesheet" })).toHaveCount(0);
-  await expect(nav.getByRole("link", { name: "Reports" })).toHaveCount(0);
   await expect(nav.getByRole("link", { name: "Billing & Plan" })).toHaveCount(0);
 });
 
-test("a client navigating straight to /reports is blocked by the guard", async ({ page, context }) => {
+test("a client's reports are the Work Report only: any other report stops at the guard", async ({ page, context }) => {
   await primeSession(context, { userId: "u7", workspaceId: "w1" });
   await page.goto("/reports");
 
+  await expect(page.getByRole("heading", { level: 1, name: "Reports" })).toBeVisible();
+  await expect(page.locator('a[href="/reports/work-report"]').first()).toBeVisible();
+  await expect(page.locator('a[href="/reports/payroll"]')).toHaveCount(0);
+
+  await page.goto("/reports/payroll");
   await expect(page.getByRole("heading", { name: "Restricted area" })).toBeVisible();
-  await expect(page.getByRole("heading", { level: 1, name: "Reports" })).toHaveCount(0);
 });

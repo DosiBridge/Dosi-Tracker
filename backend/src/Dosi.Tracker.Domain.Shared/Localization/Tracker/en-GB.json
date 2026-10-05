@@ -4,6 +4,12 @@
     "AppName": "Tracker",
     "Menu:Home": "Home",
     "LongWelcomeMessage": "Welcome to the application. This is a startup project based on the ABP framework. For more information visit",
-    "Welcome": "Welcome"
+    "Welcome": "Welcome",
+    "Tracker:ActivityTooOld": "The activity started too long ago and can no longer be recorded.",
+    "Tracker:NotProjectMember": "You are not a member of this project.",
+    "Tracker:SubscriptionInactive": "The workspace subscription is not active. Ask the workspace owner to renew it.",
+    "Tracker:InvalidUser": "The user does not exist in this workspace.",
+    "Tracker:CannotModifySelf": "You cannot make this change to your own account or membership.",
+    "Tracker:RoleNotAllowed": "Only the workspace owner can grant this role, change hourly rates or manage an owner's account."
   }
 }

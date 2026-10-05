@@ -10,12 +10,20 @@
 //    crash, must show an ERROR state rather than demo data, and must leave the
 //    demo dataset untouched (a failed load never writes empty arrays over it);
 //  - logout wipes the stored identity (dosi-user, dosi-token), drops the live
-//    tenant's data, turns impersonation off and returns to the demo default;
+//    tenant's data, turns impersonation off and leaves for /login through a
+//    neutral "signed out" state — never a frame of the demo workspace;
 //  - refreshSession() re-hydrates after a client-side sign-in (no reload).
+vi.mock("@/lib/live-session", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/live-session")>()),
+  redirectToLogin: vi.fn(),
+  reloadPage: vi.fn(),
+}));
+
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { act, screen, waitFor, within } from "@testing-library/react";
 import { useEffect } from "react";
 import { useSession } from "@/components/session-provider";
+import { redirectToLogin } from "@/lib/live-session";
 import { datasetFor, isLiveDataset } from "@/lib/tenant-data";
 import { renderWithProviders, resetPrototypeState } from "@/test/harness";
 
@@ -102,6 +110,7 @@ function stubLiveBackend(config = tenantConfig()) {
 beforeEach(() => {
   captured = null;
   resetPrototypeState();
+  vi.mocked(redirectToLogin).mockClear();
 });
 
 afterEach(() => {
@@ -185,12 +194,16 @@ describe("live session identity (token present)", () => {
     renderWithProviders(<Probe />);
 
     await waitFor(() => expect(localStorage.getItem("dosi-token")).toBeNull());
-    expect(screen.getByTestId("status")).toHaveTextContent("demo");
+    // Signed out on the way to /login: neither the old account nor the demo workspace shows.
+    expect(screen.getByTestId("status")).toHaveTextContent("signedout");
+    expect(screen.getByTestId("user-name")).not.toHaveTextContent("Ayesha Rahman");
+    expect(screen.getByTestId("workspace-name")).not.toHaveTextContent("Dosi Labs");
+    expect(redirectToLogin).toHaveBeenCalledTimes(1);
   });
 });
 
 describe("logout", () => {
-  it("clears the stored session and token, drops the live data, ends impersonation, and returns to the demo default", async () => {
+  it("clears the stored session and token, drops the live data, ends impersonation, and leaves for /login without a demo frame", async () => {
     stubLiveBackend();
     localStorage.setItem("dosi-token", "jwt-test-token");
     localStorage.setItem("dosi-impersonating", "1"); // stale flag from a previous session
@@ -205,10 +218,47 @@ describe("logout", () => {
     expect(localStorage.getItem("dosi-token")).toBeNull();
     expect(localStorage.getItem("dosi-impersonating")).toBe("0");
     expect(screen.getByTestId("impersonating")).toHaveTextContent("false");
+    expect(screen.getByTestId("status")).toHaveTextContent("signedout");
+    // The tenant's rows are gone from the data layer; what is active now is an empty placeholder, not the demo.
+    expect(datasetFor("live-tenant-t-1").users).toEqual([]);
+    expect(datasetFor("live-tenant-t-1").projects).toEqual([]);
+    // The page is leaving for /login; until it does, nobody — and no demo person — is shown.
+    expect(screen.getByTestId("user-name")).toHaveTextContent("Signed out");
+    expect(screen.getByTestId("user-name")).not.toHaveTextContent("Ayesha Rahman");
+    expect(screen.getByTestId("workspace-name")).not.toHaveTextContent("Dosi Labs");
+    expect(within(screen.getByTestId("roster")).queryAllByRole("listitem")).toHaveLength(0);
+    expect(redirectToLogin).toHaveBeenCalledTimes(1);
+
+    // Signed-out stays signed-out: a refresh with no token doesn't fall back to the demo.
+    await act(async () => {
+      await sess().refreshSession();
+    });
+    expect(screen.getByTestId("status")).toHaveTextContent("signedout");
+  });
+
+  it("signing out of the demo also leaves for /login without showing the demo again", async () => {
+    renderWithProviders(<Probe />, { role: "owner" });
     expect(screen.getByTestId("status")).toHaveTextContent("demo");
-    expect(isLiveDataset()).toBe(false);
-    expect(screen.getByTestId("user-name")).toHaveTextContent("Ayesha Rahman");
-    expect(screen.getByTestId("user-role")).toHaveTextContent("owner");
+
+    act(() => sess().logout());
+
+    expect(screen.getByTestId("status")).toHaveTextContent("signedout");
+    expect(screen.getByTestId("user-name")).not.toHaveTextContent("Ayesha Rahman");
+    expect(redirectToLogin).toHaveBeenCalledTimes(1);
+  });
+
+  it("a sign-in after signing out (same page) builds the new live session", async () => {
+    stubLiveBackend();
+    renderWithProviders(<Probe />);
+    act(() => sess().logout());
+    expect(screen.getByTestId("status")).toHaveTextContent("signedout");
+
+    localStorage.setItem("dosi-token", "jwt-next"); // what loginApi does
+    await act(async () => {
+      await sess().refreshSession();
+    });
+    expect(screen.getByTestId("status")).toHaveTextContent("ready");
+    expect(screen.getByTestId("user-name")).toHaveTextContent("Mira Okafor");
   });
 });
 

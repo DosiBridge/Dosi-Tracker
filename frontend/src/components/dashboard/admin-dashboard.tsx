@@ -1,303 +1,424 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { Clock, Users, Gauge, Camera, ArrowRight, Sparkles } from "lucide-react";
+import { Clock, Users, Gauge, CalendarRange, ArrowRight, FileText, RotateCw } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Avatar } from "@/components/ui/avatar";
-import { Ring } from "@/components/ui/ring";
-import { Button } from "@/components/ui/button";
 import { StatCard } from "@/components/dashboard/stat-card";
-import { SetupChecklist } from "@/components/dashboard/setup-checklist";
-import { ActivityTrendChart, ChartEmpty, HourlyChart, ProjectDonut, TopAppsChart } from "@/components/dashboard/charts";
+import { ActivityRing } from "@/components/dashboard/activity-ring";
+import { linkButtonClass } from "@/components/dashboard/link-button";
+import { memberPresence } from "@/components/dashboard/devices";
+import {
+  ActivityTrendChart,
+  ChartEmpty,
+  ChartLegend,
+  DonutLegend,
+  HourlyChart,
+  ProjectDonut,
+  TREND_SERIES,
+  TopAppsChart,
+  type DonutSlice,
+  type TrendPoint,
+} from "@/components/dashboard/charts";
 import { AppGlyph, ScreenMockView } from "@/components/screen-mock";
 import { useSession } from "@/components/session-provider";
-import {
-  activities,
-  hourlyToday,
-  projectById,
-  projectDistribution,
-  summary,
-  topApps,
-  userById,
-  users,
-  weeklyTrend,
-} from "@/lib/tenant-data";
+import { activities, hourlyToday, projectById, projectDistribution, summary, topApps, userById, users } from "@/lib/tenant-data";
 import { brand, greeting } from "@/lib/brand";
-import { formatDuration } from "@/lib/utils";
+import { formatDuration, colorFromString } from "@/lib/utils";
 import { Reveal, Stagger } from "@/components/motion/reveal";
-import { getApi } from "@/hooks/useApi";
-import { agoLabel } from "@/lib/live-session";
+import { getApi, getHourlyReport, getTeamPresence } from "@/hooks/useApi";
+import { useReportingZone } from "@/hooks/use-reporting-zone";
+import { agoLabel, referenceNow } from "@/lib/live-session";
+import { deriveDailyTrend, displayName } from "@/lib/live-dataset";
+import { friendlyAppName } from "@/lib/apps";
+import { demoPresence, latestBlockByUser, liveBlockIds } from "@/lib/monitor-live";
+import { describeCoverage } from "@/lib/live-loader";
+import {
+  reportingRoute,
+  type AppUsageRowDto,
+  type DailyReportRowDto,
+  type ReportSummaryDto,
+  type UserReportRowDto,
+} from "@/lib/api-contract";
+import { appsFromUsage, arrayOf, hoursFromReport, trendFromSeries } from "./dashboard-data";
+import { zonedDayKey, zonedDayRange, zonedPeriod } from "@/lib/time-zone";
+import type { UserStatus } from "@/lib/types";
 
-/** Shapes returned by /api/app/reporting (live mode). */
-interface LiveReportSummary {
-  totalActivities: number;
-  totalTrackedMinutes: number;
-  averageProductivity: number;
-  totalMouseClicks: number;
-  totalKeyboardHits: number;
-  perUser: { userId: string; activityCount: number; trackedMinutes: number; averageProductivity: number }[];
-  perProject: { projectId: string; activityCount: number; trackedMinutes: number; averageProductivity: number }[];
+/** What the live dashboard reads from the reporting API (calendar days of the reporting zone). */
+interface LiveDashboard {
+  today: Partial<ReportSummaryDto>;
+  week: Partial<ReportSummaryDto>;
+  /** The last 7 days, oldest first, one point per day (empty days included). */
+  trend: TrendPoint[];
+  /** Minutes per canonical app this week; null when the server couldn't say. */
+  apps: { app: string; minutes: number; color: string }[] | null;
+  /** Minutes per hour today; null when the server couldn't say. */
+  hourly: { hour: string; minutes: number }[] | null;
+  /** Who is tracking now (agent heartbeats); null on servers without presence. */
+  presence: Map<string, UserStatus> | null;
 }
 
-interface LiveDailyPoint {
-  date: string;
-  activityCount: number;
-  trackedMinutes: number;
-  averageProductivity: number;
-  mouseClicks: number;
-  keyboardHits: number;
+function memberLabel(row: UserReportRowDto): string {
+  return userById(row.userId)?.name ?? displayName({ name: row.name, userName: row.userName }, "Team member");
 }
 
-export function AdminDashboard({ userName, isOwner }: { userName: string; isOwner: boolean }) {
-  // LIVE MODE: headline figures come from the reporting API; every chart and
-  // list below reads the session's live dataset, which is built from the
-  // tenant's REAL rows (see tenant-data installLiveDataset). Demo mode renders
-  // the seeded dataset exactly as before.
-  const { isLive } = useSession();
-  const [live, setLive] = useState<{ summary: LiveReportSummary; series: LiveDailyPoint[] } | null>(null);
+export function AdminDashboard({
+  userName,
+  isOwner,
+  onboarding,
+}: {
+  userName: string;
+  isOwner: boolean;
+  /** Shown under the greeting while the workspace is being set up (the dashboard page passes the SetupChecklist). */
+  onboarding?: React.ReactNode;
+}) {
+  // LIVE MODE: every figure comes from the reporting API for whole calendar
+  // days of the reporting zone (never from a capped page of rows); the feed
+  // lists the newest real blocks. Demo mode renders the seeded dataset.
+  const { isLive, liveCoverage } = useSession();
+  const fallbackCoverage = describeCoverage(liveCoverage);
+  const zone = useReportingZone(isLive);
+  const [live, setLive] = useState<LiveDashboard | null>(null);
   const [liveLoading, setLiveLoading] = useState(false);
   const [liveError, setLiveError] = useState<string | null>(null);
 
-  useEffect(() => {
-    if (!isLive) return;
-    let cancelled = false;
+  const load = useCallback(async () => {
+    const tz = zone.timeZone;
+    const now = new Date();
+    const todayKey = zonedDayKey(now, tz);
+    const today = zonedDayRange(todayKey, todayKey, tz);
+    const week = zonedPeriod("week", now, tz);
+    const last7 = zonedPeriod("7d", now, tz);
     setLiveLoading(true);
-    setLiveError(null);
-    const to = new Date();
-    const from = new Date(to.getTime() - 7 * 24 * 60 * 60 * 1000);
-    const range = `From=${encodeURIComponent(from.toISOString())}&To=${encodeURIComponent(to.toISOString())}`;
-    Promise.all([
-      getApi(`/api/app/reporting/summary?${range}`) as Promise<LiveReportSummary>,
-      getApi(`/api/app/reporting/daily-series?${range}`) as Promise<LiveDailyPoint[]>,
-    ])
-      .then(([summaryRes, seriesRes]) => {
-        if (cancelled) return;
-        setLive({ summary: summaryRes, series: Array.isArray(seriesRes) ? seriesRes : [] });
-      })
-      .catch(() => {
-        if (!cancelled) setLiveError("Couldn't load this week's team stats from the server. Figures below come from the activity already loaded.");
-      })
-      .finally(() => {
-        if (!cancelled) setLiveLoading(false);
+    const [todayRes, weekRes, seriesRes, appsRes, hourlyRes, presenceRes] = await Promise.allSettled([
+      getApi(reportingRoute("summary", { from: today.from, to: today.to, timeZone: tz })),
+      getApi(reportingRoute("summary", { from: week.from, to: week.to, timeZone: tz })),
+      getApi(reportingRoute("daily-series", { from: last7.from, to: last7.to, timeZone: tz })),
+      getApi(reportingRoute("app-usage", { from: week.from, to: week.to, timeZone: tz })),
+      getHourlyReport({ from: today.from, to: today.to, timeZone: tz }),
+      getTeamPresence(),
+    ]);
+    if (todayRes.status === "rejected" || weekRes.status === "rejected" || seriesRes.status === "rejected") {
+      setLive(null);
+      setLiveError("Couldn't load the team's figures from the server. The charts below show the activity already loaded.");
+    } else {
+      setLive({
+        today: (todayRes.value ?? {}) as Partial<ReportSummaryDto>,
+        week: (weekRes.value ?? {}) as Partial<ReportSummaryDto>,
+        trend: trendFromSeries(last7.days, arrayOf<DailyReportRowDto>(seriesRes.value)),
+        apps: appsRes.status === "fulfilled" ? appsFromUsage(arrayOf<AppUsageRowDto>(appsRes.value)) : null,
+        hourly: hourlyRes.status === "fulfilled" ? hoursFromReport(hourlyRes.value) : null,
+        presence: presenceRes.status === "fulfilled" ? memberPresence(presenceRes.value, new Date()) : null,
       });
-    return () => {
-      cancelled = true;
-    };
-  }, [isLive]);
+      setLiveError(null);
+    }
+    setLiveLoading(false);
+  }, [zone.timeZone]);
 
-  const liveSummary = live?.summary ?? null;
-  const trendData =
-    live && live.series.length > 0
-      ? live.series.map((d) => ({
-          day: new Date(d.date).toLocaleDateString(undefined, { weekday: "short" }),
-          tracked: Math.round(d.trackedMinutes),
-          productive: Math.round((d.trackedMinutes * d.averageProductivity) / 100),
-        }))
-      : weeklyTrend;
+  useEffect(() => {
+    if (!isLive || !zone.ready) return;
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- data fetch defers its own setState; see docs/QUALITY.md §10
+    void load();
+  }, [isLive, zone.ready, load]);
 
-  const dist = projectDistribution();
-  const leaderboard = [...users]
-    .filter((u) => u.productivity > 0)
-    .sort((a, b) => b.trackedToday - a.trackedToday)
-    .slice(0, 5);
+  // Demo: the trend comes from the demo's own activity and stops at today.
+  const demoTrend = useMemo(() => (isLive ? [] : deriveDailyTrend(activities, referenceNow(), 7)), [isLive]);
+
+  const trendData: TrendPoint[] = isLive ? (live?.trend ?? deriveDailyTrend(activities, new Date(), 7)) : demoTrend;
+  const dist: DonutSlice[] = useMemo(() => {
+    if (!isLive || !live) return projectDistribution().filter((d) => d.value > 0);
+    return arrayOf<{ projectId: string; projectTitle?: string; trackedMinutes: number }>(live.week.perProject)
+      .filter((r) => r && typeof r.projectId === "string" && Number(r.trackedMinutes) > 0)
+      .map((r) => {
+        const known = projectById(r.projectId);
+        return {
+          name: r.projectTitle || known?.title || "Untitled project",
+          value: Math.round(Number(r.trackedMinutes)),
+          color: known?.color ?? colorFromString(r.projectId, 60, 50),
+        };
+      })
+      .sort((a, b) => b.value - a.value);
+  }, [isLive, live]);
+  const apps = isLive ? (live?.apps ?? topApps.map((a) => ({ ...a, app: friendlyAppName(a.app) }))) : topApps;
+  const hourly = isLive ? (live?.hourly ?? hourlyToday) : hourlyToday;
+  const hasHourly = hourly.some((h) => h.minutes > 0);
+
+  const leaderboard = useMemo(() => {
+    if (isLive && live) {
+      return arrayOf<UserReportRowDto>(live.today.perUser)
+        .filter((r) => r && typeof r.userId === "string" && Number(r.trackedMinutes) > 0)
+        .sort((a, b) => Number(b.trackedMinutes) - Number(a.trackedMinutes))
+        .slice(0, 5)
+        .map((r) => ({
+          id: r.userId,
+          name: memberLabel(r),
+          detail: userById(r.userId)?.designation ?? "",
+          minutes: Math.round(Number(r.trackedMinutes)),
+          activity: typeof r.averageProductivity === "number" ? Math.round(r.averageProductivity) : null,
+          status: live.presence?.get(r.userId) ?? userById(r.userId)?.status,
+        }));
+    }
+    return [...users]
+      .filter((u) => u.trackedToday > 0)
+      .sort((a, b) => b.trackedToday - a.trackedToday)
+      .slice(0, 5)
+      .map((u) => ({ id: u.id, name: u.name, detail: u.designation, minutes: u.trackedToday, activity: u.productivity, status: u.status }));
+  }, [isLive, live]);
+
   const feed = activities.slice(0, 6);
-  const hasHourly = hourlyToday.some((h) => h.minutes > 0);
-  const hasDist = dist.some((d) => d.value > 0);
+  // "live" marks a member's newest block while they are tracking (fresh presence when the server reports it,
+  // otherwise the members' statuses) — the Activity page's rule, never a flag stored on the block.
+  const liveFeedIds = useMemo(() => {
+    const now = referenceNow();
+    const presence = live?.presence
+      ? new Map([...live.presence].map(([id, status]) => [id, { state: status === "active" ? ("tracking" as const) : ("offline" as const) }]))
+      : demoPresence(users, latestBlockByUser(activities));
+    return liveBlockIds(activities, presence, now, (projectId) => projectById(projectId)?.intervalMinutes);
+  }, [live]);
   const noActivityCopy = "No activity yet — install the desktop agent to start tracking.";
+
+  // Headline figures.
+  const trackingNow = isLive
+    ? live?.presence
+      ? [...live.presence.values()].filter((s) => s === "active").length
+      : null
+    : summary.activeMembers;
+  const activeToday = isLive ? arrayOf<UserReportRowDto>(live?.today.perUser).filter((r) => Number(r?.trackedMinutes) > 0).length : null;
+  const dash = liveLoading && !live ? "…" : "—";
+  const todayMinutes = isLive ? (live ? Math.round(Number(live.today.totalTrackedMinutes) || 0) : null) : summary.totalTrackedToday;
+  const weekMinutes = isLive ? (live ? Math.round(Number(live.week.totalTrackedMinutes) || 0) : null) : dist.reduce((s, d) => s + d.value, 0);
+  const activityToday = isLive
+    ? live && typeof live.today.averageProductivity === "number"
+      ? `${Math.round(live.today.averageProductivity)}%`
+      : live
+        ? "—"
+        : dash
+    : `${summary.avgProductivity}%`;
 
   return (
     <div className="space-y-6">
       <Reveal>
-      <div className="flex flex-wrap items-end justify-between gap-4">
-        <div>
-          <div className="flex flex-wrap items-center gap-2">
-            <h1 className="page-title">{greeting(userName)}</h1>
-            <Badge tone="success" className="gap-1.5">
-              <span className="h-1.5 w-1.5 rounded-full bg-success live-dot" />
-              {liveSummary ? `${liveSummary.perUser.length} active this week` : `${summary.activeMembers} tracking now`}
-            </Badge>
+        <div className="flex flex-wrap items-end justify-between gap-4">
+          <div>
+            <div className="flex flex-wrap items-center gap-2">
+              <h1 className="page-title">{greeting(userName)}</h1>
+              {trackingNow !== null ? (
+                <Badge tone="success" className="gap-1.5">
+                  <span aria-hidden className="h-1.5 w-1.5 rounded-full bg-success live-dot" />
+                  {trackingNow} tracking now
+                </Badge>
+              ) : activeToday !== null && live ? (
+                <Badge tone="info">{activeToday} active today</Badge>
+              ) : null}
+            </div>
+            <p className="mt-1 text-sm text-muted-foreground">
+              {isOwner ? "Organization overview for today." : "What your team is working on today."}
+            </p>
+            {liveLoading && !live && (
+              <p role="status" className="mt-1 text-xs text-muted-foreground">
+                Loading the team&apos;s figures…
+              </p>
+            )}
+            {liveError && (
+              <p role="alert" className="mt-1 flex flex-wrap items-center gap-2 text-xs text-danger-on-tint">
+                {liveError}
+                {/* The charts now fall back to the session's blocks: say when those are only the newest ones. */}
+                {fallbackCoverage && <span className="text-muted-foreground">{fallbackCoverage}</span>}
+                <button type="button" onClick={() => void load()} className="inline-flex items-center gap-1 font-medium underline underline-offset-2">
+                  <RotateCw aria-hidden className="h-3 w-3" /> Retry
+                </button>
+              </p>
+            )}
           </div>
-          <p className="mt-1 text-sm text-muted-foreground">
-            {isOwner ? "Organization overview for today." : "What your team is working on today."}
-          </p>
-          {liveLoading && <p className="mt-1 text-xs text-muted-foreground">Loading live team stats…</p>}
-          {liveError && <p className="mt-1 text-xs text-danger">{liveError}</p>}
+          <div className="flex items-center gap-2">
+            <Link href="/reports/work-report" className={linkButtonClass("outline", "md")}>
+              <FileText aria-hidden className="h-4 w-4" /> Work report
+            </Link>
+            <Link href="/activities" className={linkButtonClass("primary", "md")}>
+              View activity <ArrowRight aria-hidden className="h-4 w-4" />
+            </Link>
+          </div>
         </div>
-        <div className="flex items-center gap-2">
-          <Link href="/reports/weekly">
-            <Button variant="outline" size="md">
-              <Sparkles className="h-4 w-4" /> Weekly report
-            </Button>
-          </Link>
-          <Link href="/activities">
-            <Button size="md">
-              View activity <ArrowRight className="h-4 w-4" />
-            </Button>
-          </Link>
-        </div>
-      </div>
       </Reveal>
 
-      <Reveal delay={60}>
-        <SetupChecklist isOwner={isOwner} />
-      </Reveal>
+      {onboarding && <Reveal delay={60}>{onboarding}</Reveal>}
 
       <Stagger className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4" baseDelay={55}>
         <StatCard
-          label={liveSummary ? "Tracked (7d)" : "Tracked today"}
-          value={liveSummary ? formatDuration(Math.round(liveSummary.totalTrackedMinutes)) : formatDuration(summary.totalTrackedToday)}
+          label="Tracked today"
+          value={todayMinutes === null ? dash : formatDuration(todayMinutes)}
           icon={Clock}
           accent={brand.primary}
           sub="across all members"
         />
         <StatCard
-          label="Active members"
-          value={liveSummary ? String(liveSummary.perUser.length) : `${summary.activeMembers}/${summary.totalMembers}`}
+          label={trackingNow !== null || !isLive ? "Tracking now" : "Active today"}
+          value={
+            !isLive
+              ? `${summary.activeMembers}/${summary.totalMembers}`
+              : trackingNow !== null
+                ? String(trackingNow)
+                : activeToday !== null && live
+                  ? String(activeToday)
+                  : dash
+          }
           icon={Users}
           accent={brand.info}
-          sub={liveSummary ? "active in last 7 days" : "currently online"}
+          sub={!isLive ? "currently online" : trackingNow !== null ? "agents tracking right now" : "members with time today"}
         />
+        <StatCard label="Activity today" value={activityToday} icon={Gauge} accent={brand.success} sub="keyboard & mouse share" />
         <StatCard
-          label="Avg productivity"
-          value={`${liveSummary ? Math.round(liveSummary.averageProductivity) : summary.avgProductivity}%`}
-          icon={Gauge}
-          accent={brand.success}
-          sub="team average"
-        />
-        <StatCard
-          label={liveSummary ? "Activities (7d)" : "Captures today"}
-          value={liveSummary ? String(liveSummary.totalActivities) : String(summary.screenshotsToday)}
-          icon={Camera}
+          label="Tracked this week"
+          value={weekMinutes === null ? dash : formatDuration(weekMinutes)}
+          icon={CalendarRange}
           accent={brand.pink}
-          sub={liveSummary ? "tracked sessions" : "screen captures"}
+          sub="Monday to today"
         />
       </Stagger>
 
       <Reveal delay={120}>
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
-        <Card className="card-elev-lg lg:col-span-2">
-          <CardHeader>
-            <CardTitle>Activity this week</CardTitle>
-            <div className="flex items-center gap-4 text-xs text-muted-foreground">
-              <span className="flex items-center gap-1.5"><span className="h-2 w-2 rounded-full bg-primary" /> Tracked</span>
-              <span className="flex items-center gap-1.5"><span className="h-2 w-2 rounded-full bg-success" /> Productive</span>
-            </div>
-          </CardHeader>
-          <CardContent><ActivityTrendChart data={trendData} /></CardContent>
-        </Card>
+        <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
+          <Card className="card-elev-lg lg:col-span-2">
+            <CardHeader>
+              <div>
+                <CardTitle>Activity · last 7 days</CardTitle>
+                <p className="mt-0.5 text-xs text-muted-foreground">Hours per day; active time had keyboard or mouse input</p>
+              </div>
+              <ChartLegend items={TREND_SERIES.map((s) => ({ key: s.key, label: s.label, color: s.color }))} />
+            </CardHeader>
+            <CardContent>
+              {isLive && !trendData.some((d) => d.tracked > 0) ? (
+                <ChartEmpty message="Nothing tracked in the last 7 days." />
+              ) : (
+                <ActivityTrendChart data={trendData} />
+              )}
+            </CardContent>
+          </Card>
 
-        <Card>
-          <CardHeader><CardTitle>Time by project</CardTitle></CardHeader>
-          <CardContent>
-            {isLive && !hasDist ? (
-              <ChartEmpty message="No time tracked on projects this week." />
-            ) : (
-            <>
-            <ProjectDonut data={dist} />
-            <div className="mt-3 space-y-2">
-              {dist.slice(0, 4).map((d) => (
-                <div key={d.name} className="flex items-center justify-between text-sm">
-                  <span className="flex items-center gap-2 truncate">
-                    <span className="h-2.5 w-2.5 rounded-full" style={{ background: d.color }} />
-                    <span className="truncate text-muted-foreground">{d.name}</span>
-                  </span>
-                  <span className="font-medium">{formatDuration(d.value)}</span>
-                </div>
-              ))}
-            </div>
-            </>
-            )}
-          </CardContent>
-        </Card>
-      </div>
+          <Card>
+            <CardHeader>
+              <CardTitle>Time by project</CardTitle>
+              <Badge tone="muted">This week</Badge>
+            </CardHeader>
+            <CardContent>
+              {dist.length === 0 ? (
+                <ChartEmpty message="No time tracked on projects this week." />
+              ) : (
+                <>
+                  <ProjectDonut data={dist} />
+                  <DonutLegend data={dist} max={5} />
+                </>
+              )}
+            </CardContent>
+          </Card>
+        </div>
       </Reveal>
 
       <Reveal delay={180}>
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
-        <Card className="card-quiet">
-          <CardHeader><CardTitle>Most used apps</CardTitle><Badge tone="muted">This week</Badge></CardHeader>
-          <CardContent>
-            {isLive && topApps.length === 0 ? <ChartEmpty message="No app usage recorded this week." /> : <TopAppsChart data={topApps} />}
-          </CardContent>
-        </Card>
-        <Card className="card-quiet">
-          <CardHeader><CardTitle>Today&apos;s focus by hour</CardTitle><Badge tone="muted">Minutes tracked</Badge></CardHeader>
-          <CardContent>
-            {isLive && !hasHourly ? <ChartEmpty message="Nothing tracked yet today." /> : <HourlyChart data={hourlyToday} />}
-          </CardContent>
-        </Card>
-      </div>
+        <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+          <Card className="card-quiet">
+            <CardHeader>
+              <CardTitle>Most used apps</CardTitle>
+              <Badge tone="muted">This week</Badge>
+            </CardHeader>
+            <CardContent>
+              {apps.length === 0 ? <ChartEmpty message="No app usage recorded this week." /> : <TopAppsChart data={apps} />}
+            </CardContent>
+          </Card>
+          <Card className="card-quiet">
+            <CardHeader>
+              <CardTitle>Today by hour</CardTitle>
+              <Badge tone="muted">Time tracked</Badge>
+            </CardHeader>
+            <CardContent>{isLive && !hasHourly ? <ChartEmpty message="Nothing tracked yet today." /> : <HourlyChart data={hourly} label="Time tracked per hour today" />}</CardContent>
+          </Card>
+        </div>
       </Reveal>
 
       <Reveal delay={220}>
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
-        <Card>
-          <CardHeader>
-            <CardTitle>Team leaderboard</CardTitle>
-            <Link href="/team" className="text-xs text-primary hover:underline">View all</Link>
-          </CardHeader>
-          <CardContent className="space-y-1">
-            {leaderboard.length === 0 && (
-              <p className="py-6 text-center text-sm text-muted-foreground">No one has tracked time today yet.</p>
-            )}
-            {leaderboard.map((u, i) => (
-              <div key={u.id} className="flex items-center gap-3 rounded-lg p-2 hover:bg-muted/60">
-                <span className="w-5 text-center text-sm font-semibold text-muted-foreground">{i + 1}</span>
-                <Avatar name={u.name} size="sm" status={u.status} />
-                <div className="min-w-0 flex-1">
-                  <div className="truncate text-sm font-medium">{u.name}</div>
-                  <div className="truncate text-xs text-muted-foreground">{u.designation}</div>
-                </div>
-                <span className="text-sm font-medium">{formatDuration(u.trackedToday)}</span>
-                <Ring value={u.productivity} size={36} stroke={4} />
+        <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+          <Card>
+            <CardHeader>
+              <div>
+                <CardTitle>Team today</CardTitle>
+                <p className="mt-0.5 text-xs text-muted-foreground">Most time tracked today, with activity %</p>
               </div>
-            ))}
-          </CardContent>
-        </Card>
+              <Link href="/team" className="text-xs text-primary-strong hover:underline">
+                View team
+              </Link>
+            </CardHeader>
+            <CardContent>
+              {leaderboard.length === 0 ? (
+                <p className="py-6 text-center text-sm text-muted-foreground">No one has tracked time today yet.</p>
+              ) : (
+                <ol className="space-y-1">
+                  {leaderboard.map((u, i) => (
+                    <li key={u.id} className="flex items-center gap-3 rounded-lg p-2 hover:bg-muted/60">
+                      <span className="w-5 text-center text-sm font-semibold text-muted-foreground">{i + 1}</span>
+                      <Avatar name={u.name} size="sm" status={u.status} />
+                      <div className="min-w-0 flex-1">
+                        <div className="truncate text-sm font-medium">{u.name}</div>
+                        {u.detail && <div className="truncate text-xs text-muted-foreground">{u.detail}</div>}
+                      </div>
+                      <span className="text-sm font-medium tabular-nums">{formatDuration(u.minutes)}</span>
+                      <ActivityRing value={u.activity} size={36} stroke={4} />
+                    </li>
+                  ))}
+                </ol>
+              )}
+            </CardContent>
+          </Card>
 
-        <Card>
-          <CardHeader>
-            <CardTitle>Live activity feed</CardTitle>
-            <Link href="/activities" className="text-xs text-primary hover:underline">View all</Link>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            {feed.length === 0 && (
-              <p className="py-6 text-center text-sm text-muted-foreground">
-                {noActivityCopy}{" "}
-                <Link href="/download" className="text-primary hover:underline">Get the agent</Link>
-              </p>
-            )}
-            {feed.map((a) => {
-              const u = userById(a.userId);
-              const p = projectById(a.projectId);
-              return (
-                <div key={a.id} className="flex items-center gap-3">
-                  {isLive ? (
-                    <AppGlyph app={a.screen.app} color={a.screen.accent} className="h-12 w-20 shrink-0" />
-                  ) : (
-                    <ScreenMockView screen={a.screen} className="h-12 w-20 shrink-0" />
-                  )}
-                  <div className="min-w-0 flex-1">
-                    <div className="truncate text-sm">
-                      <span className="font-medium">{u?.name ?? "Member"}</span>{" "}
-                      <span className="text-muted-foreground">— {a.description}</span>
-                    </div>
-                    <div className="mt-0.5 flex items-center gap-2 text-xs text-muted-foreground">
-                      <span className="h-2 w-2 rounded-full" style={{ background: p?.color }} />
-                      <span className="truncate">{p?.title}</span>
-                      <span>·</span>
-                      <span>{agoLabel(a.endedAt)}</span>
-                    </div>
-                  </div>
-                  {a.online && <Badge tone="success">live</Badge>}
-                </div>
-              );
-            })}
-          </CardContent>
-        </Card>
-      </div>
+          <Card>
+            <CardHeader>
+              <CardTitle>Latest activity</CardTitle>
+              <Link href="/activities" className="text-xs text-primary-strong hover:underline">
+                View all
+              </Link>
+            </CardHeader>
+            <CardContent>
+              {feed.length === 0 ? (
+                <p className="py-6 text-center text-sm text-muted-foreground">
+                  {noActivityCopy}{" "}
+                  <Link href="/download" className="text-primary-strong hover:underline">
+                    Get the agent
+                  </Link>
+                </p>
+              ) : (
+                <ul className="space-y-3">
+                  {feed.map((a) => {
+                    const u = userById(a.userId);
+                    const p = projectById(a.projectId);
+                    return (
+                      <li key={a.id} className="flex items-center gap-3">
+                        {isLive ? (
+                          <AppGlyph app={a.screen.app} color={a.screen.accent} className="h-12 w-20 shrink-0" />
+                        ) : (
+                          <ScreenMockView screen={a.screen} className="h-12 w-20 shrink-0" />
+                        )}
+                        <div className="min-w-0 flex-1">
+                          <div className="truncate text-sm">
+                            <span className="font-medium">{u?.name ?? "Team member"}</span>{" "}
+                            <span className="text-muted-foreground">— {a.description}</span>
+                          </div>
+                          <div className="mt-0.5 flex items-center gap-2 text-xs text-muted-foreground">
+                            <span aria-hidden className="h-2 w-2 shrink-0 rounded-full" style={{ background: p?.color }} />
+                            <span className="truncate">{p?.title ?? "Project"}</span>
+                            <span aria-hidden>·</span>
+                            <span className="shrink-0">{agoLabel(a.endedAt)}</span>
+                          </div>
+                        </div>
+                        {liveFeedIds.has(a.id) && <Badge tone="success">live</Badge>}
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
+            </CardContent>
+          </Card>
+        </div>
       </Reveal>
     </div>
   );

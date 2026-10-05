@@ -37,6 +37,12 @@
     "Unspecified": "Rendszer",
     "SeeAllUsers": "Lásd: Összes felhasználó",
     "TakePhoto": "Fotót készíteni",
-    "ChoosePhoto": "Válassz képet"
+    "ChoosePhoto": "Válassz képet",
+    "Tracker:ActivityTooOld": "A tevékenység túl régen kezdődött, ezért már nem rögzíthető.",
+    "Tracker:NotProjectMember": "Ön nem tagja ennek a projektnek.",
+    "Tracker:SubscriptionInactive": "A munkaterület előfizetése nem aktív. Kérje meg a munkaterület tulajdonosát, hogy újítsa meg.",
+    "Tracker:InvalidUser": "A felhasználó nem létezik ebben a munkaterületben.",
+    "Tracker:CannotModifySelf": "Ezt a módosítást nem végezheti el a saját fiókján vagy tagságán.",
+    "Tracker:RoleNotAllowed": "Csak a munkaterület tulajdonosa oszthatja ki ezt a szerepkört, módosíthatja az órabéreket vagy kezelheti egy tulajdonos fiókját."
   }
 }

@@ -182,22 +182,57 @@ jobs:
         working-directory: clients/windows
         run: cargo build --locked --release
 
+      # Versioned like the agent itself: the version in Cargo.toml.
       - name: Build installer (NSIS)
         working-directory: clients/windows/installer
-        run: makensis /DVERSION=0.1.0 dosi-tracker.nsi
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --manifest-path ../Cargo.toml --no-deps --format-version 1 --locked | ConvertFrom-Json).packages[0].version
+          # Windows' version resource takes numbers only: 0.2.0-beta.1 -> 0.2.0.
+          $numeric = ($version -split '[-+]')[0]
+          Write-Host "Dosi Tracker $version"
+          makensis /DVERSION=$version /DVERSION_NUMERIC=$numeric dosi-tracker.nsi
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Upload installer
         uses: actions/upload-artifact@v4
         with:
           name: dosi-tracker-windows-setup
           path: clients/windows/installer/dosi-tracker-setup-*.exe
+          if-no-files-found: error
 
   macos-agent:
-    name: macOS agent (swift build)
+    name: macOS agent (build, test, app bundle)
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
 
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+
       - name: Build
         working-directory: clients/macos
         run: swift build
+
+      # The core's tests: block math, queue, upload policy, API client, models.
+      - name: Test
+        working-directory: clients/macos
+        run: swift test
+
+      # The shippable artifact: a universal (arm64 + x86_64) "Dosi Tracker.app",
+      # signed ad hoc with the hardened runtime, zipped. Developer ID signing and
+      # notarization: see clients/macos/README.md.
+      - name: App bundle
+        working-directory: clients/macos
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: bash scripts/build-app.sh
+
+      - name: Upload app
+        uses: actions/upload-artifact@v4
+        with:
+          name: dosi-tracker-macos
+          path: clients/macos/.build/dist/DosiTracker-*-macos.zip
+          if-no-files-found: error

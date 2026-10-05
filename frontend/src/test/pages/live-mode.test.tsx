@@ -105,6 +105,29 @@ describe("live mode — shell", () => {
     expectNoDemoData();
   });
 
+  it("a plan that couldn't be loaded is said so, with a Retry that reloads it — never the demo's Free plan", async () => {
+    backend();
+    const base = fetchMock.getMockImplementation()!;
+    let planDown = true;
+    fetchMock.mockImplementation(async (input, init) =>
+      planDown && String(input).includes("/api/app/workspace/current-subscription") ? json({}, 500) : base(input, init),
+    );
+    renderWithProviders(
+      <DashboardLayout>
+        <div>page body</div>
+      </DashboardLayout>,
+      { route: "/dashboard" },
+    );
+
+    const banner = await screen.findByText(/couldn't load your workspace's plan data/i);
+    expect(screen.queryByText(/^Free$/)).not.toBeInTheDocument();
+
+    planDown = false;
+    fireEvent.click(within(banner.parentElement as HTMLElement).getByRole("button", { name: /retry/i }));
+    await waitFor(() => expect(screen.queryByText(/couldn't load your workspace's plan data/i)).not.toBeInTheDocument());
+    expect(screen.getAllByText("RealCo").length).toBeGreaterThan(0);
+  });
+
   it("shows an error with retry — not demo data — when the backend is down", async () => {
     fetchMock.mockRejectedValue(new TypeError("Failed to fetch"));
     renderWithProviders(
@@ -239,8 +262,8 @@ describe("live mode — dashboard + onboarding", () => {
     expect(screen.getByText("No app usage recorded this week.")).toBeInTheDocument();
     expectNoDemoData();
 
-    const invite = screen.getByText("Invite your team");
-    expect(invite).not.toHaveClass("line-through"); // a workspace of one hasn't invited anyone
+    // A workspace of one hasn't invited anyone (the checklist may name the step more than once).
+    for (const invite of screen.getAllByText("Invite your team")) expect(invite).not.toHaveClass("line-through");
     for (const link of screen.getAllByRole("link", { name: /get the agent/i })) {
       expect(link).toHaveAttribute("href", "/download");
     }

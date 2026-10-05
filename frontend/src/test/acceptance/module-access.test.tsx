@@ -32,6 +32,7 @@ const modules = [
   { href: "/timesheet", label: "Timesheet" },
   { href: "/reports", label: "Reports" },
   { href: "/billing", label: "Billing & Plan" },
+  { href: "/download", label: "Desktop agent" },
   { href: "/settings", label: "Settings" },
 ] as const;
 
@@ -41,30 +42,31 @@ beforeEach(() => {
 
 describe("Feature: Role-gated module access", () => {
   describe("Scenario: Client's restricted workspace view", () => {
-    it("Given a signed-in client When the sidebar renders Then only Dashboard and Settings are offered", () => {
+    it("Given a signed-in client When the sidebar renders Then only Dashboard, Reports and Settings are offered", () => {
       renderAsRole(<TenantSidebar />, "client", { route: "/dashboard" });
 
-      expect(screen.getByRole("link", { name: "Dashboard" })).toBeInTheDocument();
-      expect(screen.getByRole("link", { name: "Settings" })).toBeInTheDocument();
-      for (const hidden of ["Projects", "Team", "Member Monitor", "Activity", "Timesheet", "Reports", "Billing & Plan"]) {
+      for (const offered of ["Dashboard", "Reports", "Settings"]) {
+        expect(screen.getByRole("link", { name: offered })).toBeInTheDocument();
+      }
+      for (const hidden of ["Projects", "Team", "Member Monitor", "Activity", "Timesheet", "Billing & Plan", "Desktop agent"]) {
         expect(
           screen.queryByRole("link", { name: hidden }),
           `client sidebar must not offer "${hidden}"`,
         ).not.toBeInTheDocument();
       }
-      expect(screen.getAllByRole("link")).toHaveLength(2);
+      expect(screen.getAllByRole("link")).toHaveLength(3);
     });
 
-    it("Given a signed-in client When they navigate directly to /reports Then the restricted notice replaces report content", () => {
+    it("Given a signed-in client When they navigate directly to the payroll report Then the restricted notice replaces report content", () => {
       renderAsRole(
         <RoleGuard>
-          <div>quarterly report body</div>
+          <div>payroll report body</div>
         </RoleGuard>,
         "client",
-        { route: "/reports" },
+        { route: "/reports/payroll" },
       );
 
-      expect(screen.queryByText("quarterly report body")).not.toBeInTheDocument();
+      expect(screen.queryByText("payroll report body")).not.toBeInTheDocument();
       expect(screen.getByRole("heading", { name: /restricted area/i })).toBeInTheDocument();
     });
 

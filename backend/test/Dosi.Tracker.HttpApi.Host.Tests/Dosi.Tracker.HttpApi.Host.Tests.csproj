@@ -1,0 +1,44 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <Import Project="..\..\common.props" />
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <RootNamespace>Dosi.Tracker</RootNamespace>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The host's request-pipeline security (trusted proxies, sign-in rate limits, diagnostics exposure) is plain
+         ASP.NET Core code. Like the production-secrets guard in Dosi.Tracker.Domain.Tests, its source files are compiled
+         into this test assembly instead of referencing the host, which would drag the untested web-host wiring into the
+         coverage gate. -->
+    <Compile Include="..\..\src\Dosi.Tracker.HttpApi.Host\Security\AuthRateLimiting.cs" Link="Security\Host\AuthRateLimiting.cs" />
+    <Compile Include="..\..\src\Dosi.Tracker.HttpApi.Host\Security\TrustedProxies.cs" Link="Security\Host\TrustedProxies.cs" />
+    <Compile Include="..\..\src\Dosi.Tracker.HttpApi.Host\Security\DiagnosticsExposure.cs" Link="Security\Host\DiagnosticsExposure.cs" />
+    <Compile Include="..\..\src\Dosi.Tracker.HttpApi.Host\Compatibility\LegacyAgentCompatibility.cs" Link="Compatibility\Host\LegacyAgentCompatibility.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- For the HTTP routes ABP derives from the application services (Teams/TeamRoutesTests). -->
+    <ProjectReference Include="..\..\src\Dosi.Tracker.Application\Dosi.Tracker.Application.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Volo.Abp.AspNetCore.Mvc" Version="10.5.0" />
+    <!-- The account endpoints the web calls (self-service password change); TrackerHttpApiModule depends on this module. -->
+    <PackageReference Include="Volo.Abp.Account.HttpApi" Version="10.5.0" />
+    <PackageReference Include="Microsoft.AspNetCore.TestHost" Version="10.0.8" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="Shouldly" Version="4.3.0" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
+  </ItemGroup>
+
+</Project>

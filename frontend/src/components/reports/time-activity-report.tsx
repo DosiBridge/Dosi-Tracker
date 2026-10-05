@@ -1,355 +1,305 @@
 "use client";
 
-import { useCallback, useMemo, useState } from "react";
-import { Clock, Gauge, Camera, CalendarCheck, Users } from "lucide-react";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Avatar } from "@/components/ui/avatar";
-import { Progress } from "@/components/ui/progress";
+import { useCallback, useMemo } from "react";
+import { Clock, Gauge, Hourglass, Users, Zap } from "lucide-react";
+import { Card, CardContent } from "@/components/ui/card";
 import { DataTable, type Column } from "@/components/ui/data-table";
-import { ActivityTrendChart } from "@/components/dashboard/charts";
-import { ReportShell, FilterBar, ExportMenu, Kpi, KpiGrid, LiveReportNotice, useLiveReport } from "./report-shell";
-import { activities, userById, users } from "@/lib/tenant-data";
-import { trackedMembers } from "@/lib/roles";
-import { averageProductivity, dayKey, durationMinutes, minutesForUser } from "@/lib/metrics";
-import { filterActivitiesByRange, type RangeKey } from "@/lib/reports-data";
-import { asArray, memberName, reportQuery } from "@/lib/report-math";
-import { exportRecords } from "@/lib/export";
-import { cn, formatDuration } from "@/lib/utils";
 import { getApi } from "@/hooks/useApi";
-import { useSession } from "@/components/session-provider";
-import { resolveRange, type ResolvedRange } from "./date-range-picker";
+import { reportingRoute } from "@/lib/api-contract";
+import { downloadCSV } from "@/lib/export";
+import {
+  ALL,
+  activityBreakdown,
+  dayBars,
+  decimalHoursTotal,
+  displayedTotal,
+  memberName,
+  readDaily,
+  readSummary,
+  safePercent,
+  summarizeBlocks,
+  topProjectByMember,
+  type DailyFigures,
+  type ReportSummary,
+} from "@/lib/report-math";
+import { projectById, userById } from "@/lib/tenant-data";
+import { decimalHours, formatHM, projectLabel } from "@/lib/work-report";
+import {
+  ActivityBadge,
+  ActivityLegend,
+  DailyHoursChart,
+  Dash,
+  ExportMenu,
+  HoursFormatToggle,
+  Kpi,
+  KpiGrid,
+  LiveReportNotice,
+  MemberCell,
+  MiniBar,
+  NoTimeState,
+  ReportFootnote,
+  ReportShell,
+  ReportSkeleton,
+  ReportToolbar,
+  SectionHeading,
+  demoActivities,
+  useHoursFormat,
+  usePeriodReport,
+  useReportPeriod,
+  useReportScope,
+} from "./report-shell";
+
+/* ============================================================================
+ * TIME & ACTIVITY — hours per day and per member, with how much of that time
+ * had keyboard or mouse input (activity %, active time) and how much had none
+ * (idle time). Live: /reporting/summary and /reporting/daily-series for the
+ * period, in the reporting zone, filtered server-side; demo: the same shapes
+ * derived from the seeded activity.
+ * ========================================================================== */
+
+interface Figures {
+  summary: ReportSummary;
+  daily: DailyFigures[];
+}
 
 interface Row {
   userId: string;
   name: string;
-  designation: string;
+  designation: string | null;
   tracked: number;
-  activity: number;
+  active: number | null;
+  idle: number | null;
+  activity: number | null;
   sessions: number;
-  productive: number;
-  topApp: string;
-}
-
-/* ---- Live (API) shapes: /api/app/reporting/* ---- */
-
-interface LivePerUser {
-  userId: string;
-  activityCount: number;
-  trackedMinutes: number;
-  averageProductivity: number;
-}
-
-interface LiveSummary {
-  totalActivities?: number;
-  totalTrackedMinutes?: number;
-  averageProductivity?: number;
-  perUser?: LivePerUser[];
-}
-
-interface LiveDailyPoint {
-  date: string;
-  activityCount: number;
-  trackedMinutes: number;
-  averageProductivity: number;
-}
-
-interface LiveTimeActivity {
-  summary: LiveSummary;
-  series: LiveDailyPoint[];
+  topProject: string | null;
 }
 
 export function TimeActivityReport() {
-  const { isLive } = useSession();
-  const [rangeKey, setRangeKey] = useState<RangeKey>("7d");
-  const [range, setRange] = useState<ResolvedRange>(() => resolveRange("7d"));
-  const [projectId, setProjectId] = useState("all");
-  const [memberId, setMemberId] = useState("all");
-  const [viewMode, setViewMode] = useState<"table" | "grid">("table");
+  const scope = useReportScope();
+  const { isLive, projectId, memberId } = scope;
+  const range = useReportPeriod("7d", isLive);
+  const { period, timeZone } = range;
+  const { format, setFormat, fmt } = useHoursFormat();
 
-  // LIVE: the project and member filters are real ids, applied server-side.
-  const loadLive = useCallback(async (): Promise<LiveTimeActivity> => {
-    const qs = reportQuery({ from: range.from, to: range.to, projectId, userId: memberId });
-    const [summary, series] = await Promise.all([
-      getApi(`/api/app/reporting/summary?${qs}`),
-      getApi(`/api/app/reporting/daily-series?${qs}`),
-    ]);
-    return {
-      summary: summary && typeof summary === "object" ? (summary as LiveSummary) : {},
-      series: asArray<LiveDailyPoint>(series),
-    };
-  }, [range, projectId, memberId]);
+  const load = useCallback(async (): Promise<Figures> => {
+    const query = { from: period.from, to: period.to, projectId, userId: memberId, timeZone };
+    const [summary, daily] = await Promise.all([getApi(reportingRoute("summary", query)), getApi(reportingRoute("daily-series", query))]);
+    return { summary: readSummary(summary), daily: readDaily(daily) };
+  }, [period, projectId, memberId, timeZone]);
+  const live = usePeriodReport(isLive, range.ready, load);
 
-  const live = useLiveReport(isLive, loadLive);
+  const demo = useMemo<Figures | null>(() => {
+    if (isLive) return null;
+    const { summary, daily } = summarizeBlocks(demoActivities(period, projectId, memberId), timeZone);
+    return { summary, daily };
+  }, [isLive, period, projectId, memberId, timeZone]);
 
-  const acts = useMemo(() => {
-    let list = filterActivitiesByRange(activities, range.from, range.to);
-    if (projectId !== "all") list = list.filter((a) => a.projectId === projectId);
-    if (memberId !== "all") list = list.filter((a) => a.userId === memberId);
-    return list;
-  }, [range, projectId, memberId]);
+  // A live session shows only real figures (or nothing) — never the demo team.
+  const figures = isLive ? live.data : demo;
+  const pending = live.pending;
 
-  const dynamicTrend = useMemo(() => {
-    const days: Record<string, { day: string; tracked: number; productive: number }> = {};
-    const DAY_MS = 24 * 60 * 60 * 1000;
-    const count = Math.round((range.to.getTime() - range.from.getTime()) / DAY_MS) + 1;
-    
-    for (let i = 0; i < count; i++) {
-      const date = new Date(range.from.getTime() + i * DAY_MS);
-      const iso = date.toISOString().slice(0, 10);
-      const label = date.toLocaleDateString("en", { weekday: "short", timeZone: "UTC" });
-      days[iso] = { day: label, tracked: 0, productive: 0 };
-    }
-    
-    acts.forEach((a) => {
-      const iso = dayKey(a);
-      if (days[iso]) {
-        const mins = durationMinutes(a);
-        days[iso].tracked += mins;
-        days[iso].productive += Math.round((mins * a.productivity) / 100);
-      }
-    });
+  const rows = useMemo<Row[]>(() => {
+    if (!figures) return [];
+    const top = figures.summary.perUserProject ? topProjectByMember(figures.summary.perUserProject) : null;
+    return figures.summary.perUser
+      .filter((u) => memberId === ALL || u.userId === memberId)
+      .map((u) => {
+        const member = userById(u.userId);
+        const split = activityBreakdown(u.trackedMinutes, u.averageProductivity, u.idleMinutes);
+        const topId = top?.get(u.userId)?.projectId ?? null;
+        return {
+          userId: u.userId,
+          name: memberName(u.userId, member ?? (u.name ? { name: u.name } : null)),
+          designation: member?.designation ?? null,
+          tracked: split.tracked,
+          active: split.active,
+          idle: split.idle,
+          activity: split.activity,
+          sessions: u.activityCount,
+          topProject: topId ? projectLabel(topId, projectById(topId)) : null,
+        };
+      });
+  }, [figures, memberId]);
 
-    return Object.values(days);
-  }, [acts, range]);
+  const bars = useMemo(() => dayBars(period.days, figures?.daily ?? []), [period.days, figures]);
+  const idleKnown = rows.some((r) => r.idle !== null);
+  const activeKnown = rows.some((r) => r.active !== null);
+  const topKnown = !!figures?.summary.perUserProject && rows.some((r) => r.topProject !== null);
+  const hasTime = (figures?.summary.trackedMinutes ?? 0) > 0;
 
-  const mockRows = useMemo<Row[]>(() => {
-    const members = trackedMembers(users).filter(
-      (u) => memberId === "all" || u.id === memberId
-    );
-
-    return members.map((u) => {
-      const ua = acts.filter((a) => a.userId === u.id);
-      const tracked = minutesForUser(acts, u.id);
-      const activity = ua.length ? averageProductivity(ua) : u.productivity;
-      const appCount = new Map<string, number>();
-      ua.forEach((a) => appCount.set(a.screen.app, (appCount.get(a.screen.app) ?? 0) + 1));
-      const topApp = [...appCount.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? "—";
-      return {
-        userId: u.id,
-        name: u.name,
-        designation: u.designation,
-        tracked,
-        activity,
-        sessions: ua.length,
-        productive: Math.round((tracked * activity) / 100),
-        topApp,
-      };
-    });
-  }, [acts, memberId]);
-
-  const liveTrend = useMemo(
-    () =>
-      (live.data?.series ?? []).map((d) => ({
-        day: new Date(d.date).toLocaleDateString("en", { weekday: "short", timeZone: "UTC" }),
-        tracked: Math.round(d.trackedMinutes),
-        productive: Math.round((d.trackedMinutes * d.averageProductivity) / 100),
-      })),
-    [live.data],
-  );
-
-  const liveRows = useMemo<Row[]>(
-    () =>
-      asArray<LivePerUser>(live.data?.summary.perUser)
-        .filter((u) => memberId === "all" || u.userId === memberId)
-        .map((u) => {
-          const member = userById(u.userId);
-          const tracked = Math.round(u.trackedMinutes);
-          const activity = Math.round(u.averageProductivity);
-          return {
-            userId: u.userId,
-            name: memberName(u.userId, member),
-            designation: member?.designation ?? "Member",
-            tracked,
-            activity,
-            sessions: u.activityCount,
-            productive: Math.round((tracked * activity) / 100),
-            topApp: "—",
-          };
-        }),
-    [live.data, memberId],
-  );
-
-  // A live session shows only real rows (or nothing) — never the demo team.
-  const rows = isLive ? liveRows : mockRows;
-  const trendData = isLive ? liveTrend : dynamicTrend;
-
-  let totalTracked: number;
-  let avgActivity: number;
-  let totalSessions: number;
-  if (isLive) {
-    // The summary is already scoped by the ProjectId/UserId filters.
-    const s = live.data?.summary;
-    totalTracked = Math.round(Number(s?.totalTrackedMinutes) || 0);
-    avgActivity = Math.round(Number(s?.averageProductivity) || 0);
-    totalSessions = Number(s?.totalActivities) || 0;
-  } else {
-    totalTracked = rows.reduce((s, r) => s + r.tracked, 0);
-    avgActivity = rows.length ? Math.round(rows.reduce((s, r) => s + r.activity, 0) / rows.length) : 0;
-    totalSessions = rows.reduce((s, r) => s + r.sessions, 0);
-  }
+  const tracked = rows.map((r) => r.tracked);
+  const totalTracked = displayedTotal(tracked, format);
+  const totalIdle = displayedTotal(rows.map((r) => r.idle ?? 0), format);
+  const totalActive = displayedTotal(rows.map((r) => r.active ?? 0), format);
+  const sessions = rows.reduce((s, r) => s + r.sessions, 0);
+  const average = figures?.summary.averageProductivity ?? null;
+  const averagePercent = average === null ? null : Math.round(average);
+  const dash = "—";
 
   const columns: Column<Row>[] = [
+    { key: "name", header: "Member", sortValue: (r) => r.name, render: (r) => <MemberCell name={r.name} sub={r.designation} status={userById(r.userId)?.status} /> },
+    { key: "tracked", header: "Tracked", align: "right", sortValue: (r) => r.tracked, render: (r) => <span className="font-semibold tabular-nums">{fmt(r.tracked)}</span> },
+    { key: "activity", header: "Activity", align: "right", sortValue: (r) => r.activity ?? -1, render: (r) => <ActivityBadge percent={r.activity} /> },
     {
-      key: "name",
-      header: "Member",
-      sortValue: (r) => r.name,
-      render: (r) => {
-        const u = userById(r.userId);
-        return (
-          <div className="flex items-center gap-2.5">
-            <Avatar name={r.name} size="sm" status={u?.status} />
-            <div className="min-w-0">
-              <div className="truncate font-medium">{r.name}</div>
-              <div className="truncate text-xs text-muted-foreground">{r.designation}</div>
-            </div>
-          </div>
-        );
-      },
-    },
-    { key: "tracked", header: "Tracked", align: "right", sortValue: (r) => r.tracked, render: (r) => <span className="font-medium">{formatDuration(r.tracked)}</span> },
-    {
-      key: "activity",
-      header: "Activity",
+      key: "active",
+      header: "Active",
       align: "right",
-      sortValue: (r) => r.activity,
-      render: (r) => (
-        <div className="ml-auto flex w-28 items-center gap-2">
-          <Progress value={r.activity} />
-          <span className="w-9 text-right text-xs font-medium">{r.activity}%</span>
-        </div>
-      ),
+      sortValue: (r) => r.active ?? -1,
+      render: (r) => (r.active === null ? <Dash label="Not measured" /> : <span className="tabular-nums">{fmt(r.active)}</span>),
     },
-    { key: "productive", header: "Productive", align: "right", sortValue: (r) => r.productive, render: (r) => formatDuration(r.productive) },
-    { key: "sessions", header: "Sessions", align: "right", sortValue: (r) => r.sessions, render: (r) => r.sessions },
-    { key: "topApp", header: "Top app", sortValue: (r) => r.topApp, render: (r) => <span className="text-muted-foreground">{r.topApp}</span> },
+    ...(idleKnown
+      ? [
+          {
+            key: "idle",
+            header: "Idle",
+            align: "right" as const,
+            sortValue: (r: Row) => r.idle ?? -1,
+            render: (r: Row) => (r.idle === null ? <Dash label="Not reported" /> : <span className="tabular-nums">{fmt(r.idle)}</span>),
+          },
+        ]
+      : []),
+    { key: "sessions", header: "Sessions", align: "right", sortValue: (r) => r.sessions, render: (r) => <span className="tabular-nums">{r.sessions}</span> },
+    ...(topKnown
+      ? [
+          {
+            key: "topProject",
+            header: "Top project",
+            sortValue: (r: Row) => r.topProject ?? "",
+            render: (r: Row) => (r.topProject ? <span className="text-muted-foreground">{r.topProject}</span> : <Dash label="No project" />),
+          },
+        ]
+      : []),
   ];
 
-  function onRange(r: ResolvedRange) {
-    setRange(r);
-    setRangeKey(r.key);
-  }
+  const footer = (
+    <>
+      <td className="sticky left-0 z-10 bg-card px-3 py-2.5">Total</td>
+      <td className="px-3 py-2.5 text-right tabular-nums">{fmt(totalTracked)}</td>
+      <td className="px-3 py-2.5 text-right tabular-nums">{averagePercent === null ? dash : `${averagePercent}%`}</td>
+      <td className="px-3 py-2.5 text-right tabular-nums">{activeKnown ? fmt(totalActive) : dash}</td>
+      {idleKnown && <td className="px-3 py-2.5 text-right tabular-nums">{fmt(totalIdle)}</td>}
+      <td className="px-3 py-2.5 text-right tabular-nums">{sessions}</td>
+      {topKnown && <td className="px-3 py-2.5" />}
+    </>
+  );
 
-  function doExport() {
-    exportRecords(`time-activity-${range.key}`, rows, [
-      { header: "Member", value: (r) => r.name },
-      { header: "Designation", value: (r) => r.designation },
-      { header: "Tracked (min)", value: (r) => r.tracked },
-      { header: "Activity %", value: (r) => r.activity },
-      { header: "Productive (min)", value: (r) => r.productive },
-      { header: "Sessions", value: (r) => r.sessions },
-      { header: "Top app", value: (r) => r.topApp },
+  function exportCsv() {
+    const headers = [
+      "Member",
+      "Hours (h:mm)",
+      "Hours (decimal)",
+      "Activity %",
+      "Active hours (decimal)",
+      ...(idleKnown ? ["Idle hours (decimal)"] : []),
+      "Sessions",
+      ...(topKnown ? ["Top project"] : []),
+    ];
+    const body: (string | number)[][] = rows.map((r) => [
+      r.name,
+      formatHM(r.tracked),
+      decimalHours(r.tracked),
+      r.activity ?? "",
+      r.active === null ? "" : decimalHours(r.active),
+      ...(idleKnown ? [r.idle === null ? "" : decimalHours(r.idle)] : []),
+      r.sessions,
+      ...(topKnown ? [r.topProject ?? ""] : []),
     ]);
+    body.push([
+      "Total",
+      formatHM(displayedTotal(tracked, "clock")),
+      decimalHoursTotal(tracked),
+      averagePercent ?? "",
+      activeKnown ? decimalHoursTotal(rows.map((r) => r.active ?? 0)) : "",
+      ...(idleKnown ? [decimalHoursTotal(rows.map((r) => r.idle ?? 0))] : []),
+      sessions,
+      ...(topKnown ? [""] : []),
+    ]);
+    downloadCSV(`time-activity-${period.fromKey}-to-${period.toKey}`, headers, body);
   }
 
   return (
     <ReportShell
       title="Time & Activity"
-      description="Time worked, activity level, and app usage per member."
-      actions={<ExportMenu onExportCSV={doExport} />}
+      description="Hours, activity (keyboard and mouse) and idle time per member, day by day."
+      actions={<ExportMenu onExportCSV={exportCsv} disabled={pending || rows.length === 0} />}
     >
-      <FilterBar
-        rangeKey={rangeKey}
-        onRange={onRange}
+      <ReportToolbar
+        period={range}
         projectId={projectId}
-        onProject={setProjectId}
+        onProject={scope.setProjectId}
         memberId={memberId}
-        onMember={setMemberId}
+        onMember={scope.setMemberId}
+        liveWorkerId={scope.liveWorkerId}
+        extra={<HoursFormatToggle value={format} onChange={setFormat} />}
       />
 
-      {isLive && <LiveReportNotice loading={live.loading} error={live.error} onRetry={live.retry} />}
+      {isLive && (
+        <div className="no-print">
+          <LiveReportNotice loading={live.loading} error={live.error} onRetry={live.retry} />
+        </div>
+      )}
 
       <KpiGrid>
-        <Kpi label="Total tracked" value={formatDuration(totalTracked)} icon={Clock} tone="#6d5efc" />
-        <Kpi label="Avg activity" value={`${avgActivity}%`} icon={Gauge} tone="#22c55e" />
-        <Kpi label="Sessions" value={String(totalSessions)} icon={CalendarCheck} tone="#0ea5e9" />
-        {isLive ? (
-          // The summary carries no screenshot count; don't restate sessions as screenshots.
-          <Kpi label="Members tracked" value={String(rows.length)} icon={Users} tone="#ec4899" />
+        <Kpi label="Total tracked" icon={Clock} accent="blue" value={pending ? dash : fmt(totalTracked)} sub={pending ? undefined : `${sessions} ${sessions === 1 ? "session" : "sessions"}`} />
+        <Kpi
+          label="Average activity"
+          icon={Gauge}
+          accent="green"
+          value={pending || averagePercent === null ? dash : `${averagePercent}%`}
+          sub={pending ? undefined : averagePercent === null ? "keyboard & mouse not measured" : "keyboard & mouse input"}
+        >
+          {!pending && averagePercent !== null && <MiniBar percent={averagePercent} className="bg-success" />}
+        </Kpi>
+        {idleKnown || pending ? (
+          <Kpi
+            label="Idle time"
+            icon={Hourglass}
+            accent="amber"
+            value={pending ? dash : fmt(totalIdle)}
+            sub={pending ? undefined : `${safePercent(totalIdle, totalTracked)}% of tracked time`}
+          />
         ) : (
-          <Kpi label="Screenshots" value={String(totalSessions)} icon={Camera} tone="#ec4899" sub="auto-captured" />
+          <Kpi
+            label="Active time"
+            icon={Zap}
+            accent="amber"
+            value={activeKnown ? fmt(totalActive) : dash}
+            sub={activeKnown ? "tracked time × activity" : "keyboard & mouse not measured"}
+          />
         )}
+        <Kpi label="Members" icon={Users} accent="violet" value={pending ? dash : String(rows.length)} sub={pending ? undefined : "with tracked time"} />
       </KpiGrid>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Tracked vs productive time</CardTitle>
-          <span className="text-xs text-muted-foreground">{range.label}</span>
-        </CardHeader>
-        <CardContent>
-          <ActivityTrendChart data={trendData} />
-        </CardContent>
-      </Card>
+      {pending ? (
+        live.loading ? <ReportSkeleton /> : null
+      ) : !hasTime ? (
+        <NoTimeState period={period} onWiden={period.custom || range.toolbar.preset !== "30d" ? () => range.choosePreset("30d") : undefined} />
+      ) : (
+        <>
+          <Card>
+            <SectionHeading title="Hours per day" sub={`${period.label} · active, other tracked and idle time`}>
+              <ActivityLegend idle={idleKnown} other={bars.some((b) => b.other > 0)} />
+            </SectionHeading>
+            <CardContent>
+              <DailyHoursChart bars={bars} fmt={fmt} label={`Hours tracked per day, ${period.label}. The table below lists each member.`} />
+            </CardContent>
+          </Card>
 
-      <Card>
-        <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-          <div>
-            <CardTitle>Breakdown by member</CardTitle>
-            <span className="text-xs text-muted-foreground">{rows.length} members</span>
-          </div>
-          <div className="flex items-center gap-1 rounded-lg bg-muted p-0.5 text-xs">
-            <button
-              onClick={() => setViewMode("table")}
-              className={cn("px-2.5 py-1.5 rounded-md transition-all", viewMode === "table" ? "bg-card text-foreground shadow-sm font-semibold" : "text-muted-foreground hover:text-foreground")}
-            >
-              Table
-            </button>
-            <button
-              onClick={() => setViewMode("grid")}
-              className={cn("px-2.5 py-1.5 rounded-md transition-all", viewMode === "grid" ? "bg-card text-foreground shadow-sm font-semibold" : "text-muted-foreground hover:text-foreground")}
-            >
-              Grid
-            </button>
-          </div>
-        </CardHeader>
-        <CardContent>
-          {viewMode === "table" ? (
-            <DataTable
-              columns={columns}
-              rows={rows}
-              initialSort={{ key: "tracked", dir: "desc" }}
-              emptyText={isLive ? "No tracked time for these filters." : undefined}
-            />
-          ) : (
-            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
-              {rows.map((r) => {
-                const u = userById(r.userId);
-                return (
-                  <Card key={r.userId} className="p-4 hover:border-primary/40 transition-colors">
-                    <div className="flex items-center gap-3">
-                      <Avatar name={r.name} size="md" status={u?.status} />
-                      <div className="min-w-0 flex-1">
-                        <h4 className="font-semibold truncate text-sm">{r.name}</h4>
-                        <p className="text-xs text-muted-foreground truncate">{r.designation}</p>
-                      </div>
-                    </div>
-                    <div className="mt-4 grid grid-cols-2 gap-2 border-t border-border/60 pt-3 text-xs">
-                      <div>
-                        <span className="text-muted-foreground">Tracked</span>
-                        <div className="text-sm font-bold text-foreground mt-0.5">{formatDuration(r.tracked)}</div>
-                      </div>
-                      <div>
-                        <span className="text-muted-foreground">Productive</span>
-                        <div className="text-sm font-bold text-success mt-0.5">{formatDuration(r.productive)}</div>
-                      </div>
-                    </div>
-                    <div className="mt-4 space-y-1.5">
-                      <div className="flex justify-between text-xs text-muted-foreground">
-                        <span>Activity Level</span>
-                        <span className="font-semibold text-foreground">{r.activity}%</span>
-                      </div>
-                      <Progress value={r.activity} />
-                    </div>
-                    <div className="mt-4 flex items-center justify-between text-xs text-muted-foreground border-t border-border/60 pt-3">
-                      <span>Sessions: <strong className="text-foreground">{r.sessions}</strong></span>
-                      <span className="truncate max-w-[140px]">Top App: <strong className="text-foreground">{r.topApp}</strong></span>
-                    </div>
-                  </Card>
-                );
-              })}
-            </div>
-          )}
-        </CardContent>
-      </Card>
+          <Card>
+            <SectionHeading title="By member" sub={`${rows.length} ${rows.length === 1 ? "member" : "members"} with tracked time`} />
+            <CardContent>
+              <DataTable columns={columns} rows={rows} initialSort={{ key: "tracked", dir: "desc" }} footer={footer} emptyText="No tracked time for these filters." />
+            </CardContent>
+          </Card>
+        </>
+      )}
+
+      <ReportFootnote>
+        Hours are the tracked blocks recorded by the desktop app, on calendar days of the reporting time zone shown above. Activity % is
+        the share of tracked minutes with keyboard or mouse input (blocks recorded without input capture aren&apos;t counted); active time
+        is tracked time × activity %, idle time is the minutes without input, and other tracked time is the rest.
+        {!idleKnown && " This server doesn't report idle time yet."}
+      </ReportFootnote>
     </ReportShell>
   );
 }

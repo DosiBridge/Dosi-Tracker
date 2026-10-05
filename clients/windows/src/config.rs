@@ -18,6 +18,9 @@ pub struct AppConfig {
     /// Base URL of the Dosi-Tracker backend API.
     pub api_base_url: String,
 
+    /// The web dashboard, opened by "Open web dashboard" in the window and tray.
+    pub dashboard_url: String,
+
     /// How often a tracking snapshot is taken, in minutes (5..=60).
     /// A longer interval means the agent sleeps more -> lower CPU/battery use.
     pub interval_minutes: u64,
@@ -35,6 +38,10 @@ pub struct CapturePermissions {
     pub mouse: bool,
     pub active_window: bool,
     pub running_programs: bool,
+    /// Blur screen captures before upload. The effective value is the
+    /// project's policy OR this, so a local config can add blur but never
+    /// remove it.
+    pub blur_screenshots: bool,
 }
 
 impl Default for CapturePermissions {
@@ -46,14 +53,69 @@ impl Default for CapturePermissions {
             mouse: true,
             active_window: true,
             running_programs: true,
+            blur_screenshots: false,
         }
     }
+}
+
+/// Why a server address cannot be used, worded for the sign-in form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerUrlError {
+    Empty,
+    /// Only `http://` and `https://` are supported.
+    UnsupportedScheme(String),
+    Invalid,
+}
+
+impl std::fmt::Display for ServerUrlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ServerUrlError::Empty => write!(f, "Enter the server address."),
+            ServerUrlError::UnsupportedScheme(scheme) => {
+                write!(f, "The server address must start with https:// or http:// (not {scheme}://).")
+            }
+            ServerUrlError::Invalid => write!(f, "That is not a valid server address."),
+        }
+    }
+}
+
+impl std::error::Error for ServerUrlError {}
+
+/// Normalize a server (API) address typed at sign-in or written in the
+/// config: surrounding whitespace and trailing slashes go (pages are appended
+/// as "/path"), a bare host gets `https://`, and only `http(s)` URLs with a
+/// host and no credentials, query or fragment are accepted. A path prefix
+/// (a server behind a reverse proxy at `/tracker`) is kept.
+pub fn normalize_server_url(input: &str) -> Result<String, ServerUrlError> {
+    let trimmed = input.trim();
+    if trimmed.trim_end_matches('/').is_empty() {
+        return Err(ServerUrlError::Empty);
+    }
+    // "localhost:6006" would otherwise parse as scheme "localhost".
+    let with_scheme = if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("https://{trimmed}")
+    };
+    let url = reqwest::Url::parse(&with_scheme).map_err(|_| ServerUrlError::Invalid)?;
+    let scheme = url.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(ServerUrlError::UnsupportedScheme(scheme.to_string()));
+    }
+    let host = url.host_str().filter(|h| !h.is_empty()).ok_or(ServerUrlError::Invalid)?;
+    if !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.fragment().is_some() {
+        return Err(ServerUrlError::Invalid);
+    }
+    let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+    let path = url.path().trim_end_matches('/');
+    Ok(format!("{scheme}://{host}{port}{path}"))
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
             api_base_url: "https://localhost:6006".to_string(), // matches HttpApi.Host App:SelfUrl
+            dashboard_url: "http://localhost:6005".to_string(), // the Next.js frontend (`npm run dev`)
             interval_minutes: 10,
             capture: CapturePermissions::default(),
         }
@@ -104,11 +166,39 @@ impl AppConfig {
 
     fn normalized(mut self) -> Self {
         self.interval_minutes = self.interval_minutes.clamp(5, 60);
+        // Pages are appended as "/path", so no trailing slash.
+        let trimmed = self.dashboard_url.trim().trim_end_matches('/');
+        self.dashboard_url = trimmed.to_string();
+        // A trailing slash would make every endpoint "//connect/token" (404,
+        // reported as "cannot reach the server"); a typo must not go unnoticed.
+        self.api_base_url = match normalize_server_url(&self.api_base_url) {
+            Ok(url) => url,
+            Err(e) => {
+                let fallback = AppConfig::default().api_base_url;
+                tracing::warn!(url = %self.api_base_url, %e, %fallback, "invalid api_base_url; using the default");
+                fallback
+            }
+        };
         self
     }
 
     pub fn interval(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.interval_minutes * 60)
+    }
+
+    /// The server to talk to: the address saved with the sign-in (typed on
+    /// the sign-in screen) wins over `config.toml` / `DOSI__API_BASE_URL`, as
+    /// long as it is a valid address.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the server address saved at sign-in"))]
+    pub fn effective_api_base_url(&self, saved_server: Option<&str>) -> String {
+        match saved_server.map(normalize_server_url) {
+            Some(Ok(url)) => url,
+            Some(Err(e)) => {
+                tracing::warn!(%e, "the saved server address is invalid; using the configured one");
+                self.api_base_url.clone()
+            }
+            None => self.api_base_url.clone(),
+        }
     }
 }
 
@@ -156,6 +246,61 @@ mod tests {
         assert!(cfg.capture.keyboard && cfg.capture.mouse);
         assert!(cfg.capture.active_window && cfg.capture.running_programs);
         assert_eq!(cfg.api_base_url, AppConfig::default().api_base_url);
+    }
+
+    #[test]
+    fn dashboard_url_defaults_and_trims_a_trailing_slash() {
+        assert_eq!(from_toml("").dashboard_url, "http://localhost:6005");
+        let cfg = from_toml("dashboard_url = \"https://app.example.com/ \"");
+        assert_eq!(cfg.dashboard_url, "https://app.example.com");
+    }
+
+    #[test]
+    fn api_base_url_is_normalized_and_validated() {
+        let cfg = from_toml("api_base_url = \" https://tracker.example.com// \"");
+        assert_eq!(cfg.api_base_url, "https://tracker.example.com");
+        // Not a URL the agent can use: the default, not a broken one.
+        let cfg = from_toml("api_base_url = \"ftp://tracker.example.com\"");
+        assert_eq!(cfg.api_base_url, AppConfig::default().api_base_url);
+        assert!(!cfg.capture.blur_screenshots);
+    }
+
+    #[test]
+    fn server_urls_are_normalized() {
+        let ok = |input: &str| normalize_server_url(input).unwrap();
+        assert_eq!(ok("https://tracker.example.com/"), "https://tracker.example.com");
+        assert_eq!(ok("  HTTPS://Tracker.Example.com:8443/// "), "https://tracker.example.com:8443");
+        assert_eq!(ok("http://10.0.0.5:6006"), "http://10.0.0.5:6006");
+        // A bare host (what people type) is https.
+        assert_eq!(ok("tracker.example.com"), "https://tracker.example.com");
+        assert_eq!(ok("localhost:6006"), "https://localhost:6006");
+        // A reverse-proxy path prefix is kept; the default port is dropped.
+        assert_eq!(ok("https://example.com:443/tracker/"), "https://example.com/tracker");
+        assert_eq!(ok("http://[::1]:6006/"), "http://[::1]:6006");
+    }
+
+    #[test]
+    fn unusable_server_urls_are_refused() {
+        assert_eq!(normalize_server_url(""), Err(ServerUrlError::Empty));
+        assert_eq!(normalize_server_url(" / "), Err(ServerUrlError::Empty));
+        assert_eq!(
+            normalize_server_url("ftp://example.com"),
+            Err(ServerUrlError::UnsupportedScheme("ftp".into()))
+        );
+        for bad in ["https://", "https://exa mple.com", "https://user:pw@example.com", "https://example.com/?a=1", "https://example.com/#x"] {
+            assert_eq!(normalize_server_url(bad), Err(ServerUrlError::Invalid), "{bad}");
+        }
+        // The messages are meant for the sign-in form.
+        assert!(ServerUrlError::UnsupportedScheme("ftp".into()).to_string().contains("https://"));
+    }
+
+    #[test]
+    fn a_server_saved_at_sign_in_overrides_the_config() {
+        let cfg = from_toml("api_base_url = \"https://configured.example.com\"");
+        assert_eq!(cfg.effective_api_base_url(None), "https://configured.example.com");
+        assert_eq!(cfg.effective_api_base_url(Some("saved.example.com/")), "https://saved.example.com");
+        // A damaged saved value never breaks the agent.
+        assert_eq!(cfg.effective_api_base_url(Some("ftp://saved")), "https://configured.example.com");
     }
 
     #[test]

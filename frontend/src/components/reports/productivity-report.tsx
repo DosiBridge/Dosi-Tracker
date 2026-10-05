@@ -1,406 +1,341 @@
 "use client";
 
-import { useCallback, useMemo, useState } from "react";
-import {
-  Bar,
-  BarChart,
-  Cell,
-  Pie,
-  PieChart,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from "recharts";
-import { Clock, Gauge, TrendingUp, Minus, TrendingDown } from "lucide-react";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Avatar } from "@/components/ui/avatar";
-import { Badge } from "@/components/ui/badge";
+import { useCallback, useMemo } from "react";
+import Link from "next/link";
+import { ArrowRight, Gauge, Hourglass, TrendingUp, Zap } from "lucide-react";
+import { Card, CardContent } from "@/components/ui/card";
 import { DataTable, type Column } from "@/components/ui/data-table";
-import { ReportShell, FilterBar, ExportMenu, Kpi, KpiGrid, LiveReportNotice, useLiveReport } from "./report-shell";
-import { activities, userById, users } from "@/lib/tenant-data";
-import { durationMinutes } from "@/lib/metrics";
-import { categoryColor, filterActivitiesByRange, type RangeKey } from "@/lib/reports-data";
-import { activitySplit, asArray, memberName, reportQuery, safePercent } from "@/lib/report-math";
-import { exportRecords } from "@/lib/export";
-import { cn, formatDuration } from "@/lib/utils";
 import { getApi } from "@/hooks/useApi";
-import { useSession } from "@/components/session-provider";
-import { resolveRange, type ResolvedRange } from "./date-range-picker";
+import { reportingRoute } from "@/lib/api-contract";
+import { APP_CATEGORY_COLORS, OTHER_APP_COLOR } from "@/lib/apps";
+import { downloadCSV } from "@/lib/export";
+import {
+  ALL,
+  APP_GROUPS,
+  APP_GROUP_LABELS,
+  activityBreakdown,
+  appGroupTotals,
+  appUsageFromBlocks,
+  decimalHoursTotal,
+  displayedTotal,
+  memberName,
+  readAppUsage,
+  readSummary,
+  safePercent,
+  summarizeBlocks,
+  type AppGroup,
+  type AppUsageLine,
+  type ReportSummary,
+} from "@/lib/report-math";
+import { userById } from "@/lib/tenant-data";
+import { decimalHours, formatHM } from "@/lib/work-report";
+import {
+  ActivityBadge,
+  ActivityLegend,
+  Dash,
+  ExportMenu,
+  HoursFormatToggle,
+  Kpi,
+  KpiGrid,
+  LiveReportNotice,
+  MemberCell,
+  MiniBar,
+  NoTimeState,
+  RankedBars,
+  ReportFootnote,
+  ReportShell,
+  ReportSkeleton,
+  ReportToolbar,
+  SectionHeading,
+  ShareDonut,
+  demoActivities,
+  useHoursFormat,
+  usePeriodReport,
+  useReportPeriod,
+  useReportScope,
+} from "./report-shell";
 
-/* ---- Live (API) shape: /api/app/reporting/summary ---- */
+/* ============================================================================
+ * PRODUCTIVITY — two different questions, each with its own definition:
+ *  - how much of each member's tracked time had keyboard or mouse input
+ *    (active), had none (idle), or wasn't measured either way (other);
+ *  - how the team's app time splits by APP CATEGORY (productive, neutral,
+ *    unproductive — lib/apps; apps nobody has classified are shown apart).
+ * "Productive" is only ever the app category, never the activity score.
+ * Live: /reporting/summary and /reporting/app-usage for the period in the
+ * reporting zone (the app split is secondary: without it the rest stands).
+ * ========================================================================== */
 
-interface LivePerUser {
-  userId: string;
-  activityCount: number;
-  trackedMinutes: number;
-  averageProductivity: number;
+interface Figures {
+  summary: ReportSummary;
+  /** null when app usage couldn't be read. */
+  apps: AppUsageLine[] | null;
 }
-
-const tooltipStyle = {
-  borderRadius: 12,
-  border: "1px solid var(--border)",
-  background: "var(--card)",
-  fontSize: 12,
-  boxShadow: "var(--elev-lg)",
-} as const;
 
 interface Row {
   userId: string;
   name: string;
-  productive: number;
-  neutral: number;
-  unproductive: number;
-  idle: number;
-  focus: number;
+  tracked: number;
+  active: number | null;
+  idle: number | null;
+  other: number;
+  activity: number | null;
 }
 
+const GROUP_COLORS: Record<AppGroup, string> = { ...APP_CATEGORY_COLORS, unclassified: OTHER_APP_COLOR };
+
 export function ProductivityReport() {
-  const { isLive } = useSession();
-  const [rangeKey, setRangeKey] = useState<RangeKey>("7d");
-  const [range, setRange] = useState<ResolvedRange>(() => resolveRange("7d"));
-  const [memberId, setMemberId] = useState("all");
-  const [viewMode, setViewMode] = useState<"table" | "grid">("table");
+  const scope = useReportScope();
+  const { isLive, projectId, memberId } = scope;
+  const range = useReportPeriod("7d", isLive);
+  const { period, timeZone } = range;
+  const { format, setFormat, fmt } = useHoursFormat();
 
-  const loadLive = useCallback(async (): Promise<LivePerUser[]> => {
-    const summary = (await getApi(
-      `/api/app/reporting/summary?${reportQuery({ from: range.from, to: range.to, userId: memberId })}`,
-    )) as { perUser?: LivePerUser[] } | null;
-    return asArray<LivePerUser>(summary?.perUser);
-  }, [range, memberId]);
+  const load = useCallback(async (): Promise<Figures> => {
+    const query = { from: period.from, to: period.to, projectId, userId: memberId, timeZone };
+    const [summary, apps] = await Promise.all([
+      getApi(reportingRoute("summary", query)),
+      getApi(reportingRoute("app-usage", query)).catch(() => null),
+    ]);
+    return { summary: readSummary(summary), apps: Array.isArray(apps) ? readAppUsage(apps) : null };
+  }, [period, projectId, memberId, timeZone]);
+  const live = usePeriodReport(isLive, range.ready, load);
 
-  const live = useLiveReport(isLive, loadLive);
+  const demo = useMemo<Figures | null>(() => {
+    if (isLive) return null;
+    const list = demoActivities(period, projectId, memberId);
+    return { summary: summarizeBlocks(list, timeZone).summary, apps: appUsageFromBlocks(list) };
+  }, [isLive, period, projectId, memberId, timeZone]);
 
-  const mockRows = useMemo<Row[]>(() => {
-    const acts = filterActivitiesByRange(activities, range.from, range.to);
-    const members = users.filter((u) => u.role !== "client" && (memberId === "all" || u.id === memberId));
-    return members.map((u) => {
-      const ua = acts.filter((a) => a.userId === u.id);
-      let productive = 0;
-      let neutral = 0;
-      let unproductive = 0;
-      let idle = 0;
+  // A live session shows only real figures (or nothing) — never the demo team.
+  const figures = isLive ? live.data : demo;
+  const pending = live.pending;
 
-      ua.forEach((a) => {
-        const mins = durationMinutes(a);
-        const prod = Math.round((mins * a.productivity) / 100);
-        const rem = mins - prod;
-        const unprod = Math.round(rem * 0.35);
-        const neut = rem - unprod;
-
-        productive += prod;
-        neutral += neut;
-        unproductive += unprod;
-        idle += Math.round(mins * 0.08);
-      });
-
-      const total = productive + neutral + unproductive;
-      const focus = total ? Math.round((productive / total) * 100) : 0;
-      return {
-        userId: u.id,
-        name: u.name,
-        productive,
-        neutral,
-        unproductive,
-        idle,
-        focus,
-      };
-    });
-  }, [range, memberId]);
-
-  /*
-   * LIVE: the backend reports each member's tracked minutes and their
-   * duration-weighted activity score — nothing classifies time as neutral or
-   * unproductive and nothing measures idle time. So a live row carries the
-   * active ("productive") share and the rest as "other tracked"; the demo-only
-   * unproductive/idle split is never invented for a real person.
-   */
-  const liveRows = useMemo<Row[]>(
+  const rows = useMemo<Row[]>(
     () =>
-      (live.data ?? [])
-        .filter((u) => memberId === "all" || u.userId === memberId)
+      (figures?.summary.perUser ?? [])
+        .filter((u) => memberId === ALL || u.userId === memberId)
         .map((u) => {
-          const split = activitySplit(u.trackedMinutes, u.averageProductivity);
+          const split = activityBreakdown(u.trackedMinutes, u.averageProductivity, u.idleMinutes);
           return {
             userId: u.userId,
-            name: memberName(u.userId, userById(u.userId)),
-            productive: split.productive,
-            neutral: split.other,
-            unproductive: 0,
-            idle: 0,
-            focus: split.focus,
+            name: memberName(u.userId, userById(u.userId) ?? (u.name ? { name: u.name } : null)),
+            tracked: split.tracked,
+            active: split.active,
+            idle: split.idle,
+            other: split.other,
+            activity: split.activity,
           };
         }),
-    [live.data, memberId],
+    [figures, memberId],
   );
 
-  const rows = isLive ? liveRows : mockRows;
-  const neutralLabel = isLive ? "Other tracked" : "Neutral";
+  const idleKnown = rows.some((r) => r.idle !== null);
+  const activeKnown = rows.some((r) => r.active !== null);
+  // Time that is neither measured active nor idle (e.g. no input capture): a column only when there is some.
+  const otherShown = rows.some((r) => r.other > 0);
+  const hasTime = (figures?.summary.trackedMinutes ?? 0) > 0;
+  const tracked = rows.map((r) => r.tracked);
+  const totalTracked = displayedTotal(tracked, format);
+  const totalActive = displayedTotal(rows.map((r) => r.active ?? 0), format);
+  const totalIdle = displayedTotal(rows.map((r) => r.idle ?? 0), format);
+  const average = figures?.summary.averageProductivity ?? null;
+  const averagePercent = average === null ? null : Math.round(average);
+  const groups = figures?.apps ? appGroupTotals(figures.apps) : null;
+  const dash = "—";
 
-  const totals = useMemo(() => {
-    const t = { productive: 0, neutral: 0, unproductive: 0, idle: 0 };
-    rows.forEach((r) => {
-      t.productive += r.productive;
-      t.neutral += r.neutral;
-      t.unproductive += r.unproductive;
-      t.idle += r.idle;
-    });
-    return t;
-  }, [rows]);
-
-  const grand = totals.productive + totals.neutral + totals.unproductive;
-  const focusPct = safePercent(totals.productive, grand);
-
-  const donutData = isLive
-    ? [
-        { name: "Productive", value: totals.productive, color: categoryColor.productive },
-        { name: neutralLabel, value: totals.neutral, color: categoryColor.neutral },
-      ]
-    : [
-        { name: "Productive", value: totals.productive, color: categoryColor.productive },
-        { name: "Neutral", value: totals.neutral, color: categoryColor.neutral },
-        { name: "Unproductive", value: totals.unproductive, color: categoryColor.unproductive },
-      ];
-
-  const barData = rows.map((r) => ({ ...r, name: r.name.split(" ")[0] }));
-
-  const allColumns: Column<Row>[] = [
+  const columns: Column<Row>[] = [
+    { key: "name", header: "Member", sortValue: (r) => r.name, render: (r) => <MemberCell name={r.name} status={userById(r.userId)?.status} /> },
+    { key: "tracked", header: "Tracked", align: "right", sortValue: (r) => r.tracked, render: (r) => <span className="font-semibold tabular-nums">{fmt(r.tracked)}</span> },
     {
-      key: "name",
-      header: "Member",
-      sortValue: (r) => r.name,
-      render: (r) => (
-        <div className="flex items-center gap-2.5">
-          <Avatar name={r.name} size="sm" status={userById(r.userId)?.status} />
-          <span className="font-medium">{r.name}</span>
-        </div>
-      ),
-    },
-    { key: "productive", header: "Productive", align: "right", sortValue: (r) => r.productive, render: (r) => <span className="text-success">{formatDuration(r.productive)}</span> },
-    { key: "neutral", header: neutralLabel, align: "right", sortValue: (r) => r.neutral, render: (r) => <span className="text-info">{formatDuration(r.neutral)}</span> },
-    { key: "unproductive", header: "Unproductive", align: "right", sortValue: (r) => r.unproductive, render: (r) => <span className="text-danger">{formatDuration(r.unproductive)}</span> },
-    { key: "idle", header: "Idle", align: "right", sortValue: (r) => r.idle, render: (r) => <span className="text-muted-foreground">{formatDuration(r.idle)}</span> },
-    {
-      key: "focus",
-      header: "Focus",
+      key: "active",
+      header: "Active",
       align: "right",
-      sortValue: (r) => r.focus,
-      render: (r) => <Badge tone={r.focus >= 70 ? "success" : r.focus >= 50 ? "warning" : "danger"}>{r.focus}%</Badge>,
+      sortValue: (r) => r.active ?? -1,
+      render: (r) => (r.active === null ? <Dash label="Not measured" /> : <span className="tabular-nums text-success-on-tint">{fmt(r.active)}</span>),
     },
+    ...(idleKnown
+      ? [
+          {
+            key: "idle",
+            header: "Idle",
+            align: "right" as const,
+            sortValue: (r: Row) => r.idle ?? -1,
+            render: (r: Row) => (r.idle === null ? <Dash label="Not reported" /> : <span className="tabular-nums text-warning-on-tint">{fmt(r.idle)}</span>),
+          },
+        ]
+      : []),
+    ...(otherShown
+      ? [
+          {
+            key: "other",
+            header: "Other tracked",
+            align: "right" as const,
+            sortValue: (r: Row) => r.other,
+            render: (r: Row) => <span className="tabular-nums text-muted-foreground">{fmt(r.other)}</span>,
+          },
+        ]
+      : []),
+    { key: "activity", header: "Activity", align: "right", sortValue: (r) => r.activity ?? -1, render: (r) => <ActivityBadge percent={r.activity} /> },
   ];
-  // Live data has no unproductive/idle measurement: those columns would only ever read 0.
-  const columns = isLive ? allColumns.filter((c) => c.key !== "unproductive" && c.key !== "idle") : allColumns;
 
-  function onRange(r: ResolvedRange) {
-    setRange(r);
-    setRangeKey(r.key);
-  }
-  function doExport() {
-    if (isLive) {
-      exportRecords(`productivity-${range.key}`, rows, [
-        { header: "Member", value: (r) => r.name },
-        { header: "Productive (min)", value: (r) => r.productive },
-        { header: "Other tracked (min)", value: (r) => r.neutral },
-        { header: "Focus %", value: (r) => r.focus },
-      ]);
-      return;
-    }
-    exportRecords(`productivity-${range.key}`, rows, [
-      { header: "Member", value: (r) => r.name },
-      { header: "Productive (min)", value: (r) => r.productive },
-      { header: "Neutral (min)", value: (r) => r.neutral },
-      { header: "Unproductive (min)", value: (r) => r.unproductive },
-      { header: "Idle (min)", value: (r) => r.idle },
-      { header: "Focus %", value: (r) => r.focus },
+  function exportCsv() {
+    const headers = [
+      "Member",
+      "Tracked hours (decimal)",
+      "Active hours (decimal)",
+      ...(idleKnown ? ["Idle hours (decimal)"] : []),
+      ...(otherShown ? ["Other tracked hours (decimal)"] : []),
+      "Activity %",
+      "Tracked (h:mm)",
+    ];
+    const body: (string | number)[][] = rows.map((r) => [
+      r.name,
+      decimalHours(r.tracked),
+      r.active === null ? "" : decimalHours(r.active),
+      ...(idleKnown ? [r.idle === null ? "" : decimalHours(r.idle)] : []),
+      ...(otherShown ? [decimalHours(r.other)] : []),
+      r.activity ?? "",
+      formatHM(r.tracked),
     ]);
+    body.push([
+      "Total",
+      decimalHoursTotal(tracked),
+      activeKnown ? decimalHoursTotal(rows.map((r) => r.active ?? 0)) : "",
+      ...(idleKnown ? [decimalHoursTotal(rows.map((r) => r.idle ?? 0))] : []),
+      ...(otherShown ? [decimalHoursTotal(rows.map((r) => r.other))] : []),
+      averagePercent ?? "",
+      formatHM(displayedTotal(tracked, "clock")),
+    ]);
+    downloadCSV(`productivity-${period.fromKey}-to-${period.toKey}`, headers, body);
   }
+
+  const productiveShare = groups && groups.total > 0 ? safePercent(groups.productive, groups.total) : null;
 
   return (
     <ReportShell
       title="Productivity"
-      description="How time splits across productive, neutral, and unproductive apps."
-      actions={<ExportMenu onExportCSV={doExport} />}
+      description="Active and idle time per member, and time spent in productive, neutral and unproductive apps."
+      actions={<ExportMenu onExportCSV={exportCsv} disabled={pending || rows.length === 0} />}
     >
-      <FilterBar rangeKey={rangeKey} onRange={onRange} memberId={memberId} onMember={setMemberId} />
-
-      {isLive && <LiveReportNotice loading={live.loading} error={live.error} onRetry={live.retry} />}
-
-      <KpiGrid>
-        <Kpi label="Team focus" value={`${focusPct}%`} icon={Gauge} tone="#6d5efc" sub={range.label} />
-        <Kpi label="Productive" value={formatDuration(totals.productive)} icon={TrendingUp} tone="#22c55e" />
-        <Kpi label={neutralLabel} value={formatDuration(totals.neutral)} icon={Minus} tone="#0ea5e9" />
-        {isLive ? (
-          <Kpi label="Total tracked" value={formatDuration(grand)} icon={Clock} tone="#ec4899" />
-        ) : (
-          <Kpi label="Unproductive" value={formatDuration(totals.unproductive)} icon={TrendingDown} tone="#ef4444" />
-        )}
-      </KpiGrid>
-
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
-        <Card>
-          <CardHeader><CardTitle>Time split</CardTitle></CardHeader>
-          <CardContent>
-            <div className="mx-auto h-[160px] max-w-[240px] sm:h-[200px] sm:max-w-none">
-              <ResponsiveContainer width="100%" height="100%">
-                <PieChart>
-                  <Pie data={donutData} dataKey="value" innerRadius={44} outerRadius={68} paddingAngle={2} strokeWidth={0}>
-                    {donutData.map((d) => <Cell key={d.name} fill={d.color} />)}
-                  </Pie>
-                  <Tooltip contentStyle={tooltipStyle} formatter={(v) => formatDuration(Number(v))} />
-                </PieChart>
-              </ResponsiveContainer>
-            </div>
-            <div className="mt-2 space-y-1.5">
-              {donutData.map((d) => (
-                <div key={d.name} className="flex items-center justify-between text-sm">
-                  <span className="flex items-center gap-2">
-                    <span className="h-2.5 w-2.5 rounded-full" style={{ background: d.color }} /> {d.name}
-                  </span>
-                  <span className="font-medium">{safePercent(d.value, grand)}%</span>
-                </div>
-              ))}
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card className="lg:col-span-2">
-          <CardHeader><CardTitle>Per-member breakdown</CardTitle></CardHeader>
-          <CardContent>
-            <div className="h-[200px] w-full min-w-0 sm:h-[260px]">
-              <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={barData} margin={{ top: 8, right: 8, left: -8, bottom: 0 }}>
-                  <XAxis dataKey="name" tickLine={false} axisLine={false} tick={{ fill: "#94a3b8", fontSize: 11 }} interval={0} angle={0} />
-                  <YAxis tickLine={false} axisLine={false} tick={{ fill: "#94a3b8", fontSize: 11 }} width={36} />
-                  <Tooltip contentStyle={tooltipStyle} cursor={{ fill: "var(--muted)" }} formatter={(v) => formatDuration(Number(v))} />
-                  <Bar dataKey="productive" stackId="a" fill={categoryColor.productive} radius={[0, 0, 0, 0]} barSize={22} />
-                  <Bar
-                    dataKey="neutral"
-                    name={isLive ? "other tracked" : "neutral"}
-                    stackId="a"
-                    fill={categoryColor.neutral}
-                    radius={isLive ? [4, 4, 0, 0] : [0, 0, 0, 0]}
-                    barSize={22}
-                  />
-                  {!isLive && (
-                    <Bar dataKey="unproductive" stackId="a" fill={categoryColor.unproductive} radius={[4, 4, 0, 0]} barSize={22} />
-                  )}
-                </BarChart>
-              </ResponsiveContainer>
-            </div>
-          </CardContent>
-        </Card>
-      </div>
-
-      <Card>
-        <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-          <div>
-            <CardTitle>Details</CardTitle>
-            <span className="text-xs text-muted-foreground">{rows.length} members</span>
-          </div>
-          <div className="flex items-center gap-1 rounded-lg bg-muted p-0.5 text-xs">
-            <button
-              onClick={() => setViewMode("table")}
-              className={cn("px-2.5 py-1.5 rounded-md transition-all", viewMode === "table" ? "bg-card text-foreground shadow-sm font-semibold" : "text-muted-foreground hover:text-foreground")}
-            >
-              Table
-            </button>
-            <button
-              onClick={() => setViewMode("grid")}
-              className={cn("px-2.5 py-1.5 rounded-md transition-all", viewMode === "grid" ? "bg-card text-foreground shadow-sm font-semibold" : "text-muted-foreground hover:text-foreground")}
-            >
-              Grid
-            </button>
-          </div>
-        </CardHeader>
-        <CardContent>
-          {viewMode === "table" ? (
-            <DataTable
-              columns={columns}
-              rows={rows}
-              initialSort={{ key: "focus", dir: "desc" }}
-              emptyText={isLive ? "No tracked time in this range." : undefined}
-            />
-          ) : (
-            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
-              {rows.map((r) => {
-                const u = userById(r.userId);
-                const sumTotal = r.productive + r.neutral + r.unproductive;
-                return (
-                  <Card key={r.userId} className="p-4 hover:border-primary/40 transition-colors">
-                    <div className="flex items-center gap-3">
-                      <Avatar name={r.name} size="md" status={u?.status} />
-                      <div className="min-w-0 flex-1">
-                        <h4 className="font-semibold truncate text-sm">{r.name}</h4>
-                        <p className="text-xs text-muted-foreground truncate">{u?.designation ?? "Team Member"}</p>
-                      </div>
-                    </div>
-
-                    <div className="mt-4 space-y-2 border-t border-border/60 pt-3">
-                      <div className="flex justify-between text-xs">
-                        <span className="text-muted-foreground">Focus Score</span>
-                        <Badge tone={r.focus >= 70 ? "success" : r.focus >= 50 ? "warning" : "danger"}>{r.focus}%</Badge>
-                      </div>
-
-                      <div className="space-y-1">
-                        <div className="flex justify-between text-[11px] text-muted-foreground">
-                          <span>Productivity Split</span>
-                          <span>{formatDuration(r.productive)} / {formatDuration(sumTotal)}</span>
-                        </div>
-                        <div className="flex h-2 w-full overflow-hidden rounded-full bg-muted">
-                          <div className="bg-success transition-all" style={{ width: `${safePercent(r.productive, sumTotal)}%` }} title={`Productive: ${formatDuration(r.productive)}`} />
-                          <div className="bg-info transition-all" style={{ width: `${safePercent(r.neutral, sumTotal)}%` }} title={`${neutralLabel}: ${formatDuration(r.neutral)}`} />
-                          {!isLive && (
-                            <div className="bg-danger transition-all" style={{ width: `${safePercent(r.unproductive, sumTotal)}%` }} title={`Unproductive: ${formatDuration(r.unproductive)}`} />
-                          )}
-                        </div>
-                      </div>
-                    </div>
-
-                    {isLive ? (
-                      <div className="mt-4 grid grid-cols-2 gap-2 border-t border-border/60 pt-3 text-[11px] text-muted-foreground">
-                        <div>
-                          <span>Productive:</span>
-                          <div className="font-bold text-success text-xs mt-0.5">{formatDuration(r.productive)}</div>
-                        </div>
-                        <div>
-                          <span>Other tracked:</span>
-                          <div className="font-bold text-info text-xs mt-0.5">{formatDuration(r.neutral)}</div>
-                        </div>
-                      </div>
-                    ) : (
-                      <div className="mt-4 grid grid-cols-2 gap-2 border-t border-border/60 pt-3 text-[11px] text-muted-foreground">
-                        <div>
-                          <span>Productive:</span>
-                          <div className="font-bold text-success text-xs mt-0.5">{formatDuration(r.productive)}</div>
-                        </div>
-                        <div>
-                          <span>Unproductive:</span>
-                          <div className="font-bold text-danger text-xs mt-0.5">{formatDuration(r.unproductive)}</div>
-                        </div>
-                        <div className="mt-1">
-                          <span>Neutral:</span>
-                          <div className="font-bold text-info text-xs mt-0.5">{formatDuration(r.neutral)}</div>
-                        </div>
-                        <div className="mt-1">
-                          <span>Idle:</span>
-                          <div className="font-bold text-foreground text-xs mt-0.5">{formatDuration(r.idle)}</div>
-                        </div>
-                      </div>
-                    )}
-                  </Card>
-                );
-              })}
-            </div>
-          )}
-        </CardContent>
-      </Card>
+      <ReportToolbar
+        period={range}
+        projectId={projectId}
+        onProject={scope.setProjectId}
+        memberId={memberId}
+        onMember={scope.setMemberId}
+        liveWorkerId={scope.liveWorkerId}
+        extra={<HoursFormatToggle value={format} onChange={setFormat} />}
+      />
 
       {isLive && (
-        <p className="text-xs text-muted-foreground">
-          Productive time is each member&apos;s tracked time weighted by their activity score. Time isn&apos;t classified
-          as neutral or unproductive, and idle time isn&apos;t measured, so neither is shown.
-        </p>
+        <div className="no-print">
+          <LiveReportNotice loading={live.loading} error={live.error} onRetry={live.retry} />
+        </div>
       )}
+
+      <KpiGrid>
+        <Kpi
+          label="Average activity"
+          icon={Gauge}
+          accent="green"
+          value={pending || averagePercent === null ? dash : `${averagePercent}%`}
+          sub={pending ? undefined : averagePercent === null ? "keyboard & mouse not measured" : "of tracked minutes had input"}
+        >
+          {!pending && averagePercent !== null && <MiniBar percent={averagePercent} className="bg-success" />}
+        </Kpi>
+        <Kpi
+          label="Active time"
+          icon={Zap}
+          accent="blue"
+          value={pending || !activeKnown ? dash : fmt(totalActive)}
+          sub={pending ? undefined : activeKnown ? `of ${fmt(totalTracked)} tracked` : "keyboard & mouse not measured"}
+        />
+        <Kpi
+          label="Idle time"
+          icon={Hourglass}
+          accent="amber"
+          value={pending || !idleKnown ? dash : fmt(totalIdle)}
+          sub={pending ? undefined : idleKnown ? `${safePercent(totalIdle, totalTracked)}% of tracked time` : "not reported by this server"}
+        />
+        <Kpi
+          label="Productive apps"
+          icon={TrendingUp}
+          accent="violet"
+          value={pending || productiveShare === null ? dash : `${productiveShare}%`}
+          sub={pending ? undefined : groups && groups.total > 0 ? `${fmt(groups.productive)} of app time` : "no app time recorded"}
+        />
+      </KpiGrid>
+
+      {pending ? (
+        live.loading ? <ReportSkeleton /> : null
+      ) : !hasTime ? (
+        <NoTimeState period={period} onWiden={period.custom || range.toolbar.preset !== "30d" ? () => range.choosePreset("30d") : undefined} />
+      ) : (
+        <>
+          <div className="grid grid-cols-1 gap-5 xl:grid-cols-3">
+            <Card className="xl:col-span-2">
+              <SectionHeading title="Active and idle time by member" sub="Each bar is the member's tracked time">
+                <ActivityLegend idle={idleKnown} other={rows.some((r) => r.other > 0)} />
+              </SectionHeading>
+              <CardContent>
+                <RankedBars
+                  label="Tracked time by member, split into active, other and idle time"
+                  items={[...rows]
+                    .sort((a, b) => b.tracked - a.tracked)
+                    .map((r) => ({
+                      key: r.userId,
+                      label: r.name,
+                      value: r.tracked,
+                      display: fmt(r.tracked),
+                      detail: r.activity === null ? "· not measured" : `· ${r.activity}% active`,
+                      segments: [
+                        { key: "active" as const, label: `Active ${fmt(r.active ?? 0)}`, minutes: r.active ?? 0 },
+                        { key: "other" as const, label: `Other tracked ${fmt(r.other)}`, minutes: r.other },
+                        { key: "idle" as const, label: `Idle ${fmt(r.idle ?? 0)}`, minutes: r.idle ?? 0 },
+                      ],
+                    }))}
+                />
+              </CardContent>
+            </Card>
+            <Card>
+              <SectionHeading title="Time by app category" sub="Focused app time, by what the app is for">
+                <Link
+                  href="/reports/apps-urls"
+                  className="inline-flex items-center gap-1 rounded-md text-xs font-medium text-primary-strong hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  Apps <ArrowRight aria-hidden className="h-3.5 w-3.5" />
+                </Link>
+              </SectionHeading>
+              <CardContent>
+                {groups ? (
+                  <ShareDonut
+                    label="App time by category"
+                    fmt={fmt}
+                    slices={APP_GROUPS.map((g) => ({ key: g, label: APP_GROUP_LABELS[g], minutes: groups[g], color: GROUP_COLORS[g] }))}
+                  />
+                ) : (
+                  <p className="py-8 text-center text-sm text-muted-foreground">App usage couldn&apos;t be loaded. The member figures are complete.</p>
+                )}
+              </CardContent>
+            </Card>
+          </div>
+
+          <Card>
+            <SectionHeading title="By member" sub={`${rows.length} ${rows.length === 1 ? "member" : "members"} with tracked time`} />
+            <CardContent>
+              <DataTable columns={columns} rows={rows} initialSort={{ key: "tracked", dir: "desc" }} emptyText="No tracked time in this period." />
+            </CardContent>
+          </Card>
+        </>
+      )}
+
+      <ReportFootnote>
+        Activity % is the share of tracked minutes with keyboard or mouse input; active time is tracked time × activity %, idle time is the
+        minutes without input, and other tracked time is neither (for example blocks recorded without input capture). Productive, neutral
+        and unproductive are app categories — what an app is usually used for — and say nothing about input; apps that haven&apos;t been
+        classified are shown as unclassified. Days are calendar days of the reporting time zone shown above.
+      </ReportFootnote>
     </ReportShell>
   );
 }

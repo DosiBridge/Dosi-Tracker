@@ -16,19 +16,18 @@ export function Reveal({
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const reduced = usePrefersReducedMotion();
-  const [shown, setShown] = useState(reduced);
+  const [seen, setSeen] = useState(false);
+  // With reduced motion the content is simply there — no entrance to wait for.
+  const shown = reduced || seen;
 
   useEffect(() => {
-    if (reduced) {
-      setShown(true);
-      return;
-    }
+    if (reduced) return;
     const el = ref.current;
     if (!el) return;
     const io = new IntersectionObserver(
       ([entry]) => {
         if (entry.isIntersecting) {
-          setShown(true);
+          setSeen(true);
           io.disconnect();
         }
       },

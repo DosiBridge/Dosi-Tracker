@@ -10,6 +10,12 @@ Feature: Plan entitlements
     Given the seeded workspace "Nimbus Co" (w3) on the Free plan
     And Nimbus Co has 3 seat holders (1 owner, 2 workers)
 
+  Scenario: A workspace that is cut off says so
+    Given the owner's workspace turns suspended, past due, expired or canceled
+    When the owner looks at the billing page
+    Then a banner says what that means for the team (no tracked time, no new people)
+    And it offers to contact support
+
   Scenario: Free plan seat ceiling
     When the owner opens the billing page
     Then the usage panel says limits come from the Free plan
@@ -32,3 +38,8 @@ Feature: Plan entitlements
     And no "/mo" suffix dangles next to a missing price
     And the seat limit reads Unlimited
     And "$NaN" never appears anywhere on the page
+
+  Scenario: Invoices name the month they bill
+    Given a live workspace with an invoice for September 2026
+    When the owner opens the billing page
+    Then the invoice shows its billing period, "Sep 2026"

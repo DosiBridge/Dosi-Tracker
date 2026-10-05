@@ -119,6 +119,39 @@ public abstract class MemberScopingTests<TStartupModule> : TrackerApplicationTes
     }
 
     [Fact]
+    public async Task Project_Roster_Shows_Teammates_By_Name_But_Not_Their_Emails_Or_Rates()
+    {
+        var (mine, foreign) = await SeedAsync();
+        await WithUnitOfWorkAsync(async () =>
+        {
+            var userManager = GetRequiredService<IdentityUserManager>();
+            (await userManager.CreateAsync(new IdentityUser(CurrentUserId, "me", "me@acme.test"))).Succeeded.ShouldBeTrue();
+            (await userManager.CreateAsync(new IdentityUser(OtherUserId, "colleague", "colleague@acme.test")
+            {
+                Name = "Cole",
+                Surname = "League"
+            })).Succeeded.ShouldBeTrue();
+
+            var colleagueMembership = await _memberRepository.FirstAsync(m => m.ProjectId == mine && m.UserId == OtherUserId);
+            colleagueMembership.HourlyRate = 40m;
+            await _memberRepository.UpdateAsync(colleagueMembership);
+        });
+        var team = GetRequiredService<ITeamAppService>();
+
+        var roster = await team.GetProjectMembersAsync(mine);
+
+        roster.Items.Count.ShouldBe(2);
+        var colleague = roster.Items.Single(m => m.UserId == OtherUserId);
+        colleague.UserName.ShouldBe("colleague");
+        colleague.Name.ShouldBe("Cole");
+        colleague.Surname.ShouldBe("League");
+        colleague.Email.ShouldBeNull();
+        colleague.HourlyRate.ShouldBe(0m);
+
+        await Should.ThrowAsync<Volo.Abp.Authorization.AbpAuthorizationException>(() => team.GetProjectMembersAsync(foreign));
+    }
+
+    [Fact]
     public async Task Projects_Are_Limited_To_Those_The_Caller_Belongs_To()
     {
         var (mine, foreign) = await SeedAsync();

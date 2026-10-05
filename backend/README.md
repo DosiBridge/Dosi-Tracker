@@ -19,6 +19,19 @@ The solution comes with a default configuration that works out of the box. Howev
 * Run `abp install-libs` command on your solution folder to install client-side package dependencies. This step is automatically done when you create a new solution, if you didn't especially disabled it. However, you should run it yourself if you have first cloned this solution from your source control, or added a new client-side package dependency to your solution.
 * Run `Dosi.Tracker.DbMigrator` to create the initial database. This step is also automatically done when you create a new solution, if you didn't especially disabled it. This should be done in the first run. It is also needed if a new database migration is added to the solution later.
 
+#### The first platform (host) administrator
+
+The first DbMigrator run on an empty database creates the platform administrator `admin` (email `App:HostAdminEmail`, default `admin@abp.io`) with the password in `App:HostAdminPassword` — set it, e.g. as the environment variable `App__HostAdminPassword`. Outside the `Development` environment the migrator **refuses** to create that account without the setting (or with the template password `1q2w3E*`), because anyone could sign in to a fresh deployment with it. In `Development` (`dotnet run` uses the project's launch profile, which sets `DOTNET_ENVIRONMENT=Development`) it falls back to `1q2w3E*`, and the administrator must change it at the first sign-in. Later runs never create or change administrators.
+
+#### Upgrading to the agent data v2 migrations
+
+`AgentDataV2` and `AgentDataV2Followup` also bring existing data in line with the new rules (PostgreSQL only):
+
+* Subscriptions are enforced from now on: a workspace whose trial ended cannot record time or grow its team until the host activates it (`POST /api/app/platform/activate-subscription`). Workspaces whose trial had already ended before the upgrade (status `past_due`, nothing invoiced) get a new 14-day trial from the moment of the upgrade, so their owners are reminded three days before it ends and told when it ended, and the host can activate the paying ones first.
+* The Identity `manager` role is taken from everyone who no longer holds an Admin/Manager membership on an existing project.
+* Duplicate memberships are merged (the oldest stays), and every membership's rate matches its latest rate-history entry.
+* Activity of blocks that never measured input (projects that allow neither keyboard nor mouse, agents that sent no timeline) becomes "not measured" instead of 0%.
+
 #### Generating a Signing Certificate
 
 In the production environment, you need to use a production signing certificate. ABP Framework sets up signing and encryption certificates in your application and expects an `openiddict.pfx` file in your application.

@@ -7,7 +7,7 @@ using Dosi.Tracker.Activities;
 using Dosi.Tracker.Projects;
 using Reqnroll;
 using Shouldly;
-using Volo.Abp.Authorization;
+using Volo.Abp;
 using Volo.Abp.Domain.Repositories;
 
 namespace Dosi.Tracker.Acceptance.Features;
@@ -15,7 +15,8 @@ namespace Dosi.Tracker.Acceptance.Features;
 [Binding]
 public sealed class ActivityTrackingSteps
 {
-    private static readonly DateTime BaseDay = new(2026, 7, 20, 0, 0, 0, DateTimeKind.Utc);
+    /// <summary>A recent past day (UTC midnight): uploads are accepted only within the 45-day window (contract §1).</summary>
+    private static readonly DateTime BaseDay = DateTime.UtcNow.Date.AddDays(-7);
 
     private readonly AcceptanceTestFixture _app;
     private readonly ScenarioState _state;
@@ -109,7 +110,9 @@ public sealed class ActivityTrackingSteps
     [Then(@"tracking is refused as unauthorized")]
     public void ThenTrackingIsRefusedAsUnauthorized()
     {
-        _state.LastException.ShouldBeOfType<AbpAuthorizationException>();
+        // Refused with the Tracker:NotProjectMember business error (HTTP 403).
+        _state.LastException.ShouldBeOfType<BusinessException>()
+            .Code.ShouldBe(TrackerDomainErrorCodes.NotProjectMember);
     }
 
     [Then(@"only one activity is stored for the project")]

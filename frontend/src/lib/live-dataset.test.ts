@@ -12,6 +12,7 @@ import {
   mapApiCaptureMetas,
   mapApiNotifications,
   mapApiProject,
+  mapReportSummary,
   mapTeamMember,
   memberIdsByProject,
   memberRole,
@@ -19,9 +20,11 @@ import {
   parseCaptures,
   parseTimeline,
   parseWindowList,
+  presenceStatusByUser,
   thumbnailCaptureIds,
   type ApiActivityDto,
 } from "./live-dataset";
+import { appColor } from "./apps";
 import type { Activity } from "./types";
 
 const NOW = new Date("2026-09-23T15:00:00.000Z");
@@ -298,6 +301,117 @@ describe("mapApiActivity", () => {
   });
 });
 
+describe("agent data v2 (contract §5)", () => {
+  it("maps device, zone, idle time, end reason, clock skew, injected input and the task note", () => {
+    const a = mapApiActivity(
+      dto({
+        description: "  Checkout flow \u0007 –\n PR review  ",
+        platform: "MacOS",
+        osVersion: "macOS 14.5 (23F79)",
+        agentVersion: "0.2.0",
+        deviceId: "6f1c0d6e-3b9f-4c0e-9d61-1f7e2a1b2c3d",
+        deviceName: "Mira’s MacBook Pro",
+        timeZone: "Asia/Dhaka",
+        utcOffsetMinutes: 360,
+        idleSeconds: 240,
+        endReason: "Idle",
+        clockSkewSeconds: -95,
+        injectedInputEvents: 12,
+      }),
+    );
+    expect(a).toMatchObject({
+      platform: "macos",
+      osVersion: "macOS 14.5 (23F79)",
+      agentVersion: "0.2.0",
+      deviceId: "6f1c0d6e-3b9f-4c0e-9d61-1f7e2a1b2c3d",
+      deviceName: "Mira’s MacBook Pro",
+      timeZone: "Asia/Dhaka",
+      utcOffsetMinutes: 360,
+      idleSeconds: 240,
+      endReason: "idle",
+      clockSkewSeconds: -95,
+      injectedInputEvents: 12,
+      // The note as the server stores notes: control characters gone, whitespace collapsed.
+      note: "Checkout flow – PR review",
+    });
+    expect(a?.activityMeasured).toBeUndefined(); // measured
+  });
+
+  it("a null productivity means NOT MEASURED: flagged, never a real 0%", () => {
+    const a = mapApiActivity(dto({ productivity: null }));
+    expect(a).toMatchObject({ productivity: 0, activityMeasured: false });
+    expect(mapApiActivity(dto({ productivity: 0 }))?.activityMeasured).toBeUndefined();
+  });
+
+  it("drops what the server would have stored as null, and clamps idle time to the block", () => {
+    const a = mapApiActivity(
+      dto({ platform: "linux", endReason: "coffee", utcOffsetMinutes: 900, idleSeconds: 99_999, injectedInputEvents: -3, osVersion: "   " }),
+    );
+    expect(a?.platform).toBeUndefined();
+    expect(a?.endReason).toBeUndefined();
+    expect(a?.utcOffsetMinutes).toBeUndefined();
+    expect(a?.osVersion).toBeUndefined();
+    expect(a?.idleSeconds).toBe(1800); // the 30-minute block
+    expect(a?.injectedInputEvents).toBe(0);
+  });
+
+  it("an older agent's block carries none of the new fields, and no note", () => {
+    const a = mapApiActivity(dto({ description: "   " }));
+    for (const key of [
+      "platform",
+      "osVersion",
+      "agentVersion",
+      "deviceId",
+      "deviceName",
+      "timeZone",
+      "utcOffsetMinutes",
+      "idleSeconds",
+      "endReason",
+      "clockSkewSeconds",
+      "injectedInputEvents",
+      "activityMeasured",
+    ]) {
+      expect(a && key in a, key).toBe(false);
+    }
+    expect(a?.note).toBeNull();
+    expect(a?.description).toBe("Tracked session");
+  });
+
+  it("captures carry when they were taken and whether they were blurred; buckets their active seconds", () => {
+    expect(
+      parseCaptures([
+        { id: "s1", kind: "screen", capturedAt: "2026-09-23T14:07:00", blurred: true },
+        { id: "w1", kind: "webcam", capturedAt: "garbage", blurred: "yes" },
+      ]),
+    ).toEqual([
+      { id: "s1", kind: "screen", capturedAt: "2026-09-23T14:07:00.000Z", blurred: true },
+      { id: "w1", kind: "webcam" },
+    ]);
+    expect(
+      parseTimeline([
+        { Minute: 0, Active: true, ActiveSeconds: 42 },
+        { Minute: 1, Active: true, ActiveSeconds: 400 },
+        { Minute: 2, Active: false },
+      ]),
+    ).toEqual([
+      { minute: 0, keyboardHits: 0, mouseClicks: 0, active: true, activeSeconds: 42 },
+      { minute: 1, keyboardHits: 0, mouseClicks: 0, active: true, activeSeconds: 90 },
+      { minute: 2, keyboardHits: 0, mouseClicks: 0, active: false },
+    ]);
+  });
+
+  it("mapApiProject keeps the v2 tracking settings when the server sends them", () => {
+    expect(mapApiProject({ id: "p1", idleThresholdMinutes: 0, blurScreenshots: true, archivedAt: "2026-09-01T00:00:00" })).toMatchObject({
+      idleThresholdMinutes: 0,
+      blurScreenshots: true,
+      archivedAt: "2026-09-01T00:00:00.000Z",
+    });
+    const legacy = mapApiProject({ id: "p2" });
+    expect("idleThresholdMinutes" in legacy || "blurScreenshots" in legacy || "archivedAt" in legacy).toBe(false);
+    expect(mapApiProject({ id: "p3", idleThresholdMinutes: 500 }).idleThresholdMinutes).toBe(60);
+  });
+});
+
 describe("projects and roster", () => {
   it("mapApiProject fills safe defaults and always carries a memberIds array", () => {
     const p = mapApiProject({ id: "p9", isArchived: true, allowWebcam: true, allowScreenshot: false, creationTime: "2026-09-01T00:00:00" });
@@ -355,6 +469,50 @@ describe("projects and roster", () => {
     expect(gone.status).toBe("offline");
     expect(mapTeamMember({ userId: "nobody" }, rows, NOW)).toMatchObject({ trackedToday: 0, productivity: 0, status: "offline", email: "" });
   });
+
+  it("mapTeamMember counts 'today' in the reporting zone, not UTC", () => {
+    // 21:00-22:00 UTC on the 22nd is 03:00-04:00 on the 23rd in Dhaka (UTC+6): today there, yesterday in UTC.
+    const rows = [act({ userId: "u1", startedAt: "2026-09-22T21:00:00.000Z", endedAt: "2026-09-22T22:00:00.000Z" })];
+    expect(mapTeamMember({ userId: "u1" }, rows, NOW).trackedToday).toBe(0);
+    expect(mapTeamMember({ userId: "u1" }, rows, NOW, { timeZone: "Asia/Dhaka" }).trackedToday).toBe(60);
+  });
+
+  it("mapTeamMember: heartbeats decide presence; without them a long interval keeps a member active longer", () => {
+    // The newest block ended 25 minutes ago.
+    const rows = [act({ userId: "u1", projectId: "p30", startedAt: "2026-09-23T14:05:00.000Z", endedAt: "2026-09-23T14:35:00.000Z" })];
+    expect(mapTeamMember({ userId: "u1" }, rows, NOW).status).toBe("offline"); // 15-minute window by default
+    expect(mapTeamMember({ userId: "u1" }, rows, NOW, { intervals: new Map([["p30", 30]]) }).status).toBe("active");
+    expect(mapTeamMember({ userId: "u1" }, rows, NOW, { intervals: new Map([["p30", 10]]) }).status).toBe("offline");
+    expect(mapTeamMember({ userId: "u1" }, rows, NOW, { presence: new Map([["u1", "idle"]]) }).status).toBe("idle");
+    expect(mapTeamMember({ userId: "u1", isActive: false }, rows, NOW, { presence: new Map([["u1", "active"]]) }).status).toBe("offline");
+  });
+
+  it("mapTeamMember takes a member's own zone from their newest block's device", () => {
+    const rows = [
+      act({ id: "a", userId: "u1", endedAt: "2026-09-23T10:00:00.000Z", startedAt: "2026-09-23T09:00:00.000Z", timeZone: "Europe/Berlin" }),
+      act({ id: "b", userId: "u1", endedAt: "2026-09-23T12:00:00.000Z", startedAt: "2026-09-23T11:00:00.000Z", timeZone: "Asia/Dhaka" }),
+    ];
+    expect(mapTeamMember({ userId: "u1" }, rows, NOW).timezone).toBe("Asia/Dhaka");
+    expect(mapTeamMember({ userId: "u2" }, rows, NOW).timezone).toBe("UTC");
+  });
+
+  it("presenceStatusByUser: tracking is active, other live states idle, offline/signed-out/stopped offline; the liveliest device wins", () => {
+    const status = presenceStatusByUser([
+      { userId: "a", status: "tracking", online: true },
+      { userId: "b", status: "paused", online: true },
+      { userId: "c", status: "tracking", online: false },
+      { userId: "d", status: "signedout", online: true },
+      { userId: "e", status: "locked", online: true },
+      { userId: "e", status: "tracking", online: true },
+      { userId: "f", status: "stopped", online: true },
+      { userId: "f", status: "idle", online: true },
+      { status: "tracking", online: true },
+      null,
+    ]);
+    expect(Object.fromEntries(status)).toEqual({ a: "active", b: "idle", c: "offline", d: "offline", e: "active", f: "idle" });
+    expect(presenceStatusByUser({ items: [{ userId: "a", status: "break", online: true }] }).get("a")).toBe("idle");
+    expect(presenceStatusByUser("nope").size).toBe(0);
+  });
 });
 
 describe("derived series (real rows only — empty stays empty)", () => {
@@ -374,6 +532,23 @@ describe("derived series (real rows only — empty stays empty)", () => {
       { day: "Wed", tracked: 60, productive: 30 },
     ]);
     expect(deriveDailyTrend([], NOW)).toHaveLength(7);
+  });
+
+  it("deriveDailyTrend: days of the reporting zone, and unmeasured blocks add time but no active time", () => {
+    const trend = deriveDailyTrend(
+      [
+        // 20:00-21:00 UTC on the 22nd is the 23rd in Dhaka.
+        act({ startedAt: "2026-09-22T20:00:00.000Z", endedAt: "2026-09-22T21:00:00.000Z", productivity: 50 }),
+        act({ startedAt: "2026-09-23T08:00:00.000Z", endedAt: "2026-09-23T08:30:00.000Z", productivity: 0, activityMeasured: false }),
+      ],
+      NOW,
+      2,
+      "Asia/Dhaka",
+    );
+    expect(trend).toEqual([
+      { day: "Tue", tracked: 0, productive: 0 },
+      { day: "Wed", tracked: 90, productive: 30 },
+    ]);
   });
 
   it("deriveHourly splits a session across local hours and keeps the 8–19 axis", () => {
@@ -404,22 +579,44 @@ describe("derived series (real rows only — empty stays empty)", () => {
     expect(deriveHourly([], NOW).every((h) => h.minutes === 0)).toBe(true);
   });
 
-  it("deriveAppCatalog credits focused time per app with member reach, uncategorized", () => {
+  it("deriveHourly splits at the reporting zone's own hour boundaries (Kathmandu is UTC+5:45)", () => {
+    // 09:00-10:00 UTC = 14:45-15:45 in Kathmandu: 15 minutes in the 14:00 hour, 45 in the 15:00 hour.
+    const hours = deriveHourly([act({ startedAt: "2026-09-23T09:00:00.000Z", endedAt: "2026-09-23T10:00:00.000Z" })], NOW, "Asia/Kathmandu");
+    expect(hours.find((h) => h.hour === "14:00")?.minutes).toBe(15);
+    expect(hours.find((h) => h.hour === "15:00")?.minutes).toBe(45);
+    expect(hours.reduce((sum, h) => sum + h.minutes, 0)).toBe(60);
+  });
+
+  it("deriveAppCatalog credits focused time per app with member reach, under the one canonical app identity", () => {
     const rows = [
-      act({ userId: "u1", activeWindows: [{ appName: "Code", windowTitle: "", seconds: 3600 }] }),
-      act({ userId: "u2", activeWindows: [{ appName: "Code", windowTitle: "", seconds: 1800 }, { appName: "Slack", windowTitle: "", seconds: 600 }] }),
+      act({ userId: "u1", activeWindows: [{ appName: "Code.exe", windowTitle: "", seconds: 3600 }] }),
+      // The macOS agent names the same app differently; it is still one app.
+      act({ userId: "u2", activeWindows: [{ appName: "Code", windowTitle: "", seconds: 1800 }, { appName: "slack.exe", windowTitle: "", seconds: 600 }] }),
       act({ userId: "u2", activeWindows: [{ appName: "Idle", windowTitle: "", seconds: 0 }] }),
     ];
     const catalog = deriveAppCatalog(rows);
     expect(catalog.map((a) => [a.app, a.minutes, a.activeUsers, a.category])).toEqual([
-      ["Code", 90, 2, "neutral"],
+      ["Visual Studio Code", 90, 2, "productive"],
       ["Slack", 10, 1, "neutral"],
     ]);
+    // Colour follows the app (lib/apps), never its rank.
+    expect(catalog[0].color).toBe(appColor("Visual Studio Code"));
+    expect(catalog[1].color).toBe(appColor("slack.exe"));
     expect(deriveTopApps(catalog)).toEqual([
-      { app: "Code", minutes: 90, color: catalog[0].color },
+      { app: "Visual Studio Code", minutes: 90, color: catalog[0].color },
       { app: "Slack", minutes: 10, color: catalog[1].color },
     ]);
     expect(deriveAppCatalog([])).toEqual([]);
+  });
+
+  it("deriveAppCatalog counts only the blocks booked inside the range it is given ('this week' means 7 days)", () => {
+    const rows = [
+      act({ id: "new", endedAt: "2026-09-22T10:00:00.000Z", startedAt: "2026-09-22T09:00:00.000Z", activeWindows: [{ appName: "figma.exe", windowTitle: "", seconds: 600 }] }),
+      act({ id: "old", endedAt: "2026-09-01T10:00:00.000Z", startedAt: "2026-09-01T09:00:00.000Z", activeWindows: [{ appName: "zoom.exe", windowTitle: "", seconds: 3600 }] }),
+    ];
+    const week = deriveAppCatalog(rows, { from: new Date("2026-09-16T15:00:00.000Z"), to: NOW });
+    expect(week.map((a) => a.app)).toEqual(["Figma"]);
+    expect(deriveAppCatalog(rows).map((a) => a.app)).toEqual(["Zoom", "Figma"]);
   });
 
   it("applyProjectTotals fills week / month / loaded totals from the rows", () => {
@@ -435,6 +632,56 @@ describe("derived series (real rows only — empty stays empty)", () => {
       NOW,
     );
     expect(project).toMatchObject({ loggedThisWeek: 60, loggedThisMonth: 90, loggedTotal: 105 });
+  });
+
+  it("applyProjectTotals prefers the server's exact totals per period, and a missing project there is 0", () => {
+    const a = mapApiProject({ id: "p1", title: "A" });
+    const b = mapApiProject({ id: "p2", title: "B" });
+    const rows = [act({ projectId: "p1", startedAt: "2026-09-23T10:00:00.000Z", endedAt: "2026-09-23T11:00:00.000Z" })];
+    applyProjectTotals([a, b], rows, NOW, {
+      totals: { week: new Map([["p1", 4200.4]]), month: new Map([["p1", 9000]]), window: null },
+    });
+    expect(a).toMatchObject({ loggedThisWeek: 4200, loggedThisMonth: 9000, loggedTotal: 60 }); // no window total → rows
+    expect(b).toMatchObject({ loggedThisWeek: 0, loggedThisMonth: 0, loggedTotal: 0 });
+  });
+
+  it("applyProjectTotals starts 'this month' at local midnight of the 1st in the reporting zone", () => {
+    const p = mapApiProject({ id: "p1", title: "P" });
+    // 2026-08-31T20:00Z is already 1 September in Dhaka (UTC+6): September there, August in UTC.
+    const rows = [act({ projectId: "p1", startedAt: "2026-08-31T19:00:00.000Z", endedAt: "2026-08-31T20:00:00.000Z" })];
+    applyProjectTotals([p], rows, NOW, { timeZone: "Asia/Dhaka" });
+    expect(p.loggedThisMonth).toBe(60);
+    applyProjectTotals([p], rows, NOW);
+    expect(p.loggedThisMonth).toBe(0);
+  });
+});
+
+describe("server totals", () => {
+  it("mapReportSummary reads per-project and per-member minutes and Activity % (null = not measured)", () => {
+    const totals = mapReportSummary({
+      totalActivities: 3,
+      totalTrackedMinutes: 125.5,
+      averageProductivity: null,
+      perUser: [
+        { userId: "u1", trackedMinutes: 90, averageProductivity: 71.6 },
+        { userId: "u2", trackedMinutes: 35.5, averageProductivity: null },
+        { trackedMinutes: 5 },
+      ],
+      perProject: [{ projectId: "p1", trackedMinutes: 100 }, { projectId: "p2", trackedMinutes: -3 }, null],
+    });
+    expect(totals?.totalMinutes).toBe(125.5);
+    expect(totals?.activity).toBeNull();
+    expect([...(totals?.projects ?? [])]).toEqual([
+      ["p1", 100],
+      ["p2", 0],
+    ]);
+    expect(totals?.users.get("u1")).toEqual({ minutes: 90, activity: 72 });
+    expect(totals?.users.get("u2")).toEqual({ minutes: 35.5, activity: null });
+    expect(totals?.users.size).toBe(2);
+  });
+
+  it.each([[null], [[]], ["x"], [{}], [{ totalTrackedMinutes: 5 }]])("mapReportSummary(%j) is null (not a summary)", (raw) => {
+    expect(mapReportSummary(raw)).toBeNull();
   });
 });
 

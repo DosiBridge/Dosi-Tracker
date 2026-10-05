@@ -23,14 +23,20 @@
     "Tracker:ActivityClientIdConflict": "This client activity id is already used by another member.",
     "Tracker:ActivityInFuture": "The activity ends in the future. Check the device clock.",
     "Tracker:ActivityTooLong": "The activity lasts {durationMinutes} minutes, longer than the {maxMinutes}-minute maximum for this project.",
+    "Tracker:ActivityTooOld": "The activity started too long ago and can no longer be recorded.",
     "Tracker:ActivityOverlaps": "The activity overlaps time you have already tracked.",
     "Tracker:ProjectArchived": "The project is archived; time can no longer be tracked against it.",
+    "Tracker:NotProjectMember": "You are not a member of this project.",
     "Tracker:DuplicateProjectMember": "This user is already a member of the project.",
     "Tracker:InvalidCaptureData": "The uploaded capture is not valid base64 image data.",
     "Tracker:CaptureTooLarge": "The uploaded capture exceeds the maximum allowed size.",
+    "Tracker:SubscriptionInactive": "The workspace subscription is not active. Ask the workspace owner to renew it.",
     "Tracker:PlanNotFound": "The requested plan does not exist.",
     "Tracker:PlanInUse": "The plan cannot be deleted while subscriptions still use it.",
     "Tracker:SeatLimitReached": "Your plan's seat limit has been reached. Upgrade the plan to add more members.",
-    "Tracker:ReportRangeInvalid": "The report range must end after it starts and span at most {maxDays} days."
+    "Tracker:ReportRangeInvalid": "The report range must end after it starts and span at most {maxDays} days.",
+    "Tracker:InvalidUser": "The user does not exist in this workspace.",
+    "Tracker:CannotModifySelf": "You cannot make this change to your own account or membership.",
+    "Tracker:RoleNotAllowed": "Only the workspace owner can grant this role, change hourly rates or manage an owner's account."
   }
 }

@@ -4,6 +4,15 @@
 //! agent installs and toggles without administrator rights, and runs in the
 //! signed-in user's session — which is required for screen/input capture.
 
+/// Passed on the Run-key command line (and by the installer), so a launch by
+/// Windows at sign-in can be told apart from the user opening the app.
+pub const AUTOSTART_FLAG: &str = "--autostart";
+
+/// Was this process started by Windows at sign-in?
+pub fn launched_at_login() -> bool {
+    std::env::args().skip(1).any(|arg| arg == AUTOSTART_FLAG)
+}
+
 #[cfg(windows)]
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 #[cfg(windows)]
@@ -58,7 +67,7 @@ pub fn set_enabled(enabled: bool) -> anyhow::Result<()> {
 
     // Quote the path so a Program Files install (spaces) still launches correctly.
     let exe = std::env::current_exe()?;
-    let command = format!("\"{}\"", exe.display());
+    let command = format!("\"{}\" {AUTOSTART_FLAG}", exe.display());
 
     unsafe {
         let mut key = HKEY::default();

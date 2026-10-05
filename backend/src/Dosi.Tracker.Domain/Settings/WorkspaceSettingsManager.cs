@@ -1,0 +1,114 @@
+using System;
+using System.Threading.Tasks;
+using Volo.Abp;
+using Volo.Abp.Domain.Services;
+using Volo.Abp.SettingManagement;
+
+namespace Dosi.Tracker.Settings;
+
+/// <summary>
+/// The current workspace's settings (tenant-level ABP settings: the default time zone and the new-project defaults)
+/// and the current user's preferences (user-level: their time zone). Values are stored only when they differ from
+/// the platform default, so a workspace keeps following defaults it never changed.
+/// </summary>
+public class WorkspaceSettingsManager : DomainService
+{
+    private readonly ISettingManager _settingManager;
+
+    public WorkspaceSettingsManager(ISettingManager settingManager)
+    {
+        _settingManager = settingManager;
+    }
+
+    /// <summary>The workspace's default reporting time zone (an IANA id), or null when not set.</summary>
+    public virtual async Task<string?> GetDefaultTimeZoneAsync()
+    {
+        return await _settingManager.GetOrNullForCurrentTenantAsync(TrackerSettings.Workspace.DefaultTimeZone);
+    }
+
+    /// <param name="timeZoneId">An IANA id (see <see cref="TimeZoneIds.TryNormalize"/>), or null to unset it.</param>
+    public virtual Task SetDefaultTimeZoneAsync(string? timeZoneId)
+    {
+        return _settingManager.SetForCurrentTenantAsync(TrackerSettings.Workspace.DefaultTimeZone, CheckTimeZone(timeZoneId));
+    }
+
+    public virtual async Task<NewProjectDefaults> GetNewProjectDefaultsAsync()
+    {
+        var fallback = new NewProjectDefaults();
+        return new NewProjectDefaults
+        {
+            IntervalMinutes = await GetIntAsync(TrackerSettings.Workspace.NewProject.IntervalMinutes, fallback.IntervalMinutes),
+            AllowScreenshot = await GetBoolAsync(TrackerSettings.Workspace.NewProject.AllowScreenshot, fallback.AllowScreenshot),
+            AllowWebcam = await GetBoolAsync(TrackerSettings.Workspace.NewProject.AllowWebcam, fallback.AllowWebcam),
+            AllowKeyboard = await GetBoolAsync(TrackerSettings.Workspace.NewProject.AllowKeyboard, fallback.AllowKeyboard),
+            AllowMouse = await GetBoolAsync(TrackerSettings.Workspace.NewProject.AllowMouse, fallback.AllowMouse),
+            AllowActiveWindow = await GetBoolAsync(TrackerSettings.Workspace.NewProject.AllowActiveWindow, fallback.AllowActiveWindow),
+            AllowRunningPrograms = await GetBoolAsync(TrackerSettings.Workspace.NewProject.AllowRunningPrograms, fallback.AllowRunningPrograms),
+            BlurScreenshots = await GetBoolAsync(TrackerSettings.Workspace.NewProject.BlurScreenshots, fallback.BlurScreenshots),
+            IdleThresholdMinutes = await GetIntAsync(TrackerSettings.Workspace.NewProject.IdleThresholdMinutes, fallback.IdleThresholdMinutes)
+        };
+    }
+
+    public virtual async Task SetNewProjectDefaultsAsync(NewProjectDefaults defaults)
+    {
+        Check.NotNull(defaults, nameof(defaults));
+        Check.Range(defaults.IntervalMinutes, nameof(defaults.IntervalMinutes),
+            NewProjectDefaults.MinIntervalMinutes, NewProjectDefaults.MaxIntervalMinutes);
+        Check.Range(defaults.IdleThresholdMinutes, nameof(defaults.IdleThresholdMinutes),
+            0, NewProjectDefaults.MaxIdleThresholdMinutes);
+
+        await SetAsync(TrackerSettings.Workspace.NewProject.IntervalMinutes, SettingValueFormat.Write(defaults.IntervalMinutes));
+        await SetAsync(TrackerSettings.Workspace.NewProject.AllowScreenshot, SettingValueFormat.Write(defaults.AllowScreenshot));
+        await SetAsync(TrackerSettings.Workspace.NewProject.AllowWebcam, SettingValueFormat.Write(defaults.AllowWebcam));
+        await SetAsync(TrackerSettings.Workspace.NewProject.AllowKeyboard, SettingValueFormat.Write(defaults.AllowKeyboard));
+        await SetAsync(TrackerSettings.Workspace.NewProject.AllowMouse, SettingValueFormat.Write(defaults.AllowMouse));
+        await SetAsync(TrackerSettings.Workspace.NewProject.AllowActiveWindow, SettingValueFormat.Write(defaults.AllowActiveWindow));
+        await SetAsync(TrackerSettings.Workspace.NewProject.AllowRunningPrograms, SettingValueFormat.Write(defaults.AllowRunningPrograms));
+        await SetAsync(TrackerSettings.Workspace.NewProject.BlurScreenshots, SettingValueFormat.Write(defaults.BlurScreenshots));
+        await SetAsync(TrackerSettings.Workspace.NewProject.IdleThresholdMinutes, SettingValueFormat.Write(defaults.IdleThresholdMinutes));
+    }
+
+    /// <summary>The current user's own time zone preference (an IANA id), or null when not set.</summary>
+    public virtual async Task<string?> GetUserTimeZoneAsync()
+    {
+        return await _settingManager.GetOrNullForCurrentUserAsync(TrackerSettings.User.TimeZone, fallback: false);
+    }
+
+    /// <param name="timeZoneId">An IANA id (see <see cref="TimeZoneIds.TryNormalize"/>), or null to unset it.</param>
+    public virtual Task SetUserTimeZoneAsync(string? timeZoneId)
+    {
+        return _settingManager.SetForCurrentUserAsync(TrackerSettings.User.TimeZone, CheckTimeZone(timeZoneId));
+    }
+
+    /// <summary>The zone the current user's reports use: their own preference, else the workspace default. Null when
+    /// neither is set; the client then uses the browser's zone.</summary>
+    public virtual async Task<string?> GetEffectiveTimeZoneAsync()
+    {
+        return await GetUserTimeZoneAsync() ?? await GetDefaultTimeZoneAsync();
+    }
+
+    private Task SetAsync(string name, string value)
+    {
+        return _settingManager.SetForCurrentTenantAsync(name, value);
+    }
+
+    private async Task<int> GetIntAsync(string name, int fallback)
+    {
+        return SettingValueFormat.ReadInt(await _settingManager.GetOrNullForCurrentTenantAsync(name), fallback);
+    }
+
+    private async Task<bool> GetBoolAsync(string name, bool fallback)
+    {
+        return SettingValueFormat.ReadBool(await _settingManager.GetOrNullForCurrentTenantAsync(name), fallback);
+    }
+
+    private static string? CheckTimeZone(string? timeZoneId)
+    {
+        if (timeZoneId != null && (!TimeZoneIds.TryNormalize(timeZoneId, out var ianaId) || ianaId != timeZoneId))
+        {
+            throw new ArgumentException($"'{timeZoneId}' is not a normalized IANA time zone id.", nameof(timeZoneId));
+        }
+
+        return timeZoneId;
+    }
+}

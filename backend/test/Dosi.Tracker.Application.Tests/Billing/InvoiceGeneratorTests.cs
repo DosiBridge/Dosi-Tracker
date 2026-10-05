@@ -3,9 +3,12 @@ using System.Linq;
 using System.Threading.Tasks;
 using Dosi.Tracker.Projects;
 using Dosi.Tracker.SaaS;
+using Dosi.Tracker.Settings;
+using Microsoft.Extensions.DependencyInjection;
 using Shouldly;
 using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Guids;
+using Volo.Abp.Identity;
 using Volo.Abp.Modularity;
 using Xunit;
 
@@ -31,6 +34,11 @@ public abstract class InvoiceGeneratorTests<TStartupModule> : TrackerApplication
         _guidGenerator = GetRequiredService<IGuidGenerator>();
     }
 
+    protected override void AfterAddApplication(IServiceCollection services)
+    {
+        services.DisableStaticSettingSaving();
+    }
+
     private Task<Guid> CreateProjectAsync(string title)
     {
         return WithUnitOfWorkAsync(async () =>
@@ -41,6 +49,18 @@ public abstract class InvoiceGeneratorTests<TStartupModule> : TrackerApplication
         });
     }
 
+    /// <summary>A person with an account in the (host) workspace: only they can occupy a seat.</summary>
+    private Task<Guid> CreateUserAsync()
+    {
+        return WithUnitOfWorkAsync(async () =>
+        {
+            var userName = $"member-{Guid.NewGuid():N}";
+            var user = new IdentityUser(_guidGenerator.Create(), userName, $"{userName}@billing.test");
+            (await GetRequiredService<IdentityUserManager>().CreateAsync(user)).Succeeded.ShouldBeTrue();
+            return user.Id;
+        });
+    }
+
     [Fact]
     public async Task Should_Invoice_PricePerUser_Times_Seats_Once_Per_Month()
     {
@@ -48,8 +68,8 @@ public abstract class InvoiceGeneratorTests<TStartupModule> : TrackerApplication
             () => _planRepository.FirstAsync(p => p.Name == "Starter")); // $6/user
 
         // Two distinct users occupy seats (one of them on two projects — still one seat).
-        var userA = Guid.NewGuid();
-        var userB = Guid.NewGuid();
+        var userA = await CreateUserAsync();
+        var userB = await CreateUserAsync();
         var projectId = await CreateProjectAsync("Billable A");
         var secondProjectId = await CreateProjectAsync("Billable B");
         await WithUnitOfWorkAsync(async () =>
@@ -107,5 +127,79 @@ public abstract class InvoiceGeneratorTests<TStartupModule> : TrackerApplication
 
         invoice.ShouldNotBeNull();
         invoice.Amount.ShouldBe(12m);
+    }
+
+    [Fact]
+    public async Task The_Invoice_Should_Record_Its_Billing_Period_And_Payment_Term()
+    {
+        var starter = await WithUnitOfWorkAsync(() => _planRepository.FirstAsync(p => p.Name == "Starter"));
+        var subscription = new Subscription(_guidGenerator.Create(), null, starter.Id);
+
+        var invoice = await WithUnitOfWorkAsync(() => _invoiceGenerator.GenerateForCurrentMonthAsync(subscription));
+
+        invoice.ShouldNotBeNull();
+        invoice.BillingPeriodStart.ShouldBe(Invoice.GetBillingPeriodStart(DateTime.UtcNow));
+        invoice.DueDate.ShouldBeInRange(
+            DateTime.UtcNow.AddDays(InvoiceGenerator.PaymentTermDays).AddMinutes(-1),
+            DateTime.UtcNow.AddDays(InvoiceGenerator.PaymentTermDays).AddMinutes(1));
+    }
+
+    [Fact]
+    public async Task Each_Billing_Period_Should_Be_Invoiced_Once()
+    {
+        var starter = await WithUnitOfWorkAsync(() => _planRepository.FirstAsync(p => p.Name == "Starter"));
+        var subscription = new Subscription(_guidGenerator.Create(), null, starter.Id);
+        var thisMonth = Invoice.GetBillingPeriodStart(DateTime.UtcNow);
+        var lastMonth = thisMonth.AddMonths(-1);
+
+        (await WithUnitOfWorkAsync(() => _invoiceGenerator.GenerateForPeriodAsync(subscription, lastMonth.AddDays(20))))
+            .ShouldNotBeNull().BillingPeriodStart.ShouldBe(lastMonth);
+        (await WithUnitOfWorkAsync(() => _invoiceGenerator.GenerateForPeriodAsync(subscription, thisMonth)))
+            .ShouldNotBeNull().BillingPeriodStart.ShouldBe(thisMonth);
+
+        (await WithUnitOfWorkAsync(() => _invoiceGenerator.GenerateForPeriodAsync(subscription, lastMonth))).ShouldBeNull();
+        (await WithUnitOfWorkAsync(() => _invoiceGenerator.GenerateForCurrentMonthAsync(subscription))).ShouldBeNull();
+        (await WithUnitOfWorkAsync(() => _invoiceRepository.GetCountAsync())).ShouldBe(2);
+    }
+
+    [Fact]
+    public async Task A_Legacy_Invoice_Of_The_Month_Should_Count_As_That_Months_Invoice()
+    {
+        // Invoices from before billing periods have none: their creation month stands in for it.
+        var starter = await WithUnitOfWorkAsync(() => _planRepository.FirstAsync(p => p.Name == "Starter"));
+        var subscription = new Subscription(_guidGenerator.Create(), null, starter.Id);
+        await WithUnitOfWorkAsync(() => _invoiceRepository.InsertAsync(
+            new Invoice(_guidGenerator.Create(), null, 6m, DateTime.UtcNow.AddDays(14))));
+
+        (await WithUnitOfWorkAsync(() => _invoiceGenerator.GenerateForCurrentMonthAsync(subscription))).ShouldBeNull();
+
+        // ...but not for another month.
+        var lastMonth = Invoice.GetBillingPeriodStart(DateTime.UtcNow).AddMonths(-1);
+        (await WithUnitOfWorkAsync(() => _invoiceGenerator.GenerateForPeriodAsync(subscription, lastMonth))).ShouldNotBeNull();
+    }
+
+    [Fact]
+    public async Task Seats_On_Deleted_Projects_Should_Not_Be_Invoiced()
+    {
+        var starter = await WithUnitOfWorkAsync(() => _planRepository.FirstAsync(p => p.Name == "Starter")); // $6/user
+        var kept = await CreateProjectAsync("Kept");
+        var deleted = await CreateProjectAsync("Deleted");
+        var stays = await CreateUserAsync();
+        var onDeletedProjectOnly = new[] { await CreateUserAsync(), await CreateUserAsync(), await CreateUserAsync() };
+        await WithUnitOfWorkAsync(async () =>
+        {
+            await _memberRepository.InsertAsync(new ProjectMember(_guidGenerator.Create(), null, kept, stays));
+            foreach (var userId in onDeletedProjectOnly)
+            {
+                await _memberRepository.InsertAsync(new ProjectMember(_guidGenerator.Create(), null, deleted, userId));
+            }
+        });
+        await WithUnitOfWorkAsync(() => _projectRepository.DeleteAsync(deleted));
+
+        var invoice = await WithUnitOfWorkAsync(() =>
+            _invoiceGenerator.GenerateForCurrentMonthAsync(new Subscription(_guidGenerator.Create(), null, starter.Id)));
+
+        invoice.ShouldNotBeNull().Amount.ShouldBe(6m);
+        (await WithUnitOfWorkAsync(() => _invoiceGenerator.CountSeatsAsync())).ShouldBe(1);
     }
 }

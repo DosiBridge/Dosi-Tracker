@@ -4,6 +4,7 @@ import { useMemo, useState } from "react";
 import {
   formatClock,
   formatClockShort,
+  friendlyAppName,
   summarizeTimeline,
   timelineSlots,
   timelineTickStep,
@@ -30,11 +31,11 @@ function slotStatus(slot: TimelineSlot): string {
 }
 
 /** One minute in words — the tooltip, the keyboard readout and the table share it. */
-function describeSlot(slot: TimelineSlot): string {
-  const app = slot.appName ? ` in ${slot.appName}` : "";
-  if (slot.missing) return `${formatClock(slot.at)}: no data`;
-  if (!slot.active && slot.total === 0) return `${formatClock(slot.at)}: idle`;
-  return `${formatClock(slot.at)}: ${n(slot.keyboardHits)} keyboard, ${n(slot.mouseClicks)} mouse${app}`;
+function describeSlot(slot: TimelineSlot, timeZone?: string): string {
+  const app = slot.appName ? ` in ${friendlyAppName(slot.appName)}` : "";
+  if (slot.missing) return `${formatClock(slot.at, timeZone)}: no data`;
+  if (!slot.active && slot.total === 0) return `${formatClock(slot.at, timeZone)}: idle`;
+  return `${formatClock(slot.at, timeZone)}: ${n(slot.keyboardHits)} keyboard, ${n(slot.mouseClicks)} mouse${app}`;
 }
 
 /**
@@ -43,7 +44,14 @@ function describeSlot(slot: TimelineSlot): string {
  * use ←/→) for a minute's detail; the same numbers are in the table below it.
  * Renders nothing when the block has no timeline (legacy rows, demo data).
  */
-export function ActivityTimeline({ activity }: { activity: Pick<Activity, "startedAt" | "endedAt" | "timeline"> }) {
+export function ActivityTimeline({
+  activity,
+  timeZone,
+}: {
+  activity: Pick<Activity, "startedAt" | "endedAt" | "timeline">;
+  /** The zone clock times read in (default: the viewer's). */
+  timeZone?: string;
+}) {
   const slots = useMemo(() => timelineSlots(activity), [activity]);
   const summary = useMemo(() => summarizeTimeline(slots), [slots]);
   const [hovered, setHovered] = useState<number | null>(null);
@@ -55,10 +63,10 @@ export function ActivityTimeline({ activity }: { activity: Pick<Activity, "start
   const current = hovered !== null ? slots[hovered] : undefined;
 
   const label =
-    `Input per minute, ${formatClock(activity.startedAt)} to ${formatClock(activity.endedAt)}: ` +
+    `Input per minute, ${formatClock(activity.startedAt, timeZone)} to ${formatClock(activity.endedAt, timeZone)}: ` +
     `active ${summary.activeMinutes} of ${summary.minutes} minutes, ` +
     `${n(summary.keyboardHits)} keyboard presses and ${n(summary.mouseClicks)} mouse clicks` +
-    (summary.peak ? `; busiest minute ${formatClock(summary.peak.at)} with ${n(summary.peak.total)} inputs.` : ".");
+    (summary.peak ? `; busiest minute ${formatClock(summary.peak.at, timeZone)} with ${n(summary.peak.total)} inputs.` : ".");
 
   function onKeyDown(e: React.KeyboardEvent) {
     const last = slots.length - 1;
@@ -108,7 +116,7 @@ export function ActivityTimeline({ activity }: { activity: Pick<Activity, "start
             aria-hidden
           >
             <div className="font-medium text-muted-foreground">
-              {formatClock(current.at)} · {slotStatus(current)}
+              {formatClock(current.at, timeZone)} · {slotStatus(current)}
             </div>
             {!current.missing && (
               <div className="mt-0.5 space-y-0.5">
@@ -116,7 +124,7 @@ export function ActivityTimeline({ activity }: { activity: Pick<Activity, "start
                 <TipRow className={MOUSE_FILL} value={current.mouseClicks} label="mouse" />
               </div>
             )}
-            {current.appName && <div className="mt-0.5 truncate text-muted-foreground">{current.appName}</div>}
+            {current.appName && <div className="mt-0.5 truncate text-muted-foreground">{friendlyAppName(current.appName)}</div>}
           </div>
         )}
 
@@ -146,7 +154,7 @@ export function ActivityTimeline({ activity }: { activity: Pick<Activity, "start
             <div key={slot.minute} className="relative h-4 min-w-0 flex-1">
               {slot.minute % step === 0 && (
                 <span className="absolute left-1/2 top-0 -translate-x-1/2 whitespace-nowrap text-[10px] tabular-nums text-muted-foreground">
-                  {formatClockShort(slot.at)}
+                  {formatClockShort(slot.at, timeZone)}
                 </span>
               )}
             </div>
@@ -154,7 +162,7 @@ export function ActivityTimeline({ activity }: { activity: Pick<Activity, "start
         </div>
 
         <p className="sr-only" aria-live="polite">
-          {current ? describeSlot(current) : ""}
+          {current ? describeSlot(current, timeZone) : ""}
         </p>
       </div>
 
@@ -177,11 +185,13 @@ export function ActivityTimeline({ activity }: { activity: Pick<Activity, "start
             <tbody>
               {slots.map((slot) => (
                 <tr key={slot.minute} className="border-t border-border">
-                  <td className="whitespace-nowrap px-3 py-1.5 tabular-nums">{formatClock(slot.at)}</td>
+                  <td className="whitespace-nowrap px-3 py-1.5 tabular-nums">{formatClock(slot.at, timeZone)}</td>
                   <td className="px-3 py-1.5">{slotStatus(slot)}</td>
                   <td className="px-3 py-1.5 text-right tabular-nums">{slot.missing ? "—" : n(slot.keyboardHits)}</td>
                   <td className="px-3 py-1.5 text-right tabular-nums">{slot.missing ? "—" : n(slot.mouseClicks)}</td>
-                  <td className="max-w-[10rem] truncate px-3 py-1.5 text-muted-foreground">{slot.appName ?? "—"}</td>
+                  <td className="max-w-[10rem] truncate px-3 py-1.5 text-muted-foreground" title={slot.appName}>
+                    {slot.appName ? friendlyAppName(slot.appName) : "—"}
+                  </td>
                 </tr>
               ))}
             </tbody>

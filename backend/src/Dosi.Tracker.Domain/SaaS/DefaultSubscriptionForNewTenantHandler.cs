@@ -7,10 +7,8 @@ using Volo.Abp.DependencyInjection;
 using Volo.Abp.Domain.Entities.Events;
 using Volo.Abp.Domain.Repositories;
 using Volo.Abp.EventBus;
-using Volo.Abp.Guids;
 using Volo.Abp.MultiTenancy;
 using Volo.Abp.TenantManagement;
-using Volo.Abp.Timing;
 
 namespace Dosi.Tracker.SaaS;
 
@@ -30,21 +28,18 @@ public class DefaultSubscriptionForNewTenantHandler :
     private readonly IRepository<Subscription, Guid> _subscriptionRepository;
     private readonly IRepository<Plan, Guid> _planRepository;
     private readonly ICurrentTenant _currentTenant;
-    private readonly IGuidGenerator _guidGenerator;
-    private readonly IClock _clock;
+    private readonly SubscriptionManager _subscriptionManager;
 
     public DefaultSubscriptionForNewTenantHandler(
         IRepository<Subscription, Guid> subscriptionRepository,
         IRepository<Plan, Guid> planRepository,
         ICurrentTenant currentTenant,
-        IGuidGenerator guidGenerator,
-        IClock clock)
+        SubscriptionManager subscriptionManager)
     {
         _subscriptionRepository = subscriptionRepository;
         _planRepository = planRepository;
         _currentTenant = currentTenant;
-        _guidGenerator = guidGenerator;
-        _clock = clock;
+        _subscriptionManager = subscriptionManager;
         Logger = NullLogger<DefaultSubscriptionForNewTenantHandler>.Instance;
     }
 
@@ -68,16 +63,7 @@ public class DefaultSubscriptionForNewTenantHandler :
                 return; // Workspace sign-up already chose a plan.
             }
 
-            var subscription = new Subscription(_guidGenerator.Create(), tenantId, plan.Id);
-            if (plan.TrialDays > 0)
-            {
-                subscription.TrialEndsAt = _clock.Now.AddDays(plan.TrialDays);
-            }
-            else
-            {
-                subscription.Status = "active";
-            }
-
+            var subscription = _subscriptionManager.CreateForNewWorkspace(tenantId, plan);
             await _subscriptionRepository.InsertAsync(subscription);
             Logger.LogInformation("Tenant {TenantId} subscribed to the default '{Plan}' plan.", tenantId, plan.Name);
         }

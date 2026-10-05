@@ -4,7 +4,7 @@
 vi.mock("next/navigation", () => import("@/test/next-navigation-stub"));
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { screen, fireEvent } from "@testing-library/react";
+import { act, screen, fireEvent } from "@testing-library/react";
 import { ThemeToggle } from "@/components/ui/theme-toggle";
 import { renderWithProviders, resetPrototypeState } from "@/test/harness";
 
@@ -59,5 +59,31 @@ describe("ThemeToggle", () => {
     renderWithProviders(<ThemeToggle />);
     expect(isDark()).toBe(true);
     expect(localStorage.getItem("dosi-theme")).toBe("dark");
+  });
+
+  it("follows a theme chosen in another tab", () => {
+    renderWithProviders(<ThemeToggle />);
+    expect(isDark()).toBe(false);
+    localStorage.setItem("dosi-theme", "dark");
+    act(() => {
+      window.dispatchEvent(new StorageEvent("storage", { key: "dosi-theme", newValue: "dark" }));
+    });
+    expect(isDark()).toBe(true);
+    expect(screen.getByText("Light mode")).toBeInTheDocument();
+  });
+
+  // Last: the choice made while storage is blocked is held for the rest of this page view.
+  it("keeps working when the browser blocks site data: nothing is stored, nothing crashes", () => {
+    const blocked = () => {
+      throw new DOMException("The operation is insecure.", "SecurityError");
+    };
+    vi.spyOn(Storage.prototype, "getItem").mockImplementation(blocked);
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(blocked);
+    renderWithProviders(<ThemeToggle />);
+    expect(isDark()).toBe(false);
+
+    fireEvent.click(screen.getByRole("button", { name: "Toggle theme" }));
+    expect(isDark()).toBe(true);
+    expect(screen.getByText("Light mode")).toBeInTheDocument();
   });
 });

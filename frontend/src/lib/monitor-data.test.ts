@@ -21,7 +21,7 @@ import {
 } from "./monitor-data";
 import { installLiveDataset, projects, resetTenantDataForTests } from "./tenant-data";
 import type { Project, Role } from "./types";
-import { colorFromString } from "./utils";
+import { appColor } from "./apps";
 
 const TRACKED: Role[] = ["owner", "admin", "worker"];
 const trackedUsers = users.filter((u) => TRACKED.includes(u.role));
@@ -98,7 +98,18 @@ describe("Member Monitor on earlier days", () => {
     const days = availableDays(3, new Date("2026-09-23T10:00:00.000Z"));
     expect(days.map((d) => d.iso)).toEqual(["2026-09-23", "2026-09-22", "2026-09-21"]);
     expect(days.map((d) => d.isToday)).toEqual([true, false, false]);
+    expect(days[0]).toMatchObject({ label: "23 Sep", weekday: "Wed" });
     expect(availableDays(1)[0].iso).toBe(today);
+  });
+
+  it("lists the calendar days of the reporting zone a live session passes", () => {
+    // 20:00 UTC on Wed 23 Sep is already Thu 24 Sep in Dhaka (UTC+6).
+    const now = new Date("2026-09-23T20:00:00.000Z");
+    expect(availableDays(2, now, "Asia/Dhaka").map((d) => [d.iso, d.weekday, d.label])).toEqual([
+      ["2026-09-24", "Thu", "24 Sep"],
+      ["2026-09-23", "Wed", "23 Sep"],
+    ]);
+    expect(availableDays(1, now, "America/Los_Angeles")[0].iso).toBe("2026-09-23");
   });
 });
 
@@ -184,9 +195,25 @@ describe("day roll-ups over an arbitrary axis", () => {
     expect(fmtMin(605)).toBe("10:05");
   });
 
-  it("gives apps outside the demo catalog a stable color of their own", () => {
+  it("gives every app the colour it has on every other page (and outside the demo catalog too)", () => {
     const [row] = appBreakdown([block(600, 630, "Obscure Tool")]);
-    expect(row).toEqual({ app: "Obscure Tool", minutes: 30, accent: colorFromString("Obscure Tool", 60, 50), category: "neutral" });
-    expect(appBreakdown([block(600, 630, "constructor")])[0].accent).toBe(colorFromString("constructor", 60, 50));
+    expect(row).toEqual({ app: "Obscure Tool", minutes: 30, accent: appColor("Obscure Tool"), category: "neutral" });
+    expect(appBreakdown([block(600, 630, "constructor")])[0].accent).toBe(appColor("constructor"));
+    expect(appBreakdown([block(600, 630, "Figma")])[0]).toMatchObject({ accent: appColor("Figma"), category: "productive" });
+  });
+
+  it("averages activity over the measured blocks only, and adds up the idle time agents reported", () => {
+    const measured = { ...block(540, 600), productivity: 80, idleMinutes: 6 };
+    const unmeasured = { ...block(600, 630), productivity: 0, measured: false, idleMinutes: 45 };
+    const summary = daySummary([measured, unmeasured]);
+    expect(summary.tracked).toBe(90);
+    expect(summary.measuredMinutes).toBe(60);
+    expect(summary.productivityAvg).toBe(80); // the unmeasured block is not a 0%
+    expect(summary.idleInBlocks).toBe(6 + 30); // reported idle never exceeds its block
+    expect(summary.idleReported).toBe(true);
+    const nothingMeasured = daySummary([unmeasured]);
+    expect(nothingMeasured).toMatchObject({ productivityAvg: 0, measuredMinutes: 0 });
+    // Demo and older-agent blocks report no idle time at all.
+    expect(daySummary([block(540, 600)])).toMatchObject({ idleInBlocks: 0, idleReported: false, measuredMinutes: 60 });
   });
 });

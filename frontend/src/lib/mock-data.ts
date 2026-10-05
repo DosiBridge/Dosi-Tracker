@@ -1,6 +1,8 @@
-import type { Activity, Project, ScreenMock, User, WindowInfo } from "./types";
+import type { Activity, BlockEndReason, DevicePlatform, Project, ScreenMock, User, WindowInfo } from "./types";
 import { countSeats } from "./roles";
 import { activitiesOnDay, averageProductivity, minutesForProject, minutesOnDay } from "./metrics";
+import { appColor } from "./apps";
+import { utcOffsetMinutes } from "./time-zone";
 
 /** Fixed reference time so SSR and client render identically (no hydration drift). */
 export const NOW = new Date("2026-07-14T15:30:00.000Z");
@@ -147,17 +149,18 @@ function makeWindows(primary: ScreenMock): { active: WindowInfo[]; running: Wind
   return { active, running };
 }
 
+/** Task notes members type into the agent ("What are you working on?"). */
 const descriptions = [
-  "Implementing activity report filters",
-  "Fixing screenshot capture on multi-monitor",
-  "Refactoring project app service",
-  "Building dashboard charts",
-  "Reviewing pull requests",
-  "Designing the timesheet view",
-  "Writing integration tests",
-  "Tuning the Rust agent sync loop",
-  "Wiring up the invitation flow",
-  "Polishing dark mode tokens",
+  "Activity report – filter panel",
+  "Screenshot capture – multi-monitor fix",
+  "Project service – refactor",
+  "Dashboard charts – weekly trend",
+  "Checkout flow – PR review",
+  "Timesheet view – design pass",
+  "Invite flow – integration tests",
+  "Windows agent – sync loop tuning",
+  "Onboarding – invitation emails",
+  "Dark mode – token polish",
 ];
 
 export const DAY_MS = 24 * 60 * 60 * 1000;
@@ -216,6 +219,130 @@ export function planDaySessions(
   return sessions;
 }
 
+/* ----------------------------- Agent data: devices, idle time, end reasons ----------------------------- */
+
+/** A computer running the desktop agent. */
+export interface DemoDevice {
+  deviceId: string;
+  deviceName: string;
+  platform: DevicePlatform;
+  osVersion: string;
+  agentVersion: string;
+}
+
+/** The current agent release; a device still on an older one reads as outdated. */
+export const DEMO_AGENT_VERSION = "0.2.0";
+
+/** 32-bit FNV-1a: a stable seed from a string. */
+function hashString(text: string): number {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return hash >>> 0;
+}
+
+/** A stable, UUID-shaped id from a seed (the agents generate a random one per install). */
+function demoUuid(seed: string): string {
+  const next = mulberry32(hashString(seed));
+  let hex = "";
+  while (hex.length < 32) hex += Math.floor(next() * 0x100000000).toString(16).padStart(8, "0");
+  const variant = "89ab"[parseInt(hex[16], 16) % 4];
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-${variant}${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+}
+
+function demoDevice(seed: string, deviceName: string, platform: DevicePlatform, osVersion: string, agentVersion = DEMO_AGENT_VERSION): DemoDevice {
+  return { deviceId: demoUuid(seed), deviceName, platform, osVersion, agentVersion };
+}
+
+const WINDOWS_VERSIONS = ["Windows 11 Pro 23H2 (10.0.22631)", "Windows 11 Pro 24H2 (10.0.26100)", "Windows 10 Pro 22H2 (10.0.19045)"];
+const MAC_VERSIONS = ["macOS 14.5 (23F79)", "macOS 15.0 (24A335)", "macOS 14.4.1 (23E224)"];
+
+/** The primary team's computers: a Windows/macOS mix, one member on two machines, one agent a release behind. */
+const PRIMARY_DEVICES: Record<string, DemoDevice[]> = {
+  u1: [demoDevice("u1-mbp", "Ayesha's MacBook Pro", "macos", "macOS 14.5 (23F79)")],
+  u2: [
+    demoDevice("u2-desktop", "TANVIR-DESKTOP", "windows", "Windows 11 Pro 23H2 (10.0.22631)"),
+    demoDevice("u2-air", "Tanvir's MacBook Air", "macos", "macOS 14.4.1 (23E224)"),
+  ],
+  u3: [demoDevice("u3-laptop", "NUSRAT-LAPTOP", "windows", "Windows 11 Pro 23H2 (10.0.22631)")],
+  u4: [demoDevice("u4-qa", "QA-RIG-02", "windows", "Windows 10 Pro 22H2 (10.0.19045)", "0.1.4")],
+  u5: [demoDevice("u5-imac", "Sadia's iMac", "macos", "macOS 14.5 (23F79)")],
+  u6: [demoDevice("u6-ws", "IMRAN-WS", "windows", "Windows 11 Pro 24H2 (10.0.26100)")],
+  u8: [demoDevice("u8-mbp", "David's MacBook Pro", "macos", "macOS 15.0 (24A335)")],
+};
+
+/** The computers a demo member tracks on: authored for the primary team, derived (stably) for everyone else. */
+export function demoDevicesFor(user: Pick<User, "id" | "name">): DemoDevice[] {
+  const authored = PRIMARY_DEVICES[user.id];
+  if (authored) return authored;
+  const h = hashString(user.id);
+  const first = (user.name.split(" ")[0] ?? "").replace(/[^A-Za-z]/g, "") || "Member";
+  return h % 2 === 0
+    ? [demoDevice(`${user.id}-mac`, `${first}'s MacBook Pro`, "macos", MAC_VERSIONS[h % MAC_VERSIONS.length])]
+    : [demoDevice(`${user.id}-pc`, `${first.toUpperCase()}-PC`, "windows", WINDOWS_VERSIONS[h % WINDOWS_VERSIONS.length])];
+}
+
+/**
+ * The agent fields of one generated session (contract §5): the computer it was
+ * tracked on (a member with two switches between them by day), that device's
+ * zone and UTC offset, the idle seconds its Activity % implies (the minutes
+ * without input), and its task note. It draws nothing from the generators, so
+ * every other value of the session stays exactly what it was.
+ */
+export function demoAgentFields(user: Pick<User, "id" | "name" | "timezone">, session: Activity, dayIndex: number): Partial<Activity> {
+  const devices = demoDevicesFor(user);
+  const device = devices[dayIndex % devices.length];
+  const start = new Date(session.startedAt);
+  const minutes = Math.max(0, Math.round((Date.parse(session.endedAt) - start.getTime()) / 60_000));
+  const active = Math.round((minutes * session.productivity) / 100);
+  return {
+    deviceId: device.deviceId,
+    deviceName: device.deviceName,
+    platform: device.platform,
+    osVersion: device.osVersion,
+    agentVersion: device.agentVersion,
+    timeZone: user.timezone,
+    utcOffsetMinutes: utcOffsetMinutes(start, user.timezone),
+    idleSeconds: (minutes - active) * 60,
+    note: session.description,
+  };
+}
+
+/** How the sessions with a gap after them end, weighted the way a real day's gaps are. */
+const GAP_END_REASONS: readonly BlockEndReason[] = ["break", "break", "pause", "idle", "lock", "task"];
+/** How a member's day ends. */
+const DAY_END_REASONS: readonly BlockEndReason[] = ["quit", "quit", "shutdown", "signout", "sleep"];
+
+/**
+ * Give every generated session an end reason: a member's last session of a
+ * past day ends the day (closed the app, shut down, signed out, put to sleep);
+ * today's last one is still being tracked, so it last ended at its interval; a
+ * session followed by work on another project ended with the switch; the rest
+ * end at a break, a pause, an idle stretch, a locked screen or a new task
+ * note. Deterministic per row.
+ */
+export function assignDemoEndReasons(list: Activity[], today: string): void {
+  const days = new Map<string, Activity[]>();
+  for (const a of list) {
+    const key = `${a.userId}|${a.endedAt.slice(0, 10)}`;
+    const rows = days.get(key) ?? [];
+    rows.push(a);
+    days.set(key, rows);
+  }
+  for (const rows of days.values()) {
+    rows.sort((a, b) => Date.parse(a.startedAt) - Date.parse(b.startedAt));
+    rows.forEach((a, i) => {
+      const next = rows[i + 1];
+      const h = hashString(a.id);
+      if (!next) a.endReason = a.endedAt.startsWith(today) ? "interval" : DAY_END_REASONS[h % DAY_END_REASONS.length];
+      else if (next.projectId !== a.projectId) a.endReason = "project";
+      else a.endReason = GAP_END_REASONS[h % GAP_END_REASONS.length];
+    });
+  }
+}
+
 function buildActivities(): Activity[] {
   const list: Activity[] = [];
   const trackingUsers = users.filter((u) => u.role === "worker" || u.role === "owner" || u.role === "admin");
@@ -235,7 +362,7 @@ function buildActivities(): Activity[] {
         const project = pick(projects.filter((p) => !p.archived && p.memberIds.includes(user.id))) ?? projects[0];
         const { active, running } = makeWindows(template);
         id++;
-        list.push({
+        const row: Activity = {
           id: `a${id}`,
           userId: user.id,
           projectId: project.id,
@@ -253,10 +380,12 @@ function buildActivities(): Activity[] {
           screen: template,
           hasWebcam: project.permissions.webcam && rand() > 0.5,
           online: day === 0 && index === 0 ? true : rand() > 0.25,
-        });
+        };
+        list.push(Object.assign(row, demoAgentFields(user, row, day)));
       });
     }
   }
+  assignDemoEndReasons(list, NOW.toISOString().slice(0, 10));
   return list.sort((a, b) => +new Date(b.endedAt) - +new Date(a.endedAt));
 }
 
@@ -318,14 +447,15 @@ export function projectDistribution() {
     .sort((a, b) => b.value - a.value);
 }
 
+/** Coloured by lib/apps, so an app has the same colour here as on every other screen. */
 export const topApps = [
-  { app: "Visual Studio Code", minutes: 1840, color: "#3b82f6" },
-  { app: "Google Chrome", minutes: 1120, color: "#f97316" },
-  { app: "Figma", minutes: 760, color: "#ec4899" },
-  { app: "Slack", minutes: 540, color: "#a855f7" },
-  { app: "Terminal", minutes: 430, color: "#22c55e" },
-  { app: "Notion", minutes: 260, color: "#64748b" },
-];
+  { app: "Visual Studio Code", minutes: 1840 },
+  { app: "Google Chrome", minutes: 1120 },
+  { app: "Figma", minutes: 760 },
+  { app: "Slack", minutes: 540 },
+  { app: "Terminal", minutes: 430 },
+  { app: "Notion", minutes: 260 },
+].map((a) => ({ ...a, color: appColor(a.app) }));
 
 /* ----------------------------- Lookups ----------------------------- */
 

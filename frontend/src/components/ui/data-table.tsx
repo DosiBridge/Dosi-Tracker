@@ -131,29 +131,53 @@ export function DataTable<T>({
         <table className="w-full min-w-[560px] border-collapse text-sm">
           <thead>
             <tr className="border-b border-border">
-              {columns.map((c, ci) => (
-                <th
-                  key={c.key}
-                  className={cn(
-                    "whitespace-nowrap px-3 py-2.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground",
-                    alignClass[c.align ?? "left"],
-                    c.sortValue && "cursor-pointer select-none hover:text-foreground",
-                    ci === 0 && "sticky left-0 z-10 bg-card",
-                    c.headerClassName
-                  )}
-                  onClick={() => c.sortValue && toggleSort(c.key)}
-                >
-                  <span className={cn("inline-flex items-center gap-1", c.align === "right" && "flex-row-reverse")}>
+              {columns.map((c, ci) => {
+                const sortable = !!c.sortValue;
+                const active = sortable && sort?.key === c.key ? sort : null;
+                const label = (
+                  <>
                     {c.header}
-                    {c.sortValue &&
-                      (sort?.key === c.key ? (
-                        sort.dir === "asc" ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />
+                    {sortable &&
+                      (active ? (
+                        active.dir === "asc" ? <ArrowUp aria-hidden className="h-3 w-3" /> : <ArrowDown aria-hidden className="h-3 w-3" />
                       ) : (
-                        <ChevronsUpDown className="h-3 w-3 opacity-40" />
+                        <ChevronsUpDown aria-hidden className="h-3 w-3 opacity-40" />
                       ))}
-                  </span>
-                </th>
-              ))}
+                  </>
+                );
+                return (
+                  <th
+                    key={c.key}
+                    scope="col"
+                    // The sort state, announced with the header (a sortable column reads "none" until sorted).
+                    aria-sort={active ? (active.dir === "asc" ? "ascending" : "descending") : sortable ? "none" : undefined}
+                    className={cn(
+                      "whitespace-nowrap px-3 py-2.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground",
+                      alignClass[c.align ?? "left"],
+                      sortable && "cursor-pointer select-none hover:text-foreground",
+                      ci === 0 && "sticky left-0 z-10 bg-card",
+                      c.headerClassName
+                    )}
+                    // The whole cell sorts; the button inside makes it reachable with Tab and Enter/Space (its click bubbles here).
+                    onClick={sortable ? () => toggleSort(c.key) : undefined}
+                  >
+                    {sortable ? (
+                      <button
+                        type="button"
+                        className={cn(
+                          "inline-flex cursor-pointer items-center gap-1 rounded uppercase tracking-wide",
+                          "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-card",
+                          c.align === "right" && "flex-row-reverse"
+                        )}
+                      >
+                        {label}
+                      </button>
+                    ) : (
+                      <span className={cn("inline-flex items-center gap-1", c.align === "right" && "flex-row-reverse")}>{label}</span>
+                    )}
+                  </th>
+                );
+              })}
             </tr>
           </thead>
           <tbody>

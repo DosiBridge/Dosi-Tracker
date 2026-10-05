@@ -9,6 +9,7 @@ using Reqnroll;
 using Shouldly;
 using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Guids;
+using Volo.Abp.Identity;
 
 namespace Dosi.Tracker.Acceptance.Features;
 
@@ -43,12 +44,16 @@ public sealed class BillingSteps
         {
             var projects = _app.Resolve<IRepository<Project, Guid>>();
             var members = _app.Resolve<IRepository<ProjectMember, Guid>>();
+            var userManager = _app.Resolve<IdentityUserManager>();
             var guids = _app.Resolve<IGuidGenerator>();
             var projectId = guids.Create();
             await projects.InsertAsync(new Project(projectId, null, "Billable Project"));
             for (var i = 0; i < count; i++)
             {
-                await members.InsertAsync(new ProjectMember(guids.Create(), null, projectId, Guid.NewGuid()));
+                // A seat is a person with an account in the workspace who tracks time on a project.
+                var person = new IdentityUser(guids.Create(), $"person{i}", $"person{i}@acme.test");
+                (await userManager.CreateAsync(person)).Succeeded.ShouldBeTrue();
+                await members.InsertAsync(new ProjectMember(guids.Create(), null, projectId, person.Id));
             }
         });
     }

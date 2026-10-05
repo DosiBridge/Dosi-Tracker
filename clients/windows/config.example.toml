@@ -1,13 +1,25 @@
 # Copy to `config.toml` next to the executable and edit (the working directory
-# is only checked when there is none next to the executable).
+# is only checked when there is none next to the executable). The installer
+# writes this file for you when run with /SERVER=<url> and /DASHBOARD=<url>.
 # Every key is optional: anything left out keeps the default shown here.
 # Any value can also be set via env vars, e.g. DOSI__API_BASE_URL=...
 
+# The server (API) the agent signs in to: the "server address" shown on the
+# web dashboard's Download page. An address typed under "Advanced" on the
+# sign-in screen is saved with that sign-in and wins over this one.
 api_base_url = "https://localhost:6006"
 
-# Snapshot interval in minutes (clamped to 5..=60). Higher = lower CPU/battery.
+# The web dashboard, opened by "Web dashboard" in the window and the tray menu.
+# Left at this local default while the server is elsewhere, the app greys the
+# dashboard buttons out rather than open a page that does not exist.
+dashboard_url = "http://localhost:6005"
+
+# Block length in minutes (clamped to 5..=60), used until the project's own
+# interval arrives from the server.
 interval_minutes = 10
 
+# What this computer may capture. Each project's policy (set by the workspace
+# admin) decides; these can only turn a capture off here — or blur on.
 [capture]
 screenshot       = true
 webcam           = false
@@ -15,3 +27,4 @@ keyboard         = true
 mouse            = true
 active_window    = true
 running_programs = true
+blur_screenshots = false

@@ -2,17 +2,18 @@
 //
 // activity-filters.test.ts covers the happy path of each predicate; this file
 // pins down the parts a "does it roughly filter?" test cannot see:
-//   • the INCLUSIVE edges of the date range and the time-of-day window,
+//   • the edges of the date range (whole days: first instant in, next day's
+//     first instant out) and the INCLUSIVE time-of-day window,
 //   • which range wins when a preset and stale custom dates are both present,
 //   • that search matches EACH field independently and case-insensitively,
 //   • the exact chip text and active-filter count for every single dimension,
 //   • the sort comparators on inputs that are NOT already in the target order,
 //   • the option builders, including their unknown-member fallback.
 //
-// The demo clock is frozen (NOW = 2026-07-14T15:30Z); nothing here reads the
-// wall clock. `minutesOfDay()` deliberately uses the LOCAL clock, so the
-// time-of-day cases derive their bounds from the fixture instead of hardcoding
-// them — that keeps them meaningful in any CI timezone.
+// A session belongs to the day and time it STARTED (the server's From/To
+// rule), read in the reporting zone. The demo clock is frozen (NOW =
+// 2026-07-14T15:30Z) and every date case names its zone, so nothing here
+// depends on the wall clock or the zone the suite runs in.
 import { describe, it, expect, beforeEach, afterAll } from "vitest";
 import {
   activityApps,
@@ -50,64 +51,77 @@ afterAll(() => {
   resetPrototypeState();
 });
 
-/* ------------------------- date range: both ends inclusive ------------------------- */
+/* ------------------------- date range: whole days of the zone ------------------------- */
 
-describe("applyActivityFilters — a custom date range includes BOTH of its edges", () => {
-  const onFrom = buildActivity({ id: "on-from", endedAt: "2026-07-10T00:00:00.000Z" });
-  const justBefore = buildActivity({ id: "just-before", endedAt: "2026-07-09T23:59:59.999Z" });
-  const onTo = buildActivity({ id: "on-to", endedAt: "2026-07-10T23:59:59.000Z" });
-  const justAfter = buildActivity({ id: "just-after", endedAt: "2026-07-11T00:00:00.000Z" });
+/** A ten-minute block that starts at `startedAt`. */
+const startingAt = (id: string, startedAt: string) =>
+  buildActivity({ id, startedAt, endedAt: new Date(Date.parse(startedAt) + 10 * 60_000).toISOString() });
+
+describe("applyActivityFilters — a custom date range covers whole days, both included", () => {
+  const onFrom = startingAt("on-from", "2026-07-10T00:00:00.000Z");
+  const justBefore = startingAt("just-before", "2026-07-09T23:59:59.999Z");
+  const onTo = startingAt("on-to", "2026-07-10T23:59:59.000Z");
+  const justAfter = startingAt("just-after", "2026-07-11T00:00:00.000Z");
   const singleDay = { ...wide, customFrom: "2026-07-10", customTo: "2026-07-10" };
+  const utc = { timeZone: "UTC" };
 
-  it("keeps a block that ends exactly at the first instant of the from-date", () => {
-    expect(ids(applyActivityFilters([onFrom, justBefore], singleDay))).toEqual(["on-from"]);
+  it("keeps a block that starts exactly at the first instant of the from-date", () => {
+    expect(ids(applyActivityFilters([onFrom, justBefore], singleDay, utc))).toEqual(["on-from"]);
   });
 
-  it("keeps a block that ends exactly at the last instant of the to-date", () => {
-    expect(ids(applyActivityFilters([onTo, justAfter], singleDay))).toEqual(["on-to"]);
+  it("keeps a block that starts in the last second of the to-date, and drops one at the next midnight", () => {
+    expect(ids(applyActivityFilters([onTo, justAfter], singleDay, utc))).toEqual(["on-to"]);
+  });
+
+  it("keeps a block that started on the day even when it ends after midnight (it's on the day it started)", () => {
+    const overnight = buildActivity({ id: "overnight", startedAt: "2026-07-10T23:55:00.000Z", endedAt: "2026-07-11T00:05:00.000Z" });
+    expect(ids(applyActivityFilters([overnight], singleDay, utc))).toEqual(["overnight"]);
+    expect(applyActivityFilters([overnight], { ...wide, customFrom: "2026-07-11", customTo: "2026-07-11" }, utc)).toEqual([]);
+  });
+
+  it("reads the days in the reporting zone: a Dhaka day starts at 18:00 UTC the evening before", () => {
+    const dhakaMorning = startingAt("dhaka-morning", "2026-07-09T18:30:00.000Z"); // 00:30 on 10 Jul in Dhaka
+    expect(ids(applyActivityFilters([dhakaMorning], singleDay, { timeZone: "Asia/Dhaka" }))).toEqual(["dhaka-morning"]);
+    expect(applyActivityFilters([dhakaMorning], singleDay, utc)).toEqual([]);
   });
 });
 
 /* ------------------------- time-of-day window: both ends inclusive ------------------------- */
 
 describe("applyActivityFilters — the time-of-day window includes BOTH of its edges", () => {
-  // A :20 mark in UTC stays a non-zero minute under every real UTC offset (all
-  // of which are whole quarter-hours), so the fixture's minute component is
-  // always meaningful — whatever timezone the suite runs in.
-  const row = buildActivity({ id: "tod", endedAt: "2026-07-10T09:20:00.000Z" });
-  const local = new Date(row.endedAt);
-  const hours = local.getHours();
-  const minutes = local.getMinutes();
-  const minuteOfDay = hours * 60 + minutes;
-  const hhmm = (min: number) =>
-    `${String(Math.floor(min / 60)).padStart(2, "0")}:${String(min % 60).padStart(2, "0")}`;
+  // Starts 09:20 UTC = 15:05 in Kathmandu (UTC+5:45): a zone with a quarter-hour offset.
+  const row = startingAt("tod", "2026-07-10T09:20:00.000Z");
+  const kathmandu = { timeZone: "Asia/Kathmandu" };
 
-  it("keeps a block whose time-of-day sits exactly ON the lower bound", () => {
-    expect(ids(applyActivityFilters([row], { ...wide, startTime: hhmm(minuteOfDay) }))).toEqual(["tod"]);
+  it("keeps a block whose start time sits exactly ON the lower bound", () => {
+    expect(ids(applyActivityFilters([row], { ...wide, startTime: "15:05" }, kathmandu))).toEqual(["tod"]);
   });
 
-  it("keeps a block whose time-of-day sits exactly ON the upper bound", () => {
-    expect(ids(applyActivityFilters([row], { ...wide, endTime: hhmm(minuteOfDay) }))).toEqual(["tod"]);
+  it("keeps a block whose start time sits exactly ON the upper bound", () => {
+    expect(ids(applyActivityFilters([row], { ...wide, endTime: "15:05" }, kathmandu))).toEqual(["tod"]);
   });
 
   it("drops a block one minute outside either bound", () => {
-    expect(applyActivityFilters([row], { ...wide, startTime: hhmm(minuteOfDay + 1) })).toEqual([]);
-    expect(applyActivityFilters([row], { ...wide, endTime: hhmm(minuteOfDay - 1) })).toEqual([]);
+    expect(applyActivityFilters([row], { ...wide, startTime: "15:06" }, kathmandu)).toEqual([]);
+    expect(applyActivityFilters([row], { ...wide, endTime: "15:04" }, kathmandu)).toEqual([]);
   });
 
   it("reads a block's clock time as minutes PAST the hour, not back from it", () => {
-    // The bound is the top of the row's own hour. hours*60 + minutes clears it;
-    // hours*60 - minutes would fall below and the row would vanish.
-    expect(minutes).toBeGreaterThan(0);
-    expect(ids(applyActivityFilters([row], { ...wide, startTime: hhmm(hours * 60) }))).toEqual(["tod"]);
+    // The bound is the top of the row's own hour. 15*60 + 5 clears it; 15*60 - 5 would not.
+    expect(ids(applyActivityFilters([row], { ...wide, startTime: "15:00" }, kathmandu))).toEqual(["tod"]);
+  });
+
+  it("reads the start in the zone, not in UTC", () => {
+    expect(ids(applyActivityFilters([row], { ...wide, startTime: "09:20", endTime: "09:20" }, { timeZone: "UTC" }))).toEqual(["tod"]);
+    expect(applyActivityFilters([row], { ...wide, startTime: "09:20", endTime: "09:20" }, kathmandu)).toEqual([]);
   });
 });
 
 /* ------------------------- which range actually wins ------------------------- */
 
 describe("applyActivityFilters — preset vs custom date range", () => {
-  const recent = buildActivity({ id: "recent", endedAt: new Date(NOW.getTime() - DAY).toISOString() });
-  const ancient = buildActivity({ id: "ancient", endedAt: new Date(NOW.getTime() - 40 * DAY).toISOString() });
+  const recent = startingAt("recent", new Date(NOW.getTime() - DAY).toISOString());
+  const ancient = startingAt("ancient", new Date(NOW.getTime() - 40 * DAY).toISOString());
   const both = [recent, ancient];
 
   it("really applies the default 7-day preset instead of letting everything through", () => {
@@ -288,8 +302,8 @@ describe("activeFilterChips — exact text, one chip per active dimension", () =
   });
 
   it("shows a productivity chip when only ONE end of the range has moved", () => {
-    expect(chips({ minProductivity: 30 })).toEqual([{ key: "productivity", label: "Productivity: 30–100%" }]);
-    expect(chips({ maxProductivity: 70 })).toEqual([{ key: "productivity", label: "Productivity: 0–70%" }]);
+    expect(chips({ minProductivity: 30 })).toEqual([{ key: "productivity", label: "Activity: 30–100%" }]);
+    expect(chips({ maxProductivity: 70 })).toEqual([{ key: "productivity", label: "Activity: 0–70%" }]);
   });
 
   it("spells out the two toggle chips", () => {

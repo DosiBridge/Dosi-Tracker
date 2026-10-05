@@ -316,6 +316,68 @@ h1, h2, h3, p, span, a, button, td, th, label, li {
   will-change: transform;
 }
 
+/* Analytics chart motion. As with .stagger, the RESTING state is the final
+   picture; the motion is only layered on when it is welcome (and never in
+   print), so turning it off can never leave a chart half drawn. */
+/* The dash pattern lives only inside the animation, so the finished line
+   never keeps one (and a renderer that dashes oddly can't leave it short). */
+@keyframes chart-draw {
+  from { stroke-dasharray: 1; stroke-dashoffset: 1; }
+  to { stroke-dasharray: 1; stroke-dashoffset: 0; }
+}
+@keyframes chart-reveal {
+  from { transform: scaleX(0); }
+  to { transform: scaleX(1); }
+}
+@keyframes chart-grow {
+  from { opacity: 0; transform: scale(0.35); }
+  to { opacity: 1; transform: scale(1); }
+}
+@keyframes chart-cell-in {
+  from { opacity: 0; transform: scale(0.55); }
+  to { opacity: 1; transform: scale(1); }
+}
+@media (prefers-reduced-motion: no-preference) {
+  /* Lines drawn with pathLength="1". */
+  .chart-draw { animation: chart-draw 1.2s cubic-bezier(0.16, 1, 0.3, 1) backwards; }
+  /* A clip rect sweeping left to right (sparklines). */
+  .chart-reveal { transform-origin: 0 0; animation: chart-reveal 1.1s cubic-bezier(0.16, 1, 0.3, 1) both; }
+  .chart-grow { animation: chart-grow 0.7s cubic-bezier(0.16, 1, 0.3, 1) both; }
+  .chart-cell-in { animation: chart-cell-in 0.45s cubic-bezier(0.16, 1, 0.3, 1) both; }
+}
+@media print {
+  .chart-draw, .chart-grow, .chart-cell-in, .chart-reveal { animation: none !important; }
+}
+
+/* Day timelines: the gaps between tracked blocks, hatched in the colour of
+   why the block before ended (break, idle, screen lock, sleep…). The tint is
+   light in either theme, so the foreground label keeps its contrast; a card
+   halo keeps the hatch from striking through it. */
+.tl-gap {
+  --gap: var(--muted-foreground);
+  color: var(--foreground);
+  background-color: color-mix(in srgb, var(--gap) 12%, var(--card));
+  background-image: repeating-linear-gradient(135deg, color-mix(in srgb, var(--gap) 32%, transparent) 0 3px, transparent 3px 7px);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--gap) 50%, transparent);
+}
+.tl-gap > span {
+  text-shadow: 0 0 3px var(--card), 0 0 3px var(--card);
+}
+.tl-gap-break { --gap: var(--warning); }
+.tl-gap-idle { --gap: var(--muted-foreground); }
+.tl-gap-lock { --gap: #7c3aed; }
+.tl-gap-sleep { --gap: var(--info); }
+.tl-gap-off {
+  --gap: var(--muted-foreground);
+  background-image: none;
+}
+.tl-gap-untracked {
+  --gap: var(--muted-foreground);
+  background-color: transparent;
+  background-image: none;
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+
 @media (prefers-reduced-motion: reduce) {
   .animate-fade-in,
   .animate-scale-in,
@@ -398,5 +460,113 @@ h1, h2, h3, p, span, a, button, td, th, label, li {
   }
   body {
     background: #fff !important;
+  }
+
+  /* Keep meaningful fills (bars, heat cells, brand rule) instead of letting
+     the browser drop backgrounds to save ink. */
+  .print-exact {
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  /* ---- Work Report: printed as a clean light document, even from dark mode ---- */
+  .dark .work-report {
+    color-scheme: light;
+    --background: #ffffff;
+    --foreground: #1a1a1a;
+    --card: #ffffff;
+    --card-foreground: #1a1a1a;
+    --muted: #f3f4f6;
+    --muted-foreground: #6b7280;
+    --border: #e5e7eb;
+    --primary: #006bff;
+    --primary-foreground: #ffffff;
+    --primary-strong: #0055cc;
+    --accent: #eef4ff;
+    --accent-foreground: #005be6;
+    --success-on-tint: #00705d;
+    --warning-on-tint: #8a5a00;
+    --danger-on-tint: #b3151d;
+    --muted-on-tint: #5b6270;
+    --ink: #1a1a1a;
+  }
+  .work-report {
+    color: var(--foreground);
+  }
+  .work-report > * + * {
+    margin-top: 0.75rem !important;
+  }
+  /* Small sections never split across pages; long tables may, but a row never does. */
+  .work-report .wr-keep,
+  .work-report tr {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+  .work-report thead {
+    display: table-header-group;
+  }
+  /* Print the Total row once, at the end — not repeated on every page. */
+  .work-report tfoot {
+    display: table-row-group;
+  }
+  .work-report .wr-scroll {
+    overflow: visible !important;
+  }
+  /* The timesheet fits the page width: smaller type (smallest for long periods),
+     no sticky column, no min width. */
+  .work-report .wr-matrix {
+    min-width: 0 !important;
+    font-size: 9px;
+  }
+  .work-report .wr-matrix[data-dense],
+  .work-report .wr-matrix[data-dense] thead span {
+    font-size: 6.5px;
+  }
+  .work-report .wr-matrix .text-sm {
+    font-size: inherit;
+  }
+  .work-report .wr-matrix th,
+  .work-report .wr-matrix td {
+    position: static !important;
+  }
+  .work-report .wr-matrix td > span {
+    min-width: 0 !important;
+    height: 1.5rem;
+  }
+  /* The chart was laid out at screen width: keep a fixed box and let its SVG
+     (which carries a viewBox) scale into the paper width. */
+  .work-report .wr-chart {
+    height: 200px !important;
+  }
+  .work-report .wr-chart .recharts-responsive-container,
+  .work-report .wr-chart .recharts-responsive-container > div,
+  .work-report .wr-chart .recharts-wrapper,
+  .work-report .wr-chart svg.recharts-surface {
+    width: 100% !important;
+    height: 100% !important;
+  }
+  .work-report .recharts-tooltip-wrapper {
+    display: none !important;
+  }
+  /* What was worked on: every note in full (the screen clamps long ones). */
+  .work-report .wr-notes li {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  /* ---- Work Analytics: every view prints; cards never split, charts fit the paper ---- */
+  .wr-keep {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+  .analytics-chart .recharts-responsive-container,
+  .analytics-chart .recharts-responsive-container > div,
+  .analytics-chart .recharts-wrapper,
+  .analytics-chart svg.recharts-surface {
+    width: 100% !important;
+    height: 100% !important;
+  }
+  .analytics-chart .recharts-tooltip-wrapper {
+    display: none !important;
   }
 }

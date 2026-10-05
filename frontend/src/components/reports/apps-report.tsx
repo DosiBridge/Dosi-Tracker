@@ -1,285 +1,313 @@
 "use client";
 
 import { useCallback, useMemo, useState } from "react";
-import { Bar, BarChart, Cell, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { AppWindow, Clock, TrendingUp, TrendingDown } from "lucide-react";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { AppWindow, Clock, TrendingDown, TrendingUp } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
-import { Progress } from "@/components/ui/progress";
-import { Select } from "@/components/ui/input";
+import { Card, CardContent } from "@/components/ui/card";
 import { DataTable, type Column } from "@/components/ui/data-table";
-import { ReportShell, FilterBar, ExportMenu, Kpi, KpiGrid, LiveReportNotice, useLiveReport } from "./report-shell";
-import { activities } from "@/lib/tenant-data";
-import { durationMinutes } from "@/lib/metrics";
-import { categoryColor, filterActivitiesByRange, type AppCategory, type AppUsage, type RangeKey } from "@/lib/reports-data";
-import { asArray, reportQuery, safePercent } from "@/lib/report-math";
-
-const APP_PALETTE: { app: string; category: AppCategory; color: string }[] = [
-  { app: "Visual Studio Code", category: "productive", color: "#3b82f6" },
-  { app: "Terminal", category: "productive", color: "#22c55e" },
-  { app: "Figma", category: "productive", color: "#ec4899" },
-  { app: "Postman", category: "productive", color: "#f97316" },
-  { app: "Linear", category: "productive", color: "#8b7dff" },
-  { app: "Docker Desktop", category: "productive", color: "#0ea5e9" },
-  { app: "Google Chrome", category: "neutral", color: "#64748b" },
-  { app: "Slack", category: "neutral", color: "#a855f7" },
-  { app: "Notion", category: "neutral", color: "#94a3b8" },
-  { app: "Zoom", category: "neutral", color: "#38bdf8" },
-  { app: "YouTube", category: "unproductive", color: "#ef4444" },
-  { app: "Spotify", category: "unproductive", color: "#f43f5e" },
-  { app: "X (Twitter)", category: "unproductive", color: "#fb7185" },
-  { app: "X", category: "unproductive", color: "#fb7185" },
-];
-import { exportRecords } from "@/lib/export";
-import { formatDuration, colorFromString } from "@/lib/utils";
+import { Select } from "@/components/ui/input";
 import { getApi } from "@/hooks/useApi";
-import { useIsMdUp } from "@/hooks/use-media-query";
-import { useSession } from "@/components/session-provider";
-import { resolveRange, type ResolvedRange } from "./date-range-picker";
+import { reportingRoute } from "@/lib/api-contract";
+import { APP_CATEGORY_COLORS, OTHER_APP_COLOR } from "@/lib/apps";
+import { downloadCSV } from "@/lib/export";
+import {
+  APP_GROUPS,
+  APP_GROUP_LABELS,
+  appGroupTotals,
+  appUsageFromBlocks,
+  decimalHoursTotal,
+  displayedTotal,
+  readAppUsage,
+  safePercent,
+  type AppGroup,
+  type AppUsageLine,
+} from "@/lib/report-math";
+import { apportionPercent, decimalHours, formatHM } from "@/lib/work-report";
+import {
+  Dash,
+  ExportMenu,
+  HoursFormatToggle,
+  Kpi,
+  KpiGrid,
+  LiveReportNotice,
+  NoTimeState,
+  RankedBars,
+  ReportFootnote,
+  ReportShell,
+  ReportSkeleton,
+  ReportToolbar,
+  SectionHeading,
+  ShareDonut,
+  demoActivities,
+  useHoursFormat,
+  usePeriodReport,
+  useReportPeriod,
+  useReportScope,
+} from "./report-shell";
 
-/* ---- Live (API) shape: /api/app/reporting/app-usage ---- */
-interface LiveAppUsage {
-  appName: string;
-  trackedMinutes: number;
-  activityCount: number;
-  userCount: number;
-}
+/* ============================================================================
+ * APPS & WEBSITES — the applications the team works in. Every app reads under
+ * ONE name with ONE colour (lib/apps: "chrome.exe" and "Google Chrome" are the
+ * same app) and is filed under its app category; apps nobody has classified
+ * are shown as unclassified rather than guessed. Apps that were only running
+ * in the background (no focused time) are hidden until asked for. Live:
+ * /reporting/app-usage for the period, project and member, in the reporting
+ * zone; demo: the same crediting rule over the seeded activity.
+ * ========================================================================== */
 
-const tooltipStyle = {
-  borderRadius: 12,
-  border: "1px solid var(--border)",
-  background: "var(--card)",
-  fontSize: 12,
-  boxShadow: "var(--elev-lg)",
-} as const;
+const GROUP_COLORS: Record<AppGroup, string> = { ...APP_CATEGORY_COLORS, unclassified: OTHER_APP_COLOR };
 
-const catTone: Record<AppCategory, "success" | "info" | "danger"> = {
+const groupTone: Record<AppGroup, "success" | "info" | "danger" | "muted"> = {
   productive: "success",
   neutral: "info",
   unproductive: "danger",
+  unclassified: "muted",
 };
 
+/** Under a minute of focused time: the app was only running in the background. */
+const isBackground = (l: AppUsageLine) => l.minutes < 1;
+
+interface Row extends AppUsageLine {
+  share: number;
+}
+
 export function AppsReport() {
-  const md = useIsMdUp();
-  const { isLive } = useSession();
-  const [rangeKey, setRangeKey] = useState<RangeKey>("7d");
-  const [range, setRange] = useState<ResolvedRange>(() => resolveRange("7d"));
-  const [category, setCategory] = useState<AppCategory | "all">("all");
+  const scope = useReportScope();
+  const { isLive, projectId, memberId } = scope;
+  const range = useReportPeriod("7d", isLive);
+  const { period, timeZone } = range;
+  const { format, setFormat, fmt } = useHoursFormat();
+  const [category, setCategory] = useState<AppGroup | "all">("all");
+  const [showBackground, setShowBackground] = useState(false);
 
-  const loadLive = useCallback(async (): Promise<LiveAppUsage[]> => {
-    const usage = await getApi(`/api/app/reporting/app-usage?${reportQuery({ from: range.from, to: range.to })}`);
-    return asArray<LiveAppUsage>(usage);
-  }, [range]);
+  const load = useCallback(async (): Promise<AppUsageLine[]> => {
+    const usage = await getApi(reportingRoute("app-usage", { from: period.from, to: period.to, projectId, userId: memberId, timeZone }));
+    return readAppUsage(usage);
+  }, [period, projectId, memberId, timeZone]);
+  const live = usePeriodReport(isLive, range.ready, load);
 
-  const live = useLiveReport(isLive, loadLive);
-
-  const mockAllApps = useMemo<AppUsage[]>(() => {
-    const acts = filterActivitiesByRange(activities, range.from, range.to);
-    const appMinutes = new Map<string, { app: string; category: AppCategory; minutes: number; color: string; users: Set<string> }>();
-    const appMetaMap = new Map(APP_PALETTE.map((a) => [a.app, { category: a.category, color: a.color }]));
-
-    acts.forEach((a) => {
-      const appName = a.screen.app;
-      const meta = appMetaMap.get(appName) || { category: "neutral" as AppCategory, color: "#64748b" };
-      const mins = durationMinutes(a);
-
-
-      const cur = appMinutes.get(appName) ?? {
-        app: appName,
-        category: meta.category,
-        minutes: 0,
-        color: meta.color,
-        users: new Set<string>(),
-      };
-      cur.minutes += mins;
-      cur.users.add(a.userId);
-      appMinutes.set(appName, cur);
-    });
-
-    return [...appMinutes.values()]
-      .map((x) => ({
-        app: x.app,
-        category: x.category,
-        minutes: x.minutes,
-        color: x.color,
-        activeUsers: x.users.size,
-      }));
-  }, [range]);
-
-  const liveAllApps = useMemo<AppUsage[]>(() => {
-    const meta = new Map(APP_PALETTE.map((a) => [a.app, { category: a.category, color: a.color }]));
-    // The backend tracks usage, not classification, and reports process names (code.exe). Category is
-    // a client heuristic: known apps keep their palette tone, everything else reads as neutral.
-    return (live.data ?? []).map((u) => {
-      const m = meta.get(u.appName);
-      return {
-        app: u.appName,
-        category: m?.category ?? ("neutral" as AppCategory),
-        minutes: u.trackedMinutes,
-        color: m?.color ?? colorFromString(u.appName),
-        activeUsers: u.userCount,
-      };
-    });
-  }, [live.data]);
+  const demo = useMemo(() => (isLive ? null : appUsageFromBlocks(demoActivities(period, projectId, memberId))), [isLive, period, projectId, memberId]);
 
   // A live session shows only real usage (or nothing) — never the demo app mix.
-  const allApps = isLive ? liveAllApps : mockAllApps;
+  const lines = useMemo(() => (isLive ? (live.data ?? []) : (demo ?? [])), [isLive, live.data, demo]);
+  const pending = live.pending;
 
-  const rows = useMemo<AppUsage[]>(() => {
-    return allApps
-      .filter((a) => category === "all" || a.category === category)
-      .sort((a, b) => b.minutes - a.minutes);
-  }, [allApps, category]);
+  const shares = useMemo(() => apportionPercent(lines.map((l) => l.minutes)), [lines]);
+  const all = useMemo<Row[]>(() => lines.map((l, i) => ({ ...l, share: shares[i] })), [lines, shares]);
+  const background = all.filter(isBackground).length;
+  const rows = all.filter((l) => (showBackground || !isBackground(l)) && (category === "all" || l.group === category));
+  const focused = all.filter((l) => !isBackground(l));
 
-  const total = useMemo(() => allApps.reduce((s, a) => s + a.minutes, 0), [allApps]);
-  const productive = useMemo(() => allApps.filter((a) => a.category === "productive").reduce((s, a) => s + a.minutes, 0), [allApps]);
-  const unproductive = useMemo(() => allApps.filter((a) => a.category === "unproductive").reduce((s, a) => s + a.minutes, 0), [allApps]);
-  const donutData = useMemo(() => {
-    const neutral = allApps.filter((a) => a.category === "neutral").reduce((s, a) => s + a.minutes, 0);
-    return [
-      { name: "Productive", value: productive, color: categoryColor.productive },
-      { name: "Neutral", value: neutral, color: categoryColor.neutral },
-      { name: "Unproductive", value: unproductive, color: categoryColor.unproductive },
-    ];
-  }, [allApps, productive, unproductive]);
+  const totals = appGroupTotals(lines);
+  const totalTime = displayedTotal(lines.map((l) => l.minutes), format);
+  const top = focused[0] ?? null;
+  const idleKnown = lines.some((l) => l.idleMinutes !== null);
+  const hasTime = totals.total > 0;
+  const dash = "—";
 
-  const chartData = rows.slice(0, 8).map((a) => ({ app: a.app, minutes: a.minutes, color: a.color }));
-  const topApp = rows[0];
-
-  const columns: Column<AppUsage>[] = [
-    { key: "app", header: "Application", sortValue: (r) => r.app, render: (r) => (
-      <span className="flex items-center gap-2 font-medium">
-        <span className="h-2.5 w-2.5 rounded-full" style={{ background: r.color }} /> {r.app}
-      </span>
-    )},
-    { key: "category", header: "Category", sortValue: (r) => r.category, render: (r) => <Badge tone={catTone[r.category]} className="capitalize">{r.category}</Badge> },
-    { key: "minutes", header: "Time", align: "right", sortValue: (r) => r.minutes, render: (r) => <span className="font-medium">{formatDuration(r.minutes)}</span> },
-    { key: "share", header: "Share", align: "right", sortValue: (r) => r.minutes, render: (r) => (
-      <div className="ml-auto flex w-28 items-center gap-2">
-        <Progress value={(r.minutes / (topApp?.minutes || 1)) * 100} color={r.color} />
-        <span className="w-9 text-right text-xs">{safePercent(r.minutes, total)}%</span>
-      </div>
-    )},
-    { key: "activeUsers", header: "Users", align: "right", sortValue: (r) => r.activeUsers, render: (r) => r.activeUsers },
+  const columns: Column<Row>[] = [
+    {
+      key: "name",
+      header: "Application",
+      sortValue: (r) => r.name,
+      render: (r) => (
+        <span className="flex min-w-0 items-center gap-2 font-medium">
+          <span aria-hidden className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ background: r.color }} />
+          <span className="truncate" title={r.name}>
+            {r.name}
+          </span>
+        </span>
+      ),
+    },
+    { key: "group", header: "Category", sortValue: (r) => APP_GROUP_LABELS[r.group], render: (r) => <Badge tone={groupTone[r.group]}>{APP_GROUP_LABELS[r.group]}</Badge> },
+    {
+      key: "minutes",
+      header: "Time",
+      align: "right",
+      sortValue: (r) => r.minutes,
+      render: (r) => (isBackground(r) ? <span className="text-xs text-muted-foreground">Background</span> : <span className="font-semibold tabular-nums">{fmt(r.minutes)}</span>),
+    },
+    { key: "share", header: "Share", align: "right", sortValue: (r) => r.minutes, render: (r) => <span className="tabular-nums text-muted-foreground">{r.share}%</span> },
+    ...(idleKnown
+      ? [
+          {
+            key: "idle",
+            header: "Idle",
+            align: "right" as const,
+            sortValue: (r: Row) => r.idleMinutes ?? -1,
+            render: (r: Row) => (r.idleMinutes === null ? <Dash label="Not reported" /> : <span className="tabular-nums">{fmt(r.idleMinutes)}</span>),
+          },
+        ]
+      : []),
+    { key: "users", header: "Members", align: "right", sortValue: (r) => r.userCount, render: (r) => <span className="tabular-nums">{r.userCount}</span> },
+    { key: "sessions", header: "Sessions", align: "right", sortValue: (r) => r.activityCount, render: (r) => <span className="tabular-nums">{r.activityCount}</span> },
   ];
 
-  function onRange(r: ResolvedRange) { setRange(r); setRangeKey(r.key); }
-  function doExport() {
-    exportRecords(`apps-usage-${range.key}`, rows, [
-      { header: "Application", value: (r) => r.app },
-      { header: "Category", value: (r) => r.category },
-      { header: "Time (min)", value: (r) => r.minutes },
-      { header: "Share %", value: (r) => safePercent(r.minutes, total) },
-      { header: "Active users", value: (r) => r.activeUsers },
+  function exportCsv() {
+    const headers = ["Application", "Category", "Hours (decimal)", "Hours (h:mm)", "Share %", ...(idleKnown ? ["Idle hours (decimal)"] : []), "Members", "Sessions"];
+    const body: (string | number)[][] = rows.map((r) => [
+      r.name,
+      APP_GROUP_LABELS[r.group],
+      decimalHours(r.minutes),
+      formatHM(r.minutes),
+      r.share,
+      ...(idleKnown ? [r.idleMinutes === null ? "" : decimalHours(r.idleMinutes)] : []),
+      r.userCount,
+      r.activityCount,
     ]);
+    body.push([
+      "Total",
+      "",
+      decimalHoursTotal(rows.map((r) => r.minutes)),
+      formatHM(displayedTotal(rows.map((r) => r.minutes), "clock")),
+      rows.reduce((s, r) => s + r.share, 0),
+      ...(idleKnown ? [decimalHoursTotal(rows.map((r) => r.idleMinutes ?? 0))] : []),
+      "",
+      "",
+    ]);
+    downloadCSV(`apps-${period.fromKey}-to-${period.toKey}`, headers, body);
   }
 
   return (
     <ReportShell
       title="Apps & Websites"
-      description="Most-used applications and websites, categorized by productivity."
-      actions={<ExportMenu onExportCSV={doExport} />}
+      description="The applications your team works in, by time, by member and by category."
+      actions={<ExportMenu onExportCSV={exportCsv} disabled={pending || rows.length === 0} />}
     >
-      <FilterBar
-        rangeKey={rangeKey}
-        onRange={onRange}
+      <ReportToolbar
+        period={range}
+        projectId={projectId}
+        onProject={scope.setProjectId}
+        memberId={memberId}
+        onMember={scope.setMemberId}
+        liveWorkerId={scope.liveWorkerId}
         extra={
-          <Select value={category} onChange={(e) => setCategory(e.target.value as AppCategory | "all")} className="w-full min-w-0 sm:w-auto sm:min-w-40">
-            <option value="all">All categories</option>
-            <option value="productive">Productive</option>
-            <option value="neutral">Neutral</option>
-            <option value="unproductive">Unproductive</option>
-          </Select>
+          <>
+            <Select
+              aria-label="Category"
+              value={category}
+              onChange={(e) => setCategory(e.target.value as AppGroup | "all")}
+              className="h-10 w-full min-w-0 sm:w-auto sm:min-w-40"
+            >
+              <option value="all">All categories</option>
+              {APP_GROUPS.map((g) => (
+                <option key={g} value={g}>
+                  {APP_GROUP_LABELS[g]}
+                </option>
+              ))}
+            </Select>
+            <HoursFormatToggle value={format} onChange={setFormat} />
+          </>
         }
       />
 
-      {isLive && <LiveReportNotice loading={live.loading} error={live.error} onRetry={live.retry} />}
+      {isLive && (
+        <div className="no-print">
+          <LiveReportNotice loading={live.loading} error={live.error} onRetry={live.retry} />
+        </div>
+      )}
 
       <KpiGrid>
-        <Kpi label="Total app time" value={formatDuration(total)} icon={Clock} tone="#6d5efc" sub={range.label} />
-        <Kpi label="Most used" value={topApp?.app ?? "—"} icon={AppWindow} tone="#0ea5e9" sub={topApp ? formatDuration(topApp.minutes) : ""} />
-        <Kpi label="Productive" value={formatDuration(productive)} icon={TrendingUp} tone="#22c55e" />
-        <Kpi label="Unproductive" value={formatDuration(unproductive)} icon={TrendingDown} tone="#ef4444" />
+        <Kpi label="App time" icon={Clock} accent="blue" value={pending ? dash : fmt(totalTime)} sub={pending ? undefined : `${focused.length} ${focused.length === 1 ? "app" : "apps"} in use`} />
+        <Kpi label="Most used" icon={AppWindow} accent="cyan" value={pending || !top ? dash : top.name} sub={pending || !top ? undefined : `${fmt(top.minutes)} · ${top.share}%`} />
+        <Kpi
+          label="Productive apps"
+          icon={TrendingUp}
+          accent="green"
+          value={pending || !hasTime ? dash : `${safePercent(totals.productive, totals.total)}%`}
+          sub={pending || !hasTime ? undefined : `${fmt(totals.productive)} of app time`}
+        />
+        <Kpi
+          label="Unproductive apps"
+          icon={TrendingDown}
+          accent="pink"
+          value={pending || !hasTime ? dash : `${safePercent(totals.unproductive, totals.total)}%`}
+          sub={pending || !hasTime ? undefined : `${fmt(totals.unproductive)} of app time`}
+        />
       </KpiGrid>
 
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
-        <Card>
-          <CardHeader><CardTitle>Category share</CardTitle></CardHeader>
-          <CardContent>
-            <div className="mx-auto h-[160px] max-w-[240px] sm:h-[200px] sm:max-w-none">
-              <ResponsiveContainer width="100%" height="100%">
-                <PieChart>
-                  <Pie data={donutData} dataKey="value" innerRadius={44} outerRadius={68} paddingAngle={2} strokeWidth={0}>
-                    {donutData.map((d) => <Cell key={d.name} fill={d.color} />)}
-                  </Pie>
-                  <Tooltip contentStyle={tooltipStyle} formatter={(v) => formatDuration(Number(v))} />
-                </PieChart>
-              </ResponsiveContainer>
-            </div>
-            <div className="mt-2 space-y-1.5">
-              {donutData.map((d) => (
-                <div key={d.name} className="flex items-center justify-between text-sm">
-                  <span className="flex items-center gap-2">
-                    <span className="h-2.5 w-2.5 rounded-full" style={{ background: d.color }} /> {d.name}
-                  </span>
-                  <span className="font-medium">{safePercent(d.value, total)}%</span>
-                </div>
-              ))}
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card className="lg:col-span-2">
-          <CardHeader>
-            <CardTitle>Top applications</CardTitle>
-            <div className="flex items-center gap-3 text-xs text-muted-foreground">
-              {(["productive", "neutral", "unproductive"] as AppCategory[]).map((c) => (
-                <span key={c} className="flex items-center gap-1.5 capitalize">
-                  <span className="h-2 w-2 rounded-full" style={{ background: categoryColor[c] }} /> {c}
-                </span>
-              ))}
-            </div>
-          </CardHeader>
-          <CardContent>
-            <div className="h-[220px] w-full min-w-0 sm:h-[260px]">
-              <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={chartData} layout="vertical" margin={{ top: 0, right: 8, left: 4, bottom: 0 }}>
-                  <XAxis type="number" hide />
-                  <YAxis
-                    type="category"
-                    dataKey="app"
-                    tickLine={false}
-                    axisLine={false}
-                    width={md ? 120 : 72}
-                    tick={{ fill: "#94a3b8", fontSize: md ? 12 : 10 }}
-                    tickFormatter={(v) => {
-                      const s = String(v);
-                      const max = md ? 16 : 10;
-                      return s.length > max ? `${s.slice(0, max - 1)}…` : s;
-                    }}
+      {pending ? (
+        live.loading ? <ReportSkeleton /> : null
+      ) : !hasTime ? (
+        <NoTimeState
+          period={period}
+          what="No app time in this period"
+          onWiden={period.custom || range.toolbar.preset !== "30d" ? () => range.choosePreset("30d") : undefined}
+        />
+      ) : (
+        <>
+          <div className="grid grid-cols-1 gap-5 xl:grid-cols-3">
+            <Card>
+              <SectionHeading title="By category" sub="What the apps are usually used for" />
+              <CardContent>
+                <ShareDonut
+                  label="App time by category"
+                  fmt={fmt}
+                  slices={APP_GROUPS.map((g) => ({ key: g, label: APP_GROUP_LABELS[g], minutes: totals[g], color: GROUP_COLORS[g] }))}
+                />
+              </CardContent>
+            </Card>
+            <Card className="xl:col-span-2">
+              <SectionHeading
+                title="Top applications"
+                sub={category === "all" ? "By focused time" : `${APP_GROUP_LABELS[category]} apps, by focused time`}
+              />
+              <CardContent>
+                {rows.some((r) => !isBackground(r)) ? (
+                  <RankedBars
+                    label="Top applications by focused time"
+                    items={rows
+                      .filter((r) => !isBackground(r))
+                      .slice(0, 8)
+                      .map((r) => ({
+                        key: r.key,
+                        label: r.name,
+                        value: r.minutes,
+                        display: fmt(r.minutes),
+                        detail: `· ${r.share}%`,
+                        color: r.color,
+                        badge: (
+                          <Badge tone={groupTone[r.group]} className="hidden shrink-0 sm:inline-flex">
+                            {APP_GROUP_LABELS[r.group]}
+                          </Badge>
+                        ),
+                      }))}
                   />
-                  <Tooltip contentStyle={tooltipStyle} cursor={{ fill: "var(--muted)" }} formatter={(v) => formatDuration(Number(v))} />
-                  <Bar dataKey="minutes" radius={[0, 6, 6, 0]} barSize={md ? 18 : 12}>
-                    {chartData.map((d) => <Cell key={d.app} fill={d.color} />)}
-                  </Bar>
-                </BarChart>
-              </ResponsiveContainer>
-            </div>
-          </CardContent>
-        </Card>
-      </div>
+                ) : (
+                  <p className="py-8 text-center text-sm text-muted-foreground">
+                    {category === "all" ? "Only background apps in this period." : `No ${APP_GROUP_LABELS[category].toLowerCase()} apps in this period.`}
+                  </p>
+                )}
+              </CardContent>
+            </Card>
+          </div>
 
-      <Card>
-        <CardHeader><CardTitle>All applications</CardTitle><span className="text-xs text-muted-foreground">{rows.length} apps</span></CardHeader>
-        <CardContent>
-          <DataTable
-            columns={columns}
-            rows={rows}
-            initialSort={{ key: "minutes", dir: "desc" }}
-            emptyText={isLive ? "No app usage tracked in this range." : undefined}
-          />
-        </CardContent>
-      </Card>
+          <Card>
+            <SectionHeading title="All applications" sub={`${rows.length} ${rows.length === 1 ? "app" : "apps"}`}>
+              {background > 0 && (
+                <button
+                  type="button"
+                  aria-pressed={showBackground}
+                  onClick={() => setShowBackground((v) => !v)}
+                  className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-border px-3 text-xs font-medium text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  {showBackground ? "Hide background apps" : `Show background apps (${background})`}
+                </button>
+              )}
+            </SectionHeading>
+            <CardContent>
+              <DataTable columns={columns} rows={rows} initialSort={{ key: "minutes", dir: "desc" }} emptyText="No apps match these filters." />
+            </CardContent>
+          </Card>
+        </>
+      )}
+
+      <ReportFootnote>
+        Time is each application&apos;s focused (foreground) time, as reported by the desktop app; a block from an older agent without
+        per-window time counts for its focused app. One app reads under one name everywhere (chrome.exe and Google Chrome are the same
+        app). Categories describe what an app is usually used for; apps not yet classified are listed as unclassified. Background apps
+        were running but never in front.
+      </ReportFootnote>
     </ReportShell>
   );
 }

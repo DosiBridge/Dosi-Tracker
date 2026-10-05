@@ -74,7 +74,18 @@ export const planById = (id: PlanId) => plans.find((p) => p.id === id)!;
 
 /* ----------------------------- Workspaces (tenants) ----------------------------- */
 
-export type SubscriptionStatus = "active" | "trialing" | "past_due";
+/**
+ * A workspace subscription's state, as the backend stores it. Suspended,
+ * canceled and expired workspaces can't record time or add people (the API
+ * answers 402 Tracker:SubscriptionInactive); a past-due one only until its
+ * grace period ends.
+ */
+export type SubscriptionStatus = "active" | "trialing" | "past_due" | "suspended" | "canceled" | "expired";
+
+/** Statuses under which the workspace is (or is about to be) cut off: owners are told what to do. */
+export function subscriptionNeedsAttention(status: SubscriptionStatus): boolean {
+  return status === "past_due" || status === "suspended" || status === "canceled" || status === "expired";
+}
 
 export interface Workspace {
   id: string;
@@ -156,14 +167,24 @@ export const workspaces: Workspace[] = [
 
 export const primaryWorkspace = workspaces.find((w) => w.isPrimary) ?? workspaces[0];
 
-/** Seat ceiling for a workspace: the backend's plan for a live tenant, else the plan table. */
+/** Shown for a live workspace whose plan couldn't be loaded. */
+export const UNKNOWN_PLAN_NAME = "Unknown plan";
+
+/**
+ * Seat ceiling for a workspace: the backend's plan for a live tenant, else the
+ * plan table. A live tenant whose plan is NOT known gets no ceiling in the
+ * browser — the backend enforces seats itself — rather than the demo table's
+ * guess (which blocked invites with "limit reached" on paid workspaces).
+ */
 export function seatLimitFor(ws: Workspace): number {
-  return ws.live?.seatLimit ?? planById(ws.planId).seats;
+  if (ws.live) return ws.live.known ? (ws.live.seatLimit ?? INF) : INF;
+  return planById(ws.planId).seats;
 }
 
-/** Display name of a workspace's plan (the backend's own name for a live tenant). */
+/** Display name of a workspace's plan (the backend's own name for a live tenant; "Unknown plan" when it couldn't be loaded). */
 export function planNameFor(ws: Workspace): string {
-  return ws.live?.planName ?? planById(ws.planId).name;
+  if (ws.live) return ws.live.known ? (ws.live.planName ?? UNKNOWN_PLAN_NAME) : UNKNOWN_PLAN_NAME;
+  return planById(ws.planId).name;
 }
 
 /* ----------------------------- Usage ----------------------------- */
@@ -275,4 +296,7 @@ export const statusLabel: Record<SubscriptionStatus, string> = {
   active: "Active",
   trialing: "Trial",
   past_due: "Past due",
+  suspended: "Suspended",
+  canceled: "Canceled",
+  expired: "Expired",
 };

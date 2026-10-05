@@ -33,8 +33,8 @@ test("core pages keep their primary actions usable on mobile @mobile", async ({
   await primeSession(context, { userId: "u1", workspaceId: "w1" });
 
   await page.goto("/dashboard");
-  await expect(page.getByText("Tracked today")).toBeVisible();
-  await expect(page.getByText("Tracked today")).toBeInViewport();
+  await expect(page.getByText("Tracked today", { exact: true })).toBeVisible();
+  await expect(page.getByText("Tracked today", { exact: true })).toBeInViewport();
 
   await page.goto("/projects");
   const newProject = page.getByRole("button", { name: "New project" });

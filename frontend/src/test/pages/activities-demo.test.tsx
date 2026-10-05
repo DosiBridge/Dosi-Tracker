@@ -9,7 +9,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import ActivitiesPage from "@/app/(dashboard)/activities/page";
-import { activities as seededActivities, projectById, userById } from "@/lib/tenant-data";
+import { activities as seededActivities, projectById, userById, users } from "@/lib/tenant-data";
 import { renderAsRole, resetPrototypeState } from "@/test/harness";
 
 beforeEach(() => {
@@ -101,5 +101,49 @@ describe("activities page — demo-mode fallback", () => {
     for (const other of ["Ayesha Rahman", "Nusrat Jahan", "Rafiq Islam", "Sadia Akter", "Imran Kabir", "David Chen"]) {
       expect(screen.queryByText(other)).not.toBeInTheDocument();
     }
+  }, RENDER_BUDGET_MS);
+});
+
+describe("activities page — demo presence, notes and days", () => {
+  it("'Live sessions only' follows the demo roster's presence — each tracking member's latest block, never a random flag", async () => {
+    const user = userEvent.setup();
+    renderAsRole(<ActivitiesPage />, "owner", { route: "/activities" });
+
+    await user.click(screen.getByRole("button", { name: "Filters" }));
+    const tracking = users.filter((u) => u.status === "active");
+    expect(screen.getByText(`${tracking.length} members are tracking now`)).toBeInTheDocument();
+    await user.click(screen.getByRole("switch", { name: /Live sessions only/ }));
+
+    const cards = screen.queryAllByRole("button", { name: /^Open session:/ });
+    expect(cards.length).toBeGreaterThan(0);
+    expect(cards.length).toBeLessThanOrEqual(tracking.length);
+    const names = cards.map((c) => c.getAttribute("aria-label")!.replace(/^Open session: /, "").split(",")[0]);
+    // Every live card belongs to a tracking member, and each member has at most one.
+    for (const name of names) expect(tracking.map((u) => u.name)).toContain(name);
+    expect(new Set(names).size).toBe(names.length);
+    for (const card of cards) expect(card).toHaveAccessibleName(expect.stringMatching(/live now$/));
+  }, RENDER_BUDGET_MS);
+
+  it("keeps a note edit for the visit without touching the network", async () => {
+    const user = userEvent.setup();
+    renderAsRole(<ActivitiesPage />, "owner", { route: "/activities" });
+
+    await user.click(screen.getAllByRole("button", { name: /^Open session:/ })[0]);
+    const dialog = screen.getByRole("dialog", { name: "Activity detail" });
+    await user.click(within(dialog).getByRole("button", { name: "Edit note" }));
+    const field = within(dialog).getByRole("textbox", { name: "Task note" });
+    await user.clear(field);
+    await user.type(field, "Pairing on the onboarding flow{Enter}");
+
+    expect(await within(dialog).findByText("Pairing on the onboarding flow")).toBeInTheDocument();
+    expect(fetch).not.toHaveBeenCalled();
+    await user.keyboard("{Escape}");
+    expect(screen.getAllByText("Pairing on the onboarding flow").length).toBeGreaterThan(0);
+  }, RENDER_BUDGET_MS);
+
+  it("heads each day with its sessions, tracked and idle time, and average activity", () => {
+    renderAsRole(<ActivitiesPage />, "owner", { route: "/activities" });
+    const headers = screen.getAllByRole("heading", { level: 2 }).map((h) => h.nextElementSibling?.textContent ?? "");
+    expect(headers.some((t) => /\d+ sessions? · .+ tracked · .+ idle · \d+% avg activity/.test(t))).toBe(true);
   }, RENDER_BUDGET_MS);
 });

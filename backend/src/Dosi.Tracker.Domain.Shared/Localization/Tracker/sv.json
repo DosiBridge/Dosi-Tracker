@@ -37,6 +37,12 @@
 	  "ChoosePhoto": "Välj Foto",
 	  "Menu:Home": "Hem",
 	  "LongWelcomeMessage": "Välkommen till ansökan. ",
-	  "Welcome": "Välkomna"
+	  "Welcome": "Välkomna",
+	  "Tracker:ActivityTooOld": "Aktiviteten startade för länge sedan och kan inte längre registreras.",
+	  "Tracker:NotProjectMember": "Du är inte medlem i det här projektet.",
+	  "Tracker:SubscriptionInactive": "Arbetsytans prenumeration är inte aktiv. Be arbetsytans ägare att förnya den.",
+	  "Tracker:InvalidUser": "Användaren finns inte i den här arbetsytan.",
+	  "Tracker:CannotModifySelf": "Du kan inte göra den här ändringen på ditt eget konto eller medlemskap.",
+	  "Tracker:RoleNotAllowed": "Endast arbetsytans ägare kan tilldela den här rollen, ändra timpriser eller hantera en ägares konto."
 	}
   }

@@ -2,6 +2,7 @@
 
 import { CalendarDays, ChevronLeft, ChevronRight } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { brand } from "@/lib/brand";
@@ -12,6 +13,9 @@ import {
   type DaySegment,
   type SegmentType,
 } from "@/lib/monitor-data";
+import { PRESENCE_STATE_LABELS, type MemberPresence, type PresenceState } from "@/lib/monitor-live";
+import { agoLabel } from "@/lib/live-session";
+import { formatClock } from "@/lib/activity-report";
 import { cn } from "@/lib/utils";
 
 export const RANGE = DAY_END_MIN - DAY_START_MIN;
@@ -29,6 +33,15 @@ export function prodColor(p: number): string {
   return brand.danger;
 }
 
+/** A block whose input wasn't measured: neutral, never a red "0%". */
+export const UNMEASURED_COLOR = "#94a3b8";
+
+/** A segment's colour: work by its activity % (neutral when not measured), the rest by type. */
+export function segmentColor(s: Pick<DaySegment, "type" | "productivity" | "measured">): string {
+  if (s.type !== "work") return typeColor[s.type];
+  return s.measured === false ? UNMEASURED_COLOR : prodColor(s.productivity);
+}
+
 export function TypeLegend({ className }: { className?: string }) {
   return (
     <div className={cn("flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground", className)}>
@@ -44,13 +57,15 @@ export function TypeLegend({ className }: { className?: string }) {
 
 /**
  * Legend for a live day: real agents report activity blocks only (no meetings,
- * breaks or idle), and each block is colored by its productivity.
+ * breaks or idle), and each block is colored by its activity % — grey when the
+ * agent couldn't measure input.
  */
-export function ProductivityLegend({ className }: { className?: string }) {
+export function ProductivityLegend({ className, showUnmeasured = false }: { className?: string; showUnmeasured?: boolean }) {
   const bands = [
-    { label: "≥ 75% productive", color: prodColor(75) },
+    { label: "≥ 75% active", color: prodColor(75) },
     { label: "50–74%", color: prodColor(50) },
     { label: "< 50%", color: prodColor(0) },
+    ...(showUnmeasured ? [{ label: "Not measured", color: UNMEASURED_COLOR }] : []),
   ];
   return (
     <div className={cn("flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground", className)}>
@@ -90,7 +105,7 @@ export function MiniDayStrip({
       {segments.map((s) => {
         const left = ((s.startMin - span.start) / range) * 100;
         const width = Math.max(0.8, (s.minutes / range) * 100);
-        const color = s.type === "work" ? prodColor(s.productivity) : typeColor[s.type];
+        const color = segmentColor(s);
         const muted = s.type === "idle" || s.type === "break";
         return (
           <div
@@ -140,6 +155,55 @@ export function DayNav({
       )}
     </div>
   );
+}
+
+/** Badge tones per presence state: tracking reads green, stepping away amber or blue, offline grey (all AA on their tints). */
+const PRESENCE_TONES: Record<PresenceState, "success" | "warning" | "info" | "muted"> = {
+  tracking: "success",
+  idle: "warning",
+  locked: "warning",
+  paused: "info",
+  break: "info",
+  choosing: "info",
+  offline: "muted",
+};
+
+const PRESENCE_DOTS: Record<PresenceState, string> = {
+  tracking: "bg-success",
+  idle: "bg-warning",
+  locked: "bg-warning",
+  paused: "bg-info",
+  break: "bg-info",
+  choosing: "bg-info",
+  offline: "bg-muted-foreground",
+};
+
+/** What a member is doing right now: "Tracking", "On a break", "Offline"… */
+export function PresenceChip({ state, className }: { state: PresenceState; className?: string }) {
+  return (
+    <Badge tone={PRESENCE_TONES[state]} className={cn("gap-1.5", className)}>
+      <span aria-hidden className={cn("h-1.5 w-1.5 rounded-full", PRESENCE_DOTS[state], state === "tracking" && "live-dot")} />
+      {PRESENCE_STATE_LABELS[state]}
+    </Badge>
+  );
+}
+
+/**
+ * The line under a member's state: since when (while online), else when they
+ * were last seen — the later of their last heartbeat and their last upload.
+ */
+export function presenceSince(
+  presence: Pick<MemberPresence, "state" | "since" | "lastSeenAt"> | undefined,
+  lastUpload: number | undefined,
+  now: Date,
+  timeZone?: string,
+): string | null {
+  if (presence && presence.state !== "offline") {
+    return presence.since ? `since ${formatClock(presence.since, timeZone)}` : null;
+  }
+  const heartbeat = presence?.lastSeenAt ? Date.parse(presence.lastSeenAt) : Number.NaN;
+  const seen = Math.max(Number.isFinite(heartbeat) ? heartbeat : 0, lastUpload ?? 0);
+  return seen > 0 ? `last seen ${agoLabel(new Date(seen).toISOString(), now)}` : "never seen";
 }
 
 export function MonitorKpi({

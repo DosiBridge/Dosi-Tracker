@@ -13,6 +13,7 @@ import {
   BarChart3,
   MonitorDot,
   CreditCard,
+  Download,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Avatar } from "@/components/ui/avatar";
@@ -29,6 +30,8 @@ const nav = [
   { href: "/timesheet", label: "Timesheet", icon: CalendarClock, group: "Monitor" },
   { href: "/reports", label: "Reports", icon: BarChart3, group: "Analytics" },
   { href: "/billing", label: "Billing & Plan", icon: CreditCard, group: "Workspace" },
+  // Everyone who is tracked needs the agent — a new member most of all.
+  { href: "/download", label: "Desktop agent", icon: Download, group: "Workspace" },
   { href: "/settings", label: "Settings", icon: Settings, group: "Workspace" },
 ];
 
@@ -68,7 +71,7 @@ export function Sidebar({
         </div>
 
         {/* Nav */}
-        <nav className="flex-1 space-y-1 overflow-y-auto px-3 py-4">
+        <nav aria-label="Main" className="flex-1 space-y-1 overflow-y-auto px-3 py-4">
           {visibleNav.map((item, i) => {
             const active = pathname === item.href || pathname.startsWith(item.href + "/");
             const Icon = item.icon;
@@ -84,6 +87,7 @@ export function Sidebar({
                 <Link
                   href={item.href}
                   onClick={onMobileClose}
+                  aria-current={active ? "page" : undefined}
                   title={compact ? item.label : undefined}
                   className={cn(
                     "group relative flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors",
@@ -96,7 +100,7 @@ export function Sidebar({
                   {active && (
                     <span className="absolute left-0 top-1/2 h-5 w-1 -translate-y-1/2 rounded-r-full bg-primary" />
                   )}
-                  <Icon className="h-[18px] w-[18px] shrink-0" />
+                  <Icon aria-hidden className="h-[18px] w-[18px] shrink-0" />
                   {!compact && <span>{item.label}</span>}
                 </Link>
               </div>

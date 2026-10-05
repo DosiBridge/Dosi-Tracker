@@ -1,9 +1,11 @@
 import { NOW } from "./mock-data";
 import { reconcileSegmentProductivity, trimSegmentsToTarget } from "./metrics";
 import { isLiveDataset, projects, userById } from "./tenant-data";
-import { colorFromString } from "./utils";
+import { appCategory, appColor } from "./apps";
 import type { ScreenMock } from "./types";
 import type { AppCategory } from "./reports-data";
+import type { ActivityEndReason } from "./api-contract";
+import { addZonedDays, formatDayKey, startOfZonedDay, zonedDayKey, zonedParts } from "./time-zone";
 
 /* ----------------------------- Types ----------------------------- */
 
@@ -34,6 +36,14 @@ export interface DaySegment {
   screen: ScreenMock;
   /** Open browser tabs — only present when `app` is a web browser. */
   tabs?: BrowserTab[];
+  /** False when the block's input wasn't measured (a live row with activity % null); absent = measured. */
+  measured?: boolean;
+  /** Minutes of the block without keyboard or mouse input, as the agent reported them (live rows only). */
+  idleMinutes?: number;
+  /** Why the block ended (live rows from newer agents). */
+  endReason?: ActivityEndReason | null;
+  /** The member's task note for the block (live rows). */
+  note?: string | null;
 }
 
 /* ----------------------------- Browser tabs ----------------------------- */
@@ -139,7 +149,14 @@ export interface DaySummary {
   tracked: number; // work + meeting minutes
   idle: number; // idle + break minutes
   productive: number;
+  /** Minute-weighted over the measured blocks; 0 when none was measured (see measuredMinutes). */
   productivityAvg: number;
+  /** Tracked minutes whose input was measured; 0 means the day's activity % is "not measured". */
+  measuredMinutes: number;
+  /** Idle minutes the agents reported INSIDE tracked blocks (live rows from newer agents). */
+  idleInBlocks: number;
+  /** Whether any block reported its idle time (older agents don't). */
+  idleReported: boolean;
   firstMin: number | null;
   lastMin: number | null;
   longestFocus: number;
@@ -201,19 +218,33 @@ function mulberry32(seed: number) {
 
 const DAY = 24 * 60 * 60 * 1000;
 
+const WEEKDAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"] as const;
+
+/** One selectable day of the monitor. */
+export interface DayOption {
+  /** The calendar day, "YYYY-MM-DD". */
+  iso: string;
+  /** "14 Jul" */
+  label: string;
+  /** "Tue" */
+  weekday: string;
+  isToday: boolean;
+}
+
 /**
- * Last N UTC days (most recent first) as selectable options. Deterministic from
- * the demo's frozen NOW by default; a live session passes the real clock.
+ * The last N calendar days of `timeZone` (most recent first) as selectable
+ * options. The demo's days are UTC days of its frozen NOW (the default); a
+ * live session passes the real clock and the reporting zone.
  */
-export function availableDays(count = 7, now: Date = NOW) {
-  const out: { iso: string; label: string; weekday: string; isToday: boolean }[] = [];
+export function availableDays(count = 7, now: Date = NOW, timeZone = "UTC"): DayOption[] {
+  const today = zonedDayKey(now, timeZone);
+  const out: DayOption[] = [];
   for (let d = 0; d < count; d++) {
-    const date = new Date(now.getTime() - d * DAY);
-    const iso = date.toISOString().slice(0, 10);
+    const iso = addZonedDays(today, -d);
     out.push({
       iso,
-      label: date.toLocaleDateString("en", { month: "short", day: "numeric", timeZone: "UTC" }),
-      weekday: date.toLocaleDateString("en", { weekday: "short", timeZone: "UTC" }),
+      label: formatDayKey(iso),
+      weekday: WEEKDAY_NAMES[zonedParts(startOfZonedDay(iso, "UTC"), "UTC").weekday],
       isToday: d === 0,
     });
   }
@@ -401,8 +432,13 @@ export function daySummary(segments: DaySegment[]): DaySummary {
   const active = segments.filter((s) => s.type === "work" || s.type === "meeting");
   const tracked = active.reduce((s, x) => s + x.minutes, 0);
   const idle = segments.filter((s) => s.type === "idle" || s.type === "break").reduce((s, x) => s + x.minutes, 0);
-  const productive = active.reduce((s, x) => s + (x.minutes * x.productivity) / 100, 0);
-  const productivityAvg = tracked ? Math.round((productive / tracked) * 100) : 0;
+  // Blocks whose input wasn't measured stay out of the average (contract: null is "not measured", never 0%).
+  const measured = active.filter((s) => s.measured !== false);
+  const measuredMinutes = measured.reduce((s, x) => s + x.minutes, 0);
+  const productive = measured.reduce((s, x) => s + (x.minutes * x.productivity) / 100, 0);
+  const productivityAvg = measuredMinutes ? Math.round((productive / measuredMinutes) * 100) : 0;
+  const reportingIdle = active.filter((s) => typeof s.idleMinutes === "number");
+  const idleInBlocks = reportingIdle.reduce((s, x) => s + Math.min(x.minutes, Math.max(0, x.idleMinutes ?? 0)), 0);
 
   // A focus run is back-to-back work. Generated days are contiguous (an idle or
   // break segment ends a run); real agents report discrete blocks, so a gap
@@ -426,6 +462,9 @@ export function daySummary(segments: DaySegment[]): DaySummary {
     idle,
     productive: Math.round(productive),
     productivityAvg,
+    measuredMinutes,
+    idleInBlocks: Math.round(idleInBlocks),
+    idleReported: reportingIdle.length > 0,
     firstMin: segments.length ? segments[0].startMin : null,
     lastMin: segments.length ? segments[segments.length - 1].endMin : null,
     longestFocus,
@@ -454,14 +493,21 @@ export function hourlyBuckets(segments: DaySegment[], startMin = DAY_START_MIN, 
   return buckets;
 }
 
-export function appBreakdown(segments: DaySegment[]) {
-  const map = new Map<string, { app: string; minutes: number; accent: string; category: AppCategory }>();
+/** One app's minutes in a day, with its colour (the same on every page) and category. */
+export interface AppMinutes {
+  app: string;
+  minutes: number;
+  accent: string;
+  category: AppCategory;
+}
+
+/** The demo day's apps: each generated segment credits its app with its minutes. */
+export function appBreakdown(segments: DaySegment[]): AppMinutes[] {
+  const map = new Map<string, AppMinutes>();
   for (const s of segments) {
     if (s.type === "idle" || s.type === "break") continue;
-    // Apps outside the demo catalog (real agents report any app) get a stable per-app color.
     const known = Object.prototype.hasOwnProperty.call(appMeta, s.app) ? appMeta[s.app] : undefined;
-    const meta = known ?? { accent: colorFromString(s.app, 60, 50), category: "neutral" as AppCategory };
-    const cur = map.get(s.app) ?? { app: s.app, minutes: 0, accent: meta.accent, category: meta.category };
+    const cur = map.get(s.app) ?? { app: s.app, minutes: 0, accent: appColor(s.app), category: known?.category ?? appCategory(s.app) };
     cur.minutes += s.minutes;
     map.set(s.app, cur);
   }

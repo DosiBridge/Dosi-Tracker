@@ -1,5 +1,5 @@
 {
-  "_comment": "Contract between the frontend and the ABP backend. Every backend endpoint referenced anywhere in src/ MUST appear here (enforced by the architecture spec). When the backend adds/renames a route, update this file in the same PR — a mismatch means either dead frontend code or a call that will 404.",
+  "_comment": "Contract between the frontend and the ABP backend. Every backend endpoint referenced anywhere in src/ MUST appear here (enforced by the architecture spec). An entry covers itself and everything under it (\"/api/app/project\" covers \"/api/app/project/{id}\"); where ABP puts an id in the middle of a route, list the template with a {name} segment (\"/api/app/platform/{id}/plan\"). When the backend adds/renames a route, update this file in the same PR — a mismatch means either dead frontend code or a call that will 404.",
   "endpoints": [
     "/connect/token",
     "/api/abp/application-configuration",
@@ -28,6 +28,22 @@
     "/api/app/team/members",
     "/api/app/team/member",
     "/api/app/notification/my-notifications",
-    "/api/app/notification/mark-as-read"
+    "/api/app/notification/mark-as-read",
+    "/api/app/presence/team",
+    "/api/app/reporting/payroll",
+    "/api/app/reporting/hourly",
+    "/api/app/reporting/devices",
+    "/api/app/team/reset-password",
+    "/api/app/team/from-workspace",
+    "/api/account/my-profile/change-password",
+    "/api/app/workspace/settings",
+    "/api/app/workspace/my-preferences",
+    "/api/app/platform/change-tenant-plan",
+    "/api/app/platform/activate-subscription",
+    "/api/app/platform/mark-invoice-paid",
+    "/api/app/platform/plan",
+    "/api/app/platform/{id}/plan",
+    "/api/app/platform/tenant-subscriptions",
+    "/api/app/platform/suspend-subscription"
   ]
 }

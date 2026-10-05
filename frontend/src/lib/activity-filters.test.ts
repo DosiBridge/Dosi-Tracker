@@ -1,9 +1,12 @@
 import { describe, it, expect } from "vitest";
 import {
   applyActivityFilters,
+  activityDateRange,
   countActiveFilters,
   activeFilterChips,
   activityApps,
+  formatActivityRange,
+  hasLocalFilters,
   memberOptions,
   projectOptions,
   defaultActivityFilters,
@@ -30,9 +33,9 @@ function act(over: Partial<Activity> & Pick<Activity, "id">): Activity {
   };
 }
 
-const a1 = act({ id: "a1", userId: "u1", projectId: "p1", endedAt: "2024-06-01T10:00:00Z", productivity: 90, mouseClicks: 100, keyboardHits: 50, screen: { app: "VSCode", kind: "editor", accent: "#000" }, online: true, hasWebcam: true, description: "writing tests" });
-const a2 = act({ id: "a2", userId: "u2", projectId: "p1", endedAt: "2024-06-02T10:00:00Z", productivity: 40, mouseClicks: 10, keyboardHits: 5, screen: { app: "Chrome", kind: "browser", accent: "#000" }, online: false, hasWebcam: false, description: "browsing docs" });
-const a3 = act({ id: "a3", userId: "u1", projectId: "p2", endedAt: "2024-06-03T10:00:00Z", productivity: 60, mouseClicks: 200, keyboardHits: 100, screen: { app: "Slack", kind: "chat", accent: "#000" }, online: true, hasWebcam: false, description: "chatting" });
+const a1 = act({ id: "a1", userId: "u1", projectId: "p1", startedAt: "2024-06-01T09:00:00Z", endedAt: "2024-06-01T10:00:00Z", productivity: 90, mouseClicks: 100, keyboardHits: 50, screen: { app: "VSCode", kind: "editor", accent: "#000" }, online: true, hasWebcam: true, description: "writing tests" });
+const a2 = act({ id: "a2", userId: "u2", projectId: "p1", startedAt: "2024-06-02T09:00:00Z", endedAt: "2024-06-02T10:00:00Z", productivity: 40, mouseClicks: 10, keyboardHits: 5, screen: { app: "Chrome", kind: "browser", accent: "#000" }, online: false, hasWebcam: false, description: "browsing docs" });
+const a3 = act({ id: "a3", userId: "u1", projectId: "p2", startedAt: "2024-06-03T09:00:00Z", endedAt: "2024-06-03T10:00:00Z", productivity: 60, mouseClicks: 200, keyboardHits: 100, screen: { app: "Slack", kind: "chat", accent: "#000" }, online: true, hasWebcam: false, description: "chatting" });
 const all = [a1, a2, a3];
 
 // Base filter that lets everything through on date, so each test isolates ONE predicate.
@@ -43,6 +46,7 @@ const wide: ActivityFilters = {
   customTo: "2100-01-01",
 };
 const ids = (list: Activity[]) => list.map((a) => a.id);
+const utc = { timeZone: "UTC" };
 
 describe("applyActivityFilters — predicates", () => {
   it("returns all rows when only a wide date range is applied", () => {
@@ -72,9 +76,9 @@ describe("applyActivityFilters — predicates", () => {
   it("filters by a free-text query against description", () => {
     expect(ids(applyActivityFilters(all, { ...wide, query: "brows" }))).toEqual(["a2"]);
   });
-  it("excludes rows whose ended date falls outside a custom range", () => {
+  it("excludes rows whose START falls outside a custom range (the server's rule)", () => {
     const narrow = { ...wide, customFrom: "2024-06-02", customTo: "2024-06-02" };
-    expect(ids(applyActivityFilters(all, narrow))).toEqual(["a2"]);
+    expect(ids(applyActivityFilters(all, narrow, utc))).toEqual(["a2"]);
   });
 });
 
@@ -93,6 +97,119 @@ describe("applyActivityFilters — sorting", () => {
   });
   it("most active first (clicks + keys)", () => {
     expect(ids(applyActivityFilters(all, { ...wide, sort: "active-high" }))).toEqual(["a3", "a1", "a2"]);
+  });
+});
+
+describe("applyActivityFilters — live sessions come from presence, not from the row", () => {
+  it("keeps the blocks the page says are running now, whatever their own flag", () => {
+    const live = new Set(["a2"]);
+    expect(ids(applyActivityFilters(all, { ...wide, onlineOnly: true }, { isLive: (a) => live.has(a.id) }))).toEqual(["a2"]);
+    expect(applyActivityFilters(all, { ...wide, onlineOnly: true }, { isLive: () => false })).toEqual([]);
+  });
+});
+
+describe("applyActivityFilters — blocks whose activity wasn't measured", () => {
+  const unmeasured = act({ id: "n", startedAt: "2024-06-04T09:00:00Z", endedAt: "2024-06-04T10:00:00Z", productivity: 0 });
+  const rows = [...all, unmeasured];
+  const ctx = { isMeasured: (a: Activity) => a.id !== "n" };
+
+  it("are kept while the activity window is untouched", () => {
+    expect(ids(applyActivityFilters(rows, wide, ctx))).toContain("n");
+  });
+
+  it("never pass a narrowed activity window — not even one starting at 0%", () => {
+    expect(ids(applyActivityFilters(rows, { ...wide, maxProductivity: 50 }, ctx))).toEqual(["a2"]);
+    expect(ids(applyActivityFilters(rows, { ...wide, minProductivity: 0, maxProductivity: 95 }, ctx))).not.toContain("n");
+  });
+
+  it("sort after every measured block in both directions", () => {
+    expect(ids(applyActivityFilters(rows, { ...wide, sort: "prod-high" }, ctx))).toEqual(["a1", "a3", "a2", "n"]);
+    expect(ids(applyActivityFilters(rows, { ...wide, sort: "prod-low" }, ctx))).toEqual(["a2", "a3", "a1", "n"]);
+  });
+});
+
+describe("applyActivityFilters — apps by their canonical name", () => {
+  it("matches the Windows executable and the macOS name of the same app", () => {
+    const win = act({ id: "win", screen: { app: "chrome.exe", kind: "browser", accent: "#000" } });
+    const mac = act({ id: "mac", screen: { app: "Google Chrome", kind: "browser", accent: "#000" } });
+    const other = act({ id: "other", screen: { app: "Code.exe", kind: "editor", accent: "#000" } });
+    expect(ids(applyActivityFilters([win, mac, other], { ...wide, app: "Google Chrome" })).sort()).toEqual(["mac", "win"]);
+  });
+
+  it("finds an app by its canonical name in the search too", () => {
+    const row = act({ id: "code", screen: { app: "Code.exe", kind: "editor", accent: "#000" } });
+    expect(ids(applyActivityFilters([row], { ...wide, query: "visual studio" }))).toEqual(["code"]);
+  });
+
+  it("offers each app once, canonically named", () => {
+    const rows = [
+      act({ id: "x", screen: { app: "chrome.exe", kind: "browser", accent: "#000" }, activeWindows: [{ appName: "Google Chrome", windowTitle: "", seconds: 5 }] }),
+      act({ id: "y", screen: { app: "Code.exe", kind: "editor", accent: "#000" }, runningPrograms: [{ appName: "slack.exe", windowTitle: "", seconds: 0 }] }),
+    ];
+    expect(activityApps(rows)).toEqual(["Google Chrome", "Slack", "Visual Studio Code"]);
+  });
+});
+
+describe("activityDateRange — whole days of the reporting zone", () => {
+  // Wed 23 Sep 2026, 01:30 in Dhaka (UTC+6) but still Tue 22 Sep 19:30 in UTC.
+  const now = new Date("2026-09-22T19:30:00.000Z");
+  const dhaka = { now, timeZone: "Asia/Dhaka" };
+  const range = (over: Partial<ActivityFilters>, clock = dhaka) => activityDateRange({ ...defaultActivityFilters, ...over }, clock);
+
+  it("reads Today and Yesterday as local calendar days, not UTC ones", () => {
+    expect(range({ rangeKey: "today" })).toEqual({
+      from: Date.parse("2026-09-22T18:00:00.000Z"),
+      to: Date.parse("2026-09-23T18:00:00.000Z"),
+      fromKey: "2026-09-23",
+      toKey: "2026-09-23",
+    });
+    expect(range({ rangeKey: "yesterday" })).toMatchObject({ fromKey: "2026-09-22", toKey: "2026-09-22" });
+    expect(range({ rangeKey: "today" }, { now, timeZone: "UTC" })).toMatchObject({ fromKey: "2026-09-22", toKey: "2026-09-22" });
+  });
+
+  it("makes the last 7 / 30 days today plus the days before, and this month its first day to today", () => {
+    expect(range({ rangeKey: "7d" })).toMatchObject({ fromKey: "2026-09-17", toKey: "2026-09-23" });
+    expect(range({ rangeKey: "30d" })).toMatchObject({ fromKey: "2026-08-25", toKey: "2026-09-23" });
+    expect(range({ rangeKey: "month" })).toMatchObject({ fromKey: "2026-09-01", toKey: "2026-09-23" });
+  });
+
+  it("reads custom days in the zone, open on a side left empty, and falls back to 7 days with none", () => {
+    expect(range({ rangeKey: "custom", customFrom: "2026-09-01", customTo: "2026-09-02" })).toEqual({
+      from: Date.parse("2026-08-31T18:00:00.000Z"),
+      to: Date.parse("2026-09-02T18:00:00.000Z"),
+      fromKey: "2026-09-01",
+      toKey: "2026-09-02",
+    });
+    expect(range({ rangeKey: "custom", customFrom: "2026-09-01" })).toMatchObject({ to: Number.POSITIVE_INFINITY, toKey: null });
+    expect(range({ rangeKey: "custom", customTo: "2026-09-02" })).toMatchObject({ from: Number.NEGATIVE_INFINITY, fromKey: null });
+    expect(range({ rangeKey: "custom" })).toMatchObject({ fromKey: "2026-09-17", toKey: "2026-09-23" });
+  });
+
+  it("keeps a block on the local day it started, so 'Today' and the day groups agree", () => {
+    const earlyDhaka = act({ id: "early", startedAt: "2026-09-22T18:30:00.000Z", endedAt: "2026-09-22T18:40:00.000Z" }); // 00:30 local
+    expect(ids(applyActivityFilters([earlyDhaka], { ...defaultActivityFilters, rangeKey: "today" }, dhaka))).toEqual(["early"]);
+    expect(applyActivityFilters([earlyDhaka], { ...defaultActivityFilters, rangeKey: "yesterday" }, dhaka)).toEqual([]);
+  });
+
+  it("formats the days a range covers", () => {
+    expect(formatActivityRange(range({ rangeKey: "7d" }))).toBe("17 Sep – 23 Sep 2026");
+    expect(formatActivityRange(range({ rangeKey: "today" }))).toBe("23 Sep 2026");
+    expect(formatActivityRange({ fromKey: "2026-09-01", toKey: null })).toBe("From 1 Sep 2026");
+    expect(formatActivityRange({ fromKey: null, toKey: "2026-09-02" })).toBe("Until 2 Sep 2026");
+    expect(formatActivityRange({ fromKey: null, toKey: null })).toBe("All time");
+  });
+});
+
+describe("hasLocalFilters — what the server query doesn't already apply", () => {
+  it("ignores the dates, member and project (the server filters those) and counts the rest", () => {
+    expect(hasLocalFilters(defaultActivityFilters)).toBe(false);
+    expect(hasLocalFilters({ ...defaultActivityFilters, rangeKey: "30d", memberId: "u1", projectId: "p1" })).toBe(false);
+    expect(hasLocalFilters({ ...defaultActivityFilters, query: " x " })).toBe(true);
+    expect(hasLocalFilters({ ...defaultActivityFilters, startTime: "09:00" })).toBe(true);
+    expect(hasLocalFilters({ ...defaultActivityFilters, minProductivity: 10 })).toBe(true);
+    expect(hasLocalFilters({ ...defaultActivityFilters, app: "Slack" })).toBe(true);
+    expect(hasLocalFilters({ ...defaultActivityFilters, onlineOnly: true })).toBe(true);
+    expect(hasLocalFilters({ ...defaultActivityFilters, webcamOnly: true })).toBe(true);
   });
 });
 
@@ -117,7 +234,7 @@ describe("activeFilterChips", () => {
   });
   it("labels a productivity narrowing", () => {
     const chips = activeFilterChips({ ...defaultActivityFilters, minProductivity: 30, maxProductivity: 70 });
-    expect(chips[0]).toMatchObject({ key: "productivity", label: "Productivity: 30–70%" });
+    expect(chips[0]).toMatchObject({ key: "productivity", label: "Activity: 30–70%" });
   });
   it("labels a preset date range via its human name", () => {
     const chips = activeFilterChips({ ...defaultActivityFilters, rangeKey: "30d" });
@@ -149,27 +266,17 @@ describe("activeFilterChips", () => {
   });
 });
 
-describe("applyActivityFilters — time-of-day window (local, tz-robust)", () => {
-  // minutesOfDay uses the LOCAL clock, so derive the window from the fixture's own local time
-  // rather than hard-coding it — keeps the test correct in any CI timezone.
-  const local = new Date(a1.endedAt);
-  const localMin = local.getHours() * 60 + local.getMinutes();
-  const hhmm = (min: number) => {
-    const m = (min + 1440) % 1440;
-    return `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
-  };
-
-  it("keeps a row whose local time is inside the window", () => {
-    const f = { ...wide, startTime: hhmm(localMin - 1), endTime: hhmm(localMin + 1) };
-    expect(ids(applyActivityFilters([a1], f))).toEqual(["a1"]);
+describe("applyActivityFilters — time-of-day window (start time, in the zone)", () => {
+  // a1 starts at 09:00 UTC: 15:00 in Dhaka.
+  it("keeps a row whose start is inside the window in the zone", () => {
+    expect(ids(applyActivityFilters([a1], { ...wide, startTime: "08:59", endTime: "09:01" }, utc))).toEqual(["a1"]);
+    expect(ids(applyActivityFilters([a1], { ...wide, startTime: "14:59", endTime: "15:01" }, { timeZone: "Asia/Dhaka" }))).toEqual(["a1"]);
   });
   it("drops a row before the lower bound", () => {
-    const f = { ...wide, startTime: hhmm(localMin + 2) };
-    expect(applyActivityFilters([a1], f)).toHaveLength(0);
+    expect(applyActivityFilters([a1], { ...wide, startTime: "09:02" }, utc)).toHaveLength(0);
   });
   it("drops a row after the upper bound", () => {
-    const f = { ...wide, endTime: hhmm(localMin - 2) };
-    expect(applyActivityFilters([a1], f)).toHaveLength(0);
+    expect(applyActivityFilters([a1], { ...wide, endTime: "08:58" }, utc)).toHaveLength(0);
   });
 });
 

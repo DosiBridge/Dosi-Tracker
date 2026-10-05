@@ -37,6 +37,12 @@
     "Unspecified": "Sistema",
     "SeeAllUsers": "Ver todos los usuarios",
     "TakePhoto": "Tomar foto",
-    "ChoosePhoto": "Escoge una foto"
+    "ChoosePhoto": "Escoge una foto",
+    "Tracker:ActivityTooOld": "La actividad comenzó hace demasiado tiempo y ya no se puede registrar.",
+    "Tracker:NotProjectMember": "No es miembro de este proyecto.",
+    "Tracker:SubscriptionInactive": "La suscripción del espacio de trabajo no está activa. Pida al propietario del espacio de trabajo que la renueve.",
+    "Tracker:InvalidUser": "El usuario no existe en este espacio de trabajo.",
+    "Tracker:CannotModifySelf": "No puede realizar este cambio en su propia cuenta o membresía.",
+    "Tracker:RoleNotAllowed": "Solo el propietario del espacio de trabajo puede asignar este rol, cambiar las tarifas por hora o gestionar la cuenta de un propietario."
   }
 }

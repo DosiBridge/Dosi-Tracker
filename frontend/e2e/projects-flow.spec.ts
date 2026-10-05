@@ -18,13 +18,14 @@ test("owner creates a project through the wizard and sees it in the list", async
   await dialog.getByPlaceholder("Short summary").fill("Created by the Playwright suite");
   await dialog.getByRole("button", { name: "Continue" }).click();
 
-  // Step 2 — team.
-  await expect(dialog.getByText("Select team members to add to this project.")).toBeVisible();
-  await dialog.getByRole("button", { name: /Tanvir Hasan/ }).click();
+  // Step 2 — team: people are checkboxes, labelled by name.
+  await expect(dialog.getByText("Pick the people who will track time on this project.")).toBeVisible();
+  await dialog.getByText("Tanvir Hasan").click();
+  await expect(dialog.getByRole("checkbox", { name: /Tanvir Hasan/ })).toBeChecked();
   await dialog.getByRole("button", { name: "Continue" }).click();
 
-  // Step 3 — tracking, then create.
-  await expect(dialog.getByText("Snapshot interval")).toBeVisible();
+  // Step 3 — tracking (block length, idle detection, captures), then create.
+  await expect(dialog.getByText("Block length")).toBeVisible();
   await dialog.getByRole("button", { name: "Create project" }).click();
 
   // The wizard closes and the new project card is in the active list.

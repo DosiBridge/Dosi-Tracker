@@ -3,12 +3,12 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Security.Cryptography.X509Certificates;
-using System.Threading.RateLimiting;
 using System.Threading.Tasks;
 using Dosi.Tracker.Billing;
+using Dosi.Tracker.Compatibility;
 using Dosi.Tracker.SaaS;
 using Microsoft.AspNetCore.Http;
-using Microsoft.AspNetCore.RateLimiting;
+using Microsoft.AspNetCore.Mvc;
 using Volo.Abp.BackgroundWorkers;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Builder;
@@ -29,6 +29,7 @@ using Volo.Abp;
 using Volo.Abp.Studio;
 using Volo.Abp.Account;
 using Volo.Abp.Account.Web;
+using Volo.Abp.AspNetCore.Auditing;
 using Volo.Abp.AspNetCore.MultiTenancy;
 using Volo.Abp.AspNetCore.Mvc;
 using Volo.Abp.Autofac;
@@ -122,14 +123,11 @@ public class TrackerHttpApiHostModule : AbpModule
             {
                 options.DisableTransportSecurityRequirement = true;
             });
-            
-            Configure<ForwardedHeadersOptions>(options =>
-            {
-                options.ForwardedHeaders = ForwardedHeaders.XForwardedProto;
-                options.KnownIPNetworks.Clear();
-                options.KnownProxies.Clear();
-            });
         }
+
+        // X-Forwarded-For / -Proto are honoured only from the proxies listed under App:ForwardedHeaders (plus loopback),
+        // so the per-client sign-in limits see the real caller behind a load balancer and nobody else can spoof it.
+        Configure<ForwardedHeadersOptions>(options => TrustedProxies.Configure(options, configuration));
 
         if (hostingEnvironment.IsDevelopment())
         {
@@ -146,25 +144,173 @@ public class TrackerHttpApiHostModule : AbpModule
         ConfigureSwagger(context, configuration);
         ConfigureVirtualFileSystem(context);
         ConfigureCors(context, configuration);
+        ConfigureBlobStoring(context, configuration);
+        ConfigureRequestSizeLimits(context);
+        ConfigureAuditing();
+        ConfigureLegacyAgentCompatibility();
+    }
 
-        // Use S3/R2 when credentials are configured; otherwise fall back to the database
-        // blob provider so captures work out of the box (dev, small deployments).
-        if (!string.IsNullOrWhiteSpace(configuration["S3:AccessKeyId"]))
+    /// <summary>Answers desktop agents installed before shared contract v2 in shapes they can read (see
+    /// <see cref="LegacyAgentCompatibility"/>): their reporting summary carries a numeric average activity.</summary>
+    private void ConfigureLegacyAgentCompatibility()
+    {
+        Configure<MvcOptions>(options => options.Filters.Add(new LegacyAgentSummaryResultFilter()));
+    }
+
+    /// <summary>Every running desktop agent sends a presence heartbeat each minute (shared contract §3). Recording each
+    /// one as a request in the audit log would bury everything else in it, so those requests are not audited.</summary>
+    private void ConfigureAuditing()
+    {
+        Configure<AbpAspNetCoreAuditingOptions>(options =>
         {
-            Configure<AbpBlobStoringOptions>(options =>
+            options.IgnoredUrls.Add("/api/app/presence/heartbeat");
+        });
+    }
+
+    /// <summary>
+    /// Captures go to S3 or an S3-compatible store (Cloudflare R2, MinIO, …) when <c>S3:AccessKeyId</c> is set, and
+    /// to the database blob provider otherwise, so they work out of the box (dev, small deployments). S3 settings:
+    /// <c>S3:AccessKeyId</c>, <c>S3:SecretAccessKey</c>, <c>S3:ContainerName</c> (the bucket), <c>S3:Region</c>
+    /// (e.g. "eu-west-1"; "auto" for R2) and/or <c>S3:ServiceUrl</c> (the endpoint of an S3-compatible store, e.g.
+    /// "https://&lt;account&gt;.r2.cloudflarestorage.com"), and optionally <c>S3:ForcePathStyle</c> (default: on
+    /// with a ServiceUrl, off for AWS), <c>S3:CreateContainerIfNotExists</c> and <c>S3:DisablePayloadSigning</c>.
+    /// An incomplete S3 configuration stops the start-up instead of failing every capture upload later.
+    /// </summary>
+    private void ConfigureBlobStoring(ServiceConfigurationContext context, IConfiguration configuration)
+    {
+        if (string.IsNullOrWhiteSpace(configuration["S3:AccessKeyId"]))
+        {
+            return;
+        }
+
+        var region = configuration["S3:Region"]?.Trim();
+        var serviceUrl = configuration["S3:ServiceUrl"]?.Trim();
+        var missing = new List<string>();
+        if (string.IsNullOrWhiteSpace(configuration["S3:SecretAccessKey"]))
+        {
+            missing.Add("S3:SecretAccessKey");
+        }
+
+        if (string.IsNullOrWhiteSpace(configuration["S3:ContainerName"]))
+        {
+            missing.Add("S3:ContainerName (the bucket)");
+        }
+
+        if (string.IsNullOrEmpty(region) && string.IsNullOrEmpty(serviceUrl))
+        {
+            missing.Add("S3:Region or S3:ServiceUrl");
+        }
+
+        if (missing.Any())
+        {
+            throw new AbpInitializationException(
+                "S3:AccessKeyId is set, so captures are stored in S3, but these settings are missing: " +
+                string.Join(", ", missing) + ".");
+        }
+
+        Configure<AbpBlobStoringOptions>(options =>
+        {
+            options.Containers.ConfigureDefault(container =>
             {
-                options.Containers.ConfigureDefault(container =>
+                container.UseAws(aws =>
                 {
-                    container.UseAws(aws =>
+                    aws.AccessKeyId = configuration["S3:AccessKeyId"];
+                    aws.SecretAccessKey = configuration["S3:SecretAccessKey"];
+                    aws.ContainerName = configuration["S3:ContainerName"];
+                    if (!string.IsNullOrEmpty(region))
                     {
-                        aws.AccessKeyId = configuration["S3:AccessKeyId"];
-                        aws.SecretAccessKey = configuration["S3:SecretAccessKey"];
-                        aws.ContainerName = configuration["S3:ContainerName"];
-                        // For Cloudflare R2:
-                        // aws.UseCredentials = false (not available in ABP by default, handled by S3 client config)
-                    });
+                        aws.Region = region;
+                    }
+
+                    if (!string.IsNullOrEmpty(serviceUrl))
+                    {
+                        aws.ServiceURL = serviceUrl;
+                    }
+
+                    aws.CreateContainerIfNotExists = configuration.GetValue("S3:CreateContainerIfNotExists", false);
+                    aws.DisablePayloadSigning = configuration.GetValue("S3:DisablePayloadSigning", false);
                 });
             });
+        });
+
+        // ABP addresses a ServiceUrl endpoint path-style and AWS itself virtual-hosted-style; the setting overrides both.
+        var forcePathStyle = configuration.GetValue<bool?>("S3:ForcePathStyle");
+        if (forcePathStyle.HasValue)
+        {
+            context.Services.AddTransient<IAmazonS3ClientFactory>(serviceProvider => new PathStyleAmazonS3ClientFactory(
+                serviceProvider.GetRequiredService<Volo.Abp.Caching.IDistributedCache<AwsTemporaryCredentialsCacheItem>>(),
+                serviceProvider.GetRequiredService<Volo.Abp.Security.Encryption.IStringEncryptionService>(),
+                forcePathStyle.Value));
+        }
+    }
+
+    /// <summary>ABP's S3 client factory, with path-style addressing as configured by <c>S3:ForcePathStyle</c>.</summary>
+    [Volo.Abp.DependencyInjection.DisableConventionalRegistration]
+    private sealed class PathStyleAmazonS3ClientFactory : DefaultAmazonS3ClientFactory
+    {
+        private readonly bool _forcePathStyle;
+
+        public PathStyleAmazonS3ClientFactory(
+            Volo.Abp.Caching.IDistributedCache<AwsTemporaryCredentialsCacheItem> cache,
+            Volo.Abp.Security.Encryption.IStringEncryptionService stringEncryptionService,
+            bool forcePathStyle)
+            : base(cache, stringEncryptionService)
+        {
+            _forcePathStyle = forcePathStyle;
+        }
+
+        protected override async Task<Amazon.S3.AmazonS3Config> CreateS3ClientConfigAsync(
+            AwsBlobProviderConfiguration configuration, Amazon.RegionEndpoint? region)
+        {
+            var clientConfig = await base.CreateS3ClientConfigAsync(configuration, region);
+            clientConfig.ForcePathStyle = _forcePathStyle;
+            return clientConfig;
+        }
+    }
+
+    /// <summary>Largest request body accepted (shared contract §1). An activity upload carries its captures
+    /// base64-encoded in the JSON body: screen ≤ 8 MB, thumbnail ≤ 512 KB and webcam ≤ 2 MB decoded (about 14 MB
+    /// encoded), plus the block itself.</summary>
+    public const long MaxRequestBodyBytes = 32L * 1024 * 1024;
+
+    /// <summary>
+    /// Caps request bodies at <see cref="MaxRequestBodyBytes"/> on Kestrel and on IIS. A larger body is answered
+    /// with 413, which tells the agents to resend the block without its images. The server reports the overrun as
+    /// a BadHttpRequestException while MVC reads the body, and ABP's exception filter would turn that into a 500,
+    /// which the agents retry forever; the status code finder keeps the exception's own status instead.
+    /// </summary>
+    private void ConfigureRequestSizeLimits(ServiceConfigurationContext context)
+    {
+        Configure<Microsoft.AspNetCore.Server.Kestrel.Core.KestrelServerOptions>(options =>
+        {
+            options.Limits.MaxRequestBodySize = MaxRequestBodyBytes;
+        });
+
+        Configure<IISServerOptions>(options =>
+        {
+            options.MaxRequestBodySize = MaxRequestBodyBytes;
+        });
+
+        context.Services.AddTransient<
+            Volo.Abp.AspNetCore.ExceptionHandling.IHttpExceptionStatusCodeFinder, BadRequestAwareStatusCodeFinder>();
+    }
+
+    /// <summary>ABP's HTTP status of an exception, except that a request the server refused to read (body too
+    /// large, malformed, too slow) keeps its own 4xx status instead of becoming a 500.</summary>
+    [Volo.Abp.DependencyInjection.DisableConventionalRegistration]
+    private sealed class BadRequestAwareStatusCodeFinder : Volo.Abp.AspNetCore.ExceptionHandling.DefaultHttpExceptionStatusCodeFinder
+    {
+        public BadRequestAwareStatusCodeFinder(
+            Microsoft.Extensions.Options.IOptions<Volo.Abp.AspNetCore.ExceptionHandling.AbpExceptionHttpStatusCodeOptions> options)
+            : base(options)
+        {
+        }
+
+        public override System.Net.HttpStatusCode GetStatusCode(HttpContext httpContext, Exception exception)
+        {
+            return exception is BadHttpRequestException badRequest
+                ? (System.Net.HttpStatusCode)badRequest.StatusCode
+                : base.GetStatusCode(httpContext, exception);
         }
     }
 
@@ -182,35 +328,11 @@ public class TrackerHttpApiHostModule : AbpModule
         }
     }
 
-    /// <summary>Brute-force / abuse protection for the anonymous entry points
-    /// (token endpoint and workspace self-registration), keyed by client IP.</summary>
+    /// <summary>Brute-force / abuse protection for the anonymous entry points (token endpoint, account endpoints and
+    /// workspace self-registration), keyed by the real client IP; see <see cref="AuthRateLimiting"/>.</summary>
     private void ConfigureRateLimiting(ServiceConfigurationContext context)
     {
-        context.Services.AddRateLimiter(options =>
-        {
-            options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
-            options.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(httpContext =>
-            {
-                var path = httpContext.Request.Path;
-                var isSensitive =
-                    path.StartsWithSegments("/connect/token") ||
-                    (path.StartsWithSegments("/api/app/workspace/register") &&
-                     httpContext.Request.Method == HttpMethods.Post);
-
-                if (!isSensitive)
-                {
-                    return RateLimitPartition.GetNoLimiter("unlimited");
-                }
-
-                var clientIp = httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
-                return RateLimitPartition.GetFixedWindowLimiter($"auth:{clientIp}", _ => new FixedWindowRateLimiterOptions
-                {
-                    Window = TimeSpan.FromMinutes(1),
-                    PermitLimit = 10,
-                    QueueLimit = 0
-                });
-            });
-        });
+        context.Services.AddTrackerAuthRateLimiting(context.Services.GetConfiguration());
     }
 
     private void ConfigureStudio(IHostEnvironment hostingEnvironment)
@@ -365,11 +487,12 @@ public class TrackerHttpApiHostModule : AbpModule
         }
 
         app.UseRouting();
-        app.UseRateLimiter();
         app.MapAbpStaticAssets();
         app.UseAbpStudioLink();
         app.UseAbpSecurityHeaders();
         app.UseCors();
+        // After CORS, so a 429 still carries Access-Control-Allow-Origin and the web app can tell the user to wait.
+        app.UseTrackerAuthRateLimiting();
         app.UseAuthentication();
         app.UseAbpOpenIddictValidation();
 
@@ -382,14 +505,18 @@ public class TrackerHttpApiHostModule : AbpModule
         app.UseDynamicClaims();
         app.UseAuthorization();
 
-        app.UseSwagger();
-        app.UseAbpSwaggerUI(options =>
+        // The API map is not published in production unless App:SwaggerEnabled says so.
+        var configuration = context.ServiceProvider.GetRequiredService<IConfiguration>();
+        if (DiagnosticsExposure.IsSwaggerEnabled(configuration, env))
         {
-            options.SwaggerEndpoint("/swagger/v1/swagger.json", "Tracker API");
+            app.UseSwagger();
+            app.UseAbpSwaggerUI(options =>
+            {
+                options.SwaggerEndpoint("/swagger/v1/swagger.json", "Tracker API");
+                options.OAuthClientId(configuration["AuthServer:SwaggerClientId"]);
+            });
+        }
 
-            var configuration = context.ServiceProvider.GetRequiredService<IConfiguration>();
-            options.OAuthClientId(configuration["AuthServer:SwaggerClientId"]);
-        });
         app.UseAuditing();
         app.UseAbpSerilogEnrichers();
         app.UseConfiguredEndpoints();

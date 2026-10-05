@@ -248,23 +248,21 @@ describe("architecture spec: persistence boundaries", () => {
    * been reviewed. Additions require review — session state belongs in
    * SessionProvider / useApi, not sprinkled through pages.
    *
-   * Reviewed groups (as of 2026-09):
-   *  - Designed persistence layer: session-provider (dosi-user/-workspace/…),
-   *    useApi (dosi-token/-tenant), tenant-data (dosi-projects-created-*),
-   *    theme-provider + the static pre-hydration theme script in app/layout.
-   *  - lib/live-session: THE single live-mode probe (`isLiveSession()` reads
-   *    dosi-token). The 22 pages/dashboards/report widgets that used to
-   *    re-implement `localStorage.getItem("dosi-token")` inline now call it or
-   *    read `useSession().isLive`. Do NOT reintroduce an inline probe.
+   * Reviewed groups (as of 2026-10):
+   *  - lib/live-session: THE storage layer. Its safe wrappers (readStorage /
+   *    writeStorage / removeStorage, which never throw when the browser
+   *    blocks site data) carry every session read and write: useApi's tokens
+   *    and tenant, SessionProvider's demo state, tenant-data's created
+   *    projects and the theme. It is also the single live-mode probe
+   *    (`isLiveSession()` reads dosi-token): do NOT reintroduce an inline one.
+   *  - The static pre-hydration theme script in app/layout.
    */
   const STORAGE_ALLOWLIST = new Set<string>([
-    // designed persistence layer
-    "src/components/session-provider.tsx",
-    "src/components/theme-provider.tsx",
-    "src/hooks/useApi.ts",
-    "src/lib/tenant-data.ts",
     "src/app/layout.tsx", // static theme script (pre-hydration, reads dosi-theme)
-    "src/lib/live-session.ts", // the one shared live-mode probe (reads dosi-token)
+    "src/lib/live-session.ts", // the storage layer and the one shared live-mode probe
+    // per-viewer display preferences (e.g. a report's hours format): one hook,
+    // values validated against an allow-list, SSR-safe; never session state
+    "src/hooks/use-stored-choice.ts",
   ]);
 
   it("confines localStorage/sessionStorage access to the reviewed persistence allowlist", () => {
@@ -328,9 +326,20 @@ describe("architecture spec: API contract", () => {
      * merely mentions a path — e.g. the fake browser window title
      * "POST /api/activities" in src/lib/monitor-data.ts demo data — is not a
      * call site and is deliberately ignored.
+     *
+     * A route is matched by the part before its first `${…}` (the path after
+     * an entry and "/" may continue, e.g. "/api/app/project/${id}"). Where ABP
+     * puts an id in the MIDDLE of a route ("/api/app/platform/{id}/plan"), the
+     * contract lists the template: each `{name}` segment stands for exactly
+     * one path segment, and the literal must match it in full.
      */
     const endpoints: string[] = contract.endpoints;
     expect(endpoints.length).toBeGreaterThan(0);
+    const escapeRegExp = (text: string) => text.replace(/[.*+?^$()|[\]\\]/g, "\\$&");
+    const templates = endpoints
+      .filter((e) => /\{[^/}]+\}/.test(e))
+      .map((e) => new RegExp(`^${e.split("/").map((seg) => (/^\{[^/}]+\}$/.test(seg) ? "[^/]+" : escapeRegExp(seg))).join("/")}(?:/|$)`));
+    expect(templates.length, "the contract's {id} templates were not recognised").toBeGreaterThan(0);
 
     const violations: string[] = [];
     let refsSeen = 0;
@@ -347,13 +356,11 @@ describe("architecture spec: API contract", () => {
         }
         if (start === -1) continue;
         refsSeen++;
-        const called = s.value
-          .slice(start)
-          .split("?")[0]
-          .split("\u0000")[0]
-          .replace(/\/+$/, "");
-        const served = endpoints.some((e) => called === e || called.startsWith(e + "/"));
-        if (!served) violations.push(`${file}:${s.line} calls "${called}"`);
+        const path = s.value.slice(start).split("?")[0].replace(/\/+$/, "");
+        const called = path.split("\u0000")[0].replace(/\/+$/, "");
+        const served =
+          endpoints.some((e) => called === e || called.startsWith(e + "/")) || templates.some((t) => t.test(path));
+        if (!served) violations.push(`${file}:${s.line} calls "${path.replace(/\u0000/g, "${…}")}"`);
       }
     }
     expect(
@@ -440,6 +447,8 @@ describe("architecture spec: secret scanning", () => {
      * an inlined credential.
      */
     const SECRET_PATTERN = /(password|secret|api[_-]?key|bearer\s+[a-z0-9])/i;
+    // How the lexer marks a template literal's `${…}` placeholder.
+    const PLACEHOLDER = String.fromCharCode(0);
     // Each entry was read in context and is benign: UI copy, an <input type>,
     // a demo app name, or a DOM id/aria-label for a password FIELD (a label
     // for the box, never a value that goes in it).
@@ -454,8 +463,22 @@ describe("architecture spec: secret scanning", () => {
       "Forgot password?", // link copy
       // Sign-in error copy. Names the fields, carries no credential value.
       "That email, password or workspace didn't match. Check them and try again.",
+      // Backend ROUTES (lib/api-contract.ts), declared in api-contract.json: the
+      // self-service change and the manager's reset. Paths, never credentials —
+      // the passwords travel in the request body / response, never in source.
+      "/api/account/my-profile/change-password",
+      `/api/app/team/reset-password?userId=${PLACEHOLDER}`,
       // "Forgot password?" guidance; \u0000 is the support-address placeholder.
       "Contact your workspace owner to reset your password. Workspace owners: email \u0000.",
+      // HTML autocomplete tokens on password FIELDS (sign-in, the session's
+      // re-authentication dialog, Settings → Security, the change-at-sign-in
+      // step): they tell password managers which saved value goes in the box.
+      "current-password",
+      "new-password",
+      // ABP's token-endpoint error descriptions for an account that must
+      // replace its password (lib/sign-in.ts recognises them): reason codes.
+      "ShouldChangePasswordOnNextLogin",
+      "PeriodicallyChangePassword",
     ]);
     const violations: string[] = [];
     let hitsSeen = 0;

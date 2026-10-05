@@ -1,4 +1,4 @@
-import type { Activity, Project, ScreenMock, User, WindowInfo } from "./types";
+import type { Activity, ActivityCoverage, Project, ScreenMock, User, WindowInfo } from "./types";
 import type {
   AppUsage,
   AttendanceRecord,
@@ -9,13 +9,26 @@ import type {
   ProductivitySplit,
 } from "./reports-data";
 import { trackedMembers, countSeats } from "./roles";
-import { activitiesOnDay, averageProductivity, minutesByUser, minutesOnDay } from "./metrics";
-import { applyProjectTotals, deriveAppCatalog, deriveDailyTrend, deriveHourly, deriveTopApps } from "./live-dataset";
+import { activitiesOnDay, activitiesOnZonedDay, averageProductivity, minutesByUser, minutesOnDay, totalMinutes } from "./metrics";
+import {
+  applyProjectTotals,
+  deriveAppCatalog,
+  deriveDailyTrend,
+  deriveHourly,
+  deriveTopApps,
+  type ProjectTotals,
+  type SummaryTotals,
+} from "./live-dataset";
+import { readStorage, writeStorage } from "./live-session";
+import { appCategory, appColor } from "./apps";
+import { zonedDayKey } from "./time-zone";
 import {
   DAY_MS,
   NOW,
   TODAY,
   TRACKED_DAY_SPAN,
+  assignDemoEndReasons,
+  demoAgentFields,
   planDaySessions,
   syncProjectTotals,
   users as primaryUsers,
@@ -61,6 +74,16 @@ export interface Dataset {
   notifications: AppNotification[];
   /** True for a dataset built from the real backend (see buildLiveDataset). */
   live?: boolean;
+  /**
+   * Live datasets only: how complete `activities` is. When `truncated`, the
+   * rows are the newest ones and lists or charts built from rows before
+   * `completeFrom` are partial — say so ("showing the newest N of M").
+   * Totals (project week/month, today per member) come from the server and
+   * are exact either way.
+   */
+  activityCoverage?: ActivityCoverage | null;
+  /** Live datasets only: the reporting zone "today" was counted in. */
+  timeZone?: string;
 }
 
 /* ----------------------------- Seeded RNG ----------------------------- */
@@ -102,17 +125,18 @@ const genericTitles: Record<string, string[]> = {
   Notion: ["Planning", "RFC", "Checklist", "Notes"],
 };
 const otherApps = ["Postman", "Docker Desktop", "Spotify", "1Password", "Zoom", "Linear"];
+/** Task notes members type into the agent ("What are you working on?"). */
 const descriptions = [
-  "Implementing new feature",
-  "Fixing a reported bug",
-  "Refactoring core module",
-  "Building UI components",
-  "Reviewing pull requests",
-  "Designing the new view",
-  "Writing tests",
-  "Tuning performance",
-  "Wiring up the API",
-  "Polishing the UI",
+  "Checkout flow – PR review",
+  "Bug triage – login timeout",
+  "Payments module – refactor",
+  "Component library – buttons",
+  "Release 2.3 – code review",
+  "Landing page – new hero",
+  "API client – unit tests",
+  "Image pipeline – performance",
+  "Partner API – integration",
+  "Settings screen – UI polish",
 ];
 
 function makeWindows(primary: ScreenMock, rand: () => number): { active: WindowInfo[]; running: WindowInfo[] } {
@@ -158,7 +182,7 @@ function genActivities(users: User[], projects: Project[], seedNum: number): Act
         const project = mine.length ? pick(mine) : projects[0];
         const { active, running } = makeWindows(template, rand);
         id++;
-        list.push({
+        const row: Activity = {
           id: `${user.id}-a${id}`,
           userId: user.id,
           projectId: project.id,
@@ -173,10 +197,13 @@ function genActivities(users: User[], projects: Project[], seedNum: number): Act
           screen: template,
           hasWebcam: project.permissions.webcam && rand() > 0.5,
           online: day === 0 && index === 0 ? true : rand() > 0.25,
-        });
+        };
+        // Device, idle time and task note: derived, so the seeded sequence above is unchanged.
+        list.push(Object.assign(row, demoAgentFields(user, row, day)));
       });
     }
   }
+  assignDemoEndReasons(list, TODAY);
   return list.sort((a, b) => +new Date(b.endedAt) - +new Date(a.endedAt));
 }
 
@@ -212,27 +239,28 @@ function genHourly(seedNum: number) {
   }));
 }
 
-const APP_PALETTE: { app: string; category: AppUsage["category"]; color: string }[] = [
-  { app: "Visual Studio Code", category: "productive", color: "#3b82f6" },
-  { app: "Terminal", category: "productive", color: "#22c55e" },
-  { app: "Figma", category: "productive", color: "#ec4899" },
-  { app: "Postman", category: "productive", color: "#f97316" },
-  { app: "Linear", category: "productive", color: "#8b7dff" },
-  { app: "Google Chrome", category: "neutral", color: "#64748b" },
-  { app: "Slack", category: "neutral", color: "#a855f7" },
-  { app: "Notion", category: "neutral", color: "#94a3b8" },
-  { app: "Zoom", category: "neutral", color: "#38bdf8" },
-  { app: "YouTube", category: "unproductive", color: "#ef4444" },
-  { app: "Spotify", category: "unproductive", color: "#f43f5e" },
+/** The apps a generated demo team uses; name, colour and category come from lib/apps like every live screen's. */
+const DEMO_APPS = [
+  "Visual Studio Code",
+  "Terminal",
+  "Figma",
+  "Postman",
+  "Linear",
+  "Google Chrome",
+  "Slack",
+  "Notion",
+  "Zoom",
+  "YouTube",
+  "Spotify",
 ];
 
 function genAppCatalog(users: User[], seedNum: number): AppUsage[] {
   const rand = mulberry32(seedNum ^ 0x9a3f);
   const team = Math.max(1, countSeats(users));
-  return APP_PALETTE.map((a) => ({
-    app: a.app,
-    category: a.category,
-    color: a.color,
+  return DEMO_APPS.map((app) => ({
+    app,
+    category: appCategory(app),
+    color: appColor(app),
     minutes: Math.round((120 + rand() * 380) * team * 0.5),
     activeUsers: Math.max(1, Math.min(team, Math.round(1 + rand() * team))),
   })).sort((a, b) => b.minutes - a.minutes);
@@ -339,21 +367,23 @@ function computeProjectDistribution(projects: Project[]) {
 
 /* ----------------------------- Primary (w1) — exact original values ----------------------------- */
 
-const PRIMARY_APP_CATALOG: AppUsage[] = [
-  { app: "Visual Studio Code", category: "productive", minutes: 1840, color: "#3b82f6", activeUsers: 6 },
-  { app: "Terminal", category: "productive", minutes: 430, color: "#22c55e", activeUsers: 5 },
-  { app: "Figma", category: "productive", minutes: 760, color: "#ec4899", activeUsers: 3 },
-  { app: "Postman", category: "productive", minutes: 210, color: "#f97316", activeUsers: 3 },
-  { app: "Linear", category: "productive", minutes: 180, color: "#8b7dff", activeUsers: 4 },
-  { app: "Docker Desktop", category: "productive", minutes: 160, color: "#0ea5e9", activeUsers: 2 },
-  { app: "Google Chrome", category: "neutral", minutes: 1120, color: "#64748b", activeUsers: 7 },
-  { app: "Slack", category: "neutral", minutes: 540, color: "#a855f7", activeUsers: 7 },
-  { app: "Notion", category: "neutral", minutes: 260, color: "#94a3b8", activeUsers: 5 },
-  { app: "Zoom", category: "neutral", minutes: 190, color: "#38bdf8", activeUsers: 4 },
-  { app: "YouTube", category: "unproductive", minutes: 220, color: "#ef4444", activeUsers: 4 },
-  { app: "Spotify", category: "unproductive", minutes: 150, color: "#f43f5e", activeUsers: 3 },
-  { app: "X (Twitter)", category: "unproductive", minutes: 95, color: "#fb7185", activeUsers: 3 },
-];
+const PRIMARY_APP_CATALOG: AppUsage[] = (
+  [
+    ["Visual Studio Code", 1840, 6],
+    ["Terminal", 430, 5],
+    ["Figma", 760, 3],
+    ["Postman", 210, 3],
+    ["Linear", 180, 4],
+    ["Docker Desktop", 160, 2],
+    ["Google Chrome", 1120, 7],
+    ["Slack", 540, 7],
+    ["Notion", 260, 5],
+    ["Zoom", 190, 4],
+    ["YouTube", 220, 4],
+    ["Spotify", 150, 3],
+    ["X (Twitter)", 95, 3],
+  ] as const
+).map(([app, minutes, activeUsers]) => ({ app, category: appCategory(app), minutes, color: appColor(app), activeUsers }));
 const PRIMARY_RATES: Record<string, number> = { u1: 60, u2: 45, u3: 45, u4: 38, u5: 42, u6: 55, u8: 50 };
 const PRIMARY_NOTIFICATIONS: AppNotification[] = [
   { id: "n1", type: "report", title: "Weekly report ready", body: "Your team's weekly productivity report is available.", at: new Date(NOW.getTime() - 8 * 60000).toISOString(), read: false },
@@ -486,12 +516,14 @@ const cache = new Map<string, Dataset>();
 /** Live workspace ids (see live-identity.ts) all start with this prefix. */
 const LIVE_ID_PREFIX = "live-";
 
-function getLocalStorageProjects(workspaceId: string): Project[] {
-  if (typeof window === "undefined") return [];
+/** Demo projects created in this browser, per workspace. */
+const createdProjectsKey = (workspaceId: string) => `dosi-projects-created-${workspaceId}`;
+
+function readCreatedProjects(workspaceId: string): Project[] {
+  const val = readStorage(createdProjectsKey(workspaceId));
+  // Guard the parse: a corrupted value (e.g. "null" or "{}") must fall back
+  // to "no local projects" instead of crashing `datasetFor` on `.length`.
   try {
-    const val = localStorage.getItem(`dosi-projects-created-${workspaceId}`);
-    // Guard the parse: a corrupted value (e.g. "null" or "{}") must fall back
-    // to "no local projects" instead of crashing `datasetFor` on `.length`.
     const parsed: unknown = val ? JSON.parse(val) : [];
     return Array.isArray(parsed) ? (parsed as Project[]) : [];
   } catch {
@@ -514,7 +546,7 @@ export function datasetFor(workspaceId: string): Dataset {
     return ds;
   } else ds = buildEmpty(workspaceId);
 
-  const localProjects = getLocalStorageProjects(workspaceId);
+  const localProjects = readCreatedProjects(workspaceId);
   if (localProjects.length > 0) {
     ds.projects = [...localProjects, ...ds.projects];
   }
@@ -529,17 +561,11 @@ export function createTenantProject(workspaceId: string, project: Project): void
     ds.projects = [project, ...ds.projects];
   }
 
-  if (typeof window !== "undefined") {
-    try {
-      const key = `dosi-projects-created-${workspaceId}`;
-      const existing = localStorage.getItem(key);
-      const parsed: unknown = existing ? JSON.parse(existing) : [];
-      const list: Project[] = Array.isArray(parsed) ? (parsed as Project[]) : [];
-      if (!list.some((p) => p.id === project.id)) {
-        list.unshift(project);
-        localStorage.setItem(key, JSON.stringify(list));
-      }
-    } catch {}
+  // Remembered for the next visit when the browser allows it; blocked storage only means it lasts this page view.
+  const list = readCreatedProjects(workspaceId);
+  if (!list.some((p) => p.id === project.id)) {
+    list.unshift(project);
+    writeStorage(createdProjectsKey(workspaceId), JSON.stringify(list));
   }
 
   if (active.workspaceId === workspaceId) {
@@ -608,28 +634,52 @@ export interface LiveDatasetInput {
   activities: Activity[];
   /** The real clock ("today" for live data is today, not the demo's frozen NOW). */
   now: Date;
+  /** The reporting zone whose calendar day is "today" (default UTC). */
+  timeZone?: string;
+  /** How complete `activities` is (see Dataset.activityCoverage). */
+  coverage?: ActivityCoverage | null;
+  /**
+   * Exact totals from the server, preferred over sums of `activities` (which
+   * may be partial): per project for the week / month / loaded window, and
+   * today's team total and Activity %.
+   */
+  totals?: { projects?: ProjectTotals; today?: SummaryTotals | null };
 }
 
-export function buildLiveDataset({ workspaceId, users: liveUsers, projects: liveProjects, activities: liveActivities, now }: LiveDatasetInput): Dataset {
+/** "This week" on the dashboard: the last 7 days. */
+const WEEK_MS = 7 * DAY_MS;
+
+export function buildLiveDataset({
+  workspaceId,
+  users: liveUsers,
+  projects: liveProjects,
+  activities: liveActivities,
+  now,
+  timeZone,
+  coverage,
+  totals,
+}: LiveDatasetInput): Dataset {
   const projectsCopy = liveProjects.map((p) => ({ ...p, memberIds: Array.isArray(p.memberIds) ? [...p.memberIds] : [] }));
-  applyProjectTotals(projectsCopy, liveActivities, now);
-  const today = now.toISOString().slice(0, 10);
-  const todays = activitiesOnDay(liveActivities, today);
-  const appCatalog = deriveAppCatalog(liveActivities);
+  applyProjectTotals(projectsCopy, liveActivities, now, { timeZone, totals: totals?.projects });
+  const today = timeZone ? zonedDayKey(now, timeZone) : now.toISOString().slice(0, 10);
+  const todays = timeZone ? activitiesOnZonedDay(liveActivities, today, timeZone) : activitiesOnDay(liveActivities, today);
+  // "This week" means the last 7 days — never the whole preloaded window.
+  const appCatalog = deriveAppCatalog(liveActivities, { from: new Date(now.getTime() - WEEK_MS), to: now });
+  const todayTotals = totals?.today ?? null;
   return {
     workspaceId,
     users: liveUsers,
     projects: projectsCopy,
     activities: liveActivities,
-    weeklyTrend: deriveDailyTrend(liveActivities, now, 7),
-    hourlyToday: deriveHourly(liveActivities, now),
+    weeklyTrend: deriveDailyTrend(liveActivities, now, 7, timeZone),
+    hourlyToday: timeZone ? deriveHourly(liveActivities, now, timeZone) : deriveHourly(liveActivities, now),
     topApps: deriveTopApps(appCatalog),
     summary: {
-      totalTrackedToday: Math.round(minutesOnDay(liveActivities, today)),
+      totalTrackedToday: Math.round(todayTotals ? todayTotals.totalMinutes : totalMinutes(todays)),
       activeMembers: liveUsers.filter((u) => u.status === "active").length,
       totalMembers: countSeats(liveUsers),
       activeProjects: projectsCopy.filter((p) => !p.archived).length,
-      avgProductivity: averageProductivity(todays),
+      avgProductivity: todayTotals ? (todayTotals.activity ?? 0) : averageProductivity(todays),
       screenshotsToday: todays.length,
     },
     projectDistribution: computeProjectDistribution(projectsCopy),
@@ -639,7 +689,14 @@ export function buildLiveDataset({ workspaceId, users: liveUsers, projects: live
     billing: [],
     notifications: [],
     live: true,
+    activityCoverage: coverage ?? null,
+    ...(timeZone ? { timeZone } : {}),
   };
+}
+
+/** The active live dataset's row coverage (null for demo data and before a live load). */
+export function activityCoverage(): ActivityCoverage | null {
+  return active.live ? (active.activityCoverage ?? null) : null;
 }
 
 /** Register a live dataset under its workspace id and make it the active one. */

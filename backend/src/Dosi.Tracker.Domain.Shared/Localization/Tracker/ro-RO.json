@@ -4,6 +4,12 @@
     "AppName": "Tracker",
     "Menu:Home": "Home",
     "LongWelcomeMessage": "Welcome to the application. This is a startup project based on the ABP framework. For more information visit",
-    "Welcome": "Welcome"
+    "Welcome": "Welcome",
+    "Tracker:ActivityTooOld": "Activitatea a început cu prea mult timp în urmă și nu mai poate fi înregistrată.",
+    "Tracker:NotProjectMember": "Nu sunteți membru al acestui proiect.",
+    "Tracker:SubscriptionInactive": "Abonamentul spațiului de lucru nu este activ. Cereți proprietarului spațiului de lucru să îl reînnoiască.",
+    "Tracker:InvalidUser": "Utilizatorul nu există în acest spațiu de lucru.",
+    "Tracker:CannotModifySelf": "Nu puteți face această modificare propriului cont sau propriei apartenențe.",
+    "Tracker:RoleNotAllowed": "Doar proprietarul spațiului de lucru poate acorda acest rol, modifica tarifele orare sau gestiona contul unui proprietar."
   }
 }

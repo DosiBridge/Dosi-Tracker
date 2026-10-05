@@ -1,15 +1,41 @@
 "use client";
 
 import { useEffect, useRef } from "react";
+import { FLOATING_LAYER_SELECTOR, FOCUSABLE_SELECTOR as FOCUSABLE } from "./floating";
 
-const FOCUSABLE = [
-  "a[href]",
-  "button:not([disabled])",
-  "input:not([disabled])",
-  "select:not([disabled])",
-  "textarea:not([disabled])",
-  '[tabindex]:not([tabindex="-1"])',
-].join(",");
+/*
+ * Open dialogs, oldest first. Dialogs nest (a confirmation over an edit
+ * form, a dialog over a drawer): the keyboard belongs to the newest one.
+ * Escape closes only it, only it traps Tab, and the page behind stays
+ * locked until the last one closes.
+ */
+const openDialogs: HTMLElement[] = [];
+
+/** Whether `el` is the newest open dialog — the one Escape and Tab act on. */
+export function isTopmostDialog(el: HTMLElement | null): boolean {
+  return el !== null && openDialogs[openDialogs.length - 1] === el;
+}
+
+let scrollLocks = 0;
+let overflowBefore = "";
+
+/**
+ * Stop the page behind scrolling while a dialog is open; returns the release.
+ * Counted, so a nested dialog closing leaves the page locked under the one
+ * still open.
+ */
+export function lockBodyScroll(): () => void {
+  if (scrollLocks++ === 0) {
+    overflowBefore = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+  }
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    if (--scrollLocks === 0) document.body.style.overflow = overflowBefore;
+  };
+}
 
 /**
  * Focus management for a modal dialog: moves focus into the dialog when it
@@ -32,6 +58,7 @@ export function useDialogFocus<T extends HTMLElement>(open: boolean) {
     if (!dialog) return;
 
     const restoreTo = document.activeElement as HTMLElement | null;
+    openDialogs.push(dialog);
 
     // Make everything outside the dialog inert while it is open. The focus trap
     // below handles Tab, but a screen reader's virtual cursor ignores focus
@@ -54,6 +81,12 @@ export function useDialogFocus<T extends HTMLElement>(open: boolean) {
 
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key !== "Tab") return;
+      // A dialog opened over this one keeps Tab inside itself.
+      if (!isTopmostDialog(dialog)) return;
+      // A menu or popover opened from inside the dialog is portaled to <body>
+      // and handles Tab itself; pulling focus back here would strand it.
+      const current = document.activeElement;
+      if (current instanceof Element && current.closest(FLOATING_LAYER_SELECTOR)) return;
       const items = focusable();
       if (items.length === 0) {
         e.preventDefault();
@@ -78,6 +111,8 @@ export function useDialogFocus<T extends HTMLElement>(open: boolean) {
     document.addEventListener("keydown", onKeyDown, true);
     return () => {
       document.removeEventListener("keydown", onKeyDown, true);
+      const index = openDialogs.lastIndexOf(dialog);
+      if (index !== -1) openDialogs.splice(index, 1);
       siblings.forEach((el, i) => {
         if (!previouslyInert[i]) el.removeAttribute("inert");
       });

@@ -7,7 +7,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { PageHeader, PageStack } from "@/components/ui/page-header";
 import { StatCard } from "@/components/dashboard/stat-card";
-import { ProjectDonut } from "@/components/dashboard/charts";
+import { ChartEmpty, ProjectDonut } from "@/components/dashboard/charts";
 import { useSession } from "@/components/session-provider";
 import { brand } from "@/lib/brand";
 import { planBreakdown, platformOverview } from "@/lib/host-data";
@@ -147,18 +147,24 @@ export default function HostOverviewPage() {
         <Card className="lg:col-span-1">
           <CardHeader><CardTitle>Tenants by plan</CardTitle></CardHeader>
           <CardContent>
-            <ProjectDonut data={donut} />
-            <div className="mt-3 space-y-2">
+            {donut.length === 0 ? (
+              <ChartEmpty message="No tenant is subscribed to a plan yet." />
+            ) : (
+              <ProjectDonut data={donut} format={(v) => `${v}`} centerLabel={donut.reduce((s, d) => s + d.value, 0) === 1 ? "tenant" : "tenants"} />
+            )}
+            <ul className="mt-3 space-y-2">
               {o.plans.map((p) => (
-                <div key={p.name} className="flex items-center justify-between text-sm">
+                <li key={p.name} className="flex items-center justify-between text-sm">
                   <span className="flex items-center gap-2">
-                    <span className="h-2.5 w-2.5 rounded-full" style={{ background: p.color }} />
+                    <span aria-hidden className="h-2.5 w-2.5 rounded-full" style={{ background: p.color }} />
                     <span className="text-muted-foreground">{p.name}</span>
                   </span>
-                  <span className="font-medium">{p.subscribers}</span>
-                </div>
+                  <span className="font-medium">
+                    {p.subscribers} {p.subscribers === 1 ? "tenant" : "tenants"}
+                  </span>
+                </li>
               ))}
-            </div>
+            </ul>
           </CardContent>
         </Card>
 

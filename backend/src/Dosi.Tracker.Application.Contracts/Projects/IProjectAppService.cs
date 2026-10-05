@@ -14,8 +14,9 @@ public interface IProjectAppService :
         CreateUpdateProjectDto>
 {
     /// <summary>
-    /// Active (non-archived) projects the current user is a member of,
-    /// with the capture permissions the desktop agents must honor.
+    /// GET /api/app/project/my-projects — the projects the current user tracks time on: active (non-archived) projects
+    /// where they are a member with a role other than Client, with the capture and idle policy the desktop agents must
+    /// honor. Agents refresh it every 5 minutes and after a 403/409 from an upload.
     /// </summary>
     Task<List<MyProjectDto>> GetMyProjectsAsync();
 

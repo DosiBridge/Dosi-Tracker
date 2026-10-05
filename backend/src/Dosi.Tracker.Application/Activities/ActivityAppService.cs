@@ -5,15 +5,20 @@ using System.Text.Json;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using Dosi.Tracker.Identity;
 using Dosi.Tracker.Permissions;
 using Dosi.Tracker.Projects;
+using Dosi.Tracker.SaaS;
 using Volo.Abp;
 using Volo.Abp.Application.Dtos;
 using Volo.Abp.Application.Services;
 using Volo.Abp.Authorization;
 using Volo.Abp.BlobStoring;
+using Volo.Abp.DistributedLocking;
 using Volo.Abp.Domain.Entities;
 using Volo.Abp.Domain.Repositories;
+using Volo.Abp.Uow;
 using Volo.Abp.Users;
 
 namespace Dosi.Tracker.Activities;
@@ -21,19 +26,34 @@ namespace Dosi.Tracker.Activities;
 [Authorize]
 public class ActivityAppService : ApplicationService, IActivityAppService
 {
-    /// <summary>Decoded capture payloads above this size are dropped (compressed PNG/JPEG
-    /// screenshots are far below it; this only guards against abuse). Oversized/invalid
-    /// captures are skipped, never fatal — the time block itself is always recorded.</summary>
-    private const int MaxCaptureBytes = 10 * 1024 * 1024;
+    /// <summary>Largest decoded screen capture accepted (a JPEG at most 1920 px wide is typically 150-500 KB).
+    /// Larger, invalid or disallowed captures are dropped (logged); the time block itself is always stored.</summary>
+    public const int MaxScreenCaptureBytes = 8 * 1024 * 1024;
+
+    /// <summary>Largest decoded thumbnail accepted (a JPEG at most 480 px wide).</summary>
+    public const int MaxThumbCaptureBytes = 512 * 1024;
+
+    /// <summary>Largest decoded webcam frame accepted.</summary>
+    public const int MaxWebcamCaptureBytes = 2 * 1024 * 1024;
 
     /// <summary>Tolerated device-clock drift: a block may end at most this far in the server's future.</summary>
     public static readonly TimeSpan MaxFutureSkew = TimeSpan.FromMinutes(5);
 
-    /// <summary>Floor for the per-project maximum block length: max(2 × interval, this) minutes.</summary>
-    public const int MinMaxBlockMinutes = 15;
+    /// <summary>Longest block accepted. Fixed rather than derived from the project's interval (5..60 min), so a
+    /// later interval change can never reject blocks recorded, or queued offline, under the previous one.</summary>
+    public static readonly TimeSpan MaxBlockLength = TimeSpan.FromMinutes(120);
 
     /// <summary>Back-to-back blocks may overlap by up to this much (clock jitter); more is double-counting.</summary>
     public static readonly TimeSpan AllowedOverlap = TimeSpan.FromSeconds(60);
+
+    /// <summary>A screen capture time reported by the agent is kept while it lies at most this far outside the block.</summary>
+    public static readonly TimeSpan CaptureTimeTolerance = TimeSpan.FromSeconds(60);
+
+    /// <summary>How long after its start the owner of a block may still change its note.</summary>
+    public static readonly TimeSpan NoteEditWindow = TimeSpan.FromDays(30);
+
+    /// <summary>How long an upload waits for another upload of the same member to finish.</summary>
+    private static readonly TimeSpan IngestLockTimeout = TimeSpan.FromSeconds(30);
 
     private const int MaxAppNameLength = 256;
     private const int MaxWindowTitleLength = 512;
@@ -43,156 +63,83 @@ public class ActivityAppService : ApplicationService, IActivityAppService
     private readonly IRepository<ProjectMember, Guid> _memberRepository;
     private readonly IRepository<Project, Guid> _projectRepository;
     private readonly IBlobContainer _blobContainer;
+    private readonly ISubscriptionAccessChecker _subscriptionAccessChecker;
+    private readonly IAbpDistributedLock _distributedLock;
+    private readonly ActivityIngestOptions _ingestOptions;
 
     public ActivityAppService(
         IRepository<Activity, Guid> activityRepository,
         IRepository<Screenshot, Guid> screenshotRepository,
         IRepository<ProjectMember, Guid> memberRepository,
         IRepository<Project, Guid> projectRepository,
-        IBlobContainer blobContainer)
+        IBlobContainer blobContainer,
+        ISubscriptionAccessChecker subscriptionAccessChecker,
+        IAbpDistributedLock distributedLock,
+        IOptions<ActivityIngestOptions> ingestOptions)
     {
         _activityRepository = activityRepository;
         _screenshotRepository = screenshotRepository;
         _memberRepository = memberRepository;
         _projectRepository = projectRepository;
         _blobContainer = blobContainer;
+        _subscriptionAccessChecker = subscriptionAccessChecker;
+        _distributedLock = distributedLock;
+        _ingestOptions = ingestOptions.Value;
     }
 
-    /// <summary>A capture decoded and ready to persist alongside its activity.</summary>
-    private sealed record PendingCapture(string Kind, byte[] Bytes, string ContentType, string FileName);
+    /// <summary>A capture decoded and checked, ready to be stored with its block.</summary>
+    private sealed record PendingCapture(string Kind, byte[] Bytes, string ContentType, DateTime CapturedAt, bool Blurred);
 
     public async Task<ActivityDto> CreateAsync(CreateActivityDto input)
     {
         var userId = CurrentUser.GetId(); // Throws if not authenticated; activities must belong to a real user.
 
-        // Activities may only be recorded against a project the caller belongs to.
-        var isMember = await _memberRepository.AnyAsync(
-            m => m.ProjectId == input.ProjectId && m.UserId == userId);
-        if (!isMember)
+        if (input.ClientActivityId == Guid.Empty)
         {
-            throw new AbpAuthorizationException("You are not a member of the target project.");
+            throw new BusinessException(TrackerDomainErrorCodes.ActivityClientIdRequired)
+                .WithData("clientActivityId", input.ClientActivityId);
         }
 
-        // Idempotent: an agent retrying an upload gets the stored block back. Scoped to the caller, so a
-        // guessed/colliding client id can never disclose another member's activity.
-        var existingActivity = await _activityRepository.FirstOrDefaultAsync(
-            x => x.UserId == userId && x.ClientActivityId == input.ClientActivityId);
-        if (existingActivity != null)
+        // One upload per member at a time, from the checks below until the block is committed: a retry racing
+        // its original, or two devices uploading overlapping blocks, cannot both pass the duplicate and overlap
+        // checks. The unique (TenantId, UserId, ClientActivityId) index stays the backstop across server instances
+        // when no distributed lock provider is configured.
+        await using var ingestLock = await _distributedLock.TryAcquireAsync(IngestLockName(userId), IngestLockTimeout);
+        if (ingestLock == null)
         {
-            return await MapToDtoWithCapturesAsync(existingActivity);
+            throw new AbpException(
+                $"Another upload of this member is still being stored; retry the block {input.ClientActivityId} later.");
         }
 
-        var project = await _projectRepository.FindAsync(input.ProjectId);
-        if (project == null)
+        // Idempotent: an agent retrying an upload gets the stored block back, whatever changed since (membership,
+        // archive, subscription). Scoped to the caller, so a guessed or colliding client id never discloses another
+        // member's activity.
+        var stored = await FindOwnBlockAsync(userId, input.ClientActivityId);
+        if (stored != null)
         {
-            throw new EntityNotFoundException(typeof(Project), input.ProjectId);
+            return await MapToDtoWithCapturesAsync(stored);
         }
 
-        if (project.IsArchived)
+        var project = await GetUploadProjectAsync(userId, input.ProjectId);
+
+        // Client ids are unique per member; one already used by another member's block is refused without revealing it.
+        if (await _activityRepository.AnyAsync(x => x.ClientActivityId == input.ClientActivityId && x.UserId != userId))
         {
-            throw new BusinessException(TrackerDomainErrorCodes.ProjectArchived)
-                .WithData("projectId", project.Id);
+            throw new BusinessException(TrackerDomainErrorCodes.ActivityClientIdConflict)
+                .WithData("clientActivityId", input.ClientActivityId);
         }
 
-        var blockLength = input.EndedAt - input.StartedAt;
+        await ValidateBlockAsync(userId, project, input);
 
-        // The constructor enforces a non-empty client id and EndedAt > StartedAt.
-        var activity = new Activity(
-            GuidGenerator.Create(),
-            CurrentTenant.Id,
-            userId,
-            input.ProjectId,
-            input.ClientActivityId,
-            input.StartedAt,
-            input.EndedAt
-        )
+        if (!await _subscriptionAccessChecker.IsUsableAsync())
         {
-            Productivity = input.Productivity,
-            // The capture policy is enforced server-side too: data the project does not allow is not stored,
-            // even if an outdated/misconfigured agent sends it. The time block itself is always kept.
-            MouseClicks = project.AllowMouse ? Math.Max(0, input.MouseClicks) : 0,
-            KeyboardHits = project.AllowKeyboard ? Math.Max(0, input.KeyboardHits) : 0,
-            Description = input.Description,
-            ActiveWindowsJson = project.AllowActiveWindow ? SerializeWindows(input.ActiveWindows, project, blockLength) : "[]",
-            RunningProgramsJson = project.AllowRunningPrograms ? SerializeWindows(input.RunningPrograms, project, blockLength) : "[]",
-            TimelineJson = SerializeTimeline(input.Timeline, project, blockLength)
-        };
-
-        await ValidateTimeRangeAsync(userId, project, input);
-
-        // Decode captures BEFORE the durable write: invalid/oversized/disallowed captures are skipped
-        // (logged), never committed-then-lost, and never fatal to the activity.
-        var captures = new List<PendingCapture>(3);
-        if (project.AllowScreenshot)
-        {
-            AddCaptureIfValid(captures, input.ScreenshotPngBase64, Screenshot.ScreenKind, "image/png", "screen.png");
-            AddCaptureIfValid(captures, input.ScreenshotThumbJpgBase64, Screenshot.ThumbKind, "image/jpeg", "thumb.jpg");
-        }
-        else
-        {
-            LogDisallowedCapture(input.ScreenshotPngBase64, Screenshot.ScreenKind, project.Id);
-            LogDisallowedCapture(input.ScreenshotThumbJpgBase64, Screenshot.ThumbKind, project.Id);
+            throw new BusinessException(TrackerDomainErrorCodes.SubscriptionInactive);
         }
 
-        if (project.AllowWebcam)
-        {
-            AddCaptureIfValid(captures, input.WebcamJpgBase64, Screenshot.WebcamKind, "image/jpeg", "webcam.jpg");
-        }
-        else
-        {
-            LogDisallowedCapture(input.WebcamJpgBase64, Screenshot.WebcamKind, project.Id);
-        }
+        var activity = BuildActivity(userId, project, input);
+        var captures = DecodeCaptures(project, input);
 
-        var storedCaptures = new List<ActivityCaptureRefDto>(captures.Count);
-        try
-        {
-            // Separate UoW so a unique-index violation cannot poison the ambient unit of work,
-            // and so the activity + its captures commit atomically (all-or-nothing).
-            using var uow = UnitOfWorkManager.Begin(new Volo.Abp.Uow.AbpUnitOfWorkOptions(), requiresNew: true);
-
-            await _activityRepository.InsertAsync(activity, autoSave: true);
-
-            foreach (var capture in captures)
-            {
-                var blobName = $"activities/{activity.Id}/{capture.FileName}";
-                await _blobContainer.SaveAsync(blobName, capture.Bytes, overrideExisting: true);
-                var screenshot = await _screenshotRepository.InsertAsync(new Screenshot(
-                    GuidGenerator.Create(),
-                    CurrentTenant.Id,
-                    activity.Id,
-                    blobName,
-                    activity.EndedAt,
-                    capture.Bytes.Length,
-                    capture.ContentType,
-                    capture.Kind));
-                storedCaptures.Add(new ActivityCaptureRefDto { Id = screenshot.Id, Kind = screenshot.Kind });
-            }
-
-            await uow.CompleteAsync();
-        }
-        catch (Exception)
-        {
-            // A concurrent retry may have won the unique (TenantId, ClientActivityId) race — stay idempotent.
-            var winner = await _activityRepository.FirstOrDefaultAsync(
-                x => x.ClientActivityId == input.ClientActivityId);
-            if (winner != null)
-            {
-                if (winner.UserId != userId)
-                {
-                    // The id is already taken by another member's block: refuse without revealing it.
-                    throw new BusinessException(TrackerDomainErrorCodes.ActivityClientIdConflict)
-                        .WithData("clientActivityId", input.ClientActivityId);
-                }
-
-                return await MapToDtoWithCapturesAsync(winner);
-            }
-
-            throw;
-        }
-
-        var dto = MapToDto(activity);
-        dto.Captures = OrderCaptures(storedCaptures);
-        return dto;
+        return await StoreAsync(activity, captures);
     }
 
     public async Task<PagedResultDto<ActivityDto>> GetListAsync(GetActivitiesInput input)
@@ -202,7 +149,9 @@ public class ActivityAppService : ApplicationService, IActivityAppService
         var totalCount = await AsyncExecuter.CountAsync(query);
         var activities = await AsyncExecuter.ToListAsync(
             query
-                .OrderByDescending(a => a.StartedAt) // Deterministic order; Skip/Take without OrderBy is undefined.
+                // Deterministic and stable: blocks starting at the same instant keep their order across pages.
+                .OrderByDescending(a => a.StartedAt)
+                .ThenByDescending(a => a.Id)
                 .PageBy(input.SkipCount, input.MaxResultCount)
         );
 
@@ -248,12 +197,517 @@ public class ActivityAppService : ApplicationService, IActivityAppService
             throw new EntityNotFoundException(typeof(Screenshot), id);
         }
 
+        // The bytes decide: older servers stored every screen capture as image/png, whatever the agent sent.
+        var contentType = CaptureImageFormat.DetectContentType(bytes) ?? screenshot.ContentType;
         return new ScreenshotContentDto
         {
             Bytes = bytes,
-            ContentType = screenshot.ContentType,
-            FileName = $"{screenshot.ActivityId}-{screenshot.Kind}{(screenshot.ContentType == "image/png" ? ".png" : ".jpg")}"
+            ContentType = contentType,
+            FileName = $"{screenshot.ActivityId}-{screenshot.Kind}{CaptureImageFormat.FileExtension(contentType)}"
         };
+    }
+
+    public async Task<ActivityDto> UpdateNoteAsync(Guid id, UpdateActivityNoteDto input)
+    {
+        var activity = await _activityRepository.GetAsync(id);
+
+        if (activity.UserId == CurrentUser.GetId())
+        {
+            var age = UtcNow - AgentContextNormalizer.AsUtc(activity.StartedAt);
+            if (age > NoteEditWindow && !await AuthorizationService.IsGrantedAsync(TrackerPermissions.Team.Manage))
+            {
+                throw new AbpAuthorizationException(
+                    $"The note of a block can be changed within {NoteEditWindow.TotalDays:0} days of its start.");
+            }
+        }
+        else if (!await AuthorizationService.IsGrantedAsync(TrackerPermissions.Team.Manage))
+        {
+            if (!await AuthorizationService.IsGrantedAsync(TrackerPermissions.Activities.ViewAll))
+            {
+                // Other members' blocks are hidden entirely from callers who cannot read them.
+                throw new EntityNotFoundException(typeof(Activity), id);
+            }
+
+            throw new AbpAuthorizationException("Only the member who tracked a block, or a team manager, can change its note.");
+        }
+
+        activity.Description = AgentContextNormalizer.CleanNote(input.Description, UpdateActivityNoteDto.MaxDescriptionLength);
+        await _activityRepository.UpdateAsync(activity, autoSave: true);
+
+        return await MapToDtoWithCapturesAsync(activity);
+    }
+
+    /// <summary>The server's clock, as UTC.</summary>
+    private DateTime UtcNow => AgentContextNormalizer.AsUtc(Clock.Now);
+
+    private static string IngestLockName(Guid userId) => $"Tracker:ActivityIngest:{userId:N}";
+
+    private Task<Activity?> FindOwnBlockAsync(Guid userId, Guid clientActivityId) =>
+        _activityRepository.FirstOrDefaultAsync(x => x.UserId == userId && x.ClientActivityId == clientActivityId);
+
+    /// <summary>The project a block is uploaded to. Only members who track time may upload: no membership, a
+    /// <c>Client</c> role, or a deleted project are all refused as not a member (403, so agents refresh their
+    /// projects and set the block aside if the project is really gone).</summary>
+    private async Task<Project> GetUploadProjectAsync(Guid userId, Guid projectId)
+    {
+        var memberships = await _memberRepository.GetListAsync(m => m.ProjectId == projectId && m.UserId == userId);
+        var project = memberships.Any(m => !TrackerRoles.IsClientProjectRole(m.Role))
+            ? await _projectRepository.FindAsync(projectId)
+            : null;
+
+        if (project == null)
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.NotProjectMember)
+                .WithData("projectId", projectId);
+        }
+
+        return project;
+    }
+
+    /// <summary>
+    /// The time rules of shared contract §1, in its order: a valid range, a project not archived before the block
+    /// started, at most <see cref="MaxBlockLength"/> long, ending no later than <see cref="MaxFutureSkew"/> after the
+    /// server's clock, starting within <see cref="ActivityIngestOptions.MaxBlockAge"/>, and no overlap of more than
+    /// <see cref="AllowedOverlap"/> with the member's other blocks. Times are compared as UTC.
+    /// </summary>
+    private async Task ValidateBlockAsync(Guid userId, Project project, CreateActivityDto input)
+    {
+        var start = AgentContextNormalizer.AsUtc(input.StartedAt);
+        var end = AgentContextNormalizer.AsUtc(input.EndedAt);
+        if (end <= start)
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.ActivityTimeRangeInvalid)
+                .WithData("startedAt", input.StartedAt)
+                .WithData("endedAt", input.EndedAt);
+        }
+
+        // Archiving stops new time, not time already recorded: blocks queued offline before it are still accepted.
+        if (project.IsArchived && !(project.ArchivedAt.HasValue && AgentContextNormalizer.AsUtc(project.ArchivedAt.Value) > start))
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.ProjectArchived)
+                .WithData("projectId", project.Id);
+        }
+
+        var duration = end - start;
+        if (duration > MaxBlockLength)
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.ActivityTooLong)
+                .WithData("durationMinutes", Math.Round(duration.TotalMinutes, 1))
+                .WithData("maxMinutes", (int)MaxBlockLength.TotalMinutes);
+        }
+
+        var now = UtcNow;
+        if (end > now + MaxFutureSkew)
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.ActivityInFuture)
+                .WithData("endedAt", input.EndedAt)
+                .WithData("serverNow", now);
+        }
+
+        if (now - start > _ingestOptions.MaxBlockAge)
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.ActivityTooOld)
+                .WithData("startedAt", input.StartedAt)
+                .WithData("serverNow", now)
+                .WithData("maxAgeDays", Math.Round(_ingestOptions.MaxBlockAge.TotalDays, 1));
+        }
+
+        // Coarse DB filter, then the exact check. An overlap longer than AllowedOverlap implies both range bounds,
+        // and a stored block (at most MaxBlockLength long) that reaches past this one's start began at most
+        // MaxBlockLength earlier, which keeps the scan to a few rows of the (TenantId, UserId, StartedAt) index.
+        var earliestStart = start - MaxBlockLength;
+        var overlapFrom = start + AllowedOverlap;
+        var overlapTo = end - AllowedOverlap;
+        var candidates = await _activityRepository.GetListAsync(a =>
+            a.UserId == userId && a.StartedAt >= earliestStart && a.StartedAt < overlapTo && a.EndedAt > overlapFrom);
+
+        var clash = candidates.FirstOrDefault(a =>
+        {
+            var otherStart = AgentContextNormalizer.AsUtc(a.StartedAt);
+            var otherEnd = AgentContextNormalizer.AsUtc(a.EndedAt);
+            return (otherEnd < end ? otherEnd : end) - (otherStart > start ? otherStart : start) > AllowedOverlap;
+        });
+        if (clash != null)
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.ActivityOverlaps)
+                .WithData("startedAt", input.StartedAt)
+                .WithData("endedAt", input.EndedAt);
+        }
+    }
+
+    /// <summary>The block as stored. The capture policy is enforced server-side too: data the project does not
+    /// allow is not stored, even if an outdated or misconfigured agent sends it; the time block itself is always kept.
+    /// The optional context is normalized (an unusable value becomes null, never a rejection).</summary>
+    private Activity BuildActivity(Guid userId, Project project, CreateActivityDto input)
+    {
+        var blockLength = AgentContextNormalizer.AsUtc(input.EndedAt) - AgentContextNormalizer.AsUtc(input.StartedAt);
+        // Activity % and input integrity mean nothing when the project measures neither keyboard nor mouse.
+        var measuresInput = project.AllowKeyboard || project.AllowMouse;
+        var timeline = SanitizeTimeline(input.Timeline, project, blockLength);
+
+        // The constructor enforces a non-empty client id and EndedAt > StartedAt.
+        return new Activity(
+            GuidGenerator.Create(),
+            CurrentTenant.Id,
+            userId,
+            input.ProjectId,
+            input.ClientActivityId,
+            input.StartedAt,
+            input.EndedAt
+        )
+        {
+            Productivity = measuresInput ? input.Productivity : null,
+            MouseClicks = project.AllowMouse ? Math.Max(0, input.MouseClicks) : 0,
+            KeyboardHits = project.AllowKeyboard ? Math.Max(0, input.KeyboardHits) : 0,
+            Description = AgentContextNormalizer.CleanNote(input.Description, UpdateActivityNoteDto.MaxDescriptionLength),
+            ActiveWindowsJson = project.AllowActiveWindow ? SerializeWindows(input.ActiveWindows, project, blockLength) : "[]",
+            RunningProgramsJson = project.AllowRunningPrograms ? SerializeRunningPrograms(input.RunningPrograms) : "[]",
+            TimelineJson = timeline.Count == 0 ? "[]" : JsonSerializer.Serialize(timeline),
+            Platform = AgentContextNormalizer.NormalizePlatform(input.Platform),
+            OsVersion = AgentContextNormalizer.CleanText(input.OsVersion, ActivityConsts.MaxOsVersionLength),
+            AgentVersion = AgentContextNormalizer.CleanText(input.AgentVersion, ActivityConsts.MaxAgentVersionLength),
+            DeviceId = AgentContextNormalizer.NormalizeDeviceId(input.DeviceId),
+            DeviceName = AgentContextNormalizer.CleanText(input.DeviceName, ActivityConsts.MaxDeviceNameLength),
+            TimeZone = AgentContextNormalizer.NormalizeTimeZone(input.TimeZone),
+            UtcOffsetMinutes = AgentContextNormalizer.NormalizeUtcOffset(input.UtcOffsetMinutes),
+            IdleSeconds = ResolveIdleSeconds(input.IdleSeconds, timeline, blockLength, measuresInput),
+            EndReason = AgentContextNormalizer.NormalizeEndReason(input.EndReason),
+            ClockSkewSeconds = AgentContextNormalizer.ClockSkewSeconds(UtcNow, input.SentAt),
+            InjectedInputEvents = measuresInput && input.InjectedInputEvents >= 0 ? input.InjectedInputEvents : null
+        };
+    }
+
+    /// <summary>The reported idle seconds clamped to the block's length (a negative count is not a measurement);
+    /// when the agent sent none, derived from the timeline's inactive buckets. Without input measurement (the
+    /// project allows neither keyboard nor mouse) the timeline's activity flags say nothing about idling.</summary>
+    private static int? ResolveIdleSeconds(
+        int? reported, IReadOnlyCollection<ActivityMinuteDto> timeline, TimeSpan blockLength, bool measuresInput)
+    {
+        if (reported.HasValue)
+        {
+            return reported.Value >= 0
+                ? Math.Min(reported.Value, (int)Math.Ceiling(blockLength.TotalSeconds))
+                : null;
+        }
+
+        return measuresInput && timeline.Count > 0
+            ? ActivityMinuteBuckets.IdleSeconds(timeline, blockLength)
+            : null;
+    }
+
+    /// <summary>Serializes window info with over-long names/titles truncated (the list length itself is
+    /// capped by validation on the DTO). Per-window usage is sanitized: seconds are clamped to the block's
+    /// length, counts to non-negative, and input counts the project does not allow are dropped (stored as
+    /// absent — "not captured" — rather than 0). Absent usage fields are omitted from the JSON.</summary>
+    private static string SerializeWindows(List<WindowInfoDto>? windows, Project project, TimeSpan blockLength)
+    {
+        if (windows == null || windows.Count == 0)
+        {
+            return "[]";
+        }
+
+        var maxSeconds = Math.Max(0, (int)Math.Ceiling(blockLength.TotalSeconds));
+
+        return JsonSerializer.Serialize(windows
+            .Where(w => w != null)
+            .Select(w => new WindowInfoDto
+            {
+                AppName = AgentContextNormalizer.Truncate(w.AppName, MaxAppNameLength),
+                WindowTitle = AgentContextNormalizer.Truncate(w.WindowTitle, MaxWindowTitleLength),
+                Seconds = w.Seconds.HasValue ? Math.Clamp(w.Seconds.Value, 0, maxSeconds) : null,
+                KeyboardHits = project.AllowKeyboard && w.KeyboardHits.HasValue ? Math.Max(0, w.KeyboardHits.Value) : null,
+                MouseClicks = project.AllowMouse && w.MouseClicks.HasValue ? Math.Max(0, w.MouseClicks.Value) : null
+            })
+            .ToList());
+    }
+
+    /// <summary>The running applications by name only — <c>[{"AppName":"chrome.exe"}]</c>, each once, in the
+    /// order reported. Titles of background windows the member never focused are not stored (privacy), so every
+    /// agent version yields the same shape; per-window usage belongs to the active windows.</summary>
+    private static string SerializeRunningPrograms(List<WindowInfoDto>? programs)
+    {
+        if (programs == null || programs.Count == 0)
+        {
+            return "[]";
+        }
+
+        var names = programs
+            .Select(p => AgentContextNormalizer.Truncate(p?.AppName?.Trim(), MaxAppNameLength))
+            .Where(name => !string.IsNullOrEmpty(name))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Select(name => new RunningProgramEntry(name!))
+            .ToList();
+
+        return names.Count == 0 ? "[]" : JsonSerializer.Serialize(names);
+    }
+
+    /// <summary>The stored shape of one running program.</summary>
+    private sealed record RunningProgramEntry(string AppName);
+
+    /// <summary>The per-minute timeline as stored: buckets outside the block (minute &lt; 0, or past its last
+    /// minute plus one bucket of slack for a partial trailing minute) are dropped, duplicates keep the first
+    /// entry, counts are clamped to non-negative, and data the project does not allow is blanked (counts
+    /// zeroed, app name removed). The minute, its active flag and its active seconds are time data and always
+    /// kept; active seconds outside 0..90 are not a measurement and are dropped.</summary>
+    private static List<ActivityMinuteDto> SanitizeTimeline(
+        List<ActivityMinuteDto>? timeline, Project project, TimeSpan blockLength)
+    {
+        if (timeline == null || timeline.Count == 0)
+        {
+            return new List<ActivityMinuteDto>();
+        }
+
+        var lastMinute = Math.Max(0, (int)Math.Ceiling(blockLength.TotalMinutes));
+
+        return timeline
+            .Where(m => m != null && m.Minute >= 0 && m.Minute <= lastMinute)
+            .GroupBy(m => m.Minute)
+            .Select(g => g.First())
+            .OrderBy(m => m.Minute)
+            .Select(m => new ActivityMinuteDto
+            {
+                Minute = m.Minute,
+                KeyboardHits = project.AllowKeyboard ? Math.Max(0, m.KeyboardHits) : 0,
+                MouseClicks = project.AllowMouse ? Math.Max(0, m.MouseClicks) : 0,
+                Active = m.Active,
+                AppName = project.AllowActiveWindow ? AgentContextNormalizer.Truncate(m.AppName, MaxAppNameLength) : null,
+                ActiveSeconds = m.ActiveSeconds is >= 0 and <= ActivityConsts.MaxMinuteActiveSeconds ? m.ActiveSeconds : null
+            })
+            .ToList();
+    }
+
+    /// <summary>
+    /// Decodes the captures the project allows. A capture that is missing, not valid base64, larger than its limit,
+    /// neither JPEG nor PNG, or not allowed is skipped (logged) — a bad capture must never cost the time block or
+    /// block the agent's offline queue. The screen capture and its thumbnail share the capture time the agent
+    /// reported (when it lies within the block) and the blur flag; when the project requires blurred screenshots
+    /// and the agent did not blur them, both are dropped. The webcam frame is taken at the block's end.
+    /// </summary>
+    private List<PendingCapture> DecodeCaptures(Project project, CreateActivityDto input)
+    {
+        var captures = new List<PendingCapture>(3);
+
+        // Policy drops are routine with outdated agents (Information); invalid or oversized data is not (Warning).
+        if (!project.AllowScreenshot)
+        {
+            LogDroppedCapture(input.ScreenshotPngBase64, Screenshot.ScreenKind, input, LogLevel.Information, "the project does not allow screenshots");
+            LogDroppedCapture(input.ScreenshotThumbJpgBase64, Screenshot.ThumbKind, input, LogLevel.Information, "the project does not allow screenshots");
+        }
+        else if (project.BlurScreenshots && input.ScreenshotBlurred != true)
+        {
+            LogDroppedCapture(input.ScreenshotPngBase64, Screenshot.ScreenKind, input, LogLevel.Information, "the project requires blurred screenshots and the agent did not blur it");
+            LogDroppedCapture(input.ScreenshotThumbJpgBase64, Screenshot.ThumbKind, input, LogLevel.Information, "the project requires blurred screenshots and the agent did not blur it");
+        }
+        else
+        {
+            var capturedAt = ResolveScreenCapturedAt(input);
+            var blurred = input.ScreenshotBlurred == true;
+            AddCaptureIfValid(captures, input, input.ScreenshotPngBase64, Screenshot.ScreenKind, MaxScreenCaptureBytes, capturedAt, blurred);
+            AddCaptureIfValid(captures, input, input.ScreenshotThumbJpgBase64, Screenshot.ThumbKind, MaxThumbCaptureBytes, capturedAt, blurred);
+        }
+
+        if (project.AllowWebcam)
+        {
+            AddCaptureIfValid(captures, input, input.WebcamJpgBase64, Screenshot.WebcamKind, MaxWebcamCaptureBytes,
+                AgentContextNormalizer.AsUtc(input.EndedAt), blurred: false);
+        }
+        else
+        {
+            LogDroppedCapture(input.WebcamJpgBase64, Screenshot.WebcamKind, input, LogLevel.Information, "the project does not allow the webcam");
+        }
+
+        return captures;
+    }
+
+    /// <summary>When the screen was captured: the agent's report if it lies within the block (±60 s of tolerance),
+    /// otherwise the block's end.</summary>
+    private static DateTime ResolveScreenCapturedAt(CreateActivityDto input)
+    {
+        var start = AgentContextNormalizer.AsUtc(input.StartedAt);
+        var end = AgentContextNormalizer.AsUtc(input.EndedAt);
+        if (input.ScreenshotCapturedAt.HasValue)
+        {
+            var reported = AgentContextNormalizer.AsUtc(input.ScreenshotCapturedAt.Value);
+            if (reported >= start - CaptureTimeTolerance && reported <= end + CaptureTimeTolerance)
+            {
+                return reported;
+            }
+        }
+
+        return end;
+    }
+
+    private void AddCaptureIfValid(
+        List<PendingCapture> captures,
+        CreateActivityDto input,
+        string? base64,
+        string kind,
+        int maxBytes,
+        DateTime capturedAt,
+        bool blurred)
+    {
+        if (string.IsNullOrWhiteSpace(base64))
+        {
+            return;
+        }
+
+        // Refuse an oversized payload before decoding it (agents send unwrapped base64: 4 characters per 3 bytes).
+        if (base64.Length > MaxBase64Length(maxBytes))
+        {
+            LogOversizedCapture(kind, input, (long)base64.Length * 3 / 4, maxBytes);
+            return;
+        }
+
+        byte[] bytes;
+        try
+        {
+            bytes = Convert.FromBase64String(base64);
+        }
+        catch (FormatException)
+        {
+            LogDroppedCapture(base64, kind, input, LogLevel.Warning, "the payload is not valid base64");
+            return;
+        }
+
+        if (bytes.Length == 0)
+        {
+            return;
+        }
+
+        if (bytes.Length > maxBytes)
+        {
+            LogOversizedCapture(kind, input, bytes.Length, maxBytes);
+            return;
+        }
+
+        var contentType = CaptureImageFormat.DetectContentType(bytes);
+        if (contentType == null)
+        {
+            LogDroppedCapture(base64, kind, input, LogLevel.Warning, "it is neither a JPEG nor a PNG image");
+            return;
+        }
+
+        captures.Add(new PendingCapture(kind, bytes, contentType, capturedAt, blurred));
+    }
+
+    private static int MaxBase64Length(int maxBytes) => (maxBytes + 2) / 3 * 4;
+
+    private void LogOversizedCapture(string kind, CreateActivityDto input, long sizeBytes, int maxBytes)
+    {
+        Logger.LogWarning(
+            "Dropping the {Kind} capture of block {ClientActivityId}: about {SizeBytes} bytes exceeds the {MaxBytes}-byte limit. The block is still recorded.",
+            kind, input.ClientActivityId, sizeBytes, maxBytes);
+    }
+
+    private void LogDroppedCapture(string? base64, string kind, CreateActivityDto input, LogLevel level, string reason)
+    {
+        if (!string.IsNullOrWhiteSpace(base64))
+        {
+            Logger.Log(
+                level,
+                "Dropping the {Kind} capture of block {ClientActivityId} for project {ProjectId}: {Reason}. The block is still recorded.",
+                kind, input.ClientActivityId, input.ProjectId, reason);
+        }
+    }
+
+    /// <summary>
+    /// Stores the block and its captures all-or-nothing, in a transactional unit of work of its own (so a failure
+    /// cannot poison the caller's). The blobs are written first and the rows referencing them in one final save,
+    /// so a failed blob write leaves no row behind; on any failure the blobs already written are deleted again and
+    /// the error propagates, so the agent keeps the block queued and retries it. The one failure answered as success
+    /// is the duplicate-upload race: when the unique (TenantId, UserId, ClientActivityId) index refused the row
+    /// because a concurrent upload of the same block was stored first, that block is returned (idempotency).
+    /// </summary>
+    private async Task<ActivityDto> StoreAsync(Activity activity, List<PendingCapture> captures)
+    {
+        var savedBlobs = new List<string>(captures.Count);
+        var screenshots = new List<Screenshot>(captures.Count);
+        try
+        {
+            using var uow = UnitOfWorkManager.Begin(new AbpUnitOfWorkOptions(isTransactional: true), requiresNew: true);
+
+            foreach (var capture in captures)
+            {
+                var blobName = $"activities/{activity.Id}/{capture.Kind}{CaptureImageFormat.FileExtension(capture.ContentType)}";
+                await _blobContainer.SaveAsync(blobName, capture.Bytes, overrideExisting: true);
+                savedBlobs.Add(blobName);
+
+                screenshots.Add(new Screenshot(
+                    GuidGenerator.Create(),
+                    activity.TenantId,
+                    activity.Id,
+                    blobName,
+                    capture.CapturedAt,
+                    capture.Bytes.Length,
+                    capture.ContentType,
+                    capture.Kind)
+                {
+                    Blurred = capture.Blurred
+                });
+            }
+
+            await _activityRepository.InsertAsync(activity);
+            await _screenshotRepository.InsertManyAsync(screenshots);
+            await uow.CompleteAsync();
+        }
+        catch (Exception exception)
+        {
+            await DeleteBlobsAsync(savedBlobs);
+
+            if (DatabaseErrors.MayBeUniqueViolation(exception))
+            {
+                var winner = await FindOwnBlockAsync(activity.UserId, activity.ClientActivityId);
+                if (winner != null)
+                {
+                    Logger.LogInformation(
+                        "Block {ClientActivityId} was stored by a concurrent upload; returning that one.",
+                        activity.ClientActivityId);
+                    return await MapToDtoWithCapturesAsync(winner);
+                }
+            }
+
+            Logger.LogWarning(
+                "Storing block {ClientActivityId} failed; nothing of it was kept and the agent will retry it.",
+                activity.ClientActivityId);
+            throw;
+        }
+
+        var dto = MapToDto(activity);
+        dto.Captures = OrderCaptures(screenshots.Select(s => new ActivityCaptureRefDto
+        {
+            Id = s.Id,
+            Kind = s.Kind,
+            CapturedAt = s.CapturedAt,
+            Blurred = s.Blurred
+        }));
+        return dto;
+    }
+
+    /// <summary>Best-effort removal of the blobs of a block that was not stored. With the database blob provider
+    /// the transaction rollback has already removed them; an object store (S3, R2) needs the explicit delete.</summary>
+    private async Task DeleteBlobsAsync(IReadOnlyCollection<string> blobNames)
+    {
+        if (blobNames.Count == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            using var uow = UnitOfWorkManager.Begin(new AbpUnitOfWorkOptions(), requiresNew: true);
+            foreach (var blobName in blobNames)
+            {
+                await _blobContainer.DeleteAsync(blobName);
+            }
+
+            await uow.CompleteAsync();
+        }
+        catch (Exception exception)
+        {
+            Logger.LogWarning(exception,
+                "Could not delete the captures of a block that was not stored; these blobs are orphaned: {BlobNames}",
+                string.Join(", ", blobNames));
+        }
     }
 
     private async Task<IQueryable<Activity>> BuildScopedQueryAsync(GetActivitiesInput input)
@@ -304,160 +758,6 @@ public class ActivityAppService : ApplicationService, IActivityAppService
         }
     }
 
-    /// <summary>Rejects blocks that end in the future, run longer than the project's interval allows, or
-    /// double-count time the member already tracked. Times are compared as UTC (unspecified = UTC).</summary>
-    private async Task ValidateTimeRangeAsync(Guid userId, Project project, CreateActivityDto input)
-    {
-        var now = Clock.Now;
-        var nowUtc = now.Kind == DateTimeKind.Utc ? now : now.ToUniversalTime();
-        if (AsUtc(input.EndedAt) > nowUtc + MaxFutureSkew)
-        {
-            throw new BusinessException(TrackerDomainErrorCodes.ActivityInFuture)
-                .WithData("endedAt", input.EndedAt)
-                .WithData("serverNow", nowUtc);
-        }
-
-        var maxMinutes = Math.Max(2 * project.IntervalMinutes, MinMaxBlockMinutes);
-        var duration = input.EndedAt - input.StartedAt;
-        if (duration > TimeSpan.FromMinutes(maxMinutes))
-        {
-            throw new BusinessException(TrackerDomainErrorCodes.ActivityTooLong)
-                .WithData("durationMinutes", Math.Round(duration.TotalMinutes, 1))
-                .WithData("maxMinutes", maxMinutes);
-        }
-
-        // Coarse DB filter (an overlap longer than AllowedOverlap implies both bounds), then the exact check.
-        var overlapFrom = input.StartedAt + AllowedOverlap;
-        var overlapTo = input.EndedAt - AllowedOverlap;
-        var candidates = await _activityRepository.GetListAsync(
-            a => a.UserId == userId && a.StartedAt < overlapTo && a.EndedAt > overlapFrom);
-
-        var clash = candidates.FirstOrDefault(a =>
-            (a.EndedAt < input.EndedAt ? a.EndedAt : input.EndedAt) -
-            (a.StartedAt > input.StartedAt ? a.StartedAt : input.StartedAt) > AllowedOverlap);
-        if (clash != null)
-        {
-            throw new BusinessException(TrackerDomainErrorCodes.ActivityOverlaps)
-                .WithData("startedAt", input.StartedAt)
-                .WithData("endedAt", input.EndedAt);
-        }
-    }
-
-    private static DateTime AsUtc(DateTime value) => value.Kind switch
-    {
-        DateTimeKind.Local => value.ToUniversalTime(),
-        DateTimeKind.Unspecified => DateTime.SpecifyKind(value, DateTimeKind.Utc),
-        _ => value
-    };
-
-    /// <summary>Serializes window info with over-long names/titles truncated (the list length itself is
-    /// capped by validation on the DTO). Per-window usage is sanitized: seconds are clamped to the block's
-    /// length, counts to non-negative, and input counts the project does not allow are dropped (stored as
-    /// absent — "not captured" — rather than 0). Absent usage fields are omitted from the JSON.</summary>
-    private static string SerializeWindows(List<WindowInfoDto>? windows, Project project, TimeSpan blockLength)
-    {
-        if (windows == null || windows.Count == 0)
-        {
-            return "[]";
-        }
-
-        var maxSeconds = Math.Max(0, (int)Math.Ceiling(blockLength.TotalSeconds));
-
-        return JsonSerializer.Serialize(windows
-            .Where(w => w != null)
-            .Select(w => new WindowInfoDto
-            {
-                AppName = Truncate(w.AppName, MaxAppNameLength),
-                WindowTitle = Truncate(w.WindowTitle, MaxWindowTitleLength),
-                Seconds = w.Seconds.HasValue ? Math.Clamp(w.Seconds.Value, 0, maxSeconds) : null,
-                KeyboardHits = project.AllowKeyboard && w.KeyboardHits.HasValue ? Math.Max(0, w.KeyboardHits.Value) : null,
-                MouseClicks = project.AllowMouse && w.MouseClicks.HasValue ? Math.Max(0, w.MouseClicks.Value) : null
-            })
-            .ToList());
-    }
-
-    /// <summary>Serializes the per-minute timeline: buckets outside the block (minute &lt; 0, or past its last
-    /// minute plus one bucket of slack for a partial trailing minute) are dropped, duplicates keep the first
-    /// entry, counts are clamped to non-negative, and data the project does not allow is blanked (counts
-    /// zeroed, app name removed). The minute/active flags themselves are time data and always kept.</summary>
-    private static string SerializeTimeline(List<ActivityMinuteDto>? timeline, Project project, TimeSpan blockLength)
-    {
-        if (timeline == null || timeline.Count == 0)
-        {
-            return "[]";
-        }
-
-        var lastMinute = Math.Max(0, (int)Math.Ceiling(blockLength.TotalMinutes));
-
-        var minutes = timeline
-            .Where(m => m != null && m.Minute >= 0 && m.Minute <= lastMinute)
-            .GroupBy(m => m.Minute)
-            .Select(g => g.First())
-            .OrderBy(m => m.Minute)
-            .Select(m => new ActivityMinuteDto
-            {
-                Minute = m.Minute,
-                KeyboardHits = project.AllowKeyboard ? Math.Max(0, m.KeyboardHits) : 0,
-                MouseClicks = project.AllowMouse ? Math.Max(0, m.MouseClicks) : 0,
-                Active = m.Active,
-                AppName = project.AllowActiveWindow ? Truncate(m.AppName, MaxAppNameLength) : null
-            })
-            .ToList();
-
-        return minutes.Count == 0 ? "[]" : JsonSerializer.Serialize(minutes);
-    }
-
-    private static string? Truncate(string? value, int maxLength) =>
-        value == null || value.Length <= maxLength ? value : value[..maxLength];
-
-    private void LogDisallowedCapture(string? base64, string kind, Guid projectId)
-    {
-        if (!string.IsNullOrWhiteSpace(base64))
-        {
-            Logger.LogInformation(
-                "Dropping {Kind} capture: project {ProjectId} does not allow it. The activity is still recorded.",
-                kind, projectId);
-        }
-    }
-
-    /// <summary>Decodes a capture and queues it for atomic persistence with the activity.
-    /// Missing/invalid/oversized captures are skipped (logged) — a bad screenshot must never
-    /// cost the whole time block or block the agent's offline queue.</summary>
-    private void AddCaptureIfValid(
-        List<PendingCapture> captures, string? base64, string kind, string contentType, string fileName)
-    {
-        if (string.IsNullOrWhiteSpace(base64))
-        {
-            return;
-        }
-
-        byte[] bytes;
-        try
-        {
-            bytes = Convert.FromBase64String(base64);
-        }
-        catch (FormatException)
-        {
-            Logger.LogWarning("Dropping {Kind} capture for activity: payload is not valid base64.", kind);
-            return;
-        }
-
-        if (bytes.Length == 0)
-        {
-            return;
-        }
-
-        if (bytes.Length > MaxCaptureBytes)
-        {
-            Logger.LogWarning(
-                "Dropping {Kind} capture for activity: {SizeBytes} bytes exceeds the {MaxBytes}-byte limit.",
-                kind, bytes.Length, MaxCaptureBytes);
-            return;
-        }
-
-        captures.Add(new PendingCapture(kind, bytes, contentType, fileName));
-    }
-
     private ActivityDto MapToDto(Activity activity)
     {
         return new ActivityDto
@@ -475,6 +775,17 @@ public class ActivityAppService : ApplicationService, IActivityAppService
             ActiveWindowsJson = activity.ActiveWindowsJson,
             RunningProgramsJson = activity.RunningProgramsJson,
             TimelineJson = activity.TimelineJson,
+            Platform = activity.Platform,
+            OsVersion = activity.OsVersion,
+            AgentVersion = activity.AgentVersion,
+            DeviceId = activity.DeviceId,
+            DeviceName = activity.DeviceName,
+            TimeZone = activity.TimeZone,
+            UtcOffsetMinutes = activity.UtcOffsetMinutes,
+            IdleSeconds = activity.IdleSeconds,
+            EndReason = activity.EndReason,
+            ClockSkewSeconds = activity.ClockSkewSeconds,
+            InjectedInputEvents = activity.InjectedInputEvents,
             CreationTime = activity.CreationTime
         };
     }
@@ -487,7 +798,7 @@ public class ActivityAppService : ApplicationService, IActivityAppService
     }
 
     /// <summary>Fills <see cref="ActivityDto.Captures"/> for the given blocks with a single query over their
-    /// screenshot rows (id + kind only; blob content is never loaded).</summary>
+    /// screenshot rows (id, kind, capture time and blur flag only; blob content is never loaded).</summary>
     private async Task AttachCapturesAsync(IReadOnlyCollection<ActivityDto> dtos)
     {
         if (dtos.Count == 0)
@@ -500,13 +811,19 @@ public class ActivityAppService : ApplicationService, IActivityAppService
         var refs = await AsyncExecuter.ToListAsync(
             screenshots
                 .Where(s => activityIds.Contains(s.ActivityId))
-                .Select(s => new { s.Id, s.ActivityId, s.Kind }));
+                .Select(s => new { s.Id, s.ActivityId, s.Kind, s.CapturedAt, s.Blurred }));
 
         var byActivity = refs.ToLookup(r => r.ActivityId);
         foreach (var dto in dtos)
         {
             dto.Captures = OrderCaptures(
-                byActivity[dto.Id].Select(r => new ActivityCaptureRefDto { Id = r.Id, Kind = r.Kind }));
+                byActivity[dto.Id].Select(r => new ActivityCaptureRefDto
+                {
+                    Id = r.Id,
+                    Kind = r.Kind,
+                    CapturedAt = r.CapturedAt,
+                    Blurred = r.Blurred
+                }));
         }
     }
 

@@ -13,7 +13,17 @@ import { join } from "node:path";
 // investigate before raising these numbers.
 const CHUNK_DIR = join(process.cwd(), ".next", "static", "chunks");
 const MAX_SINGLE_CHUNK_KB = Number(process.env.BUDGET_MAX_CHUNK_KB ?? 480);
-const MAX_TOTAL_KB = Number(process.env.BUDGET_MAX_TOTAL_KB ?? 1900);
+//
+// Raised 1900 → 2400 KB (2026-10, contract v2 round), with this justification:
+// the round measured 1879 KB before it began and ~2285 KB after. The growth is
+// feature code (presence, devices, payroll/hourly reports, session renewal and
+// sign-in recovery, team/project/host management, timelines, popover/menu
+// primitives); recharts was moved behind ONE dynamic import (components/charts)
+// so its ~420 KB is shipped once instead of once per route group, and about
+// 300 KB of the total are Turbopack's per-route copies of small shared modules
+// (page header, data table…), which no config option controls. 2400 KB keeps
+// ~5% headroom; the largest-chunk limit is unchanged.
+const MAX_TOTAL_KB = Number(process.env.BUDGET_MAX_TOTAL_KB ?? 2400);
 
 function walk(dir) {
   const out = [];

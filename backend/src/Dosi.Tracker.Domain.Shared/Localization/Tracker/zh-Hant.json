@@ -4,6 +4,12 @@
     "AppName": "Tracker",
     "Menu:Home": "Home",
     "LongWelcomeMessage": "Welcome to the application. This is a startup project based on the ABP framework. For more information visit",
-    "Welcome": "Welcome"
+    "Welcome": "Welcome",
+    "Tracker:ActivityTooOld": "該活動開始時間過早，已無法再記錄。",
+    "Tracker:NotProjectMember": "您不是此專案的成員。",
+    "Tracker:SubscriptionInactive": "工作區訂閱未啟用。請聯絡工作區擁有者續訂。",
+    "Tracker:InvalidUser": "該使用者不存在於此工作區中。",
+    "Tracker:CannotModifySelf": "您無法對自己的帳戶或成員身分進行此變更。",
+    "Tracker:RoleNotAllowed": "只有工作區擁有者才能授予此角色、變更時薪或管理擁有者的帳戶。"
   }
 }

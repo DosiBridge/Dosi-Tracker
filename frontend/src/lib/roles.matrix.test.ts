@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import fc from "fast-check";
-import { canAccess, navAccess, inviteableRoles, countSeats, trackedMembers } from "./roles";
+import { canAccess, clientReportSlugs, navAccess, inviteableRoles, countSeats, trackedMembers } from "./roles";
+import { reportCatalog } from "./reports-data";
 import type { Role } from "./types";
 
 const allRoles: Role[] = ["host", "owner", "admin", "worker", "client"];
@@ -14,7 +15,9 @@ const allRoles: Role[] = ["host", "owner", "admin", "worker", "client"];
 //   admin  → everything except billing (and never the platform console)
 //   worker → own work surfaces: dashboard, projects, monitor, activities,
 //            screenshots, timesheet, settings — no team/reports/insights/billing
-//   client → progress portal only: dashboard + settings
+//   client → progress portal: dashboard + settings, and the reports of the
+//            projects shared with them (the Work Report only — never members'
+//            activity, apps, captures, attendance or pay); never tracked
 const expectedAccess: Record<string, Record<Role, boolean>> = {
   "/host": { host: true, owner: false, admin: false, worker: false, client: false },
   "/dashboard": { host: false, owner: true, admin: true, worker: true, client: true },
@@ -24,7 +27,7 @@ const expectedAccess: Record<string, Record<Role, boolean>> = {
   "/activities": { host: false, owner: true, admin: true, worker: true, client: false },
   "/screenshots": { host: false, owner: true, admin: true, worker: true, client: false },
   "/timesheet": { host: false, owner: true, admin: true, worker: true, client: false },
-  "/reports": { host: false, owner: true, admin: true, worker: false, client: false },
+  "/reports": { host: false, owner: true, admin: true, worker: false, client: true },
   "/insights": { host: false, owner: true, admin: true, worker: false, client: false },
   "/billing": { host: false, owner: true, admin: false, worker: false, client: false },
   "/settings": { host: false, owner: true, admin: true, worker: true, client: true },
@@ -58,9 +61,9 @@ describe("canAccess — /host deep paths stay host-only", () => {
 });
 
 describe("canAccess — client progress portal", () => {
-  it("a client can open exactly dashboard and settings among governed routes", () => {
+  it("a client can open exactly dashboard, reports and settings among governed routes", () => {
     const visible = Object.keys(navAccess).filter((route) => canAccess("client", route));
-    expect(visible.sort()).toEqual(["/dashboard", "/settings"]);
+    expect(visible.sort()).toEqual(["/dashboard", "/reports", "/settings"]);
   });
 
   it("blocks a client from capture-review deep paths", () => {
@@ -86,16 +89,58 @@ describe("canAccess — longest-prefix resolution and nested paths", () => {
     expect(canAccess("client", "/billingual")).toBe(true);
   });
 
-  it("PROPERTY: any deep child of a governed route resolves exactly like the route itself", () => {
+  it("PROPERTY: any deep child of a governed route resolves exactly like the route itself (clients' reports aside)", () => {
     fc.assert(
       fc.property(
         fc.constantFrom(...allRoles),
         fc.constantFrom(...Object.keys(navAccess)),
         fc.string(),
         (role, route, suffix) => {
+          fc.pre(!(role === "client" && route === "/reports"));
           expect(canAccess(role, `${route}/${suffix}`)).toBe(canAccess(role, route));
         }
       )
+    );
+  });
+});
+
+describe("canAccess — clients' reports", () => {
+  const slugs = ["work-report", "analytics", "time-activity", "productivity", "apps-urls", "projects", "attendance", "payroll", "weekly", "devices"];
+
+  it("covers every report in the catalog (a new report must be placed in this matrix on purpose)", () => {
+    expect([...slugs].sort()).toEqual(reportCatalog.map((r) => r.slug).sort());
+  });
+
+  it("a client may open the reports hub and the Work Report, and nothing built on members' activity, apps, attendance or pay", () => {
+    expect(clientReportSlugs).toEqual(["work-report"]);
+    expect(canAccess("client", "/reports")).toBe(true);
+    for (const slug of slugs) {
+      expect(canAccess("client", `/reports/${slug}`), slug).toBe(slug === "work-report");
+    }
+  });
+
+  it("reads the slug off a path with a query, hash or deeper segment", () => {
+    expect(canAccess("client", "/reports/work-report?range=7d")).toBe(true);
+    expect(canAccess("client", "/reports/work-report#days")).toBe(true);
+    expect(canAccess("client", "/reports/payroll?range=7d")).toBe(false);
+    expect(canAccess("client", "/reports/payroll/export")).toBe(false);
+  });
+
+  it("leaves every other role's reports untouched", () => {
+    for (const slug of slugs) {
+      expect(canAccess("owner", `/reports/${slug}`)).toBe(true);
+      expect(canAccess("admin", `/reports/${slug}`)).toBe(true);
+      expect(canAccess("worker", `/reports/${slug}`)).toBe(false);
+      expect(canAccess("host", `/reports/${slug}`)).toBe(false);
+    }
+  });
+
+  it("PROPERTY: a client opens a child of /reports exactly when its first segment is a client report", () => {
+    fc.assert(
+      fc.property(fc.oneof(fc.constantFrom(...slugs), fc.string()), fc.string(), (slug, rest) => {
+        const allowed = clientReportSlugs.includes(slug.split(/[/?#]/)[0]);
+        expect(canAccess("client", `/reports/${slug}/${rest}`)).toBe(allowed);
+      }),
     );
   });
 });

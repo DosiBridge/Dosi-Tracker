@@ -4,6 +4,7 @@ import {
   buildLiveWorkspace,
   daysUntil,
   isAuthenticatedConfig,
+  isClientOnly,
   isHostConfig,
   LIVE_WORKSPACE_PREFIX,
   liveWorkspaceId,
@@ -71,6 +72,28 @@ describe("resolveLiveRole — real identity → app role", () => {
   ] as const)("%s", (_label, cfg, expected) => {
     expect(resolveLiveRole(cfg)).toBe(expected);
   });
+
+  it("a member who only takes part as a client is a client; team rights still win", () => {
+    expect(resolveLiveRole(config(), { clientOnly: true })).toBe("client");
+    expect(resolveLiveRole(config({ roles: ["admin"] }), { clientOnly: true })).toBe("owner");
+    expect(resolveLiveRole(config({ policies: { "Tracker.Team.Manage": true } }), { clientOnly: true })).toBe("admin");
+    expect(resolveLiveRole(config({ tenantId: null }), { clientOnly: true })).toBe("worker");
+    expect(buildLiveUser(config(), { clientOnly: true })).toMatchObject({ role: "client", designation: "Client" });
+  });
+});
+
+describe("isClientOnly — every membership is the Client role", () => {
+  it.each([
+    ["one Client membership", [{ userId: "u-1", role: "Client" }], true],
+    ["Client on every project, any casing", [{ userId: "u-1", role: "client" }, { userId: "u-1", role: " CLIENT " }], true],
+    ["a Worker membership anywhere makes them a member", [{ userId: "u-1", role: "Client" }, { userId: "u-1", role: "Worker" }], false],
+    ["managers are not clients", [{ userId: "u-1", role: "Manager" }], false],
+    ["no membership at all", [], false],
+    ["only other people's memberships", [{ userId: "u-2", role: "Client" }], false],
+    ["a membership without a role", [{ userId: "u-1", role: null }], false],
+  ] as const)("%s → %s", (_label, memberships, expected) => {
+    expect(isClientOnly(memberships, "u-1")).toBe(expected);
+  });
 });
 
 describe("buildLiveUser", () => {
@@ -99,8 +122,9 @@ describe("plan + subscription mapping", () => {
     ["BUSINESS", "business"],
     ["Enterprise", "enterprise"],
     ["Custom Gold", "enterprise"],
-    ["", "free"],
-    [null, "free"],
+    // Unknown is never the most restrictive plan: that disabled invites on paid workspaces.
+    ["", "enterprise"],
+    [null, "enterprise"],
   ] as const)("planIdFromName(%j) → %s", (name, id) => {
     expect(planIdFromName(name)).toBe(id);
   });
@@ -112,6 +136,11 @@ describe("plan + subscription mapping", () => {
     ["past-due", "past_due"],
     ["PastDue", "past_due"],
     ["active", "active"],
+    // Workspaces the backend cuts off are never shown as active.
+    ["suspended", "suspended"],
+    ["canceled", "canceled"],
+    ["Cancelled", "canceled"],
+    ["expired", "expired"],
     [null, "active"],
   ] as const)("subscriptionStatus(%j) → %s", (raw, status) => {
     expect(subscriptionStatus(raw)).toBe(status);
@@ -161,7 +190,7 @@ describe("buildLiveWorkspace", () => {
 
   it("reports an unknown plan honestly instead of borrowing the demo table", () => {
     const ws = buildLiveWorkspace(config({ tenantName: "  " }), null, null, NOW);
-    expect(ws).toMatchObject({ name: "Workspace", slug: "workspace", planId: "free", status: "active" });
+    expect(ws).toMatchObject({ name: "Workspace", slug: "workspace", planId: "enterprise", status: "active" });
     expect(ws.live).toEqual({ known: false, planName: null, pricePerUser: null, seatLimit: null, trialEndsAt: null });
     expect(buildLiveWorkspace(config(), { planId: "missing" }, plans, NOW).live?.known).toBe(false);
   });

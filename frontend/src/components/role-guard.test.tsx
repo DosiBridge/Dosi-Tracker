@@ -38,6 +38,28 @@ describe("RoleGuard", () => {
     expect(screen.getByRole("heading", { name: /restricted area/i })).toBeInTheDocument();
   });
 
+  it("lets a client into their projects' Work Report, but not into a report on members' pay", () => {
+    const view = renderAsRole(
+      <RoleGuard>
+        <div>work report</div>
+      </RoleGuard>,
+      "client",
+      { route: "/reports/work-report" },
+    );
+    expect(screen.getByText("work report")).toBeInTheDocument();
+    view.unmount();
+
+    renderAsRole(
+      <RoleGuard>
+        <div>payroll report</div>
+      </RoleGuard>,
+      "client",
+      { route: "/reports/payroll" },
+    );
+    expect(screen.queryByText("payroll report")).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /restricted area/i })).toBeInTheDocument();
+  });
+
   it("names the blocked role in the fallback and offers a way back to the dashboard", () => {
     renderAsRole(
       <RoleGuard>

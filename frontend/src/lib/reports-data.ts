@@ -73,6 +73,9 @@ export const categoryColor: Record<AppCategory, string> = {
 };
 
 /* ----------------------------- Date ranges ----------------------------- */
+// The Activity page's date presets (its "custom" is a real from/to pair, see
+// activity-filters.ts). The reports use the period toolbar instead: whole
+// days of the reporting zone (report-math resolveReportPeriod).
 
 export type RangeKey = "today" | "yesterday" | "7d" | "30d" | "month" | "custom";
 
@@ -121,20 +124,100 @@ export function filterActivitiesByRange(list: Activity[], from: Date, to: Date) 
 
 /* ----------------------------- Report catalog ----------------------------- */
 
+/** A permission a report needs beyond opening /reports (contract §6); the hub only lists what the viewer can use. */
+export type ReportRequirement = "manageTeam";
+
 export interface ReportMeta {
   slug: string;
   title: string;
   description: string;
   category: "Time" | "Productivity" | "People" | "Finance";
   icon: string; // lucide icon name resolved in UI
+  /** Shown as the hub's hero card instead of a tile in the catalog grid. */
+  featured?: boolean;
+  /** Shown as the hub's analytics spotlight (below the hero) instead of a tile. */
+  spotlight?: boolean;
+  /** Pay and labour cost read hourly rates: only for Tracker.Team.Manage holders. */
+  requires?: ReportRequirement;
 }
 
+/**
+ * Wording follows the reports' one glossary: "activity" and "active time" are
+ * keyboard/mouse input, "idle" the minutes without it, and "productive" an
+ * app category — never an activity score.
+ */
 export const reportCatalog: ReportMeta[] = [
-  { slug: "time-activity", title: "Time & Activity", description: "Time worked, activity level, and screenshots per member.", category: "Time", icon: "Clock" },
-  { slug: "productivity", title: "Productivity", description: "Productive vs neutral vs unproductive time breakdown.", category: "Productivity", icon: "Gauge" },
-  { slug: "apps-urls", title: "Apps & Websites", description: "Most-used applications and websites, categorized.", category: "Productivity", icon: "AppWindow" },
-  { slug: "projects", title: "Project Breakdown", description: "Time and cost distribution across projects.", category: "Time", icon: "FolderKanban" },
-  { slug: "attendance", title: "Attendance & Shifts", description: "Clock in/out, late arrivals, and absences.", category: "People", icon: "CalendarCheck" },
-  { slug: "weekly", title: "Weekly Summary", description: "A rolled-up weekly digest per member.", category: "Time", icon: "CalendarDays" },
-  { slug: "payroll", title: "Payroll & Billing", description: "Billable hours, rates, and payable amounts.", category: "Finance", icon: "DollarSign" },
+  {
+    slug: "work-report",
+    title: "Work Report",
+    description: "A client-ready report of hours worked per day — at a glance, printable and ready to send.",
+    category: "Time",
+    icon: "CalendarClock",
+    featured: true,
+  },
+  {
+    slug: "analytics",
+    title: "Work Analytics",
+    description: "Trends, work rhythm, focus, projects and people — explored in interactive charts and diagrams.",
+    category: "Productivity",
+    icon: "Sparkles",
+    spotlight: true,
+  },
+  {
+    slug: "time-activity",
+    title: "Time & Activity",
+    description: "Hours, activity (keyboard and mouse) and idle time per member, day by day.",
+    category: "Time",
+    icon: "Clock",
+  },
+  {
+    slug: "weekly",
+    title: "Weekly Summary",
+    description: "The week at a glance per member: hours, activity, idle time, days worked and the busiest day.",
+    category: "Time",
+    icon: "CalendarDays",
+  },
+  {
+    slug: "projects",
+    title: "Project Breakdown",
+    description: "Time, share and labour cost per project, archived projects included.",
+    category: "Time",
+    icon: "FolderKanban",
+  },
+  {
+    slug: "productivity",
+    title: "Productivity",
+    description: "Active and idle time per member, and time spent in productive, neutral and unproductive apps.",
+    category: "Productivity",
+    icon: "Gauge",
+  },
+  {
+    slug: "apps-urls",
+    title: "Apps & Websites",
+    description: "The applications your team works in, by time, by member and by category.",
+    category: "Productivity",
+    icon: "AppWindow",
+  },
+  {
+    slug: "attendance",
+    title: "Attendance",
+    description: "Days present and absent, typical start and finish times, and weekend work per member.",
+    category: "People",
+    icon: "CalendarCheck",
+  },
+  {
+    slug: "devices",
+    title: "Devices & Agents",
+    description: "Every computer running the desktop agent: platform, agent version, live status and time tracked.",
+    category: "People",
+    icon: "MonitorSmartphone",
+  },
+  {
+    slug: "payroll",
+    title: "Payroll & Billing",
+    description: "Pay per member and project, each hour priced at the hourly rate in effect when it was worked.",
+    category: "Finance",
+    icon: "DollarSign",
+    requires: "manageTeam",
+  },
 ];

@@ -37,6 +37,12 @@
     "Unspecified": "System",
     "SeeAllUsers": "Alle Benutzer anzeigen",
     "TakePhoto": "Foto machen",
-    "ChoosePhoto": "Wähle ein Foto aus"
+    "ChoosePhoto": "Wähle ein Foto aus",
+    "Tracker:ActivityTooOld": "Die Aktivität liegt zu weit zurück und kann nicht mehr erfasst werden.",
+    "Tracker:NotProjectMember": "Sie sind kein Mitglied dieses Projekts.",
+    "Tracker:SubscriptionInactive": "Das Abonnement des Arbeitsbereichs ist nicht aktiv. Bitten Sie den Inhaber des Arbeitsbereichs, es zu verlängern.",
+    "Tracker:InvalidUser": "Der Benutzer existiert in diesem Arbeitsbereich nicht.",
+    "Tracker:CannotModifySelf": "Sie können diese Änderung nicht an Ihrem eigenen Konto oder Ihrer eigenen Mitgliedschaft vornehmen.",
+    "Tracker:RoleNotAllowed": "Nur der Inhaber des Arbeitsbereichs kann diese Rolle vergeben, Stundensätze ändern oder das Konto eines Inhabers verwalten."
   }
 }

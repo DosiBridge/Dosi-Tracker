@@ -3,13 +3,15 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 using Dosi.Tracker.Projects;
+using Dosi.Tracker.SaaS;
 using Shouldly;
 using Volo.Abp;
 using Volo.Abp.Application.Dtos;
-using Volo.Abp.Authorization;
+using Volo.Abp.BlobStoring;
 using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Guids;
 using Volo.Abp.Modularity;
+using Volo.Abp.MultiTenancy;
 using Xunit;
 
 namespace Dosi.Tracker.Activities;
@@ -19,6 +21,9 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
 {
     // Matches FakeCurrentPrincipalAccessor in Dosi.Tracker.TestBase.
     private static readonly Guid CurrentUserId = Guid.Parse("2e701e62-0953-4dd3-910b-dc6cc93ccb0d");
+
+    /// <summary>A day inside the 45-day upload window and in the past, whenever the suite runs.</summary>
+    private static readonly DateTime BaseDay = DateTime.UtcNow.Date.AddDays(-10);
 
     private readonly IActivityAppService _activityAppService;
     private readonly IRepository<Activity, Guid> _activityRepository;
@@ -44,7 +49,7 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
         return await _activityAppService.CreateAsync(input);
     }
 
-    private async Task EnsureProjectAsync(Guid projectId, Action<Project>? configureProject = null)
+    private async Task EnsureProjectAsync(Guid projectId, Action<Project>? configureProject = null, string role = "Worker")
     {
         if (_seededProjects.Add(projectId))
         {
@@ -54,7 +59,7 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
                 configureProject?.Invoke(project);
                 await _projectRepository.InsertAsync(project);
                 await _memberRepository.InsertAsync(
-                    new ProjectMember(_guidGenerator.Create(), null, projectId, CurrentUserId));
+                    new ProjectMember(_guidGenerator.Create(), null, projectId, CurrentUserId, role));
             });
         }
     }
@@ -64,7 +69,7 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
         DateTime? startedAt = null,
         DateTime? endedAt = null)
     {
-        var start = startedAt ?? new DateTime(2026, 7, 20, 10, 0, 0, DateTimeKind.Utc);
+        var start = startedAt ?? BaseDay.AddHours(10);
         return new CreateActivityDto
         {
             ProjectId = Guid.NewGuid(),
@@ -85,6 +90,39 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
                 new() { AppName = "chrome.exe", WindowTitle = "Dosi-Tracker" }
             }
         };
+    }
+
+    /// <summary>Bytes of the given length that start like a JPEG (FF D8 FF).</summary>
+    private static byte[] Jpeg(int length = 8)
+    {
+        var bytes = new byte[length];
+        bytes[0] = 0xFF;
+        bytes[1] = 0xD8;
+        bytes[2] = 0xFF;
+        bytes[3] = 0xE0;
+        return bytes;
+    }
+
+    /// <summary>Bytes of the given length that start like a PNG (89 50 4E 47).</summary>
+    private static byte[] Png(int length = 8)
+    {
+        var bytes = new byte[length];
+        bytes[0] = 0x89;
+        bytes[1] = 0x50;
+        bytes[2] = 0x4E;
+        bytes[3] = 0x47;
+        return bytes;
+    }
+
+    private Task<List<Screenshot>> GetStoredCapturesAsync(Guid activityId)
+    {
+        return WithUnitOfWorkAsync(() => GetRequiredService<IRepository<Screenshot, Guid>>()
+            .GetListAsync(s => s.ActivityId == activityId));
+    }
+
+    private Task<Activity> GetStoredAsync(Guid activityId)
+    {
+        return WithUnitOfWorkAsync(() => _activityRepository.GetAsync(activityId));
     }
 
     [Fact]
@@ -138,7 +176,7 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
     [Fact]
     public async Task Create_Should_Reject_EndedAt_Not_After_StartedAt()
     {
-        var start = new DateTime(2026, 7, 20, 10, 0, 0, DateTimeKind.Utc);
+        var start = BaseDay.AddHours(10);
         var input = NewInput(startedAt: start, endedAt: start.AddMinutes(-1));
 
         var exception = await Should.ThrowAsync<BusinessException>(
@@ -149,7 +187,7 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
     [Fact]
     public async Task GetList_Should_Page_And_Order_By_StartedAt_Descending()
     {
-        var baseTime = new DateTime(2026, 7, 20, 8, 0, 0, DateTimeKind.Utc);
+        var baseTime = BaseDay.AddHours(8);
         await SubmitAsync(NewInput(startedAt: baseTime, endedAt: baseTime.AddMinutes(10)));
         await SubmitAsync(NewInput(startedAt: baseTime.AddHours(2), endedAt: baseTime.AddHours(2).AddMinutes(10)));
         await SubmitAsync(NewInput(startedAt: baseTime.AddHours(1), endedAt: baseTime.AddHours(1).AddMinutes(10)));
@@ -169,7 +207,7 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
     [Fact]
     public async Task GetList_Should_Filter_By_Project_And_Date_Range()
     {
-        var baseTime = new DateTime(2026, 7, 20, 8, 0, 0, DateTimeKind.Utc);
+        var baseTime = BaseDay.AddHours(8);
         var projectA = Guid.NewGuid();
         var projectB = Guid.NewGuid();
 
@@ -261,11 +299,14 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
     [Fact]
     public async Task Create_Should_Reject_Activity_For_A_Project_The_User_Is_Not_A_Member_Of()
     {
-        // No SubmitAsync -> no membership seeded, so the service must refuse.
+        // No SubmitAsync -> no membership seeded, so the service must refuse. A business error (HTTP 403
+        // Tracker:NotProjectMember), so agents can tell it from a missing permission and refresh their projects.
         var input = NewInput();
 
-        await Should.ThrowAsync<AbpAuthorizationException>(
+        var exception = await Should.ThrowAsync<BusinessException>(
             () => _activityAppService.CreateAsync(input));
+        exception.Code.ShouldBe(TrackerDomainErrorCodes.NotProjectMember);
+        exception.Data["projectId"].ShouldBe(input.ProjectId);
     }
 
     // ---- Ingest hardening: project policy, time validation, idempotency scoping, input limits ----
@@ -277,8 +318,9 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
     {
         var input = NewInput();
 
+        // Archived before the block even started.
         var exception = await Should.ThrowAsync<BusinessException>(
-            () => SubmitAsync(input, p => p.Archive()));
+            () => SubmitAsync(input, p => p.Archive(input.StartedAt.AddHours(-1))));
         exception.Code.ShouldBe(TrackerDomainErrorCodes.ProjectArchived);
     }
 
@@ -286,8 +328,9 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
     public async Task Create_Should_Keep_The_Time_But_Drop_Everything_The_Project_Does_Not_Allow()
     {
         var input = NewInput();
-        input.ScreenshotPngBase64 = Convert.ToBase64String(new byte[] { 1, 2, 3 });
-        input.WebcamJpgBase64 = Convert.ToBase64String(new byte[] { 4, 5, 6 });
+        input.ScreenshotPngBase64 = Convert.ToBase64String(Png());
+        input.WebcamJpgBase64 = Convert.ToBase64String(Jpeg());
+        input.InjectedInputEvents = 4;
 
         var created = await SubmitAsync(input, p =>
         {
@@ -302,7 +345,9 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
         created.Id.ShouldNotBe(Guid.Empty);
         created.StartedAt.ShouldBe(input.StartedAt);
         created.EndedAt.ShouldBe(input.EndedAt);
-        created.Productivity.ShouldBe(80);
+        // Neither keyboard nor mouse may be captured: activity % is "not measured", not 0% and not the agent's figure.
+        created.Productivity.ShouldBeNull();
+        created.InjectedInputEvents.ShouldBeNull();
         created.MouseClicks.ShouldBe(0);
         created.KeyboardHits.ShouldBe(0);
         created.ActiveWindowsJson.ShouldBe("[]");
@@ -311,11 +356,23 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
     }
 
     [Fact]
+    public async Task Create_Should_Keep_Productivity_When_One_Kind_Of_Input_Is_Allowed()
+    {
+        var input = NewInput();
+
+        var created = await SubmitAsync(input, p => p.AllowKeyboard = false);
+
+        created.Productivity.ShouldBe(80);
+        created.KeyboardHits.ShouldBe(0);
+        created.MouseClicks.ShouldBe(120);
+    }
+
+    [Fact]
     public async Task Create_Should_Store_Only_The_Screenshot_When_The_Webcam_Is_Not_Allowed()
     {
         var input = NewInput();
-        input.ScreenshotPngBase64 = Convert.ToBase64String(new byte[] { 1, 2, 3 });
-        input.WebcamJpgBase64 = Convert.ToBase64String(new byte[] { 4, 5, 6 });
+        input.ScreenshotPngBase64 = Convert.ToBase64String(Png());
+        input.WebcamJpgBase64 = Convert.ToBase64String(Jpeg());
 
         var created = await SubmitAsync(input); // defaults: screenshots on, webcam off
 
@@ -343,6 +400,7 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
 
         var exception = await Should.ThrowAsync<BusinessException>(() => SubmitAsync(input));
         exception.Code.ShouldBe(TrackerDomainErrorCodes.ActivityInFuture);
+        exception.Data["serverNow"].ShouldNotBeNull();
     }
 
     [Fact]
@@ -357,25 +415,27 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
     }
 
     [Fact]
-    public async Task Create_Should_Cap_Block_Length_At_Twice_The_Project_Interval()
+    public async Task Create_Should_Cap_Block_Length_At_120_Minutes_Whatever_The_Interval()
     {
-        // Seeded project interval = 10 min -> max block = max(2 × 10, 15) = 20 min.
-        var start = new DateTime(2026, 7, 21, 8, 0, 0, DateTimeKind.Utc);
-        var tooLong = NewInput(startedAt: start, endedAt: start.AddMinutes(21));
+        // The cap is fixed: a 10-minute project still accepts 120-minute blocks (queued under an older, longer interval).
+        var start = BaseDay.AddDays(1).AddHours(8);
+        var tooLong = NewInput(startedAt: start, endedAt: start.AddMinutes(121));
 
-        var exception = await Should.ThrowAsync<BusinessException>(() => SubmitAsync(tooLong));
+        var exception = await Should.ThrowAsync<BusinessException>(() => SubmitAsync(tooLong, p => p.IntervalMinutes = 10));
         exception.Code.ShouldBe(TrackerDomainErrorCodes.ActivityTooLong);
+        exception.Data["maxMinutes"].ShouldBe(120);
 
-        var atLimit = NewInput(startedAt: start, endedAt: start.AddMinutes(20));
+        var atLimit = NewInput(startedAt: start, endedAt: start.AddMinutes(120));
         atLimit.ProjectId = tooLong.ProjectId;
         (await SubmitAsync(atLimit)).Id.ShouldNotBe(Guid.Empty);
     }
 
     [Fact]
-    public async Task Create_Should_Use_A_15_Minute_Floor_For_Short_Intervals()
+    public async Task Create_Should_Accept_Blocks_Cut_Under_An_Earlier_Longer_Interval()
     {
-        var start = new DateTime(2026, 7, 21, 8, 0, 0, DateTimeKind.Utc);
-        var input = NewInput(startedAt: start, endedAt: start.AddMinutes(15)); // 2 × 5 = 10 < 15 floor
+        // An admin lowered the interval from 30 to 5 minutes; blocks the agents already cut keep being accepted.
+        var start = BaseDay.AddDays(1).AddHours(8);
+        var input = NewInput(startedAt: start, endedAt: start.AddMinutes(30));
 
         (await SubmitAsync(input, p => p.IntervalMinutes = 5)).Id.ShouldNotBe(Guid.Empty);
     }
@@ -383,7 +443,7 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
     [Fact]
     public async Task Create_Should_Reject_A_Block_Overlapping_Tracked_Time_By_More_Than_A_Minute()
     {
-        var start = new DateTime(2026, 7, 21, 9, 0, 0, DateTimeKind.Utc);
+        var start = BaseDay.AddDays(1).AddHours(9);
         var first = NewInput(startedAt: start, endedAt: start.AddMinutes(10));
         await SubmitAsync(first);
 
@@ -395,9 +455,29 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
     }
 
     [Fact]
+    public async Task Create_Should_Detect_An_Overlap_With_A_Long_Block_That_Started_Much_Earlier()
+    {
+        // The overlap scan is bounded to blocks starting at most 120 minutes earlier, which still covers a stored
+        // block of the maximum length that reaches into the new one.
+        var start = BaseDay.AddDays(1).AddHours(9);
+        var longBlock = NewInput(startedAt: start, endedAt: start.AddMinutes(120));
+        await SubmitAsync(longBlock);
+
+        var inside = NewInput(startedAt: start.AddMinutes(110), endedAt: start.AddMinutes(118));
+        inside.ProjectId = longBlock.ProjectId;
+
+        var exception = await Should.ThrowAsync<BusinessException>(() => SubmitAsync(inside));
+        exception.Code.ShouldBe(TrackerDomainErrorCodes.ActivityOverlaps);
+
+        var after = NewInput(startedAt: start.AddMinutes(120), endedAt: start.AddMinutes(130));
+        after.ProjectId = longBlock.ProjectId;
+        (await SubmitAsync(after)).Id.ShouldNotBe(Guid.Empty);
+    }
+
+    [Fact]
     public async Task Create_Should_Allow_Up_To_A_Minute_Of_Overlap_And_Other_Members_Time()
     {
-        var start = new DateTime(2026, 7, 21, 9, 0, 0, DateTimeKind.Utc);
+        var start = BaseDay.AddDays(1).AddHours(9);
         var first = NewInput(startedAt: start, endedAt: start.AddMinutes(10));
         await SubmitAsync(first);
 
@@ -425,10 +505,16 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
             foreignId, null, OtherUserId, input.ProjectId, clientId,
             input.StartedAt.AddHours(-3), input.StartedAt.AddHours(-3).AddMinutes(10))));
 
-        var created = await _activityAppService.CreateAsync(input);
+        // The other member's block is neither handed back nor duplicated: the reused id is refused (409),
+        // here for host users (no tenant) as well.
+        var exception = await Should.ThrowAsync<BusinessException>(() => _activityAppService.CreateAsync(input));
+        exception.Code.ShouldBe(TrackerDomainErrorCodes.ActivityClientIdConflict);
+        exception.Data.Values.Cast<object?>().ShouldNotContain(foreignId);
 
-        created.Id.ShouldNotBe(foreignId);
-        created.UserId.ShouldBe(CurrentUserId);
+        await WithUnitOfWorkAsync(async () =>
+        {
+            (await _activityRepository.CountAsync(a => a.ClientActivityId == clientId)).ShouldBe(1);
+        });
     }
 
     [Fact]
@@ -437,9 +523,9 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
         var tenantId = Guid.NewGuid();
         var clientId = Guid.NewGuid();
         var projectId = Guid.NewGuid();
-        var start = new DateTime(2026, 7, 21, 9, 0, 0, DateTimeKind.Utc);
+        var start = BaseDay.AddDays(1).AddHours(9);
 
-        using (GetRequiredService<Volo.Abp.MultiTenancy.ICurrentTenant>().Change(tenantId))
+        using (GetRequiredService<ICurrentTenant>().Change(tenantId))
         {
             await WithUnitOfWorkAsync(async () =>
             {
@@ -453,10 +539,33 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
             var input = NewInput(clientActivityId: clientId, startedAt: start.AddHours(1), endedAt: start.AddHours(1).AddMinutes(10));
             input.ProjectId = projectId;
 
-            // The unique (TenantId, ClientActivityId) index fires; the service must not hand back the other block.
+            // Client ids are unique per member, and one owned by another member is refused (409) rather than
+            // stored twice; the service must not hand back the other block either.
             var exception = await Should.ThrowAsync<BusinessException>(() => _activityAppService.CreateAsync(input));
             exception.Code.ShouldBe(TrackerDomainErrorCodes.ActivityClientIdConflict);
         }
+    }
+
+    [Fact]
+    public async Task Create_Should_Accept_The_Same_Client_Id_From_Members_Of_Different_Workspaces()
+    {
+        // Uniqueness is per (tenant, member, client id): another workspace's block never conflicts.
+        var clientId = Guid.NewGuid();
+        var input = NewInput(clientActivityId: clientId);
+        await EnsureProjectAsync(input.ProjectId);
+
+        var otherTenantId = Guid.NewGuid();
+        using (GetRequiredService<ICurrentTenant>().Change(otherTenantId))
+        {
+            await WithUnitOfWorkAsync(() => _activityRepository.InsertAsync(new Activity(
+                _guidGenerator.Create(), otherTenantId, OtherUserId, Guid.NewGuid(), clientId,
+                input.StartedAt, input.EndedAt)));
+        }
+
+        var created = await _activityAppService.CreateAsync(input);
+
+        created.UserId.ShouldBe(CurrentUserId);
+        created.ClientActivityId.ShouldBe(clientId);
     }
 
     [Fact]
@@ -477,6 +586,329 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
             .ToList();
 
         await Should.ThrowAsync<Volo.Abp.Validation.AbpValidationException>(() => SubmitAsync(input));
+    }
+
+    // ---- The rest of the contract's ingest rules: who may upload, archived projects, upload window, subscription ----
+
+    [Fact]
+    public async Task Create_Should_Refuse_A_Member_Whose_Project_Role_Is_Client()
+    {
+        // Client stakeholders follow a project's progress; they never track time on it.
+        var input = NewInput();
+        await EnsureProjectAsync(input.ProjectId, role: "client");
+
+        var exception = await Should.ThrowAsync<BusinessException>(() => _activityAppService.CreateAsync(input));
+        exception.Code.ShouldBe(TrackerDomainErrorCodes.NotProjectMember);
+    }
+
+    [Fact]
+    public async Task Create_Should_Refuse_A_Deleted_Project_As_Not_A_Member()
+    {
+        // The membership outlived its project: the agent must refresh its projects (403), not retry forever (404).
+        var input = NewInput();
+        await EnsureProjectAsync(input.ProjectId);
+        await WithUnitOfWorkAsync(() => _projectRepository.DeleteAsync(input.ProjectId));
+
+        var exception = await Should.ThrowAsync<BusinessException>(() => _activityAppService.CreateAsync(input));
+        exception.Code.ShouldBe(TrackerDomainErrorCodes.NotProjectMember);
+    }
+
+    [Fact]
+    public async Task Create_Should_Accept_A_Block_That_Started_Before_The_Project_Was_Archived()
+    {
+        // Queued offline before an admin archived the project: the recorded time is still accepted.
+        var input = NewInput();
+
+        var created = await SubmitAsync(input, p => p.Archive(input.StartedAt.AddMinutes(5)));
+
+        created.Id.ShouldNotBe(Guid.Empty);
+    }
+
+    [Fact]
+    public async Task Create_Should_Refuse_An_Archived_Project_Without_An_Archive_Time()
+    {
+        var input = NewInput();
+
+        var exception = await Should.ThrowAsync<BusinessException>(
+            () => SubmitAsync(input, p => p.IsArchived = true));
+        exception.Code.ShouldBe(TrackerDomainErrorCodes.ProjectArchived);
+    }
+
+    [Fact]
+    public async Task Create_Should_Reject_A_Block_That_Started_More_Than_45_Days_Ago()
+    {
+        var projectId = Guid.NewGuid();
+        var tooOld = NewInput(startedAt: DateTime.UtcNow.AddDays(-46));
+        tooOld.ProjectId = projectId;
+
+        var exception = await Should.ThrowAsync<BusinessException>(() => SubmitAsync(tooOld));
+        exception.Code.ShouldBe(TrackerDomainErrorCodes.ActivityTooOld);
+
+        var inWindow = NewInput(startedAt: DateTime.UtcNow.AddDays(-44));
+        inWindow.ProjectId = projectId;
+        (await SubmitAsync(inWindow)).Id.ShouldNotBe(Guid.Empty);
+    }
+
+    [Fact]
+    public async Task Create_Should_Refuse_Blocks_While_The_Workspace_Subscription_Is_Inactive()
+    {
+        var tenantId = Guid.NewGuid();
+        var projectId = Guid.NewGuid();
+
+        using (GetRequiredService<ICurrentTenant>().Change(tenantId))
+        {
+            await WithUnitOfWorkAsync(async () =>
+            {
+                await _projectRepository.InsertAsync(new Project(projectId, tenantId, "Tenant Project"));
+                await _memberRepository.InsertAsync(
+                    new ProjectMember(_guidGenerator.Create(), tenantId, projectId, CurrentUserId));
+                await GetRequiredService<IRepository<Subscription, Guid>>().InsertAsync(
+                    new Subscription(_guidGenerator.Create(), tenantId, Guid.NewGuid()) { Status = Subscription.PastDueStatus });
+            });
+
+            var input = NewInput();
+            input.ProjectId = projectId;
+
+            var exception = await Should.ThrowAsync<BusinessException>(() => _activityAppService.CreateAsync(input));
+            exception.Code.ShouldBe(TrackerDomainErrorCodes.SubscriptionInactive);
+        }
+    }
+
+    [Fact]
+    public async Task Create_Should_Return_The_Stored_Block_On_A_Retry_After_The_Project_Was_Archived()
+    {
+        // The first response was lost; by the time the agent retries, the project is archived. The block is stored.
+        var input = NewInput();
+        var first = await SubmitAsync(input);
+
+        await WithUnitOfWorkAsync(async () =>
+        {
+            var project = await _projectRepository.GetAsync(input.ProjectId);
+            project.Archive(input.StartedAt.AddMinutes(-30));
+        });
+
+        var replayed = await _activityAppService.CreateAsync(input);
+
+        replayed.Id.ShouldBe(first.Id);
+    }
+
+    // ---- Normalization of the optional block context ----
+
+    [Fact]
+    public async Task Create_Should_Normalize_The_Device_And_Agent_Context()
+    {
+        var deviceId = Guid.NewGuid();
+        var input = NewInput();
+        input.Platform = " Windows ";
+        input.OsVersion = "  Windows 11 Pro 23H2 (10.0.22631) " + new string('x', 100);
+        input.AgentVersion = "0.2.0";
+        input.DeviceId = deviceId;
+        input.DeviceName = "DESKTOP\u0007-42\n";
+        input.TimeZone = " Asia/Dhaka ";
+        input.UtcOffsetMinutes = 360;
+        input.EndReason = "IDLE";
+        input.InjectedInputEvents = 12;
+
+        var created = await SubmitAsync(input);
+
+        created.Platform.ShouldBe("windows");
+        created.OsVersion!.Length.ShouldBe(ActivityConsts.MaxOsVersionLength);
+        created.OsVersion.ShouldStartWith("Windows 11 Pro 23H2 (10.0.22631) x");
+        created.AgentVersion.ShouldBe("0.2.0");
+        created.DeviceId.ShouldBe(deviceId);
+        created.DeviceName.ShouldBe("DESKTOP-42");
+        created.TimeZone.ShouldBe("Asia/Dhaka");
+        created.UtcOffsetMinutes.ShouldBe(360);
+        created.EndReason.ShouldBe("idle");
+        created.InjectedInputEvents.ShouldBe(12);
+
+        var stored = await GetStoredAsync(created.Id);
+        stored.Platform.ShouldBe("windows");
+        stored.TimeZone.ShouldBe("Asia/Dhaka");
+    }
+
+    [Fact]
+    public async Task Create_Should_Store_Unusable_Context_Values_As_Null_And_Keep_The_Block()
+    {
+        var input = NewInput();
+        input.Platform = "linux";
+        input.OsVersion = "   ";
+        input.AgentVersion = "\u0001\u0002";
+        input.DeviceId = Guid.Empty;
+        input.TimeZone = "Mars/Olympus_Mons";
+        input.UtcOffsetMinutes = 900;
+        input.EndReason = "crashed";
+        input.IdleSeconds = -5;
+        input.InjectedInputEvents = -1;
+
+        var created = await SubmitAsync(input);
+
+        created.Id.ShouldNotBe(Guid.Empty);
+        created.Platform.ShouldBeNull();
+        created.OsVersion.ShouldBeNull();
+        created.AgentVersion.ShouldBeNull();
+        created.DeviceId.ShouldBeNull();
+        created.TimeZone.ShouldBeNull();
+        created.UtcOffsetMinutes.ShouldBeNull();
+        created.EndReason.ShouldBeNull();
+        created.IdleSeconds.ShouldBeNull();
+        created.InjectedInputEvents.ShouldBeNull();
+    }
+
+    [Fact]
+    public async Task Create_Should_Accept_The_Extreme_Utc_Offsets()
+    {
+        var east = NewInput();
+        east.UtcOffsetMinutes = 840;
+        var west = NewInput(startedAt: BaseDay.AddHours(12));
+        west.ProjectId = east.ProjectId;
+        west.UtcOffsetMinutes = -840;
+
+        (await SubmitAsync(east)).UtcOffsetMinutes.ShouldBe(840);
+        (await SubmitAsync(west)).UtcOffsetMinutes.ShouldBe(-840);
+    }
+
+    [Fact]
+    public async Task Create_Should_Clamp_Idle_Seconds_To_The_Block_Length()
+    {
+        var input = NewInput(); // 10 minutes
+        input.IdleSeconds = 4000;
+
+        (await SubmitAsync(input)).IdleSeconds.ShouldBe(600);
+    }
+
+    [Fact]
+    public async Task Create_Should_Keep_The_Full_Length_Of_A_Block_Kept_After_An_Idle_Prompt()
+    {
+        var input = NewInput();
+        input.Productivity = 0;
+        input.IdleSeconds = 600;
+        input.EndReason = "idle";
+        input.ActiveWindows = new List<WindowInfoDto>();
+        input.RunningPrograms = new List<WindowInfoDto>();
+
+        var created = await SubmitAsync(input);
+
+        created.IdleSeconds.ShouldBe(600);
+        created.Productivity.ShouldBe(0);
+        created.EndReason.ShouldBe("idle");
+    }
+
+    [Fact]
+    public async Task Create_Should_Derive_Idle_Seconds_From_The_Timeline()
+    {
+        // 10 min 29 s: buckets 0..9, the last one 89 s long. Buckets 3 and 9 had no input: 60 + 89 s idle.
+        var start = BaseDay.AddHours(10);
+        var input = NewInput(startedAt: start, endedAt: start.AddSeconds(629));
+        input.IdleSeconds = null;
+        input.Timeline = Enumerable.Range(0, 10)
+            .Select(i => new ActivityMinuteDto { Minute = i, Active = i != 3 && i != 9, KeyboardHits = i == 3 || i == 9 ? 0 : 5 })
+            .ToList();
+
+        (await SubmitAsync(input)).IdleSeconds.ShouldBe(149);
+    }
+
+    [Fact]
+    public async Task Create_Should_Not_Measure_Idle_Time_Without_A_Timeline()
+    {
+        var input = NewInput();
+        input.IdleSeconds = null;
+
+        (await SubmitAsync(input)).IdleSeconds.ShouldBeNull();
+    }
+
+    [Fact]
+    public async Task Create_Should_Not_Derive_Idle_Seconds_When_The_Project_Measures_No_Input()
+    {
+        // Neither keyboard nor mouse is captured, so the timeline's activity flags are no measurement of idling.
+        var input = NewInput();
+        input.Timeline = new List<ActivityMinuteDto> { new() { Minute = 0, Active = false } };
+
+        var created = await SubmitAsync(input, p =>
+        {
+            p.AllowKeyboard = false;
+            p.AllowMouse = false;
+        });
+
+        created.IdleSeconds.ShouldBeNull();
+    }
+
+    [Fact]
+    public async Task Create_Should_Store_The_Clock_Skew_Of_The_Device()
+    {
+        // The device clock is 90 s behind the server's (positive skew).
+        var input = NewInput();
+        input.SentAt = DateTime.UtcNow.AddSeconds(-90);
+
+        var created = await SubmitAsync(input);
+
+        created.ClockSkewSeconds.ShouldNotBeNull();
+        created.ClockSkewSeconds!.Value.ShouldBeInRange(88, 100);
+    }
+
+    [Fact]
+    public async Task Create_Should_Clamp_The_Clock_Skew_To_Ten_Days()
+    {
+        var behind = NewInput();
+        behind.SentAt = DateTime.UtcNow.AddDays(-30);
+        var ahead = NewInput(startedAt: BaseDay.AddHours(12));
+        ahead.ProjectId = behind.ProjectId;
+        ahead.SentAt = DateTime.UtcNow.AddDays(30);
+
+        (await SubmitAsync(behind)).ClockSkewSeconds.ShouldBe(10 * 24 * 3600);
+        (await SubmitAsync(ahead)).ClockSkewSeconds.ShouldBe(-10 * 24 * 3600);
+    }
+
+    [Fact]
+    public async Task Create_Should_Clean_Up_The_Task_Note()
+    {
+        var input = NewInput();
+        input.Description = "  Fixing\tthe   login\r\nbug \u0007 ";
+
+        (await SubmitAsync(input)).Description.ShouldBe("Fixing the login bug");
+    }
+
+    [Fact]
+    public async Task Create_Should_Keep_Active_Seconds_In_The_Stored_Timeline()
+    {
+        var input = NewInput();
+        input.Timeline = new List<ActivityMinuteDto>
+        {
+            new() { Minute = 0, KeyboardHits = 5, MouseClicks = 2, Active = true, ActiveSeconds = 42 },
+            new() { Minute = 1, Active = false, ActiveSeconds = 0 },
+            new() { Minute = 2, Active = true, ActiveSeconds = 95 },  // more than a bucket can hold: not a measurement
+            new() { Minute = 3, Active = true, ActiveSeconds = -1 },
+            new() { Minute = 4, Active = true }                     // older agent: no active seconds
+        };
+
+        var created = await SubmitAsync(input);
+
+        created.TimelineJson.ShouldBe(
+            "[{\"Minute\":0,\"KeyboardHits\":5,\"MouseClicks\":2,\"Active\":true,\"ActiveSeconds\":42}," +
+            "{\"Minute\":1,\"KeyboardHits\":0,\"MouseClicks\":0,\"Active\":false,\"ActiveSeconds\":0}," +
+            "{\"Minute\":2,\"KeyboardHits\":0,\"MouseClicks\":0,\"Active\":true}," +
+            "{\"Minute\":3,\"KeyboardHits\":0,\"MouseClicks\":0,\"Active\":true}," +
+            "{\"Minute\":4,\"KeyboardHits\":0,\"MouseClicks\":0,\"Active\":true}]");
+    }
+
+    [Fact]
+    public async Task Create_Should_Store_Running_Programs_By_Name_Only()
+    {
+        // Titles of background windows are never stored, whatever an (older) agent sends; each app is listed once.
+        var input = NewInput();
+        input.RunningPrograms = new List<WindowInfoDto>
+        {
+            new() { AppName = "chrome.exe", WindowTitle = "Inbox - jane@acme.test - Gmail", Seconds = 30 },
+            new() { AppName = "EXCEL.EXE", WindowTitle = "Salary review.xlsx" },
+            new() { AppName = "Chrome.exe", WindowTitle = "Bank" },
+            new() { AppName = "  ", WindowTitle = "nameless" },
+            new() { AppName = "slack.exe", WindowTitle = "" }
+        };
+
+        var created = await SubmitAsync(input);
+
+        created.RunningProgramsJson.ShouldBe(
+            "[{\"AppName\":\"chrome.exe\"},{\"AppName\":\"EXCEL.EXE\"},{\"AppName\":\"slack.exe\"}]");
     }
 
     // ---- Rich block detail: per-window usage, per-minute timeline, thumbnails, capture refs ----
@@ -640,7 +1072,7 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
     [Fact]
     public async Task GetList_Should_Return_The_Capture_References_Of_Each_Activity()
     {
-        var baseTime = new DateTime(2026, 7, 22, 9, 0, 0, DateTimeKind.Utc);
+        var baseTime = BaseDay.AddDays(2).AddHours(9);
         var withCaptures = NewInput(startedAt: baseTime, endedAt: baseTime.AddMinutes(10));
         withCaptures.ScreenshotPngBase64 = Convert.ToBase64String(ScreenBytes);
         withCaptures.ScreenshotThumbJpgBase64 = Convert.ToBase64String(ThumbBytes);
@@ -664,5 +1096,387 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
         var fullSize = await _activityAppService.GetScreenshotsAsync(created.Id);
         fullSize.Select(s => s.Id).ShouldBe(
             captures.Where(c => c.Kind != Screenshot.ThumbKind).Select(c => c.Id), ignoreOrder: true);
+    }
+
+    [Fact]
+    public async Task Capture_References_Should_Carry_The_Capture_Time_And_Blur_Flag()
+    {
+        var input = NewInput();
+        input.ScreenshotPngBase64 = Convert.ToBase64String(ScreenBytes);
+        input.ScreenshotThumbJpgBase64 = Convert.ToBase64String(ThumbBytes);
+
+        var created = await SubmitAsync(input);
+
+        created.Captures.Count.ShouldBe(2);
+        created.Captures.ShouldAllBe(c => c.CapturedAt == input.EndedAt && !c.Blurred);
+
+        var listed = await _activityAppService.GetListAsync(new GetActivitiesInput { ProjectId = input.ProjectId });
+        var refs = listed.Items.ShouldHaveSingleItem().Captures;
+        refs.Select(c => (c.Id, c.Kind, c.CapturedAt, c.Blurred))
+            .ShouldBe(created.Captures.Select(c => (c.Id, c.Kind, c.CapturedAt, c.Blurred)));
+    }
+
+    [Fact]
+    public async Task Create_Should_Keep_Productivity_Null_When_It_Was_Not_Measured()
+    {
+        // Input capture unavailable/denied: the agent sends no productivity, which is "not measured", never 0%.
+        var input = NewInput();
+        input.Productivity = null;
+
+        var created = await SubmitAsync(input);
+
+        created.Productivity.ShouldBeNull();
+        var listed = await _activityAppService.GetListAsync(new GetActivitiesInput { ProjectId = input.ProjectId });
+        listed.Items.ShouldHaveSingleItem().Productivity.ShouldBeNull();
+    }
+
+    [Fact]
+    public async Task Create_Should_Still_Reject_A_Productivity_Outside_0_To_100()
+    {
+        var input = NewInput();
+        input.Productivity = 101;
+
+        await Should.ThrowAsync<Volo.Abp.Validation.AbpValidationException>(() => SubmitAsync(input));
+    }
+
+    [Fact]
+    public async Task GetList_Should_Return_The_Device_And_Agent_Context_Of_A_Block()
+    {
+        var projectId = Guid.NewGuid();
+        await EnsureProjectAsync(projectId);
+        var deviceId = Guid.NewGuid();
+        var start = BaseDay.AddDays(3).AddHours(9);
+
+        await WithUnitOfWorkAsync(() => _activityRepository.InsertAsync(new Activity(
+            _guidGenerator.Create(), null, CurrentUserId, projectId, Guid.NewGuid(), start, start.AddMinutes(10))
+        {
+            Productivity = null,
+            Platform = "macos",
+            OsVersion = "macOS 14.5 (23F79)",
+            AgentVersion = "0.2.0",
+            DeviceId = deviceId,
+            DeviceName = "Ana's MacBook",
+            TimeZone = "Asia/Dhaka",
+            UtcOffsetMinutes = 360,
+            IdleSeconds = 120,
+            EndReason = "idle",
+            ClockSkewSeconds = -4,
+            InjectedInputEvents = 7
+        }));
+
+        var dto = (await _activityAppService.GetListAsync(new GetActivitiesInput { ProjectId = projectId }))
+            .Items.ShouldHaveSingleItem();
+
+        dto.Productivity.ShouldBeNull();
+        dto.Platform.ShouldBe("macos");
+        dto.OsVersion.ShouldBe("macOS 14.5 (23F79)");
+        dto.AgentVersion.ShouldBe("0.2.0");
+        dto.DeviceId.ShouldBe(deviceId);
+        dto.DeviceName.ShouldBe("Ana's MacBook");
+        dto.TimeZone.ShouldBe("Asia/Dhaka");
+        dto.UtcOffsetMinutes.ShouldBe(360);
+        dto.IdleSeconds.ShouldBe(120);
+        dto.EndReason.ShouldBe("idle");
+        dto.ClockSkewSeconds.ShouldBe(-4);
+        dto.InjectedInputEvents.ShouldBe(7);
+    }
+
+    [Fact]
+    public async Task GetList_Should_Leave_The_Context_Of_A_Legacy_Block_Empty()
+    {
+        var created = await SubmitAsync(NewInput());
+
+        var dto = (await _activityAppService.GetListAsync(new GetActivitiesInput { ProjectId = created.ProjectId }))
+            .Items.ShouldHaveSingleItem();
+
+        dto.Platform.ShouldBeNull();
+        dto.OsVersion.ShouldBeNull();
+        dto.AgentVersion.ShouldBeNull();
+        dto.DeviceId.ShouldBeNull();
+        dto.DeviceName.ShouldBeNull();
+        dto.TimeZone.ShouldBeNull();
+        dto.UtcOffsetMinutes.ShouldBeNull();
+        dto.IdleSeconds.ShouldBeNull();
+        dto.EndReason.ShouldBeNull();
+        dto.ClockSkewSeconds.ShouldBeNull();
+        dto.InjectedInputEvents.ShouldBeNull();
+    }
+
+    [Fact]
+    public async Task GetList_Should_Page_Stably_Through_Blocks_That_Start_At_The_Same_Time()
+    {
+        // Blocks of several members starting at the same instant: paging must neither repeat nor skip one.
+        var projectId = Guid.NewGuid();
+        await EnsureProjectAsync(projectId);
+        var start = BaseDay.AddDays(3).AddHours(14);
+        var ids = new List<Guid>();
+        await WithUnitOfWorkAsync(async () =>
+        {
+            for (var i = 0; i < 5; i++)
+            {
+                var activity = new Activity(
+                    _guidGenerator.Create(), null, Guid.NewGuid(), projectId, Guid.NewGuid(), start, start.AddMinutes(10));
+                ids.Add(activity.Id);
+                await _activityRepository.InsertAsync(activity);
+            }
+        });
+
+        var firstPass = new List<Guid>();
+        var secondPass = new List<Guid>();
+        for (var skip = 0; skip < ids.Count; skip += 2)
+        {
+            var request = new GetActivitiesInput { ProjectId = projectId, SkipCount = skip, MaxResultCount = 2 };
+            var page = await _activityAppService.GetListAsync(request);
+            page.TotalCount.ShouldBe(ids.Count);
+            firstPass.AddRange(page.Items.Select(a => a.Id));
+            secondPass.AddRange((await _activityAppService.GetListAsync(request)).Items.Select(a => a.Id));
+        }
+
+        firstPass.ShouldBe(ids, ignoreOrder: true);
+        firstPass.Distinct().Count().ShouldBe(ids.Count);
+        secondPass.ShouldBe(firstPass);
+    }
+
+    // ---- Captures: format detection, size limits, capture time, blur policy ----
+
+    [Fact]
+    public async Task Create_Should_Store_A_Jpeg_Screen_Capture_As_Jpeg()
+    {
+        // The field is named for PNG, but agents send JPEG: the bytes decide the stored type and file name.
+        var bytes = Jpeg(64);
+        var input = NewInput();
+        input.ScreenshotPngBase64 = Convert.ToBase64String(bytes);
+
+        var created = await SubmitAsync(input);
+
+        var screen = (await GetStoredCapturesAsync(created.Id)).ShouldHaveSingleItem();
+        screen.ContentType.ShouldBe("image/jpeg");
+        screen.StorageUrl.ShouldBe($"activities/{created.Id}/screen.jpg");
+
+        var content = await _activityAppService.GetScreenshotContentAsync(screen.Id);
+        content.Bytes.ShouldBe(bytes);
+        content.ContentType.ShouldBe("image/jpeg");
+        content.FileName.ShouldBe($"{created.Id}-screen.jpg");
+    }
+
+    [Fact]
+    public async Task Create_Should_Store_A_Png_Screen_Capture_As_Png()
+    {
+        var input = NewInput();
+        input.ScreenshotPngBase64 = Convert.ToBase64String(Png(64));
+
+        var created = await SubmitAsync(input);
+
+        var screen = (await GetStoredCapturesAsync(created.Id)).ShouldHaveSingleItem();
+        screen.ContentType.ShouldBe("image/png");
+        screen.StorageUrl.ShouldBe($"activities/{created.Id}/screen.png");
+    }
+
+    [Fact]
+    public async Task Create_Should_Drop_A_Capture_That_Is_Neither_Jpeg_Nor_Png()
+    {
+        var input = NewInput();
+        input.ScreenshotPngBase64 = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes("<svg onload=alert(1)>"));
+        input.ScreenshotThumbJpgBase64 = Convert.ToBase64String(Jpeg());
+
+        var created = await SubmitAsync(input);
+
+        created.Captures.ShouldHaveSingleItem().Kind.ShouldBe(Screenshot.ThumbKind);
+    }
+
+    [Fact]
+    public async Task Create_Should_Drop_Captures_Over_Their_Size_Limits_And_Keep_The_Block()
+    {
+        var input = NewInput();
+        input.ScreenshotPngBase64 = Convert.ToBase64String(Png(ActivityAppService.MaxScreenCaptureBytes + 1));
+        input.ScreenshotThumbJpgBase64 = Convert.ToBase64String(Jpeg(ActivityAppService.MaxThumbCaptureBytes + 1));
+        input.WebcamJpgBase64 = Convert.ToBase64String(Jpeg(ActivityAppService.MaxWebcamCaptureBytes + 1));
+
+        var created = await SubmitAsync(input, p => p.AllowWebcam = true);
+
+        created.Id.ShouldNotBe(Guid.Empty);
+        created.Captures.ShouldBeEmpty();
+    }
+
+    [Fact]
+    public async Task Create_Should_Accept_Captures_At_Their_Size_Limits()
+    {
+        var input = NewInput();
+        input.ScreenshotThumbJpgBase64 = Convert.ToBase64String(Jpeg(ActivityAppService.MaxThumbCaptureBytes));
+        input.WebcamJpgBase64 = Convert.ToBase64String(Jpeg(ActivityAppService.MaxWebcamCaptureBytes));
+
+        var created = await SubmitAsync(input, p => p.AllowWebcam = true);
+
+        created.Captures.Select(c => c.Kind).ShouldBe(new[] { Screenshot.ThumbKind, Screenshot.WebcamKind });
+    }
+
+    [Fact]
+    public async Task Create_Should_Use_The_Reported_Screen_Capture_Time_Within_The_Block()
+    {
+        var input = NewInput(); // 10:00 - 10:10
+        var capturedAt = input.StartedAt.AddMinutes(4).AddSeconds(17);
+        input.ScreenshotCapturedAt = capturedAt;
+        input.ScreenshotPngBase64 = Convert.ToBase64String(Jpeg());
+        input.ScreenshotThumbJpgBase64 = Convert.ToBase64String(Jpeg());
+        input.WebcamJpgBase64 = Convert.ToBase64String(Jpeg());
+
+        var created = await SubmitAsync(input, p => p.AllowWebcam = true);
+
+        created.Captures.Single(c => c.Kind == Screenshot.ScreenKind).CapturedAt.ShouldBe(capturedAt);
+        created.Captures.Single(c => c.Kind == Screenshot.ThumbKind).CapturedAt.ShouldBe(capturedAt);
+        created.Captures.Single(c => c.Kind == Screenshot.WebcamKind).CapturedAt.ShouldBe(input.EndedAt);
+    }
+
+    [Fact]
+    public async Task Create_Should_Accept_A_Screen_Capture_Time_Up_To_A_Minute_Outside_The_Block()
+    {
+        var input = NewInput();
+        input.ScreenshotCapturedAt = input.EndedAt.AddSeconds(60);
+        input.ScreenshotPngBase64 = Convert.ToBase64String(Jpeg());
+
+        var created = await SubmitAsync(input);
+
+        created.Captures.ShouldHaveSingleItem().CapturedAt.ShouldBe(input.EndedAt.AddSeconds(60));
+    }
+
+    [Fact]
+    public async Task Create_Should_Use_The_Block_End_For_A_Screen_Capture_Time_Outside_The_Block()
+    {
+        var before = NewInput();
+        before.ScreenshotCapturedAt = before.StartedAt.AddSeconds(-61);
+        before.ScreenshotPngBase64 = Convert.ToBase64String(Jpeg());
+        var after = NewInput(startedAt: BaseDay.AddHours(12));
+        after.ProjectId = before.ProjectId;
+        after.ScreenshotCapturedAt = after.EndedAt.AddHours(3);
+        after.ScreenshotPngBase64 = Convert.ToBase64String(Jpeg());
+
+        (await SubmitAsync(before)).Captures.ShouldHaveSingleItem().CapturedAt.ShouldBe(before.EndedAt);
+        (await SubmitAsync(after)).Captures.ShouldHaveSingleItem().CapturedAt.ShouldBe(after.EndedAt);
+    }
+
+    [Fact]
+    public async Task Create_Should_Record_That_The_Agent_Blurred_The_Screenshot()
+    {
+        var input = NewInput();
+        input.ScreenshotPngBase64 = Convert.ToBase64String(Jpeg());
+        input.ScreenshotThumbJpgBase64 = Convert.ToBase64String(Jpeg());
+        input.WebcamJpgBase64 = Convert.ToBase64String(Jpeg());
+        input.ScreenshotBlurred = true;
+
+        var created = await SubmitAsync(input, p => p.AllowWebcam = true);
+
+        created.Captures.Single(c => c.Kind == Screenshot.ScreenKind).Blurred.ShouldBeTrue();
+        created.Captures.Single(c => c.Kind == Screenshot.ThumbKind).Blurred.ShouldBeTrue();
+        created.Captures.Single(c => c.Kind == Screenshot.WebcamKind).Blurred.ShouldBeFalse();
+        (await _activityAppService.GetScreenshotsAsync(created.Id))
+            .Single(s => s.Kind == Screenshot.ScreenKind).Blurred.ShouldBeTrue();
+    }
+
+    [Fact]
+    public async Task Create_Should_Drop_Unblurred_Screenshots_When_The_Project_Requires_Blur()
+    {
+        var input = NewInput();
+        input.ScreenshotPngBase64 = Convert.ToBase64String(Jpeg());
+        input.ScreenshotThumbJpgBase64 = Convert.ToBase64String(Jpeg());
+        input.WebcamJpgBase64 = Convert.ToBase64String(Jpeg());
+        input.ScreenshotBlurred = null; // an older agent never blurs
+
+        var created = await SubmitAsync(input, p =>
+        {
+            p.BlurScreenshots = true;
+            p.AllowWebcam = true;
+        });
+
+        // The block and the webcam frame are kept; the readable screen and its thumbnail are not.
+        created.Id.ShouldNotBe(Guid.Empty);
+        created.Captures.ShouldHaveSingleItem().Kind.ShouldBe(Screenshot.WebcamKind);
+    }
+
+    [Fact]
+    public async Task Create_Should_Keep_Blurred_Screenshots_When_The_Project_Requires_Blur()
+    {
+        var input = NewInput();
+        input.ScreenshotPngBase64 = Convert.ToBase64String(Jpeg());
+        input.ScreenshotThumbJpgBase64 = Convert.ToBase64String(Jpeg());
+        input.ScreenshotBlurred = true;
+
+        var created = await SubmitAsync(input, p => p.BlurScreenshots = true);
+
+        created.Captures.Count.ShouldBe(2);
+        created.Captures.ShouldAllBe(c => c.Blurred);
+    }
+
+    [Fact]
+    public async Task GetScreenshotContent_Should_Serve_The_Type_Of_The_Stored_Bytes()
+    {
+        // Older servers stored every screen capture as image/png, also when the agent sent a JPEG.
+        var created = await SubmitAsync(NewInput());
+        var bytes = Jpeg(32);
+        var screenshotId = _guidGenerator.Create();
+        await WithUnitOfWorkAsync(async () =>
+        {
+            var blobName = $"activities/{created.Id}/screen.png";
+            await GetRequiredService<IBlobContainer>().SaveAsync(blobName, bytes);
+            await GetRequiredService<IRepository<Screenshot, Guid>>().InsertAsync(new Screenshot(
+                screenshotId, null, created.Id, blobName, created.EndedAt, bytes.Length, "image/png"));
+        });
+
+        var content = await _activityAppService.GetScreenshotContentAsync(screenshotId);
+
+        content.ContentType.ShouldBe("image/jpeg");
+        content.FileName.ShouldBe($"{created.Id}-screen.jpg");
+        content.Bytes.ShouldBe(bytes);
+    }
+
+    // ---- Task note (PUT /api/app/activity/{id}/note). The test caller holds every permission (Team.Manage). ----
+
+    [Fact]
+    public async Task UpdateNote_Should_Store_The_Cleaned_Up_Note()
+    {
+        var created = await SubmitAsync(NewInput());
+
+        var updated = await _activityAppService.UpdateNoteAsync(created.Id, new UpdateActivityNoteDto
+        {
+            Description = "\n  Release   notes\tfor v0.2 \u0000"
+        });
+
+        updated.Id.ShouldBe(created.Id);
+        updated.Description.ShouldBe("Release notes for v0.2");
+        (await GetStoredAsync(created.Id)).Description.ShouldBe("Release notes for v0.2");
+    }
+
+    [Fact]
+    public async Task UpdateNote_Should_Clear_A_Blank_Note()
+    {
+        var created = await SubmitAsync(NewInput());
+
+        var updated = await _activityAppService.UpdateNoteAsync(created.Id, new UpdateActivityNoteDto { Description = " \t " });
+
+        updated.Description.ShouldBeNull();
+        (await GetStoredAsync(created.Id)).Description.ShouldBeNull();
+    }
+
+    [Fact]
+    public async Task UpdateNote_Should_Let_A_Team_Manager_Change_Any_Block_At_Any_Age()
+    {
+        var projectId = Guid.NewGuid();
+        await EnsureProjectAsync(projectId);
+        var start = DateTime.UtcNow.AddDays(-60);
+        var othersBlock = new Activity(_guidGenerator.Create(), null, OtherUserId, projectId, Guid.NewGuid(), start, start.AddMinutes(10));
+        await WithUnitOfWorkAsync(() => _activityRepository.InsertAsync(othersBlock));
+
+        var updated = await _activityAppService.UpdateNoteAsync(othersBlock.Id, new UpdateActivityNoteDto { Description = "Client call" });
+
+        updated.Description.ShouldBe("Client call");
+        updated.UserId.ShouldBe(OtherUserId);
+    }
+
+    [Fact]
+    public async Task UpdateNote_Should_Reject_A_Note_Over_2048_Characters()
+    {
+        var created = await SubmitAsync(NewInput());
+
+        await Should.ThrowAsync<Volo.Abp.Validation.AbpValidationException>(() => _activityAppService.UpdateNoteAsync(
+            created.Id, new UpdateActivityNoteDto { Description = new string('n', UpdateActivityNoteDto.MaxDescriptionLength + 1) }));
     }
 }

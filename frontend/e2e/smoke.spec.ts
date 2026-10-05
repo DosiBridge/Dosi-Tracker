@@ -29,10 +29,11 @@ test("demo owner sees the KPI dashboard on /dashboard @smoke", async ({ page, co
   await primeSession(context, { userId: "u1", workspaceId: "w1" });
   await page.goto("/dashboard");
   await expect(page.getByText("Organization overview for today.")).toBeVisible();
-  await expect(page.getByText("Tracked today")).toBeVisible();
-  await expect(page.getByText("Active members")).toBeVisible();
-  await expect(page.getByText("Avg productivity")).toBeVisible();
-  await expect(page.getByText("Captures today")).toBeVisible();
+  // The headline figures, named with the one glossary (activity %, not "productivity").
+  await expect(page.getByText("Tracked today", { exact: true })).toBeVisible();
+  await expect(page.getByText("Tracking now", { exact: true })).toBeVisible();
+  await expect(page.getByText("Activity today", { exact: true })).toBeVisible();
+  await expect(page.getByText("Tracked this week", { exact: true })).toBeVisible();
 });
 
 test("/projects lists the seeded demo projects @smoke", async ({ page, context }) => {
@@ -57,7 +58,8 @@ test("/settings renders the settings screen @smoke", async ({ page, context }) =
   await primeSession(context, { userId: "u1", workspaceId: "w1" });
   await page.goto("/settings");
   await expect(page.getByRole("heading", { level: 1, name: "Settings" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Profile" })).toBeVisible();
+  // The sections are a keyboard-operable tab list; Profile is selected first.
+  await expect(page.getByRole("tab", { name: "Profile" })).toHaveAttribute("aria-selected", "true");
   await expect(page.getByRole("heading", { name: "Profile" })).toBeVisible();
 });
 

@@ -23,6 +23,7 @@ const NAV = [
   { href: "/timesheet", label: "Timesheet" },
   { href: "/reports", label: "Reports" },
   { href: "/billing", label: "Billing & Plan" },
+  { href: "/download", label: "Desktop agent" },
   { href: "/settings", label: "Settings" },
 ];
 
@@ -85,9 +86,22 @@ describe("Sidebar module visibility (role × navAccess matrix)", () => {
     expect(screen.getByRole("link", { name: "Projects" })).toBeInTheDocument();
   });
 
-  it("limits a client to Dashboard and Settings only", () => {
+  it("keeps a client out of every member module (no projects, team, capture review, billing or agent)", () => {
     renderAsRole(<Sidebar {...baseProps} />, "client");
-    expect(renderedNavHrefs()).toEqual(["/dashboard", "/settings"]);
+    const hrefs = renderedNavHrefs();
+    expect(hrefs).toContain("/dashboard");
+    expect(hrefs).toContain("/settings");
+    for (const forbidden of ["/projects", "/team", "/monitor", "/activities", "/timesheet", "/billing", "/download"]) {
+      expect(hrefs, `client must not be offered ${forbidden}`).not.toContain(forbidden);
+    }
+  });
+
+  it("offers the desktop agent to everyone who is tracked", () => {
+    for (const role of ["owner", "admin", "worker"] as const) {
+      const view = renderAsRole(<Sidebar {...baseProps} />, role);
+      expect(screen.getByRole("link", { name: "Desktop agent" })).toHaveAttribute("href", "/download");
+      view.unmount();
+    }
   });
 });
 
@@ -98,7 +112,9 @@ describe("Sidebar active-route highlighting", () => {
     const reports = within(nav).getByRole("link", { name: "Reports" });
     const dashboard = within(nav).getByRole("link", { name: "Dashboard" });
     expect(reports.className).toContain("bg-accent");
+    expect(reports).toHaveAttribute("aria-current", "page");
     expect(dashboard.className).not.toContain("bg-accent");
+    expect(dashboard).not.toHaveAttribute("aria-current");
   });
 
   it("keeps the parent module highlighted on nested routes", () => {

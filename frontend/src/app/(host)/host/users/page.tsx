@@ -52,7 +52,8 @@ export default function HostUsersPage() {
           id: u.id,
           name: (u.name && u.name.trim()) || u.userName,
           email: u.email ?? "",
-          tenant: u.tenantName || "Host",
+          // A user whose tenant has no name any more belongs to a deleted workspace, not to the host.
+          tenant: u.tenantName || (u.tenantId ? "Deleted workspace" : "Host"),
         }))
       );
     } catch {

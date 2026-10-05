@@ -4,9 +4,11 @@
 vi.mock("next/navigation", () => import("@/test/next-navigation-stub"));
 
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { screen, fireEvent } from "@testing-library/react";
+import { screen, fireEvent, within } from "@testing-library/react";
+import { axe } from "jest-axe";
 import { CommandPalette } from "@/components/command-palette";
 import { canAccess } from "@/lib/roles";
+import { reportCatalog } from "@/lib/reports-data";
 import { renderAsRole, resetPrototypeState } from "@/test/harness";
 import { __router } from "@/test/next-navigation-stub";
 
@@ -21,6 +23,7 @@ const PALETTE_PAGES = [
   { label: "Timesheet", href: "/timesheet" },
   { label: "Reports", href: "/reports" },
   { label: "Billing & Plan", href: "/billing" },
+  { label: "Desktop agent", href: "/download" },
   { label: "Settings", href: "/settings" },
 ];
 
@@ -71,7 +74,10 @@ describe("CommandPalette role filtering", () => {
           canAccess(role, p.href),
         );
       }
-      // Report shortcuts and member jump-tos are gated behind /reports and /team.
+      // Each report shortcut follows its own route's access; member jump-tos are gated behind /team.
+      for (const r of reportCatalog) {
+        expect(screen.queryAllByText(r.title).length > 0, `report "${r.title}" for ${role}`).toBe(canAccess(role, `/reports/${r.slug}`));
+      }
       expect(screen.queryByText("Time & Activity")).not.toBeInTheDocument();
       expect(screen.queryByText("Members")).not.toBeInTheDocument();
     },
@@ -90,18 +96,42 @@ describe("CommandPalette navigation", () => {
   it("navigates to the clicked page and closes", () => {
     renderAsRole(<CommandPalette />, "owner");
     pressShortcut();
-    fireEvent.click(screen.getByRole("button", { name: "Team" }));
+    fireEvent.click(screen.getByRole("option", { name: "Team" }));
     expect(__router.push).toHaveBeenCalledWith("/team");
     expect(queryInput()).not.toBeInTheDocument();
   });
 
-  it("keyboard flow: arrow to an item and press Enter to open it", () => {
-    renderAsRole(<CommandPalette />, "client"); // items: Dashboard, Settings, theme action
+  it("offers the desktop agent to tracked roles and opens /download", () => {
+    renderAsRole(<CommandPalette />, "worker");
     pressShortcut();
-    const input = screen.getByPlaceholderText(/search pages/i);
+    fireEvent.click(screen.getByRole("option", { name: /desktop agent/i }));
+    expect(__router.push).toHaveBeenCalledWith("/download");
+  });
+
+  it("keyboard flow: arrow to an item and press Enter to open it", () => {
+    renderAsRole(<CommandPalette />, "client");
+    pressShortcut();
+    const input = screen.getByRole("combobox");
+    const options = screen.getAllByRole("option");
+    expect(options.length).toBeGreaterThan(1);
     fireEvent.keyDown(input, { key: "ArrowDown" });
+    // The highlighted result is announced through aria-activedescendant.
+    expect(input).toHaveAttribute("aria-activedescendant", options[1].id);
+    expect(options[1]).toHaveAttribute("aria-selected", "true");
+    const second = PALETTE_PAGES.find((p) => p.label === options[1].textContent?.trim());
     fireEvent.keyDown(input, { key: "Enter" });
-    expect(__router.push).toHaveBeenCalledWith("/settings");
+    expect(__router.push).toHaveBeenCalledWith(second?.href);
+  });
+
+  it("End and Home jump to the last and first result", () => {
+    renderAsRole(<CommandPalette />, "client");
+    pressShortcut();
+    const input = screen.getByRole("combobox");
+    const options = screen.getAllByRole("option");
+    fireEvent.keyDown(input, { key: "End" });
+    expect(input).toHaveAttribute("aria-activedescendant", options[options.length - 1].id);
+    fireEvent.keyDown(input, { key: "Home" });
+    expect(input).toHaveAttribute("aria-activedescendant", options[0].id);
   });
 
   it("search narrows to matching commands and Enter opens the top hit", () => {
@@ -123,5 +153,25 @@ describe("CommandPalette navigation", () => {
     expect(screen.getByText(/no results for/i)).toBeInTheDocument();
     fireEvent.keyDown(input, { key: "Enter" });
     expect(__router.push).not.toHaveBeenCalled();
+  });
+});
+
+describe("CommandPalette semantics", () => {
+  it("is a labelled modal dialog whose search field controls a listbox of options", () => {
+    renderAsRole(<CommandPalette />, "owner");
+    pressShortcut();
+    const dialog = screen.getByRole("dialog", { name: /search and jump/i });
+    expect(dialog).toHaveAttribute("aria-modal", "true");
+    const input = within(dialog).getByRole("combobox");
+    const listbox = within(dialog).getByRole("listbox");
+    expect(input).toHaveAttribute("aria-controls", listbox.id);
+    expect(input).toHaveFocus();
+    expect(within(listbox).getAllByRole("option").length).toBeGreaterThan(5);
+  });
+
+  it("a11y: the open palette has no axe violations", async () => {
+    const { container } = renderAsRole(<CommandPalette />, "owner");
+    pressShortcut();
+    expect(await axe(container)).toHaveNoViolations();
   });
 });

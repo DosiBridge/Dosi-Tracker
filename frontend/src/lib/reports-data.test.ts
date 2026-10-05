@@ -177,7 +177,7 @@ describe("categoryColor — the productivity palette the charts and legends rend
   });
 });
 
-describe("rangePresets — the date picker's option list", () => {
+describe("rangePresets — the Activity page's date options", () => {
   it("offers every preset in display order with its human label", () => {
     expect(rangePresets).toEqual([
       { key: "today", label: "Today" },
@@ -190,7 +190,7 @@ describe("rangePresets — the date picker's option list", () => {
   });
 
   it("each option's label is the label rangeForKey resolves for that key", () => {
-    // date-range-picker.tsx shows the preset label on the trigger, then applies
+    // The Activity filter bar shows the preset label, then applies
     // rangeForKey(key) — the two must never disagree.
     expect(rangePresets).not.toHaveLength(0);
     for (const preset of rangePresets) {
@@ -201,8 +201,20 @@ describe("rangePresets — the date picker's option list", () => {
 
 describe("reportCatalog — the report hub + /reports/[slug] routing contract", () => {
   // Slugs mirror the component map in src/app/(dashboard)/reports/[slug]/page.tsx;
-  // a slug that is not a key there renders notFound().
-  const routableSlugs = ["time-activity", "productivity", "apps-urls", "projects", "attendance", "weekly", "payroll"];
+  // a slug that is not a key there renders notFound(). The hub lists them in this
+  // order: the hero, the spotlight, then one grid grouped by category.
+  const routableSlugs = [
+    "work-report",
+    "analytics",
+    "time-activity",
+    "weekly",
+    "projects",
+    "productivity",
+    "apps-urls",
+    "attendance",
+    "devices",
+    "payroll",
+  ];
 
   it("exposes exactly the slugs that have a report page, in hub order", () => {
     expect(reportCatalog.map((r) => r.slug)).toEqual(routableSlugs);
@@ -215,12 +227,16 @@ describe("reportCatalog — the report hub + /reports/[slug] routing contract", 
 
   it("titles each report exactly as the card and page heading show it", () => {
     expect(Object.fromEntries(reportCatalog.map((r) => [r.slug, r.title]))).toEqual({
+      "work-report": "Work Report",
+      analytics: "Work Analytics",
       "time-activity": "Time & Activity",
+      weekly: "Weekly Summary",
+      projects: "Project Breakdown",
       productivity: "Productivity",
       "apps-urls": "Apps & Websites",
-      projects: "Project Breakdown",
-      attendance: "Attendance & Shifts",
-      weekly: "Weekly Summary",
+      // The tracker records no shifts or clock-ins: presence comes from tracked time.
+      attendance: "Attendance",
+      devices: "Devices & Agents",
       payroll: "Payroll & Billing",
     });
   });
@@ -234,24 +250,66 @@ describe("reportCatalog — the report hub + /reports/[slug] routing contract", 
     expect(new Set(reportCatalog.map((r) => r.title)).size).toBe(reportCatalog.length);
   });
 
-  it("files every report under a category the hub actually renders a section for", () => {
-    // reports/page.tsx iterates this exact list; an unlisted category hides the report.
+  it("describes the reports in one glossary: activity is input, productive is an app category", () => {
+    const of = (slug: string) => reportCatalog.find((r) => r.slug === slug)!.description;
+    expect(of("time-activity")).toMatch(/keyboard and mouse/);
+    expect(of("productivity")).toMatch(/productive, neutral and unproductive apps/);
+    expect(of("productivity")).toMatch(/idle/);
+    expect(of("payroll")).toMatch(/in effect when it was worked/);
+    // Nothing promises what the tracker doesn't record.
+    for (const r of reportCatalog) expect(r.description).not.toMatch(/screenshots|clock in|late arrival|billable/i);
+  });
+
+  it("files every report under one of the hub's four categories", () => {
     const sections = ["Time", "Productivity", "People", "Finance"];
     const counts = sections.map((s) => reportCatalog.filter((r) => r.category === s).length);
-    expect(counts).toEqual([3, 2, 1, 1]);
+    expect(counts).toEqual([4, 3, 2, 1]);
     expect(counts.reduce((a, b) => a + b, 0)).toBe(reportCatalog.length);
+  });
+
+  it("marks only payroll as needing the team-management permission (hourly rates)", () => {
+    expect(reportCatalog.filter((r) => r.requires).map((r) => [r.slug, r.requires])).toEqual([["payroll", "manageTeam"]]);
+  });
+
+  it("features exactly one report — the client-ready Work Report, listed first", () => {
+    // reports/page.tsx renders the featured report as the hub's hero card.
+    const featured = reportCatalog.filter((r) => r.featured);
+    expect(featured.map((r) => r.slug)).toEqual(["work-report"]);
+    expect(reportCatalog[0]).toBe(featured[0]);
+  });
+
+  it("spotlights exactly one report — Work Analytics, right after the hero", () => {
+    // reports/page.tsx renders it as the analytics spotlight card below the hero.
+    const spotlight = reportCatalog.filter((r) => r.spotlight);
+    expect(spotlight.map((r) => r.slug)).toEqual(["analytics"]);
+    expect(reportCatalog[1]).toBe(spotlight[0]);
+    expect(spotlight[0].featured).toBeFalsy();
   });
 
   it("names an icon that the hub's lucide registry can resolve (never the FileText fallback)", () => {
     // Keys of the `icons` map in reports/page.tsx.
-    const registered = ["Clock", "Gauge", "AppWindow", "FolderKanban", "CalendarCheck", "CalendarDays", "DollarSign"];
-    expect(reportCatalog.map((r) => r.icon)).toEqual([
+    const registered = [
       "Clock",
       "Gauge",
       "AppWindow",
       "FolderKanban",
       "CalendarCheck",
       "CalendarDays",
+      "DollarSign",
+      "CalendarClock",
+      "Sparkles",
+      "MonitorSmartphone",
+    ];
+    expect(reportCatalog.map((r) => r.icon)).toEqual([
+      "CalendarClock",
+      "Sparkles",
+      "Clock",
+      "CalendarDays",
+      "FolderKanban",
+      "Gauge",
+      "AppWindow",
+      "CalendarCheck",
+      "MonitorSmartphone",
       "DollarSign",
     ]);
     for (const r of reportCatalog) expect(registered).toContain(r.icon);

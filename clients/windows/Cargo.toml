@@ -39,8 +39,10 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 # Base64 encoding of captured images before upload
 base64 = "0.22"
 
-# Global keyboard/mouse activity listening (for counts only, event-driven)
-rdev = "0.5"
+# The device's IANA time zone (e.g. "Asia/Dhaka"), sent with every block so
+# reports can group days by the worker's own calendar. Already in the tree
+# through chrono.
+iana-time-zone = "0.1"
 
 # Webcam capture
 nokhwa = { version = "0.10", features = ["input-native"] }
@@ -60,20 +62,30 @@ config = "0.14"
 eframe = { version = "0.35.0", default-features = false, features = ["glow", "default_fonts"] }
 egui = { version = "0.35.0", default-features = false }
 tray-icon = "0.24.1"
+# The window's native handle, to ask Windows whether it is really shown
+# (already in the tree through eframe/winit — no extra download).
+raw-window-handle = "0.6"
 
 # Per-user config/credential directory resolution
 dirs = "6.0.0"
 tracing-appender = "0.2.5"
 
-# Windows-specific APIs (active window title / process, autostart, DPAPI)
+# Windows-specific APIs (input hooks, active window / process, autostart, DPAPI)
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_Foundation",
-    "Win32_UI_WindowsAndMessaging",
-    "Win32_System_Threading",
-    "Win32_System_ProcessStatus",
-    "Win32_System_Registry",            # autostart (HKCU Run key)
+    "Win32_UI_WindowsAndMessaging",     # low-level input hooks, windows, timers
+    "Win32_UI_Input_KeyboardAndMouse",  # GetLastInputInfo (system idle time)
+    "Win32_System_Threading",           # process image names (works for elevated apps)
+    "Win32_System_SystemInformation",   # tick count, computer name
+    "Win32_System_LibraryLoader",       # module handle for the input hooks
+    "Win32_System_StationsAndDesktops", # is input on the hooks' desktop (not the lock screen)?
+    "Win32_System_Registry",            # autostart (HKCU Run key), OS version
+    "Win32_Graphics_Gdi",               # the monitor holding the foreground window
+    "Win32_Graphics_Dwm",               # skip cloaked (suspended) windows
     "Win32_Security_Cryptography",      # DPAPI credential encryption
+    "Win32_UI_Shell",                   # open the web dashboard / logs folder
+    "Win32_UI_HiDpi",                   # size the window to the screen's work area
 ] }
 
 [dev-dependencies]

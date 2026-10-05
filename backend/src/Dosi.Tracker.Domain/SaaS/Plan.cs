@@ -24,4 +24,10 @@ public class Plan : FullAuditedAggregateRoot<Guid>
         MaxSeats = maxSeats;
         TrialDays = trialDays;
     }
+
+    /// <summary>A plan without a per-seat price: never invoiced, and with nothing to trial it is always active.</summary>
+    public bool IsFree()
+    {
+        return PricePerUser <= 0m;
+    }
 }

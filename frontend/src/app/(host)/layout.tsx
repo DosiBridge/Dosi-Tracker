@@ -8,7 +8,7 @@ import { HostSidebar } from "@/components/layout/host-sidebar";
 import { HostTopbar } from "@/components/layout/host-topbar";
 import { ToastViewport } from "@/components/toast";
 import { Card } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
+import { linkButtonClass } from "@/components/dashboard/link-button";
 import { PageEnter } from "@/components/motion/reveal";
 import { useSession } from "@/components/session-provider";
 import { SessionGate } from "@/components/session-gate";
@@ -42,8 +42,12 @@ function HostShell({ children }: { children: React.ReactNode }) {
             </p>
           </div>
           <div className="flex gap-2">
-            <Link href="/login"><Button>Go to login</Button></Link>
-            <Link href="/dashboard"><Button variant="outline">Dashboard</Button></Link>
+            <Link href="/login" className={linkButtonClass("primary", "md")}>
+              Go to login
+            </Link>
+            <Link href="/dashboard" className={linkButtonClass("outline", "md")}>
+              Dashboard
+            </Link>
           </div>
         </Card>
       </div>

@@ -11,6 +11,7 @@ import {
   usagePct,
   fmtLimit,
   statusLabel,
+  subscriptionNeedsAttention,
   type PlanId,
   type SubscriptionStatus,
 } from "./saas-data";
@@ -272,7 +273,20 @@ describe("statusLabel", () => {
       active: "Active",
       trialing: "Trial",
       past_due: "Past due",
+      suspended: "Suspended",
+      canceled: "Canceled",
+      expired: "Expired",
     };
     expect(statusLabel).toEqual(expected);
+  });
+});
+
+describe("subscriptionNeedsAttention", () => {
+  it("flags the statuses that cut a workspace off (or soon will), never a working one", () => {
+    expect(subscriptionNeedsAttention("active")).toBe(false);
+    expect(subscriptionNeedsAttention("trialing")).toBe(false);
+    for (const status of ["past_due", "suspended", "canceled", "expired"] as const) {
+      expect(subscriptionNeedsAttention(status), status).toBe(true);
+    }
   });
 });

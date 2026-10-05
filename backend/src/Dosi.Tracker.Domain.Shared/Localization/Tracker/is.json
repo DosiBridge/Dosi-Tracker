@@ -4,6 +4,12 @@
     "AppName": "Tracker",
     "Menu:Home": "Home",
     "LongWelcomeMessage": "Welcome to the application. This is a startup project based on the ABP framework. For more information visit",
-    "Welcome": "Welcome"
+    "Welcome": "Welcome",
+    "Tracker:ActivityTooOld": "Virknin hófst fyrir of löngu síðan og ekki er lengur hægt að skrá hana.",
+    "Tracker:NotProjectMember": "Þú ert ekki meðlimur í þessu verkefni.",
+    "Tracker:SubscriptionInactive": "Áskrift vinnusvæðisins er ekki virk. Biddu eiganda vinnusvæðisins að endurnýja hana.",
+    "Tracker:InvalidUser": "Notandinn er ekki til í þessu vinnusvæði.",
+    "Tracker:CannotModifySelf": "Þú getur ekki gert þessa breytingu á eigin aðgangi eða aðild.",
+    "Tracker:RoleNotAllowed": "Aðeins eigandi vinnusvæðisins getur veitt þetta hlutverk, breytt tímakaupi eða stjórnað aðgangi eiganda."
   }
 }

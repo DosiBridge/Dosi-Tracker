@@ -22,7 +22,8 @@ describe("canAccess (route authorization by longest-prefix match)", () => {
 
   it("denies a role not listed for the matched route", () => {
     expect(canAccess("worker", "/billing")).toBe(false); // billing is owner-only
-    expect(canAccess("client", "/reports")).toBe(false); // reports is owner/admin
+    expect(canAccess("worker", "/reports")).toBe(false); // reports is owner/admin (and clients' own)
+    expect(canAccess("client", "/reports/payroll")).toBe(false); // a client sees only their projects' Work Report
     expect(canAccess("admin", "/host")).toBe(false); // host is platform-only
   });
 
@@ -89,7 +90,7 @@ describe("navAccess (the authorization matrix itself — pinned exactly)", () =>
     "/activities": ["owner", "admin", "worker"],
     "/screenshots": ["owner", "admin", "worker"],
     "/timesheet": ["owner", "admin", "worker"],
-    "/reports": ["owner", "admin"],
+    "/reports": ["owner", "admin", "client"],
     "/insights": ["owner", "admin"],
     "/billing": ["owner"],
     "/settings": ["owner", "admin", "worker", "client"],

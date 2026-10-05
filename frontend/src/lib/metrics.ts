@@ -1,4 +1,5 @@
 import type { Activity } from "./types";
+import { zonedDayKey } from "./time-zone";
 
 /* ============================================================================
  * THE canonical derivation of tracked time.
@@ -22,11 +23,48 @@ import type { Activity } from "./types";
  *  - An activity belongs to the period that contains its `endedAt`. Work is
  *    booked when it lands, which is also how the day buckets and the range
  *    filters in `reports-data.ts` group rows.
- *  - "Productivity" over a set of rows is DURATION-WEIGHTED: a 90-minute block
- *    at 50% must not count the same as a 5-minute block at 95%.
+ *  - "Activity %" over a set of rows is DURATION-WEIGHTED: a 90-minute block
+ *    at 50% must not count the same as a 5-minute block at 95%. Blocks whose
+ *    input was not measured are left out of it (see the glossary below).
  *  - Calendar days are UTC, so a bucket never shifts with the viewer's or the
- *    test runner's timezone.
+ *    test runner's timezone — unless a caller names a zone (the *Zoned* /
+ *    *In helpers), which is how a live session counts "today" in the
+ *    reporting zone.
  * ========================================================================== */
+
+/* ============================================================================
+ * GLOSSARY — one name and one definition per metric, for every screen.
+ *
+ *  - ACTIVITY ("Activity %"): the share of tracked minutes that had any
+ *    keyboard or mouse input. The agents split each block into 1-minute
+ *    buckets and report the share of buckets with input as the block's
+ *    `productivity` (contract §1); across blocks it is minute-weighted,
+ *    Σ(minutes × %) / Σ minutes, over MEASURED blocks only. A block whose input
+ *    was not measured (capture unavailable or denied, or a project that allows
+ *    neither keyboard nor mouse) is excluded and reads "Not measured" — never
+ *    0%. When nothing in a set was measured the value is null, shown as "—".
+ *  - IDLE: tracked minutes without keyboard or mouse input — the block's
+ *    reported `idleSeconds`, else its inactive timeline buckets.
+ *
+ * "Productivity", "focus" and "activity level" used to name this same number
+ * on some screens and app categories on others; say "Activity" (and use the
+ * helpers below) wherever input share is meant. Productive / neutral /
+ * unproductive is an APP CATEGORY (lib/apps.ts), a different measure.
+ * ========================================================================== */
+
+export const ACTIVITY_METRIC = {
+  /** Column / tile label. */
+  label: "Activity",
+  /** Tooltip and legend copy. */
+  description: "Share of tracked minutes with keyboard or mouse input",
+  /** A block, or a set of blocks, whose input was not measured. */
+  notMeasured: "Not measured",
+} as const;
+
+export const IDLE_METRIC = {
+  label: "Idle",
+  description: "Tracked minutes with no keyboard or mouse input",
+} as const;
 
 /** Minutes a single activity accounts for. Malformed or reversed rows are 0. */
 export function durationMinutes(activity: Activity): number {
@@ -98,19 +136,116 @@ export function minutesOnDay(activities: Activity[], day: string, userId?: strin
   return totalMinutes(activitiesOnDay(activities, day, userId));
 }
 
-/**
- * Duration-weighted mean productivity (0-100, rounded). Empty input — and input
- * whose rows all have zero duration — scores 0: there is no work to rate.
- */
-export function averageProductivity(activities: Activity[]): number {
-  let weighted = 0;
+/** The calendar day ("2026-07-14") an activity is booked to in an IANA zone (an unknown zone reads as UTC). */
+export function dayKeyIn(activity: Activity, timeZone: string): string {
+  const at = Date.parse(activity.endedAt);
+  return Number.isFinite(at) ? zonedDayKey(at, timeZone) : "";
+}
+
+/** The rows booked to one calendar day of a zone, optionally for a single member. */
+export function activitiesOnZonedDay(activities: Activity[], day: string, timeZone: string, userId?: string): Activity[] {
+  return activities.filter((a) => dayKeyIn(a, timeZone) === day && (userId === undefined || a.userId === userId));
+}
+
+/** Minutes booked on one calendar day of a zone, optionally for a single member. */
+export function minutesOnZonedDay(activities: Activity[], day: string, timeZone: string, userId?: string): number {
+  return totalMinutes(activitiesOnZonedDay(activities, day, timeZone, userId));
+}
+
+/* ----------------------------- Activity % ----------------------------- */
+
+/** Whether the block's keyboard/mouse input was measured (rows that don't say, demo and older ones, were). */
+export function isActivityMeasured(activity: Activity): boolean {
+  return activity.activityMeasured !== false;
+}
+
+/** A measured block's share, clamped to 0-100 but not rounded (aggregates round once, at the end). */
+function measuredShare(activity: Activity): number | null {
+  if (!isActivityMeasured(activity) || !Number.isFinite(activity.productivity)) return null;
+  return Math.min(100, Math.max(0, activity.productivity));
+}
+
+/** One block's Activity % (0-100), or null when its input was not measured. */
+export function activityPercentOf(activity: Activity): number | null {
+  const share = measuredShare(activity);
+  return share === null ? null : Math.round(share);
+}
+
+/** Minutes of the MEASURED rows: the denominator of Activity %. */
+export function measuredMinutes(activities: Activity[]): number {
+  let minutes = 0;
+  for (const a of activities) if (measuredShare(a) !== null) minutes += durationMinutes(a);
+  return minutes;
+}
+
+/** Minutes with keyboard or mouse input, over the measured rows: the numerator of Activity %. */
+export function activeMinutes(activities: Activity[]): number {
   let minutes = 0;
   for (const a of activities) {
-    const d = durationMinutes(a);
-    weighted += d * a.productivity;
-    minutes += d;
+    const share = measuredShare(a);
+    if (share !== null) minutes += (durationMinutes(a) * share) / 100;
   }
-  return minutes > 0 ? Math.round(weighted / minutes) : 0;
+  return minutes;
+}
+
+/**
+ * Activity % over a set of rows (0-100, rounded): minute-weighted over the
+ * measured rows. Null when nothing in the set was measured — show "—" (or
+ * ACTIVITY_METRIC.notMeasured), never 0%.
+ */
+export function activityPercent(activities: Activity[]): number | null {
+  const minutes = measuredMinutes(activities);
+  return minutes > 0 ? Math.round((activeMinutes(activities) / minutes) * 100) : null;
+}
+
+/**
+ * Activity % as a plain number for callers that predate "not measured":
+ * activityPercent, with no measured work scoring 0. Prefer activityPercent
+ * in new code so an unmeasured set reads "—" rather than 0%.
+ */
+export function averageProductivity(activities: Activity[]): number {
+  return activityPercent(activities) ?? 0;
+}
+
+/** "72%", or "—" when nothing was measured. */
+export function formatActivityPercent(value: number | null | undefined): string {
+  return typeof value === "number" && Number.isFinite(value) ? `${Math.round(value)}%` : "—";
+}
+
+/* ----------------------------- Idle ----------------------------- */
+
+/**
+ * A block's idle seconds: the agent's own figure (clamped to the block), else
+ * the length of its inactive timeline buckets — bucket i spans 60 s and the
+ * last absorbs the remainder (contract §1) — else null (not known: older
+ * agents, or input that was not measured).
+ */
+export function idleSecondsOf(activity: Activity): number | null {
+  const blockSeconds = Math.round(durationMinutes(activity) * 60);
+  if (typeof activity.idleSeconds === "number" && Number.isFinite(activity.idleSeconds)) {
+    return Math.min(blockSeconds, Math.max(0, Math.round(activity.idleSeconds)));
+  }
+  if (!isActivityMeasured(activity) || !activity.timeline?.length || blockSeconds <= 0) return null;
+  const buckets = Math.max(1, Math.round(blockSeconds / 60));
+  let idle = 0;
+  for (const bucket of activity.timeline) {
+    if (bucket.active || bucket.minute >= buckets) continue;
+    idle += bucket.minute < buckets - 1 ? 60 : Math.max(0, blockSeconds - 60 * (buckets - 1));
+  }
+  return Math.min(blockSeconds, idle);
+}
+
+/** A block's idle minutes, or null when not known. */
+export function idleMinutesOf(activity: Activity): number | null {
+  const seconds = idleSecondsOf(activity);
+  return seconds === null ? null : seconds / 60;
+}
+
+/** Idle minutes across rows; rows whose idle time is not known add nothing. */
+export function totalIdleMinutes(activities: Activity[]): number {
+  let minutes = 0;
+  for (const a of activities) minutes += idleMinutesOf(a) ?? 0;
+  return minutes;
 }
 
 /** How many distinct UTC days a member logged any time on. */

@@ -5,7 +5,7 @@ import { createPortal } from "react-dom";
 import { X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "./button";
-import { useDialogFocus } from "./use-dialog-focus";
+import { isTopmostDialog, lockBodyScroll, useDialogFocus } from "./use-dialog-focus";
 
 export function Drawer({
   open,
@@ -24,14 +24,17 @@ export function Drawer({
 
   useEffect(() => {
     if (!open) return;
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    // Escape closes only the newest dialog: one opened from inside the drawer goes first.
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && isTopmostDialog(dialogRef.current)) onClose();
+    };
     document.addEventListener("keydown", onKey);
-    document.body.style.overflow = "hidden";
+    const releaseScroll = lockBodyScroll();
     return () => {
       document.removeEventListener("keydown", onKey);
-      document.body.style.overflow = "";
+      releaseScroll();
     };
-  }, [open, onClose]);
+  }, [open, onClose, dialogRef]);
 
   if (!open) return null;
 

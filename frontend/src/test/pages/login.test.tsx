@@ -4,14 +4,12 @@
 // (which now loads the real identity BEFORE the page navigates) and the router
 // stub are all exercised for real.
 //
-// KNOWN GAP (reported, not asserted): none of the field labels on this page are
-// programmatically associated with their inputs (no htmlFor/id), so screen
-// readers announce bare inputs and getByLabelText cannot find them. Tests below
-// query by placeholder/type instead of by label because of this.
+// The fields carry real labels (htmlFor/id); the older tests below still find
+// them by placeholder/type, the newer ones by label.
 vi.mock("next/navigation", () => import("@/test/next-navigation-stub"));
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { screen, waitFor } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import LoginPage from "@/app/login/page";
 import { renderWithProviders, resetPrototypeState } from "@/test/harness";
@@ -21,16 +19,17 @@ const API_BASE = process.env.NEXT_PUBLIC_API_URL || "https://localhost:6006";
 
 type UserSession = ReturnType<typeof userEvent.setup>;
 
-function jsonResponse(body: unknown, init: { status?: number; statusText?: string } = {}): Response {
-  const { status = 200, statusText = "OK" } = init;
+function jsonResponse(body: unknown, init: { status?: number; statusText?: string; headers?: Record<string, string> } = {}): Response {
+  const { status = 200, statusText = "OK", headers = {} } = init;
   const text = JSON.stringify(body);
   return {
     ok: status >= 200 && status < 300,
     status,
     statusText,
+    headers: { get: (name: string) => headers[name] ?? null },
     json: async () => JSON.parse(text),
     text: async () => text,
-  } as Response;
+  } as unknown as Response;
 }
 
 let fetchMock: ReturnType<typeof vi.fn<typeof fetch>>;
@@ -81,6 +80,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
 /** The page's labels are not wired to inputs, so locate fields by type. */
@@ -347,5 +347,212 @@ describe("login page — create-workspace mode", () => {
     expect(await screen.findByText("Workspace name is already taken.")).toBeInTheDocument();
     expect(__router.push).not.toHaveBeenCalled();
     expect(localStorage.getItem("dosi-token")).toBeNull();
+  });
+});
+
+describe("login page — every way a sign-in fails, told apart", () => {
+  async function signInWith(response: Response | Error, opts: { workspace?: string } = {}) {
+    if (response instanceof Error) fetchMock.mockRejectedValue(response);
+    else fetchMock.mockResolvedValue(response);
+    const user = userEvent.setup();
+    renderWithProviders(<LoginPage />, { route: "/login" });
+    await fillSignIn(user, { workspace: opts.workspace ?? "acme" });
+    await user.click(signInButton());
+    return user;
+  }
+
+  it("a rate limit says how long to wait — not that the password is wrong — and holds the button until then", async () => {
+    await signInWith(jsonResponse({}, { status: 429, statusText: "Too Many Requests", headers: { "Retry-After": "30" } }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(/too many sign-in attempts/i);
+    expect(alert).toHaveTextContent(/try again in 30 seconds/i);
+    expect(alert).not.toHaveTextContent(/didn't match/i);
+    const button = await screen.findByRole("button", { name: /try again in 0:[0-3]\d/i });
+    expect(button).toBeDisabled();
+    expect(localStorage.getItem("dosi-token")).toBeNull();
+  });
+
+  it("a rate limit without Retry-After waits out the server's one-minute window", async () => {
+    await signInWith(jsonResponse({}, { status: 429, statusText: "Too Many Requests" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(/try again in 1 minute/i);
+  });
+
+  it("the sign-in comes back once the wait is over", async () => {
+    await signInWith(jsonResponse({}, { status: 429, statusText: "Too Many Requests", headers: { "Retry-After": "1" } }));
+    expect(await screen.findByRole("button", { name: /try again in/i })).toBeDisabled();
+    await waitFor(() => expect(signInButton()).toBeEnabled(), { timeout: 3000 });
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("a locked account says so", async () => {
+    await signInWith(
+      jsonResponse(
+        { error: "account_locked", error_description: "The user account has been locked out due to invalid login attempts. Please wait a while and try again." },
+        { status: 400, statusText: "Bad Request" },
+      ),
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent(/locked after too many failed sign-in attempts/i);
+  });
+
+  it("an unknown workspace names it, marks the field and puts the cursor there", async () => {
+    await signInWith(jsonResponse("<html>Tenant not found!</html>", { status: 404, statusText: "Not Found" }), { workspace: "acmee" });
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/couldn't find an active workspace named “acmee”/i);
+    const ws = workspaceField();
+    expect(ws).toHaveAttribute("aria-invalid", "true");
+    expect(ws).toHaveFocus();
+    expect(ws.getAttribute("aria-describedby")).toContain("login-error");
+  });
+
+  it("wrong credentials are announced as an alert and mark the email and password fields", async () => {
+    await signInWith(jsonResponse({ error: "invalid_grant", error_description: "Invalid username or password!" }, { status: 400, statusText: "Bad Request" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/that email, password or workspace didn't match/i);
+    expect(screen.getByLabelText("Email")).toHaveAttribute("aria-invalid", "true");
+    expect(screen.getByLabelText("Password")).toHaveAttribute("aria-invalid", "true");
+  });
+
+  it("a server failure is the server's, with what it said", async () => {
+    await signInWith(jsonResponse({ error: "server_error", error_description: "Database offline" }, { status: 503, statusText: "Service Unavailable" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(/server couldn't sign you in/i);
+    expect(alert).toHaveTextContent(/Database offline/);
+    expect(alert).not.toHaveTextContent(/didn't match/i);
+  });
+
+  it("a deactivated account says so", async () => {
+    await signInWith(jsonResponse({ error: "account_inactive", error_description: "You are not allowed to login!" }, { status: 400, statusText: "Bad Request" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(/deactivated/i);
+  });
+});
+
+describe("login page — blocked site data", () => {
+  it("warns up front and keeps the form from pretending it can sign in", () => {
+    // Every write is refused — the theme's included: nothing around the page may crash on it either.
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new DOMException("The operation is insecure.", "SecurityError");
+    });
+    renderWithProviders(<LoginPage />, { route: "/login" });
+
+    expect(screen.getByRole("alert")).toHaveTextContent(/blocking site data/i);
+    expect(signInButton()).toBeDisabled();
+  });
+});
+
+describe("login page — a new workspace whose first sign-in fails", () => {
+  it("keeps the workspace it just created: switches to sign-in, filled in, and says so", async () => {
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.includes("/api/app/workspace/register")) return jsonResponse({ tenantId: "t-1", name: "Acme Corp" });
+      if (url.includes("/connect/token")) return jsonResponse({}, { status: 429, statusText: "Too Many Requests", headers: { "Retry-After": "20" } });
+      return jsonResponse({ items: [] });
+    });
+    const user = userEvent.setup();
+    renderWithProviders(<LoginPage />, { route: "/login" });
+
+    await user.click(screen.getByRole("button", { name: /create a workspace/i }));
+    await user.type(field("email"), "founder@acme.dev");
+    await user.type(field("password"), "hunter22");
+    await user.type(screen.getByPlaceholderText("Acme Corp"), "Acme Corp");
+    await user.click(screen.getByRole("button", { name: /^create workspace$/i }));
+
+    expect(await screen.findByRole("heading", { name: /welcome back/i })).toBeInTheDocument();
+    expect(workspaceField()).toHaveValue("Acme Corp");
+    expect(field("email")).toHaveValue("founder@acme.dev");
+    expect(screen.getByRole("status")).toHaveTextContent(/your workspace “Acme Corp” was created\. sign in to continue/i);
+    expect(screen.getByRole("alert")).toHaveTextContent(/too many sign-in attempts/i);
+    expect(fetchMock.mock.calls.filter(([u]) => String(u).includes("/api/app/workspace/register"))).toHaveLength(1);
+  });
+});
+
+describe("login page — a one-time password must be changed first", () => {
+  const challenge = () =>
+    jsonResponse(
+      { error: "invalid_grant", error_description: "ShouldChangePasswordOnNextLogin", userId: "u1", changePasswordToken: "cpt-1" },
+      { status: 400, statusText: "Bad Request" },
+    );
+
+  async function reachChangeStep() {
+    const user = userEvent.setup();
+    renderWithProviders(<LoginPage />, { route: "/login" });
+    await fillSignIn(user, { workspace: "acme", password: "OneTime#1" });
+    await user.click(signInButton());
+    expect(await screen.findByRole("heading", { name: /choose a new password/i })).toBeInTheDocument();
+    return user;
+  }
+
+  it("asks for a new password, changes it with the server, then signs in with it", async () => {
+    let tokenCalls = 0;
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.includes("/connect/token")) {
+        tokenCalls++;
+        const body = new URLSearchParams(String(init?.body));
+        if (body.get("NewPassword")) return jsonResponse({ access_token: "ignored", expires_in: 3600 });
+        if (body.get("password") === "Mine#2026") return jsonResponse({ access_token: "tok-new", expires_in: 3600 });
+        return challenge();
+      }
+      if (url.includes("/api/abp/application-configuration")) return jsonResponse(appConfig());
+      if (url.includes("/api/app/workspace/current-subscription")) return jsonResponse({});
+      return jsonResponse({ items: [] });
+    });
+    const user = await reachChangeStep();
+
+    await user.type(screen.getByLabelText("New password"), "Mine#2026");
+    await user.type(screen.getByLabelText("Confirm new password"), "Mine#2026");
+    await user.click(screen.getByRole("button", { name: /save and sign in/i }));
+
+    await waitFor(() => expect(__router.push).toHaveBeenCalledWith("/dashboard"), { timeout: 2000 });
+    expect(localStorage.getItem("dosi-token")).toBe("tok-new");
+    // login (challenge) → challenge again for its token → the change → sign in with the new password
+    expect(tokenCalls).toBe(4);
+    const change = fetchMock.mock.calls.find(([, i]) => String(i?.body).includes("NewPassword"));
+    expect(String(change?.[0])).toContain("__tenant=acme");
+    const body = new URLSearchParams(String(change?.[1]?.body));
+    expect(body.get("ChangePasswordToken")).toBe("cpt-1");
+    expect(body.get("password")).toBe("OneTime#1");
+  });
+
+  it("checks the two entries match and are long enough before asking the server", async () => {
+    fetchMock.mockResolvedValue(challenge());
+    const user = await reachChangeStep();
+    const calls = fetchMock.mock.calls.length;
+
+    await user.type(screen.getByLabelText("New password"), "abc");
+    await user.type(screen.getByLabelText("Confirm new password"), "abc");
+    await user.click(screen.getByRole("button", { name: /save and sign in/i }));
+    expect(screen.getByRole("alert")).toHaveTextContent(/at least 6 characters/i);
+
+    await user.clear(screen.getByLabelText("New password"));
+    await user.type(screen.getByLabelText("New password"), "abcdef1");
+    await user.click(screen.getByRole("button", { name: /save and sign in/i }));
+    expect(screen.getByRole("alert")).toHaveTextContent(/don't match/i);
+    expect(fetchMock.mock.calls.length).toBe(calls);
+  });
+
+  it("shows the server's own rules when it refuses the new password", async () => {
+    fetchMock.mockImplementation(async (_input, init) => {
+      const body = new URLSearchParams(String(init?.body));
+      if (body.get("NewPassword")) {
+        return jsonResponse({ error: "invalid_grant", error_description: "Passwords must have at least one digit ('0'-'9')." }, { status: 400, statusText: "Bad Request" });
+      }
+      return challenge();
+    });
+    const user = await reachChangeStep();
+    await user.type(screen.getByLabelText("New password"), "NoDigits#");
+    await user.type(screen.getByLabelText("Confirm new password"), "NoDigits#");
+    await user.click(screen.getByRole("button", { name: /save and sign in/i }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Passwords must have at least one digit ('0'-'9').");
+    expect(__router.push).not.toHaveBeenCalled();
+  });
+
+  it("'Back to sign in' leaves the step", async () => {
+    fetchMock.mockResolvedValue(challenge());
+    const user = await reachChangeStep();
+    await user.click(screen.getByRole("button", { name: /back to sign in/i }));
+    const form = screen.getByRole("heading", { name: /welcome back/i }).parentElement as HTMLElement;
+    expect(within(form).getByRole("button", { name: /^sign in$/i })).toBeInTheDocument();
   });
 });

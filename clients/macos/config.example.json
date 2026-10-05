@@ -1,6 +1,8 @@
 {
   "apiBaseURL": "https://localhost:6006",
+  "dashboardURL": "http://localhost:6005",
   "intervalMinutes": 10,
+  "blurScreenshots": false,
   "capture": {
     "screenshot": true,
     "webcam": false,

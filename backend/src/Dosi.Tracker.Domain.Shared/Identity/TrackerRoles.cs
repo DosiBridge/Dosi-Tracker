@@ -26,6 +26,11 @@ public static class TrackerRoles
         TrackerPermissions.Reporting.Default
     };
 
+    /// <summary>Project-member role of a stakeholder who follows a project's progress: never tracks time (the project
+    /// is not offered to the agents and uploads are refused), takes no seat, and sees only the projects they are a
+    /// client of.</summary>
+    public const string ClientProjectRole = "Client";
+
     /// <summary>True when a project-member role label ("Admin", "manager", …) should confer the
     /// Identity "manager" role. Worker/Employee/Member (anything else) confers nothing extra.</summary>
     public static bool IsManagerProjectRole(string? projectRole)
@@ -33,5 +38,11 @@ public static class TrackerRoles
         var role = projectRole?.Trim();
         return string.Equals(role, Admin, StringComparison.OrdinalIgnoreCase) ||
                string.Equals(role, Manager, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>True for the <see cref="ClientProjectRole"/> project role, whatever its case or surrounding spaces.</summary>
+    public static bool IsClientProjectRole(string? projectRole)
+    {
+        return string.Equals(projectRole?.Trim(), ClientProjectRole, StringComparison.OrdinalIgnoreCase);
     }
 }

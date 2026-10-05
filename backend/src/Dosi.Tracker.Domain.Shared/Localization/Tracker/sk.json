@@ -37,6 +37,12 @@
     "Unspecified": "Systém",
     "SeeAllUsers": "Pozrite si Všetci používatelia",
     "TakePhoto": "Odfoť",
-    "ChoosePhoto": "Vyberte fotografiu"
+    "ChoosePhoto": "Vyberte fotografiu",
+    "Tracker:ActivityTooOld": "Aktivita začala príliš dávno a už ju nie je možné zaznamenať.",
+    "Tracker:NotProjectMember": "Nie ste členom tohto projektu.",
+    "Tracker:SubscriptionInactive": "Predplatné pracovného priestoru nie je aktívne. Požiadajte vlastníka pracovného priestoru o jeho obnovenie.",
+    "Tracker:InvalidUser": "Používateľ v tomto pracovnom priestore neexistuje.",
+    "Tracker:CannotModifySelf": "Túto zmenu nemôžete vykonať vo vlastnom účte ani členstve.",
+    "Tracker:RoleNotAllowed": "Iba vlastník pracovného priestoru môže prideliť túto rolu, meniť hodinové sadzby alebo spravovať účet vlastníka."
   }
 }

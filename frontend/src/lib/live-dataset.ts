@@ -1,7 +1,32 @@
-import type { Activity, ActivityMinute, CaptureKind, CaptureRef, Project, Role, ScreenMock, User, WindowInfo } from "./types";
+import type {
+  Activity,
+  ActivityMinute,
+  BlockEndReason,
+  CaptureKind,
+  CaptureRef,
+  DevicePlatform,
+  Project,
+  Role,
+  ScreenMock,
+  User,
+  UserStatus,
+  WindowInfo,
+} from "./types";
 import type { AppNotification, AppUsage, NotificationType } from "./reports-data";
-import { mainAppOf } from "./activity-report";
-import { activitiesOnDay, averageProductivity, durationMinutes, minutesForProject, minutesOnDay } from "./metrics";
+import { DEFAULT_SESSION_DESCRIPTION, mainAppOf } from "./activity-report";
+import {
+  activeMinutes,
+  activitiesOnDay,
+  activitiesOnZonedDay,
+  averageProductivity,
+  durationMinutes,
+  inRange,
+  minutesForProject,
+  totalMinutes,
+} from "./metrics";
+import { END_REASON_LABELS, normalizeActivityNote } from "./api-contract";
+import { appCategory, appColor, appKey, friendlyAppName } from "./apps";
+import { addZonedDays, browserTimeZone, startOfZonedDay, zonedDayKey, zonedParts } from "./time-zone";
 import { colorFromString } from "./utils";
 
 /* ============================================================================
@@ -25,9 +50,11 @@ export interface ApiActivityDto {
   projectId: string;
   startedAt: string;
   endedAt: string;
+  /** Activity % 0–100; null = the block's input was not measured (contract §1). */
   productivity?: number | null;
   mouseClicks?: number | null;
   keyboardHits?: number | null;
+  /** The member's task note. */
   description?: string | null;
   /**
    * JSON string of per-(app, window title) focus over the whole block, sorted
@@ -41,8 +68,23 @@ export interface ApiActivityDto {
    * (Minute is 0-based from startedAt). Missing or "[]" on legacy rows.
    */
   timelineJson?: unknown;
-  /** The block's stored captures `[{ id, kind: "screen" | "webcam" | "thumb" }]`; absent on older backends. */
+  /**
+   * The block's stored captures `[{ id, kind: "screen" | "webcam" | "thumb", capturedAt, blurred }]`;
+   * absent on older backends (and capturedAt/blurred on pre-v2 ones).
+   */
   captures?: unknown;
+  /* Agent data v2 (contract §5) — null or absent for blocks from older agents and on older servers. */
+  platform?: string | null;
+  osVersion?: string | null;
+  agentVersion?: string | null;
+  deviceId?: string | null;
+  deviceName?: string | null;
+  timeZone?: string | null;
+  utcOffsetMinutes?: number | null;
+  idleSeconds?: number | null;
+  endReason?: string | null;
+  clockSkewSeconds?: number | null;
+  injectedInputEvents?: number | null;
 }
 
 /** GET /api/app/project item (ProjectDto). */
@@ -59,6 +101,10 @@ export interface ApiProjectDto {
   allowMouse?: boolean | null;
   allowActiveWindow?: boolean | null;
   allowRunningPrograms?: boolean | null;
+  /** 0 = idle detection off; absent on older servers (agents then use 5). */
+  idleThresholdMinutes?: number | null;
+  blurScreenshots?: boolean | null;
+  archivedAt?: string | null;
   creationTime?: string | null;
 }
 
@@ -179,11 +225,15 @@ export function parseWindowList(raw: unknown): WindowInfo[] {
 /** A block lasts minutes; more than a day of buckets is not a real timeline. */
 const MAX_TIMELINE_MINUTES = 24 * 60;
 
+/** A bucket covers a minute; the last one absorbs the remainder (up to 89 s, contract §1). */
+const MAX_BUCKET_ACTIVE_SECONDS = 90;
+
 /**
  * Parse a block's per-minute timeline (`timelineJson`), any key casing, sorted
  * by minute. Buckets without a valid minute index are dropped, a duplicated
  * minute keeps its last bucket, and a missing `Active` flag is inferred from
- * the counts. Missing, "[]" or corrupt input → [].
+ * the counts. Newer agents report each bucket's `ActiveSeconds` (kept when
+ * present, clamped to 0–90). Missing, "[]" or corrupt input → [].
  */
 export function parseTimeline(raw: unknown): ActivityMinute[] {
   const byMinute = new Map<number, ActivityMinute>();
@@ -201,6 +251,8 @@ export function parseTimeline(raw: unknown): ActivityMinute[] {
     };
     const appName = str(field(rec, "appName")).trim();
     if (appName) bucket.appName = appName;
+    const activeSeconds = optionalCount(field(rec, "activeSeconds"));
+    if (activeSeconds !== undefined) bucket.activeSeconds = Math.min(MAX_BUCKET_ACTIVE_SECONDS, activeSeconds);
     byMinute.set(minute, bucket);
   }
   return [...byMinute.values()].sort((a, b) => a.minute - b.minute);
@@ -210,7 +262,9 @@ const CAPTURE_KINDS: readonly CaptureKind[] = ["screen", "webcam", "thumb"];
 
 /**
  * Parse a block's capture refs. Entries need an id and a known kind; anything
- * else — including the property older backends never send — yields [].
+ * else — including the property older backends never send — yields []. When
+ * the server says when a capture was taken and whether the agent blurred it
+ * (contract §5), those ride along.
  */
 export function parseCaptures(raw: unknown): CaptureRef[] {
   const out: CaptureRef[] = [];
@@ -221,7 +275,12 @@ export function parseCaptures(raw: unknown): CaptureRef[] {
     const kind = str(field(rec, "kind")).trim().toLowerCase() as CaptureKind;
     if (!id || seen.has(id) || !CAPTURE_KINDS.includes(kind)) continue;
     seen.add(id);
-    out.push({ id, kind });
+    const ref: CaptureRef = { id, kind };
+    const capturedAt = normalizeUtcIso(field(rec, "capturedAt"));
+    if (capturedAt) ref.capturedAt = capturedAt;
+    const blurred = field(rec, "blurred");
+    if (typeof blurred === "boolean") ref.blurred = blurred;
+    out.push(ref);
   }
   return out;
 }
@@ -293,12 +352,70 @@ function screenFor(active: WindowInfo[]): ScreenMock {
   return { app, kind: "editor", accent: colorFromString(app, 55, 45) };
 }
 
+/** A trimmed, non-empty string, or undefined. */
+function text(value: unknown, maxLength?: number): string | undefined {
+  const s = str(value).trim();
+  if (!s) return undefined;
+  return maxLength && s.length > maxLength ? s.slice(0, maxLength) : s;
+}
+
+/** A finite whole number, or undefined. */
+function wholeNumber(value: unknown): number | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  const n = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(n) ? Math.round(n) : undefined;
+}
+
+const PLATFORMS: readonly DevicePlatform[] = ["windows", "macos"];
+
+/** The contract's offset range: UTC−14:00 … UTC+14:00. */
+const MAX_UTC_OFFSET_MINUTES = 840;
+
+/**
+ * The block's device and agent context (contract §5), with only the fields the
+ * server sent — an older agent's block carries none of them. Values the server
+ * would have stored as null (an unknown platform or end reason, an offset out
+ * of range) are dropped here too.
+ */
+function agentContext(dto: ApiActivityDto, blockSeconds: number): Partial<Activity> {
+  const extra: Partial<Activity> = {};
+  const platform = str(dto.platform).trim().toLowerCase() as DevicePlatform;
+  if (PLATFORMS.includes(platform)) extra.platform = platform;
+  const osVersion = text(dto.osVersion, 64);
+  if (osVersion) extra.osVersion = osVersion;
+  const agentVersion = text(dto.agentVersion, 32);
+  if (agentVersion) extra.agentVersion = agentVersion;
+  const deviceId = text(dto.deviceId);
+  if (deviceId) extra.deviceId = deviceId;
+  const deviceName = text(dto.deviceName, 128);
+  if (deviceName) extra.deviceName = deviceName;
+  const timeZone = text(dto.timeZone, 64);
+  if (timeZone) extra.timeZone = timeZone;
+  const offset = wholeNumber(dto.utcOffsetMinutes);
+  if (offset !== undefined && Math.abs(offset) <= MAX_UTC_OFFSET_MINUTES) extra.utcOffsetMinutes = offset;
+  const idle = optionalCount(dto.idleSeconds);
+  if (idle !== undefined) extra.idleSeconds = Math.min(idle, blockSeconds);
+  const endReason = str(dto.endReason).trim().toLowerCase();
+  if (Object.prototype.hasOwnProperty.call(END_REASON_LABELS, endReason)) extra.endReason = endReason as BlockEndReason;
+  const skew = wholeNumber(dto.clockSkewSeconds);
+  if (skew !== undefined) extra.clockSkewSeconds = skew;
+  const injected = optionalCount(dto.injectedInputEvents);
+  if (injected !== undefined) extra.injectedInputEvents = injected;
+  return extra;
+}
+
 /**
  * Map one backend activity. Rows without a usable id/time range are dropped
  * (null) rather than rendered as NaN. Newer agents report focused seconds per
  * window; a legacy row reports none, so — exactly like the backend's app-usage
  * report — its focused app (first active window) is credited with the block's
  * whole duration and flagged `credited`.
+ *
+ * Activity % is `productivity`; when the server sends null (input not
+ * measured) the row is flagged `activityMeasured: false` and its productivity
+ * reads 0, which every metric skips (metrics.ts: activityPercentOf). `note` is
+ * the member's own task note (null when none), while `description` keeps the
+ * neutral headline used when there is no note.
  */
 export function mapApiActivity(dto: ApiActivityDto | null | undefined): Activity | null {
   if (!dto || typeof dto !== "object" || !dto.id) return null;
@@ -313,6 +430,7 @@ export function mapApiActivity(dto: ApiActivityDto | null | undefined): Activity
     active[0] = { ...active[0], seconds: blockSeconds, credited: true };
   }
   const captures = parseCaptures(dto.captures);
+  const measured = dto.productivity !== null && dto.productivity !== undefined && Number.isFinite(Number(dto.productivity));
 
   return {
     id: String(dto.id),
@@ -320,8 +438,8 @@ export function mapApiActivity(dto: ApiActivityDto | null | undefined): Activity
     projectId: String(dto.projectId ?? ""),
     startedAt,
     endedAt,
-    description: str(dto.description).trim() || "Tracked session",
-    productivity: Math.min(100, Math.max(0, Math.round(num(dto.productivity)))),
+    description: str(dto.description).trim() || DEFAULT_SESSION_DESCRIPTION,
+    productivity: measured ? Math.min(100, Math.max(0, Math.round(num(dto.productivity)))) : 0,
     mouseClicks: Math.max(0, Math.round(num(dto.mouseClicks))),
     keyboardHits: Math.max(0, Math.round(num(dto.keyboardHits))),
     activeWindows: active,
@@ -331,6 +449,9 @@ export function mapApiActivity(dto: ApiActivityDto | null | undefined): Activity
     online: false,
     timeline: parseTimeline(dto.timelineJson),
     captures,
+    note: normalizeActivityNote(dto.description),
+    ...(measured ? {} : { activityMeasured: false }),
+    ...agentContext(dto, blockSeconds),
   };
 }
 
@@ -368,7 +489,19 @@ export function mapApiProject(dto: ApiProjectDto, memberIds: string[] = []): Pro
     loggedThisWeek: 0,
     loggedThisMonth: 0,
     loggedTotal: 0,
+    ...projectTrackingExtras(dto),
   };
+}
+
+/** The v2 tracking settings (contract §2), only when the server sent them. */
+function projectTrackingExtras(dto: ApiProjectDto): Partial<Project> {
+  const extra: Partial<Project> = {};
+  const idle = optionalCount(dto.idleThresholdMinutes);
+  if (idle !== undefined) extra.idleThresholdMinutes = Math.min(60, idle);
+  if (typeof dto.blurScreenshots === "boolean") extra.blurScreenshots = dto.blurScreenshots;
+  const archivedAt = normalizeUtcIso(dto.archivedAt);
+  if (archivedAt) extra.archivedAt = archivedAt;
+  return extra;
 }
 
 /** Project id → member user ids, inverted from the roster's per-member projectIds. */
@@ -408,74 +541,136 @@ export const roleDesignation: Record<Role, string> = {
   client: "Client",
 };
 
-/** A member is "active" when a block of theirs ended within this window. */
+/**
+ * Without heartbeats, a member counts as "active" while their last block ended
+ * at most one interval of its project ago, plus this grace for the upload —
+ * a block only arrives when it ends, so a 30-minute project's member is
+ * tracking even though their newest block is 25 minutes old.
+ */
+const ACTIVE_GRACE_MS = 5 * 60 * 1000;
+
+/** The window used when the project's interval isn't known (and the floor for short intervals). */
 const ACTIVE_WINDOW_MS = 15 * 60 * 1000;
+
+export interface TeamMemberContext {
+  /** IANA zone whose calendar day is "today" (default: UTC). */
+  timeZone?: string;
+  /** Live presence from the agents' heartbeats, by user id; wins over the row-based guess. */
+  presence?: ReadonlyMap<string, UserStatus>;
+  /** Project id → capture interval in minutes, to judge whether a member's newest block is still current. */
+  intervals?: ReadonlyMap<string, number>;
+}
+
+/** Row-based presence: the newest block ended within its project's interval (+ grace). */
+function statusFromRows(mine: Activity[], now: Date, intervals?: ReadonlyMap<string, number>): UserStatus {
+  let last: Activity | null = null;
+  let lastEnd = 0;
+  for (const a of mine) {
+    const end = Date.parse(a.endedAt);
+    if (Number.isFinite(end) && end > lastEnd) {
+      lastEnd = end;
+      last = a;
+    }
+  }
+  if (!last) return "offline";
+  const interval = intervals?.get(last.projectId);
+  const window = typeof interval === "number" && interval > 0 ? Math.max(ACTIVE_WINDOW_MS, interval * 60_000 + ACTIVE_GRACE_MS) : ACTIVE_WINDOW_MS;
+  return now.getTime() - lastEnd <= window ? "active" : "offline";
+}
 
 /**
  * Map one roster member to the app's User, with today's figures derived from
- * their real rows (never authored). `today` is a UTC day key.
+ * their real rows (never authored). "Today" is the calendar day of
+ * `context.timeZone` (UTC when none is given). Presence comes from the agents'
+ * heartbeats when known, else from how recently a block of theirs ended.
  */
-export function mapTeamMember(dto: ApiTeamMemberDto, activities: Activity[], now: Date): User {
-  const today = now.toISOString().slice(0, 10);
+export function mapTeamMember(dto: ApiTeamMemberDto, activities: Activity[], now: Date, context: TeamMemberContext = {}): User {
+  const zone = context.timeZone;
+  const today = zone ? zonedDayKey(now, zone) : now.toISOString().slice(0, 10);
   const mine = activities.filter((a) => a.userId === dto.userId);
-  const todays = activitiesOnDay(mine, today);
-  const lastEnd = mine.reduce((max, a) => Math.max(max, Date.parse(a.endedAt)), 0);
+  const todays = zone ? activitiesOnZonedDay(mine, today, zone) : activitiesOnDay(mine, today);
   const role = memberRole(dto);
+  const status: UserStatus =
+    dto.isActive === false ? "offline" : (context.presence?.get(String(dto.userId)) ?? statusFromRows(mine, now, context.intervals));
+  // The member's own zone is their device's, as their newest block reported it (newer agents only).
+  const deviceZone = [...mine].sort((a, b) => Date.parse(b.endedAt) - Date.parse(a.endedAt)).find((a) => a.timeZone)?.timeZone;
   return {
     id: String(dto.userId),
     name: displayName(dto),
     email: str(dto.email),
     role,
     designation: roleDesignation[role],
-    status:
-      dto.isActive === false
-        ? "offline"
-        : lastEnd > 0 && now.getTime() - lastEnd <= ACTIVE_WINDOW_MS
-          ? "active"
-          : "offline",
-    timezone: "UTC",
-    trackedToday: Math.round(minutesOnDay(todays, today)),
+    status,
+    timezone: deviceZone ?? "UTC",
+    trackedToday: Math.round(totalMinutes(todays)),
     productivity: averageProductivity(todays),
     joinedAt: "",
   };
 }
 
+/* ----------------------------- Presence ----------------------------- */
+
+const STATUS_RANK: Record<UserStatus, number> = { offline: 0, idle: 1, active: 2 };
+
+/**
+ * Each member's status from GET /api/app/presence/team (one row per device):
+ * an online device that is tracking makes them "active"; an online device
+ * that is paused, idle, on a break, locked or choosing a project makes them
+ * "idle"; anything else — offline, signed out, stopped — "offline". A member
+ * with several devices takes the liveliest. Malformed rows are skipped.
+ */
+export function presenceStatusByUser(list: unknown): Map<string, UserStatus> {
+  const out = new Map<string, UserStatus>();
+  for (const row of asItems<unknown>(list)) {
+    if (!row || typeof row !== "object") continue;
+    const rec = row as Record<string, unknown>;
+    const userId = text(rec.userId);
+    if (!userId) continue;
+    const status = str(rec.status).trim().toLowerCase();
+    const next: UserStatus =
+      rec.online !== true || status === "signedout" || status === "stopped" ? "offline" : status === "tracking" ? "active" : "idle";
+    const current = out.get(userId);
+    if (!current || STATUS_RANK[next] > STATUS_RANK[current]) out.set(userId, next);
+  }
+  return out;
+}
+
 /* ----------------------------- Derived series ----------------------------- */
 
 /**
- * The last `days` UTC days ending today (oldest first): tracked minutes, and
- * the productive share of them (duration × productivity).
+ * The last `days` calendar days of a zone ending today (oldest first; UTC by
+ * default): tracked minutes, and the minutes of them with keyboard or mouse
+ * input (Activity %, measured blocks only — an unmeasured block adds tracked
+ * time but no active time).
  */
 export function deriveDailyTrend(
   activities: Activity[],
   now: Date,
   days = 7,
+  timeZone = "UTC",
 ): { day: string; tracked: number; productive: number }[] {
   const out: { day: string; tracked: number; productive: number }[] = [];
+  const today = zonedDayKey(now, timeZone);
   for (let i = days - 1; i >= 0; i--) {
-    const d = new Date(now.getTime() - i * DAY_MS);
-    const key = d.toISOString().slice(0, 10);
-    const rows = activitiesOnDay(activities, key);
-    let tracked = 0;
-    let productive = 0;
-    for (const a of rows) {
-      const mins = durationMinutes(a);
-      tracked += mins;
-      productive += (mins * a.productivity) / 100;
-    }
-    out.push({ day: DAY_NAMES[d.getUTCDay()], tracked: Math.round(tracked), productive: Math.round(productive) });
+    const key = addZonedDays(today, -i);
+    const rows = activitiesOnZonedDay(activities, key, timeZone);
+    const tracked = rows.reduce((sum, a) => sum + durationMinutes(a), 0);
+    const weekday = new Date(`${key}T00:00:00.000Z`).getUTCDay();
+    out.push({ day: DAY_NAMES[weekday], tracked: Math.round(tracked), productive: Math.round(activeMinutes(rows)) });
   }
   return out;
 }
 
 /**
- * Minutes tracked per local hour of the viewer's current day. A session that
- * spans an hour boundary is split across both hours. The axis always covers
- * 8:00–19:00 and widens to include any hour that has work outside it.
+ * Minutes tracked per hour of the current day in a zone (the browser's by
+ * default). A session that spans an hour boundary is split across both hours.
+ * The axis always covers 8:00–19:00 and widens to include any hour that has
+ * work outside it.
  */
-export function deriveHourly(activities: Activity[], now: Date): { hour: string; minutes: number }[] {
-  const dayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
-  const dayEnd = dayStart + DAY_MS;
+export function deriveHourly(activities: Activity[], now: Date, timeZone = browserTimeZone()): { hour: string; minutes: number }[] {
+  const today = zonedDayKey(now, timeZone);
+  const dayStart = startOfZonedDay(today, timeZone).getTime();
+  const dayEnd = startOfZonedDay(addZonedDays(today, 1), timeZone).getTime();
   const buckets = Array<number>(24).fill(0);
   for (const a of activities) {
     const start = Math.max(Date.parse(a.startedAt), dayStart);
@@ -483,9 +678,11 @@ export function deriveHourly(activities: Activity[], now: Date): { hour: string;
     if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) continue;
     let cursor = start;
     while (cursor < end) {
-      const hour = new Date(cursor).getHours();
-      const hourEnd = Math.min(end, new Date(cursor).setMinutes(60, 0, 0));
-      buckets[hour] += (hourEnd - cursor) / 60_000;
+      const local = zonedParts(cursor, timeZone);
+      // The next local hour boundary, read off the zone's own clock (exact for +5:45-style offsets).
+      const toNextHour = ((60 - local.minute) * 60 - local.second) * 1000 - (cursor % 1000);
+      const hourEnd = Math.min(end, cursor + Math.max(1, toNextHour));
+      buckets[local.hour] += (hourEnd - cursor) / 60_000;
       cursor = hourEnd;
     }
   }
@@ -498,30 +695,40 @@ export function deriveHourly(activities: Activity[], now: Date): { hour: string;
 }
 
 /**
- * Focused-time-by-application across the rows (same crediting rule as the
- * backend's app-usage report), with distinct-member reach. Apps are not
- * categorized in live mode, so every app is reported as "neutral" rather than
- * guessing productive/unproductive.
+ * Focused time by application (same crediting rule as the backend's app-usage
+ * report), with distinct-member reach, over the rows booked inside `range`
+ * when one is given. Apps are grouped by their canonical name, and named,
+ * coloured and categorized through lib/apps — the same identity every other
+ * screen and the backend use (contract §8); an app nobody has classified
+ * reads as neutral.
  */
-export function deriveAppCatalog(activities: Activity[]): AppUsage[] {
+export function deriveAppCatalog(activities: Activity[], range?: { from: Date; to: Date }): AppUsage[] {
+  const rows = range ? activities.filter((a) => inRange(a, range.from, range.to)) : activities;
   const minutes = new Map<string, number>();
   const people = new Map<string, Set<string>>();
-  for (const a of activities) {
+  const names = new Map<string, string>();
+  for (const a of rows) {
     for (const w of a.activeWindows) {
-      if (w.seconds > 0) minutes.set(w.appName, (minutes.get(w.appName) ?? 0) + w.seconds / 60);
-      const set = people.get(w.appName) ?? new Set<string>();
+      const name = friendlyAppName(w.appName);
+      const key = appKey(name);
+      if (!names.has(key)) names.set(key, name);
+      if (w.seconds > 0) minutes.set(key, (minutes.get(key) ?? 0) + w.seconds / 60);
+      const set = people.get(key) ?? new Set<string>();
       set.add(a.userId);
-      people.set(w.appName, set);
+      people.set(key, set);
     }
   }
   return [...people.keys()]
-    .map((app) => ({
-      app,
-      category: "neutral" as const,
-      minutes: Math.round(minutes.get(app) ?? 0),
-      color: colorFromString(app, 60, 50),
-      activeUsers: people.get(app)?.size ?? 0,
-    }))
+    .map((key) => {
+      const app = names.get(key) ?? key;
+      return {
+        app,
+        category: appCategory(app),
+        minutes: Math.round(minutes.get(key) ?? 0),
+        color: appColor(app),
+        activeUsers: people.get(key)?.size ?? 0,
+      };
+    })
     .filter((a) => a.minutes > 0)
     .sort((a, b) => b.minutes - a.minutes || a.app.localeCompare(b.app));
 }
@@ -531,14 +738,81 @@ export function deriveTopApps(catalog: AppUsage[]): { app: string; minutes: numb
   return catalog.slice(0, 6).map((a) => ({ app: a.app, minutes: a.minutes, color: a.color }));
 }
 
-/** Fill each project's week / month / loaded-window totals from the real rows. */
-export function applyProjectTotals(projects: Project[], activities: Activity[], now: Date): void {
+/** What the session reads off one GET /api/app/reporting/summary. */
+export interface SummaryTotals {
+  /** Tracked minutes per project id. */
+  projects: Map<string, number>;
+  /** Tracked minutes and Activity % (null = nothing measured) per user id. */
+  users: Map<string, { minutes: number; activity: number | null }>;
+  totalMinutes: number;
+  /** Null when nothing in the period was measured (or the server sent no figure). */
+  activity: number | null;
+}
+
+function percentOrNull(value: unknown): number | null {
+  if (value === null || value === undefined || value === "") return null;
+  const n = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(n) ? Math.min(100, Math.max(0, Math.round(n))) : null;
+}
+
+/**
+ * Read a reporting summary (ReportSummaryDto). Rows without an id are
+ * skipped; anything that isn't a summary at all yields null, so the caller
+ * falls back to its own rows.
+ */
+export function mapReportSummary(raw: unknown): SummaryTotals | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const rec = raw as Record<string, unknown>;
+  if (!Array.isArray(rec.perUser) && !Array.isArray(rec.perProject)) return null;
+  const projects = new Map<string, number>();
+  for (const row of recordsOf(rec.perProject)) {
+    const id = text(row.projectId);
+    if (id) projects.set(id, (projects.get(id) ?? 0) + Math.max(0, num(row.trackedMinutes)));
+  }
+  const users = new Map<string, { minutes: number; activity: number | null }>();
+  for (const row of recordsOf(rec.perUser)) {
+    const id = text(row.userId);
+    if (id) users.set(id, { minutes: Math.max(0, num(row.trackedMinutes)), activity: percentOrNull(row.averageProductivity) });
+  }
+  return {
+    projects,
+    users,
+    totalMinutes: Math.max(0, num(rec.totalTrackedMinutes)),
+    activity: percentOrNull(rec.averageProductivity),
+  };
+}
+
+/** Server-side totals per project id (minutes), from /api/app/reporting/summary over each period. */
+export interface ProjectTotals {
+  week?: ReadonlyMap<string, number> | null;
+  month?: ReadonlyMap<string, number> | null;
+  window?: ReadonlyMap<string, number> | null;
+}
+
+/**
+ * Fill each project's totals: the last 7 days, this calendar month (in
+ * `timeZone`, UTC by default) and the session's whole loaded window. A period
+ * the server already totalled (`totals`, from the reporting summary) is taken
+ * from there — exact however many rows exist — and otherwise summed from the
+ * rows the session holds.
+ */
+export function applyProjectTotals(
+  projects: Project[],
+  activities: Activity[],
+  now: Date,
+  options: { timeZone?: string; totals?: ProjectTotals } = {},
+): void {
   const weekAgo = new Date(now.getTime() - 7 * DAY_MS);
-  const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+  const zone = options.timeZone;
+  const monthStart = zone
+    ? startOfZonedDay(`${zonedDayKey(now, zone).slice(0, 8)}01`, zone)
+    : new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+  const pick = (map: ReadonlyMap<string, number> | null | undefined, id: string, fallback: () => number) =>
+    Math.round(map ? (map.get(id) ?? 0) : fallback());
   for (const p of projects) {
-    p.loggedThisWeek = Math.round(minutesForProject(activities, p.id, weekAgo, now));
-    p.loggedThisMonth = Math.round(minutesForProject(activities, p.id, monthStart, now));
-    p.loggedTotal = Math.round(minutesForProject(activities, p.id));
+    p.loggedThisWeek = pick(options.totals?.week, p.id, () => minutesForProject(activities, p.id, weekAgo, now));
+    p.loggedThisMonth = pick(options.totals?.month, p.id, () => minutesForProject(activities, p.id, monthStart, now));
+    p.loggedTotal = pick(options.totals?.window, p.id, () => minutesForProject(activities, p.id));
   }
 }
 

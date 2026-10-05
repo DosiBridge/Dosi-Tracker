@@ -9,6 +9,7 @@ using Volo.Abp.EntityFrameworkCore.Sqlite;
 using Volo.Abp.FeatureManagement;
 using Volo.Abp.Modularity;
 using Volo.Abp.PermissionManagement;
+using Volo.Abp.SettingManagement;
 using Volo.Abp.Uow;
 
 namespace Dosi.Tracker.EntityFrameworkCore;
@@ -38,6 +39,13 @@ public class TrackerEntityFrameworkCoreTestModule : AbpModule
         {
             options.SaveStaticPermissionsToDatabase = false;
             options.IsDynamicPermissionStoreEnabled = false;
+        });
+        // ABP otherwise saves the static setting definitions on a background task at every test-app start, racing the
+        // tests (and the shutdown) on the shared in-memory SQLite connection.
+        Configure<SettingManagementOptions>(options =>
+        {
+            options.SaveStaticSettingsToDatabase = false;
+            options.IsDynamicSettingStoreEnabled = false;
         });
         context.Services.AddAlwaysDisableUnitOfWorkTransaction();
 

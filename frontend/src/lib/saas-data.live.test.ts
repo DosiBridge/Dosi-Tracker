@@ -2,11 +2,13 @@
 // never from the demo plan table (which a paying tenant was being quoted).
 import { describe, expect, it } from "vitest";
 import {
+  UNKNOWN_PLAN_NAME,
   liveSeatsUsed,
   monthlyCost,
   planById,
   planNameFor,
   seatLimitFor,
+  usagePct,
   workspaces,
   workspaceUsage,
   type Workspace,
@@ -37,10 +39,27 @@ describe("live workspace plan facts", () => {
     expect(planNameFor(ws)).toBe("Starter");
   });
 
-  it("an unknown backend plan falls back to the plan id's table entry for limits/name", () => {
-    const ws = liveWs({ known: false, planName: null, seatLimit: null, pricePerUser: null });
-    expect(seatLimitFor(ws)).toBe(planById("starter").seats);
-    expect(planNameFor(ws)).toBe("Starter");
+  it("an unknown backend plan says so and blocks nothing — never the demo table's Free / 3 seats", () => {
+    // A failed plan lookup used to read as Free: "8 of 3 seats used · limit reached" and a disabled Invite on a paid workspace.
+    const ws = liveWs({ known: false, planName: null, seatLimit: null, pricePerUser: null }, 8);
+    expect(seatLimitFor(ws)).toBe(Number.POSITIVE_INFINITY);
+    expect(planNameFor(ws)).toBe(UNKNOWN_PLAN_NAME);
+    expect(UNKNOWN_PLAN_NAME).toBe("Unknown plan");
+    const seats = workspaceUsage(ws)[0];
+    expect(seats).toMatchObject({ used: 8, limit: Number.POSITIVE_INFINITY });
+    expect(usagePct(seats.used, seats.limit)).toBe(0);
+    expect(monthlyCost(ws)).toBeNull();
+  });
+
+  it("an unknown plan ignores whatever plan id it carries", () => {
+    const ws = { ...liveWs({ known: false, planName: null, seatLimit: null, pricePerUser: null }), planId: "free" as const };
+    expect(seatLimitFor(ws)).toBe(Number.POSITIVE_INFINITY);
+    expect(planNameFor(ws)).toBe(UNKNOWN_PLAN_NAME);
+  });
+
+  it("a known plan without a seat figure is not capped in the browser", () => {
+    expect(seatLimitFor(liveWs({ seatLimit: null }))).toBe(Number.POSITIVE_INFINITY);
+    expect(planNameFor(liveWs({ planName: null }))).toBe(UNKNOWN_PLAN_NAME);
   });
 
   it("demo workspaces keep reading the plan table", () => {

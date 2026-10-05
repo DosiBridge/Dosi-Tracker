@@ -33,8 +33,15 @@ namespace Dosi.Tracker.Migrations
                         .IsRequired()
                         .HasColumnType("text");
 
+                    b.Property<string>("AgentVersion")
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
                     b.Property<Guid>("ClientActivityId")
                         .HasColumnType("uuid");
+
+                    b.Property<int?>("ClockSkewSeconds")
+                        .HasColumnType("integer");
 
                     b.Property<string>("ConcurrencyStamp")
                         .IsConcurrencyToken()
@@ -54,6 +61,17 @@ namespace Dosi.Tracker.Migrations
                     b.Property<string>("Description")
                         .HasColumnType("text");
 
+                    b.Property<Guid?>("DeviceId")
+                        .HasColumnType("uuid");
+
+                    b.Property<string>("DeviceName")
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.Property<string>("EndReason")
+                        .HasMaxLength(16)
+                        .HasColumnType("character varying(16)");
+
                     b.Property<DateTime>("EndedAt")
                         .HasColumnType("timestamp without time zone");
 
@@ -62,13 +80,27 @@ namespace Dosi.Tracker.Migrations
                         .HasColumnType("text")
                         .HasColumnName("ExtraProperties");
 
+                    b.Property<int?>("IdleSeconds")
+                        .HasColumnType("integer");
+
+                    b.Property<int?>("InjectedInputEvents")
+                        .HasColumnType("integer");
+
                     b.Property<int>("KeyboardHits")
                         .HasColumnType("integer");
 
                     b.Property<int>("MouseClicks")
                         .HasColumnType("integer");
 
-                    b.Property<int>("Productivity")
+                    b.Property<string>("OsVersion")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<string>("Platform")
+                        .HasMaxLength(16)
+                        .HasColumnType("character varying(16)");
+
+                    b.Property<int?>("Productivity")
                         .HasColumnType("integer");
 
                     b.Property<Guid>("ProjectId")
@@ -85,6 +117,10 @@ namespace Dosi.Tracker.Migrations
                         .HasColumnType("uuid")
                         .HasColumnName("TenantId");
 
+                    b.Property<string>("TimeZone")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
                     b.Property<string>("TimelineJson")
                         .IsRequired()
                         .HasColumnType("text");
@@ -92,13 +128,23 @@ namespace Dosi.Tracker.Migrations
                     b.Property<Guid>("UserId")
                         .HasColumnType("uuid");
 
+                    b.Property<int?>("UtcOffsetMinutes")
+                        .HasColumnType("integer");
+
                     b.HasKey("Id");
 
-                    b.HasIndex("TenantId", "ClientActivityId")
-                        .IsUnique();
+                    b.HasIndex("TenantId", "ClientActivityId");
+
+                    b.HasIndex("TenantId", "StartedAt")
+                        .IsDescending(false, true);
 
                     b.HasIndex("TenantId", "ProjectId", "StartedAt")
                         .IsDescending(false, false, true);
+
+                    b.HasIndex("TenantId", "UserId", "ClientActivityId")
+                        .IsUnique();
+
+                    NpgsqlIndexBuilderExtensions.AreNullsDistinct(b.HasIndex("TenantId", "UserId", "ClientActivityId"), false);
 
                     b.HasIndex("TenantId", "UserId", "StartedAt")
                         .IsDescending(false, false, true);
@@ -167,6 +213,9 @@ namespace Dosi.Tracker.Migrations
                     b.Property<decimal>("Amount")
                         .HasColumnType("numeric");
 
+                    b.Property<DateTime?>("BillingPeriodStart")
+                        .HasColumnType("timestamp without time zone");
+
                     b.Property<string>("ConcurrencyStamp")
                         .IsConcurrencyToken()
                         .IsRequired()
@@ -223,6 +272,10 @@ namespace Dosi.Tracker.Migrations
 
                     b.HasKey("Id");
 
+                    b.HasIndex("TenantId", "BillingPeriodStart")
+                        .IsUnique()
+                        .HasFilter("\"BillingPeriodStart\" IS NOT NULL AND \"IsDeleted\" = false");
+
                     b.ToTable("AppInvoices", (string)null);
                 });
 
@@ -271,6 +324,80 @@ namespace Dosi.Tracker.Migrations
                     b.ToTable("AppNotifications", (string)null);
                 });
 
+            modelBuilder.Entity("Dosi.Tracker.Presence.AgentPresence", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .HasColumnType("uuid");
+
+                    b.Property<string>("AgentVersion")
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
+                    b.Property<DateTime>("CreationTime")
+                        .HasColumnType("timestamp without time zone")
+                        .HasColumnName("CreationTime");
+
+                    b.Property<Guid?>("CreatorId")
+                        .HasColumnType("uuid")
+                        .HasColumnName("CreatorId");
+
+                    b.Property<string>("CurrentApp")
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)");
+
+                    b.Property<Guid>("DeviceId")
+                        .HasColumnType("uuid");
+
+                    b.Property<string>("DeviceName")
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.Property<DateTime>("LastSeenAt")
+                        .HasColumnType("timestamp without time zone");
+
+                    b.Property<string>("OsVersion")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<string>("Platform")
+                        .HasMaxLength(16)
+                        .HasColumnType("character varying(16)");
+
+                    b.Property<Guid?>("ProjectId")
+                        .HasColumnType("uuid");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasMaxLength(16)
+                        .HasColumnType("character varying(16)");
+
+                    b.Property<DateTime?>("StatusSince")
+                        .HasColumnType("timestamp without time zone");
+
+                    b.Property<Guid?>("TenantId")
+                        .HasColumnType("uuid")
+                        .HasColumnName("TenantId");
+
+                    b.Property<string>("TimeZone")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<Guid>("UserId")
+                        .HasColumnType("uuid");
+
+                    b.Property<int?>("UtcOffsetMinutes")
+                        .HasColumnType("integer");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("TenantId", "UserId", "DeviceId")
+                        .IsUnique();
+
+                    NpgsqlIndexBuilderExtensions.AreNullsDistinct(b.HasIndex("TenantId", "UserId", "DeviceId"), false);
+
+                    b.ToTable("AppAgentPresences", (string)null);
+                });
+
             modelBuilder.Entity("Dosi.Tracker.Projects.Project", b =>
                 {
                     b.Property<Guid>("Id")
@@ -294,9 +421,16 @@ namespace Dosi.Tracker.Migrations
                     b.Property<bool>("AllowWebcam")
                         .HasColumnType("boolean");
 
+                    b.Property<DateTime?>("ArchivedAt")
+                        .HasColumnType("timestamp without time zone");
+
+                    b.Property<bool>("BlurScreenshots")
+                        .HasColumnType("boolean");
+
                     b.Property<string>("Color")
                         .IsRequired()
-                        .HasColumnType("text");
+                        .HasMaxLength(7)
+                        .HasColumnType("character varying(7)");
 
                     b.Property<string>("ConcurrencyStamp")
                         .IsConcurrencyToken()
@@ -322,12 +456,16 @@ namespace Dosi.Tracker.Migrations
                         .HasColumnName("DeletionTime");
 
                     b.Property<string>("Description")
-                        .HasColumnType("text");
+                        .HasMaxLength(2048)
+                        .HasColumnType("character varying(2048)");
 
                     b.Property<string>("ExtraProperties")
                         .IsRequired()
                         .HasColumnType("text")
                         .HasColumnName("ExtraProperties");
+
+                    b.Property<int>("IdleThresholdMinutes")
+                        .HasColumnType("integer");
 
                     b.Property<int>("IntervalMinutes")
                         .HasColumnType("integer");
@@ -398,7 +536,48 @@ namespace Dosi.Tracker.Migrations
 
                     b.HasIndex("ProjectId");
 
+                    b.HasIndex("TenantId", "ProjectId", "UserId")
+                        .IsUnique();
+
+                    NpgsqlIndexBuilderExtensions.AreNullsDistinct(b.HasIndex("TenantId", "ProjectId", "UserId"), false);
+
                     b.ToTable("AppProjectMembers", (string)null);
+                });
+
+            modelBuilder.Entity("Dosi.Tracker.Projects.ProjectMemberRate", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .HasColumnType("uuid");
+
+                    b.Property<DateTime>("CreationTime")
+                        .HasColumnType("timestamp without time zone")
+                        .HasColumnName("CreationTime");
+
+                    b.Property<Guid?>("CreatorId")
+                        .HasColumnType("uuid")
+                        .HasColumnName("CreatorId");
+
+                    b.Property<DateTime>("EffectiveFrom")
+                        .HasColumnType("timestamp without time zone");
+
+                    b.Property<decimal>("HourlyRate")
+                        .HasColumnType("numeric");
+
+                    b.Property<Guid>("ProjectId")
+                        .HasColumnType("uuid");
+
+                    b.Property<Guid?>("TenantId")
+                        .HasColumnType("uuid")
+                        .HasColumnName("TenantId");
+
+                    b.Property<Guid>("UserId")
+                        .HasColumnType("uuid");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("TenantId", "ProjectId", "UserId", "EffectiveFrom");
+
+                    b.ToTable("AppProjectMemberRates", (string)null);
                 });
 
             modelBuilder.Entity("Dosi.Tracker.SaaS.Plan", b =>
@@ -2466,7 +2645,9 @@ namespace Dosi.Tracker.Migrations
 
                     b.HasIndex("Name");
 
-                    b.HasIndex("NormalizedName");
+                    b.HasIndex("NormalizedName")
+                        .IsUnique()
+                        .HasFilter("\"IsDeleted\" = false");
 
                     b.ToTable("AbpTenants", (string)null);
                 });

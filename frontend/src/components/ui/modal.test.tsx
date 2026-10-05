@@ -8,6 +8,7 @@ import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { axe } from "jest-axe";
 import { Modal } from "@/components/ui/modal";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { resetPrototypeState } from "@/test/harness";
 
 beforeEach(() => {
@@ -95,5 +96,65 @@ describe("Modal", () => {
   it("a11y: the open modal has no axe violations", async () => {
     render(<ModalHost />);
     expect(await axe(document.body)).toHaveNoViolations();
+  });
+});
+
+/** An edit form that asks for confirmation in a second dialog, as Team → Edit member → Remove does. */
+function NestedHost() {
+  const [editing, setEditing] = useState(true);
+  const [confirming, setConfirming] = useState(false);
+  return (
+    <>
+      <Modal open={editing} onClose={() => setEditing(false)} title="Edit member">
+        <button type="button" onClick={() => setConfirming(true)}>
+          Remove…
+        </button>
+      </Modal>
+      <ConfirmDialog
+        open={confirming}
+        onCancel={() => setConfirming(false)}
+        onConfirm={() => setConfirming(false)}
+        title="Remove from project?"
+        description="They stop tracking time on it."
+        confirmLabel="Remove"
+      />
+    </>
+  );
+}
+
+describe("Modal under a nested dialog", () => {
+  it("Escape closes only the newest dialog, then the one under it", async () => {
+    const user = userEvent.setup();
+    render(<NestedHost />);
+    await user.click(screen.getByRole("button", { name: "Remove…" }));
+    expect(screen.getByRole("dialog", { name: "Remove from project?" })).toBeInTheDocument();
+
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog", { name: "Remove from project?" })).not.toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "Edit member" })).toBeInTheDocument();
+
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog", { name: "Edit member" })).not.toBeInTheDocument();
+  });
+
+  it("keeps Tab inside the newest dialog", async () => {
+    const user = userEvent.setup();
+    render(<NestedHost />);
+    await user.click(screen.getByRole("button", { name: "Remove…" }));
+    const confirm = screen.getByRole("dialog", { name: "Remove from project?" });
+    for (let i = 0; i < 6; i++) {
+      await user.tab();
+      expect(confirm.contains(document.activeElement)).toBe(true);
+    }
+  });
+
+  it("keeps the page locked until the last dialog closes", async () => {
+    const user = userEvent.setup();
+    render(<NestedHost />);
+    await user.click(screen.getByRole("button", { name: "Remove…" }));
+    await user.keyboard("{Escape}");
+    expect(document.body.style.overflow).toBe("hidden");
+    await user.keyboard("{Escape}");
+    expect(document.body.style.overflow).toBe("");
   });
 });

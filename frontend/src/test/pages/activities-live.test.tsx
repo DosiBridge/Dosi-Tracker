@@ -13,6 +13,9 @@ vi.mock("@/hooks/useApi", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/hooks/useApi")>()),
   getApi: vi.fn(),
   getAuthedBlobUrl: vi.fn(),
+  getAuthedBlob: vi.fn(),
+  getTeamPresence: vi.fn(),
+  updateActivityNote: vi.fn(),
 }));
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
@@ -20,7 +23,8 @@ import { act, cleanup, render, screen, waitFor, within, fireEvent } from "@testi
 import userEvent from "@testing-library/user-event";
 import { axe } from "jest-axe";
 import ActivitiesPage from "@/app/(dashboard)/activities/page";
-import { getApi, getAuthedBlobUrl } from "@/hooks/useApi";
+import { ApiError, getApi, getAuthedBlob, getAuthedBlobUrl, getTeamPresence, updateActivityNote } from "@/hooks/useApi";
+import { activityDateRange, defaultActivityFilters } from "@/lib/activity-filters";
 import { mapApiActivities, mapApiProject, type ApiActivityDto } from "@/lib/live-dataset";
 import { formatClock } from "@/lib/activity-report";
 import { installLiveDataset } from "@/lib/tenant-data";
@@ -131,7 +135,9 @@ class FakeObserver {
     this.callback(entries, this as unknown as IntersectionObserver);
   }
 }
-function scrollEverythingIntoView() {
+async function scrollEverythingIntoView() {
+  // Tiles register with their observer in an effect after they render: wait for that, then scroll.
+  await waitFor(() => expect(FakeObserver.all.some((o) => o.targets.size > 0)).toBe(true));
   act(() => {
     for (const o of [...FakeObserver.all]) o.fire();
   });
@@ -173,6 +179,12 @@ beforeEach(() => {
   vi.mocked(getApi).mockReset();
   vi.mocked(getAuthedBlobUrl).mockReset();
   vi.mocked(getAuthedBlobUrl).mockImplementation(async (endpoint: string) => blobFor(endpoint));
+  // The screenshot viewer also needs the file's type (to name a download): it goes through the same getter.
+  vi.mocked(getAuthedBlob).mockReset();
+  vi.mocked(getAuthedBlob).mockImplementation(async (endpoint, init) => ({ url: await vi.mocked(getAuthedBlobUrl)(endpoint, init), type: "image/jpeg" }));
+  // Nobody is tracking unless a test says so (GET /api/app/presence/team).
+  vi.mocked(getTeamPresence).mockReset();
+  vi.mocked(getTeamPresence).mockResolvedValue([]);
   window.scrollTo = vi.fn() as unknown as typeof window.scrollTo;
 });
 
@@ -194,12 +206,16 @@ describe("activity cards — real screenshot thumbnails (live)", () => {
     render(<ActivitiesPage />);
 
     expect(await screen.findAllByRole("button", { name: /^Open session:/ })).toHaveLength(3);
+    // Only the two blocks with a screenshot can open the viewer.
+    expect(screen.getAllByRole("button", { name: /^View screenshot:/ })).toHaveLength(2);
     // Lazy: two tiles with captures wait as skeletons; the legacy row is a glyph straight away.
     expect(screen.getAllByTestId("capture-thumb-skeleton")).toHaveLength(2);
-    expect(screen.getByTitle("Rider")).toBeInTheDocument();
+    const legacyCard = screen.getByRole("button", { name: /^Open session: .*Old agent block/ });
+    expect(within(legacyCard).queryByTestId("capture-thumb-skeleton")).toBeNull();
+    expect(within(legacyCard).getAllByTitle("Rider").length).toBeGreaterThan(0);
     expect(getAuthedBlobUrl).not.toHaveBeenCalled();
 
-    scrollEverythingIntoView();
+    await scrollEverythingIntoView();
 
     await waitFor(() => expect(imgSrcs()).toEqual(expect.arrayContaining([blobFor(content(THUMB_NEW)), blobFor(content(SCREEN_ONLY))])));
     const requested = vi.mocked(getAuthedBlobUrl).mock.calls.map(([e]) => e);
@@ -208,11 +224,14 @@ describe("activity cards — real screenshot thumbnails (live)", () => {
     expect(requested).not.toContain(content(WEBCAM_NEW));
     expect(screen.queryAllByTestId("capture-thumb-skeleton")).toHaveLength(0);
 
-    // The card still names the block's main app (code.exe: 220s across two windows) over the image,
-    // keeps its time badge, and flags the webcam capture.
+    // The card names the block's main app readably (code.exe: 220s across two windows → "Visual Studio
+    // Code", the one canonical name every page uses; the raw name on hover) and what was on screen; the
+    // screenshot flags the webcam capture.
     const card = screen.getAllByRole("button", { name: /^Open session:/ })[0];
-    expect(within(card).getByText("code.exe")).toBeInTheDocument();
-    expect(within(card).getByTitle("Webcam opt-in")).toBeInTheDocument();
+    expect(within(card).getByTitle("code.exe")).toHaveTextContent("Visual Studio Code");
+    expect(within(card).getByText("main.rs")).toBeInTheDocument();
+    const media = screen.getAllByRole("button", { name: /^View screenshot:/ })[0];
+    expect(within(media).getByTitle("Webcam opt-in")).toBeInTheDocument();
   }, RENDER_BUDGET_MS);
 
   it("falls back to the full capture when the thumb fails, and to the app glyph when nothing loads", async () => {
@@ -222,9 +241,9 @@ describe("activity cards — real screenshot thumbnails (live)", () => {
     });
     goLive([newRow(), screenOnlyRow()]);
     render(<ActivitiesPage />);
-    const cards = await screen.findAllByRole("button", { name: /^Open session:/ });
+    const cards = await screen.findAllByRole("button", { name: /^View screenshot:/ });
 
-    scrollEverythingIntoView();
+    await scrollEverythingIntoView();
 
     await waitFor(() => expect(imgSrcs()).toEqual([blobFor(content(SCREEN_NEW))]));
     expect(vi.mocked(getAuthedBlobUrl).mock.calls.map(([e]) => e)).toEqual(
@@ -257,7 +276,7 @@ describe("activity cards — real screenshot thumbnails (live)", () => {
     const { unmount } = render(<ActivitiesPage />);
     await screen.findAllByRole("button", { name: /^Open session:/ });
 
-    scrollEverythingIntoView();
+    await scrollEverythingIntoView();
     await waitFor(() => expect(getAuthedBlobUrl).toHaveBeenCalledTimes(4));
     expect(peak).toBe(4);
 
@@ -273,10 +292,156 @@ describe("activity cards — real screenshot thumbnails (live)", () => {
     await waitFor(() => expect(FakeObserver.all.length).toBeGreaterThan(0));
     expect(screen.queryAllByRole("button", { name: /^Open session:/ })).toHaveLength(0); // the grid, not the session cards
 
-    scrollEverythingIntoView();
+    await scrollEverythingIntoView();
 
     await waitFor(() => expect(imgSrcs()).toEqual([blobFor(content(THUMB_NEW))]));
-    expect(screen.getByText("code.exe")).toBeInTheDocument();
+    expect(screen.getByTitle("code.exe")).toHaveTextContent("Visual Studio Code");
+  }, RENDER_BUDGET_MS);
+
+  it("the Screens grid is a screenshot gallery: blocks without one are left to the Sessions list", async () => {
+    __setPathname("/activities?view=screens");
+    goLive([newRow(), legacyRow()]);
+    render(<ActivitiesPage />);
+
+    expect(await screen.findAllByRole("button", { name: /^View screenshot:/ })).toHaveLength(1);
+    expect(screen.getByText(/1 session without a screenshot is listed under Sessions only/)).toBeInTheDocument();
+  }, RENDER_BUDGET_MS);
+});
+
+describe("screenshot viewer — image by image (live)", () => {
+  /** Two blocks with screenshots (newest first) around a legacy block without one. */
+  const rows = () => [newRow(), legacyRow(), screenOnlyRow()];
+
+  it("opens at the clicked screenshot, shows the thumb then the full capture, and steps with buttons and arrow keys", async () => {
+    const user = userEvent.setup();
+    goLive(rows());
+    render(<ActivitiesPage />);
+
+    await user.click((await screen.findAllByRole("button", { name: /^View screenshot:/ }))[0]);
+    const viewer = await screen.findByRole("dialog", { name: "Screenshot viewer" });
+    expect(within(viewer).getByText("1 / 2")).toBeInTheDocument(); // the legacy block has nothing to view
+    await waitFor(() =>
+      expect(within(viewer).getByRole("img", { name: /^Screenshot — Visual Studio Code/ })).toHaveAttribute("src", blobFor(content(SCREEN_NEW))),
+    );
+    // The full capture downloads under its real type (agents send JPEG), not a fixed ".png".
+    expect(within(viewer).getByRole("link", { name: /download/i })).toHaveAttribute("download", expect.stringMatching(/^screenshot-.*\.jpg$/));
+    const requested = () => vi.mocked(getAuthedBlobUrl).mock.calls.map(([e]) => e);
+    expect(requested()).toContain(content(THUMB_NEW));
+    // The next block's full capture is fetched ahead, so stepping is instant.
+    await waitFor(() => expect(requested()).toContain(content(SCREEN_ONLY)));
+    expect(within(viewer).getByRole("button", { name: "Previous screenshot" })).toBeDisabled();
+
+    await user.click(within(viewer).getByRole("button", { name: "Next screenshot" }));
+    expect(within(viewer).getByText("2 / 2")).toBeInTheDocument();
+    await waitFor(() => expect(within(viewer).getByRole("img", { name: /^Screenshot —/ })).toHaveAttribute("src", blobFor(content(SCREEN_ONLY))));
+    expect(within(viewer).getByRole("button", { name: "Next screenshot" })).toBeDisabled();
+
+    await user.keyboard("{ArrowLeft}");
+    expect(within(viewer).getByText("1 / 2")).toBeInTheDocument();
+    await user.keyboard("{End}");
+    expect(within(viewer).getByText("2 / 2")).toBeInTheDocument();
+
+    // The side panel describes the block on screen.
+    expect(within(viewer).getByText("Key presses")).toBeInTheDocument();
+    expect(within(viewer).getByText("Apps used")).toBeInTheDocument();
+
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog", { name: "Screenshot viewer" })).not.toBeInTheDocument();
+    // Everything the viewer downloaded is released when it closes.
+    expect(revoke).toHaveBeenCalledWith(blobFor(content(SCREEN_NEW)));
+    expect(revoke).toHaveBeenCalledWith(blobFor(content(SCREEN_ONLY)));
+  }, RENDER_BUDGET_MS);
+
+  it("the Slideshow button starts at the first screenshot, the filmstrip jumps, and the report hands over to the drawer", async () => {
+    const user = userEvent.setup();
+    vi.mocked(getApi).mockResolvedValue([]);
+    goLive(rows());
+    render(<ActivitiesPage />);
+    await screen.findAllByRole("button", { name: /^Open session:/ });
+
+    await user.click(screen.getByRole("button", { name: /Slideshow/ }));
+    const viewer = await screen.findByRole("dialog", { name: "Screenshot viewer" });
+    expect(within(viewer).getByText("1 / 2")).toBeInTheDocument();
+
+    const strip = within(viewer).getByLabelText("All screenshots");
+    expect(within(strip).getAllByRole("button")).toHaveLength(2);
+    await user.click(within(strip).getByRole("button", { name: /^Screenshot 2:/ }));
+    expect(within(viewer).getByText("2 / 2")).toBeInTheDocument();
+    expect(within(strip).getByRole("button", { name: /^Screenshot 2:/ })).toHaveAttribute("aria-current", "true");
+
+    await user.click(within(viewer).getByRole("button", { name: /Full session report/ }));
+    expect(screen.queryByRole("dialog", { name: "Screenshot viewer" })).not.toBeInTheDocument();
+    await screen.findByRole("dialog", { name: "Activity detail" });
+    expect(getApi).toHaveBeenCalledWith(`/api/app/activity/screenshots/${A_SCREEN_ONLY}`);
+  }, RENDER_BUDGET_MS);
+
+  it("the report's screenshot opens the viewer at that session, and closing it returns to the report", async () => {
+    const user = userEvent.setup();
+    vi.mocked(getApi).mockImplementation(async (endpoint: string) =>
+      endpoint === `/api/app/activity/screenshots/${A_SCREEN_ONLY}`
+        ? [{ id: SCREEN_ONLY, activityId: A_SCREEN_ONLY, kind: "screen", capturedAt: "2026-09-29T10:02:00Z", contentType: "image/png" }]
+        : [],
+    );
+    goLive(rows());
+    render(<ActivitiesPage />);
+
+    // Newest first: the new block, the legacy block, then the screen-only block.
+    await user.click((await screen.findAllByRole("button", { name: /^Open session:/ }))[2]);
+    let report = await screen.findByRole("dialog", { name: "Activity detail" });
+    // The capture is a button into the viewer; the new-tab link moved to the caption.
+    await user.click(await within(report).findByRole("button", { name: /^View screenshot large/ }));
+
+    expect(screen.queryByRole("dialog", { name: "Activity detail" })).not.toBeInTheDocument();
+    const viewer = await screen.findByRole("dialog", { name: "Screenshot viewer" });
+    expect(within(viewer).getByText("2 / 2")).toBeInTheDocument(); // the screen-only block, second in the list
+
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog", { name: "Screenshot viewer" })).not.toBeInTheDocument();
+    report = await screen.findByRole("dialog", { name: "Activity detail" });
+    expect(await within(report).findByRole("link", { name: /open full size/i })).toHaveAttribute("href", blobFor(content(SCREEN_ONLY)));
+  }, RENDER_BUDGET_MS);
+
+  it("a block without a screenshot has no way into the viewer from its report", async () => {
+    const user = userEvent.setup();
+    vi.mocked(getApi).mockResolvedValue([]);
+    goLive(rows());
+    render(<ActivitiesPage />);
+
+    await user.click(await screen.findByRole("button", { name: /^Open session: .*Old agent block/ }));
+    const report = await screen.findByRole("dialog", { name: "Activity detail" });
+    expect(await within(report).findByText("No screenshot captured")).toBeInTheDocument();
+    expect(within(report).queryByRole("button", { name: /^View screenshot large/ })).not.toBeInTheDocument();
+  }, RENDER_BUDGET_MS);
+
+  it("plays the slideshow on its own and stops at the last screenshot", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      goLive(rows());
+      render(<ActivitiesPage />);
+      fireEvent.click((await screen.findAllByRole("button", { name: /^View screenshot:/ }))[0]);
+      const viewer = await screen.findByRole("dialog", { name: "Screenshot viewer" });
+
+      fireEvent.click(within(viewer).getByRole("button", { name: "Play slideshow" }));
+      await act(async () => {
+        vi.advanceTimersByTime(3_100);
+      });
+      expect(within(viewer).getByText("2 / 2")).toBeInTheDocument();
+      // Reaching the end stops playback.
+      expect(within(viewer).getByRole("button", { name: "Play slideshow" })).toHaveAttribute("aria-pressed", "false");
+    } finally {
+      vi.useRealTimers();
+    }
+  }, RENDER_BUDGET_MS);
+
+  it("a11y: the viewer has no axe violations", async () => {
+    const user = userEvent.setup();
+    goLive(rows());
+    render(<ActivitiesPage />);
+    await user.click((await screen.findAllByRole("button", { name: /^View screenshot:/ }))[0]);
+    const viewer = await screen.findByRole("dialog", { name: "Screenshot viewer" });
+    await waitFor(() => expect(within(viewer).getByRole("img", { name: /^Screenshot —/ })).toHaveAttribute("src", blobFor(content(SCREEN_NEW))));
+
+    expect(await axe(viewer)).toHaveNoViolations();
   }, RENDER_BUDGET_MS);
 });
 
@@ -290,6 +455,7 @@ describe("activity drawer — the block report (live)", () => {
           { id: SCREEN_NEW, activityId: A_NEW, kind: "screen", blurred: true, capturedAt: "2026-09-29T10:02:00Z", sizeBytes: 250_000, contentType: "image/jpeg" },
         ];
       }
+      if (endpoint.startsWith("/api/app/workspace/")) return {}; // the reporting zone: none set
       throw new Error(`unexpected endpoint ${endpoint}`);
     });
     goLive([newRow()]);
@@ -298,8 +464,9 @@ describe("activity drawer — the block report (live)", () => {
     await user.click(await screen.findByRole("button", { name: /^Open session:/ }));
     const dialog = await screen.findByRole("dialog", { name: "Activity detail" });
 
-    // The bug: the id travels in the path, never as ?activityId=.
-    const calls = vi.mocked(getApi).mock.calls.map(([e]) => e);
+    // The bug: the id travels in the path, never as ?activityId=. (The page's other reads are the
+    // reporting zone's settings.)
+    const calls = vi.mocked(getApi).mock.calls.map(([e]) => e).filter((e) => e.startsWith("/api/app/activity"));
     expect(calls).toEqual([`/api/app/activity/screenshots/${A_NEW}`]);
     expect(calls.some((e) => e.includes("?activityId="))).toBe(false);
 
@@ -336,11 +503,13 @@ describe("activity drawer — the block report (live)", () => {
     // Keyboard inspection: focus the chart and step through the minutes.
     act(() => chart.focus());
     fireEvent.keyDown(chart, { key: "ArrowRight" });
-    expect(within(dialog).getByText(/: 120 keyboard, 5 mouse in code\.exe$/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/: 120 keyboard, 5 mouse in Visual Studio Code$/)).toBeInTheDocument();
 
-    // Apps & windows: grouped by app, summed, share of the block, input per app and per window.
+    // Apps & windows: grouped by app (canonically named, the raw name on hover), summed, share of
+    // the block, input per app and per window.
     const apps = within(dialog).getByRole("table", { name: /per app and window/ });
-    const code = within(apps).getByRole("button", { name: /code\.exe/ });
+    const code = within(apps).getByRole("button", { name: /Visual Studio Code/ });
+    expect(within(code).getByTitle("code.exe")).toBeInTheDocument();
     const codeRow = code.closest("tr")!;
     expect(within(codeRow).getByText("3m 40s")).toBeInTheDocument();
     expect(within(codeRow).getByText("74%")).toBeInTheDocument();
@@ -349,7 +518,7 @@ describe("activity drawer — the block report (live)", () => {
     const mainRs = within(apps).getByText("main.rs").closest("tr")!;
     expect(within(mainRs).getByText("3m")).toBeInTheDocument();
     expect(within(apps).getByText("lib.rs")).toBeInTheDocument();
-    const chromeRow = within(apps).getByText("chrome.exe").closest("tr")!;
+    const chromeRow = within(apps).getByText("Google Chrome").closest("tr")!;
     expect(within(chromeRow).getByText("1m")).toBeInTheDocument();
     expect(within(chromeRow).getByText("20%")).toBeInTheDocument();
     // Multi-window apps collapse.
@@ -358,8 +527,9 @@ describe("activity drawer — the block report (live)", () => {
     expect(code).toHaveAttribute("aria-expanded", "false");
     expect(within(apps).queryByText("main.rs")).not.toBeInTheDocument();
 
-    // Running programs.
-    expect(within(dialog).getByText("slack.exe")).toBeInTheDocument();
+    // Running programs, by their canonical names.
+    expect(within(dialog).getByText("Slack")).toBeInTheDocument();
+    expect(within(dialog).getByTitle("spotify.exe")).toHaveTextContent("Spotify");
 
     // Object URLs are released when the page goes away.
     unmount();
@@ -416,5 +586,311 @@ describe("activity drawer — the block report (live)", () => {
     expect(await within(dialog).findByText("Couldn’t load captures.")).toBeInTheDocument();
     // The rest of the report doesn't depend on the captures.
     expect(within(dialog).getByRole("heading", { name: "Activity timeline" })).toBeInTheDocument();
+  }, RENDER_BUDGET_MS);
+});
+
+/* ---------------------------------------------------------------------------
+ * Contract v2: what the page asks the server, what newer agents report about a
+ * block (note, idle, end reason, device, capture), who is live right now, and
+ * editing a block's note.
+ * ------------------------------------------------------------------------- */
+
+/** A row from a newer agent: ApiActivityDto plus the contract v2 fields. */
+function v2Row(over: Record<string, unknown> = {}): ApiActivityDto {
+  return { ...newRow(), ...over } as ApiActivityDto;
+}
+
+/** Serve the reporting zone (the viewer's preference) and, optionally, other GETs. */
+function serveZone(zone: string, more: (endpoint: string) => unknown = () => []) {
+  vi.mocked(getApi).mockImplementation(async (endpoint: string) => {
+    if (endpoint === "/api/app/workspace/my-preferences") return { timeZone: zone };
+    if (endpoint === "/api/app/workspace/settings") return {};
+    return more(endpoint);
+  });
+}
+
+/** The activity list requests the page made, as URLs. */
+function listRequests(): URL[] {
+  return vi
+    .mocked(fetch)
+    .mock.calls.map(([url]) => new URL(String(url)))
+    .filter((u) => u.pathname === "/api/app/activity");
+}
+
+describe("the activity list asks the server for the selected days, member and project (live)", () => {
+  it("sends the reporting zone's days as From/To, a page at a time, and re-asks when the member changes", async () => {
+    const user = userEvent.setup();
+    serveZone("Asia/Dhaka");
+    goLive([newRow()]);
+    render(<ActivitiesPage />);
+    await screen.findAllByRole("button", { name: /^Open session:/ });
+
+    const [first] = listRequests();
+    const expected = activityDateRange(defaultActivityFilters, { now: new Date(), timeZone: "Asia/Dhaka" });
+    expect(Date.parse(first.searchParams.get("From")!)).toBe(expected.from); // Dhaka midnight, 6 days ago
+    expect(Date.parse(first.searchParams.get("To")!)).toBeLessThanOrEqual(Date.now() + 10 * 60_000);
+    expect(first.searchParams.get("SkipCount")).toBe("0");
+    expect(first.searchParams.get("MaxResultCount")).toBe("500");
+    expect(first.searchParams.has("UserId")).toBe(false);
+    // The header says which days these are, and in which zone.
+    expect(screen.getByText(/times in Dhaka \(UTC\+6\)/)).toBeInTheDocument();
+
+    await user.selectOptions(screen.getByRole("combobox", { name: "Member" }), WORKER);
+    await waitFor(() => expect(listRequests().some((u) => u.searchParams.get("UserId") === WORKER)).toBe(true));
+  }, RENDER_BUDGET_MS);
+
+  it("says how many of the range's sessions are loaded, and loads the older ones on request", async () => {
+    const user = userEvent.setup();
+    serveZone("UTC");
+    goLive([]);
+    vi.mocked(fetch).mockImplementation(async (url) => {
+      const skip = new URL(String(url)).searchParams.get("SkipCount");
+      return skip === "0"
+        ? json({ items: [newRow()], totalCount: 3 })
+        : json({ items: [newRow(), legacyRow(), screenOnlyRow()], totalCount: 3 }); // a repeated row is kept once
+    });
+    render(<ActivitiesPage />);
+
+    expect(await screen.findByText(/Loaded the 1 most recent of 3 sessions in this range\./)).toBeInTheDocument();
+    expect(screen.getByText(/^3 tracked sessions/)).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: /^Open session:/ })).toHaveLength(1);
+
+    await user.click(screen.getAllByRole("button", { name: "Load older sessions" })[0]);
+    await waitFor(() => expect(screen.getAllByRole("button", { name: /^Open session:/ })).toHaveLength(3));
+    expect(listRequests().map((u) => u.searchParams.get("SkipCount"))).toEqual(["0", "1"]);
+    expect(screen.queryByText(/most recent of 3 sessions/)).not.toBeInTheDocument();
+  }, RENDER_BUDGET_MS);
+
+  it("points at the desktop agent only when the default range has nothing at all", async () => {
+    serveZone("UTC");
+    goLive([]);
+    render(<ActivitiesPage />);
+    expect(await screen.findByText("No activity in the last 7 days")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Get the desktop agent" })).toHaveAttribute("href", "/download");
+  }, RENDER_BUDGET_MS);
+});
+
+describe("session cards show what newer agents report (live)", () => {
+  const capturedAt = () => new Date(Date.now() - 31 * 60_000).toISOString();
+
+  it("shows the note, idle time, why the block ended, the device, and the capture's time and blur", async () => {
+    serveZone("UTC");
+    const at = capturedAt();
+    goLive([
+      v2Row({
+        description: "Fixing the login bug",
+        idleSeconds: 120,
+        endReason: "pause",
+        platform: "windows",
+        osVersion: "Windows 11 Pro",
+        deviceName: "DESKTOP-7Q2",
+        agentVersion: "0.2.0",
+        captures: [
+          { id: SCREEN_NEW, kind: "screen", capturedAt: at, blurred: true },
+          { id: THUMB_NEW, kind: "thumb", capturedAt: at, blurred: true },
+        ],
+      }),
+    ]);
+    render(<ActivitiesPage />);
+
+    const card = await screen.findByRole("button", { name: /^Open session:/ });
+    expect(within(card).getByText("Fixing the login bug")).toBeInTheDocument();
+    expect(within(card).getByText("Task note:")).toBeInTheDocument();
+    expect(within(card).getByText("2m idle")).toBeInTheDocument();
+    expect(within(card).getByText("Paused")).toBeInTheDocument();
+    expect(within(card).getByText("DESKTOP-7Q2")).toBeInTheDocument();
+    expect(within(card).getByTitle("Windows 11 Pro · DESKTOP-7Q2 · agent 0.2.0")).toBeInTheDocument();
+
+    const media = screen.getByRole("button", { name: /^View screenshot:/ });
+    expect(media).toHaveAccessibleName(expect.stringContaining(`captured ${formatClock(at, "UTC")}, blurred`));
+    expect(within(media).getByText("Blurred")).toBeInTheDocument();
+    expect(within(media).getByText(formatClock(at, "UTC"))).toBeInTheDocument();
+  }, RENDER_BUDGET_MS);
+
+  it("shows an unmeasured block as 'Not measured', never as 0%", async () => {
+    serveZone("UTC");
+    goLive([v2Row({ productivity: null })]);
+    render(<ActivitiesPage />);
+    const card = await screen.findByRole("button", { name: /^Open session:/ });
+    expect(within(card).getByText("Not measured")).toBeInTheDocument();
+    expect(within(card).queryByRole("progressbar")).not.toBeInTheDocument();
+    expect(screen.getByText(/activity not measured$/)).toBeInTheDocument(); // the day's header
+  }, RENDER_BUDGET_MS);
+});
+
+describe("editing a block's task note (live)", () => {
+  it("lets a manager edit the note in the report; the card follows and the server's tidy text wins", async () => {
+    const user = userEvent.setup();
+    serveZone("UTC");
+    vi.mocked(updateActivityNote).mockReset();
+    vi.mocked(updateActivityNote).mockResolvedValue({ ...v2Row({ description: "Release notes v2" }) } as never);
+    goLive([v2Row({ description: "Release notes" })]);
+    render(<ActivitiesPage />);
+
+    await user.click(await screen.findByRole("button", { name: /^Open session:/ }));
+    const dialog = await screen.findByRole("dialog", { name: "Activity detail" });
+    await user.click(within(dialog).getByRole("button", { name: "Edit note" }));
+    const field = within(dialog).getByRole("textbox", { name: "Task note" });
+    await user.clear(field);
+    await user.type(field, "  Release   notes v2 ");
+    await user.click(within(dialog).getByRole("button", { name: "Save note" }));
+
+    expect(updateActivityNote).toHaveBeenCalledWith(A_NEW, "Release notes v2");
+    expect(await within(dialog).findByText("Release notes v2")).toBeInTheDocument();
+    expect(within(dialog).getByText("Note saved.")).toBeInTheDocument();
+
+    await user.keyboard("{Escape}");
+    const card = await screen.findByRole("button", { name: /^Open session:/ });
+    expect(within(card).getByText("Release notes v2")).toBeInTheDocument();
+  }, RENDER_BUDGET_MS);
+
+  it("keeps the draft and says why when the server refuses, and Escape cancels without closing the report", async () => {
+    const user = userEvent.setup();
+    serveZone("UTC");
+    vi.mocked(updateActivityNote).mockReset();
+    vi.mocked(updateActivityNote).mockRejectedValue(
+      new ApiError("API PUT Error: Forbidden", 403, { code: null, message: "Notes can be edited for 30 days.", details: null, validationErrors: [] }),
+    );
+    goLive([v2Row({ description: null })]);
+    render(<ActivitiesPage />);
+
+    await user.click(await screen.findByRole("button", { name: /^Open session:/ }));
+    const dialog = await screen.findByRole("dialog", { name: "Activity detail" });
+    expect(within(dialog).getByText("No task note")).toBeInTheDocument();
+    await user.click(within(dialog).getByRole("button", { name: "Add note" }));
+    await user.type(within(dialog).getByRole("textbox", { name: "Task note" }), "Standup notes{Enter}");
+
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent("Notes can be edited for 30 days.");
+    expect(within(dialog).getByRole("textbox", { name: "Task note" })).toHaveValue("Standup notes");
+
+    await user.keyboard("{Escape}");
+    expect(screen.getByRole("dialog", { name: "Activity detail" })).toBeInTheDocument();
+    expect(within(dialog).queryByRole("textbox", { name: "Task note" })).not.toBeInTheDocument();
+  }, RENDER_BUDGET_MS);
+
+  it("lets a member edit their own recent note too", async () => {
+    serveZone("UTC");
+    goLive([v2Row({ description: "My block" })]);
+    session.current = { user: worker, isLive: true, status: "ready" };
+    const user = userEvent.setup();
+    render(<ActivitiesPage />);
+    await user.click(await screen.findByRole("button", { name: /^Open session:/ }));
+    const dialog = await screen.findByRole("dialog", { name: "Activity detail" });
+    expect(within(dialog).getByRole("button", { name: "Edit note" })).toBeInTheDocument();
+  }, RENDER_BUDGET_MS);
+});
+
+describe("who is live comes from presence, not from the row (live)", () => {
+  it("badges the tracking member's latest block and filters to it with 'Live sessions only'", async () => {
+    const user = userEvent.setup();
+    serveZone("UTC");
+    vi.mocked(getTeamPresence).mockResolvedValue([
+      { userId: WORKER, userName: "wendy", deviceId: "d1", status: "tracking", online: true, lastSeenAt: new Date().toISOString() },
+    ]);
+    const running = newRow({ id: guid(7), ...times(2, 298) }); // ended 2 min ago, on a 10-minute project
+    goLive([running, legacyRow()]);
+    render(<ActivitiesPage />);
+
+    const cards = await screen.findAllByRole("button", { name: /^Open session:/ });
+    await waitFor(() => expect(cards[0]).toHaveAccessibleName(expect.stringMatching(/live now$/)));
+    expect(cards[1]).not.toHaveAccessibleName(expect.stringMatching(/live now$/));
+    expect(within(screen.getAllByRole("button", { name: /^View screenshot:/ })[0]).getByText("Live")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Filters" }));
+    const toggle = screen.getByRole("switch", { name: /Live sessions only/ });
+    expect(screen.getByText("1 member is tracking now")).toBeInTheDocument();
+    await user.click(toggle);
+    await waitFor(() => expect(screen.getAllByRole("button", { name: /^Open session:/ })).toHaveLength(1));
+    expect(screen.getByRole("button", { name: /^Open session:/ })).toHaveAccessibleName(expect.stringMatching(/live now$/));
+  }, RENDER_BUDGET_MS);
+
+  it("has no live session while nobody is tracking", async () => {
+    const user = userEvent.setup();
+    serveZone("UTC");
+    goLive([newRow({ ...times(2, 298) })]);
+    render(<ActivitiesPage />);
+    await screen.findAllByRole("button", { name: /^Open session:/ });
+    await user.click(screen.getByRole("button", { name: "Filters" }));
+    expect(screen.getByText("Nobody is tracking right now")).toBeInTheDocument();
+    await user.click(screen.getByRole("switch", { name: /Live sessions only/ }));
+    expect(await screen.findByText("No activities match your filters")).toBeInTheDocument();
+  }, RENDER_BUDGET_MS);
+});
+
+describe("screenshot viewer below 1024px and its downloads (live)", () => {
+  it("opens the block's details as a bottom sheet; Escape closes the sheet first, then the viewer", async () => {
+    const user = userEvent.setup();
+    serveZone("UTC");
+    goLive([v2Row({ description: "Sprint review deck", idleSeconds: 60, endReason: "lock" })]);
+    render(<ActivitiesPage />);
+    await user.click(await screen.findByRole("button", { name: /^View screenshot:/ }));
+    const viewer = await screen.findByRole("dialog", { name: "Screenshot viewer" });
+
+    const details = within(viewer).getByRole("button", { name: "Details" });
+    expect(details).toHaveAttribute("aria-expanded", "false");
+    await user.click(details);
+    const sheet = within(viewer).getByRole("region", { name: "Screenshot details" });
+    expect(details).toHaveAttribute("aria-expanded", "true");
+    expect(within(sheet).getByText("Sprint review deck")).toBeInTheDocument();
+    expect(within(sheet).getByText("Screen locked")).toBeInTheDocument();
+    expect(within(sheet).getByText("1m idle")).toBeInTheDocument();
+    expect(within(sheet).getByText("Key presses")).toBeInTheDocument();
+    expect(await axe(sheet)).toHaveNoViolations();
+
+    await user.keyboard("{Escape}");
+    expect(within(viewer).queryByRole("region", { name: "Screenshot details" })).not.toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "Screenshot viewer" })).toBeInTheDocument();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog", { name: "Screenshot viewer" })).not.toBeInTheDocument();
+  }, RENDER_BUDGET_MS);
+
+  it("edits a block's note from the viewer, and a draft never follows to the next screenshot", async () => {
+    const user = userEvent.setup();
+    serveZone("UTC");
+    vi.mocked(updateActivityNote).mockReset();
+    vi.mocked(updateActivityNote).mockResolvedValue({ ...v2Row({ id: A_SCREEN_ONLY, description: "Checked the build" }) } as never);
+    goLive([v2Row({ description: "First block" }), { ...screenOnlyRow(), description: null }]);
+    render(<ActivitiesPage />);
+    await user.click((await screen.findAllByRole("button", { name: /^View screenshot:/ }))[0]);
+    const viewer = await screen.findByRole("dialog", { name: "Screenshot viewer" });
+    await user.click(within(viewer).getByRole("button", { name: "Details" }));
+    let sheet = within(viewer).getByRole("region", { name: "Screenshot details" });
+
+    // A draft on the first screenshot is dropped when stepping to the next one.
+    await user.click(within(sheet).getByRole("button", { name: "Edit note" }));
+    await user.type(within(sheet).getByRole("textbox", { name: "Task note" }), " (draft)");
+    await user.click(within(viewer).getByRole("button", { name: "Next screenshot" }));
+    sheet = within(viewer).getByRole("region", { name: "Screenshot details" });
+    expect(within(sheet).queryByRole("textbox", { name: "Task note" })).not.toBeInTheDocument();
+    expect(within(sheet).getByText("No task note")).toBeInTheDocument();
+
+    // The second block's note is saved against the second block.
+    await user.click(within(sheet).getByRole("button", { name: "Add note" }));
+    await user.type(within(sheet).getByRole("textbox", { name: "Task note" }), "Checked the build{Enter}");
+    expect(updateActivityNote).toHaveBeenCalledWith(A_SCREEN_ONLY, "Checked the build");
+    expect(await within(sheet).findByText("Checked the build")).toBeInTheDocument();
+  }, RENDER_BUDGET_MS);
+
+  it("abandons the downloads still running when it closes, and releases one that lands after", async () => {
+    const user = userEvent.setup();
+    serveZone("UTC");
+    const pending = new Map<string, { resolve: (url: string) => void; signal?: AbortSignal }>();
+    vi.mocked(getAuthedBlobUrl).mockImplementation((endpoint: string, init?: { signal?: AbortSignal }) =>
+      endpoint === content(SCREEN_NEW)
+        ? new Promise<string>((resolve) => pending.set(endpoint, { resolve, signal: init?.signal }))
+        : Promise.resolve(blobFor(endpoint)),
+    );
+    goLive([newRow()]);
+    render(<ActivitiesPage />);
+    await user.click(await screen.findByRole("button", { name: /^View screenshot:/ }));
+    await screen.findByRole("dialog", { name: "Screenshot viewer" });
+    await waitFor(() => expect(pending.has(content(SCREEN_NEW))).toBe(true));
+
+    await user.keyboard("{Escape}");
+    const download = pending.get(content(SCREEN_NEW))!;
+    expect(download.signal?.aborted).toBe(true);
+    // It arrives anyway (the abort raced it): nobody will show it, so it is released at once.
+    act(() => download.resolve("blob:late-screen"));
+    await waitFor(() => expect(revoke).toHaveBeenCalledWith("blob:late-screen"));
   }, RENDER_BUDGET_MS);
 });

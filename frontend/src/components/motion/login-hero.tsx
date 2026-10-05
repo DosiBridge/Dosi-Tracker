@@ -4,8 +4,8 @@ import { Radar, ShieldCheck, Camera, Gauge } from "lucide-react";
 import { parallaxStyle, usePointerParallax } from "@/hooks/use-pointer-parallax";
 
 const features = [
-  { icon: Gauge, text: "Live productivity & focus signals" },
-  { icon: Camera, text: "Optional captures — blur by default" },
+  { icon: Gauge, text: "Live activity & focus signals" },
+  { icon: Camera, text: "Optional captures — blurred where a project asks" },
   { icon: ShieldCheck, text: "Counts only — never keystroke content" },
 ];
 

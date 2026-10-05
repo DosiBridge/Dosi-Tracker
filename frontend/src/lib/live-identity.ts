@@ -77,9 +77,12 @@ export function isHostConfig(config: AppConfiguration): boolean {
  *    "host" (the platform operator);
  *  - tenant "admin" role → "owner" (the workspace's owner/admin account);
  *  - team managers / people who may see everyone's activity → "admin";
+ *  - a member whose every project membership is the Client role
+ *    (`clientOnly`, see isClientOnly) → "client" (their projects' progress
+ *    and reports; never tracked);
  *  - everyone else → "worker" (sees only their own data).
  */
-export function resolveLiveRole(config: AppConfiguration): Role {
+export function resolveLiveRole(config: AppConfiguration, options: { clientOnly?: boolean } = {}): Role {
   if (isHostConfig(config)) {
     // Host side: the platform operator (Tracker.Platform, or the host admin).
     // Any other host-side account has no tenant and no platform rights.
@@ -87,13 +90,32 @@ export function resolveLiveRole(config: AppConfiguration): Role {
   }
   if (hasRole(config, "admin")) return "owner";
   if (granted(config, PERMISSION.manageTeam) || granted(config, PERMISSION.viewAllActivities)) return "admin";
-  return "worker";
+  return options.clientOnly ? "client" : "worker";
+}
+
+/** A project membership as GET /api/app/team/project-members/{projectId} lists it. */
+export interface MembershipRole {
+  userId?: string | null;
+  role?: string | null;
+}
+
+/** The project role of clients: they follow their projects' progress and reports, and never track (contract §2, §6). */
+export const CLIENT_PROJECT_ROLE = "client";
+
+/**
+ * Whether `userId` takes part ONLY as a client: they hold at least one
+ * membership and every one of them has the Client role. Someone who tracks on
+ * any project (Worker, Manager, Admin) is a member, not a client.
+ */
+export function isClientOnly(memberships: readonly MembershipRole[], userId: string): boolean {
+  const mine = memberships.filter((m) => m && String(m.userId ?? "") === userId);
+  return mine.length > 0 && mine.every((m) => (m.role ?? "").trim().toLowerCase() === CLIENT_PROJECT_ROLE);
 }
 
 /** The signed-in user, from the backend identity (never a demo person). */
-export function buildLiveUser(config: AppConfiguration): User {
+export function buildLiveUser(config: AppConfiguration, options: { clientOnly?: boolean } = {}): User {
   const cu = config.currentUser ?? {};
-  const role = resolveLiveRole(config);
+  const role = resolveLiveRole(config, options);
   return {
     id: String(cu.id ?? "me"),
     name: displayName({ name: cu.name, surName: cu.surName, userName: cu.userName, email: cu.email }, "You"),
@@ -109,17 +131,30 @@ export function buildLiveUser(config: AppConfiguration): User {
   };
 }
 
-/** Backend plan name → the app's plan id (unknown/custom plans read as enterprise-style custom pricing). */
+/**
+ * Backend plan name → the app's plan id. A custom plan — or one that couldn't
+ * be loaded at all — reads as the custom-pricing tier (no seat cap, no list
+ * price), never as Free: guessing the most restrictive plan disabled invites
+ * and showed "limit reached" to paying tenants whose plan lookup had failed.
+ */
 export function planIdFromName(name: string | null | undefined): PlanId {
   const n = (name ?? "").trim().toLowerCase();
   if (n === "free" || n === "starter" || n === "business" || n === "enterprise") return n;
-  return n ? "enterprise" : "free";
+  return "enterprise";
 }
 
+/**
+ * The backend's subscription status as the app's. A workspace without a
+ * subscription (or an older server that sends none) reads as active — the
+ * backend enforces nothing then either.
+ */
 export function subscriptionStatus(raw: string | null | undefined): SubscriptionStatus {
   const s = (raw ?? "").toLowerCase().replace(/[\s-]/g, "_");
   if (s === "trialing" || s === "trial") return "trialing";
   if (s === "past_due" || s === "pastdue") return "past_due";
+  if (s === "suspended") return "suspended";
+  if (s === "canceled" || s === "cancelled") return "canceled";
+  if (s === "expired") return "expired";
   return "active";
 }
 
@@ -144,7 +179,10 @@ export function liveWorkspaceId(config: AppConfiguration): string {
 /**
  * The real workspace: the tenant's own name and its real subscription. Seat and
  * price limits come from the backend plan when it is known, so the UI never
- * quotes the demo plan table to a paying tenant.
+ * quotes the demo plan table to a paying tenant. When the plan is NOT known
+ * (`live.known` false — the lookup failed or the plan was removed), the
+ * workspace says so ("Unknown plan", no seat cap; see saas-data) and the
+ * backend, which enforces seats itself, stays the judge.
  */
 export function buildLiveWorkspace(
   config: AppConfiguration,

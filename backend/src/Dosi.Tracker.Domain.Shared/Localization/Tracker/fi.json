@@ -37,6 +37,12 @@
     "Unspecified": "Järjestelmä",
     "SeeAllUsers": "Katso Kaikki käyttäjät",
     "TakePhoto": "Ota valokuva",
-    "ChoosePhoto": "Valitse Valokuva"
+    "ChoosePhoto": "Valitse Valokuva",
+    "Tracker:ActivityTooOld": "Aktiviteetti alkoi liian kauan sitten, eikä sitä voi enää tallentaa.",
+    "Tracker:NotProjectMember": "Et ole tämän projektin jäsen.",
+    "Tracker:SubscriptionInactive": "Työtilan tilaus ei ole voimassa. Pyydä työtilan omistajaa uusimaan se.",
+    "Tracker:InvalidUser": "Käyttäjää ei ole tässä työtilassa.",
+    "Tracker:CannotModifySelf": "Et voi tehdä tätä muutosta omaan tiliisi tai jäsenyyteesi.",
+    "Tracker:RoleNotAllowed": "Vain työtilan omistaja voi myöntää tämän roolin, muuttaa tuntihintoja tai hallita omistajan tiliä."
   }
 }

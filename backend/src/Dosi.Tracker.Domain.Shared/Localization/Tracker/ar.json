@@ -37,6 +37,12 @@
     "Unspecified": "نظام",
     "SeeAllUsers": "رؤية كافة المستخدمين",
     "TakePhoto": "تصوير",
-    "ChoosePhoto": "اختر صورة"
+    "ChoosePhoto": "اختر صورة",
+    "Tracker:ActivityTooOld": "بدأ هذا النشاط منذ وقت طويل جدًا ولم يعد من الممكن تسجيله.",
+    "Tracker:NotProjectMember": "أنت لست عضوًا في هذا المشروع.",
+    "Tracker:SubscriptionInactive": "اشتراك مساحة العمل غير نشط. اطلب من مالك مساحة العمل تجديده.",
+    "Tracker:InvalidUser": "المستخدم غير موجود في مساحة العمل هذه.",
+    "Tracker:CannotModifySelf": "لا يمكنك إجراء هذا التغيير على حسابك أو عضويتك.",
+    "Tracker:RoleNotAllowed": "يمكن لمالك مساحة العمل فقط منح هذا الدور أو تغيير الأجور بالساعة أو إدارة حساب المالك."
   }
 }

@@ -2,7 +2,6 @@ using Riok.Mapperly.Abstractions;
 using Volo.Abp.Mapperly;
 using Dosi.Tracker.SaaS;
 using Dosi.Tracker.Billing;
-using Dosi.Tracker.Teams;
 using Dosi.Tracker.Projects;
 using Dosi.Tracker.Notifications;
 
@@ -30,10 +29,10 @@ public partial class InvoiceMapper : MapperBase<Invoice, InvoiceDto>
 }
 
 [Mapper(RequiredMappingStrategy = RequiredMappingStrategy.Target)]
-public partial class ProjectMemberMapper : MapperBase<ProjectMember, ProjectMemberDto>
+public partial class ProjectMapper : MapperBase<Project, ProjectDto>
 {
-    public override partial ProjectMemberDto Map(ProjectMember source);
-    public override partial void Map(ProjectMember source, ProjectMemberDto destination);
+    public override partial ProjectDto Map(Project source);
+    public override partial void Map(Project source, ProjectDto destination);
 }
 
 [Mapper(RequiredMappingStrategy = RequiredMappingStrategy.Target)]

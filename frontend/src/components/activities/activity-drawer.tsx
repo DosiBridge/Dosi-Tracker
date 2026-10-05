@@ -9,8 +9,12 @@ import {
   ChartColumn,
   ChevronRight,
   Clock,
+  Cpu,
   Download,
+  Expand,
+  ExternalLink,
   Gauge,
+  Hourglass,
   Keyboard,
   ListTree,
   Maximize2,
@@ -24,21 +28,32 @@ import { Drawer } from "@/components/ui/drawer";
 import { ScreenMockView } from "@/components/screen-mock";
 import { ActivityTimeline } from "@/components/activities/activity-timeline";
 import { captureContentEndpoint } from "@/components/activities/capture-thumb";
+import { NoteEditor, type NoteEditing } from "@/components/activities/note-editor";
+import { BlurredChip, EndReasonChip, LiveBadge } from "@/components/activities/session-meta";
+import { ViewHint, activityValue } from "@/components/activities/session-card";
 import { getApi, getAuthedBlobUrl, isLiveSession } from "@/hooks/useApi";
 import {
+  DEFAULT_SESSION_DESCRIPTION,
   blockSeconds,
+  clockSkewNote,
   formatClock,
+  formatSessionDate,
   formatTimeRange,
+  friendlyAppName,
   groupWindowsByApp,
   shareOfBlock,
   summarizeTimeline,
   timelineSlots,
   type AppWindowGroup,
+  type SessionDetails,
 } from "@/lib/activity-report";
+import { appColor } from "@/lib/apps";
+import { captureExtension, platformLabel } from "@/lib/api-contract";
 import { mapApiCaptureMetas, type CaptureMeta } from "@/lib/live-dataset";
 import { userById } from "@/lib/tenant-data";
-import type { Activity } from "@/lib/types";
-import { cn, colorFromString, formatSeconds } from "@/lib/utils";
+import { formatUtcOffset, timeZoneLabel, zonedParts } from "@/lib/time-zone";
+import type { Activity, UserStatus } from "@/lib/types";
+import { cn, formatSeconds } from "@/lib/utils";
 
 /** Real backend rows have GUID ids; mock demo rows use short slugs. */
 const GUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
@@ -71,14 +86,19 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-/** "screen-2026-09-29-1004.jpg" — a download name that sorts by time. */
-function captureFileName(c: CaptureMeta): string {
-  const ext = c.contentType?.includes("png") ? "png" : c.contentType?.includes("webp") ? "webp" : "jpg";
-  const d = c.capturedAt ? new Date(c.capturedAt) : null;
+/** "screen-2026-09-29-1004.jpg" — a download name that sorts by time (the clock of `timeZone`, default the viewer's). */
+function captureFileName(c: CaptureMeta, timeZone?: string): string {
+  const ext = captureExtension(c.contentType);
+  const at = c.capturedAt ? Date.parse(c.capturedAt) : Number.NaN;
   const pad = (v: number) => String(v).padStart(2, "0");
-  const stamp = d
-    ? `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`
-    : c.id;
+  let stamp = c.id;
+  if (Number.isFinite(at)) {
+    const d = new Date(at);
+    const p = timeZone
+      ? zonedParts(at, timeZone)
+      : { year: d.getFullYear(), month: d.getMonth() + 1, day: d.getDate(), hour: d.getHours(), minute: d.getMinutes() };
+    stamp = `${p.year}-${pad(p.month)}-${pad(p.day)}-${pad(p.hour)}${pad(p.minute)}`;
+  }
   return `${c.kind}-${stamp}.${ext}`;
 }
 
@@ -92,11 +112,29 @@ function captureFileName(c: CaptureMeta): string {
 export function ActivityDrawer({
   activity,
   project,
+  details,
+  note,
+  liveNow = false,
+  memberStatus,
+  timeZone,
   onClose,
+  onViewScreenshot,
 }: {
   activity: Activity | null;
   project: ProjectLabel | null;
+  /** what newer agents report about the block (note, idle, end reason, device, capture) */
+  details?: SessionDetails;
+  /** how the viewer may change the block's task note; omitted: read-only */
+  note?: NoteEditing;
+  /** the member is tracking right now and this is their latest block */
+  liveNow?: boolean;
+  /** the member's presence dot (default: the roster's status) */
+  memberStatus?: UserStatus;
+  /** the reporting zone dates and clock times read in (default: the viewer's) */
+  timeZone?: string;
   onClose: () => void;
+  /** open this block in the full-screen screenshot viewer; omitted when it has nothing to view */
+  onViewScreenshot?: () => void;
 }) {
   const a = activity;
   const u = a ? userById(a.userId) : null;
@@ -157,6 +195,9 @@ export function ActivityDrawer({
   const slots = useMemo(() => (a ? timelineSlots(a) : []), [a]);
   const timeline = useMemo(() => summarizeTimeline(slots), [slots]);
   const apps = useMemo(() => (a ? groupWindowsByApp(a.activeWindows) : []), [a]);
+  const activityPercent = a ? activityValue(a, details) : null;
+  // The member's own words: the reported note, else a demo/legacy description that isn't the placeholder.
+  const noteText = details ? details.note : a && a.description !== DEFAULT_SESSION_DESCRIPTION ? a.description : null;
 
   return (
     <Drawer open={!!a} onClose={onClose} title="Activity detail">
@@ -165,7 +206,7 @@ export function ActivityDrawer({
           <div className="space-y-4">
             <div className="flex items-center justify-between gap-3">
               <div className="flex min-w-0 items-center gap-3">
-                <Avatar name={u?.name ?? ""} size="lg" status={u?.status} />
+                <Avatar name={u?.name ?? ""} size="lg" status={memberStatus ?? u?.status} />
                 <div className="min-w-0">
                   <div className="truncate font-semibold">{u?.name ?? "Unknown member"}</div>
                   <div className="truncate text-xs text-muted-foreground">{u?.designation}</div>
@@ -179,25 +220,22 @@ export function ActivityDrawer({
               )}
             </div>
             <div className="rounded-xl border border-border p-3">
-              <p className="text-sm font-medium">{a.description}</p>
-              <div className="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
+              <NoteEditor note={noteText} editing={note} />
+              <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1.5 text-xs text-muted-foreground">
                 <span className="inline-flex items-center gap-1.5">
                   <CalendarDays className="h-3.5 w-3.5" aria-hidden />
-                  {new Date(a.startedAt).toLocaleDateString("en", {
-                    weekday: "short",
-                    month: "short",
-                    day: "numeric",
-                    year: "numeric",
-                  })}
+                  {formatSessionDate(a.startedAt, timeZone, { year: true })}
                 </span>
                 <span className="inline-flex items-center gap-1.5">
                   <Clock className="h-3.5 w-3.5" aria-hidden />
-                  {formatTimeRange(a)}
+                  {formatTimeRange(a, timeZone)}
                 </span>
                 <span className="inline-flex items-center gap-1.5">
                   <Timer className="h-3.5 w-3.5" aria-hidden />
                   {formatSeconds(totalSeconds)}
                 </span>
+                <EndReasonChip reason={details?.endReason} />
+                {liveNow && <LiveBadge />}
               </div>
             </div>
           </div>
@@ -207,7 +245,7 @@ export function ActivityDrawer({
               screenCaptures.length > 0 ? (
                 <div className="space-y-4">
                   {screenCaptures.map((c) => (
-                    <CaptureFigure key={c.id} capture={c} />
+                    <CaptureFigure key={c.id} capture={c} onView={onViewScreenshot} timeZone={timeZone} />
                   ))}
                 </div>
               ) : (
@@ -219,6 +257,17 @@ export function ActivityDrawer({
                       : "No screenshot captured"}
                 </div>
               )
+            ) : onViewScreenshot ? (
+              <button
+                type="button"
+                onClick={onViewScreenshot}
+                aria-label="View screenshot large"
+                className="group/media relative block w-full cursor-zoom-in overflow-hidden rounded-xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                <ScreenMockView screen={a.screen} title={a.activeWindows[0]?.windowTitle} className="aspect-video w-full" />
+                <ViewLargeBadge />
+                <ViewHint />
+              </button>
             ) : (
               <ScreenMockView screen={a.screen} title={a.activeWindows[0]?.windowTitle} className="aspect-video w-full" />
             )}
@@ -233,7 +282,7 @@ export function ActivityDrawer({
                       <img
                         key={c.id}
                         src={c.url}
-                        alt={c.capturedAt ? `Webcam frame, ${formatClock(c.capturedAt)}` : "Webcam frame"}
+                        alt={c.capturedAt ? `Webcam frame, ${formatClock(c.capturedAt, timeZone)}` : "Webcam frame"}
                         className="aspect-video w-40 rounded-lg border border-border object-cover"
                       />
                     ))}
@@ -257,19 +306,25 @@ export function ActivityDrawer({
               {timeline.minutes > 0 && (
                 <Stat icon={ActivityIcon} label="Active minutes" value={`${timeline.activeMinutes} of ${timeline.minutes} min`} />
               )}
-              <Stat icon={Gauge} label="Activity" value={`${a.productivity}%`} />
+              <Stat icon={Gauge} label="Activity" value={activityPercent === null ? "Not measured" : `${activityPercent}%`} />
+              {details?.idleSeconds !== null && details?.idleSeconds !== undefined && (
+                <Stat icon={Hourglass} label="Idle" value={formatSeconds(Math.min(details.idleSeconds, totalSeconds))} />
+              )}
               <Stat icon={Keyboard} label="Keyboard presses" value={count(a.keyboardHits)} />
               <Stat icon={MousePointerClick} label="Mouse clicks" value={count(a.mouseClicks)} />
             </div>
             <p className="text-xs text-muted-foreground">
-              Activity is based on focused apps and input counts during this block — not a judgment score. Keys are
-              counted, never recorded.
+              {activityPercent === null
+                ? "The desktop app couldn’t measure keyboard and mouse input for this block (not allowed by the project, or not available on the device), so it has no activity %."
+                : "Activity is based on focused apps and input counts during this block — not a judgment score. Keys are counted, never recorded."}
             </p>
           </div>
 
+          {details && <DeviceSection details={details} reportingZone={timeZone} startedAt={a.startedAt} />}
+
           {slots.length > 0 && (
             <Section icon={ChartColumn} title="Activity timeline">
-              <ActivityTimeline activity={a} />
+              <ActivityTimeline activity={a} timeZone={timeZone} />
             </Section>
           )}
 
@@ -293,8 +348,8 @@ export function ActivityDrawer({
             <Section icon={ListTree} title="Running programs">
               <div className="flex flex-wrap gap-1.5">
                 {a.runningPrograms.map((w, i) => (
-                  <Badge key={i} tone="muted">
-                    {w.appName}
+                  <Badge key={i} tone="muted" title={w.appName}>
+                    {friendlyAppName(w.appName)}
                   </Badge>
                 ))}
               </div>
@@ -340,39 +395,134 @@ function Stat({ icon: Icon, label, value }: { icon: typeof Clock; label: string;
   );
 }
 
-/** One full-size capture: click to open it at full resolution in a new tab, or download it. */
-function CaptureFigure({ capture: c }: { capture: CaptureView }) {
-  const when = c.capturedAt ? formatClock(c.capturedAt) : null;
+/**
+ * Where the block came from: the device, its system and agent version, the
+ * device's own time zone, and anything about the clock or the input worth a
+ * second look. Renders nothing for a block from an older agent.
+ */
+function DeviceSection({
+  details: d,
+  reportingZone,
+  startedAt,
+}: {
+  details: SessionDetails;
+  reportingZone?: string;
+  startedAt: string;
+}) {
+  const at = Date.parse(startedAt);
+  const zone =
+    d.timeZone && Number.isFinite(at)
+      ? timeZoneLabel(d.timeZone, at)
+      : d.utcOffsetMinutes !== null
+        ? formatUtcOffset(d.utcOffsetMinutes)
+        : null;
+  const skew = clockSkewNote(d.clockSkewSeconds);
+  const rows: { label: string; value: string }[] = [];
+  if (d.deviceName) rows.push({ label: "Device", value: d.deviceName });
+  const system = d.osVersion ?? platformLabel(d.platform);
+  if (system) rows.push({ label: "System", value: system });
+  if (d.agentVersion) rows.push({ label: "Desktop app", value: `Version ${d.agentVersion}` });
+  // Only worth a row when it differs from the zone the page reads in.
+  if (zone && d.timeZone !== reportingZone) rows.push({ label: "Device time zone", value: zone });
+  if (skew) rows.push({ label: "Clock", value: skew });
+  if (d.injectedInputEvents) {
+    rows.push({
+      label: "Synthetic input",
+      value: `${count(d.injectedInputEvents)} software-generated ${d.injectedInputEvents === 1 ? "event" : "events"} ignored`,
+    });
+  }
+  if (rows.length === 0) return null;
+  return (
+    <Section icon={Cpu} title="Device">
+      <dl className="divide-y divide-border rounded-xl border border-border text-sm">
+        {rows.map((r) => (
+          <div key={r.label} className="flex items-baseline justify-between gap-4 px-3 py-2">
+            <dt className="shrink-0 text-xs text-muted-foreground">{r.label}</dt>
+            <dd className="min-w-0 truncate text-right font-medium" title={r.value}>
+              {r.value}
+            </dd>
+          </div>
+        ))}
+      </dl>
+    </Section>
+  );
+}
+
+/** An always-visible "View large" chip on a screenshot that opens the viewer. */
+function ViewLargeBadge() {
+  return (
+    <span
+      aria-hidden
+      className="pointer-events-none absolute right-2 top-2 flex items-center gap-1 rounded-md bg-black/65 px-2 py-1 text-[11px] font-medium text-white backdrop-blur"
+    >
+      <Expand className="h-3 w-3" /> View large
+    </span>
+  );
+}
+
+/**
+ * One full-size capture. With `onView` the image opens the full-screen viewer
+ * (and the caption keeps a new-tab link); without it, the image itself opens
+ * the capture at full resolution in a new tab. Downloadable either way.
+ */
+function CaptureFigure({ capture: c, onView, timeZone }: { capture: CaptureView; onView?: () => void; timeZone?: string }) {
+  const when = c.capturedAt ? formatClock(c.capturedAt, timeZone) : null;
   const details = [
     when ? `Captured ${when}` : "Screen capture",
     c.blurred ? "blurred" : null,
     c.sizeBytes ? formatBytes(c.sizeBytes) : null,
   ].filter(Boolean);
+  const frame =
+    "relative block w-full overflow-hidden rounded-xl border border-border focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring";
+  const captionLink = "inline-flex shrink-0 items-center gap-1 font-medium text-primary-strong hover:underline";
   return (
     <figure className="space-y-1.5">
-      <a href={c.url} target="_blank" rel="noopener noreferrer" className="group relative block overflow-hidden rounded-xl border border-border focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
-        {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img
-          src={c.url}
-          alt={when ? `Screen capture from ${when} — open full size` : "Screen capture — open full size"}
-          className="aspect-video w-full object-cover object-top transition-opacity group-hover:opacity-90"
-        />
-        <span
-          className="absolute right-2 top-2 flex h-7 w-7 items-center justify-center rounded-md bg-black/60 text-white opacity-0 backdrop-blur transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100"
-          aria-hidden
+      {onView ? (
+        <button
+          type="button"
+          onClick={onView}
+          aria-label={when ? `View screenshot large (captured ${when})` : "View screenshot large"}
+          className={cn("group/media cursor-zoom-in", frame)}
         >
-          <Maximize2 className="h-3.5 w-3.5" />
-        </span>
-      </a>
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src={c.url}
+            alt={when ? `Screen capture from ${when}` : "Screen capture"}
+            className="aspect-video w-full object-cover object-top"
+          />
+          <ViewLargeBadge />
+          {c.blurred && <BlurredChip className="pointer-events-none absolute left-2 top-2" />}
+          <ViewHint />
+        </button>
+      ) : (
+        <a href={c.url} target="_blank" rel="noopener noreferrer" className={cn("group", frame)}>
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src={c.url}
+            alt={when ? `Screen capture from ${when} — open full size` : "Screen capture — open full size"}
+            className="aspect-video w-full object-cover object-top transition-opacity group-hover:opacity-90"
+          />
+          {c.blurred && <BlurredChip className="pointer-events-none absolute left-2 top-2" />}
+          <span
+            className="absolute right-2 top-2 flex h-7 w-7 items-center justify-center rounded-md bg-black/60 text-white opacity-0 backdrop-blur transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100"
+            aria-hidden
+          >
+            <Maximize2 className="h-3.5 w-3.5" />
+          </span>
+        </a>
+      )}
       <figcaption className="flex items-center justify-between gap-3 text-xs text-muted-foreground">
         <span className="truncate">{details.join(" · ")}</span>
-        <a
-          href={c.url}
-          download={captureFileName(c)}
-          className="inline-flex shrink-0 items-center gap-1 font-medium text-primary-strong hover:underline"
-        >
-          <Download className="h-3.5 w-3.5" aria-hidden /> Download
-        </a>
+        <span className="flex shrink-0 items-center gap-3">
+          {onView && (
+            <a href={c.url} target="_blank" rel="noopener noreferrer" className={captionLink}>
+              <ExternalLink className="h-3.5 w-3.5" aria-hidden /> Open full size
+            </a>
+          )}
+          <a href={c.url} download={captureFileName(c, timeZone)} className={captionLink}>
+            <Download className="h-3.5 w-3.5" aria-hidden /> Download
+          </a>
+        </span>
       </figcaption>
     </figure>
   );
@@ -430,7 +580,9 @@ function AppsTable({ apps, totalSeconds }: { apps: AppWindowGroup[]; totalSecond
                       <div className="flex min-w-0 items-center gap-2">
                         <AppDot app={g.appName} />
                         <div className="min-w-0">
-                          <div className="truncate">{g.appName}</div>
+                          <div className="truncate" title={g.appName}>
+                            {g.displayName}
+                          </div>
                           {g.windows[0].windowTitle && (
                             <div className="truncate text-xs font-normal text-muted-foreground" title={g.windows[0].windowTitle}>
                               {g.windows[0].windowTitle}
@@ -450,7 +602,9 @@ function AppsTable({ apps, totalSeconds }: { apps: AppWindowGroup[]; totalSecond
                           aria-hidden
                         />
                         <AppDot app={g.appName} />
-                        <span className="truncate">{g.appName}</span>
+                        <span className="truncate" title={g.appName}>
+                          {g.displayName}
+                        </span>
                         <span className="hidden shrink-0 text-xs font-normal text-muted-foreground sm:inline">
                           {g.windows.length} windows
                         </span>
@@ -496,6 +650,7 @@ function AppsTable({ apps, totalSeconds }: { apps: AppWindowGroup[]; totalSecond
   );
 }
 
+/** The app's colour — the same one it has on every other page (lib/apps). */
 function AppDot({ app }: { app: string }) {
-  return <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: colorFromString(app, 55, 45) }} aria-hidden />;
+  return <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: appColor(app) }} aria-hidden />;
 }

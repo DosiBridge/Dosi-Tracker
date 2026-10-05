@@ -19,6 +19,7 @@
         <Project Path="test/Dosi.Tracker.Acceptance.Tests/Dosi.Tracker.Acceptance.Tests.csproj" />
         <Project Path="test/Dosi.Tracker.TestBase/Dosi.Tracker.TestBase.csproj" />
         <Project Path="test/Dosi.Tracker.Domain.Tests/Dosi.Tracker.Domain.Tests.csproj" />
+        <Project Path="test/Dosi.Tracker.HttpApi.Host.Tests/Dosi.Tracker.HttpApi.Host.Tests.csproj" />
         <Project Path="test/Dosi.Tracker.HttpApi.Client.ConsoleTestApp/Dosi.Tracker.HttpApi.Client.ConsoleTestApp.csproj" />
     </Folder>
 </Solution>

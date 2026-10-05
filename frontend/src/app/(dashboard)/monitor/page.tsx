@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
   AlertTriangle,
@@ -10,6 +10,7 @@ import {
   Gauge,
   Coffee,
   Download,
+  Hourglass,
   Video,
   Pause,
   MousePointerClick,
@@ -24,6 +25,10 @@ import {
   Users,
   Search,
   Camera,
+  Laptop,
+  Monitor,
+  RefreshCw,
+  StickyNote,
 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -39,19 +44,29 @@ import {
   DayNav,
   MiniDayStrip,
   MonitorKpi,
+  PresenceChip,
   ProductivityLegend,
   TypeLegend,
+  UNMEASURED_COLOR,
+  presenceSince,
   prodColor,
-  typeColor,
+  segmentColor,
 } from "@/components/monitor/shared";
+import { useTeamPresence, useVisibleInterval } from "@/components/monitor/use-team-presence";
+import { CaptureThumb } from "@/components/activities/capture-thumb";
+import { BlurredChip, EndReasonChip } from "@/components/activities/session-meta";
 import { HourlyChart } from "@/components/dashboard/charts";
 import { AppGlyph, ScreenMockView } from "@/components/screen-mock";
 import { useSession } from "@/components/session-provider";
-import { getApi, getAuthedBlobUrl } from "@/hooks/useApi";
+import { getAllPagesApi } from "@/hooks/useApi";
+import { useReportingZone } from "@/hooks/use-reporting-zone";
 import { brand } from "@/lib/brand";
-import { mapApiActivities } from "@/lib/live-dataset";
+import { mapApiActivities, thumbnailCaptureIds } from "@/lib/live-dataset";
 import { referenceNow } from "@/lib/live-session";
 import { activities as sessionActivities, projectById, users } from "@/lib/tenant-data";
+import { formatClock, sessionDetailsById, type SessionDetails } from "@/lib/activity-report";
+import { appColor } from "@/lib/apps";
+import { platformLabel } from "@/lib/api-contract";
 import {
   appBreakdown,
   availableDays,
@@ -62,21 +77,36 @@ import {
   hourlyBuckets,
   type BrowserOverview,
   type DaySegment,
+  type DaySummary,
   type SegmentType,
 } from "@/lib/monitor-data";
 import {
+  DAY_ACTIVITY_LIMIT,
+  DAY_ACTIVITY_MAX,
   DEFAULT_DAY_WINDOW,
+  PRESENCE_STATE_LABELS,
   dayActivityEndpoint,
+  demoPresence,
   lastSeenByUser,
+  latestBlockByUser,
+  liveAppBreakdown,
   liveRoster,
+  mergePresence,
+  presenceGroup,
+  presenceUserStatus,
   segmentsByUser,
   timelineWindow,
+  uploadPresence,
   type DayWindow,
+  type MemberPresence,
+  type PresenceGroup,
+  type PresenceState,
 } from "@/lib/monitor-live";
 import { categoryColor, type AppCategory } from "@/lib/reports-data";
 import { roleLabels } from "@/lib/roles";
+import { timeZoneLabel } from "@/lib/time-zone";
 import { cn, formatDuration } from "@/lib/utils";
-import type { Activity, User, UserStatus } from "@/lib/types";
+import type { Activity, User } from "@/lib/types";
 
 const catLabel: Record<AppCategory, string> = {
   productive: "Productive",
@@ -84,21 +114,9 @@ const catLabel: Record<AppCategory, string> = {
   unproductive: "Unproductive",
 };
 
-const statusCopy: Record<UserStatus, string> = {
-  active: "Active",
-  idle: "Idle",
-  offline: "Offline",
-};
-
-const statusTone: Record<UserStatus, "success" | "warning" | "muted"> = {
-  active: "success",
-  idle: "warning",
-  offline: "muted",
-};
-
 type MonitorView = "timeline" | "schedule";
 type Panel = "roster" | "detail";
-type StatusFilter = "all" | UserStatus;
+type StatusFilter = "all" | PresenceGroup;
 
 const typeIcon: Record<SegmentType, typeof Coffee> = {
   work: Zap,
@@ -107,38 +125,44 @@ const typeIcon: Record<SegmentType, typeof Coffee> = {
   idle: Pause,
 };
 
-function sortRoster<T extends { user: { status: UserStatus }; summary: { tracked: number } }>(list: T[]) {
-  return [...list].sort((a, b) => {
-    const rank = (s: UserStatus) => (s === "active" ? 0 : s === "idle" ? 1 : 2);
-    const byStatus = rank(a.user.status) - rank(b.user.status);
-    if (byStatus !== 0) return byStatus;
-    return b.summary.tracked - a.summary.tracked;
-  });
+/** How often presence (and today's blocks) refresh while the tab is visible. */
+const REFRESH_MS = 30_000;
+
+/** Tracking first, then away, then offline; within a group, the most time tracked first. */
+function sortRoster<T extends { state: PresenceState; summary: { tracked: number } }>(list: T[]) {
+  const rank = (s: PresenceState) => {
+    const group = presenceGroup(s);
+    return group === "tracking" ? 0 : group === "away" ? 1 : 2;
+  };
+  return [...list].sort((a, b) => rank(a.state) - rank(b.state) || b.summary.tracked - a.summary.tracked);
+}
+
+/** Minute-weighted activity over the measured blocks of several summaries; null when none was measured. */
+function teamActivity(summaries: DaySummary[]): number | null {
+  const measured = summaries.reduce((s, x) => s + x.measuredMinutes, 0);
+  if (measured <= 0) return null;
+  const productive = summaries.reduce((s, x) => s + (x.productivityAvg * x.measuredMinutes) / 100, 0);
+  return Math.round((productive / measured) * 100);
 }
 
 /* ── Live mode (real backend session) ─────────────────────────────────────
  * A live session shows ONLY real data: the selected day's activity blocks
- * are fetched and mapped by src/lib/monitor-live.ts, the roster is the real
- * team (a worker sees only themselves), and a failed call shows an error
- * with Retry — never the generated demo timeline. Demo mode is unchanged. */
+ * (a calendar day of the reporting zone, every page of it) mapped by
+ * src/lib/monitor-live.ts, the roster is the real team (a worker sees only
+ * themselves), and who is working NOW comes from the agents' heartbeats.
+ * Presence and today's blocks refresh every 30 s while the tab is visible.
+ * A failed call shows an error with Retry — never the generated demo
+ * timeline. Demo mode keeps its generated days. */
 
-/** The selected day's rows, keyed by `${iso}#${reloadKey}` so a Retry re-fetches. */
-type LiveFetch =
-  | { key: string; ok: true; rows: Activity[]; fetchedAt: number }
-  | { key: string; ok: false };
-
-interface LiveShot {
-  id: string;
-  url: string;
-  /** "09:35" (UTC) */
-  time: string;
-  app: string;
-}
-
-/** "09:35" (UTC) from an ISO timestamp. */
-function fmtIsoTime(ts: string): string {
-  const t = Date.parse(ts);
-  return Number.isNaN(t) ? "—" : new Date(t).toISOString().slice(11, 16);
+/** One loaded day: the rows, what newer agents report about them, and whether the day was cut short. */
+interface LiveDay {
+  /** zone|day|member — which question this answers. */
+  scope: string;
+  rows: Activity[];
+  details: Map<string, SessionDetails>;
+  totalCount: number;
+  truncated: boolean;
+  fetchedAt: number;
 }
 
 /** Two-hourly tick marks across a timeline axis. */
@@ -149,16 +173,14 @@ function axisTicks(span: DayWindow): number[] {
 export default function MonitorPage() {
   const router = useRouter();
   const { user, isLive } = useSession();
-
-  /* ── Live mode state (demo mode never reads it) ── */
-  const [liveFetch, setLiveFetch] = useState<LiveFetch | null>(null);
-  const [reloadKey, setReloadKey] = useState(0);
-  const [shotState, setShotState] = useState<{ key: string; shots: LiveShot[]; done: boolean } | null>(null);
-
-  // Live days pivot on the real clock; demo days on the demo's frozen instant.
-  const days = useMemo(() => availableDays(7, isLive ? referenceNow() : undefined), [isLive]);
-  const monitorable = useMemo(() => users.filter((u) => u.role !== "client"), []);
   const isSelfOnly = user.role === "worker";
+
+  // Live days are calendar days of the reporting zone; the demo's generated days are UTC days of its frozen clock.
+  const zone = useReportingZone(isLive);
+  const tz = isLive ? zone.timeZone : "UTC";
+  const [clock, setClock] = useState(() => referenceNow().getTime());
+  const days = useMemo(() => (isLive ? availableDays(7, new Date(clock), tz) : availableDays(7)), [isLive, clock, tz]);
+  const monitorable = useMemo(() => users.filter((u) => u.role !== "client"), []);
 
   const [panel, setPanel] = useState<Panel>(isSelfOnly ? "detail" : "roster");
   const [userId, setUserId] = useState(() =>
@@ -177,123 +199,122 @@ export default function MonitorPage() {
     window.scrollTo({ top: 0, behavior: "smooth" });
   }, [panel, activeUserId]);
 
-  /* ── Live mode: fetch the selected day's real activity blocks ── */
-  const fetchKey = `${iso}#${reloadKey}`;
+  /* ── Live mode: the selected day's real activity blocks (every page, up to DAY_ACTIVITY_MAX) ── */
   const selfFilter = isSelfOnly ? user.id : undefined;
+  const scope = `${tz}|${iso}|${selfFilter ?? ""}`;
+  const [refreshKey, setRefreshKey] = useState(0);
+  const [liveDay, setLiveDay] = useState<LiveDay | null>(null);
+  const [dayError, setDayError] = useState<{ scope: string; at: number } | null>(null);
+
   useEffect(() => {
-    if (!isLive) return;
-    let cancelled = false;
-    const key = `${iso}#${reloadKey}`;
-    getApi(dayActivityEndpoint(iso, selfFilter))
-      .then((items: unknown) => {
-        if (cancelled) return;
-        if (!Array.isArray(items)) throw new Error("Unexpected activity payload");
-        setLiveFetch({ key, ok: true, rows: mapApiActivities(items), fetchedAt: referenceNow().getTime() });
+    // Wait for the reporting zone, so a day isn't fetched once in the wrong zone and again in the right one.
+    if (!isLive || !zone.ready) return;
+    const controller = new AbortController();
+    getAllPagesApi<unknown>(dayActivityEndpoint(iso, selfFilter, tz), {
+      pageSize: DAY_ACTIVITY_LIMIT,
+      maxItems: DAY_ACTIVITY_MAX,
+      signal: controller.signal,
+    })
+      .then((page) => {
+        if (controller.signal.aborted) return;
+        setLiveDay({
+          scope,
+          rows: mapApiActivities(page.items),
+          details: sessionDetailsById(page.items),
+          totalCount: page.totalCount,
+          truncated: page.truncated,
+          fetchedAt: Date.now(),
+        });
+        setDayError(null);
       })
       .catch(() => {
         // An honest error state with Retry — never the demo timeline.
-        if (!cancelled) setLiveFetch({ key, ok: false });
+        if (!controller.signal.aborted) setDayError({ scope, at: Date.now() });
       });
-    return () => {
-      cancelled = true;
-    };
-  }, [isLive, iso, reloadKey, selfFilter]);
+    return () => controller.abort();
+  }, [isLive, zone.ready, iso, selfFilter, tz, scope, refreshKey]);
 
-  const liveResult = isLive && liveFetch?.key === fetchKey ? liveFetch : null;
-  const livePending = isLive && liveResult === null;
-  const liveFailed = liveResult?.ok === false;
-  const liveRows = liveResult?.ok === true ? liveResult.rows : null;
-  const liveFetchedAt = liveResult?.ok === true ? liveResult.fetchedAt : 0;
+  // Who is working now: the agents' heartbeats, refreshed while the tab is visible.
+  const team = useTeamPresence(isLive, REFRESH_MS);
+  useVisibleInterval(
+    () => {
+      setClock(referenceNow().getTime());
+      // Today keeps filling in; earlier days don't change.
+      if (isLive && day.isToday) setRefreshKey((k) => k + 1);
+    },
+    REFRESH_MS,
+    true,
+  );
+  function refreshNow() {
+    setClock(referenceNow().getTime());
+    setRefreshKey((k) => k + 1);
+    team.refresh();
+  }
+
+  const liveResult = isLive && liveDay?.scope === scope ? liveDay : null;
+  const livePending = isLive && !liveResult && dayError?.scope !== scope;
+  const liveFailed = isLive && !liveResult && dayError?.scope === scope;
+  const refreshFailed = !!liveResult && dayError?.scope === scope && dayError.at > liveResult.fetchedAt;
+  const liveRows = liveResult?.rows ?? null;
+  const detailsOf = useCallback((a: Activity) => liveResult?.details.get(a.id), [liveResult]);
+  const intervalOf = useCallback((projectId: string) => projectById(projectId)?.intervalMinutes, []);
+
+  /** Every member's presence right now (live: heartbeats, else recent uploads; demo: the seeded roster). */
+  const presence: Map<string, MemberPresence> = useMemo(() => {
+    if (!isLive) return demoPresence(users, latestBlockByUser(sessionActivities));
+    if (team.devices) return mergePresence(team.devices, new Date(clock));
+    return uploadPresence(latestBlockByUser([...sessionActivities, ...(liveRows ?? [])]), new Date(clock), intervalOf);
+  }, [isLive, team.devices, liveRows, clock, intervalOf]);
+  const lastUpload = useMemo(() => lastSeenByUser([...sessionActivities, ...(liveRows ?? [])]), [liveRows]);
+  const stateOf = useCallback((id: string): PresenceState => presence.get(id)?.state ?? "offline", [presence]);
 
   /** The real day: blocks per member, the roster (workers: only themselves) and whether anything was ever tracked. */
   const liveModel = useMemo(() => {
     if (!liveRows) return null;
-    const byUser = segmentsByUser(liveRows, iso);
-    const lastSeen = lastSeenByUser([...sessionActivities, ...liveRows]);
+    const byUser = segmentsByUser(liveRows, iso, tz, detailsOf);
+    const status = (id: string) => presenceUserStatus(stateOf(id));
     const roster = isSelfOnly
-      ? liveRoster([user], [], lastSeen, liveFetchedAt)
-      : liveRoster(users, byUser.keys(), lastSeen, liveFetchedAt);
+      ? liveRoster([user], [], lastUpload, clock, status)
+      : liveRoster(users, byUser.keys(), lastUpload, clock, status);
     return { byUser, roster, hasAny: sessionActivities.length > 0 || liveRows.length > 0 };
-  }, [liveRows, liveFetchedAt, iso, isSelfOnly, user]);
+  }, [liveRows, iso, tz, detailsOf, stateOf, isSelfOnly, user, lastUpload, clock]);
 
   const member: User = isLive
     ? (liveModel?.roster.find((u) => u.id === activeUserId) ?? { ...user, status: "offline" })
-    : (users.find((u) => u.id === activeUserId) ?? user);
+    : { ...(users.find((u) => u.id === activeUserId) ?? user), status: presenceUserStatus(stateOf(activeUserId)) };
+  const memberState = stateOf(member.id);
+  const memberPresence = presence.get(member.id);
 
   const segments = useMemo(
     () => (isLive ? (liveModel?.byUser.get(activeUserId) ?? []) : buildDayTimeline(activeUserId, iso)),
     [isLive, liveModel, activeUserId, iso]
   );
-  // Live work can sit anywhere in the UTC day; widen the axis so none of it is clipped.
+  const memberRows = useMemo(
+    () => (liveRows ?? []).filter((a) => a.userId === activeUserId).sort((a, b) => Date.parse(a.startedAt) - Date.parse(b.startedAt)),
+    [liveRows, activeUserId],
+  );
+  // Live work can sit anywhere in the day; widen the axis so none of it is clipped.
   const axis = useMemo(() => (isLive ? timelineWindow(segments) : DEFAULT_DAY_WINDOW), [isLive, segments]);
   const summary = useMemo(() => daySummary(segments), [segments]);
   const hourly = useMemo(() => hourlyBuckets(segments, axis.start, axis.end), [segments, axis]);
-  const apps = useMemo(() => appBreakdown(segments), [segments]);
+  // Live apps come from the focused seconds each window reported, not from each block's top app.
+  const apps = useMemo(
+    () => (isLive ? liveAppBreakdown(memberRows, iso, tz) : appBreakdown(segments)),
+    [isLive, memberRows, iso, tz, segments],
+  );
   const browser = useMemo(() => browserSummary(segments), [segments]);
   const shots = segments.filter((s) => s.type === "work" || s.type === "meeting");
+  const liveShots = memberRows.filter((a) => thumbnailCaptureIds(a).length > 0);
   const memberHasActivity =
     !isLive || segments.length > 0 || sessionActivities.some((a) => a.userId === member.id);
 
-  const shotKey = `${activeUserId}:${iso}`;
-  const liveShots = shotState?.key === shotKey ? shotState.shots : [];
-  const liveShotsLoading = isLive && segments.length > 0 && !(shotState?.key === shotKey && shotState.done);
-
-  /* ── Live mode: real captures for the shown blocks (≤12, bearer-authed blobs; webcam never shown) ── */
-  useEffect(() => {
-    if (!isLive || segments.length === 0) return;
-    const key = `${activeUserId}:${iso}`;
-    let cancelled = false;
-    const urls: string[] = [];
-    (async () => {
-      const collected: LiveShot[] = [];
-      for (const seg of segments) {
-        if (cancelled || collected.length >= 12) break;
-        let metas: { id: string; kind?: string; capturedAt?: string }[] = [];
-        try {
-          // The activity id is a PATH parameter (ABP: GET screenshots/{activityId}); a query string 404s.
-          const res = await getApi(`/api/app/activity/screenshots/${encodeURIComponent(seg.id)}`);
-          if (Array.isArray(res)) metas = res;
-        } catch {
-          continue; // block without readable captures — keep going
-        }
-        for (const m of metas) {
-          if (cancelled || collected.length >= 12) break;
-          if (!m || typeof m.id !== "string" || m.kind === "webcam") continue;
-          try {
-            const url = await getAuthedBlobUrl(`/api/app/activity/screenshot/${encodeURIComponent(m.id)}/content`);
-            if (cancelled) {
-              URL.revokeObjectURL(url);
-              return;
-            }
-            urls.push(url);
-            const time = m.capturedAt ? fmtIsoTime(m.capturedAt) : fmtMin(seg.startMin);
-            collected.push({ id: m.id, url, time, app: seg.app });
-            setShotState({ key, shots: [...collected], done: false });
-          } catch {
-            /* skip unreadable capture */
-          }
-        }
-      }
-      if (!cancelled) setShotState({ key, shots: collected, done: true });
-    })();
-    return () => {
-      cancelled = true;
-      for (const u of urls) URL.revokeObjectURL(u);
-    };
-  }, [isLive, segments, activeUserId, iso]);
-
   const rosterRows = useMemo(() => {
-    if (isLive) {
-      return (liveModel?.roster ?? []).map((u) => {
-        const segs = liveModel?.byUser.get(u.id) ?? [];
-        return { user: u, segments: segs, summary: daySummary(segs) };
-      });
-    }
-    return monitorable.map((u) => {
-      const segs = buildDayTimeline(u.id, iso);
-      return { user: u, segments: segs, summary: daySummary(segs) };
+    const list = isLive ? (liveModel?.roster ?? []) : monitorable.map((u) => ({ ...u, status: presenceUserStatus(stateOf(u.id)) }));
+    return list.map((u) => {
+      const segs = isLive ? (liveModel?.byUser.get(u.id) ?? []) : buildDayTimeline(u.id, iso);
+      return { user: u, segments: segs, summary: daySummary(segs), state: stateOf(u.id), presence: presence.get(u.id) };
     });
-  }, [isLive, liveModel, monitorable, iso]);
+  }, [isLive, liveModel, monitorable, iso, stateOf, presence]);
   // One shared axis so every member's strip is comparable.
   const rosterAxis = useMemo(
     () => (isLive ? timelineWindow(rosterRows.flatMap((r) => r.segments)) : DEFAULT_DAY_WINDOW),
@@ -307,7 +328,7 @@ export default function MonitorPage() {
     const q = query.trim().toLowerCase();
     return sortRoster(
       rosterRows.filter((r) => {
-        if (statusFilter !== "all" && r.user.status !== statusFilter) return false;
+        if (statusFilter !== "all" && presenceGroup(r.state) !== statusFilter) return false;
         if (!q) return true;
         return (
           r.user.name.toLowerCase().includes(q) ||
@@ -320,12 +341,9 @@ export default function MonitorPage() {
 
   const teamTotals = useMemo(() => {
     const tracked = rosterRows.reduce((s, r) => s + r.summary.tracked, 0);
-    const activeNow = rosterRows.filter((r) => r.user.status === "active").length;
-    const withTime = rosterRows.filter((r) => r.summary.tracked > 0);
-    const avgProd = withTime.length
-      ? Math.round(withTime.reduce((s, r) => s + r.summary.productivityAvg, 0) / withTime.length)
-      : 0;
-    return { tracked, activeNow, avgProd, withTime: withTime.length, count: rosterRows.length };
+    const trackingNow = rosterRows.filter((r) => r.state === "tracking").length;
+    const away = rosterRows.filter((r) => presenceGroup(r.state) === "away").length;
+    return { tracked, trackingNow, away, activity: teamActivity(rosterRows.map((r) => r.summary)), count: rosterRows.length };
   }, [rosterRows]);
 
   const range = axis.end - axis.start;
@@ -355,15 +373,26 @@ export default function MonitorPage() {
     />
   );
 
-  // Live blocks are placed on the UTC day the agents report in.
-  const utcNote = isLive ? " · times in UTC" : "";
-  const legend = isLive ? <ProductivityLegend /> : <TypeLegend />;
+  // Live blocks sit on the calendar days of the reporting zone.
+  const zoneNote = isLive ? ` · times in ${timeZoneLabel(tz, clock)}` : "";
+  const legend = isLive ? <ProductivityLegend showUnmeasured={summary.measuredMinutes < summary.tracked} /> : <TypeLegend />;
   const installAgent = { label: "Get the desktop agent", onClick: () => router.push("/download") };
+  const updatedAt = Math.max(liveResult?.fetchedAt ?? 0, team.updatedAt ?? 0);
+  const refreshControl = isLive && (
+    <div className="flex items-center gap-2">
+      <span className="text-xs text-muted-foreground" aria-live="polite">
+        {updatedAt > 0 ? `Updated ${formatClock(new Date(updatedAt).toISOString(), tz)}` : "Updating…"}
+      </span>
+      <Button variant="ghost" size="icon" onClick={refreshNow} aria-label="Refresh now" title="Refresh now">
+        <RefreshCw className="h-4 w-4" />
+      </Button>
+    </div>
+  );
 
   const focusCard = (
     <Card>
       <CardHeader>
-        <CardTitle>Focus by hour</CardTitle>
+        <CardTitle>Time tracked by hour</CardTitle>
         <Badge tone="muted">Minutes</Badge>
       </CardHeader>
       <CardContent>
@@ -382,21 +411,42 @@ export default function MonitorPage() {
         {apps.length === 0 ? (
           <p className="text-sm text-muted-foreground">No apps recorded for this day.</p>
         ) : (
-          apps.map((a) => (
-            <div key={a.app}>
-              <div className="mb-1 flex items-center justify-between text-sm">
-                <span className="flex items-center gap-2 truncate">
-                  <span className="h-2.5 w-2.5 rounded-full" style={{ background: a.accent }} />
-                  <span className="truncate">{a.app}</span>
-                </span>
-                <span className="tabular-nums text-muted-foreground">{formatDuration(a.minutes)}</span>
+          <>
+            {apps.map((a) => (
+              <div key={a.app}>
+                <div className="mb-1 flex items-center justify-between text-sm">
+                  <span className="flex items-center gap-2 truncate">
+                    <span aria-hidden className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ background: a.accent }} />
+                    <span className="truncate">{a.app}</span>
+                  </span>
+                  <span className="tabular-nums text-muted-foreground">{formatDuration(a.minutes)}</span>
+                </div>
+                <Progress value={(a.minutes / (apps[0]?.minutes || 1)) * 100} color={a.accent} aria-label={`${a.app}: ${formatDuration(a.minutes)}`} />
               </div>
-              <Progress value={(a.minutes / (apps[0]?.minutes || 1)) * 100} color={a.accent} />
-            </div>
-          ))
+            ))}
+            {isLive && (
+              <p className="pt-1 text-xs text-muted-foreground">Time each app was in front, from the desktop app&apos;s per-window report.</p>
+            )}
+          </>
         )}
       </CardContent>
     </Card>
+  );
+
+  const truncationNote = liveResult?.truncated && (
+    <Card variant="quiet" className="px-5 py-3 text-sm text-muted-foreground" role="status">
+      Showing the first {liveResult.rows.length.toLocaleString("en")} of {liveResult.totalCount.toLocaleString("en")} blocks
+      recorded on this day — the figures below cover those blocks only.
+    </Card>
+  );
+  const refreshNote = refreshFailed && liveResult && (
+    <p role="status" className="flex flex-wrap items-center gap-2 text-xs text-warning-on-tint">
+      <AlertTriangle aria-hidden className="h-3.5 w-3.5" />
+      Couldn&apos;t refresh — showing the day as of {formatClock(new Date(liveResult.fetchedAt).toISOString(), tz)}.
+      <button type="button" onClick={refreshNow} className="font-medium text-primary-strong hover:underline">
+        Try again
+      </button>
+    </p>
   );
 
   /* ── Live mode: first load for the selected day ── */
@@ -432,7 +482,7 @@ export default function MonitorPage() {
           icon={AlertTriangle}
           title="Couldn't load activity"
           description="The tracker backend didn't return this day's activity. Check your connection and try again."
-          action={{ label: "Retry", onClick: () => setReloadKey((k) => k + 1) }}
+          action={{ label: "Retry", onClick: () => setRefreshKey((k) => k + 1) }}
         />
       </PageStack>
     );
@@ -445,21 +495,34 @@ export default function MonitorPage() {
         <PageHeader
           eyebrow="Monitor"
           title="Member Monitor"
-          description={`${teamTotals.activeNow} active now · ${formatDuration(teamTotals.tracked)} tracked · ${dayLabel.toLowerCase()}${utcNote}`}
-          actions={dayNav}
+          description={`${teamTotals.trackingNow} tracking now · ${formatDuration(teamTotals.tracked)} tracked · ${dayLabel.toLowerCase()}${zoneNote}`}
+          actions={
+            <div className="flex flex-wrap items-center gap-2">
+              {refreshControl}
+              {dayNav}
+            </div>
+          }
         />
 
         <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
           <MonitorKpi icon={Users} tone={brand.primary} label="Team size" value={String(teamTotals.count)} />
-          <MonitorKpi icon={Zap} tone={brand.success} label="Active now" value={String(teamTotals.activeNow)} />
+          <MonitorKpi
+            icon={Zap}
+            tone={brand.success}
+            label={teamTotals.away > 0 ? `Tracking now · ${teamTotals.away} away` : "Tracking now"}
+            value={String(teamTotals.trackingNow)}
+          />
           <MonitorKpi icon={Clock} tone={brand.info} label="Team tracked" value={formatDuration(teamTotals.tracked)} />
           <MonitorKpi
             icon={Gauge}
-            tone={prodColor(teamTotals.avgProd)}
-            label="Avg productivity"
-            value={teamTotals.withTime ? `${teamTotals.avgProd}%` : "—"}
+            tone={teamTotals.activity === null ? UNMEASURED_COLOR : prodColor(teamTotals.activity)}
+            label="Avg activity"
+            value={teamTotals.activity === null ? "—" : `${teamTotals.activity}%`}
           />
         </div>
+
+        {truncationNote}
+        {refreshNote}
 
         {!noLiveActivity && (
           <>
@@ -470,8 +533,8 @@ export default function MonitorPage() {
                 onChange={setStatusFilter}
                 options={[
                   { value: "all", label: "All" },
-                  { value: "active", label: "Active" },
-                  { value: "idle", label: "Idle" },
+                  { value: "tracking", label: "Tracking" },
+                  { value: "away", label: "Away" },
                   { value: "offline", label: "Offline" },
                 ]}
               />
@@ -519,70 +582,72 @@ export default function MonitorPage() {
             <div className="hidden grid-cols-[minmax(0,1.5fr)_6.5rem_5rem_5.5rem_minmax(8rem,1.2fr)_5.5rem] gap-3 border-b border-border bg-muted/35 px-4 py-2.5 text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground lg:grid">
               <span>Member</span>
               <span className="text-right">Tracked</span>
-              <span className="text-right">Prod.</span>
+              <span className="text-right">Activity</span>
               <span className="text-right">Focus</span>
               <span>Day activity</span>
               <span className="text-right">Open</span>
             </div>
 
             <ul className="divide-y divide-border">
-              {filteredRoster.map(({ user: u, segments: segs, summary: sum }) => (
-                <li key={u.id}>
-                  <button
-                    type="button"
-                    onClick={() => openMember(u.id)}
-                    className="group grid w-full grid-cols-1 gap-3 px-4 py-3.5 text-left transition-colors hover:bg-primary/[0.04] focus-visible:bg-primary/[0.04] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring lg:grid-cols-[minmax(0,1.5fr)_6.5rem_5rem_5.5rem_minmax(8rem,1.2fr)_5.5rem] lg:items-center"
-                  >
-                    <div className="flex min-w-0 items-center gap-3">
-                      <Avatar name={u.name} size="sm" status={u.status} />
+              {filteredRoster.map(({ user: u, segments: segs, summary: sum, state, presence: p }) => {
+                const since = presenceSince(p, lastUpload.get(u.id), new Date(clock), tz);
+                const activity = sum.measuredMinutes > 0 ? sum.productivityAvg : null;
+                return (
+                  <li key={u.id}>
+                    <button
+                      type="button"
+                      onClick={() => openMember(u.id)}
+                      className="group grid w-full grid-cols-1 gap-3 px-4 py-3.5 text-left transition-colors hover:bg-primary/[0.04] focus-visible:bg-primary/[0.04] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring lg:grid-cols-[minmax(0,1.5fr)_6.5rem_5rem_5.5rem_minmax(8rem,1.2fr)_5.5rem] lg:items-center"
+                    >
+                      <div className="flex min-w-0 items-center gap-3">
+                        <Avatar name={u.name} size="sm" status={u.status} />
+                        <div className="min-w-0">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="truncate font-medium group-hover:text-primary-strong">{u.name}</span>
+                            <PresenceChip state={state} />
+                            <Badge tone="muted" className="hidden sm:inline-flex">
+                              {roleLabels[u.role]}
+                            </Badge>
+                          </div>
+                          <div className="truncate text-xs text-muted-foreground">
+                            {state === "tracking" && p?.currentApp ? `In ${p.currentApp}` : u.designation}
+                            {since ? ` · ${since}` : ""}
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-3 gap-2 text-sm lg:contents">
+                        <MetricCell label="Tracked" value={sum.tracked ? formatDuration(sum.tracked) : "—"} strong />
+                        <MetricCell
+                          label="Activity"
+                          value={activity === null ? "—" : `${activity}%`}
+                          strong
+                          color={activity === null ? undefined : prodColor(activity)}
+                        />
+                        <MetricCell
+                          label="Focus"
+                          value={sum.longestFocus ? formatDuration(sum.longestFocus) : "—"}
+                          muted
+                        />
+                      </div>
+
                       <div className="min-w-0">
-                        <div className="flex flex-wrap items-center gap-2">
-                          <span className="truncate font-medium group-hover:text-primary">{u.name}</span>
-                          <Badge tone={statusTone[u.status]} className="sm:hidden">
-                            {statusCopy[u.status]}
-                          </Badge>
-                          <Badge tone="muted" className="hidden sm:inline-flex">
-                            {roleLabels[u.role]}
-                          </Badge>
-                        </div>
-                        <div className="truncate text-xs text-muted-foreground">
-                          {u.designation}
-                          <span className="hidden sm:inline"> · {statusCopy[u.status]}</span>
+                        <MiniDayStrip segments={segs} span={rosterAxis} />
+                        <div className="mt-1 text-[10px] text-muted-foreground">
+                          {sum.firstMin !== null
+                            ? `${fmtMin(sum.firstMin)} – ${fmtMin(sum.lastMin!)}`
+                            : "No activity this day"}
                         </div>
                       </div>
-                    </div>
 
-                    <div className="grid grid-cols-3 gap-2 text-sm lg:contents">
-                      <MetricCell label="Tracked" value={sum.tracked ? formatDuration(sum.tracked) : "—"} strong />
-                      <MetricCell
-                        label="Prod."
-                        value={sum.tracked ? `${sum.productivityAvg}%` : "—"}
-                        strong
-                        color={sum.tracked ? prodColor(sum.productivityAvg) : undefined}
-                      />
-                      <MetricCell
-                        label="Focus"
-                        value={sum.longestFocus ? formatDuration(sum.longestFocus) : "—"}
-                        muted
-                      />
-                    </div>
-
-                    <div className="min-w-0">
-                      <MiniDayStrip segments={segs} span={rosterAxis} />
-                      <div className="mt-1 text-[10px] text-muted-foreground">
-                        {sum.firstMin !== null
-                          ? `${fmtMin(sum.firstMin)} – ${fmtMin(sum.lastMin!)}`
-                          : "No activity this day"}
-                      </div>
-                    </div>
-
-                    <span className="inline-flex items-center gap-1 text-xs font-medium text-primary lg:justify-end">
-                      Details
-                      <ArrowRight className="h-3.5 w-3.5 transition-transform group-hover:translate-x-0.5" />
-                    </span>
-                  </button>
-                </li>
-              ))}
+                      <span className="inline-flex items-center gap-1 text-xs font-medium text-primary-strong lg:justify-end">
+                        Details
+                        <ArrowRight className="h-3.5 w-3.5 motion-safe:transition-transform motion-safe:group-hover:translate-x-0.5" />
+                      </span>
+                    </button>
+                  </li>
+                );
+              })}
             </ul>
           </Card>
         )}
@@ -591,6 +656,12 @@ export default function MonitorPage() {
   }
 
   /* ── Member detail ── */
+  const since = presenceSince(memberPresence, lastUpload.get(member.id), new Date(clock), tz);
+  const memberActivity = summary.measuredMinutes > 0 ? summary.productivityAvg : null;
+  const DeviceIcon = memberPresence?.platform === "macos" ? Laptop : Monitor;
+  const device = [memberPresence?.deviceName, platformLabel(memberPresence?.platform), memberPresence?.agentVersion ? `agent ${memberPresence.agentVersion}` : null]
+    .filter(Boolean)
+    .join(" · ");
   return (
     <PageStack>
       {!isSelfOnly && (
@@ -598,7 +669,7 @@ export default function MonitorPage() {
           <button
             type="button"
             onClick={() => setPanel("roster")}
-            className="inline-flex items-center gap-1.5 text-sm text-muted-foreground transition-colors hover:text-foreground"
+            className="inline-flex items-center gap-1.5 rounded-lg text-sm text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
             <ArrowLeft className="h-4 w-4" /> All members
           </button>
@@ -633,16 +704,40 @@ export default function MonitorPage() {
         title={isSelfOnly ? "My day" : member.name}
         description={
           isSelfOnly
-            ? `Your activity for ${dayLabel.toLowerCase()}${isLive ? " (times in UTC)" : ""}.`
-            : `${member.designation} · ${statusCopy[member.status]} · ${dayLabel}${utcNote}`
+            ? `Your activity for ${dayLabel.toLowerCase()}${zoneNote}.`
+            : `${member.designation} · ${dayLabel}${zoneNote}`
         }
         actions={
-          <div className="flex items-center gap-2.5">
+          <div className="flex flex-wrap items-center gap-2.5">
+            {refreshControl}
             <Avatar name={member.name} size="sm" status={member.status} />
-            <Badge tone={statusTone[member.status]}>{statusCopy[member.status]}</Badge>
+            <PresenceChip state={memberState} />
           </div>
         }
       />
+
+      {/* Right now: what the agent says the member is doing. */}
+      <Card variant="quiet" className="flex flex-wrap items-center gap-x-4 gap-y-1.5 px-4 py-3 text-sm">
+        <span className="font-medium">{PRESENCE_STATE_LABELS[memberState]}</span>
+        {memberState === "tracking" && memberPresence?.currentApp && (
+          <span className="text-muted-foreground">
+            in <span className="font-medium text-foreground">{memberPresence.currentApp}</span>
+          </span>
+        )}
+        {memberPresence?.projectTitle && memberState !== "offline" && (
+          <span className="text-muted-foreground">on {memberPresence.projectTitle}</span>
+        )}
+        {since && <span className="text-muted-foreground">{since}</span>}
+        {device && (
+          <span className="inline-flex min-w-0 items-center gap-1.5 text-muted-foreground">
+            <DeviceIcon aria-hidden className="h-3.5 w-3.5 shrink-0" />
+            <span className="truncate">{device}</span>
+          </span>
+        )}
+        {isLive && memberPresence?.source === "uploads" && (
+          <span className="text-xs text-muted-foreground">(from recent uploads — this server doesn&apos;t report live status)</span>
+        )}
+      </Card>
 
       <Toolbar>
         <SegmentedControl
@@ -655,6 +750,9 @@ export default function MonitorPage() {
         />
         <div className="w-full sm:ml-auto sm:w-auto">{dayNav}</div>
       </Toolbar>
+
+      {truncationNote}
+      {refreshNote}
 
       {segments.length === 0 && !memberHasActivity ? (
         <EmptyState
@@ -692,14 +790,19 @@ export default function MonitorPage() {
             <MonitorKpi icon={Clock} tone={brand.primary} label="Tracked" value={formatDuration(summary.tracked)} />
             <MonitorKpi
               icon={Gauge}
-              tone={prodColor(summary.productivityAvg)}
-              label="Productivity"
-              value={`${summary.productivityAvg}%`}
+              tone={memberActivity === null ? UNMEASURED_COLOR : prodColor(memberActivity)}
+              label="Activity"
+              value={memberActivity === null ? "Not measured" : `${memberActivity}%`}
             />
             <MonitorKpi icon={Zap} tone={brand.success} label="Longest focus" value={formatDuration(summary.longestFocus)} />
             {isLive ? (
-              // Agents report activity blocks, not idle time — count the blocks instead of claiming zero idle.
-              <MonitorKpi icon={Layers} tone="#94a3b8" label="Activity blocks" value={String(segments.length)} />
+              summary.idleReported ? (
+                // Idle minutes inside tracked blocks, as the desktop app measured them.
+                <MonitorKpi icon={Hourglass} tone="#94a3b8" label="Idle while tracked" value={formatDuration(summary.idleInBlocks)} />
+              ) : (
+                // Older agents report blocks, not idle time — count the blocks instead of claiming zero idle.
+                <MonitorKpi icon={Layers} tone="#94a3b8" label="Activity blocks" value={String(segments.length)} />
+              )
             ) : (
               <MonitorKpi
                 icon={Pause}
@@ -740,7 +843,6 @@ export default function MonitorPage() {
                   {segments.map((s) => {
                     const left = ((s.startMin - axis.start) / range) * 100;
                     const width = (s.minutes / range) * 100;
-                    const color = s.type === "work" ? prodColor(s.productivity) : typeColor[s.type];
                     return (
                       <div
                         key={s.id}
@@ -751,7 +853,7 @@ export default function MonitorPage() {
                           "absolute top-1.5 bottom-6 rounded-sm transition-all hover:brightness-110",
                           (s.type === "idle" || s.type === "break") && "opacity-50"
                         )}
-                        style={{ left: `${left}%`, width: `calc(${width}% - 1px)`, background: color }}
+                        style={{ left: `${left}%`, width: `calc(${width}% - 1px)`, background: segmentColor(s) }}
                       />
                     );
                   })}
@@ -802,38 +904,47 @@ export default function MonitorPage() {
           {browser.tabInstances > 0 && <BrowserActivity data={browser} />}
 
           {isLive
-            ? (liveShots.length > 0 || liveShotsLoading) && (
+            ? liveShots.length > 0 && (
                 <Card>
                   <CardHeader>
                     <CardTitle className="flex items-center gap-2">
                       <Camera className="h-4 w-4 text-muted-foreground" />
                       Screenshots
                     </CardTitle>
-                    <Badge tone="muted">
-                      {liveShots.length === 0 && liveShotsLoading ? "Loading…" : `${liveShots.length} captures`}
-                    </Badge>
+                    <Badge tone="muted">{liveShots.length} captures</Badge>
                   </CardHeader>
                   <CardContent>
-                    {liveShots.length === 0 ? (
-                      <p className="text-sm text-muted-foreground">Loading screenshots…</p>
-                    ) : (
-                      <div className="flex gap-3 overflow-x-auto pb-2">
-                        {liveShots.map((s) => (
-                          <div key={s.id} className="w-44 shrink-0">
-                            {/* eslint-disable-next-line @next/next/no-img-element */}
-                            <img
-                              src={s.url}
-                              alt={`Screenshot at ${s.time}`}
-                              className="aspect-video w-full rounded-lg border border-border object-cover"
-                            />
-                            <div className="mt-1.5 flex items-center justify-between text-xs">
-                              <span className="font-medium tabular-nums">{s.time}</span>
-                              <span className="truncate pl-2 text-muted-foreground">{s.app}</span>
+                    {/* Thumbnails first, loaded as they scroll into view, a few at a time (shared limit). */}
+                    <ul className="flex gap-3 overflow-x-auto pb-2" aria-label="Screenshots of the day">
+                      {liveShots.map((a) => {
+                        const d = detailsOf(a);
+                        const at = d?.capture?.capturedAt ?? a.startedAt;
+                        const time = formatClock(at, tz);
+                        return (
+                          <li key={a.id} className="w-44 shrink-0">
+                            <div className="relative">
+                              <CaptureThumb
+                                captureIds={thumbnailCaptureIds(a)}
+                                app={a.screen.app}
+                                color={appColor(a.screen.app)}
+                                alt={`Screenshot at ${time}`}
+                                className="aspect-video w-full rounded-lg border border-border"
+                              />
+                              {d?.capture?.blurred && <BlurredChip className="pointer-events-none absolute left-1.5 top-1.5" />}
                             </div>
-                          </div>
-                        ))}
-                      </div>
-                    )}
+                            <div className="mt-1.5 flex items-center justify-between gap-2 text-xs">
+                              <span className="font-medium tabular-nums">{time}</span>
+                              <span className="truncate text-muted-foreground" title={a.screen.app}>
+                                {segments.find((s) => s.id === a.id)?.app ?? a.screen.app}
+                              </span>
+                            </div>
+                          </li>
+                        );
+                      })}
+                    </ul>
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      Open a screenshot full size from <span className="font-medium">Activity · Screens</span>.
+                    </p>
                   </CardContent>
                 </Card>
               )
@@ -970,6 +1081,11 @@ function DayScheduleView({
   );
 }
 
+/** "82%" — or "Not measured" for a block whose input the agent couldn't measure. */
+function activityText(seg: DaySegment, suffix = ""): string {
+  return seg.measured === false ? "Not measured" : `${seg.productivity}%${suffix}`;
+}
+
 function ScheduleBlock({
   seg,
   axisStart,
@@ -984,7 +1100,7 @@ function ScheduleBlock({
   const top = (seg.startMin - axisStart) * pxPerMin;
   const height = Math.max(18, seg.minutes * pxPerMin);
   const isPassive = seg.type === "idle" || seg.type === "break";
-  const color = seg.type === "work" ? prodColor(seg.productivity) : typeColor[seg.type];
+  const color = segmentColor(seg);
   const compact = height < 34;
   const label = isPassive ? seg.type.charAt(0).toUpperCase() + seg.type.slice(1) : seg.app;
 
@@ -992,7 +1108,7 @@ function ScheduleBlock({
     <button
       type="button"
       onClick={() => onSelect(seg)}
-      title={`${fmtMin(seg.startMin)}–${fmtMin(seg.endMin)} · ${label}${isPassive ? "" : ` · ${seg.productivity}%`}${seg.tabs ? ` · ${seg.tabs.length} tabs` : ""} — click for details`}
+      title={`${fmtMin(seg.startMin)}–${fmtMin(seg.endMin)} · ${label}${isPassive ? "" : ` · ${activityText(seg)}`}${seg.tabs ? ` · ${seg.tabs.length} tabs` : ""} — click for details`}
       className={cn(
         "absolute left-1.5 right-1.5 flex flex-col overflow-hidden rounded-md border-l-[3px] px-2 py-1 text-left transition-all hover:z-10 hover:brightness-[1.03] hover:ring-1 hover:ring-primary/40 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary",
         isPassive && "opacity-80"
@@ -1013,9 +1129,7 @@ function ScheduleBlock({
           </span>
         )}
         {!isPassive && !seg.tabs && !compact && (
-          <span className="ml-auto shrink-0 text-[10px] font-semibold" style={{ color }}>
-            {seg.productivity}%
-          </span>
+          <span className="ml-auto shrink-0 text-[10px] font-semibold text-foreground">{activityText(seg)}</span>
         )}
       </div>
       {!compact && (
@@ -1039,7 +1153,6 @@ function SegmentDetailModal({
   if (!seg) return null;
   const isPassive = seg.type === "idle" || seg.type === "break";
   const p = seg.projectId ? projectById(seg.projectId) : null;
-  const color = seg.type === "work" ? prodColor(seg.productivity) : typeColor[seg.type];
   const label = isPassive ? seg.type.charAt(0).toUpperCase() + seg.type.slice(1) : seg.app;
 
   return (
@@ -1055,10 +1168,17 @@ function SegmentDetailModal({
             {seg.type}
           </Badge>
           {!isPassive && (
-            <Badge tone="muted" style={{ color }}>
-              {seg.productivity}% productive
+            <Badge tone={seg.measured === false ? "muted" : seg.productivity >= 75 ? "success" : seg.productivity >= 50 ? "warning" : "danger"}>
+              {seg.measured === false ? "Activity not measured" : `${seg.productivity}% active`}
             </Badge>
           )}
+          {typeof seg.idleMinutes === "number" && seg.idleMinutes > 0 && (
+            <Badge tone="muted" className="gap-1">
+              <Hourglass aria-hidden className="h-3 w-3" />
+              {formatDuration(seg.idleMinutes)} idle
+            </Badge>
+          )}
+          <EndReasonChip reason={seg.endReason} />
           {seg.tabs && seg.tabs.length > 0 && (
             <Badge tone="muted" className="gap-1">
               <Globe className="h-3 w-3" />
@@ -1066,6 +1186,16 @@ function SegmentDetailModal({
             </Badge>
           )}
         </div>
+
+        {seg.note && (
+          <p className="flex items-start gap-2 text-sm">
+            <StickyNote aria-hidden className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
+            <span>
+              <span className="sr-only">Task note: </span>
+              {seg.note}
+            </span>
+          </p>
+        )}
 
         {!isPassive && (
           <div className="flex items-start gap-3">
@@ -1253,7 +1383,7 @@ function TimelineRow({ seg, live = false }: { seg: DaySegment; live?: boolean })
   const p = seg.projectId ? projectById(seg.projectId) : null;
   const Icon = typeIcon[seg.type];
   const isPassive = seg.type === "idle" || seg.type === "break";
-  const dotColor = seg.type === "work" ? prodColor(seg.productivity) : typeColor[seg.type];
+  const dotColor = segmentColor(seg);
 
   return (
     <div className="relative flex gap-3 py-2.5">
@@ -1289,6 +1419,7 @@ function TimelineRow({ seg, live = false }: { seg: DaySegment; live?: boolean })
             <div className="flex flex-wrap items-center gap-2">
               <span className="truncate text-sm font-semibold">{seg.app}</span>
               {seg.type === "meeting" && <Badge tone="info">Meeting</Badge>}
+              <EndReasonChip reason={seg.endReason} />
               {seg.tabs && seg.tabs.length > 0 && (
                 <Badge tone="muted" className="gap-1">
                   <Globe className="h-3 w-3" />
@@ -1297,6 +1428,13 @@ function TimelineRow({ seg, live = false }: { seg: DaySegment; live?: boolean })
               )}
             </div>
             <div className="truncate text-xs text-muted-foreground">{seg.windowTitle}</div>
+            {seg.note && seg.note !== seg.windowTitle && (
+              <div className="mt-0.5 flex min-w-0 items-center gap-1 text-xs text-foreground">
+                <StickyNote aria-hidden className="h-3 w-3 shrink-0 text-primary" />
+                <span className="sr-only">Task note: </span>
+                <span className="truncate">{seg.note}</span>
+              </div>
+            )}
             <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
               {p && (
                 <span className="flex items-center gap-1">
@@ -1306,6 +1444,12 @@ function TimelineRow({ seg, live = false }: { seg: DaySegment; live?: boolean })
               <span className="tabular-nums">
                 {fmtMin(seg.startMin)}–{fmtMin(seg.endMin)} · {formatDuration(seg.minutes)}
               </span>
+              {typeof seg.idleMinutes === "number" && seg.idleMinutes > 0 && (
+                <span className="flex items-center gap-1" title="Minutes in this block with no keyboard or mouse input">
+                  <Hourglass aria-hidden className="h-3 w-3" />
+                  {formatDuration(seg.idleMinutes)} idle
+                </span>
+              )}
               <span className="flex items-center gap-1">
                 <MousePointerClick className="h-3 w-3" />
                 {seg.mouseClicks.toLocaleString()}
@@ -1319,7 +1463,13 @@ function TimelineRow({ seg, live = false }: { seg: DaySegment; live?: boolean })
             {seg.tabs && seg.tabs.length > 0 && <TabList tabs={seg.tabs} />}
           </div>
           <div className="shrink-0">
-            <Ring value={seg.productivity} size={38} stroke={4} />
+            {seg.measured === false ? (
+              <span className="flex h-[38px] items-center text-[10px] font-medium text-muted-foreground" title="Activity not measured">
+                n/a
+              </span>
+            ) : (
+              <Ring value={seg.productivity} size={38} stroke={4} />
+            )}
           </div>
         </div>
       )}
@@ -1359,7 +1509,7 @@ function TabList({ tabs }: { tabs: NonNullable<DaySegment["tabs"]> }) {
         <button
           type="button"
           onClick={() => setOpen((o) => !o)}
-          className="mt-1.5 text-[11px] font-medium text-primary hover:underline"
+          className="mt-1.5 text-[11px] font-medium text-primary-strong hover:underline"
         >
           {open ? "Show less" : `+${hidden} more ${hidden === 1 ? "tab" : "tabs"}`}
         </button>

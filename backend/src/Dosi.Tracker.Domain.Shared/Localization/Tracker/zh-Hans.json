@@ -37,6 +37,12 @@
     "Unspecified": "System",
     "SeeAllUsers": "查看所有用户",
     "TakePhoto": "拍摄照片",
-    "ChoosePhoto": "选择照片"
+    "ChoosePhoto": "选择照片",
+    "Tracker:ActivityTooOld": "该活动开始时间过早，已无法再记录。",
+    "Tracker:NotProjectMember": "您不是此项目的成员。",
+    "Tracker:SubscriptionInactive": "工作区订阅未激活。请联系工作区所有者续订。",
+    "Tracker:InvalidUser": "该用户不存在于此工作区中。",
+    "Tracker:CannotModifySelf": "您不能对自己的账户或成员身份进行此更改。",
+    "Tracker:RoleNotAllowed": "只有工作区所有者才能授予此角色、更改时薪或管理所有者的账户。"
   }
 }

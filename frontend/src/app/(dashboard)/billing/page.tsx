@@ -19,7 +19,8 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { DataTable, type Column } from "@/components/ui/data-table";
-import { ExportMenu } from "@/components/reports/report-shell";
+import { ExportMenu } from "@/components/reports/export-menu";
+import { linkButtonClass } from "@/components/dashboard/link-button";
 import { PageHeader, PageStack } from "@/components/ui/page-header";
 import { useSession } from "@/components/session-provider";
 import { toast } from "@/components/toast";
@@ -32,12 +33,15 @@ import {
   planNameFor,
   plans,
   statusLabel,
+  subscriptionNeedsAttention,
   usagePct,
   workspaceUsage,
   type Invoice,
+  type SubscriptionStatus,
 } from "@/lib/saas-data";
 import { SUPPORT_EMAIL } from "@/lib/brand";
 import { getApi } from "@/hooks/useApi";
+import { normalizeUtcIso } from "@/lib/live-dataset";
 import { exportRecords } from "@/lib/export";
 import { cn } from "@/lib/utils";
 
@@ -48,6 +52,21 @@ interface ApiInvoice {
   status?: string | null;
   dueDate?: string | null;
   creationTime?: string | null;
+  /** Start of the billed month (newer servers). */
+  billingPeriodStart?: string | null;
+}
+
+/** An invoice row, with the billed month when the server says. */
+type InvoiceRow = Invoice & { period?: string | null };
+
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"] as const;
+
+/** "Oct 2026" for the start of a billing period (a UTC month start), the same in every browser. */
+function periodLabel(iso: string | null | undefined): string | null {
+  const at = normalizeUtcIso(iso);
+  if (!at) return null;
+  const d = new Date(at);
+  return `${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
 }
 
 /** GET /api/app/workspace/available-plans item (PlanDto). */
@@ -70,7 +89,7 @@ interface PlanCard {
 }
 
 /** Backend invoice statuses are paid / pending / failed; show pending ones as due once past their due date. */
-function toInvoice(inv: ApiInvoice, planName: string, now: number): Invoice {
+function toInvoice(inv: ApiInvoice, planName: string, now: number): InvoiceRow {
   const due = Date.parse(inv.dueDate ?? "");
   const status: Invoice["status"] =
     inv.status === "paid" ? "paid" : inv.status === "failed" || (Number.isFinite(due) && due < now) ? "due" : "upcoming";
@@ -80,6 +99,7 @@ function toInvoice(inv: ApiInvoice, planName: string, now: number): Invoice {
     amount: Number(inv.amount ?? 0),
     status,
     plan: planName,
+    period: periodLabel(inv.billingPeriodStart),
   };
 }
 
@@ -93,6 +113,31 @@ const usageIcon: Record<string, LucideIcon> = {
 /** Honest copy for plan/payment actions until online payments exist. */
 const PAYMENTS_NOTICE = `Online payments are coming soon. To change your plan or billing details, email ${SUPPORT_EMAIL}.`;
 
+/**
+ * What an overdue or cut-off subscription means for the team: the server
+ * refuses tracked time and new people (Tracker:SubscriptionInactive) once a
+ * workspace is suspended, canceled or expired, and past due after the grace
+ * period.
+ */
+const ATTENTION_COPY: Partial<Record<SubscriptionStatus, { title: string; detail: string }>> = {
+  past_due: {
+    title: "Payment is overdue",
+    detail: "Settle the open invoice to keep tracking: once the grace period ends, members can't record time and nobody can be added.",
+  },
+  suspended: {
+    title: "This workspace is suspended",
+    detail: "Members can't record time and nobody can be added until it's reactivated. Your data is kept.",
+  },
+  canceled: {
+    title: "This workspace's subscription is canceled",
+    detail: "Members can't record time and nobody can be added until a plan is active again. Your data is kept.",
+  },
+  expired: {
+    title: "This workspace's subscription has expired",
+    detail: "Members can't record time and nobody can be added until a plan is active again. Your data is kept.",
+  },
+};
+
 function mailtoChange(workspaceName: string, planName?: string): string {
   const subject = planName ? `Change plan to ${planName} — ${workspaceName}` : `Billing — ${workspaceName}`;
   return `mailto:${SUPPORT_EMAIL}?subject=${encodeURIComponent(subject)}`;
@@ -104,7 +149,7 @@ export default function BillingPage() {
   // LIVE: real invoices and the backend's own plan list. The current plan,
   // status and seat usage come from the session's live workspace (built from
   // the real subscription). Nothing here is demo data in a live session.
-  const [liveInvoices, setLiveInvoices] = useState<Invoice[] | null>(null);
+  const [liveInvoices, setLiveInvoices] = useState<InvoiceRow[] | null>(null);
   const [livePlans, setLivePlans] = useState<ApiPlan[] | null>(null);
   const [liveLoading, setLiveLoading] = useState(false);
   const [liveError, setLiveError] = useState(false);
@@ -144,7 +189,8 @@ export default function BillingPage() {
   const cycleDays = workspace.cycleDays;
   const usage = workspaceUsage(workspace);
   const cost = monthlyCost(workspace);
-  const invoices = isLive ? (liveInvoices ?? []) : invoicesFor(workspace);
+  const invoices: InvoiceRow[] = isLive ? (liveInvoices ?? []) : invoicesFor(workspace);
+  const hasPeriods = invoices.some((r) => r.period);
 
   const planCards: PlanCard[] = isLive
     ? [...(livePlans ?? [])]
@@ -178,8 +224,9 @@ export default function BillingPage() {
     });
   }
 
-  const invoiceColumns: Column<Invoice>[] = [
+  const invoiceColumns: Column<InvoiceRow>[] = [
     { key: "date", header: "Date", sortValue: (r) => r.date, render: (r) => (r.date ? new Date(r.date + "T00:00:00Z").toLocaleDateString("en", { year: "numeric", month: "short", day: "numeric", timeZone: "UTC" }) : "—") },
+    ...(hasPeriods ? [{ key: "period", header: "Period", render: (r: InvoiceRow) => r.period ?? "—" }] : []),
     { key: "plan", header: "Plan", render: (r) => r.plan },
     { key: "amount", header: "Amount", align: "right", sortValue: (r) => r.amount, render: (r) => <span className="font-medium">${r.amount.toLocaleString()}</span> },
     {
@@ -197,6 +244,7 @@ export default function BillingPage() {
   function exportInvoices() {
     exportRecords(`invoices-${workspace.slug}`, invoices, [
       { header: "Date", value: (r) => r.date },
+      { header: "Period", value: (r) => r.period ?? "" },
       { header: "Plan", value: (r) => r.plan },
       { header: "Amount USD", value: (r) => r.amount },
       { header: "Status", value: (r) => r.status },
@@ -226,12 +274,26 @@ export default function BillingPage() {
             </div>
           </div>
           {isLive ? (
-            <a href={mailtoChange(workspace.name, planName)}>
-              <Button size="sm"><Mail className="h-4 w-4" /> Contact support</Button>
+            <a href={mailtoChange(workspace.name, planName)} className={linkButtonClass("primary", "sm")}>
+              <Mail aria-hidden className="h-4 w-4" /> Contact support
             </a>
           ) : (
             <Button size="sm" onClick={() => changePlan(planName, true)}>Add payment method</Button>
           )}
+        </Card>
+      )}
+
+      {/* Overdue or cut off: what it means for the team, and who can fix it */}
+      {subscriptionNeedsAttention(status) && (
+        <Card role="status" className="flex flex-wrap items-center gap-3 border-danger/40 bg-danger/10 p-4">
+          <AlertTriangle aria-hidden className="h-5 w-5 text-danger-on-tint" />
+          <div className="min-w-0 flex-1">
+            <div className="text-sm font-medium text-danger-on-tint">{ATTENTION_COPY[status]?.title}</div>
+            <div className="text-xs text-muted-foreground">{ATTENTION_COPY[status]?.detail}</div>
+          </div>
+          <a href={mailtoChange(workspace.name)} className={linkButtonClass("primary", "sm")}>
+            <Mail aria-hidden className="h-4 w-4" /> Contact support
+          </a>
         </Card>
       )}
 
@@ -362,10 +424,8 @@ export default function BillingPage() {
                   {isCurrent ? (
                     <Button variant="outline" className="w-full" disabled>Current plan</Button>
                   ) : isLive ? (
-                    <a href={mailtoChange(workspace.name, p.name)} className="block">
-                      <Button variant={isUpgrade ? "primary" : "outline"} className="w-full" title={PAYMENTS_NOTICE}>
-                        <Mail className="h-4 w-4" /> Request {isUpgrade ? "upgrade" : "switch"}
-                      </Button>
+                    <a href={mailtoChange(workspace.name, p.name)} className={cn(linkButtonClass(isUpgrade ? "primary" : "outline", "md"), "w-full")} title={PAYMENTS_NOTICE}>
+                      <Mail aria-hidden className="h-4 w-4" /> Request {isUpgrade ? "upgrade" : "switch"}
                     </a>
                   ) : p.pricePerUser === null ? (
                     <Button variant="outline" className="w-full" onClick={() => toast({ title: "Contact sales", description: `Email ${SUPPORT_EMAIL} about Enterprise.`, tone: "info" })}>
