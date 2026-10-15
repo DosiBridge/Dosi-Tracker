@@ -4,7 +4,7 @@ using Dosi.Tracker.Billing;
 using Microsoft.EntityFrameworkCore;
 using Shouldly;
 using Volo.Abp.Domain.Repositories;
-using Volo.Abp.MultiTenancy;
+using Dosi.Tracker.Workspaces;
 using Xunit;
 
 namespace Dosi.Tracker.EntityFrameworkCore.Persistence;
@@ -15,12 +15,12 @@ public class InvoicePersistenceTests : TrackerEntityFrameworkCoreTestBase
     private static readonly DateTime October = new(2026, 10, 1, 0, 0, 0, DateTimeKind.Utc);
 
     private readonly IRepository<Invoice, Guid> _invoiceRepository;
-    private readonly ICurrentTenant _currentTenant;
+    private readonly ICurrentWorkspace _currentWorkspace;
 
     public InvoicePersistenceTests()
     {
         _invoiceRepository = GetRequiredService<IRepository<Invoice, Guid>>();
-        _currentTenant = GetRequiredService<ICurrentTenant>();
+        _currentWorkspace = GetRequiredService<ICurrentWorkspace>();
     }
 
     private async Task<Invoice> InsertAsync(Guid tenantId, DateTime? billingPeriodStart)
@@ -39,7 +39,7 @@ public class InvoicePersistenceTests : TrackerEntityFrameworkCoreTestBase
     {
         var tenantId = Guid.NewGuid();
 
-        using (_currentTenant.Change(tenantId))
+        using (_currentWorkspace.Change(tenantId))
         {
             var invoice = await InsertAsync(tenantId, October);
             (await WithUnitOfWorkAsync(() => _invoiceRepository.GetAsync(invoice.Id))).BillingPeriodStart.ShouldBe(October);
@@ -57,7 +57,7 @@ public class InvoicePersistenceTests : TrackerEntityFrameworkCoreTestBase
     {
         var tenantId = Guid.NewGuid();
 
-        using (_currentTenant.Change(tenantId))
+        using (_currentWorkspace.Change(tenantId))
         {
             await InsertAsync(tenantId, null);
             await InsertAsync(tenantId, null);
@@ -71,7 +71,7 @@ public class InvoicePersistenceTests : TrackerEntityFrameworkCoreTestBase
     {
         var tenantId = Guid.NewGuid();
 
-        using (_currentTenant.Change(tenantId))
+        using (_currentWorkspace.Change(tenantId))
         {
             var voided = await InsertAsync(tenantId, October);
             await WithUnitOfWorkAsync(() => _invoiceRepository.DeleteAsync(voided.Id)); // soft delete
@@ -88,12 +88,12 @@ public class InvoicePersistenceTests : TrackerEntityFrameworkCoreTestBase
         var tenantA = Guid.NewGuid();
         var tenantB = Guid.NewGuid();
 
-        using (_currentTenant.Change(tenantA))
+        using (_currentWorkspace.Change(tenantA))
         {
             await InsertAsync(tenantA, October);
         }
 
-        using (_currentTenant.Change(tenantB))
+        using (_currentWorkspace.Change(tenantB))
         {
             await InsertAsync(tenantB, October);
             (await WithUnitOfWorkAsync(() => _invoiceRepository.GetCountAsync())).ShouldBe(1);

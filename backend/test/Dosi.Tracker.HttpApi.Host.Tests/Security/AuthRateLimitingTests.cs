@@ -151,44 +151,6 @@ public sealed class AuthRateLimitingTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task The_Per_Account_Budget_Should_Not_Depend_On_The_Workspace_The_Request_Names()
-    {
-        // A guesser naming the target workspace in one place and inventing another value elsewhere (header, form) per
-        // request, or trying the same user name in another workspace, still draws on one budget.
-        var attempts = new[]
-        {
-            ("/connect/token?__tenant=acme", "acme-header-1"),
-            ("/connect/token?__tenant=acme", "acme-header-2"),
-            ("/connect/token", "other-workspace")
-        };
-        foreach (var (path, header) in attempts)
-        {
-            var allowed = await _server.SendAsync(context => TenantedPasswordGrant(context, path, header));
-            allowed.Response.StatusCode.ShouldBe(StatusCodes.Status200OK);
-        }
-
-        var rejected = await _server.SendAsync(context => TenantedPasswordGrant(context, "/connect/token?__tenant=acme", "acme-header-3"));
-        rejected.Response.StatusCode.ShouldBe(StatusCodes.Status429TooManyRequests);
-    }
-
-    /// <summary>A password grant for "admin" that names a workspace in the query string, in a header and in the form.</summary>
-    private static void TenantedPasswordGrant(HttpContext context, string pathAndQuery, string headerTenant)
-    {
-        var queryStart = pathAndQuery.IndexOf('?');
-        context.Request.Method = "POST";
-        context.Request.Path = queryStart < 0 ? pathAndQuery : pathAndQuery[..queryStart];
-        context.Request.QueryString = queryStart < 0 ? QueryString.Empty : new QueryString(pathAndQuery[queryStart..]);
-        context.Connection.RemoteIpAddress = IPAddress.Parse("203.0.113.10");
-        context.Request.Headers["__tenant"] = headerTenant;
-
-        var body = Encoding.UTF8.GetBytes(
-            $"grant_type=password&client_id=Tracker_App&username=Admin&password=guess&__tenant={headerTenant}-form");
-        context.Request.ContentType = "application/x-www-form-urlencoded";
-        context.Request.ContentLength = body.Length;
-        context.Request.Body = new MemoryStream(body);
-    }
-
-    [Fact]
     public async Task One_Address_Spraying_Many_Accounts_Should_Hit_The_Per_Client_Limit()
     {
         for (var account = 0; account < 6; account++)
@@ -316,6 +278,13 @@ public sealed class AuthRateLimitingTests : IAsyncLifetime
     [InlineData("POST", "/Account/Login", null, AuthRateLimiting.RequestKind.Account)]
     [InlineData("POST", "/api/account/my-profile/change-password", null, AuthRateLimiting.RequestKind.Account)]
     [InlineData("POST", "/api/app/workspace/register", null, AuthRateLimiting.RequestKind.SignUp)]
+    [InlineData("POST", "/api/app/workspaces", null, AuthRateLimiting.RequestKind.SignUp)]
+    [InlineData("POST", "/api/app/workspaces/", null, AuthRateLimiting.RequestKind.SignUp)]
+    [InlineData("POST", "/api/app/workspaces/0f8fad5b-d9cb-469f-a165-70867728950e/leave", null, AuthRateLimiting.RequestKind.None)]
+    [InlineData("GET", "/api/app/workspaces/mine", null, AuthRateLimiting.RequestKind.None)]
+    [InlineData("POST", "/api/app/invitations/abc123/accept", null, AuthRateLimiting.RequestKind.Account)]
+    [InlineData("GET", "/api/app/invitations/abc123", null, AuthRateLimiting.RequestKind.None)]
+    [InlineData("POST", "/api/app/workspace/find-my-workspaces", null, AuthRateLimiting.RequestKind.None)]
     [InlineData("GET", "/connect/token", null, AuthRateLimiting.RequestKind.None)]
     [InlineData("GET", "/api/account/my-profile", null, AuthRateLimiting.RequestKind.None)]
     [InlineData("POST", "/api/app/team/invite-member", null, AuthRateLimiting.RequestKind.None)]

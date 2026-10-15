@@ -41,7 +41,7 @@ public abstract class TeamSeatLockTests<TStartupModule> : TeamTestBase<TStartupM
         await TeamAppService.InviteMemberAsync(new InviteMemberDto { ProjectId = projectId, Email = "new@acme.test" });
         await TeamAppService.UpdateMemberAsync(projectId, worker.Id, new UpdateProjectMemberDto { Role = ProjectMemberRoles.Client });
 
-        _locks.Acquired.ShouldBe(Enumerable.Repeat(SeatCounter.SeatLockName(null), 3));
+        _locks.Acquired.ShouldBe(Enumerable.Repeat(SeatCounter.SeatLockName(TrackerTestConsts.WorkspaceId), 3));
         _locks.Held.ShouldBe(0); // released again
     }
 
@@ -68,7 +68,7 @@ public abstract class TeamSeatLockTests<TStartupModule> : TeamTestBase<TStartupM
         var tenantB = Guid.NewGuid();
 
         SeatCounter.SeatLockName(tenantA).ShouldNotBe(SeatCounter.SeatLockName(tenantB));
-        SeatCounter.SeatLockName(tenantA).ShouldNotBe(SeatCounter.SeatLockName(null));
+        SeatCounter.SeatLockName(tenantA).ShouldNotBe(SeatCounter.SeatLockName(TrackerTestConsts.WorkspaceId));
     }
 
     /// <summary>A lock that grants every request (unless told to refuse) and records what was taken.</summary>

@@ -1,7 +1,7 @@
 using System;
 using Volo.Abp.Data;
 using Volo.Abp.Domain.Entities.Auditing;
-using Volo.Abp.MultiTenancy;
+using Dosi.Tracker.Workspaces;
 
 namespace Dosi.Tracker.SaaS;
 
@@ -12,7 +12,7 @@ namespace Dosi.Tracker.SaaS;
 /// <c>active</c>. <c>canceled</c> (its workspace was deleted), <c>suspended</c> (by the host) and <c>expired</c> end
 /// access. What each status allows is decided by <see cref="SubscriptionAccessChecker"/>.
 /// </summary>
-public class Subscription : FullAuditedAggregateRoot<Guid>, IMultiTenant
+public class Subscription : FullAuditedAggregateRoot<Guid>, IWorkspaceScoped
 {
     public const string TrialingStatus = "trialing";
     public const string ActiveStatus = "active";
@@ -30,17 +30,17 @@ public class Subscription : FullAuditedAggregateRoot<Guid>, IMultiTenant
     /// <summary>Extra property set once the owners have been reminded that the trial is ending (sent once).</summary>
     public const string TrialReminderSentProperty = "TrialReminderSent";
 
-    public Guid? TenantId { get; protected set; }
+    public Guid WorkspaceId { get; protected set; }
     public Guid PlanId { get; set; }
     public string Status { get; set; } // one of the *Status constants
     public DateTime? TrialEndsAt { get; set; }
 
     protected Subscription() { }
 
-    public Subscription(Guid id, Guid? tenantId, Guid planId)
+    public Subscription(Guid id, Guid workspaceId, Guid planId)
         : base(id)
     {
-        TenantId = tenantId;
+        WorkspaceId = workspaceId;
         PlanId = planId;
         Status = TrialingStatus;
     }

@@ -43,16 +43,16 @@ const PLANS = [
 ];
 
 /**
- * The in-memory platform. `subscriptions` is what GET tenant-subscriptions
- * answers; left out, the server is an older one without that endpoint (and
- * without suspend), as the contract's own host additions assume.
+ * The in-memory platform. `subscriptions` is what GET workspace-subscriptions
+ * answers (the workspace list itself); left out, Acme has no subscription.
  */
+const NO_SUBSCRIPTION = { workspaceId: ACME, workspaceName: "Acme", subscriptionId: null, planId: null, planName: null, status: null, trialEndsAt: null, seatsUsed: 0, maxSeats: null };
+
 function platform(opts: { deletePlanStatus?: number; subscriptions?: unknown[] } = {}) {
   fetchMock.mockImplementation(async (input, init) => {
     const url = String(input).replace(API, "");
     const method = init?.method ?? "GET";
-    if (url.startsWith("/api/app/platform/tenant-subscriptions") && opts.subscriptions) return json({ items: opts.subscriptions });
-    if (url.startsWith("/api/app/platform/tenant-subscriptions")) return json({ error: { code: null, message: "Not found" } }, 404);
+    if (url.startsWith("/api/app/platform/workspace-subscriptions")) return json({ items: opts.subscriptions ?? [NO_SUBSCRIPTION] });
     if (url.startsWith("/api/app/platform/suspend-subscription") && method === "POST" && opts.subscriptions) return json(null, 204);
     if (url.startsWith("/api/abp/application-configuration")) {
       return json({
@@ -61,11 +61,10 @@ function platform(opts: { deletePlanStatus?: number; subscriptions?: unknown[] }
         auth: { grantedPolicies: { "Tracker.Platform": true } },
       });
     }
-    if (url.startsWith("/api/multi-tenancy/tenants")) return json({ items: [{ id: ACME, name: "Acme" }], totalCount: 1 });
     if (url.startsWith("/api/app/platform/plans")) return json({ items: PLANS });
     if (url.startsWith("/api/app/platform/overview")) {
       return json({
-        tenantCount: 1,
+        workspaceCount: 1,
         activeSubscriptions: 1,
         trialingSubscriptions: 0,
         mrr: 48,
@@ -78,14 +77,14 @@ function platform(opts: { deletePlanStatus?: number; subscriptions?: unknown[] }
     if (url.startsWith("/api/app/platform/invoices")) {
       return json({
         items: [
-          { id: "inv-1", tenantId: ACME, tenantName: "Acme", amount: 48, status: "pending", dueDate: "2026-10-01T00:00:00Z", billingPeriodStart: "2026-09-01T00:00:00Z" },
-          { id: "inv-2", tenantId: ACME, tenantName: "=HYPERLINK(\"https://evil.example\",\"Open\")", amount: 48, status: "paid", dueDate: "2026-09-01T00:00:00Z" },
-          { id: "inv-3", tenantId: "dddddddd-dddd-dddd-dddd-dddddddddddd", tenantName: "", amount: 12, status: "paid", dueDate: "2026-08-01T00:00:00Z" },
+          { id: "inv-1", workspaceId: ACME, workspaceName: "Acme", amount: 48, status: "pending", dueDate: "2026-10-01T00:00:00Z", billingPeriodStart: "2026-09-01T00:00:00Z" },
+          { id: "inv-2", workspaceId: ACME, workspaceName: "=HYPERLINK(\"https://evil.example\",\"Open\")", amount: 48, status: "paid", dueDate: "2026-09-01T00:00:00Z" },
+          { id: "inv-3", workspaceId: "dddddddd-dddd-dddd-dddd-dddddddddddd", workspaceName: "", amount: 12, status: "paid", dueDate: "2026-08-01T00:00:00Z" },
         ],
         totalCount: 3,
       });
     }
-    if (url.startsWith("/api/app/platform/change-tenant-plan") && method === "POST") return json(null, 204);
+    if (url.startsWith("/api/app/platform/change-workspace-plan") && method === "POST") return json(null, 204);
     if (url.startsWith("/api/app/platform/activate-subscription") && method === "POST") return json(null, 204);
     if (url.startsWith("/api/app/platform/mark-invoice-paid") && method === "POST") return json(null, 204);
     if (url === "/api/app/platform/plan" && method === "POST") return json({ id: "plan-new", ...JSON.parse(String(init?.body)) });
@@ -133,7 +132,7 @@ describe("Feature: Host billing lifecycle", () => {
       expect(calls("/api/app/platform/change-tenant-plan", "POST")).toHaveLength(0);
       await user.click(within(confirm).getByRole("button", { name: "Change plan" }));
 
-      await waitFor(() => expect(calls(`/api/app/platform/change-tenant-plan?tenantId=${ACME}&planId=plan-business`, "POST")).toHaveLength(1));
+      await waitFor(() => expect(calls(`/api/app/platform/change-workspace-plan?workspaceId=${ACME}&planId=plan-business`, "POST")).toHaveLength(1));
       expect(await screen.findByText("Acme moved to Business")).toBeInTheDocument();
     });
   });
@@ -146,13 +145,13 @@ describe("Feature: Host billing lifecycle", () => {
       await user.click(within(drawer).getByRole("button", { name: /^activate$/i }));
       await user.click(within(screen.getByRole("dialog", { name: /activate acme's subscription\?/i })).getByRole("button", { name: "Activate subscription" }));
 
-      await waitFor(() => expect(calls(`/api/app/platform/activate-subscription?tenantId=${ACME}`, "POST")).toHaveLength(1));
+      await waitFor(() => expect(calls(`/api/app/platform/activate-subscription?workspaceId=${ACME}`, "POST")).toHaveLength(1));
       expect(await screen.findByText("Acme's subscription is active")).toBeInTheDocument();
     });
   });
 
   describe("Scenario: See each tenant's plan and status", () => {
-    const acme = { tenantId: ACME, tenantName: "Acme", subscriptionId: "sub-1", planId: "plan-starter", planName: "Starter", status: "active", trialEndsAt: null, seatsUsed: 8, maxSeats: 25 };
+    const acme = { workspaceId: ACME, workspaceName: "Acme", subscriptionId: "sub-1", planId: "plan-starter", planName: "Starter", status: "active", trialEndsAt: null, seatsUsed: 8, maxSeats: 25 };
 
     it("Given a server that reports subscriptions Then the table and the drawer show the real plan, status and seats", async () => {
       platform({ subscriptions: [acme] });
@@ -166,13 +165,12 @@ describe("Feature: Host billing lifecycle", () => {
       expect(within(drawer).queryByText(/doesn't report each tenant's current plan/i)).not.toBeInTheDocument();
     });
 
-    it("Given an older server without them Then plan and status read '—', never a guessed 'Active', and nothing offers to suspend", async () => {
+    it("Given a workspace without a subscription Then plan and status read '—', never a guessed 'Active', and nothing offers to suspend", async () => {
       const user = userEvent.setup();
       const drawer = await openAcme(user);
 
       const table = screen.getAllByRole("table")[0];
       expect(within(table).queryByText("Active")).not.toBeInTheDocument();
-      expect(within(drawer).getByText(/doesn't report each tenant's current plan/i)).toBeInTheDocument();
       expect(within(drawer).queryByRole("button", { name: /suspend/i })).not.toBeInTheDocument();
       // Signing in as a tenant is a demo-only tool: a live console doesn't show it at all.
       expect(within(drawer).queryByRole("button", { name: /login as tenant/i })).not.toBeInTheDocument();
@@ -190,7 +188,7 @@ describe("Feature: Host billing lifecycle", () => {
       expect(calls("/api/app/platform/suspend-subscription", "POST")).toHaveLength(0);
       await user.click(within(confirm).getByRole("button", { name: "Suspend workspace" }));
 
-      await waitFor(() => expect(calls(`/api/app/platform/suspend-subscription?tenantId=${ACME}`, "POST")).toHaveLength(1));
+      await waitFor(() => expect(calls(`/api/app/platform/suspend-subscription?workspaceId=${ACME}`, "POST")).toHaveLength(1));
       expect(await screen.findByText("Acme suspended")).toBeInTheDocument();
     });
 
@@ -202,7 +200,7 @@ describe("Feature: Host billing lifecycle", () => {
       expect(within(screen.getAllByRole("table")[0]).getByText("Suspended")).toBeInTheDocument();
       await user.click(await within(drawer).findByRole("button", { name: /reactivate/i }));
       await user.click(within(screen.getByRole("dialog", { name: /activate acme's subscription\?/i })).getByRole("button", { name: "Activate subscription" }));
-      await waitFor(() => expect(calls(`/api/app/platform/activate-subscription?tenantId=${ACME}`, "POST")).toHaveLength(1));
+      await waitFor(() => expect(calls(`/api/app/platform/activate-subscription?workspaceId=${ACME}`, "POST")).toHaveLength(1));
     });
   });
 
@@ -337,13 +335,12 @@ describe("Feature: Host billing lifecycle", () => {
     });
   });
 
-  describe("Scenario: Deleting a tenant says what really happens", () => {
-    it("Given a live tenant's details Then the danger zone says sign-ins stop and the data is not erased", async () => {
+  describe("Scenario: Live workspaces belong to their owners", () => {
+    it("Given a live workspace's details Then the console offers no delete and no create", async () => {
       const user = userEvent.setup();
       const drawer = await openAcme(user);
-      expect(within(drawer).getByText(/stops every sign-in to it/i)).toBeInTheDocument();
-      expect(within(drawer).getByText(/not erased from the database/i)).toBeInTheDocument();
-      expect(within(drawer).queryByText(/removes all of its data/i)).not.toBeInTheDocument();
+      expect(within(drawer).queryByRole("button", { name: /delete tenant/i })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /new tenant/i })).not.toBeInTheDocument();
     });
   });
 });

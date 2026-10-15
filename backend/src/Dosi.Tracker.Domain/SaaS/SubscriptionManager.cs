@@ -6,6 +6,7 @@ using Dosi.Tracker.Billing;
 using Microsoft.Extensions.Logging;
 using Volo.Abp.Domain.Entities;
 using Volo.Abp.Domain.Repositories;
+using Dosi.Tracker.Workspaces;
 using Volo.Abp.Domain.Services;
 
 namespace Dosi.Tracker.SaaS;
@@ -23,7 +24,7 @@ public enum SubscriptionReviewOutcome
 /// The subscription lifecycle of the current workspace: how a new workspace starts, the host's plan and status
 /// changes, recording a payment, and the hourly review that ends trials and acts on overdue invoices.
 /// </summary>
-public class SubscriptionManager : DomainService
+public class SubscriptionManager : TrackerDomainService
 {
     private readonly IRepository<Subscription, Guid> _subscriptionRepository;
     private readonly IRepository<Plan, Guid> _planRepository;
@@ -50,9 +51,9 @@ public class SubscriptionManager : DomainService
 
     /// <summary>The subscription a new workspace starts with (not yet saved): a paid plan with trial days starts a
     /// trial; a free plan, and a paid plan without a trial (which only the host can assign), is active.</summary>
-    public virtual Subscription CreateForNewWorkspace(Guid? tenantId, Plan plan)
+    public virtual Subscription CreateForNewWorkspace(Guid workspaceId, Plan plan)
     {
-        var subscription = new Subscription(GuidGenerator.Create(), tenantId, plan.Id);
+        var subscription = new Subscription(GuidGenerator.Create(), workspaceId, plan.Id);
         if (!plan.IsFree() && plan.TrialDays > 0)
         {
             subscription.StartTrial(Clock.Now.AddDays(plan.TrialDays));
@@ -67,7 +68,8 @@ public class SubscriptionManager : DomainService
 
     public virtual Task<Subscription?> FindCurrentAsync()
     {
-        return _subscriptionRepository.FirstOrDefaultAsync(s => s.TenantId == CurrentTenant.Id);
+        var workspaceId = CurrentWorkspace.Id;
+        return _subscriptionRepository.FirstOrDefaultAsync(s => s.WorkspaceId == workspaceId);
     }
 
     /// <summary>Host: moves the current workspace to <paramref name="plan"/> (see <see cref="Subscription.ChangePlan"/>);
@@ -80,7 +82,7 @@ public class SubscriptionManager : DomainService
         var subscription = await FindCurrentAsync();
         if (subscription == null)
         {
-            subscription = new Subscription(GuidGenerator.Create(), CurrentTenant.Id, plan.Id);
+            subscription = new Subscription(GuidGenerator.Create(), CurrentWorkspace.GetId(), plan.Id);
             subscription.Activate();
             await _subscriptionRepository.InsertAsync(subscription, autoSave: true);
         }
@@ -90,7 +92,7 @@ public class SubscriptionManager : DomainService
             await _subscriptionRepository.UpdateAsync(subscription, autoSave: true);
         }
 
-        Logger.LogInformation("Workspace {TenantId} moved to the '{Plan}' plan ({Status}).", CurrentTenant.Id, plan.Name, subscription.Status);
+        Logger.LogInformation("Workspace {WorkspaceId} moved to the '{Plan}' plan ({Status}).", CurrentWorkspace.Id, plan.Name, subscription.Status);
         return subscription;
     }
 
@@ -118,8 +120,8 @@ public class SubscriptionManager : DomainService
             await _invoiceRepository.UpdateManyAsync(excused, autoSave: true);
         }
 
-        Logger.LogInformation("Subscription of workspace {TenantId} activated ({Count} overdue invoice(s) excused).",
-            CurrentTenant.Id, excused.Count);
+        Logger.LogInformation("Subscription of workspace {WorkspaceId} activated ({Count} overdue invoice(s) excused).",
+            CurrentWorkspace.Id, excused.Count);
         return subscription;
     }
 
@@ -130,7 +132,7 @@ public class SubscriptionManager : DomainService
         subscription.Suspend();
         await _subscriptionRepository.UpdateAsync(subscription, autoSave: true);
 
-        Logger.LogInformation("Subscription of workspace {TenantId} suspended.", CurrentTenant.Id);
+        Logger.LogInformation("Subscription of workspace {WorkspaceId} suspended.", CurrentWorkspace.Id);
         return subscription;
     }
 
@@ -174,7 +176,7 @@ public class SubscriptionManager : DomainService
         subscription.Activate();
         await _subscriptionRepository.UpdateAsync(subscription, autoSave: true);
 
-        Logger.LogInformation("Workspace {TenantId} paid its overdue invoices and is active again.", CurrentTenant.Id);
+        Logger.LogInformation("Workspace {WorkspaceId} paid its overdue invoices and is active again.", CurrentWorkspace.Id);
         return true;
     }
 
@@ -212,8 +214,8 @@ public class SubscriptionManager : DomainService
                 "subscription is activated; contact support to continue.");
 
             Logger.LogInformation(
-                "Subscription {SubscriptionId} (tenant {TenantId}) trial ended; marked past_due.",
-                subscription.Id, subscription.TenantId);
+                "Subscription {SubscriptionId} (workspace {WorkspaceId}) trial ended; marked past_due.",
+                subscription.Id, subscription.WorkspaceId);
             return SubscriptionReviewOutcome.TrialEnded;
         }
 
@@ -258,8 +260,8 @@ public class SubscriptionManager : DomainService
             $"{FormatDate(graceEndsAt)} (UTC); settle the invoice to keep it running.");
 
         Logger.LogInformation(
-            "Subscription {SubscriptionId} (tenant {TenantId}) has {Count} overdue invoice(s); marked past_due.",
-            subscription.Id, subscription.TenantId, newlyOverdue.Count);
+            "Subscription {SubscriptionId} (workspace {WorkspaceId}) has {Count} overdue invoice(s); marked past_due.",
+            subscription.Id, subscription.WorkspaceId, newlyOverdue.Count);
         return SubscriptionReviewOutcome.MarkedPastDue;
     }
 

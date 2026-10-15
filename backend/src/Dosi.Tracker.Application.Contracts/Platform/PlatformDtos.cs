@@ -4,23 +4,22 @@ using System.ComponentModel.DataAnnotations;
 
 namespace Dosi.Tracker.Platform;
 
-/// <summary>Headline metrics for the platform-owner dashboard, aggregated across every existing tenant
-/// (subscriptions of deleted workspaces are left out).</summary>
+/// <summary>Headline metrics for the platform-owner dashboard, aggregated across every workspace.</summary>
 public class PlatformOverviewDto
 {
-    public int TenantCount { get; set; }
+    public int WorkspaceCount { get; set; }
     public int ActiveSubscriptions { get; set; }
     public int TrialingSubscriptions { get; set; }
 
     /// <summary>Monthly recurring revenue: sum over ACTIVE subscriptions of the plan's per-user price
-    /// times that tenant's occupied seats (min one seat). Trialing subscriptions pay nothing and are excluded.</summary>
+    /// times that workspace's occupied seats (min one seat). Trialing subscriptions pay nothing and are excluded.</summary>
     public decimal Mrr { get; set; }
 
     /// <summary>Total occupied (billable) seats across active subscriptions on paid plans; seats on free plans
     /// pay nothing and are not counted.</summary>
     public int PaidSeats { get; set; }
 
-    /// <summary>Sum of every invoice ever raised, across all tenants.</summary>
+    /// <summary>Sum of every invoice ever raised, across all workspaces.</summary>
     public decimal TotalInvoiced { get; set; }
 
     public int PendingInvoices { get; set; }
@@ -37,41 +36,41 @@ public class PlanSubscriberDto
     public int SubscriberCount { get; set; }
 }
 
-/// <summary>An invoice with its owning tenant resolved, for the platform billing view.</summary>
+/// <summary>An invoice with its workspace resolved, for the platform billing view.</summary>
 public class PlatformInvoiceDto
 {
     public Guid Id { get; set; }
-    public Guid? TenantId { get; set; }
+    public Guid WorkspaceId { get; set; }
 
-    /// <summary>The workspace's name; "Host" without a tenant, "Deleted workspace" when the tenant no longer exists.</summary>
-    public string TenantName { get; set; } = string.Empty;
+    /// <summary>The workspace's name; "Deleted workspace" when it no longer exists.</summary>
+    public string WorkspaceName { get; set; } = string.Empty;
 
     public decimal Amount { get; set; }
     public string Status { get; set; } = string.Empty;
     public DateTime DueDate { get; set; }
 
-    /// <summary>UTC start of the billed month (unique per tenant); null on invoices from before billing periods.</summary>
+    /// <summary>UTC start of the billed month (unique per workspace); null on invoices from before billing periods.</summary>
     public DateTime? BillingPeriodStart { get; set; }
 }
 
-/// <summary>A user account resolved to its owning tenant, for the cross-tenant users view.</summary>
+/// <summary>A user account (global) with the workspaces it is an active member of.</summary>
 public class PlatformUserDto
 {
     public Guid Id { get; set; }
     public string UserName { get; set; } = string.Empty;
     public string? Email { get; set; }
     public string? Name { get; set; }
-    public Guid? TenantId { get; set; }
+    public bool IsActive { get; set; }
 
-    /// <summary>The workspace's name; "Host" without a tenant, "Deleted workspace" when the tenant no longer exists.</summary>
-    public string TenantName { get; set; } = string.Empty;
+    /// <summary>Names of the workspaces the user is an active member of, by name.</summary>
+    public List<string> WorkspaceNames { get; set; } = new();
 }
 
-/// <summary>A workspace with its subscription, for the host's tenant list and plan management.</summary>
-public class TenantSubscriptionDto
+/// <summary>A workspace with its subscription, for the platform's workspace list and plan management.</summary>
+public class WorkspaceSubscriptionDto
 {
-    public Guid TenantId { get; set; }
-    public string TenantName { get; set; } = string.Empty;
+    public Guid WorkspaceId { get; set; }
+    public string WorkspaceName { get; set; } = string.Empty;
 
     /// <summary>Null (as are the plan and status fields) when the workspace has no subscription.</summary>
     public Guid? SubscriptionId { get; set; }

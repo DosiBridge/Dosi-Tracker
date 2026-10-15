@@ -37,9 +37,9 @@ public abstract class BillingAppServiceTests<TStartupModule> : TrackerApplicatio
         var baseDate = new DateTime(2026, 7, 1, 0, 0, 0, DateTimeKind.Utc);
         await WithUnitOfWorkAsync(async () =>
         {
-            await _invoiceRepository.InsertAsync(new Invoice(_guidGenerator.Create(), null, 10m, baseDate));
-            await _invoiceRepository.InsertAsync(new Invoice(_guidGenerator.Create(), null, 30m, baseDate.AddMonths(2)));
-            await _invoiceRepository.InsertAsync(new Invoice(_guidGenerator.Create(), null, 20m, baseDate.AddMonths(1)));
+            await _invoiceRepository.InsertAsync(new Invoice(_guidGenerator.Create(), TrackerTestConsts.WorkspaceId, 10m, baseDate));
+            await _invoiceRepository.InsertAsync(new Invoice(_guidGenerator.Create(), TrackerTestConsts.WorkspaceId, 30m, baseDate.AddMonths(2)));
+            await _invoiceRepository.InsertAsync(new Invoice(_guidGenerator.Create(), TrackerTestConsts.WorkspaceId, 20m, baseDate.AddMonths(1)));
         });
 
         var page = await _billingAppService.GetInvoicesAsync(new PagedAndSortedResultRequestDto
@@ -62,9 +62,9 @@ public abstract class BillingAppServiceTests<TStartupModule> : TrackerApplicatio
         await WithUnitOfWorkAsync(async () =>
         {
             await _invoiceRepository.InsertAsync(
-                new Invoice(_guidGenerator.Create(), null, 18m, period.AddDays(14)) { BillingPeriodStart = period });
+                new Invoice(_guidGenerator.Create(), TrackerTestConsts.WorkspaceId, 18m, period.AddDays(14)) { BillingPeriodStart = period });
             await _invoiceRepository.InsertAsync(
-                new Invoice(_guidGenerator.Create(), null, 12m, period.AddMonths(-2))); // from before billing periods
+                new Invoice(_guidGenerator.Create(), TrackerTestConsts.WorkspaceId, 12m, period.AddMonths(-2))); // from before billing periods
         });
 
         var page = await _billingAppService.GetInvoicesAsync(new PagedAndSortedResultRequestDto { MaxResultCount = 10 });

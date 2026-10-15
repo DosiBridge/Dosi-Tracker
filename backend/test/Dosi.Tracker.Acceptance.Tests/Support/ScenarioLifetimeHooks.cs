@@ -1,3 +1,4 @@
+using Dosi.Tracker.Workspaces;
 using System.Threading.Tasks;
 using Dosi.Tracker.Identity;
 using Reqnroll;
@@ -30,8 +31,8 @@ public sealed class ScenarioLifetimeHooks
     }
 
     /// <summary>
-    /// The acting user (<see cref="ScenarioState.CurrentUserId"/>) is the workspace owner, with the account a real owner
-    /// has: an active user in the Identity "admin" role. Seats, for one, are only held by people with an account.
+    /// The acting user (<see cref="ScenarioState.CurrentUserId"/>) is the owner of the test workspace, with the account a
+    /// real owner has. Seats, for one, are only held by active members.
     /// </summary>
     [BeforeScenario(Order = 1)]
     public async Task CreateTheActingOwnerAsync()
@@ -42,7 +43,7 @@ public sealed class ScenarioLifetimeHooks
             var userManager = app.Resolve<IdentityUserManager>();
             var owner = new IdentityUser(ScenarioState.CurrentUserId, "owner", "owner@tracker.test");
             (await userManager.CreateAsync(owner)).Succeeded.ShouldBeTrue();
-            (await userManager.AddToRoleAsync(owner, TrackerRoles.Admin)).Succeeded.ShouldBeTrue();
+            await app.Resolve<WorkspaceMembershipManager>().AddAsync(TrackerTestConsts.WorkspaceId, owner.Id, WorkspaceRoles.Owner);
         });
     }
 

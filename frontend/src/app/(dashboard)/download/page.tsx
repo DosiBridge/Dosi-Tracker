@@ -24,7 +24,7 @@ import { cn } from "@/lib/utils";
  * so the page shows the address to paste into its sign-in screen.
  */
 export default function DownloadPage() {
-  const { workspace, user, isLive } = useSession();
+  const { user, isLive } = useSession();
   const os = useVisitorOs();
 
   return (
@@ -39,10 +39,9 @@ export default function DownloadPage() {
         heading="What the agent asks for when you sign in"
         headingLevel={2}
         agentLink={false}
-        workspaceName={workspace.name}
         email={isLive ? user.email || null : null}
       >
-        Paste the <span className="font-medium text-foreground">server address</span> exactly as shown — the agent can&apos;t find your
+        Paste the <span className="font-medium text-foreground">server address</span> exactly as shown — the agent can&apos;t reach your
         workspace without it. Then sign in with the email and password you use here.
       </SignInDetails>
 
@@ -70,7 +69,7 @@ export default function DownloadPage() {
               <span className="font-medium text-foreground">More info → Run anyway</span>.
             </li>
             <li>
-              Sign in with the <span className="font-medium text-foreground">server address</span>, workspace, email and password above.
+              Sign in with the <span className="font-medium text-foreground">server address</span>, email and password above.
               The agent lives in the system tray.
             </li>
             <li>Choose the project you&apos;re working on (only when you&apos;re on more than one) and start tracking.</li>
@@ -100,7 +99,7 @@ export default function DownloadPage() {
           <ol className="list-decimal space-y-2 pl-5 text-muted-foreground">
             <li>Build and start the agent by following the setup guide.</li>
             <li>
-              Sign in with the <span className="font-medium text-foreground">server address</span>, workspace, email and password above.
+              Sign in with the <span className="font-medium text-foreground">server address</span>, email and password above.
               The agent lives in the menu bar.
             </li>
             <li>

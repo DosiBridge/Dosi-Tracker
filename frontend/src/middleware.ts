@@ -1,18 +1,27 @@
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
 
+/** Same-site paths only (`?next=` must never send anyone off-site). */
+function safeNext(raw: string | null | undefined): string | null {
+  if (!raw || !raw.startsWith("/") || raw.startsWith("//")) return null;
+  return raw;
+}
+
 /**
  * Server-side route gate. `loginApi` mirrors a session flag into the
  * `dosi-token` cookie (the JWT itself stays in localStorage only); without it,
- * every app route redirects to /login.
+ * every app route redirects to /login. Invitation links open for everyone.
  */
 export function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl;
   const hasSession = request.cookies.has("dosi-token");
 
+  if (pathname.startsWith("/invite/")) return NextResponse.next();
+
   if (pathname === "/login") {
     if (hasSession) {
-      return NextResponse.redirect(new URL("/dashboard", request.url));
+      const next = safeNext(request.nextUrl.searchParams?.get("next"));
+      return NextResponse.redirect(new URL(next ?? "/dashboard", request.url));
     }
     return NextResponse.next();
   }

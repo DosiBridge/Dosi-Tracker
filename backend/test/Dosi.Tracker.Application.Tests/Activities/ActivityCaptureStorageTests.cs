@@ -8,7 +8,7 @@ using Volo.Abp.BlobStoring;
 using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Guids;
 using Volo.Abp.Modularity;
-using Volo.Abp.MultiTenancy;
+using Dosi.Tracker.Workspaces;
 using Volo.Abp.Uow;
 using Xunit;
 
@@ -34,7 +34,7 @@ public abstract class ActivityCaptureStorageTests<TStartupModule> : TrackerAppli
     private readonly IRepository<Activity, Guid> _activityRepository;
     private readonly IRepository<Screenshot, Guid> _screenshotRepository;
     private readonly IGuidGenerator _guidGenerator;
-    private readonly ICurrentTenant _currentTenant;
+    private readonly ICurrentWorkspace _currentWorkspace;
 
     protected ActivityCaptureStorageTests()
     {
@@ -42,7 +42,7 @@ public abstract class ActivityCaptureStorageTests<TStartupModule> : TrackerAppli
         _activityRepository = GetRequiredService<IRepository<Activity, Guid>>();
         _screenshotRepository = GetRequiredService<IRepository<Screenshot, Guid>>();
         _guidGenerator = GetRequiredService<IGuidGenerator>();
-        _currentTenant = GetRequiredService<ICurrentTenant>();
+        _currentWorkspace = GetRequiredService<ICurrentWorkspace>();
     }
 
     protected override void AfterAddApplication(IServiceCollection services)
@@ -91,7 +91,7 @@ public abstract class ActivityCaptureStorageTests<TStartupModule> : TrackerAppli
     public async Task A_Failed_Capture_Upload_Fails_The_Request_And_Keeps_Nothing_Of_The_Block()
     {
         var tenantId = Guid.NewGuid();
-        using (_currentTenant.Change(tenantId))
+        using (_currentWorkspace.Change(tenantId))
         {
             var input = NewInputWithCaptures(await SeedProjectAsync(tenantId));
             // The screen capture uploads; the thumbnail hits an object-store outage.
@@ -118,7 +118,7 @@ public abstract class ActivityCaptureStorageTests<TStartupModule> : TrackerAppli
     public async Task A_Concurrent_Upload_Of_The_Same_Block_Is_Answered_With_The_Block_It_Stored()
     {
         var tenantId = Guid.NewGuid();
-        using (_currentTenant.Change(tenantId))
+        using (_currentWorkspace.Change(tenantId))
         {
             var projectId = await SeedProjectAsync(tenantId);
             var input = NewInputWithCaptures(projectId);
@@ -150,7 +150,7 @@ public abstract class ActivityCaptureStorageTests<TStartupModule> : TrackerAppli
     public async Task Captures_Are_Stored_Under_The_Block_With_Their_Detected_Format()
     {
         var tenantId = Guid.NewGuid();
-        using (_currentTenant.Change(tenantId))
+        using (_currentWorkspace.Change(tenantId))
         {
             var input = NewInputWithCaptures(await SeedProjectAsync(tenantId));
 

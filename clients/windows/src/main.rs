@@ -38,6 +38,7 @@ mod prefs;
 mod session_events;
 #[allow(unfulfilled_lint_expectations)]
 mod shell;
+mod signing;
 mod single_instance;
 mod state;
 #[allow(unfulfilled_lint_expectations)]
@@ -420,8 +421,9 @@ fn debug_auto_signin(commands: &tokio::sync::mpsc::UnboundedSender<Command>) {
     let (Ok(username), Ok(password)) = (std::env::var("DOSI_USERNAME"), std::env::var("DOSI_PASSWORD")) else {
         return;
     };
-    let workspace = std::env::var("DOSI_WORKSPACE").unwrap_or_default();
-    tracing::info!(%workspace, %username, "debug auto sign-in");
+    // Optional: the workspace (name or id) to pick after signing in.
+    let workspace = std::env::var("DOSI_WORKSPACE").ok();
+    tracing::info!(?workspace, %username, "debug auto sign-in");
     let server = std::env::var("DOSI_SERVER").ok();
     let _ = commands.send(Command::SignIn { workspace, username, password, server });
     if std::env::var("DOSI_AUTO_SYNC").is_ok() {

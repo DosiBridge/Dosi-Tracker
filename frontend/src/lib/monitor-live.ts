@@ -269,21 +269,27 @@ export function liveRoster(
   return roster.map((u) => ({ ...u, status: statusOf ? statusOf(u.id) : liveStatus(lastSeen.get(u.id), now) }));
 }
 
+/** Snap interval used for the timeline axis boundaries (60 min = whole hours). */
+const AXIS_SNAP_HOUR = 60;
+
 /**
- * The axis that shows every segment: the working day, widened to whole
- * two-hour marks when real work falls outside it, and never beyond
- * midnight–midnight.
+ * The axis that shows every segment: derived from the actual activity range
+ * (with one-hour padding on each side, snapped to whole hours).
+ * Falls back to the default working day when there are no segments.
+ * Never expands beyond midnight–midnight.
  */
 export function timelineWindow(segments: DaySegment[]): DayWindow {
-  let start = DEFAULT_DAY_WINDOW.start;
-  let end = DEFAULT_DAY_WINDOW.end;
+  if (segments.length === 0) return DEFAULT_DAY_WINDOW;
+  let start = Infinity;
+  let end = -Infinity;
   for (const s of segments) {
     start = Math.min(start, s.startMin);
     end = Math.max(end, s.endMin);
   }
+  // Add one hour of padding and snap to whole hours so axis ticks land cleanly.
   return {
-    start: Math.max(0, Math.floor(start / AXIS_SNAP_MIN) * AXIS_SNAP_MIN),
-    end: Math.min(MINUTES_PER_DAY, Math.ceil(end / AXIS_SNAP_MIN) * AXIS_SNAP_MIN),
+    start: Math.max(0, Math.floor((start - 60) / AXIS_SNAP_HOUR) * AXIS_SNAP_HOUR),
+    end: Math.min(MINUTES_PER_DAY, Math.ceil((end + 60) / AXIS_SNAP_HOUR) * AXIS_SNAP_HOUR),
   };
 }
 

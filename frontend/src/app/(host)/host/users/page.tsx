@@ -19,7 +19,7 @@ interface Row {
   id: string;
   name: string;
   email: string;
-  tenant: string;
+  workspaces: string[];
 }
 
 /** Shape of GET /api/app/platform/users items. */
@@ -28,8 +28,8 @@ interface ApiUser {
   userName: string;
   email?: string | null;
   name?: string | null;
-  tenantId?: string | null;
-  tenantName?: string | null;
+  isActive?: boolean;
+  workspaceNames?: string[] | null;
 }
 
 export default function HostUsersPage() {
@@ -52,8 +52,7 @@ export default function HostUsersPage() {
           id: u.id,
           name: (u.name && u.name.trim()) || u.userName,
           email: u.email ?? "",
-          // A user whose tenant has no name any more belongs to a deleted workspace, not to the host.
-          tenant: u.tenantName || (u.tenantId ? "Deleted workspace" : "Host"),
+          workspaces: Array.isArray(u.workspaceNames) ? u.workspaceNames.filter((n) => typeof n === "string") : [],
         }))
       );
     } catch {
@@ -76,23 +75,23 @@ export default function HostUsersPage() {
         id: g.user.id,
         name: g.user.name,
         email: g.user.email,
-        tenant: g.workspaceName,
+        workspaces: [g.workspaceName],
       })),
     [workspaces]
   );
 
   // Live: real users only; a failed load shows an error, never demo people.
   const all = useMemo(() => (isLive ? (live ?? []) : mockRows), [isLive, live, mockRows]);
-  const tenants = useMemo(() => [...new Set(all.map((r) => r.tenant))].sort(), [all]);
+  const tenants = useMemo(() => [...new Set(all.flatMap((r) => r.workspaces))].sort(), [all]);
 
   const rows = useMemo(
     () =>
       all
-        .filter((r) => (tenant === "all" ? true : r.tenant === tenant))
+        .filter((r) => (tenant === "all" ? true : r.workspaces.includes(tenant)))
         .filter((r) => {
           if (!query.trim()) return true;
           const q = query.toLowerCase();
-          return r.name.toLowerCase().includes(q) || r.email.toLowerCase().includes(q) || r.tenant.toLowerCase().includes(q);
+          return r.name.toLowerCase().includes(q) || r.email.toLowerCase().includes(q) || r.workspaces.some((w) => w.toLowerCase().includes(q));
         }),
     [all, tenant, query]
   );
@@ -113,10 +112,10 @@ export default function HostUsersPage() {
       ),
     },
     {
-      key: "tenant",
-      header: "Tenant",
-      sortValue: (r) => r.tenant.toLowerCase(),
-      render: (r) => <span className="text-muted-foreground">{r.tenant}</span>,
+      key: "workspaces",
+      header: "Workspaces",
+      sortValue: (r) => r.workspaces.join(", ").toLowerCase(),
+      render: (r) => <span className="text-muted-foreground">{r.workspaces.length ? r.workspaces.join(", ") : "No workspace"}</span>,
     },
   ];
 
@@ -125,7 +124,7 @@ export default function HostUsersPage() {
       <PageHeader
         eyebrow="Host"
         title="Global Users"
-        description={`${rows.length} of ${all.length} users across every tenant.`}
+        description={`${rows.length} of ${all.length} users across every workspace.`}
         actions={<Badge tone="muted" className="gap-1.5"><UsersIcon className="h-3.5 w-3.5" /> {all.length} total</Badge>}
       />
 
@@ -140,9 +139,9 @@ export default function HostUsersPage() {
       )}
 
       <Toolbar>
-        <SearchField value={query} onChange={setQuery} placeholder="Search name, email or tenant…" />
+        <SearchField value={query} onChange={setQuery} placeholder="Search name, email or workspace…" />
         <Select value={tenant} onChange={(e) => setTenant(e.target.value)} className="w-full sm:w-auto sm:min-w-40">
-          <option value="all">All tenants</option>
+          <option value="all">All workspaces</option>
           {tenants.map((t) => (
             <option key={t} value={t}>{t}</option>
           ))}

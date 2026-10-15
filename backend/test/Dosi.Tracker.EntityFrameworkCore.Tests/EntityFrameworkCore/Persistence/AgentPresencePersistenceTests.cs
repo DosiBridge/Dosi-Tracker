@@ -4,7 +4,7 @@ using Dosi.Tracker.Presence;
 using Microsoft.EntityFrameworkCore;
 using Shouldly;
 using Volo.Abp.Domain.Repositories;
-using Volo.Abp.MultiTenancy;
+using Dosi.Tracker.Workspaces;
 using Xunit;
 
 namespace Dosi.Tracker.EntityFrameworkCore.Persistence;
@@ -15,12 +15,12 @@ public class AgentPresencePersistenceTests : TrackerEntityFrameworkCoreTestBase
     private static readonly DateTime Now = new(2026, 10, 5, 9, 30, 0, DateTimeKind.Utc);
 
     private readonly IRepository<AgentPresence, Guid> _presenceRepository;
-    private readonly ICurrentTenant _currentTenant;
+    private readonly ICurrentWorkspace _currentWorkspace;
 
     public AgentPresencePersistenceTests()
     {
         _presenceRepository = GetRequiredService<IRepository<AgentPresence, Guid>>();
-        _currentTenant = GetRequiredService<ICurrentTenant>();
+        _currentWorkspace = GetRequiredService<ICurrentWorkspace>();
     }
 
     private Task InsertAsync(Guid tenantId, Guid userId, Guid deviceId, string status = "tracking")
@@ -39,7 +39,7 @@ public class AgentPresencePersistenceTests : TrackerEntityFrameworkCoreTestBase
         var projectId = Guid.NewGuid();
         var id = Guid.NewGuid();
 
-        using (_currentTenant.Change(tenantId))
+        using (_currentWorkspace.Change(tenantId))
         {
             await WithUnitOfWorkAsync(() => _presenceRepository.InsertAsync(
                 new AgentPresence(id, tenantId, userId, deviceId, "tracking", Now)
@@ -56,7 +56,7 @@ public class AgentPresencePersistenceTests : TrackerEntityFrameworkCoreTestBase
                 }));
 
             var stored = await WithUnitOfWorkAsync(() => _presenceRepository.GetAsync(id));
-            stored.TenantId.ShouldBe(tenantId);
+            stored.WorkspaceId.ShouldBe(tenantId);
             stored.UserId.ShouldBe(userId);
             stored.DeviceId.ShouldBe(deviceId);
             stored.DeviceName.ShouldBe("DESKTOP-42");
@@ -97,7 +97,7 @@ public class AgentPresencePersistenceTests : TrackerEntityFrameworkCoreTestBase
         var userId = Guid.NewGuid();
         var deviceId = Guid.NewGuid();
 
-        using (_currentTenant.Change(tenantId))
+        using (_currentWorkspace.Change(tenantId))
         {
             await InsertAsync(tenantId, userId, deviceId);
 
@@ -119,12 +119,12 @@ public class AgentPresencePersistenceTests : TrackerEntityFrameworkCoreTestBase
         var deviceId = Guid.NewGuid();
         var userId = Guid.NewGuid();
 
-        using (_currentTenant.Change(tenantA))
+        using (_currentWorkspace.Change(tenantA))
         {
             await InsertAsync(tenantA, userId, deviceId);
         }
 
-        using (_currentTenant.Change(tenantB))
+        using (_currentWorkspace.Change(tenantB))
         {
             (await WithUnitOfWorkAsync(() => _presenceRepository.GetCountAsync())).ShouldBe(0);
         }

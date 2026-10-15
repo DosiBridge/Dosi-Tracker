@@ -228,6 +228,8 @@ pub enum NoticeKind {
     QueueReset { moved_to: String },
     /// The saved password no longer works.
     SignInExpired,
+    /// The account lost access to the workspace it tracked in.
+    WorkspaceLost { name: String },
 }
 
 impl Notice {
@@ -249,8 +251,19 @@ impl Notice {
                 format!("The local queue was damaged and was set aside ({moved_to}). Tracking continues.")
             }
             NoticeKind::SignInExpired => "Your sign-in has expired. Enter your password to continue tracking.".to_owned(),
+            NoticeKind::WorkspaceLost { name } => format!("You no longer have access to {name}. Choose another workspace."),
         }
     }
+}
+
+/// A workspace offered by the picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceChoice {
+    pub name: String,
+    /// The user's role there ("Owner", "Admin", "Member"…).
+    pub role: Option<String>,
+    /// The workspace tracked in now.
+    pub is_current: bool,
 }
 
 /// How many notices are kept for the window to pick up.
@@ -265,7 +278,7 @@ pub struct SharedState {
     pub status: TrackerStatus,
     pub pending_action: Option<PendingAction>,
     pub display_name: String,
-    /// Workspace (tenant) of the signed-in account; empty for a host account.
+    /// The name of the workspace tracked in.
     pub workspace: String,
     /// The server this account talks to (the address saved at sign-in, else
     /// the configured one).
@@ -336,6 +349,14 @@ pub struct SharedState {
     /// Set once a sign-in attempt fails so the login view can show it.
     pub login_error: Option<String>,
     pub signing_in: bool,
+    /// Workspaces to choose from after a sign-in or "Switch workspace".
+    pub workspace_choices: Vec<WorkspaceChoice>,
+    /// The workspaces of the saved sign-in are being looked up.
+    pub finding_workspaces: bool,
+    /// The answer to "Switch workspace" when there is nothing to choose.
+    pub workspace_note: Option<String>,
+    /// The account lost access to this workspace: another must be chosen.
+    pub workspace_lost: Option<String>,
     /// Things to tell the user once, oldest first (at most [`MAX_NOTICES`]).
     pub notices: Vec<Notice>,
 }
@@ -379,6 +400,10 @@ impl Default for SharedState {
             last_error: None,
             login_error: None,
             signing_in: false,
+            workspace_choices: Vec::new(),
+            finding_workspaces: false,
+            workspace_note: None,
+            workspace_lost: None,
             notices: Vec::new(),
         }
     }
@@ -431,9 +456,20 @@ impl StateHandle {
 /// exactly there, however long the worker takes to get to it (CONTRACT §4).
 #[derive(Debug, Clone)]
 pub enum Command {
-    /// Sign in. `server` is the address typed on the sign-in screen; `None`
-    /// keeps the one saved with this account (or the configured one).
-    SignIn { workspace: String, username: String, password: String, server: Option<String> },
+    /// Sign in, then pick the workspace: the one named by `workspace` (a
+    /// name or id), the only one, or one of [`SharedState::workspace_choices`].
+    /// `server` is the address typed on the sign-in screen; `None` keeps the
+    /// one saved with this account (or the configured one).
+    SignIn { workspace: Option<String>, username: String, password: String, server: Option<String> },
+    /// Use `workspace_choices[index]` after signing in.
+    ChooseWorkspace { index: usize },
+    /// Close the workspace picker.
+    CancelWorkspaceChoice,
+    /// Signed in: list the user's workspaces.
+    SwitchWorkspace,
+    /// Track in `workspace_choices[index]` from now on (same sign-in). The
+    /// block ends at `at`.
+    SwitchToWorkspace { index: usize, at: DateTime<Utc> },
     /// Save the block in progress (ended by `signout`), say so to the server
     /// and forget the saved sign-in.
     SignOut { at: DateTime<Utc> },

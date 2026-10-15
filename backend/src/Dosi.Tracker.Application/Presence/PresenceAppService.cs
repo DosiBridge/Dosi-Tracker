@@ -14,6 +14,8 @@ using Volo.Abp.Identity;
 using Volo.Abp.Uow;
 using Volo.Abp.Users;
 
+using Dosi.Tracker.Workspaces;
+
 namespace Dosi.Tracker.Presence;
 
 /// <summary>
@@ -24,7 +26,7 @@ namespace Dosi.Tracker.Presence;
 /// <see cref="AgentPresenceConsts.StaleDeviceDays"/> days: the list is tidied whenever a new device of theirs reports.
 /// </summary>
 [Authorize]
-public class PresenceAppService : ApplicationService, IPresenceAppService
+public class PresenceAppService : TrackerAppService, IPresenceAppService
 {
     private readonly IRepository<AgentPresence, Guid> _presenceRepository;
     private readonly IRepository<Project, Guid> _projectRepository;
@@ -58,7 +60,7 @@ public class PresenceAppService : ApplicationService, IPresenceAppService
         var presence = await FindDeviceAsync(userId, input.DeviceId);
         if (presence == null)
         {
-            var created = new AgentPresence(GuidGenerator.Create(), CurrentTenant.Id, userId, input.DeviceId, status, now);
+            var created = new AgentPresence(GuidGenerator.Create(), CurrentWorkspace.GetId(), userId, input.DeviceId, status, now);
             Apply(created, input, status, project, now, previousStatus: null);
 
             // Null when a concurrent heartbeat of the same device created the row first; that row is updated instead.
@@ -153,7 +155,7 @@ public class PresenceAppService : ApplicationService, IPresenceAppService
     }
 
     /// <summary>Inserts the first row of a device in a unit of work of its own (a refused insert must not poison the
-    /// caller's). When the unique (TenantId, UserId, DeviceId) index refuses it because a concurrent heartbeat
+    /// caller's). When the unique (WorkspaceId, UserId, DeviceId) index refuses it because a concurrent heartbeat
     /// stored the device first, returns that row; returns null when this insert won.</summary>
     private async Task<AgentPresence?> InsertOrFindConcurrentAsync(AgentPresence presence)
     {

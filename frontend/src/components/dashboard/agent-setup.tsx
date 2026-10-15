@@ -146,7 +146,6 @@ function DetailRow({ label, value, mono = true }: { label: React.ReactNode; valu
  * one-time password after an invite or a reset; pass its label as JSX.
  */
 export function SignInDetails({
-  workspaceName,
   email,
   secret,
   heading = "Sign-in details",
@@ -155,7 +154,6 @@ export function SignInDetails({
   className,
   children,
 }: {
-  workspaceName: string;
   email?: string | null;
   secret?: { label: React.ReactNode; value: string } | null;
   heading?: React.ReactNode;
@@ -194,7 +192,6 @@ export function SignInDetails({
       </div>
       <dl ref={listRef} className="divide-y divide-border/70">
         <DetailRow label="Server address" value={AGENT_SERVER_URL} />
-        <DetailRow label="Workspace" value={workspaceName} mono={false} />
         {email ? <DetailRow label="Email" value={email} mono={false} /> : null}
         {secret ? <DetailRow label={secret.label} value={secret.value} /> : null}
         {agentLink && origin ? <DetailRow label="Desktop agent" value={`${origin}/download`} mono={false} /> : null}

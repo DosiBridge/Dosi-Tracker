@@ -265,14 +265,14 @@ namespace Dosi.Tracker.Features
             await this.ScenarioCleanupAsync();
         }
         
-        [Xunit.SkippableFactAttribute(DisplayName="Inviting a new email creates a user with a one-time password")]
+        [Xunit.SkippableFactAttribute(DisplayName="Inviting an email without an account creates a pending invitation")]
         [Xunit.TraitAttribute("FeatureTitle", "Projects and team management")]
-        [Xunit.TraitAttribute("Description", "Inviting a new email creates a user with a one-time password")]
-        public async global::System.Threading.Tasks.Task InvitingANewEmailCreatesAUserWithAOne_TimePassword()
+        [Xunit.TraitAttribute("Description", "Inviting an email without an account creates a pending invitation")]
+        public async global::System.Threading.Tasks.Task InvitingAnEmailWithoutAnAccountCreatesAPendingInvitation()
         {
             string[] tagsOfScenario = ((string[])(null));
             global::System.Collections.Specialized.OrderedDictionary argumentsOfScenario = new global::System.Collections.Specialized.OrderedDictionary();
-            global::Reqnroll.ScenarioInfo scenarioInfo = new global::Reqnroll.ScenarioInfo("Inviting a new email creates a user with a one-time password", null, tagsOfScenario, argumentsOfScenario, featureTags);
+            global::Reqnroll.ScenarioInfo scenarioInfo = new global::Reqnroll.ScenarioInfo("Inviting an email without an account creates a pending invitation", null, tagsOfScenario, argumentsOfScenario, featureTags);
 #line 29
   this.ScenarioInitialize(scenarioInfo);
 #line hidden
@@ -290,10 +290,10 @@ namespace Dosi.Tracker.Features
     await testRunner.WhenAsync("I invite \"new.worker@acme.test\" as a \"Worker\"", ((string)(null)), ((global::Reqnroll.Table)(null)), "When ");
 #line hidden
 #line 32
-    await testRunner.ThenAsync("a new user is created with a one-time password", ((string)(null)), ((global::Reqnroll.Table)(null)), "Then ");
+    await testRunner.ThenAsync("a pending invitation link is returned", ((string)(null)), ((global::Reqnroll.Table)(null)), "Then ");
 #line hidden
 #line 33
-    await testRunner.AndAsync("the invitee is a member of the project", ((string)(null)), ((global::Reqnroll.Table)(null)), "And ");
+    await testRunner.AndAsync("no account exists yet for \"new.worker@acme.test\"", ((string)(null)), ((global::Reqnroll.Table)(null)), "And ");
 #line hidden
             }
             await this.ScenarioCleanupAsync();

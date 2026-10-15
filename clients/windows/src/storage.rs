@@ -6,24 +6,21 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::model::Activity;
+use crate::signing;
 
 /// Files SQLite keeps next to a database (a hot journal is part of it).
 pub const SQLITE_SIDECARS: [&str; 3] = ["-journal", "-wal", "-shm"];
 
-/// Identify the account a queued row belongs to: workspace (tenant) + user.
+/// Identify the user a queued row belongs to (the workspace it belongs to is
+/// kept per row, in `workspace_id`).
 ///
-/// Rows are only ever uploaded under the token of the account that captured
+/// Rows are only ever uploaded under the token of the user who captured
 /// them — otherwise signing out and in as someone else would upload the first
-/// user's time and screenshots as the second user's. Both parts are
-/// case-insensitive on the server, so they are normalised here. The separator
-/// is a control character that cannot be typed into the sign-in form, so two
-/// different accounts can never produce the same key.
-pub fn owner_key(workspace: &str, username: &str) -> String {
-    format!(
-        "{}\u{1f}{}",
-        workspace.trim().to_lowercase(),
-        username.trim().to_lowercase()
-    )
+/// user's time and screenshots as the second user's. Emails are
+/// case-insensitive on the server, so they are normalised here. The prefix
+/// keeps keys of older builds (workspace + user) from ever matching.
+pub fn owner_key(username: &str) -> String {
+    format!("user\u{1f}{}", username.trim().to_lowercase())
 }
 
 /// Bounds that keep the offline queue from growing without limit while the
@@ -70,6 +67,14 @@ pub enum RowStatus {
     Queued,
     /// Parked: the server refused it; kept for diagnostics, never retried.
     Rejected,
+}
+
+/// A pending row to upload, with the workspace it was recorded in.
+#[derive(Debug, Clone)]
+pub struct PendingRow {
+    pub id: i64,
+    pub workspace_id: String,
+    pub activity: Activity,
 }
 
 /// One row of the queue as the window lists it.
@@ -143,9 +148,18 @@ impl std::error::Error for DamagedDatabase {}
 /// signed-in account's rows.
 pub struct Storage {
     conn: Connection,
+    /// Device signing key loaded at startup; `None` only in tests that call
+    /// the low-level `open()` constructor without a key.
+    signing_key: Option<Vec<u8>>,
 }
 
 impl Storage {
+    /// Attach the device signing key so that [`Storage::enqueue`] can sign
+    /// each payload. Call this once after opening the queue.
+    pub fn set_signing_key(&mut self, key: Vec<u8>) {
+        self.signing_key = Some(key);
+    }
+
     /// Open (and migrate) the queue.
     ///
     /// `legacy_owner` is the account signed in when this build first opens a
@@ -210,6 +224,8 @@ impl Storage {
         let summary_columns_added = add_column_if_missing(&tx, "project_id", "TEXT NULL")?;
         add_column_if_missing(&tx, "started_at", "TEXT NULL")?;
         add_column_if_missing(&tx, "ended_at", "TEXT NULL")?;
+        add_column_if_missing(&tx, "sig", "TEXT NULL")?;
+        add_column_if_missing(&tx, "workspace_id", "TEXT NULL")?;
         if summary_columns_added {
             tx.execute(
                 "UPDATE activities SET \
@@ -226,7 +242,7 @@ impl Storage {
         )?;
         tx.commit()?;
 
-        Ok(Self { conn })
+        Ok(Self { conn, signing_key: None })
     }
 
     /// Open the queue at `path`, checking that it is intact. A damaged file
@@ -257,20 +273,30 @@ impl Storage {
         Ok(storage)
     }
 
-    /// Queue an activity for upload on behalf of `owner`.
-    pub fn enqueue(&self, activity: &Activity, owner: &str) -> Result<i64> {
+    /// Queue an activity for upload on behalf of `owner`, in `workspace_id`.
+    pub fn enqueue(&self, activity: &Activity, owner: &str, workspace_id: &str) -> Result<i64> {
+        // Sign the payload before writing it so the server can detect tampering.
+        // The signature is computed over the canonical JSON (without the
+        // `payloadSignature` field itself, which is always None at this point).
         let payload = serde_json::to_string(activity)?;
+        let sig: Option<String> = self
+            .signing_key
+            .as_deref()
+            .map(|key| signing::sign_payload(key, payload.as_bytes()));
+
         let iso = |t: DateTime<Utc>| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         self.conn.execute(
-            "INSERT INTO activities (payload, synced, owner, capture_bytes, project_id, started_at, ended_at) \
-             VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO activities (payload, synced, owner, capture_bytes, project_id, started_at, ended_at, sig, workspace_id) \
+             VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
                 payload,
                 owner,
                 capture_bytes(activity),
                 activity.project_id,
                 iso(activity.started_at),
-                iso(activity.ended_at)
+                iso(activity.ended_at),
+                sig,
+                workspace_id
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -284,23 +310,37 @@ impl Storage {
     /// offset means a row that fails to leave the queue can never be handed
     /// back in the same pass. A row whose payload no longer parses is parked as
     /// rejected instead of silently sitting in the queue forever.
+    #[cfg(test)]
     pub fn pending_batch(&self, owner: &str, after_id: i64, limit: u32) -> Result<Vec<(i64, Activity)>> {
-        let rows: Vec<(i64, String)> = {
+        Ok(self.pending_rows(owner, after_id, limit)?.into_iter().map(|row| (row.id, row.activity)).collect())
+    }
+
+    /// [`Storage::pending_batch`], with each row's workspace. Rows without a
+    /// workspace (queued by older builds) are never uploaded.
+    pub fn pending_rows(&self, owner: &str, after_id: i64, limit: u32) -> Result<Vec<PendingRow>> {
+        let rows: Vec<(i64, String, Option<String>, String)> = {
             let mut stmt = self.conn.prepare(
-                "SELECT id, payload FROM activities \
-                 WHERE synced = 0 AND owner = ?1 AND id > ?2 \
+                "SELECT id, payload, sig, workspace_id FROM activities \
+                 WHERE synced = 0 AND owner = ?1 AND workspace_id IS NOT NULL AND id > ?2 \
                  ORDER BY id LIMIT ?3",
             )?;
             let mapped = stmt.query_map(rusqlite::params![owner, after_id, limit], |row| {
-                Ok((row.get(0)?, row.get(1)?))
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })?;
             mapped.collect::<rusqlite::Result<_>>()?
         };
 
         let mut out = Vec::with_capacity(rows.len());
-        for (id, payload) in rows {
+        for (id, payload, sig, workspace_id) in rows {
             match serde_json::from_str::<Activity>(&payload) {
-                Ok(activity) => out.push((id, activity)),
+                Ok(mut activity) => {
+                    // Propagate the stored signature into the Activity so the
+                    // upload includes it for server-side verification.
+                    if activity.payload_signature.is_none() {
+                        activity.payload_signature = sig;
+                    }
+                    out.push(PendingRow { id, workspace_id, activity });
+                }
                 Err(e) => {
                     tracing::warn!(id, ?e, "queued activity is unreadable; parking it");
                     self.mark_rejected(id, &format!("unreadable local payload: {e}"))?;
@@ -313,7 +353,7 @@ impl Storage {
     /// How many of `owner`'s activities are waiting to upload.
     pub fn pending_count(&self, owner: &str) -> Result<u32> {
         let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM activities WHERE synced = 0 AND owner = ?1",
+            "SELECT COUNT(*) FROM activities WHERE synced = 0 AND owner = ?1 AND workspace_id IS NOT NULL",
             [owner],
             |row| row.get(0),
         )?;
@@ -593,8 +633,9 @@ fn add_column_if_missing(conn: &Connection, column: &str, decl: &str) -> Result<
 mod tests {
     use super::*;
 
-    const ALICE: &str = "acme\u{1f}alice@acme.com";
-    const BOB: &str = "acme\u{1f}bob@acme.com";
+    const ALICE: &str = "user\u{1f}alice@acme.com";
+    const BOB: &str = "user\u{1f}bob@acme.com";
+    const WS: &str = "w1";
 
     fn sample(project: &str) -> Activity {
         let now = Utc::now();
@@ -654,16 +695,30 @@ mod tests {
 
     #[test]
     fn owner_key_is_case_and_whitespace_insensitive() {
-        assert_eq!(owner_key(" Acme ", "Alice@Acme.com "), ALICE);
-        assert_ne!(owner_key("acme", "alice@acme.com"), owner_key("", "alice@acme.com"));
-        // The separator keeps the (workspace, user) split unambiguous.
-        assert_ne!(owner_key("a", "bc"), owner_key("ab", "c"));
+        assert_eq!(owner_key(" Alice@Acme.com "), ALICE);
+        assert_ne!(owner_key("alice@acme.com"), owner_key("bob@acme.com"));
+        // Keys of older builds (workspace + user) never match.
+        assert_ne!(owner_key("alice@acme.com"), "acme\u{1f}alice@acme.com");
+    }
+
+    #[test]
+    fn each_row_keeps_its_workspace_and_rows_without_one_never_upload() {
+        let s = store();
+        s.enqueue(&sample("a"), ALICE, "w1").unwrap();
+        s.enqueue(&sample("b"), ALICE, "w2").unwrap();
+        s.conn
+            .execute("INSERT INTO activities (payload, synced, owner) VALUES (?1, 0, ?2)", [serde_json::to_string(&sample("old")).unwrap(), ALICE.to_owned()])
+            .unwrap();
+        let rows = s.pending_rows(ALICE, 0, 10).unwrap();
+        let seen: Vec<(&str, &str)> = rows.iter().map(|r| (r.activity.project_id.as_str(), r.workspace_id.as_str())).collect();
+        assert_eq!(seen, [("a", "w1"), ("b", "w2")]);
+        assert_eq!(s.pending_count(ALICE).unwrap(), 2, "a row without a workspace is not waiting to upload");
     }
 
     #[test]
     fn enqueue_then_pending_roundtrips() {
         let s = store();
-        s.enqueue(&sample("p1"), ALICE).unwrap();
+        s.enqueue(&sample("p1"), ALICE, WS).unwrap();
         let pending = pending(&s, ALICE);
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].1.project_id, "p1");
@@ -673,9 +728,9 @@ mod tests {
     #[test]
     fn only_the_signed_in_accounts_rows_are_uploadable() {
         let s = store();
-        s.enqueue(&sample("alice-1"), ALICE).unwrap();
-        s.enqueue(&sample("bob-1"), BOB).unwrap();
-        s.enqueue(&sample("alice-2"), ALICE).unwrap();
+        s.enqueue(&sample("alice-1"), ALICE, WS).unwrap();
+        s.enqueue(&sample("bob-1"), BOB, WS).unwrap();
+        s.enqueue(&sample("alice-2"), ALICE, WS).unwrap();
 
         let alice: Vec<String> = pending(&s, ALICE).into_iter().map(|(_, a)| a.project_id).collect();
         assert_eq!(alice, ["alice-1", "alice-2"]);
@@ -683,16 +738,16 @@ mod tests {
         assert_eq!(bob, ["bob-1"]);
         assert_eq!(s.pending_count(ALICE).unwrap(), 2);
         assert_eq!(s.pending_count(BOB).unwrap(), 1);
-        assert!(pending(&s, "acme\u{1f}mallory@acme.com").is_empty());
+        assert!(pending(&s, "user\u{1f}mallory@acme.com").is_empty());
     }
 
     #[test]
     fn batches_page_through_the_queue_oldest_first() {
         let s = store();
         for i in 0..5 {
-            s.enqueue(&sample(&format!("p{i}")), ALICE).unwrap();
+            s.enqueue(&sample(&format!("p{i}")), ALICE, WS).unwrap();
         }
-        s.enqueue(&sample("bob"), BOB).unwrap();
+        s.enqueue(&sample("bob"), BOB, WS).unwrap();
 
         let mut seen = Vec::new();
         let mut cursor = 0;
@@ -713,11 +768,11 @@ mod tests {
         let s = store();
         s.conn
             .execute(
-                "INSERT INTO activities (payload, synced, owner) VALUES ('{not json', 0, ?1)",
+                "INSERT INTO activities (payload, synced, owner, workspace_id) VALUES ('{not json', 0, ?1, 'w1')",
                 [ALICE],
             )
             .unwrap();
-        s.enqueue(&sample("ok"), ALICE).unwrap();
+        s.enqueue(&sample("ok"), ALICE, WS).unwrap();
 
         let batch = pending(&s, ALICE);
         assert_eq!(batch.len(), 1);
@@ -729,7 +784,7 @@ mod tests {
     #[test]
     fn synced_rows_are_removed_from_the_queue() {
         let s = store();
-        let id = s.enqueue(&sample("p1"), ALICE).unwrap();
+        let id = s.enqueue(&sample("p1"), ALICE, WS).unwrap();
         s.remove_synced(id).unwrap();
         assert!(pending(&s, ALICE).is_empty());
     }
@@ -737,7 +792,7 @@ mod tests {
     #[test]
     fn rejected_rows_are_parked_not_retried() {
         let s = store();
-        let id = s.enqueue(&with_captures("p1"), ALICE).unwrap();
+        let id = s.enqueue(&with_captures("p1"), ALICE, WS).unwrap();
         s.mark_rejected(id, "HTTP 400: bad project").unwrap();
 
         // Parked rows must never come back as pending — that is what used to
@@ -757,10 +812,10 @@ mod tests {
     fn recent_rows_list_both_states_with_the_server_reason() {
         let s = store();
         let first = sample("p1");
-        let a = s.enqueue(&first, ALICE).unwrap();
-        let b = s.enqueue(&with_captures("p2"), ALICE).unwrap();
-        let c = s.enqueue(&sample("p3"), ALICE).unwrap();
-        s.enqueue(&sample("bob"), BOB).unwrap();
+        let a = s.enqueue(&first, ALICE, WS).unwrap();
+        let b = s.enqueue(&with_captures("p2"), ALICE, WS).unwrap();
+        let c = s.enqueue(&sample("p3"), ALICE, WS).unwrap();
+        s.enqueue(&sample("bob"), BOB, WS).unwrap();
         s.mark_rejected(b, "Overlaps another block.").unwrap();
         s.note_attempt(c, Some("Your computer clock is ahead")).unwrap();
 
@@ -789,8 +844,8 @@ mod tests {
     #[test]
     fn stripping_one_row_keeps_its_time_data_and_place_in_the_queue() {
         let s = store();
-        let id = s.enqueue(&with_captures("p1"), ALICE).unwrap();
-        let other = s.enqueue(&with_captures("p2"), ALICE).unwrap();
+        let id = s.enqueue(&with_captures("p1"), ALICE, WS).unwrap();
+        let other = s.enqueue(&with_captures("p2"), ALICE, WS).unwrap();
         assert!(s.strip_captures(id).unwrap());
 
         let row = raw_payload(&s, id);
@@ -802,7 +857,7 @@ mod tests {
 
         // Nothing left to strip: resending could not make it smaller.
         assert!(!s.strip_captures(id).unwrap());
-        let bare = s.enqueue(&sample("p3"), ALICE).unwrap();
+        let bare = s.enqueue(&sample("p3"), ALICE, WS).unwrap();
         assert!(!s.strip_captures(bare).unwrap());
         // A parked row is not pending: nothing to strip.
         s.mark_rejected(other, "nope").unwrap();
@@ -812,7 +867,7 @@ mod tests {
     #[test]
     fn purge_keeps_recent_rejects_and_drops_old_ones() {
         let s = store();
-        let id = s.enqueue(&sample("p1"), ALICE).unwrap();
+        let id = s.enqueue(&sample("p1"), ALICE, WS).unwrap();
         s.mark_rejected(id, "nope").unwrap();
 
         // Just-parked rows survive a 30-day purge.
@@ -828,9 +883,9 @@ mod tests {
     #[test]
     fn another_accounts_rows_wait_then_expire() {
         let s = store();
-        let bob_recent = s.enqueue(&sample("bob-recent"), BOB).unwrap();
-        let bob_old = s.enqueue(&sample("bob-old"), BOB).unwrap();
-        let alice_old = s.enqueue(&sample("alice-old"), ALICE).unwrap();
+        let bob_recent = s.enqueue(&sample("bob-recent"), BOB, WS).unwrap();
+        let bob_old = s.enqueue(&sample("bob-old"), BOB, WS).unwrap();
+        let alice_old = s.enqueue(&sample("alice-old"), ALICE, WS).unwrap();
         backdate(&s, bob_old, 20);
         backdate(&s, alice_old, 20);
 
@@ -873,6 +928,10 @@ mod tests {
         }
     }
 
+    fn owned(s: &Storage, owner: &str) -> i64 {
+        s.conn.query_row("SELECT COUNT(*) FROM activities WHERE owner = ?1", [owner], |r| r.get(0)).unwrap()
+    }
+
     fn auto_vacuum_mode(s: &Storage) -> i64 {
         s.conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0)).unwrap()
     }
@@ -885,13 +944,13 @@ mod tests {
 
         {
             let s = Storage::open(&path_str, Some(ALICE)).unwrap();
-            assert_eq!(s.pending_count(ALICE).unwrap(), 2);
+            assert_eq!(owned(&s, ALICE), 2);
         }
         {
             // Re-opening (even as someone else) is a no-op: the migration ran once.
             let s = Storage::open(&path_str, Some(BOB)).unwrap();
-            assert_eq!(s.pending_count(ALICE).unwrap(), 2);
-            assert_eq!(s.pending_count(BOB).unwrap(), 0);
+            assert_eq!(owned(&s, ALICE), 2);
+            assert_eq!(owned(&s, BOB), 0);
         }
         let _ = std::fs::remove_file(&path);
     }
@@ -922,6 +981,7 @@ mod tests {
         legacy_db_with(&path, &rows);
         let limit = 512 * 1024; // the backlog (~1.5 MB) is over it
         let s = Storage::open_with(&path.to_string_lossy(), Some(ALICE), limit).unwrap();
+        s.conn.execute("UPDATE activities SET workspace_id = 'w1'", []).unwrap();
         assert_eq!(auto_vacuum_mode(&s), 0, "not rebuilt while the backlog is large");
         let ids: Vec<i64> = pending(&s, ALICE).into_iter().map(|(id, _)| id).collect();
         assert_eq!(ids.len(), 24, "the queue works meanwhile");
@@ -970,7 +1030,7 @@ mod tests {
     fn limits_shed_images_first_and_keep_time_data() {
         let s = store();
         let ids: Vec<i64> = (0..4)
-            .map(|i| s.enqueue(&with_captures(&format!("p{i}")), ALICE).unwrap())
+            .map(|i| s.enqueue(&with_captures(&format!("p{i}")), ALICE, WS).unwrap())
             .collect();
         backdate(&s, ids[3], 40); // newest row, but too old to keep images
 
@@ -1007,7 +1067,7 @@ mod tests {
             .enumerate()
             .map(|(i, bytes)| {
                 let row = if bytes == 0 { sample(&format!("p{i}")) } else { with_image_bytes(&format!("p{i}"), bytes) };
-                s.enqueue(&row, BOB).unwrap()
+                s.enqueue(&row, BOB, WS).unwrap()
             })
             .collect();
 
@@ -1041,9 +1101,9 @@ mod tests {
     fn limits_drop_the_oldest_rows_beyond_the_hard_cap() {
         let s = store();
         for i in 0..5 {
-            s.enqueue(&sample(&format!("p{i}")), ALICE).unwrap();
+            s.enqueue(&sample(&format!("p{i}")), ALICE, WS).unwrap();
         }
-        let parked = s.enqueue(&sample("parked"), ALICE).unwrap();
+        let parked = s.enqueue(&sample("parked"), ALICE, WS).unwrap();
         s.mark_rejected(parked, "nope").unwrap();
 
         let limits = QueueLimits {
@@ -1064,7 +1124,7 @@ mod tests {
     fn space_freed_by_uploads_goes_back_to_the_disk() {
         let path = temp_db_path();
         let s = Storage::open(&path.to_string_lossy(), None).unwrap();
-        let ids: Vec<i64> = (0..40).map(|i| s.enqueue(&with_image_bytes(&format!("p{i}"), 64 * 1024), ALICE).unwrap()).collect();
+        let ids: Vec<i64> = (0..40).map(|i| s.enqueue(&with_image_bytes(&format!("p{i}"), 64 * 1024), ALICE, WS).unwrap()).collect();
         let size = || std::fs::metadata(&path).unwrap().len();
         let full = size();
         for id in ids {
@@ -1098,7 +1158,7 @@ mod tests {
         assert!(!with_suffix(&path, "-journal").exists(), "no stale journal next to the new queue");
 
         // The fresh queue works.
-        opened.storage.enqueue(&sample("p1"), ALICE).unwrap();
+        opened.storage.enqueue(&sample("p1"), ALICE, WS).unwrap();
         assert_eq!(opened.storage.pending_count(ALICE).unwrap(), 1);
         drop(opened);
 
@@ -1159,7 +1219,7 @@ mod tests {
         ) {
             let s = store();
             for p in &projects {
-                s.enqueue(&sample(p), ALICE).unwrap();
+                s.enqueue(&sample(p), ALICE, WS).unwrap();
             }
             let mut order = Vec::new();
             let mut cursor = 0;
@@ -1181,7 +1241,7 @@ mod tests {
         ) {
             let s = store();
             for _ in &keep_flags {
-                s.enqueue(&sample("p"), ALICE).unwrap();
+                s.enqueue(&sample("p"), ALICE, WS).unwrap();
             }
 
             let ids: Vec<i64> = pending(&s, ALICE).into_iter().map(|(id, _)| id).collect();
@@ -1211,7 +1271,7 @@ mod tests {
             let s = store();
             let ids: Vec<i64> = sizes.iter().map(|&n| {
                 let row = if n == 0 { sample("p") } else { with_image_bytes("p", n) };
-                s.enqueue(&row, ALICE).unwrap()
+                s.enqueue(&row, ALICE, WS).unwrap()
             }).collect();
             let limits = QueueLimits { capture_max_rows: 1_000, capture_max_bytes: budget, capture_max_age_days: 30, max_pending_rows: 1_000 };
             s.enforce_limits(&limits).unwrap();

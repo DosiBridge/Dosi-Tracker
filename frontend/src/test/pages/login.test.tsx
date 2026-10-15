@@ -34,33 +34,39 @@ function jsonResponse(body: unknown, init: { status?: number; statusText?: strin
 
 let fetchMock: ReturnType<typeof vi.fn<typeof fetch>>;
 
-/** ABP application-configuration for a signed-in tenant owner (or the host when tenantId is null). */
-function appConfig(opts: { tenantId?: string | null; tenantName?: string | null; roles?: string[] } = {}) {
-  const { tenantId = "tenant-1", tenantName = "acme", roles = ["admin"] } = opts;
+const ACME = "11111111-1111-1111-1111-111111111111";
+const BETA = "22222222-2222-2222-2222-222222222222";
+const ws = (id: string, name: string, role = "owner") => ({ id, name, role, planName: "Free", isOwner: role === "owner" });
+
+/** ABP application-configuration: a global account (no tenant); `roles` carries platform-admin for the operator. */
+function appConfig(opts: { roles?: string[]; policies?: Record<string, boolean> } = {}) {
+  const { roles = [], policies = {} } = opts;
   return {
     currentUser: {
       isAuthenticated: true,
       id: "user-1",
-      tenantId,
+      tenantId: null,
       userName: "ayesha",
       name: "Ayesha",
       surName: "Rahman",
       email: "ayesha@dosi.dev",
       roles,
     },
-    currentTenant: tenantId ? { id: tenantId, name: tenantName, isAvailable: true } : { id: null, name: null, isAvailable: false },
-    auth: { grantedPolicies: {} },
+    currentTenant: { id: null, name: null, isAvailable: false },
+    auth: { grantedPolicies: policies },
   };
 }
 
 /**
- * A backend that accepts the token request and then serves the session
- * load that follows it: identity (tenant or host) + empty tenant lists.
+ * A backend that accepts the token request and then serves what follows it:
+ * the account's workspaces, its identity and empty workspace lists.
  */
-function stubBackend(token: string, config = appConfig()): void {
+function stubBackend(token: string, opts: { mine?: unknown[]; config?: unknown } = {}): void {
+  const { mine = [ws(ACME, "Acme")], config = appConfig() } = opts;
   fetchMock.mockImplementation(async (input) => {
     const url = String(input);
     if (url.includes("/connect/token")) return jsonResponse({ access_token: token, expires_in: 3600 });
+    if (url.includes("/api/app/workspaces/mine")) return jsonResponse(mine);
     if (url.includes("/api/abp/application-configuration")) return jsonResponse(config);
     if (url.includes("/api/app/workspace/current-subscription")) return jsonResponse({});
     return jsonResponse({ items: [] });
@@ -90,49 +96,49 @@ function field(type: "email" | "password"): HTMLInputElement {
   return el;
 }
 
-const workspaceField = () => screen.getByPlaceholderText(/your workspace name/i);
 const signInButton = () => screen.getByRole("button", { name: /^sign in$/i });
 
 async function fillSignIn(
   user: UserSession,
   opts: { workspace?: string; email?: string; password?: string } = {},
 ): Promise<void> {
-  const { workspace = "", email = "ayesha@dosi.dev", password = "hunter22" } = opts;
-  if (workspace) await user.type(workspaceField(), workspace);
+  const { email = "ayesha@dosi.dev", password = "hunter22" } = opts;
   await user.type(field("email"), email);
   await user.type(field("password"), password);
 }
 
 describe("login page — sign-in form", () => {
-  it("renders workspace, email and password fields with visible labels and a submit button", () => {
+  it("asks only for email and password — no workspace name", () => {
     renderWithProviders(<LoginPage />, { route: "/login" });
 
-    expect(screen.getByText("Workspace")).toBeInTheDocument();
+    expect(screen.queryByText("Workspace")).not.toBeInTheDocument();
+    expect(screen.queryByPlaceholderText(/workspace name/i)).not.toBeInTheDocument();
     expect(screen.getByText("Email")).toBeInTheDocument();
     expect(screen.getByText("Password")).toBeInTheDocument();
-    expect(workspaceField()).toBeInTheDocument();
     expect(field("email")).toBeRequired();
     expect(field("password")).toBeRequired();
     expect(signInButton()).toBeEnabled();
   });
 
-  it("tenant sign-in sends __tenant on /connect/token, stores the token + cookie flag, and lands on /dashboard", async () => {
+  it("signs in with no workspace named, opens the only workspace, stores the session and lands on /dashboard", async () => {
     stubBackend("tok-123");
     const user = userEvent.setup();
     renderWithProviders(<LoginPage />, { route: "/login" });
 
-    await fillSignIn(user, { workspace: "acme" });
+    await fillSignIn(user);
     await user.click(signInButton());
 
     await waitFor(() => expect(localStorage.getItem("dosi-token")).toBe("tok-123"));
     expect(tokenCalls()).toHaveLength(1);
     const [url, init] = fetchMock.mock.calls[0];
-    expect(String(url)).toBe(`${API_BASE}/connect/token?__tenant=acme`);
+    expect(String(url)).toBe(`${API_BASE}/connect/token`);
     const body = new URLSearchParams(String(init?.body));
     expect(body.get("grant_type")).toBe("password");
     expect(body.get("username")).toBe("ayesha@dosi.dev");
     expect(body.get("password")).toBe("hunter22");
-    expect(localStorage.getItem("dosi-tenant")).toBe("acme");
+    expect(body.get("scope")).toBe("openid profile email roles offline_access Tracker");
+    expect(body.has("__tenant")).toBe(false);
+    await waitFor(() => expect(localStorage.getItem("dosi-workspace")).toBe(ACME));
     expect(document.cookie).toContain("dosi-token=1");
     await waitFor(() => expect(__router.push).toHaveBeenCalledWith("/dashboard"), { timeout: 2000 });
   });
@@ -151,8 +157,8 @@ describe("login page — sign-in form", () => {
     expect(configAt).toBeGreaterThan(0); // after the token request, before navigation resolved
   });
 
-  it("host sign-in (empty workspace) omits __tenant and lands on the platform console", async () => {
-    stubBackend("tok-host", appConfig({ tenantId: null, tenantName: null }));
+  it("the platform admin (global platform-admin role) lands on the platform console with no workspace", async () => {
+    stubBackend("tok-host", { mine: [], config: appConfig({ roles: ["platform-admin"], policies: { "Tracker.Platform": true } }) });
     const user = userEvent.setup();
     renderWithProviders(<LoginPage />, { route: "/login" });
 
@@ -161,7 +167,7 @@ describe("login page — sign-in form", () => {
 
     await waitFor(() => expect(tokenCalls()).toHaveLength(1));
     expect(String(fetchMock.mock.calls[0][0])).toBe(`${API_BASE}/connect/token`);
-    expect(localStorage.getItem("dosi-tenant")).toBeNull();
+    expect(localStorage.getItem("dosi-workspace")).toBeNull();
     await waitFor(() => expect(__router.push).toHaveBeenCalledWith("/host"), { timeout: 2000 });
   });
 
@@ -175,7 +181,7 @@ describe("login page — sign-in form", () => {
 
     // Names the fields the form actually has (email, not "username") and
     // blames the credentials only because the server really did reject them.
-    expect(await screen.findByText(/that email, password or workspace didn't match/i)).toBeInTheDocument();
+    expect(await screen.findByText(/that email or password didn't match/i)).toBeInTheDocument();
     expect(signInButton()).toBeEnabled(); // no longer stuck in "Signing in…"
     expect(localStorage.getItem("dosi-token")).toBeNull();
     expect(document.cookie).not.toContain("dosi-token=1");
@@ -203,7 +209,6 @@ describe("login page — sign-in form", () => {
     const user = userEvent.setup();
     renderWithProviders(<LoginPage />, { route: "/login" });
 
-    await user.type(workspaceField(), "acme");
     await user.type(field("email"), "ayesha@dosi.dev");
     await user.type(field("password"), "hunter22{Enter}");
 
@@ -274,32 +279,66 @@ describe("login page — create-workspace mode", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("previews the exact workspace name to sign in with — not an invented subdomain", async () => {
+  it("does not invent a subdomain or ask people to remember the workspace name", async () => {
     const user = userEvent.setup();
     renderWithProviders(<LoginPage />, { route: "/login" });
 
     await user.click(screen.getByRole("button", { name: /create a workspace/i }));
     await user.type(screen.getByPlaceholderText("Acme Corp"), "Acme Corp");
 
-    expect(screen.getByText(/sign in with the workspace name/i)).toHaveTextContent("Acme Corp");
+    expect(screen.queryByText(/sign in with the workspace name/i)).not.toBeInTheDocument();
     expect(document.body.textContent).not.toContain(".dositracker.app");
   });
 
-  it("registers the tenant, signs into it, shows the exact workspace name to use, then lands on /dashboard", async () => {
-    fetchMock.mockImplementation(async (input) => {
-      const url = String(input);
-      if (url.includes("/api/app/workspace/register")) {
-        return jsonResponse({ tenantId: "t-1", name: "Acme Corp" });
-      }
-      if (url.includes("/connect/token")) {
-        return jsonResponse({ access_token: "tok-signup", expires_in: 60 });
-      }
-      if (url.includes("/api/abp/application-configuration")) {
-        return jsonResponse(appConfig({ tenantId: "t-1", tenantName: "Acme Corp" }));
-      }
-      if (url.includes("/api/app/workspace/current-subscription")) return jsonResponse({});
-      return jsonResponse({ items: [] });
+  it("?mode=signup opens the create-workspace form with the email filled in", async () => {
+    window.history.pushState({}, "", "/login?mode=signup&email=a%40b.dev");
+    try {
+      renderWithProviders(<LoginPage />, { route: "/login" });
+      expect(await screen.findByRole("heading", { name: /create your workspace/i })).toBeInTheDocument();
+      expect(field("email")).toHaveValue("a@b.dev");
+    } finally {
+      window.history.pushState({}, "", "/");
+    }
+  });
+
+  it("creates the account and workspace, signs in automatically and opens the new workspace", async () => {
+    stubBackend("tok-signup", { mine: [ws(ACME, "Acme Corp")] });
+    const base = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (input, init) =>
+      String(input).includes("/api/app/workspace/register")
+        ? jsonResponse({ workspaceId: ACME, workspaceName: "Acme Corp", userName: "founder" })
+        : base(input, init),
+    );
+    const user = userEvent.setup();
+    renderWithProviders(<LoginPage />, { route: "/login" });
+
+    await user.click(screen.getByRole("button", { name: /create a workspace/i }));
+    await user.type(screen.getByLabelText("First name"), "Fara");
+    await user.type(screen.getByLabelText("Surname"), "Haque");
+    await user.type(field("email"), "founder@acme.dev");
+    await user.type(field("password"), "hunter22");
+    await user.type(screen.getByPlaceholderText("Acme Corp"), "Acme Corp");
+    await user.click(screen.getByRole("button", { name: /^create workspace$/i }));
+
+    await waitFor(() => expect(__router.push).toHaveBeenCalledWith("/dashboard"), { timeout: 2000 });
+    const [regUrl, regInit] = fetchMock.mock.calls[0];
+    expect(String(regUrl)).toBe(`${API_BASE}/api/app/workspace/register`);
+    expect(JSON.parse(String(regInit?.body))).toEqual({
+      firstName: "Fara",
+      surname: "Haque",
+      email: "founder@acme.dev",
+      password: "hunter22",
+      workspaceName: "Acme Corp",
+      planName: "Free",
     });
+    expect(String(fetchMock.mock.calls[1][0])).toBe(`${API_BASE}/connect/token`);
+    expect(localStorage.getItem("dosi-workspace")).toBe(ACME);
+  });
+
+  it("an email that already has an account says to sign in and create the workspace from the sidebar", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({ error: { code: "Tracker:EmailAlreadyRegistered", message: "taken" } }, { status: 409, statusText: "Conflict" }),
+    );
     const user = userEvent.setup();
     renderWithProviders(<LoginPage />, { route: "/login" });
 
@@ -309,23 +348,11 @@ describe("login page — create-workspace mode", () => {
     await user.type(screen.getByPlaceholderText("Acme Corp"), "Acme Corp");
     await user.click(screen.getByRole("button", { name: /^create workspace$/i }));
 
-    // The success screen names the workspace exactly as it must be typed at sign-in.
-    expect(await screen.findByTestId("created-workspace-name")).toHaveTextContent("Acme Corp");
-    const [regUrl, regInit] = fetchMock.mock.calls[0];
-    expect(String(regUrl)).toBe(`${API_BASE}/api/app/workspace/register`);
-    expect(JSON.parse(String(regInit?.body))).toEqual({
-      name: "Acme Corp",
-      adminEmail: "founder@acme.dev",
-      adminPassword: "hunter22",
-      planName: "Free", // default plan selection maps to the seeded backend plan name
-    });
-    // The follow-up login is scoped to the tenant the backend just created.
-    expect(String(fetchMock.mock.calls[1][0])).toBe(
-      `${API_BASE}/connect/token?__tenant=${encodeURIComponent("Acme Corp")}`,
+    expect(await screen.findByRole("heading", { name: /welcome back/i })).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "You already have an account — sign in and create a new workspace from the sidebar.",
     );
-    expect(__router.push).not.toHaveBeenCalled(); // the owner reads the name first
-    await user.click(screen.getByRole("button", { name: /continue to your dashboard/i }));
-    expect(__router.push).toHaveBeenCalledWith("/dashboard");
+    expect(tokenCalls()).toHaveLength(0);
   });
 
   it("surfaces the backend's registration error message instead of a blank screen", async () => {
@@ -395,20 +422,10 @@ describe("login page — every way a sign-in fails, told apart", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(/locked after too many failed sign-in attempts/i);
   });
 
-  it("an unknown workspace names it, marks the field and puts the cursor there", async () => {
-    await signInWith(jsonResponse("<html>Tenant not found!</html>", { status: 404, statusText: "Not Found" }), { workspace: "acmee" });
-
-    expect(await screen.findByRole("alert")).toHaveTextContent(/couldn't find an active workspace named “acmee”/i);
-    const ws = workspaceField();
-    expect(ws).toHaveAttribute("aria-invalid", "true");
-    expect(ws).toHaveFocus();
-    expect(ws.getAttribute("aria-describedby")).toContain("login-error");
-  });
-
   it("wrong credentials are announced as an alert and mark the email and password fields", async () => {
     await signInWith(jsonResponse({ error: "invalid_grant", error_description: "Invalid username or password!" }, { status: 400, statusText: "Bad Request" }));
 
-    expect(await screen.findByRole("alert")).toHaveTextContent(/that email, password or workspace didn't match/i);
+    expect(await screen.findByRole("alert")).toHaveTextContent(/that email or password didn't match/i);
     expect(screen.getByLabelText("Email")).toHaveAttribute("aria-invalid", "true");
     expect(screen.getByLabelText("Password")).toHaveAttribute("aria-invalid", "true");
   });
@@ -444,7 +461,7 @@ describe("login page — a new workspace whose first sign-in fails", () => {
   it("keeps the workspace it just created: switches to sign-in, filled in, and says so", async () => {
     fetchMock.mockImplementation(async (input) => {
       const url = String(input);
-      if (url.includes("/api/app/workspace/register")) return jsonResponse({ tenantId: "t-1", name: "Acme Corp" });
+      if (url.includes("/api/app/workspace/register")) return jsonResponse({ workspaceId: ACME, workspaceName: "Acme Corp", userName: "f" });
       if (url.includes("/connect/token")) return jsonResponse({}, { status: 429, statusText: "Too Many Requests", headers: { "Retry-After": "20" } });
       return jsonResponse({ items: [] });
     });
@@ -458,9 +475,8 @@ describe("login page — a new workspace whose first sign-in fails", () => {
     await user.click(screen.getByRole("button", { name: /^create workspace$/i }));
 
     expect(await screen.findByRole("heading", { name: /welcome back/i })).toBeInTheDocument();
-    expect(workspaceField()).toHaveValue("Acme Corp");
     expect(field("email")).toHaveValue("founder@acme.dev");
-    expect(screen.getByRole("status")).toHaveTextContent(/your workspace “Acme Corp” was created\. sign in to continue/i);
+    expect(screen.getByRole("status")).toHaveTextContent(/your account was created\. sign in to continue/i);
     expect(screen.getByRole("alert")).toHaveTextContent(/too many sign-in attempts/i);
     expect(fetchMock.mock.calls.filter(([u]) => String(u).includes("/api/app/workspace/register"))).toHaveLength(1);
   });
@@ -493,6 +509,7 @@ describe("login page — a one-time password must be changed first", () => {
         if (body.get("password") === "Mine#2026") return jsonResponse({ access_token: "tok-new", expires_in: 3600 });
         return challenge();
       }
+      if (url.includes("/api/app/workspaces/mine")) return jsonResponse([ws(ACME, "Acme")]);
       if (url.includes("/api/abp/application-configuration")) return jsonResponse(appConfig());
       if (url.includes("/api/app/workspace/current-subscription")) return jsonResponse({});
       return jsonResponse({ items: [] });
@@ -508,7 +525,7 @@ describe("login page — a one-time password must be changed first", () => {
     // login (challenge) → challenge again for its token → the change → sign in with the new password
     expect(tokenCalls).toBe(4);
     const change = fetchMock.mock.calls.find(([, i]) => String(i?.body).includes("NewPassword"));
-    expect(String(change?.[0])).toContain("__tenant=acme");
+    expect(String(change?.[0])).toBe(`${API_BASE}/connect/token`);
     const body = new URLSearchParams(String(change?.[1]?.body));
     expect(body.get("ChangePasswordToken")).toBe("cpt-1");
     expect(body.get("password")).toBe("OneTime#1");
@@ -554,5 +571,49 @@ describe("login page — a one-time password must be changed first", () => {
     await user.click(screen.getByRole("button", { name: /back to sign in/i }));
     const form = screen.getByRole("heading", { name: /welcome back/i }).parentElement as HTMLElement;
     expect(within(form).getByRole("button", { name: /^sign in$/i })).toBeInTheDocument();
+  });
+});
+
+describe("login page — which workspace opens after sign-in", () => {
+  async function signIn() {
+    const user = userEvent.setup();
+    renderWithProviders(<LoginPage />, { route: "/login" });
+    await fillSignIn(user);
+    await user.click(signInButton());
+    return user;
+  }
+
+  it("no workspace yet: goes to the chooser to create the first one", async () => {
+    stubBackend("tok-0", { mine: [] });
+    await signIn();
+    await waitFor(() => expect(__router.push).toHaveBeenCalledWith("/workspaces"), { timeout: 2000 });
+    expect(localStorage.getItem("dosi-workspace")).toBeNull();
+  });
+
+  it("several workspaces: reopens the last used one while still a member", async () => {
+    localStorage.setItem("dosi-workspace", BETA);
+    stubBackend("tok-2", { mine: [ws(ACME, "Acme"), ws(BETA, "Beta", "member")] });
+    await signIn();
+    await waitFor(() => expect(__router.push).toHaveBeenCalledWith("/dashboard"), { timeout: 2000 });
+    expect(localStorage.getItem("dosi-workspace")).toBe(BETA);
+  });
+
+  it("several workspaces and no (valid) last one: goes to the chooser", async () => {
+    localStorage.setItem("dosi-workspace", "33333333-3333-3333-3333-333333333333");
+    stubBackend("tok-2", { mine: [ws(ACME, "Acme"), ws(BETA, "Beta", "member")] });
+    await signIn();
+    await waitFor(() => expect(__router.push).toHaveBeenCalledWith("/workspaces"), { timeout: 2000 });
+    expect(localStorage.getItem("dosi-workspace")).toBeNull();
+  });
+
+  it("?next= (an invitation) is where a sign-in returns to", async () => {
+    window.history.pushState({}, "", "/login?next=%2Finvite%2Ftok-1");
+    try {
+      stubBackend("tok-n");
+      await signIn();
+      await waitFor(() => expect(__router.push).toHaveBeenCalledWith("/invite/tok-1"), { timeout: 2000 });
+    } finally {
+      window.history.pushState({}, "", "/");
+    }
   });
 });

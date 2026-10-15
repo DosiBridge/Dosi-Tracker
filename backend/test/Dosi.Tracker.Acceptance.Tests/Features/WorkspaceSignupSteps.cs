@@ -7,7 +7,7 @@ using Shouldly;
 using Volo.Abp;
 using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Identity;
-using Volo.Abp.MultiTenancy;
+using Dosi.Tracker.Workspaces;
 
 namespace Dosi.Tracker.Acceptance.Features;
 
@@ -31,14 +31,14 @@ public sealed class WorkspaceSignupSteps
         {
             var result = await workspaces.RegisterAsync(new RegisterWorkspaceDto
             {
-                Name = name,
-                AdminEmail = adminEmail,
-                AdminPassword = "1q2w3E*" + name,
+                WorkspaceName = name,
+                Email = adminEmail,
+                Password = "1q2w3E*" + name,
                 PlanName = plan
             });
             _state.LastResult = result;
-            _state.TenantId = result.TenantId;
-            _state.WorkspaceName = result.Name;
+            _state.WorkspaceId = result.WorkspaceId;
+            _state.WorkspaceName = result.WorkspaceName;
         }
         catch (Exception ex)
         {
@@ -46,38 +46,35 @@ public sealed class WorkspaceSignupSteps
         }
     }
 
-    [Then(@"the workspace is created with its own tenant")]
-    public void ThenTheWorkspaceIsCreatedWithItsOwnTenant()
+    [Then(@"the workspace is created")]
+    public void ThenTheWorkspaceIsCreated()
     {
         _state.LastException.ShouldBeNull();
-        _state.TenantId.ShouldNotBe(Guid.Empty);
+        _state.WorkspaceId.ShouldNotBe(Guid.Empty);
     }
 
-    [Then(@"the tenant has an administrator ""(.*)""")]
-    public async Task ThenTheTenantHasAnAdministrator(string email)
+    [Then(@"""(.*)"" owns the workspace")]
+    public async Task ThenOwnsTheWorkspace(string email)
     {
-        var currentTenant = _app.Resolve<ICurrentTenant>();
-        using (currentTenant.Change(_state.TenantId))
+        await _app.WithUow(async () =>
         {
-            await _app.WithUow(async () =>
-            {
-                var users = _app.Resolve<IIdentityUserRepository>();
-                var all = await users.GetListAsync();
-                all.ShouldContain(u => u.Email == email);
-            });
-        }
+            var user = await _app.Resolve<IdentityUserManager>().FindByEmailAsync(email);
+            user.ShouldNotBeNull();
+            var member = await _app.Resolve<WorkspaceMembershipManager>().FindActiveAsync(_state.WorkspaceId, user.Id);
+            member.ShouldNotBeNull().Role.ShouldBe(WorkspaceRoles.Owner);
+        });
     }
 
     [Then(@"the subscription is ""(.*)""")]
     public async Task ThenTheSubscriptionIs(string status)
     {
-        var currentTenant = _app.Resolve<ICurrentTenant>();
-        using (currentTenant.Change(_state.TenantId))
+        var currentTenant = _app.Resolve<ICurrentWorkspace>();
+        using (currentTenant.Change(_state.WorkspaceId))
         {
             await _app.WithUow(async () =>
             {
                 var subscriptions = _app.Resolve<IRepository<Subscription, Guid>>();
-                var subscription = await subscriptions.FirstOrDefaultAsync(s => s.TenantId == _state.TenantId);
+                var subscription = await subscriptions.FirstOrDefaultAsync(s => s.WorkspaceId == _state.WorkspaceId);
                 subscription.ShouldNotBeNull();
                 subscription.Status.ShouldBe(status);
             });

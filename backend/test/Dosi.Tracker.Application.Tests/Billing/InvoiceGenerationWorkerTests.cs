@@ -13,8 +13,7 @@ using Volo.Abp.DistributedLocking;
 using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Guids;
 using Volo.Abp.Modularity;
-using Volo.Abp.MultiTenancy;
-using Volo.Abp.TenantManagement;
+using Dosi.Tracker.Workspaces;
 using Volo.Abp.Threading;
 using Xunit;
 
@@ -26,10 +25,8 @@ public abstract class InvoiceGenerationWorkerTests<TStartupModule> : TrackerAppl
     private readonly IRepository<Plan, Guid> _plans;
     private readonly IRepository<Subscription, Guid> _subscriptions;
     private readonly IRepository<Invoice, Guid> _invoices;
-    private readonly ITenantManager _tenantManager;
-    private readonly ITenantRepository _tenantRepository;
     private readonly IGuidGenerator _guidGenerator;
-    private readonly ICurrentTenant _currentTenant;
+    private readonly ICurrentWorkspace _currentWorkspace;
     private readonly IDataFilter _dataFilter;
     private readonly InvoiceGenerationWorker _worker;
 
@@ -38,10 +35,8 @@ public abstract class InvoiceGenerationWorkerTests<TStartupModule> : TrackerAppl
         _plans = GetRequiredService<IRepository<Plan, Guid>>();
         _subscriptions = GetRequiredService<IRepository<Subscription, Guid>>();
         _invoices = GetRequiredService<IRepository<Invoice, Guid>>();
-        _tenantManager = GetRequiredService<ITenantManager>();
-        _tenantRepository = GetRequiredService<ITenantRepository>();
         _guidGenerator = GetRequiredService<IGuidGenerator>();
-        _currentTenant = GetRequiredService<ICurrentTenant>();
+        _currentWorkspace = GetRequiredService<ICurrentWorkspace>();
         _dataFilter = GetRequiredService<IDataFilter>();
         _worker = GetRequiredService<InvoiceGenerationWorker>();
     }
@@ -56,29 +51,24 @@ public abstract class InvoiceGenerationWorkerTests<TStartupModule> : TrackerAppl
         return WithUnitOfWorkAsync(() => _plans.FirstAsync(p => p.Name == "Starter")); // $6/user
     }
 
-    /// <summary>A workspace (tenant) subscribed to <paramref name="planId"/>; both saved together so the
-    /// default-subscription handler leaves the subscription as given.</summary>
-    private Task<Guid> CreateWorkspaceAsync(string name, Guid planId, string status)
+    /// <summary>A workspace subscribed to <paramref name="planId"/>.</summary>
+    private async Task<Guid> CreateWorkspaceAsync(string name, Guid planId, string status)
     {
-        return WithUnitOfWorkAsync(async () =>
+        var workspaceId = await ServiceProvider.CreateWorkspaceAsync(name);
+        using (_currentWorkspace.Change(workspaceId))
         {
-            var tenant = await _tenantManager.CreateAsync(name);
-            await _tenantRepository.InsertAsync(tenant);
-            using (_currentTenant.Change(tenant.Id))
-            {
-                await _subscriptions.InsertAsync(
-                    new Subscription(_guidGenerator.Create(), tenant.Id, planId) { Status = status });
-            }
+            await WithUnitOfWorkAsync(() => _subscriptions.InsertAsync(
+                new Subscription(_guidGenerator.Create(), workspaceId, planId) { Status = status }));
+        }
 
-            return tenant.Id;
-        });
+        return workspaceId;
     }
 
     private Task<List<Invoice>> AllInvoicesAsync()
     {
         return WithUnitOfWorkAsync(async () =>
         {
-            using (_dataFilter.Disable<IMultiTenant>())
+            using (_dataFilter.Disable<IWorkspaceScoped>())
             {
                 return await _invoices.GetListAsync();
             }
@@ -108,7 +98,7 @@ public abstract class InvoiceGenerationWorkerTests<TStartupModule> : TrackerAppl
         result.Failed.ShouldBe(0);
         var invoices = await AllInvoicesAsync();
         var invoice = invoices.ShouldHaveSingleItem();
-        invoice.TenantId.ShouldBe(activeTenant);
+        invoice.WorkspaceId.ShouldBe(activeTenant);
         invoice.Amount.ShouldBe(6m); // one seat minimum
         invoice.BillingPeriodStart.ShouldBe(Invoice.GetBillingPeriodStart(DateTime.UtcNow));
 
@@ -121,12 +111,9 @@ public abstract class InvoiceGenerationWorkerTests<TStartupModule> : TrackerAppl
     public async Task Deleted_Workspaces_Should_Never_Be_Invoiced()
     {
         var starter = await StarterAsync();
-        var deleted = await CreateWorkspaceAsync("deleted", starter.Id, Subscription.ActiveStatus);
-        await GetRequiredService<ITenantAppService>().DeleteAsync(deleted);
-
-        // A subscription whose workspace row is gone altogether (deleted before deletions canceled subscriptions).
+        // A subscription whose workspace row is gone.
         var orphan = Guid.NewGuid();
-        using (_currentTenant.Change(orphan))
+        using (_currentWorkspace.Change(orphan))
         {
             await WithUnitOfWorkAsync(() => _subscriptions.InsertAsync(
                 new Subscription(_guidGenerator.Create(), orphan, starter.Id) { Status = Subscription.ActiveStatus }));
@@ -146,7 +133,7 @@ public abstract class InvoiceGenerationWorkerTests<TStartupModule> : TrackerAppl
         var period = Invoice.GetBillingPeriodStart(DateTime.UtcNow);
 
         // Another replica's sweep inserts this period's invoice right after our check found none.
-        using (_currentTenant.Change(tenantId))
+        using (_currentWorkspace.Change(tenantId))
         {
             await WithUnitOfWorkAsync(() => _invoices.InsertAsync(
                 new Invoice(_guidGenerator.Create(), tenantId, 6m, DateTime.UtcNow.AddDays(14)) { BillingPeriodStart = period }));
@@ -171,7 +158,7 @@ public abstract class InvoiceGenerationWorkerTests<TStartupModule> : TrackerAppl
 
         result.Failed.ShouldBe(1);
         result.Generated.ShouldBe(1);
-        (await AllInvoicesAsync()).ShouldHaveSingleItem().TenantId.ShouldBe(healthy);
+        (await AllInvoicesAsync()).ShouldHaveSingleItem().WorkspaceId.ShouldBe(healthy);
     }
 
     [Fact]
@@ -208,7 +195,7 @@ public abstract class InvoiceGenerationWorkerTests<TStartupModule> : TrackerAppl
 
         await new ScheduleProbe(ServiceProvider).RunScheduledAsync(ServiceProvider);
 
-        (await AllInvoicesAsync()).ShouldHaveSingleItem().TenantId.ShouldBe(tenantId);
+        (await AllInvoicesAsync()).ShouldHaveSingleItem().WorkspaceId.ShouldBe(tenantId);
     }
 
     /// <summary>An <see cref="InvoiceGenerator"/> that can miss its first "already invoiced?" check (as when another
@@ -229,7 +216,7 @@ public abstract class InvoiceGenerationWorkerTests<TStartupModule> : TrackerAppl
 
         public override Task<Invoice?> GenerateForPeriodAsync(Subscription subscription, DateTime periodStart)
         {
-            if (FailFor.HasValue && subscription.TenantId == FailFor)
+            if (FailFor.HasValue && subscription.WorkspaceId == FailFor)
             {
                 throw new InvalidOperationException("The billing store is unavailable.");
             }
@@ -237,7 +224,7 @@ public abstract class InvoiceGenerationWorkerTests<TStartupModule> : TrackerAppl
             return base.GenerateForPeriodAsync(subscription, periodStart);
         }
 
-        public override Task<bool> IsInvoicedAsync(Guid? tenantId, DateTime periodStart)
+        public override Task<bool> IsInvoicedAsync(Guid tenantId, DateTime periodStart)
         {
             if (MissFirstCheck)
             {

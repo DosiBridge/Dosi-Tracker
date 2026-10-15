@@ -22,8 +22,11 @@ import { NOW } from "./mock-data";
 /** localStorage key holding the backend bearer token. */
 export const TOKEN_STORAGE_KEY = "dosi-token";
 
-/** The workspace (tenant) name the session signed in with; renewals send it as `__tenant`. */
-export const TENANT_STORAGE_KEY = "dosi-tenant";
+/** The current workspace id; every workspace-scoped request sends it as `X-Workspace-Id`. */
+export const WORKSPACE_STORAGE_KEY = "dosi-workspace";
+
+/** Where a signed-in person picks (or creates) a workspace. */
+export const WORKSPACE_CHOOSER_PATH = "/workspaces";
 
 /** When the access token expires, in epoch ms (written with every token). */
 export const TOKEN_EXPIRES_STORAGE_KEY = "dosi-token-expires-at";
@@ -117,10 +120,21 @@ export function canRenewSession(): boolean {
   return !!readStorage(REFRESH_TOKEN_STORAGE_KEY);
 }
 
-/** The workspace name the session signed in with (null for the platform account). */
-export function storedTenantName(): string | null {
-  const tenant = readStorage(TENANT_STORAGE_KEY)?.trim();
-  return tenant ? tenant : null;
+const GUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** The current workspace id (a GUID), or null when none is chosen. Demo workspace ids never qualify. */
+export function currentWorkspaceId(): string | null {
+  const id = readStorage(WORKSPACE_STORAGE_KEY)?.trim();
+  return id && GUID.test(id) ? id : null;
+}
+
+/** Make `id` the current workspace (false when the browser refused to store it). */
+export function setCurrentWorkspace(id: string): boolean {
+  return writeStorage(WORKSPACE_STORAGE_KEY, id);
+}
+
+export function clearCurrentWorkspace(): void {
+  removeStorage(WORKSPACE_STORAGE_KEY);
 }
 
 /* ----------------------------- Navigation ----------------------------- */
@@ -136,6 +150,35 @@ export function redirectToLogin(): void {
     window.location.assign("/login");
   } catch {
     // A navigation the environment refuses leaves the neutral signed-out screen up.
+  }
+}
+
+const WORKSPACE_FREE_PATHS = [WORKSPACE_CHOOSER_PATH, "/invite", "/login"];
+
+/** Pages that work without a chosen workspace (the chooser, invitations, sign-in). */
+export function isWorkspaceFreePath(path: string): boolean {
+  return WORKSPACE_FREE_PATHS.some((p) => path === p || path.startsWith(`${p}/`));
+}
+
+/** Leave for the workspace chooser with a full navigation (no-op on pages that need no workspace). */
+export function redirectToWorkspaceChooser(): void {
+  if (typeof window === "undefined") return;
+  try {
+    if (isWorkspaceFreePath(window.location.pathname)) return;
+    window.location.assign(WORKSPACE_CHOOSER_PATH);
+  } catch {
+    // Keep the current screen.
+  }
+}
+
+/** Switch to another workspace: store it and reload everything from the dashboard. */
+export function switchToWorkspace(id: string, path = "/dashboard"): void {
+  setCurrentWorkspace(id);
+  if (typeof window === "undefined") return;
+  try {
+    window.location.assign(path);
+  } catch {
+    // Keep the current screen.
   }
 }
 

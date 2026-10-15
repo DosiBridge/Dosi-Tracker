@@ -29,6 +29,7 @@ import {
   isAuthenticatedConfig,
   isClientOnly,
   isHostConfig,
+  isPlatformAdminConfig,
   type ApiPlanDto,
   type ApiSubscriptionDto,
   type AppConfiguration,
@@ -73,6 +74,14 @@ export class SessionExpiredError extends Error {
   constructor() {
     super("Your session has expired. Please sign in again.");
     this.name = "SessionExpiredError";
+  }
+}
+
+/** Signed in, but no workspace is chosen (or the chosen one is no longer theirs): go choose one. */
+export class WorkspaceRequiredError extends Error {
+  constructor() {
+    super("Choose a workspace to continue.");
+    this.name = "WorkspaceRequiredError";
   }
 }
 
@@ -140,6 +149,7 @@ const iso = (d: Date) => encodeURIComponent(d.toISOString());
 
 export const LIVE_ENDPOINTS = {
   configuration: "/api/abp/application-configuration?IncludeLocalizationResources=false",
+  mine: "/api/app/workspaces/mine",
   members: "/api/app/team/members",
   projects: "/api/app/project?MaxResultCount=1000",
   subscription: "/api/app/workspace/current-subscription",
@@ -168,23 +178,29 @@ export interface LiveLoadOptions {
   previous?: LiveSessionData | null;
   /** The browser's zone, the last fallback for the reporting zone (default: read from the platform). */
   browserZone?: string;
+  /**
+   * The current workspace id (sent as X-Workspace-Id). When given, the load
+   * checks it against /api/app/workspaces/mine; null means none is chosen.
+   * Undefined keeps the configuration's own scope (tests, older servers).
+   */
+  workspaceId?: string | null;
 }
 
 /* ----------------------------- Pieces ----------------------------- */
 
 function identityOf(config: AppConfiguration): LiveIdentity {
   const cu = config.currentUser ?? {};
-  const tenantId = config.currentTenant?.id ?? cu.tenantId ?? null;
+  const tenantId = config.currentWorkspace?.id ?? config.currentTenant?.id ?? cu.tenantId ?? null;
   return {
     userId: String(cu.id ?? ""),
     tenantId,
-    tenantName: tenantId ? (config.currentTenant?.name ?? "").trim() || null : null,
+    tenantName: tenantId ? (config.currentWorkspace?.name ?? config.currentTenant?.name ?? "").trim() || null : null,
     userName: (cu.userName ?? cu.email ?? "").trim(),
   };
 }
 
 function sameIdentity(a: LiveIdentity, b: LiveIdentity): boolean {
-  return a.userId === b.userId && (a.tenantId ?? null) === (b.tenantId ?? null);
+  return a.userId === b.userId && (a.tenantId ?? "").toLowerCase() === (b.tenantId ?? "").toLowerCase();
 }
 
 function stringField(value: unknown, field: string): string | null {
@@ -377,6 +393,35 @@ function teamRoleOf(projectRole: string | null | undefined): User["role"] {
 
 /* ----------------------------- The load ----------------------------- */
 
+interface MineRow {
+  id?: unknown;
+  name?: unknown;
+  role?: unknown;
+}
+
+/**
+ * Put the chosen workspace (with the caller's role in it) into the
+ * configuration. No workspace chosen: the platform operator gets the console;
+ * anyone else must choose one (WorkspaceRequiredError).
+ */
+async function scopeToWorkspace(get: LiveGetter, cfg: AppConfiguration, workspaceId: string | null | undefined): Promise<AppConfiguration> {
+  // A server that scopes the token itself (no X-Workspace-Id) already names the workspace.
+  if (workspaceId === undefined || cfg.currentTenant?.id || cfg.currentUser?.tenantId) return cfg;
+  if (workspaceId) {
+    const raw = await get(LIVE_ENDPOINTS.mine);
+    const list = (Array.isArray(raw) ? raw : []) as MineRow[];
+    const row = list.find((w) => typeof w?.id === "string" && w.id.toLowerCase() === workspaceId.toLowerCase());
+    if (row) {
+      return {
+        ...cfg,
+        currentWorkspace: { id: String(row.id), name: typeof row.name === "string" ? row.name : "Workspace", role: typeof row.role === "string" ? row.role : null },
+      };
+    }
+  }
+  if (isPlatformAdminConfig(cfg)) return { ...cfg, currentWorkspace: null };
+  throw new WorkspaceRequiredError();
+}
+
 /**
  * Load the live session. The identity call is REQUIRED (it rejects when the
  * backend is unreachable and throws SessionExpiredError when the token is no
@@ -388,7 +433,7 @@ function teamRoleOf(projectRole: string | null | undefined): User["role"] {
 export async function loadLiveSession(get: LiveGetter, now: Date = new Date(), options: LiveLoadOptions = {}): Promise<LiveSessionData> {
   const config = await get(LIVE_ENDPOINTS.configuration);
   if (!isAuthenticatedConfig(config)) throw new SessionExpiredError();
-  const cfg = config as AppConfiguration;
+  const cfg = await scopeToWorkspace(get, config as AppConfiguration, options.workspaceId);
   const identity = identityOf(cfg);
   const previous = options.previous && sameIdentity(options.previous.identity, identity) ? options.previous : null;
   const browserZone = options.browserZone ?? browserTimeZone();
@@ -558,9 +603,11 @@ export async function loadLiveSession(get: LiveGetter, now: Date = new Date(), o
  * Who the stored token belongs to, or null when the backend no longer accepts
  * it. Rejects when the backend can't be reached. Cheap: one configuration call.
  */
-export async function fetchLiveIdentity(get: LiveGetter): Promise<LiveIdentity | null> {
+export async function fetchLiveIdentity(get: LiveGetter, workspaceId?: string | null): Promise<LiveIdentity | null> {
   const config = await get(LIVE_ENDPOINTS.configuration);
-  return isAuthenticatedConfig(config) ? identityOf(config as AppConfiguration) : null;
+  if (!isAuthenticatedConfig(config)) return null;
+  const identity = identityOf(config as AppConfiguration);
+  return workspaceId ? { ...identity, tenantId: workspaceId } : identity;
 }
 
 /** Whether two identities are the same account in the same workspace. */

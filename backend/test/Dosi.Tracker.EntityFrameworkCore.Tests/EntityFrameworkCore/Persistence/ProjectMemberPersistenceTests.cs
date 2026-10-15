@@ -4,7 +4,7 @@ using Dosi.Tracker.Projects;
 using Microsoft.EntityFrameworkCore;
 using Shouldly;
 using Volo.Abp.Domain.Repositories;
-using Volo.Abp.MultiTenancy;
+using Dosi.Tracker.Workspaces;
 using Xunit;
 
 namespace Dosi.Tracker.EntityFrameworkCore.Persistence;
@@ -16,13 +16,13 @@ public class ProjectMemberPersistenceTests : TrackerEntityFrameworkCoreTestBase
 {
     private readonly IRepository<Project, Guid> _projectRepository;
     private readonly IRepository<ProjectMember, Guid> _memberRepository;
-    private readonly ICurrentTenant _currentTenant;
+    private readonly ICurrentWorkspace _currentWorkspace;
 
     public ProjectMemberPersistenceTests()
     {
         _projectRepository = GetRequiredService<IRepository<Project, Guid>>();
         _memberRepository = GetRequiredService<IRepository<ProjectMember, Guid>>();
-        _currentTenant = GetRequiredService<ICurrentTenant>();
+        _currentWorkspace = GetRequiredService<ICurrentWorkspace>();
     }
 
     private Task<Guid> CreateProjectAsync(Guid tenantId)
@@ -44,7 +44,7 @@ public class ProjectMemberPersistenceTests : TrackerEntityFrameworkCoreTestBase
         var tenantId = Guid.NewGuid();
         var userId = Guid.NewGuid();
 
-        using (_currentTenant.Change(tenantId))
+        using (_currentWorkspace.Change(tenantId))
         {
             var projectId = await CreateProjectAsync(tenantId);
             await InsertAsync(tenantId, projectId, userId);
@@ -63,7 +63,7 @@ public class ProjectMemberPersistenceTests : TrackerEntityFrameworkCoreTestBase
         var tenantId = Guid.NewGuid();
         var userId = Guid.NewGuid();
 
-        using (_currentTenant.Change(tenantId))
+        using (_currentWorkspace.Change(tenantId))
         {
             var website = await CreateProjectAsync(tenantId);
             var app = await CreateProjectAsync(tenantId);

@@ -1,17 +1,17 @@
 using System;
 using System.Threading.Tasks;
 using Volo.Abp;
-using Volo.Abp.Domain.Services;
+using Dosi.Tracker.Workspaces;
 using Volo.Abp.SettingManagement;
 
 namespace Dosi.Tracker.Settings;
 
 /// <summary>
-/// The current workspace's settings (tenant-level ABP settings: the default time zone and the new-project defaults)
+/// The current workspace's settings (workspace-level ABP settings, provider "W": the default time zone and the new-project defaults)
 /// and the current user's preferences (user-level: their time zone). Values are stored only when they differ from
 /// the platform default, so a workspace keeps following defaults it never changed.
 /// </summary>
-public class WorkspaceSettingsManager : DomainService
+public class WorkspaceSettingsManager : TrackerDomainService
 {
     private readonly ISettingManager _settingManager;
 
@@ -23,13 +23,13 @@ public class WorkspaceSettingsManager : DomainService
     /// <summary>The workspace's default reporting time zone (an IANA id), or null when not set.</summary>
     public virtual async Task<string?> GetDefaultTimeZoneAsync()
     {
-        return await _settingManager.GetOrNullForCurrentTenantAsync(TrackerSettings.Workspace.DefaultTimeZone);
+        return await GetOrNullAsync(TrackerSettings.Workspace.DefaultTimeZone);
     }
 
     /// <param name="timeZoneId">An IANA id (see <see cref="TimeZoneIds.TryNormalize"/>), or null to unset it.</param>
     public virtual Task SetDefaultTimeZoneAsync(string? timeZoneId)
     {
-        return _settingManager.SetForCurrentTenantAsync(TrackerSettings.Workspace.DefaultTimeZone, CheckTimeZone(timeZoneId));
+        return SetAsync(TrackerSettings.Workspace.DefaultTimeZone, CheckTimeZone(timeZoneId));
     }
 
     public virtual async Task<NewProjectDefaults> GetNewProjectDefaultsAsync()
@@ -87,19 +87,24 @@ public class WorkspaceSettingsManager : DomainService
         return await GetUserTimeZoneAsync() ?? await GetDefaultTimeZoneAsync();
     }
 
-    private Task SetAsync(string name, string value)
+    private Task SetAsync(string name, string? value)
     {
-        return _settingManager.SetForCurrentTenantAsync(name, value);
+        return _settingManager.SetAsync(name, value, WorkspaceSettingValueProvider.ProviderName, CurrentWorkspace.GetId().ToString());
+    }
+
+    private Task<string?> GetOrNullAsync(string name)
+    {
+        return _settingManager.GetOrNullAsync(name, WorkspaceSettingValueProvider.ProviderName, CurrentWorkspace.GetId().ToString());
     }
 
     private async Task<int> GetIntAsync(string name, int fallback)
     {
-        return SettingValueFormat.ReadInt(await _settingManager.GetOrNullForCurrentTenantAsync(name), fallback);
+        return SettingValueFormat.ReadInt(await GetOrNullAsync(name), fallback);
     }
 
     private async Task<bool> GetBoolAsync(string name, bool fallback)
     {
-        return SettingValueFormat.ReadBool(await _settingManager.GetOrNullForCurrentTenantAsync(name), fallback);
+        return SettingValueFormat.ReadBool(await GetOrNullAsync(name), fallback);
     }
 
     private static string? CheckTimeZone(string? timeZoneId)

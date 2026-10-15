@@ -18,7 +18,10 @@ public class TeamRoutesTests
     }
 
     [Theory]
-    [InlineData(nameof(TeamAppService.ResetPasswordAsync), "POST", "api/app/team/reset-password")]
+    [InlineData(nameof(TeamAppService.UpdateWorkspaceRoleAsync), "PUT", "api/app/team/workspace-role")]
+    [InlineData(nameof(TeamAppService.GetInvitationsAsync), "GET", "api/app/team/invitations")]
+    [InlineData(nameof(TeamAppService.DeleteInvitationAsync), "DELETE", "api/app/team/{id}/invitation")]
+    [InlineData(nameof(TeamAppService.RemoveMemberAsync), "DELETE", "api/app/team/member/{memberId}")]
     [InlineData(nameof(TeamAppService.RemoveFromWorkspaceAsync), "DELETE", "api/app/team/from-workspace")]
     [InlineData(nameof(TeamAppService.UpdateMemberAsync), "PUT", "api/app/team/member")]
     [InlineData(nameof(TeamAppService.AddMemberAsync), "POST", "api/app/team/member")]
@@ -34,9 +37,9 @@ public class TeamRoutesTests
     public void The_User_Id_Of_Reset_And_Removal_Should_Stay_In_The_Query_String()
     {
         // The escape hatch ABP honours: an optional parameter is never turned into a route segment.
-        foreach (var methodName in new[] { nameof(TeamAppService.ResetPasswordAsync), nameof(TeamAppService.RemoveFromWorkspaceAsync) })
+        foreach (var methodName in new[] { nameof(TeamAppService.UpdateWorkspaceRoleAsync), nameof(TeamAppService.RemoveFromWorkspaceAsync) })
         {
-            var userId = typeof(TeamAppService).GetMethod(methodName)!.GetParameters().Single();
+            var userId = typeof(TeamAppService).GetMethod(methodName)!.GetParameters().First();
             userId.Name.ShouldBe("userId");
             userId.IsOptional.ShouldBeTrue();
         }

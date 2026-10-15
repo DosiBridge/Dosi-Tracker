@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using System.Reflection;
 using Dosi.Tracker.Activities;
 using Dosi.Tracker.Platform;
@@ -46,15 +47,52 @@ public class ContractRoutesTests
     [InlineData(typeof(WorkspaceAppService), nameof(WorkspaceAppService.UpdateMyPreferencesAsync), "PUT", "api/app/workspace/my-preferences")]
     [InlineData(typeof(WorkspaceAppService), nameof(WorkspaceAppService.GetAvailablePlansAsync), "GET", "api/app/workspace/available-plans")]
     [InlineData(typeof(WorkspaceAppService), nameof(WorkspaceAppService.RegisterAsync), "POST", "api/app/workspace/register")]
+    [InlineData(typeof(WorkspaceAppService), nameof(WorkspaceAppService.GetCurrentSubscriptionAsync), "GET", "api/app/workspace/current-subscription")]
     // §7 host console
-    [InlineData(typeof(PlatformAppService), nameof(PlatformAppService.ChangeTenantPlanAsync), "POST", "api/app/platform/change-tenant-plan")]
+    [InlineData(typeof(PlatformAppService), nameof(PlatformAppService.ChangeWorkspacePlanAsync), "POST", "api/app/platform/change-workspace-plan")]
     [InlineData(typeof(PlatformAppService), nameof(PlatformAppService.ActivateSubscriptionAsync), "POST", "api/app/platform/activate-subscription")]
     [InlineData(typeof(PlatformAppService), nameof(PlatformAppService.SuspendSubscriptionAsync), "POST", "api/app/platform/suspend-subscription")]
     [InlineData(typeof(PlatformAppService), nameof(PlatformAppService.MarkInvoicePaidAsync), "POST", "api/app/platform/mark-invoice-paid")]
-    [InlineData(typeof(PlatformAppService), nameof(PlatformAppService.GetTenantSubscriptionsAsync), "GET", "api/app/platform/tenant-subscriptions")]
+    [InlineData(typeof(PlatformAppService), nameof(PlatformAppService.GetWorkspaceSubscriptionsAsync), "GET", "api/app/platform/workspace-subscriptions")]
     public void Contract_Endpoints_Should_Have_The_Contract_Routes(Type appService, string methodName, string verb, string route)
     {
         ConventionalRoutes.Of(appService, methodName).ShouldBe((verb, route));
+    }
+
+    [Theory]
+    [InlineData(nameof(WorkspaceAppService.GetMineAsync))]
+    [InlineData(nameof(WorkspaceAppService.CreateAsync))]
+    [InlineData(nameof(WorkspaceAppService.LeaveAsync))]
+    [InlineData(nameof(WorkspaceAppService.GetInvitationAsync))]
+    [InlineData(nameof(WorkspaceAppService.AcceptInvitationAsync))]
+    public void Workspace_And_Invitation_Endpoints_Should_Be_Served_By_Controllers_Only(string methodName)
+    {
+        typeof(WorkspaceAppService).GetMethod(methodName)!
+            .GetCustomAttribute<Volo.Abp.RemoteServiceAttribute>()!.IsEnabled.ShouldBeFalse();
+    }
+
+    [Theory]
+    [InlineData(typeof(Dosi.Tracker.Controllers.WorkspacesController), "GetMineAsync", "GET", "mine")]
+    [InlineData(typeof(Dosi.Tracker.Controllers.WorkspacesController), "CreateAsync", "POST", "")]
+    [InlineData(typeof(Dosi.Tracker.Controllers.WorkspacesController), "LeaveAsync", "POST", "{id}/leave")]
+    [InlineData(typeof(Dosi.Tracker.Controllers.InvitationsController), "GetAsync", "GET", "{token}")]
+    [InlineData(typeof(Dosi.Tracker.Controllers.InvitationsController), "AcceptAsync", "POST", "{token}/accept")]
+    public void Workspace_And_Invitation_Controllers_Should_Have_The_Contract_Routes(Type controller, string methodName, string verb, string template)
+    {
+        var prefix = controller == typeof(Dosi.Tracker.Controllers.WorkspacesController) ? "api/app/workspaces" : "api/app/invitations";
+        controller.GetCustomAttribute<Microsoft.AspNetCore.Mvc.RouteAttribute>()!.Template.ShouldBe(prefix);
+        controller.GetCustomAttribute<Dosi.Tracker.Workspaces.WorkspaceNotRequiredAttribute>().ShouldNotBeNull();
+
+        var method = controller.GetMethod(methodName)!;
+        var http = method.GetCustomAttributes().OfType<Microsoft.AspNetCore.Mvc.Routing.HttpMethodAttribute>().Single();
+        http.HttpMethods.ShouldBe(new[] { verb });
+        (http.Template ?? string.Empty).ShouldBe(template);
+    }
+
+    [Fact]
+    public void The_Workspace_Switch_Grant_Should_Be_Gone()
+    {
+        Dosi.Tracker.OpenIddict.OpenIddictDataSeedContributor.AppClientGrantTypes().ShouldNotContain("urn:dosi:workspace_switch");
     }
 
     [Fact]

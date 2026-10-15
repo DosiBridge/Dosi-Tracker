@@ -19,7 +19,7 @@ public abstract class SelfRegistrationTests<TStartupModule> : TrackerApplication
         var value = await GetRequiredService<ISettingProvider>().GetOrNullAsync(AccountSettingNames.IsSelfRegistrationEnabled);
         value.ShouldBe("False");
 
-        // Anonymous /api/account/register would otherwise create users straight in the host.
+        // Accounts are created by the workspace sign-up only.
         await Should.ThrowAsync<UserFriendlyException>(() =>
             GetRequiredService<IAccountAppService>().RegisterAsync(new RegisterDto
             {
@@ -35,11 +35,11 @@ public abstract class SelfRegistrationTests<TStartupModule> : TrackerApplication
     {
         var result = await GetRequiredService<IWorkspaceAppService>().RegisterAsync(new RegisterWorkspaceDto
         {
-            Name = "stillworks",
-            AdminEmail = "owner@stillworks.test",
-            AdminPassword = "1q2w3E*still"
+            WorkspaceName = "stillworks",
+            Email = "owner@stillworks.test",
+            Password = "1q2w3E*still"
         });
 
-        result.TenantId.ShouldNotBe(System.Guid.Empty);
+        result.WorkspaceId.ShouldNotBe(System.Guid.Empty);
     }
 }

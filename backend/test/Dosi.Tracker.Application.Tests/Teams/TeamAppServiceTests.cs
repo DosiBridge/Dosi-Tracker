@@ -11,7 +11,7 @@ using Volo.Abp.Domain.Entities;
 using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Identity;
 using Volo.Abp.Modularity;
-using Volo.Abp.MultiTenancy;
+using Dosi.Tracker.Workspaces;
 using Xunit;
 
 namespace Dosi.Tracker.Teams;
@@ -104,40 +104,24 @@ public abstract class TeamAppServiceTests<TStartupModule> : TeamTestBase<TStartu
         var unknown = await Should.ThrowAsync<BusinessException>(() => AddAsync(projectId, Guid.NewGuid()));
         unknown.Code.ShouldBe(TrackerDomainErrorCodes.InvalidUser);
 
-        // A user of another workspace is invisible here.
-        var otherTenantUserId = await WithUnitOfWorkAsync(async () =>
-        {
-            using (GetRequiredService<ICurrentTenant>().Change(Guid.NewGuid()))
-            {
-                var stranger = new IdentityUser(GuidGenerator.Create(), "stranger", "stranger@other.test", GetRequiredService<ICurrentTenant>().Id);
-                (await GetRequiredService<IdentityUserManager>().CreateAsync(stranger)).Succeeded.ShouldBeTrue();
-                return stranger.Id;
-            }
-        });
-        (await Should.ThrowAsync<BusinessException>(() => AddAsync(projectId, otherTenantUserId)))
+        // An account that is not a member of this workspace (only of another one) can't be added.
+        var stranger = await CreateUserAsync("stranger", member: false);
+        await ServiceProvider.AddWorkspaceMemberAsync(stranger.Id, WorkspaceRoles.Member, Guid.NewGuid());
+        (await Should.ThrowAsync<BusinessException>(() => AddAsync(projectId, stranger.Id)))
             .Code.ShouldBe(TrackerDomainErrorCodes.InvalidUser);
 
         (await TeamAppService.GetProjectMembersAsync(projectId)).Items.Count.ShouldBe(1); // only the creator
     }
 
     [Fact]
-    public async Task AddMember_By_An_Owner_Should_Bring_Back_A_Deactivated_User()
+    public async Task AddMember_Should_Refuse_Someone_Removed_From_The_Workspace()
     {
-        // Deactivated accounts are those removed from the workspace; an owner may bring them back (a manager may not,
-        // see TeamOwnerRulesTests).
         var projectId = await CreateProjectAsync();
         var user = await CreateUserAsync("gone");
-        await WithUnitOfWorkAsync(async () =>
-        {
-            var userManager = GetRequiredService<IdentityUserManager>();
-            var stored = await userManager.GetByIdAsync(user.Id);
-            stored.SetIsActive(false);
-            (await userManager.UpdateAsync(stored)).Succeeded.ShouldBeTrue();
-        });
+        await TeamAppService.RemoveFromWorkspaceAsync(user.Id);
 
-        (await AddAsync(projectId, user.Id)).UserId.ShouldBe(user.Id);
-
-        (await FindUserAsync(user.Id))!.IsActive.ShouldBeTrue();
+        (await Should.ThrowAsync<BusinessException>(() => AddAsync(projectId, user.Id)))
+            .Code.ShouldBe(TrackerDomainErrorCodes.InvalidUser);
     }
 
     [Fact]
@@ -243,7 +227,7 @@ public abstract class TeamAppServiceTests<TStartupModule> : TeamTestBase<TStartu
     }
 
     [Fact]
-    public async Task Invite_Should_Create_A_New_User_With_A_OneTime_Password()
+    public async Task Invite_Of_An_Unknown_Email_Should_Create_A_Pending_Invitation_And_No_Account()
     {
         var projectId = await CreateProjectAsync();
 
@@ -255,50 +239,59 @@ public abstract class TeamAppServiceTests<TStartupModule> : TeamTestBase<TStartu
             HourlyRate = 30m
         });
 
-        result.UserCreated.ShouldBeTrue();
-        result.InitialPassword.ShouldNotBeNullOrWhiteSpace();
-        result.Member.Role.ShouldBe("Worker");
-        result.Member.HourlyRate.ShouldBe(30m);
-        result.Member.UserName.ShouldBe("new.worker@acme.test");
-        result.Member.Email.ShouldBe("new.worker@acme.test");
+        result.Added.ShouldBeFalse();
+        result.Member.ShouldBeNull();
+        result.WorkspaceRole.ShouldBe(WorkspaceRoles.Member);
+        result.InvitationId.ShouldNotBeNull();
+        result.InvitePath.ShouldNotBeNull().ShouldStartWith("/invite/");
+        result.InvitePath!.Length.ShouldBeGreaterThan("/invite/".Length + 32);
+        result.ExpiresAt!.Value.ShouldBeInRange(DateTime.UtcNow.AddDays(14).AddMinutes(-1), DateTime.UtcNow.AddDays(14).AddMinutes(1));
 
-        // The invitee is a member and was notified.
-        var members = await TeamAppService.GetProjectMembersAsync(projectId);
-        members.Items.ShouldContain(m => m.UserId == result.Member.UserId);
+        (await WithUnitOfWorkAsync(() => GetRequiredService<IdentityUserManager>().FindByEmailAsync("new.worker@acme.test"))).ShouldBeNull();
+        (await TeamAppService.GetProjectMembersAsync(projectId)).Items.Count.ShouldBe(1); // only the creator
 
+        var pending = (await TeamAppService.GetInvitationsAsync()).Items.ShouldHaveSingleItem();
+        pending.Email.ShouldBe("new.worker@acme.test");
+        pending.ProjectId.ShouldBe(projectId);
+        pending.ProjectRole.ShouldBe("Worker");
+
+        // Only the hash of the token is stored.
+        var token = result.InvitePath["/invite/".Length..];
         await WithUnitOfWorkAsync(async () =>
         {
-            var notifications = await _notificationRepository.GetListAsync(
-                n => n.UserId == result.Member.UserId);
-            notifications.Count.ShouldBe(1);
+            var stored = await GetRequiredService<IRepository<WorkspaceInvitation, Guid>>().GetAsync(result.InvitationId!.Value);
+            stored.TokenHash.ShouldBe(WorkspaceInvitation.HashToken(token));
+            stored.TokenHash.ShouldNotBe(token);
+            stored.HourlyRate.ShouldBe(30m);
         });
 
-        // The one-time password works, and must be changed at the first sign-in.
-        await WithUnitOfWorkAsync(async () =>
-        {
-            var userManager = GetRequiredService<IdentityUserManager>();
-            var invitee = await userManager.GetByIdAsync(result.Member.UserId);
-            (await userManager.CheckPasswordAsync(invitee, result.InitialPassword!)).ShouldBeTrue();
-            invitee.ShouldChangePasswordOnNextLogin.ShouldBeTrue();
-            invitee.EmailConfirmed.ShouldBeTrue();
-        });
-        (await GetRatesAsync(projectId, result.Member.UserId)).ShouldHaveSingleItem().HourlyRate.ShouldBe(30m);
+        await TeamAppService.DeleteInvitationAsync(pending.Id);
+        (await TeamAppService.GetInvitationsAsync()).Items.ShouldBeEmpty();
     }
 
     [Fact]
-    public async Task Invite_Should_Reuse_An_Existing_User_Without_A_Password()
+    public async Task Invite_Of_An_Existing_Account_Should_Add_It_At_Once()
     {
         var projectA = await CreateProjectAsync();
+        var existing = await CreateUserAsync("repeat.worker", email: "repeat.worker@acme.test", member: false);
 
         var first = await TeamAppService.InviteMemberAsync(new InviteMemberDto
         {
             ProjectId = projectA,
-            Email = "repeat.worker@acme.test",
-            Role = "Worker"
+            Email = "REPEAT.worker@acme.test",
+            Role = "Worker",
+            HourlyRate = 30m
         });
 
-        var projectB = await CreateProjectAsync("Second Invite Project");
+        first.Added.ShouldBeTrue();
+        first.InvitePath.ShouldBeNull();
+        first.Member!.UserId.ShouldBe(existing.Id);
+        first.Member.HourlyRate.ShouldBe(30m);
+        (await IsInRoleAsync(existing.Id, WorkspaceRoles.Member)).ShouldBeTrue();
+        await WithUnitOfWorkAsync(async () =>
+            (await _notificationRepository.GetListAsync(n => n.UserId == existing.Id)).Count.ShouldBe(1));
 
+        var projectB = await CreateProjectAsync("Second Invite Project");
         var second = await TeamAppService.InviteMemberAsync(new InviteMemberDto
         {
             ProjectId = projectB,
@@ -306,9 +299,30 @@ public abstract class TeamAppServiceTests<TStartupModule> : TeamTestBase<TStartu
             Role = "Admin"
         });
 
-        second.UserCreated.ShouldBeFalse();
-        second.InitialPassword.ShouldBeNull();
-        second.Member.UserId.ShouldBe(first.Member.UserId); // same identity, new membership
+        second.Added.ShouldBeTrue();
+        second.Member!.UserId.ShouldBe(existing.Id);
+        second.WorkspaceRole.ShouldBe(WorkspaceRoles.Manager);
+
+        (await Should.ThrowAsync<BusinessException>(() => TeamAppService.InviteMemberAsync(new InviteMemberDto
+        {
+            Email = "repeat.worker@acme.test"
+        }))).Code.ShouldBe(TrackerDomainErrorCodes.AlreadyWorkspaceMember);
+    }
+
+    [Fact]
+    public async Task Invite_Without_A_Project_Should_Only_Add_To_The_Workspace()
+    {
+        var existing = await CreateUserAsync("solo", member: false);
+
+        var result = await TeamAppService.InviteMemberAsync(new InviteMemberDto
+        {
+            Email = existing.Email,
+            WorkspaceRole = "manager"
+        });
+
+        result.Added.ShouldBeTrue();
+        result.Member.ShouldBeNull();
+        (await IsInRoleAsync(existing.Id, WorkspaceRoles.Manager)).ShouldBeTrue();
     }
 
     [Fact]
@@ -320,7 +334,7 @@ public abstract class TeamAppServiceTests<TStartupModule> : TeamTestBase<TStartu
         await WithUnitOfWorkAsync(async () =>
         {
             await _subscriptionRepository.InsertAsync(
-                new Subscription(GuidGenerator.Create(), null, freePlan.Id));
+                new Subscription(GuidGenerator.Create(), TrackerTestConsts.WorkspaceId, freePlan.Id));
         });
 
         var projectId = await CreateProjectAsync();
@@ -358,16 +372,7 @@ public abstract class TeamAppServiceTests<TStartupModule> : TeamTestBase<TStartu
         var member = await AddAsync(projectId, user.Id, role);
 
         member.Role.ShouldBe(ProjectMemberRoles.Normalize(role)); // stored in its canonical spelling
-        (await IsInRoleAsync(user.Id, TrackerRoles.Manager)).ShouldBeTrue();
-
-        // The role was provisioned with the team-lead permission set.
-        await WithUnitOfWorkAsync(async () =>
-        {
-            var grants = await GetRequiredService<Volo.Abp.PermissionManagement.IPermissionGrantRepository>()
-                .GetListAsync(Volo.Abp.Authorization.Permissions.RolePermissionValueProvider.ProviderName,
-                    TrackerRoles.Manager);
-            grants.Select(g => g.Name).ShouldBe(TrackerRoles.ManagerPermissions, ignoreOrder: true);
-        });
+        (await IsInRoleAsync(user.Id, WorkspaceRoles.Manager)).ShouldBeTrue();
     }
 
     [Theory]
@@ -382,13 +387,14 @@ public abstract class TeamAppServiceTests<TStartupModule> : TeamTestBase<TStartu
 
         await AddAsync(projectId, user.Id, role);
 
-        (await IsInRoleAsync(user.Id, TrackerRoles.Manager)).ShouldBeFalse();
+        (await IsInRoleAsync(user.Id, WorkspaceRoles.Manager)).ShouldBeFalse();
     }
 
     [Fact]
     public async Task Invite_As_Manager_Should_Grant_The_Manager_Role()
     {
         var projectId = await CreateProjectAsync();
+        await CreateUserAsync("lead", email: "lead@acme.test", member: false);
 
         var result = await TeamAppService.InviteMemberAsync(new InviteMemberDto
         {
@@ -397,11 +403,11 @@ public abstract class TeamAppServiceTests<TStartupModule> : TeamTestBase<TStartu
             Role = "Manager"
         });
 
-        (await IsInRoleAsync(result.Member.UserId, TrackerRoles.Manager)).ShouldBeTrue();
+        (await IsInRoleAsync(result.Member!.UserId, WorkspaceRoles.Manager)).ShouldBeTrue();
     }
 
     [Fact]
-    public async Task GetMembers_Should_List_Tenant_Users_With_Roles_And_Projects()
+    public async Task GetMembers_Should_List_The_Active_Members_With_Roles_And_Projects()
     {
         var projectId = await CreateProjectAsync();
         var lead = await CreateUserAsync("lead");
@@ -430,12 +436,16 @@ public abstract class TeamAppServiceTests<TStartupModule> : TeamTestBase<TStartu
 
         members.Items.Single(m => m.UserId == client.Id).IsClient.ShouldBeTrue();
 
-        // The caller owns the workspace; so does the seeded host administrator, who holds no projects.
+        leadRow.Role.ShouldBe(WorkspaceRoles.Manager);
+        workerRow.Role.ShouldBe(WorkspaceRoles.Member);
+
+        // The caller owns the workspace; the seeded platform administrator is no member of it.
         members.Items.Single(m => m.UserId == CurrentUserId).IsOwner.ShouldBeTrue();
-        var admin = members.Items.Single(m => m.UserName == "admin");
-        admin.IsOwner.ShouldBeTrue();
-        admin.IsClient.ShouldBeFalse();
-        admin.ProjectIds.ShouldBeEmpty();
+        members.Items.ShouldNotContain(m => m.UserName == "admin");
+
+        // Someone removed from the workspace is no longer listed.
+        await TeamAppService.RemoveFromWorkspaceAsync(worker.Id);
+        (await TeamAppService.GetMembersAsync()).Items.ShouldNotContain(m => m.UserId == worker.Id);
     }
 
     [Fact]
@@ -450,13 +460,13 @@ public abstract class TeamAppServiceTests<TStartupModule> : TeamTestBase<TStartu
         promoted.Role.ShouldBe("Manager");
         promoted.HourlyRate.ShouldBe(55m);
         promoted.UserName.ShouldBe("promoted");
-        (await IsInRoleAsync(user.Id, TrackerRoles.Manager)).ShouldBeTrue();
+        (await IsInRoleAsync(user.Id, WorkspaceRoles.Manager)).ShouldBeTrue();
         (await TeamAppService.GetProjectMembersAsync(projectId)).Items
             .Single(m => m.UserId == user.Id).HourlyRate.ShouldBe(55m);
 
         await TeamAppService.UpdateMemberAsync(projectId, user.Id, new UpdateProjectMemberDto { Role = "Worker", HourlyRate = 55m });
 
-        (await IsInRoleAsync(user.Id, TrackerRoles.Manager)).ShouldBeFalse(); // no Admin/Manager membership left
+        (await IsInRoleAsync(user.Id, WorkspaceRoles.Manager)).ShouldBeFalse(); // no Admin/Manager membership left
     }
 
     [Fact]
@@ -470,7 +480,7 @@ public abstract class TeamAppServiceTests<TStartupModule> : TeamTestBase<TStartu
 
         await TeamAppService.UpdateMemberAsync(projectA, user.Id, new UpdateProjectMemberDto { Role = "Worker" });
 
-        (await IsInRoleAsync(user.Id, TrackerRoles.Manager)).ShouldBeTrue();
+        (await IsInRoleAsync(user.Id, WorkspaceRoles.Manager)).ShouldBeTrue();
     }
 
     [Fact]

@@ -1,12 +1,11 @@
 Feature: Workspace signup
-  A new customer self-registers a workspace. Registration provisions an isolated tenant,
-  an administrator account, and a subscription on the chosen plan — trialing for paid plans,
-  active immediately for Free.
+  A new customer signs up. Sign-up creates their account, a workspace they own, and a
+  subscription on the chosen plan — trialing for paid plans, active immediately for Free.
 
   Scenario: Registering on a paid plan starts a trial
     When I register the workspace "acme" for admin "owner@acme.test" on the "Starter" plan
-    Then the workspace is created with its own tenant
-    And the tenant has an administrator "owner@acme.test"
+    Then the workspace is created
+    And "owner@acme.test" owns the workspace
     And the subscription is "trialing"
 
   Scenario: Registering on the Free plan activates immediately

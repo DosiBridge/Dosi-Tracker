@@ -9,20 +9,20 @@ using Volo.Abp;
 using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Identity;
 using Volo.Abp.Modularity;
-using Volo.Abp.PermissionManagement;
+using Dosi.Tracker.Workspaces;
 using Xunit;
 
 namespace Dosi.Tracker.Teams;
 
 /// <summary>
-/// The owner-only rules, as a team lead meets them. The caller holds the Identity "manager" role — and with it
-/// Tracker.Team.Manage — but is not a workspace owner: they may run the team, but not hand out manager rights, set pay,
-/// touch an owner's memberships or change their own.
+/// The owner-only rules, as a team lead meets them. The caller is a workspace manager — and with it holds
+/// Tracker.Team.Manage — but not an owner: they may run the team, but not hand out manager rights, set pay, change
+/// workspace roles, touch an owner or another manager, or change their own.
 /// </summary>
 public abstract class TeamOwnerRulesTests<TStartupModule> : TeamTestBase<TStartupModule>
     where TStartupModule : IAbpModule
 {
-    protected override string? CallerRole => TrackerRoles.Manager;
+    protected override string? CallerRole => WorkspaceRoles.Manager;
 
     [Theory]
     [InlineData("Admin")]
@@ -37,7 +37,7 @@ public abstract class TeamOwnerRulesTests<TStartupModule> : TeamTestBase<TStartu
 
         exception.Code.ShouldBe(TrackerDomainErrorCodes.RoleNotAllowed);
         (await GetMembershipsOfUserAsync(user.Id)).ShouldBeEmpty();
-        (await IsInRoleAsync(user.Id, TrackerRoles.Manager)).ShouldBeFalse();
+        (await IsInRoleAsync(user.Id, WorkspaceRoles.Manager)).ShouldBeFalse();
     }
 
     [Fact]
@@ -100,8 +100,8 @@ public abstract class TeamOwnerRulesTests<TStartupModule> : TeamTestBase<TStartu
         await TeamAppService.RemoveFromWorkspaceAsync(worker.Id);
         var back = await TeamAppService.InviteMemberAsync(new InviteMemberDto { ProjectId = projectId, Email = "worker@acme.test" });
 
-        back.UserCreated.ShouldBeFalse();
-        back.Member.HourlyRate.ShouldBe(40m);
+        back.Added.ShouldBeTrue();
+        back.Member!.HourlyRate.ShouldBe(40m);
         (await GetRatesAsync(projectId, worker.Id)).ShouldHaveSingleItem().HourlyRate.ShouldBe(40m);
     }
 
@@ -115,36 +115,24 @@ public abstract class TeamOwnerRulesTests<TStartupModule> : TeamTestBase<TStartu
 
         (await Should.ThrowAsync<BusinessException>(() => AddAsync(projectId, leaver.Id)))
             .Code.ShouldBe(TrackerDomainErrorCodes.InvalidUser);
-        (await FindUserAsync(leaver.Id))!.IsActive.ShouldBeFalse();
+        (await FindUserAsync(leaver.Id))!.IsActive.ShouldBeTrue(); // the account itself is untouched
     }
 
     [Fact]
-    public async Task A_Manager_Cannot_Reset_Or_Remove_An_Account_With_Rights_Beyond_Their_Own()
+    public async Task A_Manager_Can_Remove_Members_But_Not_Other_Managers_Or_Change_Workspace_Roles()
     {
-        var permissions = GetRequiredService<IPermissionManager>();
-        // An accountant the owner gave billing rights through a role of their own, and someone granted project deletion.
-        await WithUnitOfWorkAsync(async () =>
-        {
-            (await GetRequiredService<IdentityRoleManager>().CreateAsync(
-                new IdentityRole(GuidGenerator.Create(), "accounting"))).Succeeded.ShouldBeTrue();
-            await permissions.SetForRoleAsync("accounting", TrackerPermissions.Billing.Default, true);
-        });
-        var accountant = await CreateUserAsync("accountant", "accounting");
-        var deleter = await CreateUserAsync("deleter");
-        await WithUnitOfWorkAsync(() => permissions.SetForUserAsync(deleter.Id, TrackerPermissions.Projects.Delete, true));
+        var worker = await CreateUserAsync("worker");
+        var colleague = await CreateUserAsync("colleague", WorkspaceRoles.Manager);
 
-        foreach (var target in new[] { accountant.Id, deleter.Id })
-        {
-            (await Should.ThrowAsync<BusinessException>(() => TeamAppService.ResetPasswordAsync(target)))
-                .Code.ShouldBe(TrackerDomainErrorCodes.RoleNotAllowed);
-            (await Should.ThrowAsync<BusinessException>(() => TeamAppService.RemoveFromWorkspaceAsync(target)))
-                .Code.ShouldBe(TrackerDomainErrorCodes.RoleNotAllowed);
-            (await FindUserAsync(target))!.IsActive.ShouldBeTrue();
-        }
+        (await Should.ThrowAsync<BusinessException>(() => TeamAppService.RemoveFromWorkspaceAsync(colleague.Id)))
+            .Code.ShouldBe(TrackerDomainErrorCodes.RoleNotAllowed);
+        (await IsInRoleAsync(colleague.Id, WorkspaceRoles.Manager)).ShouldBeTrue();
 
-        // Another lead has the same rights as the caller.
-        var colleague = await CreateUserAsync("colleague", TrackerRoles.Manager);
-        (await TeamAppService.ResetPasswordAsync(colleague.Id)).InitialPassword.ShouldNotBeNullOrWhiteSpace();
+        (await Should.ThrowAsync<BusinessException>(() => TeamAppService.UpdateWorkspaceRoleAsync(worker.Id, WorkspaceRoles.Manager)))
+            .Code.ShouldBe(TrackerDomainErrorCodes.RoleNotAllowed);
+
+        await TeamAppService.RemoveFromWorkspaceAsync(worker.Id);
+        (await IsActiveMemberAsync(worker.Id)).ShouldBeFalse();
     }
 
     [Fact]
@@ -163,7 +151,7 @@ public abstract class TeamOwnerRulesTests<TStartupModule> : TeamTestBase<TStartu
     }
 
     [Fact]
-    public async Task A_Manager_Cannot_Invite_A_Manager_Or_With_A_Rate_And_Creates_No_Account_Trying()
+    public async Task A_Manager_Cannot_Invite_A_Manager_Or_Owner_Or_With_A_Rate()
     {
         var projectId = await CreateProjectAsync();
 
@@ -179,14 +167,19 @@ public abstract class TeamOwnerRulesTests<TStartupModule> : TeamTestBase<TStartu
             })))
             .Code.ShouldBe(TrackerDomainErrorCodes.RoleNotAllowed);
 
-        (await WithUnitOfWorkAsync(() => GetRequiredService<IdentityUserManager>().FindByEmailAsync("alt.account@acme.test")))
-            .ShouldBeNull();
+        (await Should.ThrowAsync<BusinessException>(() => TeamAppService.InviteMemberAsync(new InviteMemberDto
+            {
+                Email = "alt.account@acme.test", WorkspaceRole = WorkspaceRoles.Owner
+            })))
+            .Code.ShouldBe(TrackerDomainErrorCodes.RoleNotAllowed);
+
+        (await TeamAppService.GetInvitationsAsync()).Items.ShouldBeEmpty();
 
         var worker = await TeamAppService.InviteMemberAsync(new InviteMemberDto
         {
             ProjectId = projectId, Email = "plain.worker@acme.test", Role = "Worker"
         });
-        worker.UserCreated.ShouldBeTrue();
+        worker.InvitePath.ShouldNotBeNull();
     }
 
     [Fact]
@@ -214,7 +207,7 @@ public abstract class TeamOwnerRulesTests<TStartupModule> : TeamTestBase<TStartu
     public async Task A_Manager_Cannot_Touch_An_Owners_Memberships()
     {
         var projectId = await CreateProjectAsync();
-        var owner = await CreateUserAsync("owner", TrackerRoles.Admin);
+        var owner = await CreateUserAsync("owner", WorkspaceRoles.Owner);
 
         (await Should.ThrowAsync<BusinessException>(() => AddAsync(projectId, owner.Id)))
             .Code.ShouldBe(TrackerDomainErrorCodes.RoleNotAllowed);
@@ -223,7 +216,7 @@ public abstract class TeamOwnerRulesTests<TStartupModule> : TeamTestBase<TStartu
         var ownerProject = Guid.NewGuid();
         var membership = await WithUnitOfWorkAsync(async () =>
         {
-            await GetRequiredService<IRepository<Project, Guid>>().InsertAsync(new Project(ownerProject, null, "Owner's project"));
+            await GetRequiredService<IRepository<Project, Guid>>().InsertAsync(new Project(ownerProject, TrackerTestConsts.WorkspaceId, "Owner's project"));
             return await GetRequiredService<ProjectMembershipManager>().EnrollAsync(ownerProject, owner.Id, "Admin", 0m);
         });
 
@@ -235,23 +228,9 @@ public abstract class TeamOwnerRulesTests<TStartupModule> : TeamTestBase<TStartu
     }
 
     [Fact]
-    public async Task A_Manager_Can_Reset_A_Members_Password_But_Not_An_Owners_Or_Their_Own()
-    {
-        var worker = await CreateUserAsync("worker");
-        var owner = await CreateUserAsync("owner", TrackerRoles.Admin);
-
-        (await TeamAppService.ResetPasswordAsync(worker.Id)).InitialPassword.ShouldNotBeNullOrWhiteSpace();
-
-        (await Should.ThrowAsync<BusinessException>(() => TeamAppService.ResetPasswordAsync(owner.Id)))
-            .Code.ShouldBe(TrackerDomainErrorCodes.RoleNotAllowed);
-        (await Should.ThrowAsync<BusinessException>(() => TeamAppService.ResetPasswordAsync(CurrentUserId)))
-            .Code.ShouldBe(TrackerDomainErrorCodes.CannotModifySelf);
-    }
-
-    [Fact]
     public async Task Nobody_Can_Remove_An_Owner_Or_Themselves_From_The_Workspace()
     {
-        var owner = await CreateUserAsync("owner", TrackerRoles.Admin);
+        var owner = await CreateUserAsync("owner", WorkspaceRoles.Owner);
 
         (await Should.ThrowAsync<BusinessException>(() => TeamAppService.RemoveFromWorkspaceAsync(owner.Id)))
             .Code.ShouldBe(TrackerDomainErrorCodes.RoleNotAllowed);

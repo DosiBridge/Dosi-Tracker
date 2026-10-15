@@ -3,24 +3,22 @@ using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
 using System.Linq;
 using System.Runtime.InteropServices;
-using System.Security.Cryptography;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Options;
 using Dosi.Tracker.Identity;
 using Dosi.Tracker.Notifications;
 using Dosi.Tracker.Permissions;
 using Dosi.Tracker.Projects;
 using Dosi.Tracker.SaaS;
+using Dosi.Tracker.Workspaces;
 using Volo.Abp;
 using Volo.Abp.Application.Dtos;
 using Volo.Abp.Authorization;
 using Volo.Abp.Domain.Entities;
 using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Identity;
-using Volo.Abp.PermissionManagement;
 using Volo.Abp.Uow;
 using Volo.Abp.Users;
 using Volo.Abp.Validation;
@@ -29,12 +27,11 @@ using IdentityUser = Volo.Abp.Identity.IdentityUser;
 namespace Dosi.Tracker.Teams;
 
 /// <summary>
-/// The workspace team: project rosters, adding and inviting people, roles and hourly rates, password resets and
-/// removal from the workspace. Everything that changes the team needs Tracker.Team.Manage, which managers hold too, so
-/// the owner-only rules are enforced here: only workspace owners (Identity "admin" role) grant Admin/Manager, set or
-/// change hourly rates, touch an owner's memberships, bring back someone removed from the workspace, or reset or remove
-/// an account with rights beyond the caller's; and nobody changes their own role or rate. Changes that can take a seat
-/// are serialized per workspace (<see cref="SeatCounter.LockAsync"/>) and committed before the next one counts seats.
+/// The current workspace's team: project rosters, adding and inviting people, roles and hourly rates, and removal from
+/// the workspace. Everything that changes the team needs Tracker.Team.Manage, which managers hold too, so the owner-only
+/// rules are enforced here: only workspace owners grant Admin/Manager, set or change hourly rates, change workspace roles
+/// or touch an owner; and nobody changes their own role or rate. Changes that can take a seat are serialized per
+/// workspace (<see cref="SeatCounter.LockAsync"/>) and committed before the next one counts seats.
 /// </summary>
 [Authorize]
 public class TeamAppService : TrackerAppService, ITeamAppService
@@ -42,36 +39,42 @@ public class TeamAppService : TrackerAppService, ITeamAppService
     private readonly IRepository<ProjectMember, Guid> _memberRepository;
     private readonly IRepository<Project, Guid> _projectRepository;
     private readonly IRepository<Notification, Guid> _notificationRepository;
+    private readonly IRepository<WorkspaceMember, Guid> _workspaceMemberRepository;
+    private readonly IRepository<WorkspaceInvitation, Guid> _invitationRepository;
     private readonly SeatCounter _seatCounter;
     private readonly IdentityUserManager _userManager;
     private readonly IIdentityUserRepository _userRepository;
-    private readonly IOptions<IdentityOptions> _identityOptions;
     private readonly ProjectMembershipManager _memberships;
+    private readonly WorkspaceMembershipManager _workspaceMemberships;
+    private readonly WorkspaceJoiner _joiner;
     private readonly ISubscriptionAccessChecker _subscriptionAccess;
-    private readonly IPermissionManager _permissionManager;
 
     public TeamAppService(
         IRepository<ProjectMember, Guid> memberRepository,
         IRepository<Project, Guid> projectRepository,
         IRepository<Notification, Guid> notificationRepository,
+        IRepository<WorkspaceMember, Guid> workspaceMemberRepository,
+        IRepository<WorkspaceInvitation, Guid> invitationRepository,
         SeatCounter seatCounter,
         IdentityUserManager userManager,
         IIdentityUserRepository userRepository,
-        IOptions<IdentityOptions> identityOptions,
         ProjectMembershipManager memberships,
-        ISubscriptionAccessChecker subscriptionAccess,
-        IPermissionManager permissionManager)
+        WorkspaceMembershipManager workspaceMemberships,
+        WorkspaceJoiner joiner,
+        ISubscriptionAccessChecker subscriptionAccess)
     {
         _memberRepository = memberRepository;
         _projectRepository = projectRepository;
         _notificationRepository = notificationRepository;
+        _workspaceMemberRepository = workspaceMemberRepository;
+        _invitationRepository = invitationRepository;
         _seatCounter = seatCounter;
         _userManager = userManager;
         _userRepository = userRepository;
-        _identityOptions = identityOptions;
         _memberships = memberships;
+        _workspaceMemberships = workspaceMemberships;
+        _joiner = joiner;
         _subscriptionAccess = subscriptionAccess;
-        _permissionManager = permissionManager;
     }
 
     public async Task<ListResultDto<ProjectMemberDto>> GetProjectMembersAsync(Guid projectId)
@@ -101,23 +104,18 @@ public class TeamAppService : TrackerAppService, ITeamAppService
             .ToList());
     }
 
-    /// <remarks>An owner may also bring back someone removed from the workspace (a deactivated account): their account
-    /// is reactivated with the password it had; a new one-time password is a <see cref="ResetPasswordAsync"/> away.
-    /// That is the way back for an account whose email is not verified, which an invite never attaches to.</remarks>
     [Authorize(TrackerPermissions.Team.Manage)]
     public async Task<ProjectMemberDto> AddMemberAsync(CreateProjectMemberDto input)
     {
         await using var seatLock = await _seatCounter.LockAsync();
         using var uow = UnitOfWorkManager.Begin(new AbpUnitOfWorkOptions(isTransactional: true), requiresNew: true);
 
-        // The project must exist in the current tenant (throws EntityNotFoundException otherwise).
         var project = await _projectRepository.GetAsync(input.ProjectId);
         await EnsureSubscriptionUsableAsync();
 
-        // Tenant-filtered: a user id of another workspace or a deleted user is refused, and so is a deactivated one
-        // unless an owner brings them back.
+        // Only an active member of this workspace with an active account can join its projects.
         var user = await _userRepository.FindAsync(input.UserId);
-        if (user == null || (!user.IsActive && !await IsOwnerAsync(CurrentUser.GetId())))
+        if (user == null || !user.IsActive || await _workspaceMemberships.FindActiveAsync(WorkspaceId, user.Id) == null)
         {
             throw new BusinessException(TrackerDomainErrorCodes.InvalidUser)
                 .WithData("userId", input.UserId);
@@ -127,13 +125,6 @@ public class TeamAppService : TrackerAppService, ITeamAppService
         await EnsureNotMemberAsync(project.Id, user.Id);
         var hourlyRate = await EnsureMayAssignAsync(project.Id, user.Id, role, input.HourlyRate);
         await EnsureSeatAvailableAsync(user.Id, role);
-
-        if (!user.IsActive)
-        {
-            user.SetIsActive(true);
-            (await _userManager.UpdateAsync(user)).CheckErrors();
-            Logger.LogInformation("User {UserId} was brought back to the workspace by {CallerId}.", user.Id, CurrentUser.GetId());
-        }
 
         var member = await _memberships.EnrollAsync(project.Id, user.Id, role, hourlyRate);
         await NotifyAddedAsync(user.Id, project);
@@ -148,70 +139,129 @@ public class TeamAppService : TrackerAppService, ITeamAppService
         await using var seatLock = await _seatCounter.LockAsync();
         using var uow = UnitOfWorkManager.Begin(new AbpUnitOfWorkOptions(isTransactional: true), requiresNew: true);
 
-        var project = await _projectRepository.GetAsync(input.ProjectId);
+        var workspaceId = WorkspaceId;
+        var callerIsOwner = await IsOwnerAsync(CurrentUser.GetId());
+        var workspaceRole = input.WorkspaceRole.IsNullOrWhiteSpace()
+            ? WorkspaceRoles.Member
+            : WorkspaceRoles.Normalize(input.WorkspaceRole) ?? throw new AbpValidationException(new List<ValidationResult>
+            {
+                new("The workspace role must be owner, manager or member.", new[] { nameof(InviteMemberDto.WorkspaceRole) })
+            });
+        if (workspaceRole != WorkspaceRoles.Member && !callerIsOwner)
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.RoleNotAllowed).WithData("role", workspaceRole);
+        }
+
+        Project? project = null;
+        var role = ProjectMemberRoles.Normalize(input.Role.IsNullOrWhiteSpace() ? ProjectMemberRoles.Worker : input.Role);
+        if (input.ProjectId.HasValue)
+        {
+            project = await _projectRepository.GetAsync(input.ProjectId.Value);
+        }
+
         await EnsureSubscriptionUsableAsync();
 
         var email = input.Email.Trim();
-        var role = ProjectMemberRoles.Normalize(input.Role);
         var user = await _userManager.FindByEmailAsync(email);
-        string? initialPassword = null;
-        var created = false;
-        decimal hourlyRate;
-
         if (user != null)
         {
-            // Users can edit their own email, so an unverified address proves nothing: attaching the invite to such an
-            // account would let anyone claim a membership (and a Manager role) meant for the real owner of the address.
-            if (!user.EmailConfirmed)
-            {
-                throw new AbpValidationException(new List<ValidationResult>
-                {
-                    new("An account with this email address already exists, but the address is not verified. " +
-                        "Add that person from the team list instead.", new[] { nameof(InviteMemberDto.Email) })
-                });
-            }
-
-            await EnsureNotMemberAsync(project.Id, user.Id);
-            hourlyRate = await EnsureMayAssignAsync(project.Id, user.Id, role, input.HourlyRate);
-            await EnsureSeatAvailableAsync(user.Id, role);
-
             if (!user.IsActive)
             {
-                // Removed from the workspace earlier: inviting them again brings the account back, with a fresh
-                // one-time password (the old one may be known to others by now).
-                user.SetIsActive(true);
-                initialPassword = await SetOneTimePasswordAsync(user);
+                throw new BusinessException(TrackerDomainErrorCodes.InvalidUser).WithData("email", email);
             }
+
+            var existing = await _workspaceMemberships.FindActiveAsync(workspaceId, user.Id);
+            if (existing != null && project == null)
+            {
+                throw new BusinessException(TrackerDomainErrorCodes.AlreadyWorkspaceMember).WithData("email", email);
+            }
+
+            if (existing is { IsOwner: true } && !callerIsOwner)
+            {
+                throw new BusinessException(TrackerDomainErrorCodes.RoleNotAllowed).WithData("userId", user.Id);
+            }
+
+            var hourlyRate = 0m;
+            if (project != null)
+            {
+                await EnsureNotMemberAsync(project.Id, user.Id);
+                hourlyRate = await EnsureMayAssignAsync(project.Id, user.Id, role, input.HourlyRate);
+            }
+
+            var (member, projectMember) = await _joiner.JoinAsync(user.Id, workspaceRole, project?.Id, role, hourlyRate);
+            await uow.CompleteAsync();
+
+            return new InviteMemberResultDto
+            {
+                Added = true,
+                WorkspaceRole = member.Role,
+                Member = projectMember == null ? null : ToDto(projectMember, user, includePrivateData: true)
+            };
         }
-        else
+
+        var rate = project == null ? 0m : await EnsureMayAssignAsync(project.Id, null, role, input.HourlyRate);
+        var normalizedEmail = WorkspaceInvitation.NormalizeEmail(email);
+        var stale = await _invitationRepository.GetListAsync(i =>
+            i.WorkspaceId == workspaceId && i.NormalizedEmail == normalizedEmail && i.AcceptedAt == null);
+        if (stale.Count > 0)
         {
-            hourlyRate = await EnsureMayAssignAsync(project.Id, null, role, input.HourlyRate);
-            await EnsureSeatAvailableAsync(null, role);
-
-            // No email delivery is configured, so the one-time initial password is returned to the (Team.Manage)
-            // caller, who shares it out-of-band; the invitee must change it at the first sign-in.
-            initialPassword = GenerateInitialPassword();
-            user = new IdentityUser(GuidGenerator.Create(), await CreateUserNameAsync(email), email, CurrentTenant.Id);
-            // The address was entered by the workspace's manager, which is the verification this workspace has. The
-            // user changing it later (profile) clears this again, so a re-invite never attaches to an edited address.
-            user.SetEmailConfirmed(true);
-            user.SetShouldChangePasswordOnNextLogin(true);
-
-            await _identityOptions.SetAsync();
-            (await _userManager.CreateAsync(user, initialPassword)).CheckErrors();
-            created = true;
+            await _invitationRepository.DeleteManyAsync(stale);
         }
 
-        var member = await _memberships.EnrollAsync(project.Id, user.Id, role, hourlyRate);
-        await NotifyAddedAsync(user.Id, project);
+        var token = WorkspaceInvitation.NewToken();
+        var invitation = new WorkspaceInvitation(
+            GuidGenerator.Create(),
+            workspaceId,
+            email,
+            WorkspaceJoiner.EffectiveRole(workspaceRole, project?.Id, role),
+            project?.Id,
+            project == null ? null : role,
+            project == null ? null : rate,
+            WorkspaceInvitation.HashToken(token),
+            Clock.Now.AddDays(WorkspaceConsts.InvitationLifetimeDays));
+        await _invitationRepository.InsertAsync(invitation, autoSave: true);
         await uow.CompleteAsync();
 
         return new InviteMemberResultDto
         {
-            Member = ToDto(member, user, includePrivateData: true),
-            UserCreated = created,
-            InitialPassword = initialPassword
+            Added = false,
+            WorkspaceRole = invitation.Role,
+            InvitationId = invitation.Id,
+            InvitePath = "/invite/" + token,
+            ExpiresAt = invitation.ExpiresAt
         };
+    }
+
+    [Authorize(TrackerPermissions.Team.Manage)]
+    public async Task<ListResultDto<WorkspaceInvitationDto>> GetInvitationsAsync()
+    {
+        var workspaceId = WorkspaceId;
+        var now = Clock.Now;
+        var invitations = await _invitationRepository.GetListAsync(i =>
+            i.WorkspaceId == workspaceId && i.AcceptedAt == null && i.ExpiresAt > now);
+
+        return new ListResultDto<WorkspaceInvitationDto>(invitations
+            .OrderByDescending(i => i.CreationTime)
+            .Select(i => new WorkspaceInvitationDto
+            {
+                Id = i.Id,
+                Email = i.Email,
+                Role = i.Role,
+                ProjectId = i.ProjectId,
+                ProjectRole = i.ProjectRole,
+                ExpiresAt = i.ExpiresAt,
+                CreationTime = i.CreationTime
+            })
+            .ToList());
+    }
+
+    [Authorize(TrackerPermissions.Team.Manage)]
+    public async Task DeleteInvitationAsync(Guid id)
+    {
+        var workspaceId = WorkspaceId;
+        var invitation = await _invitationRepository.FirstOrDefaultAsync(i => i.Id == id && i.WorkspaceId == workspaceId)
+                         ?? throw new EntityNotFoundException(typeof(WorkspaceInvitation), id);
+        await _invitationRepository.DeleteAsync(invitation);
     }
 
     [Authorize(TrackerPermissions.Team.Manage)]
@@ -240,61 +290,51 @@ public class TeamAppService : TrackerAppService, ITeamAppService
 
     public async Task<ListResultDto<TeamMemberDto>> GetMembersAsync()
     {
+        var workspaceId = WorkspaceId;
         var canSeeEveryone =
             await AuthorizationService.IsGrantedAsync(TrackerPermissions.Team.Manage) ||
             await AuthorizationService.IsGrantedAsync(TrackerPermissions.Activities.ViewAll);
 
-        List<IdentityUser> users;
-        if (canSeeEveryone)
-        {
-            // Tenant-filtered by ABP: only this workspace's users.
-            users = await _userRepository.GetListAsync(sorting: nameof(IdentityUser.UserName));
-        }
-        else
-        {
-            var me = await _userRepository.FindAsync(CurrentUser.GetId());
-            users = me == null ? new List<IdentityUser>() : new List<IdentityUser> { me };
-        }
-
-        if (users.Count == 0)
+        var me = CurrentUser.GetId();
+        var workspaceMembers = await _workspaceMemberRepository.GetListAsync(m =>
+            m.WorkspaceId == workspaceId && m.Status == WorkspaceMemberStatus.Active && (canSeeEveryone || m.UserId == me));
+        if (workspaceMembers.Count == 0)
         {
             return new ListResultDto<TeamMemberDto>(new List<TeamMemberDto>());
         }
 
-        var userIds = users.Select(u => u.Id).ToList();
-
-        var roleNames = (await _userRepository.GetRoleNamesAsync(userIds))
-            .ToDictionary(r => r.Id, r => r.RoleNames ?? Array.Empty<string>());
-
+        var userIds = workspaceMembers.Select(m => m.UserId).ToList();
+        var users = await GetUsersByIdAsync(userIds);
         var memberships = (await _memberRepository.GetListAsync(m => userIds.Contains(m.UserId)))
             .GroupBy(m => m.UserId)
             .ToDictionary(g => g.Key, g => g.ToList());
 
-        bool HasRole(Guid userId, string role) =>
-            roleNames.TryGetValue(userId, out var names) &&
-            names.Any(n => string.Equals(n, role, StringComparison.OrdinalIgnoreCase));
-
-        var items = users
-            .Select(u =>
-            {
-                var userMemberships = memberships.GetValueOrDefault(u.Id) ?? new List<ProjectMember>();
-                return new TeamMemberDto
-                {
-                    UserId = u.Id,
-                    UserName = u.UserName,
-                    Name = u.Name,
-                    Surname = u.Surname,
-                    Email = u.Email,
-                    IsActive = u.IsActive,
-                    IsManager = HasRole(u.Id, TrackerRoles.Manager),
-                    IsOwner = HasRole(u.Id, TrackerRoles.Admin),
-                    IsClient = userMemberships.Count > 0 && userMemberships.All(m => ProjectMemberRoles.IsClient(m.Role)),
-                    ProjectIds = userMemberships.Select(m => m.ProjectId).Distinct().ToList()
-                };
-            })
+        var items = workspaceMembers
+            .Where(m => users.ContainsKey(m.UserId))
+            .Select(m => ToTeamMemberDto(m, users[m.UserId], memberships.GetValueOrDefault(m.UserId) ?? new List<ProjectMember>()))
+            .OrderBy(m => m.UserName, StringComparer.OrdinalIgnoreCase)
             .ToList();
 
         return new ListResultDto<TeamMemberDto>(items);
+    }
+
+    private static TeamMemberDto ToTeamMemberDto(WorkspaceMember member, IdentityUser user, List<ProjectMember> memberships)
+    {
+        return new TeamMemberDto
+        {
+            UserId = user.Id,
+            UserName = user.UserName,
+            Name = user.Name,
+            Surname = user.Surname,
+            Email = user.Email,
+            IsActive = user.IsActive,
+            Role = member.Role,
+            IsManager = member.Role == WorkspaceRoles.Manager,
+            IsOwner = member.Role == WorkspaceRoles.Owner,
+            IsClient = memberships.Count > 0 && memberships.All(m => ProjectMemberRoles.IsClient(m.Role)),
+            JoinedAt = member.JoinedAt,
+            ProjectIds = memberships.Select(m => m.ProjectId).Distinct().ToList()
+        };
     }
 
     [Authorize(TrackerPermissions.Team.Manage)]
@@ -350,26 +390,32 @@ public class TeamAppService : TrackerAppService, ITeamAppService
     }
 
     /// <inheritdoc />
-    /// <remarks><paramref name="userId"/> is optional only so that ABP keeps it in the query string
-    /// (<c>?userId=</c>, the route of the shared contract) instead of a <c>/{userId}</c> route segment.</remarks>
+    /// <remarks><paramref name="userId"/> is optional only so that ABP keeps it in the query string.</remarks>
     [Authorize(TrackerPermissions.Team.Manage)]
-    public async Task<ResetPasswordResultDto> ResetPasswordAsync([Optional] Guid userId)
+    public async Task<TeamMemberDto> UpdateWorkspaceRoleAsync([Optional] Guid userId, string role)
     {
-        var user = await GetManageableUserAsync(userId);
-
-        var password = await SetOneTimePasswordAsync(user);
-
-        // A forgotten password often comes with a locked-out account: let them in again. (Identity refuses to set a
-        // lockout end for an account whose lockout is disabled, and such an account is never locked out anyway.)
-        if (await _userManager.IsLockedOutAsync(user))
+        var newRole = WorkspaceRoles.Normalize(role) ?? throw new AbpValidationException(new List<ValidationResult>
         {
-            (await _userManager.SetLockoutEndDateAsync(user, null)).CheckErrors();
+            new("The role must be owner, manager or member.", new[] { nameof(role) })
+        });
+
+        if (!await IsOwnerAsync(CurrentUser.GetId()))
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.RoleNotAllowed).WithData("role", newRole);
         }
 
-        (await _userManager.ResetAccessFailedCountAsync(user)).CheckErrors();
+        if (userId == CurrentUser.GetId())
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.CannotModifySelf);
+        }
 
-        Logger.LogInformation("User {UserId} got a new one-time password from {CallerId}.", user.Id, CurrentUser.GetId());
-        return new ResetPasswordResultDto { InitialPassword = password };
+        var member = await _workspaceMemberships.FindActiveAsync(WorkspaceId, userId)
+                     ?? throw new BusinessException(TrackerDomainErrorCodes.InvalidUser).WithData("userId", userId);
+        await _workspaceMemberships.ChangeRoleAsync(member, newRole);
+
+        var user = await _userRepository.GetAsync(userId);
+        var memberships = await _memberRepository.GetListAsync(m => m.UserId == userId);
+        return ToTeamMemberDto(member, user, memberships);
     }
 
     /// <inheritdoc />
@@ -378,84 +424,26 @@ public class TeamAppService : TrackerAppService, ITeamAppService
     [Authorize(TrackerPermissions.Team.Manage)]
     public async Task RemoveFromWorkspaceAsync([Optional] Guid userId)
     {
-        var user = await GetManageableUserAsync(userId, ownersAllowed: false);
-
-        // A seat is a member with a project membership: removing them all frees it. The manager role goes in any case,
-        // however it was given, so a later re-invite does not bring it back.
-        var removed = await _memberships.RemoveAllOfUserAsync(user.Id);
-
-        user.SetIsActive(false);
-        (await _userManager.UpdateAsync(user)).CheckErrors();
-        // Invalidates what the security stamp protects (e.g. password-reset tokens issued before the removal).
-        (await _userManager.UpdateSecurityStampAsync(user)).CheckErrors();
-
-        Logger.LogInformation("User {UserId} was removed from the workspace ({Count} membership(s)) by {CallerId}.",
-            user.Id, removed, CurrentUser.GetId());
-    }
-
-    /// <summary>
-    /// The target of a reset or removal: an existing user of this workspace other than the caller. An owner can only be
-    /// targeted by an owner (reset), or not at all (<paramref name="ownersAllowed"/> false). Anyone else may only target
-    /// an account whose rights do not go beyond their own (see <see cref="EnsureRightsWithinCallersAsync"/>).
-    /// </summary>
-    private async Task<IdentityUser> GetManageableUserAsync(Guid userId, bool ownersAllowed = true)
-    {
         if (userId == CurrentUser.GetId())
         {
             throw new BusinessException(TrackerDomainErrorCodes.CannotModifySelf);
         }
 
-        var user = await _userRepository.FindAsync(userId);
-        if (user == null)
-        {
-            throw new BusinessException(TrackerDomainErrorCodes.InvalidUser)
-                .WithData("userId", userId);
-        }
+        var member = await _workspaceMemberships.FindActiveAsync(WorkspaceId, userId)
+                     ?? throw new BusinessException(TrackerDomainErrorCodes.InvalidUser).WithData("userId", userId);
 
         var callerIsOwner = await IsOwnerAsync(CurrentUser.GetId());
-        if (await IsOwnerAsync(user.Id) && (!ownersAllowed || !callerIsOwner))
+        if (member.IsOwner || (member.Role == WorkspaceRoles.Manager && !callerIsOwner))
         {
-            throw new BusinessException(TrackerDomainErrorCodes.RoleNotAllowed)
-                .WithData("userId", userId);
+            throw new BusinessException(TrackerDomainErrorCodes.RoleNotAllowed).WithData("userId", userId);
         }
 
-        if (!callerIsOwner)
-        {
-            await EnsureRightsWithinCallersAsync(user);
-        }
+        // Project memberships occupy seats: removing them all frees the person's seat. The account is untouched.
+        var removed = await _memberships.RemoveAllOfUserAsync(userId);
+        await _workspaceMemberships.RemoveAsync(member);
 
-        return user;
-    }
-
-    /// <summary>
-    /// Refuses (<c>Tracker:RoleNotAllowed</c>) a target that holds a permission the caller does not — through any role
-    /// or granted to them directly. Resetting someone's password hands the caller a way into their account, and removing
-    /// them takes it from them: a manager must not do either to an account the owner gave more rights (billing, project
-    /// deletion, identity administration, …). Both sides are read from the permission store, not from tokens.
-    /// </summary>
-    private async Task EnsureRightsWithinCallersAsync(IdentityUser target)
-    {
-        var targetPermissions = await GrantedPermissionsAsync(target.Id);
-        if (targetPermissions.Count == 0)
-        {
-            return;
-        }
-
-        var callerPermissions = await GrantedPermissionsAsync(CurrentUser.GetId());
-        var beyondCaller = targetPermissions.Where(name => !callerPermissions.Contains(name)).ToList();
-        if (beyondCaller.Count > 0)
-        {
-            throw new BusinessException(TrackerDomainErrorCodes.RoleNotAllowed)
-                .WithData("userId", target.Id)
-                .WithData("permissions", string.Join(", ", beyondCaller));
-        }
-    }
-
-    /// <summary>Every permission granted to the user in the current workspace, through their roles or directly.</summary>
-    private async Task<HashSet<string>> GrantedPermissionsAsync(Guid userId)
-    {
-        var permissions = await _permissionManager.GetAllForUserAsync(userId);
-        return permissions.Where(p => p.IsGranted).Select(p => p.Name).ToHashSet(StringComparer.Ordinal);
+        Logger.LogInformation("User {UserId} was removed from workspace {WorkspaceId} ({Count} membership(s)) by {CallerId}.",
+            userId, member.WorkspaceId, removed, CurrentUser.GetId());
     }
 
     /// <summary>
@@ -492,11 +480,13 @@ public class TeamAppService : TrackerAppService, ITeamAppService
         return hourlyRate;
     }
 
-    /// <summary>Workspace owners hold the Identity "admin" role (read from the store, not from a possibly stale token).</summary>
+    private Guid WorkspaceId => CurrentWorkspace.GetId();
+
+    /// <summary>An active owner of the current workspace (read from the store, never from a token).</summary>
     private async Task<bool> IsOwnerAsync(Guid userId)
     {
-        var roles = await _userRepository.GetRoleNamesAsync(userId);
-        return roles.Any(r => string.Equals(r, TrackerRoles.Admin, StringComparison.OrdinalIgnoreCase));
+        var member = await _workspaceMemberships.FindActiveAsync(WorkspaceId, userId);
+        return member is { IsOwner: true };
     }
 
     private async Task EnsureNotMemberAsync(Guid projectId, Guid userId)
@@ -537,55 +527,10 @@ public class TeamAppService : TrackerAppService, ITeamAppService
         // Let the member know they can start tracking.
         await _notificationRepository.InsertAsync(new Notification(
             GuidGenerator.Create(),
-            CurrentTenant.Id,
+            WorkspaceId,
             userId,
             $"You were added to project '{project.Title}'."
         ));
-    }
-
-    /// <summary>Replaces the user's password with a new one-time password they must change at the next sign-in (the
-    /// token endpoint then answers the password grant with <c>invalid_grant</c> / <c>ShouldChangePasswordOnNextLogin</c>
-    /// and a change-password token). Saves the user, including any other pending change such as re-activation.</summary>
-    private async Task<string> SetOneTimePasswordAsync(IdentityUser user)
-    {
-        var password = GenerateInitialPassword();
-        user.SetShouldChangePasswordOnNextLogin(true);
-
-        await _identityOptions.SetAsync();
-        if (await _userManager.HasPasswordAsync(user))
-        {
-            (await _userManager.RemovePasswordAsync(user)).CheckErrors();
-        }
-
-        // Validates against the password policy and saves the user.
-        (await _userManager.AddPasswordAsync(user, password)).CheckErrors();
-
-        return password;
-    }
-
-    /// <summary>
-    /// A user name for an invited person: their email when Identity accepts it as a user name (as before). Otherwise
-    /// (e.g. o'brien@acme.com — an apostrophe is not a user-name character, so the invite used to fail) the allowed
-    /// characters of the address's local part, without '@' so it can never equal somebody else's email, made unique
-    /// with a number. People sign in with their email address either way: the token endpoint resolves it.
-    /// </summary>
-    private async Task<string> CreateUserNameAsync(string email)
-    {
-        var allowed = _userManager.Options.User.AllowedUserNameCharacters;
-        if (InviteUserNames.IsAllowed(email, allowed))
-        {
-            return email;
-        }
-
-        var stem = InviteUserNames.Stem(email, allowed);
-        for (var attempt = 1; ; attempt++)
-        {
-            var candidate = InviteUserNames.Candidate(stem, attempt);
-            if (await _userManager.FindByNameAsync(candidate) == null)
-            {
-                return candidate;
-            }
-        }
     }
 
     private async Task<Dictionary<Guid, IdentityUser>> GetUsersByIdAsync(IEnumerable<Guid> userIds)
@@ -616,12 +561,5 @@ public class TeamAppService : TrackerAppService, ITeamAppService
             Surname = user?.Surname,
             Email = includePrivateData ? user?.Email : null
         };
-    }
-
-    /// <summary>Random 20-character one-time password covering every complexity class (upper, lower, digit, symbol)
-    /// with 64 bits of cryptographically secure randomness.</summary>
-    private static string GenerateInitialPassword()
-    {
-        return "Dt1!" + RandomNumberGenerator.GetHexString(16, lowercase: true);
     }
 }

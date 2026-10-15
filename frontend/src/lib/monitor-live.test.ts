@@ -406,19 +406,24 @@ describe("liveRoster", () => {
 });
 
 describe("timelineWindow", () => {
-  it("is the working day when every segment fits in it (and when there are none)", () => {
+  it("falls back to the working day when there are no segments", () => {
     expect(DEFAULT_DAY_WINDOW).toEqual({ start: 480, end: 1200 });
     expect(timelineWindow([])).toEqual({ start: 480, end: 1200 });
-    expect(timelineWindow([seg(480, 1200), seg(600, 700)])).toEqual({ start: 480, end: 1200 });
   });
 
-  it("widens to whole two-hour marks so work outside it stays on the axis", () => {
-    expect(timelineWindow([seg(185, 250)])).toEqual({ start: 120, end: 1200 });
-    expect(timelineWindow([seg(1250, 1300)])).toEqual({ start: 480, end: 1320 });
-    expect(timelineWindow([seg(360, 400), seg(1201, 1210)])).toEqual({ start: 360, end: 1320 });
+  it("focuses on actual activity range with one-hour padding, snapped to whole hours", () => {
+    // 08:00–20:00 work: padded to 07:00–21:00
+    expect(timelineWindow([seg(480, 1200), seg(600, 700)])).toEqual({ start: 420, end: 1260 });
+    // Early-morning work at 03:05–04:10: padded to 02:00–06:00
+    expect(timelineWindow([seg(185, 250)])).toEqual({ start: 120, end: 360 });
+    // Late-night work at 20:50–21:40: padded to 19:00–22:00
+    expect(timelineWindow([seg(1250, 1300)])).toEqual({ start: 1140, end: 1380 });
+    // Spanning early and late: 06:00–20:10, padded to 05:00–21:00
+    expect(timelineWindow([seg(360, 400), seg(1201, 1210)])).toEqual({ start: 300, end: 1320 });
   });
 
   it("never runs past midnight on either side", () => {
+    // Near-midnight activity: start clamped to 0, end clamped to 1440
     expect(timelineWindow([seg(0, 30), seg(1430, 1440)])).toEqual({ start: 0, end: 1440 });
     expect(timelineWindow([seg(-30, 10), seg(1400, 1500)])).toEqual({ start: 0, end: 1440 });
   });

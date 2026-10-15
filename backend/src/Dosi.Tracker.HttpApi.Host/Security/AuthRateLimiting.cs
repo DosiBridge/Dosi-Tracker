@@ -17,19 +17,16 @@ namespace Dosi.Tracker.Security;
 
 /// <summary>
 /// Brute-force protection for the anonymous entry points: the OpenIddict token endpoint, ABP's account endpoints
-/// (cookie login, password checks and resets) and workspace self-registration. Every limit is per real client IP —
+/// (cookie login, password checks and resets), invitation acceptance, sign-up and workspace creation. Every limit is per real client IP —
 /// which requires <see cref="TrustedProxies"/> behind a proxy — so one abusive address cannot block everyone else:
 /// <list type="bullet">
 /// <item>password (and other non-refresh) token grants: <see cref="AuthRateLimitOptions.TokenPermitLimit"/> per
 /// client — an office behind one NAT signs in together at 9:00 — and
-/// <see cref="AuthRateLimitOptions.TokenPerAccountPermitLimit"/> per client and user name, which stops guessing one
-/// account's password. The user name alone keys it, whatever workspace (<c>__tenant</c>) the request names: ABP takes the
-/// workspace from the first of several places that has one (query string, route, header, cookie), so keying on any one
-/// reading of it would let a guesser spread one account's attempts over invented values elsewhere; and the same name in
-/// every workspace (such as an owner's "admin") shares one budget, which slows spraying it across workspaces;</item>
+/// <see cref="AuthRateLimitOptions.TokenPerAccountPermitLimit"/> per client and user name (or email), which stops
+/// guessing one account's password;</item>
 /// <item>refresh-token grants: <see cref="AuthRateLimitOptions.RefreshPermitLimit"/> per client (agents renew their
 /// sessions this way, and a refresh token cannot be guessed);</item>
-/// <item>account endpoints and workspace sign-up: <see cref="AuthRateLimitOptions.AccountPermitLimit"/> /
+/// <item>account endpoints (and invitation acceptance), and sign-up / workspace creation: <see cref="AuthRateLimitOptions.AccountPermitLimit"/> /
 /// <see cref="AuthRateLimitOptions.SignUpPermitLimit"/> per client.</item>
 /// </list>
 /// A request refused by the per-account limit still uses up permits of its client's budget, so hammering one account
@@ -41,8 +38,10 @@ public static class AuthRateLimiting
 {
     public static readonly PathString TokenPath = new("/connect/token");
     public static readonly PathString WorkspaceRegisterPath = new("/api/app/workspace/register");
+    public static readonly PathString WorkspacesPath = new("/api/app/workspaces");
+    public static readonly PathString InvitationsPath = new("/api/app/invitations");
 
-    /// <summary>ABP account endpoints that take a password, issue a session or start a password reset (API and pages).</summary>
+    /// <summary>Endpoints that take a password, issue a session or start a password reset (ABP account API and pages).</summary>
     public static readonly PathString[] AccountPaths =
     {
         new("/api/account/login"),
@@ -77,7 +76,7 @@ public static class AuthRateLimiting
         /// <summary>An account endpoint (login, password check/reset, registration).</summary>
         Account,
 
-        /// <summary>Workspace self-registration.</summary>
+        /// <summary>Sign-up and workspace creation.</summary>
         SignUp
     }
 
@@ -125,14 +124,35 @@ public static class AuthRateLimiting
                 : RequestKind.TokenGrant;
         }
 
-        if (request.Path.StartsWithSegments(WorkspaceRegisterPath))
+        if (request.Path.StartsWithSegments(WorkspaceRegisterPath, StringComparison.OrdinalIgnoreCase) ||
+            IsWorkspaceCreation(request.Path))
         {
             return RequestKind.SignUp;
+        }
+
+        if (IsInvitationAcceptance(request.Path))
+        {
+            return RequestKind.Account;
         }
 
         return AccountPaths.Any(path => request.Path.StartsWithSegments(path, StringComparison.OrdinalIgnoreCase))
             ? RequestKind.Account
             : RequestKind.None;
+    }
+
+    /// <summary><c>POST /api/app/workspaces</c> itself (not its sub-routes such as <c>/{id}/leave</c>).</summary>
+    private static bool IsWorkspaceCreation(PathString path)
+    {
+        return path.StartsWithSegments(WorkspacesPath, StringComparison.OrdinalIgnoreCase, out var rest) &&
+               (!rest.HasValue || rest.Value == "/");
+    }
+
+    /// <summary><c>POST /api/app/invitations/{token}/accept</c>.</summary>
+    private static bool IsInvitationAcceptance(PathString path)
+    {
+        return path.StartsWithSegments(InvitationsPath, StringComparison.OrdinalIgnoreCase, out var rest) &&
+               rest.HasValue &&
+               rest.Value!.TrimEnd('/').EndsWith("/accept", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>The caller's address as the API sees it (the forwarded one when a trusted proxy supplied it).</summary>
@@ -249,7 +269,7 @@ public class AuthRateLimitOptions
     /// <summary>Non-refresh token requests per client IP and window.</summary>
     public int TokenPermitLimit { get; set; } = 60;
 
-    /// <summary>Non-refresh token requests per client IP and user name (in any workspace) and window.</summary>
+    /// <summary>Non-refresh token requests per client IP and user name and window.</summary>
     public int TokenPerAccountPermitLimit { get; set; } = 10;
 
     /// <summary>Refresh-token requests per client IP and window.</summary>
@@ -258,7 +278,7 @@ public class AuthRateLimitOptions
     /// <summary>Account endpoint requests (login, password check/reset/change, registration) per client IP and window.</summary>
     public int AccountPermitLimit { get; set; } = 10;
 
-    /// <summary>Workspace sign-ups per client IP and window.</summary>
+    /// <summary>Sign-ups and workspace creations per client IP and window.</summary>
     public int SignUpPermitLimit { get; set; } = 10;
 
     /// <summary>Length of the fixed window, in seconds.</summary>

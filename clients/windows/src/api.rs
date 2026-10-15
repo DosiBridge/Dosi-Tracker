@@ -10,21 +10,6 @@ use serde::Deserialize;
 
 use crate::model::{AbpError, Activity, Heartbeat, HeartbeatResult, Project};
 
-/// Percent-encode a query-parameter value (workspace names may contain spaces
-/// or other characters that would otherwise break the URL).
-fn urlencode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.as_bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(*byte as char)
-            }
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
-}
-
 /// Subset of `GET /api/app/reporting/summary` the desktop UI displays.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -53,7 +38,10 @@ fn summary_query(from: DateTime<Utc>, to: DateTime<Utc>, time_zone: Option<&str>
 
 /// OpenIddict client id seeded by the backend (`Tracker_App`, password grant enabled).
 const CLIENT_ID: &str = "Tracker_App";
-const SCOPE: &str = "Tracker";
+const SCOPE: &str = "openid profile email roles offline_access Tracker";
+
+/// Names the workspace a workspace-scoped request acts in.
+pub const WORKSPACE_HEADER: &str = "X-Workspace-Id";
 
 /// Give up on a TCP/TLS connect that has not completed by then, so a dead or
 /// black-holed server can never hang the worker (and with it the UI's
@@ -74,6 +62,7 @@ pub const CLOCK_SKEW_WARNING_SECS: i64 = 120;
 
 /// The server's business error codes the agent acts on (CONTRACT §1).
 pub mod codes {
+    pub const NOT_WORKSPACE_MEMBER: &str = "Tracker:NotWorkspaceMember";
     pub const ACTIVITY_TIME_RANGE_INVALID: &str = "Tracker:ActivityTimeRangeInvalid";
     pub const ACTIVITY_CLIENT_ID_CONFLICT: &str = "Tracker:ActivityClientIdConflict";
     pub const ACTIVITY_IN_FUTURE: &str = "Tracker:ActivityInFuture";
@@ -251,71 +240,6 @@ struct OAuthError {
     error_description: Option<String>,
 }
 
-/// The header ABP's multi-tenancy sets when it cannot open the workspace a
-/// request names (unknown or inactive), with its reason, HTML-encoded.
-const TENANT_RESOLVE_ERROR: &str = "Abp-Tenant-Resolve-Error";
-
-/// The longest server reason quoted in a sign-in message.
-const MAX_REASON_CHARS: usize = 200;
-
-/// The sign-in failed because the server could not open the workspace
-/// (`Abp-Tenant-Resolve-Error`). Not a refusal of the credentials: ABP
-/// answers the same way when looking the workspace up fails on its side, so
-/// a saved sign-in is kept and retried; the sign-in form shows the reason.
-pub fn workspace_unavailable(header: &str) -> AuthError {
-    let reason: String = decode_html_text(header).trim().chars().take(MAX_REASON_CHARS).collect();
-    if reason.is_empty() {
-        AuthError::Server("The server could not open this workspace. Check the workspace name.".to_string())
-    } else {
-        AuthError::Server(format!("The server could not open this workspace ({reason}). Check the workspace name."))
-    }
-}
-
-/// Undo HTML encoding (`&amp;`, `&#x27;`, `&#39;`, …); anything that is not a
-/// well-formed entity is kept as written.
-fn decode_html_text(text: &str) -> String {
-    fn entity(name: &str) -> Option<char> {
-        match name {
-            "amp" => Some('&'),
-            "lt" => Some('<'),
-            "gt" => Some('>'),
-            "quot" => Some('"'),
-            "apos" => Some('\''),
-            _ => {
-                let number = name.strip_prefix('#')?;
-                let code = match number.strip_prefix(['x', 'X']) {
-                    Some(hex) => u32::from_str_radix(hex, 16).ok()?,
-                    None => number.parse().ok()?,
-                };
-                char::from_u32(code)
-            }
-        }
-    }
-
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = rest.find('&') {
-        out.push_str(&rest[..start]);
-        let tail = &rest[start..];
-        let decoded = tail
-            .find(';')
-            .filter(|&end| end > 1 && end <= 10)
-            .and_then(|end| entity(&tail[1..end]).map(|c| (c, end + 1)));
-        match decoded {
-            Some((c, length)) => {
-                out.push(c);
-                rest = &tail[length..];
-            }
-            None => {
-                out.push('&');
-                rest = &tail[1..];
-            }
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
 /// Classify a token-endpoint failure. Only a refusal of the credentials is
 /// [`AuthError::Rejected`]; a bare 400 from a proxy, a 404 or a 5xx is not.
 pub fn classify_token_failure(status: u16, body: &str) -> AuthError {
@@ -334,6 +258,21 @@ pub fn classify_token_failure(status: u16, body: &str) -> AuthError {
     }
 }
 
+/// A workspace the signed-in user belongs to (`GET /api/app/workspaces/mine`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Workspace {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub plan_name: Option<String>,
+    #[serde(default)]
+    pub is_owner: bool,
+}
+
 /// Why a request other than an upload failed.
 #[derive(Debug)]
 pub enum ApiError {
@@ -344,6 +283,9 @@ pub enum ApiError {
     /// The server answered with an error status (after one sign-in retry on
     /// a 401), and its ABP error body when it sent one.
     Http { status: u16, error: Option<AbpError> },
+    /// 403 `Tracker:NotWorkspaceMember`: the account lost access to the
+    /// workspace the request named.
+    NotWorkspaceMember(String),
     /// The answer could not be read.
     Invalid(String),
 }
@@ -374,6 +316,7 @@ impl std::fmt::Display for ApiError {
                 Some(summary) => write!(f, "HTTP {status}: {summary}"),
                 None => write!(f, "HTTP {status}"),
             },
+            ApiError::NotWorkspaceMember(message) => write!(f, "not a workspace member: {message}"),
             ApiError::Invalid(reason) => write!(f, "unexpected response: {reason}"),
         }
     }
@@ -405,6 +348,9 @@ pub enum SubmitError {
     /// 413, `Tracker:CaptureTooLarge` or `Tracker:InvalidCaptureData`: the
     /// images are the problem. Strip them from the row and resend at once.
     StripCaptures(String),
+    /// 403 `Tracker:NotWorkspaceMember`: the account lost access to the
+    /// row's workspace. Keep the row; it waits for access to come back.
+    NotWorkspaceMember(String),
     /// A definitive rejection of this block (overlap, too long/old, invalid
     /// time range, id conflict, validation errors): park it with the server's
     /// message.
@@ -423,6 +369,7 @@ impl std::fmt::Display for SubmitError {
             SubmitError::ProjectUnavailable { code, message } => write!(f, "{code}: {message}"),
             SubmitError::ClockAhead(message) => write!(f, "clock ahead: {message}"),
             SubmitError::StripCaptures(message) => write!(f, "captures refused: {message}"),
+            SubmitError::NotWorkspaceMember(message) => write!(f, "not a workspace member: {message}"),
             SubmitError::Rejected(message) => write!(f, "rejected: {message}"),
         }
     }
@@ -451,6 +398,7 @@ pub fn classify_upload_failure(status: u16, body: &str, retry_after: Option<Dura
     let invalid_payload = status == 400 && error.as_ref().is_some_and(AbpError::has_validation_errors);
     match code {
         Some(codes::SUBSCRIPTION_INACTIVE) => SubmitError::SubscriptionInactive(message),
+        Some(codes::NOT_WORKSPACE_MEMBER) => SubmitError::NotWorkspaceMember(message),
         Some(code @ (codes::NOT_PROJECT_MEMBER | codes::PROJECT_ARCHIVED)) => {
             SubmitError::ProjectUnavailable { code: code.to_string(), message }
         }
@@ -491,31 +439,113 @@ impl From<RequestError> for ApiError {
     }
 }
 
+/// The bearer token (and refresh token) of one signed-in user, shared by
+/// every client acting for that user, so a renewal by one is seen by all and
+/// a rotated refresh token is never used twice.
+#[derive(Clone, Default)]
+pub struct TokenCell(Arc<TokenSlot>);
+
+#[derive(Default)]
+struct TokenSlot {
+    token: std::sync::Mutex<Option<GrantedToken>>,
+    /// Held while renewing, so concurrent clients renew once.
+    renewing: tokio::sync::Mutex<()>,
+}
+
+impl TokenCell {
+    /// A cell that renews with `refresh_token` before its first request.
+    pub fn with_refresh_token(refresh_token: Option<String>) -> Self {
+        let cell = Self::default();
+        if let Some(refresh_token) = refresh_token.filter(|t| !t.is_empty()) {
+            cell.set(GrantedToken { access_token: String::new(), refresh_token: Some(refresh_token), expires_at: Instant::now() });
+        }
+        cell
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<GrantedToken>> {
+        self.0.token.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn set(&self, token: GrantedToken) {
+        *self.lock() = Some(token);
+    }
+
+    /// The latest refresh token, to save with the sign-in.
+    pub fn refresh_token(&self) -> Option<String> {
+        self.lock().as_ref().and_then(|t| t.refresh_token.clone())
+    }
+
+    fn valid_access_token(&self) -> Option<String> {
+        self.lock()
+            .as_ref()
+            .filter(|t| !t.access_token.is_empty() && Instant::now() < t.expires_at)
+            .map(|t| t.access_token.clone())
+    }
+
+    /// The server refused `access_token`: renew before the next request
+    /// (unless another client already did).
+    fn invalidate(&self, access_token: &str) {
+        if let Some(token) = self.lock().as_mut().filter(|t| t.access_token == access_token) {
+            token.access_token.clear();
+        }
+    }
+}
+
+impl PartialEq for TokenCell {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for TokenCell {}
+
+impl std::fmt::Debug for TokenCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TokenCell(<hidden>)")
+    }
+}
+
 /// Thin HTTP client wrapping the Dosi-Tracker backend REST API.
 ///
 /// Authentication uses the backend's OpenIddict token endpoint
-/// (`POST /connect/token`, resource-owner password flow). The token is cached
-/// and transparently refreshed via re-login shortly before it expires, and
-/// once more when a request answers 401.
+/// (`POST /connect/token`). The token is renewed with the refresh token
+/// shortly before it expires and once when a request answers 401; only when
+/// the refresh token is refused does it sign in again with the saved password.
+/// Workspace-scoped requests carry [`WORKSPACE_HEADER`].
 pub struct ApiClient {
     http: reqwest::Client,
     base_url: String,
     username: String,
     password: String,
-    /// Workspace (tenant) name. Empty means the host account.
-    tenant: String,
-    token: Option<Token>,
+    tokens: TokenCell,
+    workspace_id: Option<String>,
     clock: ServerClock,
 }
 
-struct Token {
+#[derive(Clone)]
+struct GrantedToken {
     access_token: String,
+    refresh_token: Option<String>,
     expires_at: Instant,
+}
+
+impl GrantedToken {
+    fn of(response: TokenResponse, previous_refresh: Option<String>) -> Self {
+        // Renew one minute early so requests never race the expiry.
+        let ttl = response.expires_in.saturating_sub(60).max(60);
+        Self {
+            access_token: response.access_token,
+            refresh_token: response.refresh_token.filter(|t| !t.is_empty()).or(previous_refresh),
+            expires_at: Instant::now() + Duration::from_secs(ttl),
+        }
+    }
 }
 
 #[derive(Deserialize)]
 struct TokenResponse {
     access_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
     #[serde(default = "default_expires_in")]
     expires_in: u64,
 }
@@ -524,13 +554,15 @@ fn default_expires_in() -> u64 {
     3600
 }
 
+fn scoped(request: reqwest::RequestBuilder, workspace_id: Option<&str>) -> reqwest::RequestBuilder {
+    match workspace_id {
+        Some(id) => request.header(WORKSPACE_HEADER, id),
+        None => request,
+    }
+}
+
 impl ApiClient {
-    pub fn new(
-        base_url: impl Into<String>,
-        username: String,
-        password: String,
-        tenant: String,
-    ) -> Self {
+    pub fn new(base_url: impl Into<String>, username: String, password: String) -> Self {
         // Endpoints are appended as "/path": a trailing slash would make
         // every one of them "//path".
         let base_url = base_url.into().trim().trim_end_matches('/').to_string();
@@ -539,8 +571,8 @@ impl ApiClient {
             base_url,
             username,
             password,
-            tenant,
-            token: None,
+            tokens: TokenCell::default(),
+            workspace_id: None,
             clock: ServerClock::default(),
         }
     }
@@ -551,6 +583,26 @@ impl ApiClient {
     pub fn with_server_clock(mut self, clock: ServerClock) -> Self {
         self.clock = clock;
         self
+    }
+
+    /// Use (and share) `tokens` instead of signing in first.
+    pub fn with_tokens(mut self, tokens: TokenCell) -> Self {
+        self.tokens = tokens;
+        self
+    }
+
+    pub fn with_workspace(mut self, workspace_id: Option<String>) -> Self {
+        self.workspace_id = workspace_id;
+        self
+    }
+
+    /// The workspace workspace-scoped requests act in from now on.
+    pub fn set_workspace(&mut self, workspace_id: Option<String>) {
+        self.workspace_id = workspace_id;
+    }
+
+    pub fn workspace_id(&self) -> Option<&str> {
+        self.workspace_id.as_deref()
     }
 
     /// The server clock offset seen in the latest response's `Date` header.
@@ -565,10 +617,10 @@ impl ApiClient {
         &self.base_url
     }
 
-    /// The account this client acts as, in the form the offline queue tags rows
+    /// The user this client acts as, in the form the offline queue tags rows
     /// with — so rows are only ever uploaded under their owner's token.
     pub fn owner_key(&self) -> String {
-        crate::storage::owner_key(&self.tenant, &self.username)
+        crate::storage::owner_key(&self.username)
     }
 
     /// Send a request and note the server's clock from its `Date` header.
@@ -585,109 +637,111 @@ impl ApiClient {
         Ok(response)
     }
 
-    /// Authenticate against the OpenIddict token endpoint and cache the bearer token.
-    ///
-    /// The workspace (tenant) MUST travel as a query parameter: ABP's tenant
-    /// resolvers read route/query/header/cookie, **not** the POST body. Putting
-    /// `__tenant` in the form body silently resolves to the host tenant, which
-    /// makes a tenant user's sign-in fail (or, worse, authenticate as host).
-    pub async fn login(&mut self) -> Result<(), AuthError> {
-        let url = if self.tenant.is_empty() {
-            format!("{}/connect/token", self.base_url)
-        } else {
-            format!(
-                "{}/connect/token?__tenant={}",
-                self.base_url,
-                urlencode(&self.tenant)
-            )
-        };
-        let params = [
-            ("grant_type", "password"),
-            ("username", self.username.as_str()),
-            ("password", self.password.as_str()),
-            ("client_id", CLIENT_ID),
-            ("scope", SCOPE),
-        ];
-
+    /// `POST /connect/token` with `params`; the token is stored on success.
+    async fn token_request(&self, params: &[(&str, &str)], previous_refresh: Option<String>) -> Result<(), AuthError> {
+        let url = format!("{}/connect/token", self.base_url);
         let response = self
-            .execute(self.http.post(url).header(ACCEPT, "application/json").form(&params))
+            .execute(self.http.post(url).header(ACCEPT, "application/json").form(params))
             .await
             .map_err(|e| AuthError::Offline(describe(&e)))?;
         let status = response.status();
-        let tenant_error = response
-            .headers()
-            .get(TENANT_RESOLVE_ERROR)
-            .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned());
-        let body = response
-            .text()
-            .await
-            .map_err(|e| AuthError::Offline(describe(&e)))?;
+        let body = response.text().await.map_err(|e| AuthError::Offline(describe(&e)))?;
         if !status.is_success() {
-            return Err(match tenant_error {
-                Some(header) => workspace_unavailable(&header),
-                None => classify_token_failure(status.as_u16(), &body),
-            });
+            return Err(classify_token_failure(status.as_u16(), &body));
         }
         let token: TokenResponse = serde_json::from_str(&body)
             .map_err(|e| AuthError::Server(format!("The server sent an unexpected sign-in response ({e}).")))?;
-
-        // Refresh one minute early so requests never race the expiry.
-        let ttl = token.expires_in.saturating_sub(60).max(60);
-        self.token = Some(Token {
-            access_token: token.access_token,
-            expires_at: Instant::now() + Duration::from_secs(ttl),
-        });
+        self.tokens.set(GrantedToken::of(token, previous_refresh));
         Ok(())
     }
 
+    /// Sign in with the email (or user name) and password.
+    pub async fn login(&mut self) -> Result<(), AuthError> {
+        let params = [
+            ("grant_type", "password"),
+            ("client_id", CLIENT_ID),
+            ("username", self.username.as_str()),
+            ("password", self.password.as_str()),
+            ("scope", SCOPE),
+        ];
+        self.token_request(&params, None).await
+    }
+
+    async fn refresh(&self, refresh_token: &str) -> Result<(), AuthError> {
+        let params = [("grant_type", "refresh_token"), ("client_id", CLIENT_ID), ("refresh_token", refresh_token)];
+        self.token_request(&params, Some(refresh_token.to_owned())).await
+    }
+
     async fn ensure_token(&mut self) -> Result<String, AuthError> {
-        let expired = match &self.token {
-            Some(token) => Instant::now() >= token.expires_at,
-            None => true,
-        };
-        if expired {
+        if let Some(token) = self.tokens.valid_access_token() {
+            return Ok(token);
+        }
+        let slot = self.tokens.0.clone();
+        let _renewing = slot.renewing.lock().await;
+        if let Some(token) = self.tokens.valid_access_token() {
+            return Ok(token);
+        }
+        if let Some(refresh_token) = self.tokens.refresh_token() {
+            match self.refresh(&refresh_token).await {
+                Ok(()) => {}
+                Err(AuthError::Rejected(reason)) if self.password.is_empty() => return Err(AuthError::Rejected(reason)),
+                Err(AuthError::Rejected(reason)) => {
+                    tracing::info!(%reason, "the refresh token was refused; signing in with the saved password");
+                    self.login().await?;
+                }
+                Err(e) => return Err(e),
+            }
+        } else if self.password.is_empty() {
+            return Err(AuthError::Rejected("Please sign in again.".to_owned()));
+        } else {
             self.login().await?;
         }
-        Ok(self
-            .token
-            .as_ref()
-            .map(|t| t.access_token.clone())
-            .expect("token present after login"))
+        self.tokens
+            .valid_access_token()
+            .ok_or_else(|| AuthError::Server("The server sent an unusable token.".to_owned()))
     }
 
     /// Send an authorized request built by `build` (given the HTTP client and
-    /// a bearer token). On a 401 the token was revoked or expired server-side:
-    /// sign in again once and resend, so a stale token never costs a request.
-    async fn send_authorized<F>(&mut self, build: F) -> Result<reqwest::Response, RequestError>
+    /// a bearer token), in `workspace_id` when given. On a 401 the token was
+    /// revoked or expired server-side: renew it once and resend.
+    async fn send_authorized<F>(&mut self, workspace_id: Option<&str>, build: F) -> Result<reqwest::Response, RequestError>
     where
         F: Fn(&reqwest::Client, &str) -> reqwest::RequestBuilder,
     {
         let token = self.ensure_token().await.map_err(RequestError::Auth)?;
         let response = self
-            .execute(build(&self.http, &token))
+            .execute(scoped(build(&self.http, &token), workspace_id))
             .await
             .map_err(RequestError::Transport)?;
         if response.status() != StatusCode::UNAUTHORIZED {
             return Ok(response);
         }
-        self.token = None;
+        self.tokens.invalidate(&token);
         let token = self.ensure_token().await.map_err(RequestError::Auth)?;
         let response = self
-            .execute(build(&self.http, &token))
+            .execute(scoped(build(&self.http, &token), workspace_id))
             .await
             .map_err(RequestError::Transport)?;
         if response.status() == StatusCode::UNAUTHORIZED {
-            self.token = None;
+            self.tokens.invalidate(&token);
         }
         Ok(response)
     }
 
-    /// The active (non-archived) projects the user may track, with the
-    /// per-project capture permissions and policy the backend pushes down
-    /// (`GET /api/app/project/my-projects`).
+    /// The workspaces this user belongs to (`GET /api/app/workspaces/mine`).
+    pub async fn workspaces_mine(&mut self) -> Result<Vec<Workspace>, ApiError> {
+        let url = format!("{}/api/app/workspaces/mine", self.base_url);
+        let response = self.send_authorized(None, |http, token| http.get(&url).bearer_auth(token)).await?;
+        read_json(response).await
+    }
+
+    /// The active (non-archived) projects the user may track in the current
+    /// workspace, with the per-project capture permissions and policy the
+    /// backend pushes down (`GET /api/app/project/my-projects`).
     pub async fn my_projects(&mut self) -> Result<Vec<Project>, ApiError> {
         let url = format!("{}/api/app/project/my-projects", self.base_url);
-        let response = self.send_authorized(|http, token| http.get(&url).bearer_auth(token)).await?;
+        let workspace = self.workspace_id.clone();
+        let response = self.send_authorized(workspace.as_deref(), |http, token| http.get(&url).bearer_auth(token)).await?;
         read_json(response).await
     }
 
@@ -702,8 +756,9 @@ impl ApiClient {
     ) -> Result<ReportSummary, ApiError> {
         let url = format!("{}/api/app/reporting/summary", self.base_url);
         let query = summary_query(from, to, time_zone);
+        let workspace = self.workspace_id.clone();
         let response = self
-            .send_authorized(|http, token| http.get(&url).query(&query).bearer_auth(token))
+            .send_authorized(workspace.as_deref(), |http, token| http.get(&url).query(&query).bearer_auth(token))
             .await?;
         read_json(response).await
     }
@@ -716,9 +771,10 @@ impl ApiClient {
     pub async fn heartbeat(&mut self, heartbeat: &Heartbeat, timeout: Duration) -> Result<HeartbeatResult, ApiError> {
         let url = format!("{}/api/app/presence/heartbeat", self.base_url);
         let body = heartbeat.clone().normalized();
+        let workspace = self.workspace_id.clone();
         let call = async {
             let response = self
-                .send_authorized(|http, token| {
+                .send_authorized(workspace.as_deref(), |http, token| {
                     let mut body = body.clone();
                     body.sent_at = Some(Utc::now());
                     http.post(&url).bearer_auth(token).timeout(timeout).json(&body)
@@ -727,7 +783,7 @@ impl ApiClient {
             let status = response.status();
             if !status.is_success() {
                 let text = response.text().await.unwrap_or_default();
-                return Err(ApiError::Http { status: status.as_u16(), error: AbpError::from_body(&text) });
+                return Err(http_error(status.as_u16(), &text));
             }
             // The heartbeat counted even if its answer cannot be read.
             let text = response.text().await.unwrap_or_default();
@@ -738,12 +794,14 @@ impl ApiClient {
             .unwrap_or_else(|_| Err(ApiError::Offline(format!("no answer within {} ms", timeout.as_millis()))))
     }
 
-    /// Upload a completed activity time block. `sentAt` is stamped at send
-    /// time (the server derives the device's clock skew from it).
+    /// Upload a completed activity time block to the current workspace.
+    /// `sentAt` is stamped at send time (the server derives the device's
+    /// clock skew from it).
     pub async fn submit_activity(&mut self, activity: &Activity) -> Result<(), SubmitError> {
         let url = format!("{}/api/app/activity", self.base_url);
+        let workspace = self.workspace_id.clone();
         let response = self
-            .send_authorized(|http, token| {
+            .send_authorized(workspace.as_deref(), |http, token| {
                 let mut body = activity.clone();
                 body.sent_at = Some(Utc::now());
                 http.post(&url).bearer_auth(token).timeout(UPLOAD_TIMEOUT).json(&body)
@@ -778,12 +836,22 @@ impl ApiClient {
     }
 }
 
+/// The error for a failed answer: lost workspace access has its own kind.
+fn http_error(status: u16, body: &str) -> ApiError {
+    let error = AbpError::from_body(body);
+    if status == 403 && error.as_ref().and_then(AbpError::code) == Some(codes::NOT_WORKSPACE_MEMBER) {
+        let message = error.as_ref().and_then(AbpError::summary).unwrap_or_else(|| "HTTP 403".to_owned());
+        return ApiError::NotWorkspaceMember(message);
+    }
+    ApiError::Http { status, error }
+}
+
 /// Read a JSON answer, or the error the server sent instead.
 async fn read_json<T: DeserializeOwned>(response: reqwest::Response) -> Result<T, ApiError> {
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        return Err(ApiError::Http { status: status.as_u16(), error: AbpError::from_body(&body) });
+        return Err(http_error(status.as_u16(), &body));
     }
     let body = response.text().await.map_err(|e| ApiError::Offline(describe(&e)))?;
     serde_json::from_str(&body).map_err(|e| ApiError::Invalid(e.to_string()))
@@ -802,18 +870,13 @@ mod tests {
 
     #[test]
     fn owner_key_matches_the_queue_tagging() {
-        let client = ApiClient::new(
-            "https://example.invalid",
-            "Alice@Acme.com".into(),
-            "secret".into(),
-            "Acme".into(),
-        );
-        assert_eq!(client.owner_key(), crate::storage::owner_key("acme", "alice@acme.com"));
+        let client = ApiClient::new("https://example.invalid", "Alice@Acme.com".into(), "secret".into());
+        assert_eq!(client.owner_key(), crate::storage::owner_key("alice@acme.com"));
     }
 
     #[test]
     fn the_base_url_never_ends_with_a_slash() {
-        let client = ApiClient::new(" https://tracker.example.com// ", "a".into(), "b".into(), String::new());
+        let client = ApiClient::new(" https://tracker.example.com// ", "a".into(), "b".into());
         assert_eq!(client.base_url(), "https://tracker.example.com");
     }
 
@@ -837,12 +900,6 @@ mod tests {
         // No zone: the parameter is left out (the server's default applies).
         assert_eq!(summary_query(from, to, None).len(), 2);
         assert_eq!(summary_query(from, to, Some("  ")).len(), 2);
-    }
-
-    #[test]
-    fn workspace_names_are_percent_encoded() {
-        assert_eq!(urlencode("Acme Corp/EU"), "Acme%20Corp%2FEU");
-        assert_eq!(urlencode("plain-name_1.x~"), "plain-name_1.x~");
     }
 
     #[test]
@@ -870,6 +927,7 @@ mod tests {
             SubmitError::SubscriptionInactive(_) => "subscription",
             SubmitError::ProjectUnavailable { .. } => "project",
             SubmitError::ClockAhead(_) => "clock",
+            SubmitError::NotWorkspaceMember(_) => "workspace",
             SubmitError::StripCaptures(_) => "strip",
             SubmitError::Rejected(_) => "park",
         };
@@ -952,30 +1010,6 @@ mod tests {
         assert!(matches!(classify_token_failure(429, ""), AuthError::Server(m) if m.contains("Too many")));
         assert!(matches!(classify_token_failure(503, ""), AuthError::Server(m) if m.contains("503")));
         assert!(AuthError::Offline("tcp connect error".into()).user_message().contains("Cannot reach the server"));
-    }
-
-    #[test]
-    fn an_unknown_workspace_is_named_but_not_a_refusal() {
-        let error = workspace_unavailable("Tenant not found!");
-        assert!(!error.is_rejected(), "a saved sign-in is kept and retried");
-        assert_eq!(
-            error.user_message(),
-            "The server could not open this workspace (Tenant not found!). Check the workspace name."
-        );
-        // ABP HTML-encodes the reason.
-        let encoded = workspace_unavailable("There is no tenant with the tenant id or name: Acme &amp; Co &#x27;EU&#39;");
-        assert!(encoded.user_message().contains("name: Acme & Co 'EU')"), "{}", encoded.user_message());
-        assert_eq!(workspace_unavailable("  ").user_message(), "The server could not open this workspace. Check the workspace name.");
-        let long = workspace_unavailable(&"x".repeat(5_000)).user_message();
-        assert!(long.chars().count() < MAX_REASON_CHARS + 80);
-    }
-
-    #[test]
-    fn html_entities_are_decoded_and_anything_else_is_kept() {
-        assert_eq!(decode_html_text("a &lt;b&gt; &quot;c&quot; &#65;&#x42;&#X43;"), "a <b> \"c\" ABC");
-        assert_eq!(decode_html_text("R&D & co &bogus; &#xZZ; &; &#99999999;"), "R&D & co &bogus; &#xZZ; &; &#99999999;");
-        assert_eq!(decode_html_text("trailing &amp"), "trailing &amp");
-        assert_eq!(decode_html_text("plain"), "plain");
     }
 
     #[test]
@@ -1078,7 +1112,7 @@ mod tests {
     }
 
     fn client(url: &str) -> ApiClient {
-        ApiClient::new(format!("{url}/"), "alice@acme.com".into(), "pw".into(), "acme".into())
+        ApiClient::new(format!("{url}/"), "alice@acme.com".into(), "pw".into()).with_workspace(Some("w1".into()))
     }
 
     fn sample_activity() -> Activity {
@@ -1099,7 +1133,7 @@ mod tests {
 
         let requests: Vec<String> = requests.try_iter().collect();
         assert_eq!(requests.len(), 4);
-        assert!(requests[0].starts_with("POST /connect/token?__tenant=acme "), "{}", requests[0]);
+        assert!(requests[0].starts_with("POST /connect/token "), "{}", requests[0]);
         assert!(requests[1].starts_with("POST /api/app/activity "), "no double slash: {}", requests[1]);
         assert!(requests[2].starts_with("POST /connect/token"));
         let upload = &requests[3];
@@ -1111,23 +1145,6 @@ mod tests {
         assert!(json.get("productivity").is_none(), "unmeasured: left out");
         // The Date header of the last answer set the clock offset.
         assert!(api.server_clock().offset_secs().is_some());
-    }
-
-    #[tokio::test]
-    async fn an_unknown_workspace_at_sign_in_says_so() {
-        let (url, requests) = canned_server(vec![http(
-            "404 Not Found",
-            &[("Abp-Tenant-Resolve-Error", "Tenant not found!")],
-            "<html><body><h3>Tenant not found!</h3></body></html>",
-        )]);
-        match client(&url).login().await {
-            Err(error @ AuthError::Server(_)) => {
-                assert!(error.user_message().contains("Tenant not found!"), "{}", error.user_message())
-            }
-            other => panic!("expected a workspace error, got {other:?}"),
-        }
-        let request = requests.try_iter().next().unwrap().to_ascii_lowercase();
-        assert!(request.contains("accept: application/json"), "{request}");
     }
 
     #[tokio::test]
@@ -1144,7 +1161,7 @@ mod tests {
         assert_eq!(error.status(), None);
 
         // Unreachable is not a refusal.
-        let mut offline = ApiClient::new("http://127.0.0.1:9", "a@b.c".into(), "x".into(), String::new());
+        let mut offline = ApiClient::new("http://127.0.0.1:9", "a@b.c".into(), "x".into());
         assert!(!offline.my_projects().await.unwrap_err().is_auth_rejected());
     }
 
@@ -1201,7 +1218,7 @@ mod tests {
     #[tokio::test]
     async fn an_unreachable_server_is_transient_and_offline() {
         // Nothing listens on port 9 (discard) locally: a real connect error.
-        let mut api = ApiClient::new("http://127.0.0.1:9", "a@b.c".into(), "x".into(), String::new());
+        let mut api = ApiClient::new("http://127.0.0.1:9", "a@b.c".into(), "x".into());
         assert!(matches!(api.login().await, Err(AuthError::Offline(_))));
         assert!(matches!(api.submit_activity(&sample_activity()).await, Err(SubmitError::Transient { .. })));
         assert!(matches!(api.my_projects().await, Err(ApiError::Offline(_))));
@@ -1230,6 +1247,23 @@ mod tests {
         assert!(error.to_string().contains("Authorization failed!"));
         let summary_request = requests.try_iter().nth(2).unwrap();
         assert!(summary_request.contains("TimeZone=Asia%2FDhaka"), "{summary_request}");
+    }
+
+    fn heartbeat() -> Heartbeat {
+        Heartbeat {
+            device_id: uuid::Uuid::new_v4().to_string(),
+            device_name: None,
+            platform: Some("windows".into()),
+            os_version: None,
+            agent_version: None,
+            status: crate::model::PresenceStatus::Stopped,
+            project_id: None,
+            status_since: None,
+            current_app: None,
+            time_zone: None,
+            utc_offset_minutes: None,
+            sent_at: None,
+        }
     }
 
     #[tokio::test]
@@ -1288,8 +1322,123 @@ mod tests {
         let request = requests.try_iter().nth(1).unwrap();
         assert!(request.starts_with("POST /api/app/presence/heartbeat "), "{request}");
         let body: serde_json::Value = serde_json::from_str(&request[request.find("\r\n\r\n").unwrap() + 4..]).unwrap();
-        assert_eq!(body["status"], "tracking");
-        assert_eq!(body["currentApp"], "code.exe");
         assert!(body["sentAt"].is_string());
+    }
+
+    // --- Workspaces, the header and token renewal -------------------------
+
+    fn body_of(request: &str) -> &str {
+        &request[request.find("\r\n\r\n").unwrap() + 4..]
+    }
+
+    fn header_of<'a>(request: &'a str, name: &str) -> Option<&'a str> {
+        let head = &request[..request.find("\r\n\r\n").unwrap_or(request.len())];
+        head.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim().eq_ignore_ascii_case(name).then(|| value.trim())
+        })
+    }
+
+    #[tokio::test]
+    async fn the_password_sign_in_sends_no_tenant_and_asks_for_a_refresh_token() {
+        let (url, requests) = canned_server(vec![token_ok()]);
+        client(&url).login().await.unwrap();
+        let request = requests.try_iter().next().unwrap();
+        assert!(request.starts_with("POST /connect/token "), "{request}");
+        assert!(!request.to_lowercase().contains("__tenant"), "{request}");
+        let form = body_of(&request);
+        for part in ["grant_type=password", "client_id=Tracker_App", "username=alice%40acme.com", "password=pw", "offline_access"] {
+            assert!(form.contains(part), "{part} in {form}");
+        }
+        assert_eq!(header_of(&request, WORKSPACE_HEADER), None);
+    }
+
+    #[tokio::test]
+    async fn workspace_calls_carry_the_header_and_token_and_mine_calls_do_not() {
+        let mine = r#"[{"id":"w1","name":"Acme","role":"Owner","planName":"Pro","isOwner":true},{"id":"w2","name":"Globex","role":"Member"}]"#;
+        let (url, requests) = canned_server(vec![
+            token_ok(),
+            http("200 OK", &[], mine),
+            http("200 OK", &[], "[]"),
+            http("200 OK", &[], r#"{"totalTrackedMinutes":1}"#),
+            http("200 OK", &[], "{}"),
+            http("200 OK", &[], "{}"),
+        ]);
+        let mut api = client(&url);
+        let workspaces = api.workspaces_mine().await.unwrap();
+        assert_eq!(workspaces.len(), 2);
+        assert_eq!((workspaces[0].id.as_str(), workspaces[0].role.as_deref(), workspaces[0].is_owner), ("w1", Some("Owner"), true));
+        assert_eq!(workspaces[1].plan_name, None);
+
+        api.set_workspace(Some("w2".into()));
+        api.my_projects().await.unwrap();
+        api.summary(Utc::now() - chrono::Duration::hours(1), Utc::now(), None).await.unwrap();
+        api.heartbeat(&heartbeat(), Duration::from_secs(5)).await.unwrap();
+        api.submit_activity(&sample_activity()).await.unwrap();
+
+        let requests: Vec<String> = requests.try_iter().collect();
+        assert_eq!(header_of(&requests[0], WORKSPACE_HEADER), None, "the token request");
+        assert!(requests[1].starts_with("GET /api/app/workspaces/mine "), "{}", requests[1]);
+        assert_eq!(header_of(&requests[1], WORKSPACE_HEADER), None, "listing the workspaces");
+        for request in &requests[2..] {
+            assert_eq!(header_of(request, WORKSPACE_HEADER), Some("w2"), "{request}");
+            assert_eq!(header_of(request, "authorization"), Some("Bearer t0k3n"));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_expired_token_is_renewed_with_the_refresh_token_not_the_password() {
+        let refreshed = http("200 OK", &[], r#"{"access_token":"n3w","refresh_token":"r2","expires_in":3600}"#);
+        let (url, requests) = canned_server(vec![http("401 Unauthorized", &[], ""), refreshed, http("200 OK", &[], "[]")]);
+        let tokens = TokenCell::with_refresh_token(Some("r1".into()));
+        tokens.set(GrantedToken { access_token: "old".into(), refresh_token: Some("r1".into()), expires_at: Instant::now() + Duration::from_secs(600) });
+        let mut api = client(&url).with_tokens(tokens.clone()).with_workspace(Some("w1".into()));
+        api.my_projects().await.unwrap();
+
+        let requests: Vec<String> = requests.try_iter().collect();
+        assert_eq!(header_of(&requests[0], "authorization"), Some("Bearer old"));
+        let form = body_of(&requests[1]);
+        assert!(form.contains("grant_type=refresh_token") && form.contains("refresh_token=r1"), "{form}");
+        assert!(!form.contains("password"), "{form}");
+        assert_eq!(header_of(&requests[2], "authorization"), Some("Bearer n3w"));
+        assert_eq!(tokens.refresh_token().as_deref(), Some("r2"), "the rotated refresh token is kept");
+
+        // A saved refresh token is used before the first request.
+        let (url, requests) = canned_server(vec![token_ok(), http("200 OK", &[], "[]")]);
+        let mut api = client(&url).with_tokens(TokenCell::with_refresh_token(Some("saved".into())));
+        api.workspaces_mine().await.unwrap();
+        assert!(body_of(&requests.try_iter().next().unwrap()).contains("refresh_token=saved"));
+    }
+
+    #[tokio::test]
+    async fn a_refused_refresh_token_falls_back_to_the_saved_password() {
+        let refused = http("400 Bad Request", &[], r#"{"error":"invalid_grant","error_description":"The token is no longer valid."}"#);
+        let (url, requests) = canned_server(vec![refused.clone(), token_ok(), http("200 OK", &[], "[]")]);
+        let mut api = client(&url).with_tokens(TokenCell::with_refresh_token(Some("r1".into())));
+        api.workspaces_mine().await.unwrap();
+        let requests: Vec<String> = requests.try_iter().collect();
+        assert!(body_of(&requests[1]).contains("grant_type=password"));
+
+        // Without a saved password the refusal means signing in again.
+        let (url, _requests) = canned_server(vec![refused]);
+        let mut api = ApiClient::new(url, "alice@acme.com".into(), String::new()).with_tokens(TokenCell::with_refresh_token(Some("r1".into())));
+        assert!(api.workspaces_mine().await.unwrap_err().is_auth_rejected());
+    }
+
+    #[tokio::test]
+    async fn losing_workspace_access_has_its_own_error() {
+        let not_member = abp(Some(codes::NOT_WORKSPACE_MEMBER), "You are not a member of this workspace.");
+        let (url, _requests) = canned_server(vec![
+            token_ok(),
+            http("403 Forbidden", &[], &not_member),
+            http("403 Forbidden", &[], &not_member),
+        ]);
+        let mut api = client(&url).with_workspace(Some("w1".into()));
+        match api.my_projects().await {
+            Err(ApiError::NotWorkspaceMember(message)) => assert_eq!(message, "You are not a member of this workspace."),
+            other => panic!("expected not a member, got {other:?}"),
+        }
+        assert!(matches!(api.submit_activity(&sample_activity()).await, Err(SubmitError::NotWorkspaceMember(_))));
+        assert!(matches!(classify_upload_failure(403, &not_member, None), SubmitError::NotWorkspaceMember(_)), "never parked");
     }
 }

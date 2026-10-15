@@ -7,18 +7,18 @@ using Dosi.Tracker.Identity;
 using Dosi.Tracker.Projects;
 using Volo.Abp;
 using Volo.Abp.Domain.Repositories;
-using Volo.Abp.Domain.Services;
+using Dosi.Tracker.Workspaces;
 using Volo.Abp.Uow;
 
 namespace Dosi.Tracker.Teams;
 
 /// <summary>
 /// Creates and removes project memberships together with what hangs off them: the hourly-rate history that payroll
-/// prices tracked time with, and the Identity "manager" role that Admin/Manager memberships confer. Shared by the
+/// prices tracked time with, and the workspace manager role that Admin/Manager memberships confer. Shared by the
 /// project and team services so every path (project creation, add, invite, update, removal, project deletion,
 /// removal from the workspace) keeps them consistent. Callers check permissions and business rules first.
 /// </summary>
-public class ProjectMembershipManager : DomainService
+public class ProjectMembershipManager : TrackerDomainService
 {
     private readonly IRepository<ProjectMember, Guid> _memberRepository;
     private readonly IRepository<ProjectMemberRate, Guid> _rateRepository;
@@ -46,7 +46,7 @@ public class ProjectMembershipManager : DomainService
         decimal hourlyRate,
         bool grantManagerRole = true)
     {
-        var member = new ProjectMember(GuidGenerator.Create(), CurrentTenant.Id, projectId, userId, role, hourlyRate);
+        var member = new ProjectMember(GuidGenerator.Create(), CurrentWorkspace.GetId(), projectId, userId, role, hourlyRate);
         await InsertMembershipAsync(member);
         await RecordRateAsync(projectId, userId, hourlyRate);
 
@@ -98,7 +98,7 @@ public class ProjectMembershipManager : DomainService
         }
 
         await _rateRepository.InsertAsync(
-            new ProjectMemberRate(GuidGenerator.Create(), CurrentTenant.Id, projectId, userId, hourlyRate, Clock.Now),
+            new ProjectMemberRate(GuidGenerator.Create(), CurrentWorkspace.GetId(), projectId, userId, hourlyRate, Clock.Now),
             autoSave: true);
     }
 
@@ -146,7 +146,7 @@ public class ProjectMembershipManager : DomainService
 
     /// <summary>
     /// Saves a new membership. When two adds of the same person race past the callers' duplicate check, the unique
-    /// (tenant, project, user) index lets the first one in and refuses the other, which is then answered like any
+    /// (workspace, project, user) index lets the first one in and refuses the other, which is then answered like any
     /// duplicate (<c>Tracker:DuplicateProjectMember</c>, 409) instead of a server error.
     /// </summary>
     private async Task InsertMembershipAsync(ProjectMember member)

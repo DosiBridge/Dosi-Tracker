@@ -13,7 +13,7 @@ public class ScreenshotTests
         var activityId = Guid.NewGuid();
         var capturedAt = new DateTime(2026, 7, 20, 10, 0, 0, DateTimeKind.Utc);
 
-        var shot = new Screenshot(id, null, activityId, "blob-key", capturedAt, 2048);
+        var shot = new Screenshot(id, TrackerTestConsts.WorkspaceId, activityId, "blob-key", capturedAt, 2048);
 
         shot.Id.ShouldBe(id);
         shot.ActivityId.ShouldBe(activityId);
@@ -30,7 +30,7 @@ public class ScreenshotTests
         var capturedAt = new DateTime(2026, 7, 20, 10, 0, 0, DateTimeKind.Utc);
 
         var shot = new Screenshot(
-            Guid.NewGuid(), null, Guid.NewGuid(), "cam-blob", capturedAt, 512, "image/png", Screenshot.WebcamKind);
+            Guid.NewGuid(), TrackerTestConsts.WorkspaceId, Guid.NewGuid(), "cam-blob", capturedAt, 512, "image/png", Screenshot.WebcamKind);
 
         shot.ContentType.ShouldBe("image/png");
         shot.Kind.ShouldBe(Screenshot.WebcamKind);

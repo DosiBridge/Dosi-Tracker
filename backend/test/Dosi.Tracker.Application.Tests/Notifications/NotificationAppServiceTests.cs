@@ -31,7 +31,7 @@ public abstract class NotificationAppServiceTests<TStartupModule> : TrackerAppli
     {
         return await WithUnitOfWorkAsync(async () =>
             await _notificationRepository.InsertAsync(
-                new Notification(_guidGenerator.Create(), null, userId, message)));
+                new Notification(_guidGenerator.Create(), TrackerTestConsts.WorkspaceId, userId, message)));
     }
 
     [Fact]

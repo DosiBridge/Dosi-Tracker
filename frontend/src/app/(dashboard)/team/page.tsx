@@ -12,8 +12,9 @@ import {
   Pencil,
   UserPlus,
   UserMinus,
-  KeyRound,
   UserX,
+  Link2,
+  Trash2,
   MonitorSmartphone,
   RotateCw,
 } from "lucide-react";
@@ -31,7 +32,7 @@ import { SearchField, SegmentedControl, Toolbar } from "@/components/ui/toolbar"
 import { ActivityRing } from "@/components/dashboard/activity-ring";
 import { DevicesPanel } from "@/components/dashboard/devices-panel";
 import { memberPresence } from "@/components/dashboard/devices";
-import { SignInDetails } from "@/components/dashboard/agent-setup";
+import { CopyButton } from "@/components/dashboard/agent-setup";
 import { linkButtonClass } from "@/components/dashboard/link-button";
 import { AddMemberDialog } from "@/components/projects/project-members";
 import {
@@ -51,13 +52,15 @@ import type { Role, UserStatus } from "@/lib/types";
 import { cn, formatDuration } from "@/lib/utils";
 import {
   addProjectMember,
+  changeWorkspaceRole,
   getApi,
+  getInvitations,
   getProjectMembers,
   getTeamPresence,
   inviteMember,
   removeMemberFromWorkspace,
   removeProjectMember,
-  resetMemberPassword,
+  revokeInvitation,
   updateProjectMember,
 } from "@/hooks/useApi";
 import { useReportingZone } from "@/hooks/use-reporting-zone";
@@ -71,7 +74,9 @@ import {
   type ProjectMemberDto,
   type ProjectRole,
   type ReportSummaryDto,
+  type WorkspaceInvitationDto,
 } from "@/lib/api-contract";
+import { workspaceRoleLabel, type WorkspaceRole } from "@/lib/sign-in";
 import { zonedDayKey, zonedDayRange } from "@/lib/time-zone";
 import { toast } from "@/components/toast";
 
@@ -106,6 +111,8 @@ interface MemberView {
   activity: number | null;
   /** The projects this member belongs to. */
   projectIds: string[];
+  /** owner | manager | member (live). */
+  workspaceRole?: string | null;
 }
 
 interface ProjectOption {
@@ -120,6 +127,25 @@ const roleFromValue = (value: string): ProjectRole => projectRoleOf(value);
 
 /** The project role an app role invites as. */
 const inviteRoleFor: Record<Role, ProjectRole> = { host: "Worker", owner: "Admin", admin: "Admin", worker: "Worker", client: "Client" };
+
+/** The workspace role an app role invites as. */
+const workspaceRoleFor: Record<Role, WorkspaceRole> = { host: "member", owner: "owner", admin: "manager", worker: "member", client: "member" };
+
+const WORKSPACE_ROLES: WorkspaceRole[] = ["owner", "manager", "member"];
+
+const REMOVE_FROM_WORKSPACE_NOTE = "They keep their account; they just lose access to this workspace.";
+
+/** An invitation link as people open it: this site + the server's "/invite/{token}". */
+function inviteUrl(invitePath: string): string {
+  const origin = typeof window !== "undefined" ? window.location.origin : "";
+  return `${origin}${invitePath}`;
+}
+
+function formatExpiry(iso: string | null | undefined): string | null {
+  if (!iso) return null;
+  const at = Date.parse(iso);
+  return Number.isFinite(at) ? new Date(at).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" }) : null;
+}
 
 /** Demo workspace changes made on this page (they last until the next reload). */
 interface DemoChanges {
@@ -148,6 +174,7 @@ export default function TeamPage() {
   const [leaving, setLeaving] = useState<MemberView | null>(null);
   const [leavingBusy, setLeavingBusy] = useState(false);
   const [demo, setDemo] = useState<DemoChanges>(NO_DEMO_CHANGES);
+  const [invitesKey, setInvitesKey] = useState(0);
 
   // LIVE MODE: the real roster from GET /api/app/team/members (roles from the
   // backend's owner/manager flags), refetched after every change. A failure
@@ -181,6 +208,7 @@ export default function TeamPage() {
               activity: mapped.trackedToday > 0 ? mapped.productivity : null,
               projectIds: Array.isArray(m.projectIds) ? m.projectIds : [],
               isOwner: m.isOwner === true,
+              workspaceRole: typeof (m as { role?: unknown }).role === "string" ? ((m as { role?: string }).role ?? null) : null,
             };
           }),
       );
@@ -375,7 +403,7 @@ export default function TeamPage() {
       onTeamChanged();
       toast({
         title: `${member.name} removed from the workspace`,
-        description: "They can't sign in or track time any more, and their seat is free. Their tracked time stays in reports.",
+        description: `${REMOVE_FROM_WORKSPACE_NOTE} Their tracked time stays in reports.`,
       });
     } catch (err) {
       toast({ tone: "danger", title: "Couldn't remove them", description: membershipErrorText(err, "The change wasn't saved.") });
@@ -546,7 +574,14 @@ export default function TeamPage() {
 
       <ViewTabs value={view} onChange={setView} />
       <div role="tabpanel" id={`team-${view}-panel`} aria-labelledby={`team-${view}-tab`} className="space-y-6">
-        {view === "members" ? roster : <DevicesPanel live={isLive} zone={zone} nameOf={nameOf} />}
+        {view === "members" ? (
+          <>
+            {roster}
+            {isLive && canManage && <PendingInvitations key={invitesKey} />}
+          </>
+        ) : (
+          <DevicesPanel live={isLive} zone={zone} nameOf={nameOf} />
+        )}
       </div>
 
       {invite && (
@@ -555,8 +590,10 @@ export default function TeamPage() {
           inviterRole={user.role}
           live={isLive}
           projects={activeProjects}
-          workspaceName={workspace.name}
-          onInvited={onTeamChanged}
+          onInvited={() => {
+            onTeamChanged();
+            setInvitesKey((k) => k + 1);
+          }}
         />
       )}
       {adding && (
@@ -576,7 +613,6 @@ export default function TeamPage() {
           viewer={user}
           live={isLive}
           projects={projectOptions}
-          workspaceName={workspace.name}
           targetIsOwner={members.find((m) => m.id === editing.id)?.isOwner ?? false}
           onClose={() => setEditing(null)}
           onChanged={onTeamChanged}
@@ -602,7 +638,7 @@ export default function TeamPage() {
         onCancel={() => setLeaving(null)}
         onConfirm={() => leaving && void removeFromWorkspace(leaving)}
         title={leaving ? `Remove ${leaving.name} from the workspace?` : "Remove from the workspace?"}
-        description="They're taken off every project and their account is deactivated: they can't sign in or track time, and their seat is freed from the next invoice. Time they already tracked stays in reports."
+        description={`${REMOVE_FROM_WORKSPACE_NOTE} Their seat is freed, and time they already tracked stays in reports.`}
         confirmLabel="Remove from workspace"
         busy={leavingBusy}
       />
@@ -669,8 +705,9 @@ function isEmailAddress(value: string): boolean {
 interface InviteOutcome {
   email: string;
   ok: boolean;
-  userCreated?: boolean;
-  initialSecret?: string | null;
+  added?: boolean;
+  invitePath?: string | null;
+  expiresAt?: string | null;
   error?: string;
 }
 
@@ -679,7 +716,6 @@ function InviteModal({
   inviterRole,
   live,
   projects: projectChoices,
-  workspaceName,
   onInvited,
 }: {
   onClose: () => void;
@@ -687,7 +723,6 @@ function InviteModal({
   live: boolean;
   /** Every active project, sorted by title. */
   projects: ProjectOption[];
-  workspaceName: string;
   onInvited?: () => void;
 }) {
   const roles = inviteableRoles({ role: inviterRole });
@@ -726,10 +761,6 @@ function InviteModal({
       return;
     }
 
-    if (!project) {
-      setFormError("Select a project first.");
-      return;
-    }
     const rate = canSetRate ? parseHourlyRate(hourlyRate) : 0;
     if (rate === null) {
       setFormError("Hourly rate must be a number from 0 to 10,000 with at most two decimals.");
@@ -741,8 +772,14 @@ function InviteModal({
     const outcomes: InviteOutcome[] = [];
     for (const email of emailList) {
       try {
-        const res = await inviteMember({ projectId: project, email, role: inviteRoleFor[role], hourlyRate: rate });
-        outcomes.push({ email, ok: true, userCreated: !!res?.userCreated, initialSecret: res?.initialPassword ?? null });
+        const res = await inviteMember({
+          projectId: project || null,
+          email,
+          role: inviteRoleFor[role],
+          workspaceRole: workspaceRoleFor[role],
+          hourlyRate: rate,
+        });
+        outcomes.push({ email, ok: true, added: res?.added === true, invitePath: res?.invitePath ?? null, expiresAt: res?.expiresAt ?? null });
       } catch (err) {
         outcomes.push({ email, ok: false, error: membershipErrorText(err, "The invite failed.") });
       }
@@ -761,7 +798,7 @@ function InviteModal({
   }
 
   return (
-    <Modal open onClose={onClose} title="Invite members" description="Add people to a project by email.">
+    <Modal open onClose={onClose} title="Invite members" description="Add people to this workspace by email.">
       {sent ? (
         <div role="status" className="flex flex-col items-center gap-3 py-8 text-center">
           <div className="flex h-12 w-12 items-center justify-center rounded-full bg-success/15 text-success-on-tint">
@@ -776,24 +813,14 @@ function InviteModal({
             <div key={`${r.email}-${i}`} className="rounded-xl border border-border/60 bg-muted/40 p-3">
               <div className="flex items-center justify-between gap-2">
                 <span className="truncate text-sm font-medium">{r.email}</span>
-                {r.ok ? <Badge tone="success">{r.userCreated ? "Account created" : "Added"}</Badge> : <Badge tone="danger">Failed</Badge>}
+                {r.ok ? <Badge tone="success">{r.added ? "Added" : "Invited"}</Badge> : <Badge tone="danger">Failed</Badge>}
               </div>
-              {r.ok && !r.userCreated && (
+              {r.ok && r.added && (
                 <p className="mt-1 text-xs text-muted-foreground">
-                  They already had an account here and were added to the project. They sign in with their usual details.
+                  They already have an account and were added to this workspace. It appears in their workspace switcher.
                 </p>
               )}
-              {r.ok && r.userCreated && r.initialSecret && (
-                <SignInDetails
-                  className="mt-3"
-                  workspaceName={workspaceName}
-                  email={r.email}
-                  secret={{ label: <>One-time password</>, value: r.initialSecret }}
-                >
-                  Share these securely — the one-time password is shown only once. They sign in to the web app or the desktop agent
-                  with them, then choose their own password in Settings → Security.
-                </SignInDetails>
-              )}
+              {r.ok && !r.added && r.invitePath && <InviteLink path={r.invitePath} expiresAt={r.expiresAt} />}
               {!r.ok && <p className="mt-1 text-xs text-danger-on-tint">{r.error}</p>}
             </div>
           ))}
@@ -838,22 +865,19 @@ function InviteModal({
               <label htmlFor="invite-project" className="text-sm font-medium">
                 Project
               </label>
-              <Select id="invite-project" value={project} onChange={(e) => setProject(e.target.value)} disabled={projectChoices.length === 0}>
-                {projectChoices.length === 0 ? (
-                  <option value="">No projects yet</option>
-                ) : (
-                  projectChoices.map((p) => (
-                    <option key={p.id} value={p.id}>
-                      {p.title}
-                    </option>
-                  ))
-                )}
+              <Select id="invite-project" value={project} onChange={(e) => setProject(e.target.value)}>
+                <option value="">{projectChoices.length === 0 ? "No projects yet" : "No project (workspace only)"}</option>
+                {projectChoices.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.title}
+                  </option>
+                ))}
               </Select>
             </div>
           </div>
           {projectChoices.length === 0 && (
             <p className="rounded-lg bg-muted/60 px-3 py-2 text-xs text-muted-foreground">
-              People join a project when invited.{" "}
+              They join the workspace now; add them to a project later.{" "}
               <Link href="/projects" className="font-medium text-primary-strong underline underline-offset-2">
                 Create a project first
               </Link>
@@ -877,13 +901,105 @@ function InviteModal({
             <Button variant="ghost" onClick={onClose}>
               Cancel
             </Button>
-            <Button onClick={() => void send()} disabled={!emails.trim() || roles.length === 0 || submitting || (live && !project)}>
+            <Button onClick={() => void send()} disabled={!emails.trim() || roles.length === 0 || submitting}>
               <Send className="h-4 w-4" /> {submitting ? "Sending…" : "Send invites"}
             </Button>
           </div>
         </div>
       )}
     </Modal>
+  );
+}
+
+/** A copyable invitation link and when it expires. */
+function InviteLink({ path, expiresAt }: { path: string; expiresAt?: string | null }) {
+  const url = inviteUrl(path);
+  const expiry = formatExpiry(expiresAt);
+  return (
+    <div className="mt-2 space-y-1.5">
+      <p className="text-xs text-muted-foreground">They don&apos;t have an account yet. Send them this link to join:</p>
+      <div className="flex items-center gap-2">
+        <span data-testid="invite-link" className="min-w-0 flex-1 break-all rounded-lg bg-card px-2 py-1.5 font-mono text-xs">
+          {url}
+        </span>
+        <CopyButton value={url} />
+      </div>
+      {expiry && <p className="text-xs text-muted-foreground">Expires {expiry}.</p>}
+    </div>
+  );
+}
+
+/* ----------------------------- Pending invitations ----------------------------- */
+
+function PendingInvitations() {
+  const [items, setItems] = useState<WorkspaceInvitationDto[] | null>(null);
+  const [failed, setFailed] = useState(false);
+  const [revoking, setRevoking] = useState<WorkspaceInvitationDto | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      setItems(await getInvitations());
+      setFailed(false);
+    } catch {
+      setFailed(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- data fetch defers its own setState; see docs/QUALITY.md §10
+    void load();
+  }, [load]);
+
+  async function revoke(inv: WorkspaceInvitationDto) {
+    setBusy(true);
+    try {
+      await revokeInvitation(inv.id);
+      toast({ title: "Invitation revoked", description: `The link sent to ${inv.email} no longer works.` });
+      await load();
+    } catch (err) {
+      toast({ tone: "danger", title: "Couldn't revoke the invitation", description: requestErrorText(err, "Try again.") });
+    } finally {
+      setBusy(false);
+      setRevoking(null);
+    }
+  }
+
+  if (failed) {
+    return (
+      <p role="alert" className="text-sm text-muted-foreground">
+        Couldn&apos;t load pending invitations.
+      </p>
+    );
+  }
+  if (!items || items.length === 0) return null;
+  return (
+    <section aria-labelledby="pending-invitations-heading" className="space-y-3">
+      <h2 id="pending-invitations-heading" className="flex items-center gap-2 text-sm font-semibold">
+        <Link2 aria-hidden className="h-4 w-4 text-muted-foreground" /> Pending invitations
+      </h2>
+      <ul className="divide-y divide-border rounded-xl border border-border">
+        {items.map((inv) => (
+          <li key={inv.id} className="flex flex-wrap items-center gap-3 px-3 py-2.5">
+            <span className="min-w-0 flex-1 truncate text-sm font-medium">{inv.email}</span>
+            <Badge tone="muted">{workspaceRoleLabel(inv.role)}</Badge>
+            {formatExpiry(inv.expiresAt) && <span className="text-xs text-muted-foreground">Expires {formatExpiry(inv.expiresAt)}</span>}
+            <Button size="sm" variant="ghost" className="text-danger-on-tint" onClick={() => setRevoking(inv)} aria-label={`Revoke invitation for ${inv.email}`}>
+              <Trash2 className="h-3.5 w-3.5" /> Revoke
+            </Button>
+          </li>
+        ))}
+      </ul>
+      <ConfirmDialog
+        open={!!revoking}
+        onCancel={() => setRevoking(null)}
+        onConfirm={() => revoking && void revoke(revoking)}
+        title={revoking ? `Revoke the invitation for ${revoking.email}?` : "Revoke the invitation?"}
+        description="The invitation link stops working. You can invite them again later."
+        confirmLabel="Revoke invitation"
+        busy={busy}
+      />
+    </section>
   );
 }
 
@@ -894,17 +1010,10 @@ type Prefill =
   | { state: "failed"; message: string }
   | { state: "ready"; membership: ProjectMemberDto | null };
 
-type ResetState =
-  | { step: "idle" }
-  | { step: "confirm" }
-  | { step: "working" }
-  | { step: "done"; secret: string | null }
-  | { step: "failed"; message: string };
-
 /**
  * One member's place in the workspace: their role and hourly rate on each of
  * their projects (PUT /api/app/team/member), removing them from a project,
- * adding them to another, a new one-time password, and removing them from the
+ * adding them to another, their workspace role (owners), and removing them from the
  * workspace — each offered only when the viewer may do it (contract §7).
  */
 function ManageMemberModal({
@@ -912,7 +1021,6 @@ function ManageMemberModal({
   viewer,
   live,
   projects: allProjects,
-  workspaceName,
   targetIsOwner,
   onClose,
   onChanged,
@@ -924,7 +1032,6 @@ function ManageMemberModal({
   viewer: { id: string; role: Role };
   live: boolean;
   projects: ProjectOption[];
-  workspaceName: string;
   targetIsOwner: boolean;
   onClose: () => void;
   onChanged: () => void;
@@ -954,7 +1061,10 @@ function ManageMemberModal({
   const [error, setError] = useState<string | null>(null);
   const [confirmRemove, setConfirmRemove] = useState(false);
   const [removing, setRemoving] = useState(false);
-  const [reset, setReset] = useState<ResetState>({ step: "idle" });
+  const initialWorkspaceRole = ((member.workspaceRole ?? (targetIsOwner ? "owner" : member.role === "admin" ? "manager" : "member")).toLowerCase()) as WorkspaceRole;
+  const [workspaceRole, setWorkspaceRole] = useState<WorkspaceRole>(initialWorkspaceRole);
+  const [roleSaving, setRoleSaving] = useState(false);
+  const [roleError, setRoleError] = useState<string | null>(null);
 
   const prefillFor = `${projectId}:${prefillKey}`;
   const prefill: Prefill = !live
@@ -1039,17 +1149,23 @@ function ManageMemberModal({
     }
   }
 
-  async function issueReset() {
-    if (!live) {
-      setReset({ step: "done", secret: null });
-      return;
-    }
-    setReset({ step: "working" });
+  async function saveWorkspaceRole() {
+    if (workspaceRole === initialWorkspaceRole) return;
+    setRoleSaving(true);
+    setRoleError(null);
     try {
-      const res = await resetMemberPassword(member.id);
-      setReset({ step: "done", secret: typeof res?.initialPassword === "string" ? res.initialPassword : null });
+      if (live) {
+        await changeWorkspaceRole(member.id, workspaceRole);
+        onChanged();
+      } else {
+        onDemoChange({ role: workspaceRole === "owner" ? "owner" : workspaceRole === "manager" ? "admin" : "worker" });
+      }
+      toast({ tone: "success", title: "Workspace role changed", description: `${member.name} is now ${workspaceRoleLabel(workspaceRole).toLowerCase()}.` });
+      onClose();
     } catch (err) {
-      setReset({ step: "failed", message: requestErrorText(err, "The reset failed.") });
+      setRoleError(membershipErrorText(err, "Couldn't change their role."));
+    } finally {
+      setRoleSaving(false);
     }
   }
 
@@ -1172,71 +1288,40 @@ function ManageMemberModal({
           </Button>
         </div>
 
-        {(account.canResetPassword || account.canRemoveFromWorkspace) && (
+        {(account.canChangeWorkspaceRole || account.canRemoveFromWorkspace) && (
           <section aria-labelledby="manage-account-heading" className="space-y-3 border-t border-border pt-4">
             <h3 id="manage-account-heading" className="text-sm font-semibold">
-              Account
+              Workspace access
             </h3>
-            {account.canResetPassword && (
-              <div className="rounded-xl border border-border p-3">
-                {reset.step === "done" ? (
-                  reset.secret ? (
-                    <SignInDetails
-                      heading={<>New sign-in details for {member.name}</>}
-                      workspaceName={workspaceName}
-                      email={member.email || null}
-                      secret={{ label: <>One-time password</>, value: reset.secret }}
-                    >
-                      Shown only once — share it securely. Their old password no longer works, and they choose a new one the next
-                      time they sign in.
-                    </SignInDetails>
-                  ) : (
-                    <p role="status" className="text-sm text-muted-foreground">
-                      {live ? (
-                        <>The password was reset, but this server didn&apos;t return the new one. Reset it again to get a password to share.</>
-                      ) : (
-                        <>Demo workspace — no password was issued. In a live workspace the one-time password appears here to share.</>
-                      )}
+            {account.canChangeWorkspaceRole && (
+              <div className="flex flex-wrap items-end gap-3 rounded-xl border border-border p-3">
+                <div className="min-w-0 flex-1 space-y-1.5">
+                  <label htmlFor="edit-workspace-role" className="text-sm font-medium">
+                    Workspace role
+                  </label>
+                  <Select id="edit-workspace-role" value={workspaceRole} onChange={(e) => setWorkspaceRole(e.target.value as WorkspaceRole)}>
+                    {WORKSPACE_ROLES.map((r) => (
+                      <option key={r} value={r}>
+                        {workspaceRoleLabel(r)}
+                      </option>
+                    ))}
+                  </Select>
+                  {roleError && (
+                    <p role="alert" className="text-xs text-danger-on-tint">
+                      {roleError}
                     </p>
-                  )
-                ) : reset.step === "confirm" || reset.step === "working" ? (
-                  <div className="space-y-3">
-                    <p className="text-sm">
-                      Give {member.name} a new one-time password? Their current password stops working at once, and the desktop agent
-                      asks them to sign in again.
-                    </p>
-                    <div className="flex justify-end gap-2">
-                      <Button variant="ghost" size="sm" onClick={() => setReset({ step: "idle" })} disabled={reset.step === "working"}>
-                        Cancel
-                      </Button>
-                      <Button size="sm" variant="danger" onClick={() => void issueReset()} disabled={reset.step === "working"}>
-                        <KeyRound className="h-3.5 w-3.5" /> {reset.step === "working" ? "Resetting…" : <>Reset password</>}
-                      </Button>
-                    </div>
-                  </div>
-                ) : (
-                  <div className="flex flex-wrap items-center justify-between gap-3">
-                    <div className="min-w-0 text-sm">
-                      <div className="font-medium">Reset password</div>
-                      <div className="text-xs text-muted-foreground">Issue a one-time password when they&apos;re locked out.</div>
-                      {reset.step === "failed" && (
-                        <div role="alert" className="mt-1 text-xs text-danger-on-tint">
-                          {reset.message}
-                        </div>
-                      )}
-                    </div>
-                    <Button variant="outline" size="sm" onClick={() => setReset({ step: "confirm" })}>
-                      <KeyRound className="h-3.5 w-3.5" /> Reset…
-                    </Button>
-                  </div>
-                )}
+                  )}
+                </div>
+                <Button size="sm" variant="outline" onClick={() => void saveWorkspaceRole()} disabled={roleSaving || workspaceRole === initialWorkspaceRole}>
+                  {roleSaving ? "Saving…" : "Change role"}
+                </Button>
               </div>
             )}
             {account.canRemoveFromWorkspace && (
               <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-danger/30 bg-danger/5 p-3">
                 <div className="min-w-0 text-sm">
                   <div className="font-medium text-danger-on-tint">Remove from workspace</div>
-                  <div className="text-xs text-muted-foreground">Takes them off every project, deactivates the account and frees the seat.</div>
+                  <div className="text-xs text-muted-foreground">{REMOVE_FROM_WORKSPACE_NOTE}</div>
                 </div>
                 <Button variant="outline" size="sm" className="border-danger/40 text-danger-on-tint hover:bg-danger/10" onClick={onRemoveFromWorkspace}>
                   <UserX className="h-3.5 w-3.5" /> Remove…

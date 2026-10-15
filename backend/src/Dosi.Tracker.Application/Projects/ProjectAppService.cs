@@ -16,6 +16,8 @@ using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Users;
 using Volo.Abp.Validation;
 
+using Dosi.Tracker.Workspaces;
+
 namespace Dosi.Tracker.Projects;
 
 [Authorize]
@@ -191,7 +193,7 @@ public class ProjectAppService :
     {
         NormalizeAndValidate(createInput);
 
-        return new Project(GuidGenerator.Create(), CurrentTenant.Id, createInput.Title, createInput.IntervalMinutes, createInput.Color)
+        return new Project(GuidGenerator.Create(), LazyServiceProvider.LazyGetRequiredService<ICurrentWorkspace>().GetId(), createInput.Title, createInput.IntervalMinutes, createInput.Color)
         {
             Description = createInput.Description,
             AllowScreenshot = createInput.AllowScreenshot,

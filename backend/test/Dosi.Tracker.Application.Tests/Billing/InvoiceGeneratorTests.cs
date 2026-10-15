@@ -44,21 +44,23 @@ public abstract class InvoiceGeneratorTests<TStartupModule> : TrackerApplication
         return WithUnitOfWorkAsync(async () =>
         {
             var project = await _projectRepository.InsertAsync(
-                new Project(_guidGenerator.Create(), null, title));
+                new Project(_guidGenerator.Create(), TrackerTestConsts.WorkspaceId, title));
             return project.Id;
         });
     }
 
-    /// <summary>A person with an account in the (host) workspace: only they can occupy a seat.</summary>
-    private Task<Guid> CreateUserAsync()
+    /// <summary>An active member of the test workspace: only members occupy a seat.</summary>
+    private async Task<Guid> CreateUserAsync()
     {
-        return WithUnitOfWorkAsync(async () =>
+        var userId = await WithUnitOfWorkAsync(async () =>
         {
             var userName = $"member-{Guid.NewGuid():N}";
             var user = new IdentityUser(_guidGenerator.Create(), userName, $"{userName}@billing.test");
             (await GetRequiredService<IdentityUserManager>().CreateAsync(user)).Succeeded.ShouldBeTrue();
             return user.Id;
         });
+        await ServiceProvider.AddWorkspaceMemberAsync(userId, Dosi.Tracker.Workspaces.WorkspaceRoles.Member);
+        return userId;
     }
 
     [Fact]
@@ -74,12 +76,12 @@ public abstract class InvoiceGeneratorTests<TStartupModule> : TrackerApplication
         var secondProjectId = await CreateProjectAsync("Billable B");
         await WithUnitOfWorkAsync(async () =>
         {
-            await _memberRepository.InsertAsync(new ProjectMember(_guidGenerator.Create(), null, projectId, userA));
-            await _memberRepository.InsertAsync(new ProjectMember(_guidGenerator.Create(), null, secondProjectId, userA));
-            await _memberRepository.InsertAsync(new ProjectMember(_guidGenerator.Create(), null, projectId, userB));
+            await _memberRepository.InsertAsync(new ProjectMember(_guidGenerator.Create(), TrackerTestConsts.WorkspaceId, projectId, userA));
+            await _memberRepository.InsertAsync(new ProjectMember(_guidGenerator.Create(), TrackerTestConsts.WorkspaceId, secondProjectId, userA));
+            await _memberRepository.InsertAsync(new ProjectMember(_guidGenerator.Create(), TrackerTestConsts.WorkspaceId, projectId, userB));
         });
 
-        var subscription = new Subscription(_guidGenerator.Create(), null, starter.Id);
+        var subscription = new Subscription(_guidGenerator.Create(), TrackerTestConsts.WorkspaceId, starter.Id);
 
         var invoice = await WithUnitOfWorkAsync(
             () => _invoiceGenerator.GenerateForCurrentMonthAsync(subscription));
@@ -105,7 +107,7 @@ public abstract class InvoiceGeneratorTests<TStartupModule> : TrackerApplication
         var free = await WithUnitOfWorkAsync(
             () => _planRepository.FirstAsync(p => p.Name == "Free"));
 
-        var subscription = new Subscription(_guidGenerator.Create(), null, free.Id);
+        var subscription = new Subscription(_guidGenerator.Create(), TrackerTestConsts.WorkspaceId, free.Id);
 
         var invoice = await WithUnitOfWorkAsync(
             () => _invoiceGenerator.GenerateForCurrentMonthAsync(subscription));
@@ -120,7 +122,7 @@ public abstract class InvoiceGeneratorTests<TStartupModule> : TrackerApplication
             () => _planRepository.FirstAsync(p => p.Name == "Business")); // $12/user
 
         // No project members at all — the workspace admin still occupies a seat.
-        var subscription = new Subscription(_guidGenerator.Create(), null, business.Id);
+        var subscription = new Subscription(_guidGenerator.Create(), TrackerTestConsts.WorkspaceId, business.Id);
 
         var invoice = await WithUnitOfWorkAsync(
             () => _invoiceGenerator.GenerateForCurrentMonthAsync(subscription));
@@ -133,7 +135,7 @@ public abstract class InvoiceGeneratorTests<TStartupModule> : TrackerApplication
     public async Task The_Invoice_Should_Record_Its_Billing_Period_And_Payment_Term()
     {
         var starter = await WithUnitOfWorkAsync(() => _planRepository.FirstAsync(p => p.Name == "Starter"));
-        var subscription = new Subscription(_guidGenerator.Create(), null, starter.Id);
+        var subscription = new Subscription(_guidGenerator.Create(), TrackerTestConsts.WorkspaceId, starter.Id);
 
         var invoice = await WithUnitOfWorkAsync(() => _invoiceGenerator.GenerateForCurrentMonthAsync(subscription));
 
@@ -148,7 +150,7 @@ public abstract class InvoiceGeneratorTests<TStartupModule> : TrackerApplication
     public async Task Each_Billing_Period_Should_Be_Invoiced_Once()
     {
         var starter = await WithUnitOfWorkAsync(() => _planRepository.FirstAsync(p => p.Name == "Starter"));
-        var subscription = new Subscription(_guidGenerator.Create(), null, starter.Id);
+        var subscription = new Subscription(_guidGenerator.Create(), TrackerTestConsts.WorkspaceId, starter.Id);
         var thisMonth = Invoice.GetBillingPeriodStart(DateTime.UtcNow);
         var lastMonth = thisMonth.AddMonths(-1);
 
@@ -167,9 +169,9 @@ public abstract class InvoiceGeneratorTests<TStartupModule> : TrackerApplication
     {
         // Invoices from before billing periods have none: their creation month stands in for it.
         var starter = await WithUnitOfWorkAsync(() => _planRepository.FirstAsync(p => p.Name == "Starter"));
-        var subscription = new Subscription(_guidGenerator.Create(), null, starter.Id);
+        var subscription = new Subscription(_guidGenerator.Create(), TrackerTestConsts.WorkspaceId, starter.Id);
         await WithUnitOfWorkAsync(() => _invoiceRepository.InsertAsync(
-            new Invoice(_guidGenerator.Create(), null, 6m, DateTime.UtcNow.AddDays(14))));
+            new Invoice(_guidGenerator.Create(), TrackerTestConsts.WorkspaceId, 6m, DateTime.UtcNow.AddDays(14))));
 
         (await WithUnitOfWorkAsync(() => _invoiceGenerator.GenerateForCurrentMonthAsync(subscription))).ShouldBeNull();
 
@@ -188,16 +190,16 @@ public abstract class InvoiceGeneratorTests<TStartupModule> : TrackerApplication
         var onDeletedProjectOnly = new[] { await CreateUserAsync(), await CreateUserAsync(), await CreateUserAsync() };
         await WithUnitOfWorkAsync(async () =>
         {
-            await _memberRepository.InsertAsync(new ProjectMember(_guidGenerator.Create(), null, kept, stays));
+            await _memberRepository.InsertAsync(new ProjectMember(_guidGenerator.Create(), TrackerTestConsts.WorkspaceId, kept, stays));
             foreach (var userId in onDeletedProjectOnly)
             {
-                await _memberRepository.InsertAsync(new ProjectMember(_guidGenerator.Create(), null, deleted, userId));
+                await _memberRepository.InsertAsync(new ProjectMember(_guidGenerator.Create(), TrackerTestConsts.WorkspaceId, deleted, userId));
             }
         });
         await WithUnitOfWorkAsync(() => _projectRepository.DeleteAsync(deleted));
 
         var invoice = await WithUnitOfWorkAsync(() =>
-            _invoiceGenerator.GenerateForCurrentMonthAsync(new Subscription(_guidGenerator.Create(), null, starter.Id)));
+            _invoiceGenerator.GenerateForCurrentMonthAsync(new Subscription(_guidGenerator.Create(), TrackerTestConsts.WorkspaceId, starter.Id)));
 
         invoice.ShouldNotBeNull().Amount.ShouldBe(6m);
         (await WithUnitOfWorkAsync(() => _invoiceGenerator.CountSeatsAsync())).ShouldBe(1);

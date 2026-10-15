@@ -2,13 +2,13 @@ using System;
 using System.Collections.Generic;
 using Volo.Abp;
 using Volo.Abp.Domain.Entities.Auditing;
-using Volo.Abp.MultiTenancy;
+using Dosi.Tracker.Workspaces;
 
 namespace Dosi.Tracker.Activities;
 
-public class Activity : CreationAuditedAggregateRoot<Guid>, IMultiTenant
+public class Activity : CreationAuditedAggregateRoot<Guid>, IWorkspaceScoped
 {
-    public Guid? TenantId { get; set; }
+    public Guid WorkspaceId { get; set; }
     public Guid UserId { get; set; }
     public Guid ProjectId { get; set; }
     public Guid ClientActivityId { get; set; } // Offline Idempotency key from Agent
@@ -55,7 +55,7 @@ public class Activity : CreationAuditedAggregateRoot<Guid>, IMultiTenant
 
     public Activity(
         Guid id, 
-        Guid? tenantId, 
+        Guid workspaceId, 
         Guid userId, 
         Guid projectId, 
         Guid clientActivityId, 
@@ -76,7 +76,7 @@ public class Activity : CreationAuditedAggregateRoot<Guid>, IMultiTenant
                 .WithData("endedAt", endedAt);
         }
 
-        TenantId = tenantId;
+        WorkspaceId = workspaceId;
         UserId = userId;
         ProjectId = projectId;
         ClientActivityId = clientActivityId;

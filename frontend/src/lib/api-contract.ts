@@ -64,6 +64,15 @@ export const TRACKER_ERROR_STATUS = {
   "Tracker:InvalidUser": 404,
   "Tracker:CannotModifySelf": 403,
   "Tracker:RoleNotAllowed": 403,
+  "Tracker:NotWorkspaceMember": 403,
+  "Tracker:WorkspaceRequired": 400,
+  "Tracker:EmailAlreadyRegistered": 409,
+  "Tracker:DuplicateWorkspaceName": 409,
+  "Tracker:LastOwnerCannotLeave": 409,
+  "Tracker:AlreadyWorkspaceMember": 409,
+  "Tracker:InvitationNotFound": 404,
+  "Tracker:InvitationExpired": 410,
+  "Tracker:InvitationEmailMismatch": 403,
 } as const;
 
 export type TrackerErrorCode = keyof typeof TRACKER_ERROR_STATUS;
@@ -805,19 +814,18 @@ export function membershipEditRules(input: { canManageTeam: boolean; callerIsOwn
 }
 
 /**
- * Account actions on another member (contract §7): a new one-time password
- * (an owner's only by another owner) and removal from the workspace (never
- * yourself or an owner). Both need Tracker.Team.Manage.
+ * Actions on another member: changing their workspace role (owners only) and
+ * removal from the workspace (never yourself or an owner).
  */
 export function memberAccountActions(input: {
   canManageTeam: boolean;
   callerIsOwner: boolean;
   targetIsOwner: boolean;
   isSelf: boolean;
-}): { canResetPassword: boolean; canRemoveFromWorkspace: boolean } {
+}): { canChangeWorkspaceRole: boolean; canRemoveFromWorkspace: boolean } {
   const allowed = input.canManageTeam && !input.isSelf;
   return {
-    canResetPassword: allowed && (!input.targetIsOwner || input.callerIsOwner),
+    canChangeWorkspaceRole: allowed && input.callerIsOwner,
     canRemoveFromWorkspace: allowed && !input.targetIsOwner,
   };
 }
@@ -832,17 +840,25 @@ export interface CreateProjectMemberDto {
 
 /** POST /api/app/team/invite-member body. */
 export interface InviteMemberDto {
-  projectId: string;
+  projectId?: string | null;
   email: string;
   role: ProjectRole;
+  /** owner | manager | member (default member). */
+  workspaceRole?: string | null;
   hourlyRate: number;
 }
 
-/** POST /api/app/team/invite-member result; `initialPassword` only when the user was created. */
+/**
+ * POST /api/app/team/invite-member result. An existing account is `added` at
+ * once; anyone else gets an invitation link (`invitePath`, "/invite/{token}").
+ */
 export interface InviteMemberResultDto {
-  member: ProjectMemberDto;
-  userCreated: boolean;
-  initialPassword?: string | null;
+  added: boolean;
+  workspaceRole: string;
+  member?: ProjectMemberDto | null;
+  invitationId?: string | null;
+  invitePath?: string | null;
+  expiresAt?: string | null;
 }
 
 /** PUT /api/app/team/member?projectId=&userId= body. A new rate applies from now on (rates are effective-dated). */
@@ -874,14 +890,13 @@ export interface TeamMemberDto {
   surname?: string | null;
   email?: string | null;
   isActive: boolean;
+  /** Workspace role: owner | manager | member. */
+  role?: string | null;
   isManager: boolean;
   isOwner: boolean;
+  isClient?: boolean;
+  joinedAt?: string | null;
   projectIds: string[];
-}
-
-/** POST /api/app/team/reset-password?userId=… result: share it once; it must be changed at next sign-in. */
-export interface ResetPasswordResultDto {
-  initialPassword: string;
 }
 
 /** POST /api/account/my-profile/change-password body. */
@@ -948,8 +963,8 @@ export interface InvoiceDto {
 
 export interface PlatformInvoiceDto {
   id: string;
-  tenantId?: string | null;
-  tenantName: string;
+  workspaceId?: string | null;
+  workspaceName: string;
   amount: number;
   status: string;
   dueDate: string;
@@ -1026,42 +1041,109 @@ export function removeMemberRoute(membershipId: string): string {
   return `/api/app/team/member/${encodeURIComponent(membershipId)}`;
 }
 
-/** POST: issue a member a new one-time password (Team.Manage). */
-export function resetPasswordRoute(userId: string): string {
-  return `/api/app/team/reset-password?userId=${encodeURIComponent(userId)}`;
-}
-
-/** DELETE: remove a member from every project and deactivate them, freeing the seat (Team.Manage). */
+/** DELETE: end someone's membership of the current workspace (their account stays). */
 export function removeFromWorkspaceRoute(userId: string): string {
   return `/api/app/team/from-workspace?userId=${encodeURIComponent(userId)}`;
 }
 
-/** POST (host): move a tenant to another plan. */
-export function changeTenantPlanRoute(tenantId: string, planId: string): string {
-  return `/api/app/platform/change-tenant-plan?tenantId=${encodeURIComponent(tenantId)}&planId=${encodeURIComponent(planId)}`;
+/** PUT (owner): change a member's workspace role (owner | manager | member). */
+export function workspaceRoleRoute(userId: string, role: string): string {
+  return `/api/app/team/workspace-role?userId=${encodeURIComponent(userId)}&role=${encodeURIComponent(role)}`;
 }
 
-/** POST (host): mark a tenant's subscription active. */
-export function activateSubscriptionRoute(tenantId: string): string {
-  return `/api/app/platform/activate-subscription?tenantId=${encodeURIComponent(tenantId)}`;
+/** GET pending invitations of the current workspace. */
+export const TEAM_INVITATIONS_ROUTE = "/api/app/team/invitations";
+
+/** DELETE: revoke a pending invitation. */
+export function revokeInvitationRoute(invitationId: string): string {
+  return `/api/app/team/${encodeURIComponent(invitationId)}/invitation`;
 }
 
-/** POST (host): suspend a tenant — it can't record time until activated again. */
-export function suspendSubscriptionRoute(tenantId: string): string {
-  return `/api/app/platform/suspend-subscription?tenantId=${encodeURIComponent(tenantId)}`;
+/** Workspace endpoints that are not scoped to the current workspace (no X-Workspace-Id). */
+export const WORKSPACE_ROUTES = {
+  mine: "/api/app/workspaces/mine",
+  create: "/api/app/workspaces",
+  register: "/api/app/workspace/register",
+} as const;
+
+export function leaveWorkspaceRoute(workspaceId: string): string {
+  return `/api/app/workspaces/${encodeURIComponent(workspaceId)}/leave`;
 }
 
-/** GET (host): every workspace with its plan, subscription status and occupied seats. */
-export const TENANT_SUBSCRIPTIONS_ROUTE = "/api/app/platform/tenant-subscriptions";
+export function invitationRoute(token: string): string {
+  return `/api/app/invitations/${encodeURIComponent(token)}`;
+}
 
-/**
- * GET /api/app/platform/tenant-subscriptions item. Beyond the v2 contract: the
- * backend added it for the host console, so an older server answers 404 and
- * the console shows "—" for plan and status, as before.
- */
-export interface TenantSubscriptionDto {
-  tenantId: string;
-  tenantName: string;
+export function acceptInvitationRoute(token: string): string {
+  return `${invitationRoute(token)}/accept`;
+}
+
+/** GET /api/app/team/invitations item. */
+export interface WorkspaceInvitationDto {
+  id: string;
+  email: string;
+  role: string;
+  projectId?: string | null;
+  projectRole?: string | null;
+  expiresAt: string;
+  creationTime?: string;
+}
+
+/** GET /api/app/invitations/{token} (anonymous). */
+export interface InvitationInfoDto {
+  workspaceName: string;
+  email: string;
+  role: string;
+  expired: boolean;
+}
+
+/** POST /api/app/invitations/{token}/accept. */
+export interface AcceptInvitationResultDto {
+  workspaceId: string;
+  workspaceName: string;
+  role: string;
+}
+
+/** POST /api/app/workspace/register body (anonymous). */
+export interface RegisterWorkspaceInput {
+  firstName?: string;
+  surname?: string;
+  email: string;
+  password: string;
+  workspaceName?: string;
+  planId?: string;
+  planName?: string;
+  inviteToken?: string;
+}
+
+export interface WorkspaceRegistrationResultDto {
+  workspaceId: string;
+  workspaceName: string;
+  userName: string;
+}
+
+/** POST (platform): move a workspace to another plan. */
+export function changeWorkspacePlanRoute(workspaceId: string, planId: string): string {
+  return `/api/app/platform/change-workspace-plan?workspaceId=${encodeURIComponent(workspaceId)}&planId=${encodeURIComponent(planId)}`;
+}
+
+/** POST (platform): mark a workspace's subscription active. */
+export function activateSubscriptionRoute(workspaceId: string): string {
+  return `/api/app/platform/activate-subscription?workspaceId=${encodeURIComponent(workspaceId)}`;
+}
+
+/** POST (platform): suspend a workspace — it can't record time until activated again. */
+export function suspendSubscriptionRoute(workspaceId: string): string {
+  return `/api/app/platform/suspend-subscription?workspaceId=${encodeURIComponent(workspaceId)}`;
+}
+
+/** GET (platform): every workspace with its plan, subscription status and occupied seats. */
+export const WORKSPACE_SUBSCRIPTIONS_ROUTE = "/api/app/platform/workspace-subscriptions";
+
+/** GET /api/app/platform/workspace-subscriptions item. */
+export interface WorkspaceSubscriptionDto {
+  workspaceId: string;
+  workspaceName: string;
   /** Null (as are the plan and status fields) when the workspace has no subscription. */
   subscriptionId?: string | null;
   planId?: string | null;

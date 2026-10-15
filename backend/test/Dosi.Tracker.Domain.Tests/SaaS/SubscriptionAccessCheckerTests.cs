@@ -7,7 +7,7 @@ using Shouldly;
 using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Guids;
 using Volo.Abp.Modularity;
-using Volo.Abp.MultiTenancy;
+using Dosi.Tracker.Workspaces;
 using Xunit;
 
 namespace Dosi.Tracker.SaaS;
@@ -18,7 +18,7 @@ public abstract class SubscriptionAccessCheckerTests<TStartupModule> : TrackerDo
     private readonly ISubscriptionAccessChecker _checker;
     private readonly IRepository<Subscription, Guid> _subscriptionRepository;
     private readonly IRepository<Invoice, Guid> _invoiceRepository;
-    private readonly ICurrentTenant _currentTenant;
+    private readonly ICurrentWorkspace _currentWorkspace;
     private readonly IGuidGenerator _guidGenerator;
 
     protected SubscriptionAccessCheckerTests()
@@ -26,7 +26,7 @@ public abstract class SubscriptionAccessCheckerTests<TStartupModule> : TrackerDo
         _checker = GetRequiredService<ISubscriptionAccessChecker>();
         _subscriptionRepository = GetRequiredService<IRepository<Subscription, Guid>>();
         _invoiceRepository = GetRequiredService<IRepository<Invoice, Guid>>();
-        _currentTenant = GetRequiredService<ICurrentTenant>();
+        _currentWorkspace = GetRequiredService<ICurrentWorkspace>();
         _guidGenerator = GetRequiredService<IGuidGenerator>();
     }
 
@@ -37,7 +37,7 @@ public abstract class SubscriptionAccessCheckerTests<TStartupModule> : TrackerDo
 
     private async Task SubscribeAsync(Guid tenantId, string status, DateTime? trialEndsAt = null)
     {
-        using (_currentTenant.Change(tenantId))
+        using (_currentWorkspace.Change(tenantId))
         {
             await WithUnitOfWorkAsync(() => _subscriptionRepository.InsertAsync(
                 new Subscription(_guidGenerator.Create(), tenantId, Guid.NewGuid())
@@ -50,7 +50,7 @@ public abstract class SubscriptionAccessCheckerTests<TStartupModule> : TrackerDo
 
     private async Task InvoiceAsync(Guid tenantId, DateTime dueDate, string status = Invoice.PendingStatus, bool excused = false)
     {
-        using (_currentTenant.Change(tenantId))
+        using (_currentWorkspace.Change(tenantId))
         {
             var invoice = new Invoice(_guidGenerator.Create(), tenantId, 12m, dueDate) { Status = status };
             if (excused)
@@ -65,7 +65,7 @@ public abstract class SubscriptionAccessCheckerTests<TStartupModule> : TrackerDo
     /// <summary>Asks the checker from inside the given workspace (null = the host).</summary>
     private async Task<bool> IsUsableAsync(Guid? tenantId)
     {
-        using (_currentTenant.Change(tenantId))
+        using (_currentWorkspace.Change(tenantId))
         {
             return await WithUnitOfWorkAsync(() => _checker.IsUsableAsync());
         }
@@ -174,7 +174,7 @@ public abstract class SubscriptionAccessCheckerTests<TStartupModule> : TrackerDo
 
         (await IsUsableAsync(tenantId)).ShouldBeTrue(); // the grace runs from the later invoice: 5 days left
 
-        using (_currentTenant.Change(tenantId))
+        using (_currentWorkspace.Change(tenantId))
         {
             (await WithUnitOfWorkAsync(() => GetRequiredService<SubscriptionAccessChecker>().GetPastDueGraceEndAsync()))
                 .ShouldBe(laterDueDate.AddDays(Subscription.PastDueGraceDays));

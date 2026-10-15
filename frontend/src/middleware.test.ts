@@ -4,9 +4,9 @@ import { describe, it, expect } from "vitest";
 import { middleware } from "./middleware";
 import type { NextRequest } from "next/server";
 
-function req(pathname: string, hasToken: boolean): NextRequest {
+function req(pathname: string, hasToken: boolean, search = ""): NextRequest {
   return {
-    nextUrl: { pathname },
+    nextUrl: { pathname, searchParams: new URLSearchParams(search) },
     url: `http://localhost${pathname}`,
     cookies: { has: (name: string) => name === "dosi-token" && hasToken },
   } as unknown as NextRequest;
@@ -35,5 +35,14 @@ describe("middleware route gate", () => {
   it("allows an unauthenticated user to reach /login", () => {
     const res = middleware(req("/login", false));
     expect(locationOf(res)).toBeNull();
+  });
+
+  it("lets anyone open an invitation link", () => {
+    expect(locationOf(middleware(req("/invite/abc", false)))).toBeNull();
+  });
+
+  it("sends a signed-in user from /login to a same-site ?next=", () => {
+    expect(locationOf(middleware(req("/login", true, "next=/invite/abc")))).toMatch(/\/invite\/abc$/);
+    expect(locationOf(middleware(req("/login", true, "next=//evil.example")))).toMatch(/\/dashboard$/);
   });
 });

@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   API_BASE_URL,
+  pickWorkspace,
+  workspaceInitial,
+  workspaceRoleLabel,
   SIGN_IN_RETRY_DEFAULT_SECONDS,
   WEB_SIGN_IN_CLIENT,
   changePasswordAtSignIn,
@@ -53,7 +56,7 @@ describe("classifySignInError — every way a sign-in fails, told apart", () => 
 
 describe("signInFailureMessage", () => {
   it("blames the credentials only when the server rejected them", () => {
-    expect(signInFailureMessage({ kind: "invalid" })).toBe("That email, password or workspace didn't match. Check them and try again.");
+    expect(signInFailureMessage({ kind: "invalid" })).toBe("That email or password didn't match. Check them and try again.");
     for (const kind of ["rate-limited", "unreachable", "server", "locked", "unknown-workspace", "storage"] as const) {
       expect(signInFailureMessage({ kind }), kind).not.toMatch(/didn't match/);
     }
@@ -106,10 +109,9 @@ describe("small helpers", () => {
     expect(failureField({ kind: "locked" })).toBeNull();
   });
 
-  it("tokenEndpoint scopes a workspace account with __tenant (a query parameter, as ABP needs)", () => {
-    expect(tokenEndpoint("Acme Corp", "https://api.test")).toBe("https://api.test/connect/token?__tenant=Acme%20Corp");
-    expect(tokenEndpoint(null, "https://api.test")).toBe("https://api.test/connect/token");
-    expect(tokenEndpoint(undefined)).toBe(`${API_BASE_URL}/connect/token`);
+  it("tokenEndpoint names no workspace (accounts are global)", () => {
+    expect(tokenEndpoint("https://api.test")).toBe("https://api.test/connect/token");
+    expect(tokenEndpoint()).toBe(`${API_BASE_URL}/connect/token`);
   });
 });
 
@@ -128,7 +130,7 @@ function response(status: number, body: unknown, headers: Record<string, string>
 
 const request = (fetch: (input: string, init: RequestInit) => Promise<Response>) => ({
   fetch,
-  tokenUrl: "https://api.test/connect/token?__tenant=acme",
+  tokenUrl: "https://api.test/connect/token",
   clientId: WEB_SIGN_IN_CLIENT.clientId,
   scope: WEB_SIGN_IN_CLIENT.scope,
   username: "sam@realco.test",
@@ -145,14 +147,14 @@ describe("changePasswordAtSignIn — ABP's change-at-sign-in exchange", () => {
 
     expect(fetch).toHaveBeenCalledTimes(2);
     const [url, first] = fetch.mock.calls[0];
-    expect(url).toBe("https://api.test/connect/token?__tenant=acme");
+    expect(url).toBe("https://api.test/connect/token");
     const firstBody = new URLSearchParams(String(first.body));
     expect(Object.fromEntries(firstBody)).toEqual({
       grant_type: "password",
       username: "sam@realco.test",
       password: "OneTime#1",
       client_id: "Tracker_App",
-      scope: "Tracker offline_access",
+      scope: "openid profile email roles offline_access Tracker",
     });
     const second = new URLSearchParams(String(fetch.mock.calls[1][1].body));
     expect(second.get("ChangePasswordToken")).toBe("cpt-1");
@@ -190,5 +192,26 @@ describe("changePasswordAtSignIn — ABP's change-at-sign-in exchange", () => {
 
     const dropped = vi.fn().mockResolvedValueOnce(challenge).mockRejectedValueOnce(new TypeError("Failed to fetch"));
     expect(await changePasswordAtSignIn(request(dropped))).toEqual({ ok: false, failure: { kind: "unreachable" }, message: null });
+  });
+});
+
+describe("workspace choices", () => {
+  const a = { id: "11111111-1111-1111-1111-111111111111", name: "Acme", role: "owner" };
+  const b = { id: "22222222-2222-2222-2222-222222222222", name: "Beta", role: "member" };
+
+  it("none → create, one → open it, several → the last used one while still a member, else choose", () => {
+    expect(pickWorkspace([], null)).toEqual({ kind: "create" });
+    expect(pickWorkspace([a], null)).toEqual({ kind: "select", id: a.id });
+    expect(pickWorkspace([a], b.id)).toEqual({ kind: "select", id: a.id });
+    expect(pickWorkspace([a, b], b.id.toUpperCase())).toEqual({ kind: "select", id: b.id });
+    expect(pickWorkspace([a, b], "33333333-3333-3333-3333-333333333333")).toEqual({ kind: "choose" });
+    expect(pickWorkspace([a, b], null)).toEqual({ kind: "choose" });
+  });
+
+  it("labels roles and initials", () => {
+    expect(workspaceRoleLabel("owner")).toBe("Owner");
+    expect(workspaceRoleLabel("MANAGER")).toBe("Manager");
+    expect(workspaceRoleLabel(null)).toBe("Member");
+    expect(workspaceInitial(a)).toBe("A");
   });
 });

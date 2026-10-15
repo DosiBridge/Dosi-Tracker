@@ -2,21 +2,31 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import {
   REFRESH_TOKEN_STORAGE_KEY,
   SESSION_UNAUTHORIZED_EVENT,
-  TENANT_STORAGE_KEY,
   TOKEN_EXPIRES_STORAGE_KEY,
   TOKEN_STORAGE_KEY,
+  clearCurrentWorkspace,
+  currentWorkspaceId,
   isLiveSession,
   readStorage,
+  redirectToWorkspaceChooser,
   removeStorage,
   writeStorage,
 } from '@/lib/live-session';
-import { API_BASE_URL, WEB_SIGN_IN_CLIENT, tokenEndpoint } from '@/lib/sign-in';
+import { API_BASE_URL, WEB_SIGN_IN_CLIENT, tokenEndpoint, type WorkspaceMembership } from '@/lib/sign-in';
 import {
   API_ROUTES,
   TEAM_ROUTES,
   activateSubscriptionRoute,
   activityNoteRoute,
-  changeTenantPlanRoute,
+  acceptInvitationRoute,
+  changeWorkspacePlanRoute,
+  invitationRoute,
+  leaveWorkspaceRoute,
+  revokeInvitationRoute,
+  TEAM_INVITATIONS_ROUTE,
+  WORKSPACE_ROUTES,
+  WORKSPACE_SUBSCRIPTIONS_ROUTE,
+  workspaceRoleRoute,
   collectPages,
   markInvoicePaidRoute,
   parseApiErrorBody,
@@ -26,9 +36,7 @@ import {
   removeFromWorkspaceRoute,
   removeMemberRoute,
   reportingRoute,
-  resetPasswordRoute,
   suspendSubscriptionRoute,
-  TENANT_SUBSCRIPTIONS_ROUTE,
   toPagedResult,
   updateMemberRoute,
   type ActivityDto,
@@ -49,8 +57,13 @@ import {
   type ProjectDto,
   type ProjectMemberDto,
   type ReportingQuery,
-  type ResetPasswordResultDto,
-  type TenantSubscriptionDto,
+  type AcceptInvitationResultDto,
+  type InvitationInfoDto,
+  type RegisterWorkspaceInput,
+  type TeamMemberDto,
+  type WorkspaceInvitationDto,
+  type WorkspaceRegistrationResultDto,
+  type WorkspaceSubscriptionDto,
   type UpdateProjectMemberDto,
   type WorkspaceSettingsDto,
 } from '@/lib/api-contract';
@@ -225,7 +238,7 @@ const exchangeRefreshToken = async (): Promise<boolean> => {
   params.append('client_id', WEB_SIGN_IN_CLIENT.clientId);
   let res: Response;
   try {
-    res = await fetch(tokenEndpoint(readStorage(TENANT_STORAGE_KEY)), {
+    res = await fetch(tokenEndpoint(), {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: params.toString(),
@@ -278,9 +291,26 @@ export const refreshAccessToken = (): Promise<boolean> => {
   return renewal;
 };
 
-const headersFor = (token: string | null, json: boolean): Record<string, string> => ({
+/** Routes that are not scoped to a workspace: they never carry X-Workspace-Id. */
+const UNSCOPED_PREFIXES = [
+  '/connect/token',
+  WORKSPACE_ROUTES.create, // also covers /mine and /{id}/leave
+  WORKSPACE_ROUTES.register,
+  '/api/app/invitations',
+  '/api/account/my-profile',
+];
+
+/** The X-Workspace-Id for a request: the current workspace, except on unscoped routes. */
+export const workspaceHeaderFor = (endpoint: string): string | null => {
+  const path = endpoint.split('?')[0];
+  if (UNSCOPED_PREFIXES.some((p) => path.startsWith(p))) return null;
+  return currentWorkspaceId();
+};
+
+const headersFor = (token: string | null, json: boolean, workspaceId: string | null): Record<string, string> => ({
   ...(json ? { 'Content-Type': 'application/json' } : {}),
   ...(token ? { Authorization: `Bearer ${token}` } : {}),
+  ...(workspaceId ? { 'X-Workspace-Id': workspaceId } : {}),
 });
 
 /**
@@ -299,7 +329,7 @@ const send = async (
       method: init.method,
       body: init.body,
       signal: init.signal,
-      headers: headersFor(token, init.json !== false),
+      headers: headersFor(token, init.json !== false, workspaceHeaderFor(endpoint)),
     });
   const sentWith = readStorage(TOKEN_STORAGE_KEY);
   const res = await attempt(sentWith);
@@ -333,6 +363,17 @@ const handleUnauthorized = (res: Response) => {
   }
 };
 
+/**
+ * The current workspace was refused (no longer a member, or none chosen): forget
+ * it and go choose another.
+ */
+const handleWorkspaceRefused = (status: number, code: string | null) => {
+  const refused = (status === 403 && code === 'Tracker:NotWorkspaceMember') || (status === 400 && code === 'Tracker:WorkspaceRequired');
+  if (!refused || typeof window === 'undefined') return;
+  clearCurrentWorkspace();
+  redirectToWorkspaceChooser();
+};
+
 const headerOf = (res: Response, name: string): string | null =>
   typeof res.headers?.get === 'function' ? res.headers.get(name) : null;
 
@@ -348,6 +389,7 @@ const bodyText = async (res: Response): Promise<string> => {
 const apiFailure = async (prefix: string, res: Response): Promise<ApiError> => {
   handleUnauthorized(res);
   const info = parseApiErrorBody(await bodyText(res));
+  handleWorkspaceRefused(res.status, info.code);
   const statusText = res.statusText || `HTTP ${res.status}`;
   return new ApiError(
     `${prefix}: ${statusText}${info.message ? `: ${info.message}` : ''}`,
@@ -508,9 +550,8 @@ export const putApi = async (endpoint: string, body: unknown) => {
 };
 
 /**
- * OpenIddict resource-owner password flow. For tenant users the token request
- * must carry the tenant (`__tenant`); afterwards the JWT itself resolves the
- * tenant on every API call.
+ * OpenIddict resource-owner password flow. Accounts are global: the token
+ * names no workspace; requests choose one with X-Workspace-Id.
  *
  * The token is mirrored into a cookie so the Next.js middleware can gate
  * routes server-side (localStorage is invisible to middleware). With
@@ -522,24 +563,18 @@ export const putApi = async (endpoint: string, body: unknown) => {
  * SignInServerError (5xx), ApiUnreachableError (no server) and
  * StorageUnavailableError (the browser won't keep the session).
  */
-export const loginApi = async (username: string, password: string, tenant?: string): Promise<string> => {
+export const loginApi = async (username: string, password: string): Promise<string> => {
   const params = new URLSearchParams();
   params.append('grant_type', 'password');
   params.append('username', username);
   params.append('password', password);
   params.append('client_id', WEB_SIGN_IN_CLIENT.clientId);
   params.append('scope', WEB_SIGN_IN_CLIENT.scope);
-
-  // The tenant MUST be a query parameter, not a form field: ABP's tenant
-  // resolvers read route/query/header/cookie and ignore the POST body, so a
-  // body-only `__tenant` silently resolves to the host tenant.
   let res: Response;
   try {
-    res = await fetch(tokenEndpoint(tenant), {
+    res = await fetch(tokenEndpoint(), {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: params.toString(),
     });
   } catch {
@@ -557,11 +592,6 @@ export const loginApi = async (username: string, password: string, tenant?: stri
   const token = json.access_token;
   if (typeof window !== 'undefined' && typeof token === 'string' && token) {
     try {
-      if (tenant) {
-        keep(TENANT_STORAGE_KEY, tenant);
-      } else {
-        removeStorage(TENANT_STORAGE_KEY);
-      }
       storeTokens({ ...json, access_token: token }, false);
     } catch {
       removeStorage(TOKEN_STORAGE_KEY);
@@ -578,45 +608,64 @@ export const logoutApi = () => {
     removeStorage(TOKEN_STORAGE_KEY);
     removeStorage(TOKEN_EXPIRES_STORAGE_KEY);
     removeStorage(REFRESH_TOKEN_STORAGE_KEY);
-    removeStorage(TENANT_STORAGE_KEY);
+    // The current workspace is kept: the next sign-in reopens it when still a member.
     document.cookie = 'dosi-token=; Path=/; Max-Age=0; SameSite=Lax';
   }
 };
 
-/**
- * Self-service SaaS signup: creates an isolated tenant with its own admin user
- * and starts a subscription on the chosen plan (backend: WorkspaceAppService).
- */
-export const registerWorkspaceApi = async (
-  name: string,
-  adminEmail: string,
-  adminPassword: string,
-  planName?: string,
-) => {
+/* ----------------------------- Workspaces ----------------------------- */
+
+const listOf = <T,>(json: unknown): T[] => {
+  if (Array.isArray(json)) return json as T[];
+  const items = (json as { items?: unknown } | null)?.items;
+  return Array.isArray(items) ? (items as T[]) : [];
+};
+
+/** The signed-in person's workspaces, with their role in each. */
+export const getMyWorkspacesApi = async (): Promise<WorkspaceMembership[]> => listOf<WorkspaceMembership>(await getApi(WORKSPACE_ROUTES.mine));
+
+/** Create a workspace owned by the signed-in person. */
+export const createWorkspaceApi = (name: string, planId?: string | null): Promise<{ id: string; name: string }> =>
+  postApi(WORKSPACE_ROUTES.create, planId ? { name, planId } : { name });
+
+/** Leave a workspace (409 Tracker:LastOwnerCannotLeave for its last owner). */
+export const leaveWorkspaceApi = async (workspaceId: string): Promise<void> => {
+  await postApi(leaveWorkspaceRoute(workspaceId), {});
+};
+
+/** Anonymous JSON call: never a token, never a workspace. */
+const anonymous = async <T,>(endpoint: string, init: { method?: string; body?: unknown } = {}): Promise<T> => {
   let res: Response;
   try {
-    res = await fetch(`${API_BASE_URL}/api/app/workspace/register`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ name, adminEmail, adminPassword, planName }),
+    res = await fetch(`${API_BASE_URL}${endpoint}`, {
+      method: init.method ?? 'GET',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'omit',
+      body: init.body === undefined ? undefined : JSON.stringify(init.body),
     });
   } catch {
     throw new ApiUnreachableError();
   }
-
   if (!res.ok) {
-    const errorText = await res.text();
-    let message = `Workspace registration failed (HTTP ${res.status})`;
-    try {
-      const parsed = JSON.parse(errorText);
-      message = parsed?.error?.message || message;
-    } catch {}
-    throw new Error(message);
+    const info = parseApiErrorBody(await bodyText(res));
+    throw new ApiError(`API Error: ${res.statusText || `HTTP ${res.status}`}${info.message ? `: ${info.message}` : ''}`, res.status, info);
   }
-  return await res.json() as { tenantId: string; name: string };
+  const text = await bodyText(res);
+  return (text ? JSON.parse(text) : null) as T;
 };
+
+/**
+ * Self-service sign-up: a new account and (unless joining by invitation) its
+ * first workspace. 409 Tracker:EmailAlreadyRegistered / DuplicateWorkspaceName.
+ */
+export const registerWorkspaceApi = (input: RegisterWorkspaceInput): Promise<WorkspaceRegistrationResultDto> =>
+  anonymous(WORKSPACE_ROUTES.register, { method: 'POST', body: input });
+
+/** What an invitation link opens (anonymous). */
+export const getInvitationApi = (token: string): Promise<InvitationInfoDto> => anonymous(invitationRoute(token));
+
+/** Accept an invitation as the signed-in person. */
+export const acceptInvitationApi = (token: string): Promise<AcceptInvitationResultDto> => postApi(acceptInvitationRoute(token), {});
 
 /* ----------------------------- Contract v2 endpoints ----------------------------- */
 // Typed wrappers over the helpers above (routes from lib/api-contract). Each
@@ -645,7 +694,7 @@ export const getProjectMembers = async (projectId: string): Promise<ProjectMembe
 /** Add an existing workspace user to a project (404 Tracker:InvalidUser when they aren't in the workspace). */
 export const addProjectMember = (input: CreateProjectMemberDto): Promise<ProjectMemberDto> => postApi(TEAM_ROUTES.member, input);
 
-/** Invite someone to a project by email; a new user comes back with a one-time password. */
+/** Invite someone by email: an existing account is added; anyone else gets an invitation link. */
 export const inviteMember = (input: InviteMemberDto): Promise<InviteMemberResultDto> => postApi(TEAM_ROUTES.inviteMember, input);
 
 /** Change a member's role and/or rate on one project (see membershipEditRules for who may). */
@@ -655,11 +704,16 @@ export const updateProjectMember = (projectId: string, userId: string, input: Up
 /** Remove one project membership, by its id from getProjectMembers. */
 export const removeProjectMember = (membershipId: string): Promise<void> => delApi(removeMemberRoute(membershipId));
 
-/** Issue a member a new one-time password; they must change it at their next sign-in. */
-export const resetMemberPassword = (userId: string): Promise<ResetPasswordResultDto> =>
-  postApi(resetPasswordRoute(userId), {});
+/** Owner: change a member's workspace role (owner | manager | member). */
+export const changeWorkspaceRole = (userId: string, role: string): Promise<TeamMemberDto> => putApi(workspaceRoleRoute(userId, role), {});
 
-/** Remove a member from every project and deactivate them (frees their seat). */
+/** Pending invitations of the current workspace. */
+export const getInvitations = async (): Promise<WorkspaceInvitationDto[]> => listOf<WorkspaceInvitationDto>(await getApi(TEAM_INVITATIONS_ROUTE));
+
+/** Revoke a pending invitation. */
+export const revokeInvitation = (invitationId: string): Promise<void> => delApi(revokeInvitationRoute(invitationId));
+
+/** End someone's membership of this workspace (their account stays). */
 export const removeMemberFromWorkspace = (userId: string): Promise<void> => delApi(removeFromWorkspaceRoute(userId));
 
 /** Change the signed-in user's own password. */
@@ -679,29 +733,29 @@ export const getMyPreferences = (): Promise<MyPreferencesDto> => getApi(API_ROUT
 export const updateMyPreferences = (preferences: MyPreferencesDto): Promise<MyPreferencesDto> =>
   putApi(API_ROUTES.myPreferences, preferences);
 
-/** Host: move a tenant to another plan. */
-export const changeTenantPlan = async (tenantId: string, planId: string): Promise<void> => {
-  await postApi(changeTenantPlanRoute(tenantId, planId), {});
+/** Platform: move a workspace to another plan. */
+export const changeWorkspacePlan = async (workspaceId: string, planId: string): Promise<void> => {
+  await postApi(changeWorkspacePlanRoute(workspaceId, planId), {});
 };
 
-/** Host: mark a tenant's subscription active (e.g. after payment). */
-export const activateSubscription = async (tenantId: string): Promise<void> => {
-  await postApi(activateSubscriptionRoute(tenantId), {});
+/** Platform: mark a workspace's subscription active (e.g. after payment). */
+export const activateSubscription = async (workspaceId: string): Promise<void> => {
+  await postApi(activateSubscriptionRoute(workspaceId), {});
 };
 
-/** Host: suspend a tenant's subscription (it can't record time until activated again). */
-export const suspendSubscription = async (tenantId: string): Promise<void> => {
-  await postApi(suspendSubscriptionRoute(tenantId), {});
+/** Platform: suspend a workspace's subscription (it can't record time until activated again). */
+export const suspendSubscription = async (workspaceId: string): Promise<void> => {
+  await postApi(suspendSubscriptionRoute(workspaceId), {});
 };
 
 /**
- * Host: every workspace's plan, status and seats; null when the server has no
- * such endpoint (an older one answers 404), so the console can say "—".
+ * Platform: every workspace's plan, status and seats; null when the server has
+ * no such endpoint (404), so the console can say "—".
  */
-export const getTenantSubscriptions = async (): Promise<TenantSubscriptionDto[] | null> => {
+export const getWorkspaceSubscriptions = async (): Promise<WorkspaceSubscriptionDto[] | null> => {
   try {
-    const items = await getApi(TENANT_SUBSCRIPTIONS_ROUTE);
-    return Array.isArray(items) ? (items as TenantSubscriptionDto[]) : [];
+    const items = await getApi(WORKSPACE_SUBSCRIPTIONS_ROUTE);
+    return Array.isArray(items) ? (items as WorkspaceSubscriptionDto[]) : [];
   } catch (err) {
     if (err instanceof ApiError && (err.status === 404 || err.status === 405)) return null;
     throw err;

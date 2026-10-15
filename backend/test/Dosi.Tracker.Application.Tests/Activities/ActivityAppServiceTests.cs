@@ -11,7 +11,7 @@ using Volo.Abp.BlobStoring;
 using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Guids;
 using Volo.Abp.Modularity;
-using Volo.Abp.MultiTenancy;
+using Dosi.Tracker.Workspaces;
 using Xunit;
 
 namespace Dosi.Tracker.Activities;
@@ -55,11 +55,11 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
         {
             await WithUnitOfWorkAsync(async () =>
             {
-                var project = new Project(projectId, null, "Seeded Project");
+                var project = new Project(projectId, TrackerTestConsts.WorkspaceId, "Seeded Project");
                 configureProject?.Invoke(project);
                 await _projectRepository.InsertAsync(project);
                 await _memberRepository.InsertAsync(
-                    new ProjectMember(_guidGenerator.Create(), null, projectId, CurrentUserId, role));
+                    new ProjectMember(_guidGenerator.Create(), TrackerTestConsts.WorkspaceId, projectId, CurrentUserId, role));
             });
         }
     }
@@ -483,7 +483,7 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
 
         // Another member tracked the very same window — irrelevant to this member.
         await WithUnitOfWorkAsync(() => _activityRepository.InsertAsync(new Activity(
-            _guidGenerator.Create(), null, OtherUserId, first.ProjectId, Guid.NewGuid(),
+            _guidGenerator.Create(), TrackerTestConsts.WorkspaceId, OtherUserId, first.ProjectId, Guid.NewGuid(),
             start.AddMinutes(10), start.AddMinutes(20))));
 
         // Starts 60 s before the previous block ends: tolerated jitter.
@@ -502,7 +502,7 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
 
         var foreignId = _guidGenerator.Create();
         await WithUnitOfWorkAsync(() => _activityRepository.InsertAsync(new Activity(
-            foreignId, null, OtherUserId, input.ProjectId, clientId,
+            foreignId, TrackerTestConsts.WorkspaceId, OtherUserId, input.ProjectId, clientId,
             input.StartedAt.AddHours(-3), input.StartedAt.AddHours(-3).AddMinutes(10))));
 
         // The other member's block is neither handed back nor duplicated: the reused id is refused (409),
@@ -525,7 +525,7 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
         var projectId = Guid.NewGuid();
         var start = BaseDay.AddDays(1).AddHours(9);
 
-        using (GetRequiredService<ICurrentTenant>().Change(tenantId))
+        using (GetRequiredService<ICurrentWorkspace>().Change(tenantId))
         {
             await WithUnitOfWorkAsync(async () =>
             {
@@ -555,7 +555,7 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
         await EnsureProjectAsync(input.ProjectId);
 
         var otherTenantId = Guid.NewGuid();
-        using (GetRequiredService<ICurrentTenant>().Change(otherTenantId))
+        using (GetRequiredService<ICurrentWorkspace>().Change(otherTenantId))
         {
             await WithUnitOfWorkAsync(() => _activityRepository.InsertAsync(new Activity(
                 _guidGenerator.Create(), otherTenantId, OtherUserId, Guid.NewGuid(), clientId,
@@ -655,7 +655,7 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
         var tenantId = Guid.NewGuid();
         var projectId = Guid.NewGuid();
 
-        using (GetRequiredService<ICurrentTenant>().Change(tenantId))
+        using (GetRequiredService<ICurrentWorkspace>().Change(tenantId))
         {
             await WithUnitOfWorkAsync(async () =>
             {
@@ -1148,7 +1148,7 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
         var start = BaseDay.AddDays(3).AddHours(9);
 
         await WithUnitOfWorkAsync(() => _activityRepository.InsertAsync(new Activity(
-            _guidGenerator.Create(), null, CurrentUserId, projectId, Guid.NewGuid(), start, start.AddMinutes(10))
+            _guidGenerator.Create(), TrackerTestConsts.WorkspaceId, CurrentUserId, projectId, Guid.NewGuid(), start, start.AddMinutes(10))
         {
             Productivity = null,
             Platform = "macos",
@@ -1215,7 +1215,7 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
             for (var i = 0; i < 5; i++)
             {
                 var activity = new Activity(
-                    _guidGenerator.Create(), null, Guid.NewGuid(), projectId, Guid.NewGuid(), start, start.AddMinutes(10));
+                    _guidGenerator.Create(), TrackerTestConsts.WorkspaceId, Guid.NewGuid(), projectId, Guid.NewGuid(), start, start.AddMinutes(10));
                 ids.Add(activity.Id);
                 await _activityRepository.InsertAsync(activity);
             }
@@ -1418,7 +1418,7 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
             var blobName = $"activities/{created.Id}/screen.png";
             await GetRequiredService<IBlobContainer>().SaveAsync(blobName, bytes);
             await GetRequiredService<IRepository<Screenshot, Guid>>().InsertAsync(new Screenshot(
-                screenshotId, null, created.Id, blobName, created.EndedAt, bytes.Length, "image/png"));
+                screenshotId, TrackerTestConsts.WorkspaceId, created.Id, blobName, created.EndedAt, bytes.Length, "image/png"));
         });
 
         var content = await _activityAppService.GetScreenshotContentAsync(screenshotId);
@@ -1462,7 +1462,7 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
         var projectId = Guid.NewGuid();
         await EnsureProjectAsync(projectId);
         var start = DateTime.UtcNow.AddDays(-60);
-        var othersBlock = new Activity(_guidGenerator.Create(), null, OtherUserId, projectId, Guid.NewGuid(), start, start.AddMinutes(10));
+        var othersBlock = new Activity(_guidGenerator.Create(), TrackerTestConsts.WorkspaceId, OtherUserId, projectId, Guid.NewGuid(), start, start.AddMinutes(10));
         await WithUnitOfWorkAsync(() => _activityRepository.InsertAsync(othersBlock));
 
         var updated = await _activityAppService.UpdateNoteAsync(othersBlock.Id, new UpdateActivityNoteDto { Description = "Client call" });

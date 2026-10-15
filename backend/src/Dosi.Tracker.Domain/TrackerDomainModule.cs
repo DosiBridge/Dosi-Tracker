@@ -19,7 +19,6 @@ using Volo.Abp.BackgroundWorkers;
 using Volo.Abp.Emailing;
 using Volo.Abp.FeatureManagement;
 using Volo.Abp.Identity;
-using Volo.Abp.TenantManagement;
 
 namespace Dosi.Tracker;
 
@@ -35,7 +34,6 @@ namespace Dosi.Tracker;
     typeof(AbpEmailingModule),
     typeof(AbpIdentityDomainModule),
     typeof(AbpOpenIddictDomainModule),
-    typeof(AbpTenantManagementDomainModule),
     typeof(AbpBackgroundWorkersModule),
     typeof(BlobStoringDatabaseDomainModule)
     )]
@@ -46,6 +44,27 @@ public class TrackerDomainModule : AbpModule
         Configure<AbpMultiTenancyOptions>(options =>
         {
             options.IsEnabled = MultiTenancyConsts.IsEnabled;
+        });
+
+        // One account per person: the email identifies them across every workspace they belong to.
+        Configure<Microsoft.AspNetCore.Identity.IdentityOptions>(options =>
+        {
+            options.User.RequireUniqueEmail = true;
+        });
+
+        Configure<Volo.Abp.Settings.AbpSettingOptions>(options =>
+        {
+            InsertBefore(options.ValueProviders, typeof(Volo.Abp.Settings.UserSettingValueProvider), typeof(Settings.WorkspaceSettingValueProvider));
+        });
+
+        Configure<Volo.Abp.Authorization.Permissions.AbpPermissionOptions>(options =>
+        {
+            options.ValueProviders.Add<Workspaces.WorkspaceRolePermissionValueProvider>();
+        });
+
+        Configure<SettingManagementOptions>(options =>
+        {
+            InsertBefore(options.Providers, typeof(UserSettingManagementProvider), typeof(Settings.WorkspaceSettingManagementProvider));
         });
 
         // Agents submit UTC and reports bucket by UTC day, so the server clock must be UTC too:
@@ -59,5 +78,18 @@ public class TrackerDomainModule : AbpModule
 #if DEBUG
         context.Services.Replace(ServiceDescriptor.Singleton<IEmailSender, NullEmailSender>());
 #endif
+    }
+
+    private static void InsertBefore<T>(Volo.Abp.Collections.ITypeList<T> list, Type before, Type type)
+    {
+        var index = list.IndexOf(before);
+        if (index < 0)
+        {
+            list.Add(type);
+        }
+        else
+        {
+            list.Insert(index, type);
+        }
     }
 }

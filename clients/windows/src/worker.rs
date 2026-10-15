@@ -32,7 +32,7 @@ use chrono::{DateTime, Datelike, Local, NaiveDate, TimeDelta, TimeZone, Utc};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::time::Instant;
 
-use crate::api::{ApiClient, ApiError, AuthError, ServerClock};
+use crate::api::{ApiClient, ApiError, AuthError, ServerClock, TokenCell, Workspace};
 use crate::config::{normalize_server_url, AppConfig};
 use crate::credentials::{self, Credentials, ProjectCache, SavedPause};
 use crate::model::{Activity, EndReason, Heartbeat, PresenceStatus, Project};
@@ -40,7 +40,7 @@ use crate::power::{self, SleepDetector};
 use crate::session_events::{SystemEvent, SystemNotice};
 use crate::state::{
     AwayPrompt, CaptureFlags, Command, LastScreenshot, NoticeKind, ProjectOption, RecentBlock, StateHandle,
-    TrackerStatus, UploadState, RECENT_BLOCKS,
+    TrackerStatus, UploadState, WorkspaceChoice, RECENT_BLOCKS,
 };
 use crate::storage::{self, QueueLimits, Storage};
 use crate::tracking::screenshot::ScreenCapture;
@@ -109,38 +109,61 @@ const QUEUE_ROWS_SHOWN: u32 = 20;
 /// The longest task note ("≤ 200 chars in the UI", CONTRACT §4).
 pub const TASK_NOTE_MAX_CHARS: usize = 200;
 
+const ONE_WORKSPACE: &str = "You aren't in any other workspace.";
+pub const NO_WORKSPACE: &str =
+    "You aren't in any workspace yet. Create one on the web dashboard or ask for an invite.";
+
 const NO_PROJECTS: &str = "You are not a member of any active project.";
 
-/// An account the agent signs in as, and the server it lives on.
+/// The signed-in user, the server it lives on and the workspace tracked in.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Account {
     /// The API address, normalized.
     pub server: String,
-    pub workspace: String,
     pub username: String,
     pub password: String,
+    /// `None` until a workspace is chosen (or after access to it was lost).
+    pub workspace_id: Option<String>,
+    pub workspace_name: String,
+    /// The user's token, shared by every client of this sign-in.
+    pub tokens: TokenCell,
 }
 
 impl Account {
+    pub fn new(server: String, username: String, password: String) -> Self {
+        Self { server, username, password, workspace_id: None, workspace_name: String::new(), tokens: TokenCell::default() }
+    }
+
+    /// The same sign-in, tracking in another workspace.
+    pub fn in_workspace(mut self, id: &str, name: &str) -> Self {
+        self.workspace_id = Some(id.to_owned());
+        self.workspace_name = name.to_owned();
+        self
+    }
+
     fn of(saved: &Credentials, cfg: &AppConfig) -> Self {
         Self {
             server: cfg.effective_api_base_url(saved.server.as_deref()),
-            workspace: saved.workspace.clone(),
             username: saved.username.clone(),
             password: saved.password.clone(),
+            workspace_id: saved.workspace_id.clone(),
+            workspace_name: saved.workspace_name.clone(),
+            tokens: TokenCell::with_refresh_token(saved.refresh_token.clone()),
         }
     }
 
-    /// The account, as the offline queue tags its rows.
+    /// The user, as the offline queue tags its rows.
     pub fn owner(&self) -> String {
-        storage::owner_key(&self.workspace, &self.username)
+        storage::owner_key(&self.username)
     }
 
     /// A client for this account. Every client shares `clock`, so the clock
     /// warning sees every answer.
     pub fn client(&self, clock: &ServerClock) -> ApiClient {
-        ApiClient::new(self.server.clone(), self.username.clone(), self.password.clone(), self.workspace.clone())
+        ApiClient::new(self.server.clone(), self.username.clone(), self.password.clone())
             .with_server_clock(clock.clone())
+            .with_tokens(self.tokens.clone())
+            .with_workspace(self.workspace_id.clone())
     }
 }
 
@@ -148,7 +171,7 @@ impl std::fmt::Debug for Account {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Account")
             .field("server", &self.server)
-            .field("workspace", &self.workspace)
+            .field("workspace_id", &self.workspace_id)
             .field("username", &self.username)
             .field("password", &"<hidden>")
             .finish()
@@ -389,6 +412,16 @@ async fn run(
     };
     state.update(|s| s.last_error = None);
 
+    // Attach the device signing key so every enqueued payload gets an HMAC tag.
+    let mut storage = opened.storage;
+    match crate::signing::load_or_create_key() {
+        Ok(key) => storage.set_signing_key(key),
+        Err(e) => tracing::warn!(?e, "could not load device signing key; payloads will not be signed"),
+    }
+    // Reconstruct Opened with the updated storage so the rest of the worker
+    // can use it through the original variable name.
+    let opened = crate::storage::Opened { storage, moved_aside: opened.moved_aside };
+
     let clock = ServerClock::default();
     let (control_events_tx, mut control_events) = mpsc::unbounded_channel();
     let control = control::spawn(state.clone(), clock.clone(), control_events_tx);
@@ -516,6 +549,12 @@ struct Worker {
     /// The saved sign-in, with what it remembers; `None` when signed out.
     saved: Option<Credentials>,
     account: Option<Account>,
+    /// Signed in to the server, waiting for a workspace to be picked.
+    pending: Option<Account>,
+    /// The workspace (name or id) to pick after signing in, if listed.
+    preselect: Option<String>,
+    /// Workspaces offered to choose from.
+    choices: Vec<Workspace>,
     /// The server refused the saved password.
     expired: bool,
     /// A sign-in the user typed is being checked.
@@ -589,6 +628,9 @@ impl Worker {
             credentials_file,
             saved: None,
             account: None,
+            pending: None,
+            preselect: None,
+            choices: Vec::new(),
             expired: false,
             signing_in: false,
             contacting: false,
@@ -642,7 +684,8 @@ impl Worker {
             self.state.update(|s| s.push_notice(NoticeKind::QueueReset { moved_to }, now));
         }
 
-        let Some(mut saved) = saved else {
+        // A sign-in saved by an older build names no workspace: sign in again.
+        let Some(mut saved) = saved.filter(|saved| saved.workspace_id.is_some()) else {
             let server = self.cfg.api_base_url.clone();
             self.state.update(|s| s.server_url = server);
             return;
@@ -656,7 +699,7 @@ impl Worker {
         // Offline first: the saved list is used at once; the server's answer
         // replaces it shortly.
         self.projects = saved.usable_projects(now).map(<[Project]>::to_vec);
-        let (name, workspace, server) = (saved.username.clone(), saved.workspace.clone(), account.server.clone());
+        let (name, workspace, server) = (saved.username.clone(), saved.workspace_name.clone(), account.server.clone());
         self.state.update(|s| {
             s.display_name = name;
             s.workspace = workspace;
@@ -827,7 +870,8 @@ impl Worker {
 
     /// Build the finished blocks and queue them locally.
     fn record(&mut self, finished: Vec<FinishedBlock>, speed: Speed) {
-        let Some(owner) = self.account.as_ref().map(Account::owner).filter(|_| !finished.is_empty()) else {
+        let tagged = self.account.as_ref().and_then(|a| Some((a.owner(), a.workspace_id.clone()?)));
+        let Some((owner, workspace)) = tagged.filter(|_| !finished.is_empty()) else {
             self.prune_screens();
             return;
         };
@@ -864,7 +908,7 @@ impl Worker {
                 description: block.description.as_deref(),
             };
             let activity = self.machine.snapshot(&spec, screen);
-            if self.enqueue(&activity, &owner, now) {
+            if self.enqueue(&activity, &owner, &workspace, now) {
                 queued += 1;
             }
         }
@@ -880,8 +924,8 @@ impl Worker {
 
     /// Queue one block and show it (and count it in the totals at once; the
     /// server's totals, refreshed after the upload, replace that estimate).
-    fn enqueue(&mut self, activity: &Activity, owner: &str, now: DateTime<Utc>) -> bool {
-        let id = match self.store.enqueue(activity, owner) {
+    fn enqueue(&mut self, activity: &Activity, owner: &str, workspace: &str, now: DateTime<Utc>) -> bool {
+        let id = match self.store.enqueue(activity, owner, workspace) {
             Ok(id) => id,
             Err(e) => {
                 tracing::error!(?e, "failed to queue activity");
@@ -1072,7 +1116,8 @@ impl Worker {
             maintain_queue(&self.store, owner.as_deref());
             publish_queue(&self.store, &self.state, owner.as_deref());
         }
-        if self.account.is_none() || self.expired || self.suspended.is_some() || self.shutting_down.is_some() {
+        let in_workspace = self.account.as_ref().is_some_and(|a| a.workspace_id.is_some());
+        if !in_workspace || self.expired || self.suspended.is_some() || self.shutting_down.is_some() {
             return;
         }
         if now >= self.next_projects_refresh {
@@ -1161,6 +1206,13 @@ impl Worker {
         self.announce_autostart = false;
         match command {
             Command::SignIn { workspace, username, password, server } => self.sign_in(workspace, username, password, server),
+            Command::ChooseWorkspace { index } => self.choose_workspace(index),
+            Command::CancelWorkspaceChoice => self.clear_choices(),
+            Command::SwitchWorkspace => self.switch_workspace(),
+            Command::SwitchToWorkspace { index, at } => {
+                self.user_acted(at);
+                self.switch_to(index, at);
+            }
             Command::SignOut { at } => self.sign_out(at),
             Command::SelectProject { project_id, at } => {
                 self.user_acted(at);
@@ -1195,7 +1247,7 @@ impl Worker {
         }
     }
 
-    fn sign_in(&mut self, workspace: String, username: String, password: String, server: Option<String>) {
+    fn sign_in(&mut self, workspace: Option<String>, username: String, password: String, server: Option<String>) {
         if self.account.is_some() && !self.expired {
             tracing::warn!("sign-in ignored: already signed in");
             return;
@@ -1207,39 +1259,227 @@ impl Worker {
                 return;
             }
         };
-        // The same account signing in again keeps the server saved with it.
-        let saved_server = self
-            .saved
-            .as_ref()
-            .filter(|saved| saved.same_account(&workspace, &username))
-            .and_then(|saved| saved.server.clone());
+        // The same user signing in again keeps the server and workspace saved.
+        let same = self.saved.as_ref().filter(|saved| saved.same_account(&username));
+        let saved_server = same.and_then(|saved| saved.server.clone());
+        let saved_workspace = same.and_then(|saved| saved.workspace_id.clone());
         let server = self.cfg.effective_api_base_url(typed.or(saved_server).as_deref());
+        self.clear_choices();
+        self.preselect = workspace.map(|w| w.trim().to_owned()).filter(|w| !w.is_empty()).or(saved_workspace);
         self.signing_in = true;
         self.state.update(|s| {
             s.signing_in = true;
             s.login_error = None;
         });
-        self.control.send(ControlRequest::SignIn(Account { server, workspace, username, password }));
+        self.control.send(ControlRequest::SignIn(Account::new(server, username, password)));
     }
 
-    /// The server accepted a sign-in. The same account (its password entered
-    /// again after it expired) keeps everything it remembered; another one
-    /// starts afresh.
-    fn signed_in(&mut self, account: Account, projects: Result<Vec<Project>, ApiError>) {
+    /// The server accepted the sign-in: pick the workspace to track in.
+    fn signed_in_to_server(&mut self, account: Account, workspaces: Result<Vec<Workspace>, ApiError>) {
+        if !self.signing_in {
+            return;
+        }
+        self.signing_in = false;
+        let preselect = self.preselect.take();
+        let workspaces = match workspaces {
+            Ok(workspaces) => workspaces,
+            Err(error) => {
+                let message = match &error {
+                    ApiError::Auth(e) => e.user_message(),
+                    ApiError::Offline(_) => AuthError::Offline(String::new()).user_message(),
+                    other => format!("Signed in, but your workspaces could not be loaded ({other})."),
+                };
+                return self.state.update(|s| {
+                    s.signing_in = false;
+                    s.login_error = Some(message);
+                });
+            }
+        };
+        let preselected = preselect.as_deref().and_then(|wanted| {
+            workspaces.iter().find(|w| w.id.eq_ignore_ascii_case(wanted)).or_else(|| workspaces.iter().find(|w| w.name.trim().eq_ignore_ascii_case(wanted)))
+        });
+        match (preselected, workspaces.as_slice()) {
+            (_, []) => self.state.update(|s| {
+                s.signing_in = false;
+                s.login_error = Some(NO_WORKSPACE.to_owned());
+            }),
+            (Some(workspace), _) | (None, [workspace]) => {
+                let account = account.in_workspace(&workspace.id, &workspace.name);
+                self.state.update(|s| s.signing_in = false);
+                self.signed_in(account);
+            }
+            (None, _) => {
+                self.offer(&workspaces, None);
+                self.choices = workspaces;
+                self.pending = Some(account);
+                self.state.update(|s| s.signing_in = false);
+            }
+        }
+    }
+
+    /// Show `workspaces` in the picker.
+    fn offer(&self, workspaces: &[Workspace], current: Option<&str>) {
+        let choices: Vec<WorkspaceChoice> = workspaces
+            .iter()
+            .map(|w| WorkspaceChoice { name: w.name.clone(), role: w.role.clone(), is_current: current == Some(w.id.as_str()) })
+            .collect();
+        self.state.update(|s| s.workspace_choices = choices);
+    }
+
+    /// The workspace picked after signing in.
+    fn choose_workspace(&mut self, index: usize) {
+        let (Some(workspace), Some(account)) = (self.choices.get(index).cloned(), self.pending.take()) else { return };
+        self.clear_choices();
+        self.signed_in(account.in_workspace(&workspace.id, &workspace.name));
+    }
+
+    fn clear_choices(&mut self) {
+        self.pending = None;
+        self.choices.clear();
+        self.state.update(|s| {
+            s.workspace_choices.clear();
+            s.finding_workspaces = false;
+            s.workspace_note = None;
+        });
+    }
+
+    /// "Switch workspace": list the workspaces of the signed-in user.
+    fn switch_workspace(&mut self) {
+        if self.account.is_none() || self.expired {
+            return;
+        }
+        self.clear_choices();
+        self.state.update(|s| s.finding_workspaces = true);
+        self.control.send(ControlRequest::MyWorkspaces);
+    }
+
+    fn my_workspaces_found(&mut self, found: Result<Vec<Workspace>, String>) {
+        self.state.update(|s| s.finding_workspaces = false);
+        let Some(current) = self.account.as_ref().filter(|_| !self.expired).map(|a| a.workspace_id.clone()) else { return };
+        let others = |items: &[Workspace]| items.iter().filter(|w| current.as_deref() != Some(w.id.as_str())).count();
+        let items = match found {
+            Err(message) => return self.state.update(|s| s.workspace_note = Some(message)),
+            Ok(items) if items.is_empty() => return self.state.update(|s| s.workspace_note = Some(NO_WORKSPACE.to_owned())),
+            Ok(items) if others(&items) == 0 => return self.state.update(|s| s.workspace_note = Some(ONE_WORKSPACE.to_owned())),
+            Ok(items) => items,
+        };
+        self.offer(&items, current.as_deref());
+        self.choices = items;
+    }
+
+    /// Track in `workspace_choices[index]` from now on: the block so far is
+    /// queued in the workspace it was recorded in, and the project is chosen
+    /// again. The sign-in (and its token) stays.
+    fn switch_to(&mut self, index: usize, at: DateTime<Utc>) {
+        let Some(old) = self.account.clone().filter(|_| !self.expired) else { return };
+        let Some(target) = self.choices.get(index).cloned() else { return };
+        if old.workspace_id.as_deref() == Some(target.id.as_str()) {
+            return;
+        }
+        let now = self.now();
+        let finished = self.blocks.end(at.min(now), now, EndReason::SignOut);
+        self.record(finished, Speed::Normal);
+        self.clear_choices();
+        self.use_workspace(old.in_workspace(&target.id, &target.name), now);
+    }
+
+    /// Carry on in `account`'s workspace: what belonged to the previous one
+    /// (projects, the chosen project, the question about time away) is dropped.
+    fn use_workspace(&mut self, account: Account, now: DateTime<Utc>) {
+        if let Some(saved) = self.saved.as_mut() {
+            saved.workspace_id = account.workspace_id.clone();
+            saved.workspace_name = account.workspace_name.clone();
+            saved.project_id = None;
+            saved.projects = None;
+        }
+        self.persist();
+        self.projects = None;
+        self.session = None;
+        self.choose_notified = false;
+        self.away = None;
+        self.prompt = None;
+        self.presence_sent = None;
+        self.contacting = account.workspace_id.is_some();
+        let (name, lost) = (account.workspace_name.clone(), account.workspace_id.is_none());
+        self.state.update(|s| {
+            s.workspace = if lost { String::new() } else { name };
+            s.projects.clear();
+            s.selected_project = None;
+            s.tracked_today_secs = 0.0;
+            s.tracked_week_secs = 0.0;
+            s.week_day_secs = [0.0; 7];
+            s.week_days_fetched = None;
+            s.last_productivity = 0;
+            s.capture = CaptureFlags::default();
+            s.last_error = None;
+            if !lost {
+                s.workspace_lost = None;
+            }
+        });
+        self.account = Some(account.clone());
+        self.control.send(ControlRequest::UseAccount(Some(account.clone())));
+        self.uploader.send(UploadCommand::Account(Some(account.clone())));
+        if account.workspace_id.is_some() {
+            self.control.send(ControlRequest::RefreshProjects);
+            self.next_projects_refresh = Instant::now() + RECONNECT_EVERY;
+            self.totals_wanted = true;
+        }
+        self.choose_session(now);
+        self.reconcile(now, EndReason::Interval);
+    }
+
+    /// The account lost access to the workspace it tracks in: tracking stops
+    /// (what was recorded waits in the queue) and another workspace is asked for.
+    fn workspace_lost(&mut self, workspace_id: &str) {
+        let Some(account) = self.account.clone().filter(|_| !self.expired) else { return };
+        if account.workspace_id.as_deref() != Some(workspace_id) {
+            return;
+        }
+        let now = self.now();
+        let name = if account.workspace_name.trim().is_empty() { "this workspace".to_owned() } else { account.workspace_name.clone() };
+        tracing::warn!(%workspace_id, "no longer a member of the workspace; tracking stops");
+        let finished = self.blocks.end(now, now, EndReason::SignOut);
+        self.record(finished, Speed::Normal);
+        self.uploader.send(UploadCommand::RowsQueued);
+        let mut account = account;
+        account.workspace_id = None;
+        self.use_workspace(account, now);
+        let note = format!("You no longer have access to {name}.");
+        self.state.update(|s| {
+            s.workspace_lost = Some(name.clone());
+            s.workspace_note = Some(note);
+            s.finding_workspaces = true;
+            s.push_notice(NoticeKind::WorkspaceLost { name }, now);
+        });
+        self.control.send(ControlRequest::MyWorkspaces);
+    }
+
+    /// A workspace was chosen after signing in. The same user in the same
+    /// workspace (the password entered again after it expired) keeps
+    /// everything it remembered; otherwise it starts afresh.
+    fn signed_in(&mut self, account: Account) {
         let now = self.now();
         self.signing_in = false;
-        let same = self.saved.as_ref().is_some_and(|saved| saved.owner_key() == account.owner());
+        let same = self
+            .saved
+            .as_ref()
+            .is_some_and(|saved| saved.owner_key() == account.owner() && saved.workspace_id == account.workspace_id);
         if !same && self.account.is_some() {
             self.forget_account(now);
         }
         let mut saved = match self.saved.take() {
             Some(saved) if same => saved,
-            _ => Credentials::new(String::new(), String::new(), String::new(), None),
+            _ => Credentials::new(String::new(), String::new(), None),
         };
-        saved.workspace = account.workspace.clone();
+        saved.workspace_id = account.workspace_id.clone();
+        saved.workspace_name = account.workspace_name.clone();
         saved.username = account.username.clone();
         saved.password = account.password.clone();
+        saved.refresh_token = account.tokens.refresh_token();
         saved.server = (account.server != self.cfg.api_base_url).then(|| account.server.clone());
+        if !same {
+            self.projects = None;
+        }
         self.saved = Some(saved);
         self.persist();
 
@@ -1248,31 +1488,28 @@ impl Worker {
             maintain_queue(&self.store, Some(&owner));
         }
         publish_queue(&self.store, &self.state, Some(&owner));
-        let (name, workspace, server) = (account.username.clone(), account.workspace.clone(), account.server.clone());
+        let (name, workspace, server) = (account.username.clone(), account.workspace_name.clone(), account.server.clone());
         self.state.update(|s| {
             s.display_name = name;
             s.workspace = workspace;
             s.server_url = server;
             s.signing_in = false;
             s.login_error = None;
+            s.workspace_lost = None;
         });
         self.account = Some(account.clone());
         self.expired = false;
-        self.contacting = false;
+        self.contacting = true;
         // Say where this device stands at once.
         self.presence_sent = None;
         self.set_reachable(true);
+        self.control.send(ControlRequest::UseAccount(Some(account.clone())));
+        self.control.send(ControlRequest::RefreshProjects);
+        self.next_projects_refresh = Instant::now() + RECONNECT_EVERY;
         self.uploader.send(UploadCommand::Account(Some(account)));
         self.totals_wanted = true;
-        match projects {
-            Ok(projects) => self.apply_projects(projects),
-            Err(e) => {
-                tracing::warn!(error = %e, "signed in, but the projects could not be loaded");
-                self.next_projects_refresh = Instant::now() + RECONNECT_EVERY;
-                self.choose_session(now);
-                self.reconcile(now, EndReason::Interval);
-            }
-        }
+        self.choose_session(now);
+        self.reconcile(now, EndReason::Interval);
     }
 
     fn sign_in_failed(&mut self, error: &AuthError) {
@@ -1352,6 +1589,8 @@ impl Worker {
         self.screens.clear();
         self.presence_sent = None;
         self.announce_autostart = false;
+        self.pending = None;
+        self.choices.clear();
         publish_queue(&self.store, &self.state, None);
         let server = self.cfg.api_base_url.clone();
         self.state.update(|s| {
@@ -1371,6 +1610,9 @@ impl Worker {
             s.last_screenshot = None;
             s.upload_issue = None;
             s.last_error = None;
+            s.workspace_choices.clear();
+            s.workspace_note = None;
+            s.workspace_lost = None;
         });
     }
 
@@ -1467,7 +1709,7 @@ impl Worker {
         }
         // Also while the sign-in is expired: the queue keeps the account's
         // rows for when the password is entered again.
-        let Some(owner) = self.account.as_ref().map(Account::owner) else {
+        let Some((owner, workspace)) = self.account.as_ref().and_then(|a| Some((a.owner(), a.workspace_id.clone()?))) else {
             tracing::info!("time away not kept: signed out");
             return;
         };
@@ -1476,7 +1718,7 @@ impl Worker {
         let blocks = self.machine.kept_idle_blocks(prompt.session.project_id(), prompt.from, prompt.to, interval, self.task_note.as_deref());
         let mut queued = 0;
         for activity in &blocks {
-            if self.enqueue(activity, &owner, now) {
+            if self.enqueue(activity, &owner, &workspace, now) {
                 queued += 1;
             }
         }
@@ -1512,10 +1754,12 @@ impl Worker {
 
     fn on_control(&mut self, event: ControlEvent) {
         match event {
-            ControlEvent::SignedIn { account, projects } => self.signed_in(account, projects),
+            ControlEvent::SignedIn { account, workspaces } => self.signed_in_to_server(account, workspaces),
             ControlEvent::SignInFailed(error) => self.sign_in_failed(&error),
+            ControlEvent::MyWorkspaces(found) => self.my_workspaces_found(found),
+            ControlEvent::WorkspaceLost(workspace) => self.workspace_lost(&workspace),
             ControlEvent::Projects(projects) => {
-                if self.account.is_some() && !self.expired {
+                if self.account.as_ref().is_some_and(|a| a.workspace_id.is_some()) && !self.expired {
                     self.apply_projects(projects);
                 }
             }
@@ -1534,14 +1778,18 @@ impl Worker {
         match event {
             // A pass of the previous account (a sign-out's final drain) may
             // report after another account signed in: not about this one.
-            UploadEvent::SignInExpired { owner, .. } | UploadEvent::Projects { owner, .. } | UploadEvent::Parked { owner, .. }
+            UploadEvent::SignInExpired { owner, .. }
+            | UploadEvent::Projects { owner, .. }
+            | UploadEvent::Parked { owner, .. }
+            | UploadEvent::WorkspaceLost { owner, .. }
                 if !self.is_current_owner(&owner) =>
             {
                 tracing::debug!("an upload event of the previous account ignored");
             }
             UploadEvent::SignInExpired { reason, .. } => self.expire(&reason),
+            UploadEvent::WorkspaceLost { workspace_id, .. } => self.workspace_lost(&workspace_id),
             UploadEvent::Projects { projects, .. } => {
-                if !self.expired {
+                if !self.expired && self.account.as_ref().is_some_and(|a| a.workspace_id.is_some()) {
                     self.apply_projects(projects);
                 }
             }
@@ -1584,6 +1832,7 @@ impl Worker {
             sign_in_expired: self.expired,
             paused: self.pause.is_some(),
             has_session: self.session.is_some(),
+            no_workspace: self.account.as_ref().is_some_and(|a| a.workspace_id.is_none()),
             projects_known: self.projects.is_some(),
             contacting: self.contacting || self.signing_in,
             locked: self.locked || self.disconnected,
@@ -1654,7 +1903,8 @@ impl Worker {
     /// every change of status or project. Never queued.
     fn maybe_heartbeat(&mut self, status: TrackerStatus) {
         let timed_break = self.pause.is_some_and(|p| p.until.is_some());
-        let online = self.account.is_some() && !self.expired && self.suspended.is_none() && self.shutting_down.is_none();
+        let in_workspace = self.account.as_ref().is_some_and(|a| a.workspace_id.is_some());
+        let online = in_workspace && !self.expired && self.suspended.is_none() && self.shutting_down.is_none();
         let Some(presence) = session::presence(status, timed_break).filter(|_| online) else {
             return;
         };
@@ -1708,7 +1958,11 @@ impl Worker {
         let (Some(path), Some(saved)) = (&self.credentials_file, &self.saved) else {
             return;
         };
-        if let Err(e) = credentials::save_at(path, saved) {
+        let mut saved = saved.clone();
+        if let Some(refresh_token) = self.account.as_ref().and_then(|a| a.tokens.refresh_token()) {
+            saved.refresh_token = Some(refresh_token);
+        }
+        if let Err(e) = credentials::save_at(path, &saved) {
             tracing::warn!(?e, "could not save the sign-in");
         }
     }
@@ -1885,3 +2139,4 @@ fn local_midnight<Tz: TimeZone>(date: NaiveDate, tz: &Tz) -> Option<DateTime<Utc
 
 #[cfg(test)]
 mod tests;
+

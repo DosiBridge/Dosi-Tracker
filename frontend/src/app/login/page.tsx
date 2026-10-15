@@ -2,19 +2,21 @@
 
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { useRouter } from "next/navigation";
-import { Radar, Eye, EyeOff, Loader2, ArrowLeft, Building2, CheckCircle2, KeyRound, ShieldAlert } from "lucide-react";
+import { Radar, Eye, EyeOff, Loader2, ArrowLeft, Building2, KeyRound, ShieldAlert } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input, Select } from "@/components/ui/input";
 import { ThemeToggle } from "@/components/ui/theme-toggle";
 import { LoginHero } from "@/components/motion/login-hero";
-import { loginApi, registerWorkspaceApi } from "@/hooks/useApi";
+import { ApiError, loginApi, registerWorkspaceApi } from "@/hooks/useApi";
+import { resolveLanding, safeNext } from "@/hooks/workspace-landing";
 import { useSession } from "@/components/session-provider";
 import { landingFor } from "@/lib/roles";
 import { SUPPORT_EMAIL } from "@/lib/brand";
-import { isStorageAvailable } from "@/lib/live-session";
+import { isStorageAvailable, setCurrentWorkspace } from "@/lib/live-session";
 import {
   WEB_SIGN_IN_CLIENT,
   changePasswordAtSignIn,
+  EMAIL_ALREADY_REGISTERED_MESSAGE,
   classifySignInError,
   failureField,
   signInFailureMessage,
@@ -34,6 +36,7 @@ const PLAN_NAME: Record<PlanId, string> = {
 /** ABP Identity's default minimum; the server's own rules are reported if it asks for more. */
 const MIN_NEW_SECRET_LENGTH = 6;
 
+const deadlineAfter = (seconds: number) => Date.now() + seconds * 1000;
 const subscribeNothing = () => () => {};
 const assumeAvailable = () => true;
 
@@ -47,39 +50,51 @@ function clock(seconds: number): string {
 interface PendingChange {
   email: string;
   current: string;
-  tenant: string | undefined;
 }
 
 export default function LoginPage() {
   const router = useRouter();
   const { refreshSession } = useSession();
   const [mode, setModeState] = useState<"signin" | "signup">("signin");
+  const [firstName, setFirstName] = useState("");
+  const [surname, setSurname] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [workspace, setWorkspace] = useState("");
   const [show, setShow] = useState(false);
   const [loading, setLoading] = useState<string | null>(null);
   const [wsName, setWsName] = useState("");
   const [wsPlan, setWsPlan] = useState<PlanId>("free");
   const [failure, setFailure] = useState<SignInFailure | null>(null);
-  /** The workspace name the failure refers to (as typed when it happened). */
-  const [failedWorkspace, setFailedWorkspace] = useState("");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [infoMsg, setInfoMsg] = useState<string | null>(null);
-  /** Set after a successful signup: the exact workspace name to sign in with. */
-  const [createdWorkspace, setCreatedWorkspace] = useState<string | null>(null);
+  /** Joining by invitation (`?invite=`): sign-up creates no workspace. */
+  const [inviteToken, setInviteToken] = useState<string | null>(null);
+  /** Where to go after signing in (`?next=`, e.g. back to an invitation). */
+  const [next, setNext] = useState<string | null>(null);
   /** A rate limit: no sign-in attempts before this instant (epoch ms). */
   const [retryAt, setRetryAt] = useState<number | null>(null);
   const [now, setNow] = useState<number | null>(null);
   const [pendingChange, setPendingChange] = useState<PendingChange | null>(null);
   const [newSecret, setNewSecret] = useState("");
   const [confirmSecret, setConfirmSecret] = useState("");
-  const workspaceRef = useRef<HTMLInputElement>(null);
   const passwordRef = useRef<HTMLInputElement>(null);
 
   // Blocked site data means no session can be kept: say so before anyone types a password.
-  // (On the server, and while hydrating, assume it works — the notice only appears in a browser that refuses.)
   const storageAvailable = useSyncExternalStore(subscribeNothing, isStorageAvailable, assumeAvailable);
+
+  // ?mode=signup&email=…&invite=…&next=…
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const id = window.setTimeout(() => {
+      setNext(safeNext(params.get("next")));
+      const invite = params.get("invite");
+      if (invite) setInviteToken(invite);
+      const prefill = params.get("email");
+      if (prefill) setEmail(prefill);
+      if (params.get("mode") === "signup") setModeState("signup");
+    }, 0);
+    return () => window.clearTimeout(id);
+  }, []);
 
   // Count down a rate limit (on the button), then let the form go again.
   useEffect(() => {
@@ -103,38 +118,51 @@ export default function LoginPage() {
   const secondsLeft = retryAt !== null && now !== null ? Math.max(0, (retryAt - now) / 1000) : null;
   const rateLimited = retryAt !== null;
 
-  // Switching between sign-in and signup starts clean: an error from one form
-  // must not linger over the other.
-  function setMode(next: "signin" | "signup") {
-    setModeState(next);
+  function setMode(nextMode: "signin" | "signup") {
+    setModeState(nextMode);
     setFailure(null);
     setErrorMsg(null);
     setInfoMsg(null);
   }
 
-  /** Show a failure, start a rate limit's countdown, and point at the field to fix. */
-  function applyFailure(f: SignInFailure, typedWorkspace: string) {
+  function applyFailure(f: SignInFailure) {
     setFailure(f);
-    setFailedWorkspace(typedWorkspace);
-    if (f.kind === "rate-limited") setRetryAt(Date.now() + (f.retryAfterSeconds ?? 60) * 1000);
-    const field = failureField(f);
-    if (field === "workspace") workspaceRef.current?.focus();
-    else if (field === "credentials") passwordRef.current?.select();
+    if (f.kind === "rate-limited") setRetryAt(deadlineAfter(f.retryAfterSeconds ?? 60));
+    if (failureField(f) === "credentials") passwordRef.current?.select();
   }
 
-  function fail(err: unknown, typedWorkspace: string): SignInFailure {
+  function fail(err: unknown): SignInFailure {
     const f = classifySignInError(err);
-    applyFailure(f, typedWorkspace);
+    applyFailure(f);
     return f;
   }
 
-  async function finishSignIn(tenant: string) {
-    // Build the real session (identity, workspace, data) BEFORE navigating,
-    // so the first page after sign-in already shows this account, not a
-    // stale or demo one. The role decides where they land.
+  /** Signed in: pick the workspace (or the console, or the chooser) and go. */
+  async function finishSignIn(workspaceId?: string) {
+    if (next) {
+      router.push(next);
+      return;
+    }
+    let landing;
+    try {
+      if (workspaceId) {
+        setCurrentWorkspace(workspaceId);
+        landing = "dashboard" as const;
+      } else {
+        landing = await resolveLanding();
+      }
+    } catch (err) {
+      fail(err);
+      setLoading(null);
+      return;
+    }
+    if (landing === "chooser") {
+      router.push("/workspaces");
+      return;
+    }
+    // Build the real session BEFORE navigating, so the first page already shows this account.
     const signedIn = await refreshSession();
-    const destination = signedIn ? landingFor(signedIn.role) : tenant ? "/dashboard" : "/host";
-    router.push(destination);
+    router.push(signedIn ? landingFor(signedIn.role) : landing === "host" ? "/host" : "/dashboard");
   }
 
   async function onSubmit(e: React.FormEvent) {
@@ -144,20 +172,18 @@ export default function LoginPage() {
     setFailure(null);
     setErrorMsg(null);
     setInfoMsg(null);
-    const tenant = workspace.trim();
     try {
-      // Workspace (tenant) name scopes the login; the platform account signs in without one.
-      await loginApi(email, password, tenant || undefined);
+      await loginApi(email.trim(), password);
     } catch (err) {
-      const f = fail(err, tenant);
+      const f = fail(err);
       if (f.kind === "change-required") {
-        setPendingChange({ email, current: password, tenant: tenant || undefined });
+        setPendingChange({ email: email.trim(), current: password });
         setFailure(null);
       }
       setLoading(null);
       return;
     }
-    await finishSignIn(tenant);
+    await finishSignIn();
   }
 
   async function onChangeSecret(e: React.FormEvent) {
@@ -180,7 +206,7 @@ export default function LoginPage() {
     setLoading("change");
     const result = await changePasswordAtSignIn({
       fetch: (input, init) => fetch(input, init),
-      tokenUrl: tokenEndpoint(pendingChange.tenant),
+      tokenUrl: tokenEndpoint(),
       clientId: WEB_SIGN_IN_CLIENT.clientId,
       scope: WEB_SIGN_IN_CLIENT.scope,
       username: pendingChange.email,
@@ -188,67 +214,72 @@ export default function LoginPage() {
       newPassword: newSecret,
     });
     if (!result.ok) {
-      // The server's own words for a refused new password (its rules); otherwise the usual explanation.
       if (result.message) setErrorMsg(result.message);
-      else applyFailure(result.failure, pendingChange.tenant ?? "");
+      else applyFailure(result.failure);
       setLoading(null);
       return;
     }
     try {
-      await loginApi(pendingChange.email, newSecret, pendingChange.tenant);
+      await loginApi(pendingChange.email, newSecret);
     } catch (err) {
-      fail(err, pendingChange.tenant ?? "");
+      fail(err);
       setLoading(null);
       return;
     }
     setPendingChange(null);
     setPassword("");
-    await finishSignIn(pendingChange.tenant ?? "");
+    await finishSignIn();
   }
 
-  async function onCreateWorkspace(e: React.FormEvent) {
+  async function onSignUp(e: React.FormEvent) {
     e.preventDefault();
-    if (!wsName.trim() || !password) return;
+    if ((!inviteToken && !wsName.trim()) || !password || !email.trim()) return;
     setLoading("__signup__");
     setFailure(null);
     setErrorMsg(null);
     setInfoMsg(null);
-    let created: string;
+    let workspaceId: string | undefined;
     try {
-      const result = await registerWorkspaceApi(wsName.trim(), email, password, PLAN_NAME[wsPlan]);
-      created = result.name || wsName.trim();
+      const result = await registerWorkspaceApi({
+        firstName: firstName.trim() || undefined,
+        surname: surname.trim() || undefined,
+        email: email.trim(),
+        password,
+        ...(inviteToken ? { inviteToken } : { workspaceName: wsName.trim(), planName: PLAN_NAME[wsPlan] }),
+      });
+      workspaceId = result?.workspaceId || undefined;
     } catch (err) {
-      const f = classifySignInError(err);
-      setErrorMsg(
-        f.kind === "unreachable"
-          ? signInFailureMessage(f)
-          : err instanceof Error
-            ? err.message
-            : "We couldn't create your workspace. Please try again.",
-      );
+      if (err instanceof ApiError && err.code === "Tracker:EmailAlreadyRegistered") {
+        setModeState("signin");
+        setInfoMsg(EMAIL_ALREADY_REGISTERED_MESSAGE);
+      } else if (err instanceof ApiError && err.code === "Tracker:DuplicateWorkspaceName") {
+        setErrorMsg("A workspace with that name already exists. Choose another name.");
+      } else {
+        const f = classifySignInError(err);
+        setErrorMsg(
+          f.kind === "unreachable"
+            ? signInFailureMessage(f)
+            : err instanceof ApiError && err.serverMessage
+              ? err.serverMessage
+              : "We couldn't create your account. Please try again.",
+        );
+      }
       setLoading(null);
       return;
     }
     try {
-      // Log straight into the freshly created tenant as its admin.
-      await loginApi(email, password, created);
-      await refreshSession();
+      await loginApi(email.trim(), password);
     } catch (err) {
-      // The workspace exists now — don't strand it behind a "name already taken"
-      // on the next attempt: switch to sign-in with everything filled in.
       setModeState("signin");
-      setWorkspace(created);
+      setInfoMsg("Your account was created. Sign in to continue.");
+      fail(err);
       setLoading(null);
-      setInfoMsg(`Your workspace “${created}” was created. Sign in to continue.`);
-      fail(err, created);
       return;
     }
-    // Show the exact name they will type at the next sign-in before moving on.
-    setCreatedWorkspace(created);
-    setLoading(null);
+    await finishSignIn(workspaceId);
   }
 
-  const errorText = errorMsg ?? (failure ? signInFailureMessage(failure, { workspace: failedWorkspace }) : null);
+  const errorText = errorMsg ?? (failure ? signInFailureMessage(failure) : null);
   const errorId = "login-error";
   const describedBy = errorText ? errorId : undefined;
   const credentialsInvalid = failure?.kind === "invalid";
@@ -279,28 +310,7 @@ export default function LoginPage() {
             </div>
           )}
 
-          {createdWorkspace ? (
-            <div className="space-y-5">
-              <div className="flex h-12 w-12 items-center justify-center rounded-full bg-success/15 text-success">
-                <CheckCircle2 className="h-6 w-6" />
-              </div>
-              <div>
-                <h2 className="font-display text-2xl font-bold tracking-tight">Your workspace is ready</h2>
-                <p className="mt-1 text-sm text-muted-foreground">
-                  You&apos;re signed in as its owner. Next time you sign in, enter this in the Workspace field:
-                </p>
-              </div>
-              <div className="rounded-xl border border-border bg-muted/40 p-3">
-                <div className="text-xs text-muted-foreground">Workspace</div>
-                <div className="mt-0.5 break-all font-mono text-base font-semibold" data-testid="created-workspace-name">
-                  {createdWorkspace}
-                </div>
-              </div>
-              <Button size="lg" className="w-full" onClick={() => router.push("/dashboard")}>
-                Continue to your dashboard
-              </Button>
-            </div>
-          ) : pendingChange ? (
+          {pendingChange ? (
             <>
               <button
                 type="button"
@@ -320,8 +330,8 @@ export default function LoginPage() {
               </div>
               <h2 className="mt-4 font-display text-2xl font-bold tracking-tight">Choose a new password</h2>
               <p className="mt-1 text-sm text-muted-foreground">
-                This account has to set a new password before it can sign in — your workspace owner gave you a one-time
-                password, or yours has expired. You&apos;ll use the new one from now on, here and in the desktop app.
+                This account has to set a new password before it can sign in. You&apos;ll use the new one from now on, here
+                and in the desktop app.
               </p>
               <form onSubmit={onChangeSecret} className="mt-8 space-y-4" noValidate>
                 <div className="space-y-1.5">
@@ -373,69 +383,73 @@ export default function LoginPage() {
               >
                 <ArrowLeft className="h-4 w-4" aria-hidden="true" /> Back to sign in
               </button>
-              <h2 className="font-display text-2xl font-bold tracking-tight">Create your workspace</h2>
+              <h2 className="font-display text-2xl font-bold tracking-tight">{inviteToken ? "Create your account" : "Create your workspace"}</h2>
               <p className="mt-1 text-sm text-muted-foreground">
-                Spin up a new, fully isolated tenant. You&apos;ll be the owner.
+                {inviteToken
+                  ? "One account for every workspace you join."
+                  : "You'll be its owner. One account works across all your workspaces."}
               </p>
 
-              <form onSubmit={onCreateWorkspace} className="mt-8 space-y-4">
+              <form onSubmit={onSignUp} className="mt-8 space-y-4">
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="space-y-1.5">
+                    <label htmlFor="signup-first-name" className="text-sm font-medium">First name</label>
+                    <Input id="signup-first-name" value={firstName} onChange={(e) => setFirstName(e.target.value)} autoComplete="given-name" autoFocus />
+                  </div>
+                  <div className="space-y-1.5">
+                    <label htmlFor="signup-surname" className="text-sm font-medium">Surname</label>
+                    <Input id="signup-surname" value={surname} onChange={(e) => setSurname(e.target.value)} autoComplete="family-name" />
+                  </div>
+                </div>
                 <div className="space-y-1.5">
                   <label htmlFor="signup-email" className="text-sm font-medium">Email</label>
-                  <Input id="signup-email" type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="name@company.com" autoComplete="email" required autoFocus />
+                  <Input id="signup-email" type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="name@company.com" autoComplete="email" required />
                 </div>
                 <div className="space-y-1.5">
                   <label htmlFor="signup-password" className="text-sm font-medium">Password</label>
                   <Input id="signup-password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="new-password" required minLength={6} />
                 </div>
-                <div className="space-y-1.5">
-                  <label htmlFor="signup-workspace-name" className="text-sm font-medium">Workspace name</label>
-                  <Input id="signup-workspace-name" value={wsName} onChange={(e) => setWsName(e.target.value)} placeholder="Acme Corp" autoComplete="organization" required />
-                  {wsName.trim() && (
-                    <p className="text-xs text-muted-foreground">
-                      You&apos;ll sign in with the workspace name <span className="font-medium text-foreground">{wsName.trim()}</span>.
-                    </p>
-                  )}
-                </div>
-                <div className="space-y-1.5">
-                  <label htmlFor="signup-plan" className="text-sm font-medium">Choose a plan</label>
-                  <Select id="signup-plan" value={wsPlan} onChange={(e) => setWsPlan(e.target.value as PlanId)}>
-                    <option value="free">Free — $0 · up to 3 seats</option>
-                    <option value="starter">Starter — $6/user/mo · 14-day trial</option>
-                    <option value="business">Business — $12/user/mo · 14-day trial</option>
-                  </Select>
-                </div>
+                {!inviteToken && (
+                  <>
+                    <div className="space-y-1.5">
+                      <label htmlFor="signup-workspace-name" className="text-sm font-medium">Workspace name</label>
+                      <Input id="signup-workspace-name" value={wsName} onChange={(e) => setWsName(e.target.value)} placeholder="Acme Corp" autoComplete="organization" required />
+                    </div>
+                    <div className="space-y-1.5">
+                      <label htmlFor="signup-plan" className="text-sm font-medium">Choose a plan</label>
+                      <Select id="signup-plan" value={wsPlan} onChange={(e) => setWsPlan(e.target.value as PlanId)}>
+                        <option value="free">Free — $0 · up to 3 seats</option>
+                        <option value="starter">Starter — $6/user/mo · 14-day trial</option>
+                        <option value="business">Business — $12/user/mo · 14-day trial</option>
+                      </Select>
+                    </div>
+                  </>
+                )}
                 {errorText && <ErrorNote id={errorId}>{errorText}</ErrorNote>}
-                <Button type="submit" size="lg" className="w-full" disabled={!!loading || !storageAvailable || !wsName.trim() || !email || !password}>
+                <Button
+                  type="submit"
+                  size="lg"
+                  className="w-full"
+                  disabled={!!loading || !storageAvailable || (!inviteToken && !wsName.trim()) || !email || !password}
+                >
                   {loading === "__signup__" && <Loader2 className="h-4 w-4 animate-spin motion-reduce:animate-none" aria-hidden="true" />}
-                  {loading === "__signup__" ? "Creating…" : "Create workspace"}
+                  {loading === "__signup__" ? "Creating…" : inviteToken ? "Create account" : "Create workspace"}
                 </Button>
               </form>
 
-              <div className="mt-6 flex items-start gap-2.5 rounded-xl border border-border bg-muted/40 p-3 text-xs text-muted-foreground">
-                <Building2 className="mt-0.5 h-4 w-4 shrink-0" />
-                Every workspace is a separate tenant with isolated members, projects, screenshots, and billing.
-              </div>
+              {!inviteToken && (
+                <div className="mt-6 flex items-start gap-2.5 rounded-xl border border-border bg-muted/40 p-3 text-xs text-muted-foreground">
+                  <Building2 className="mt-0.5 h-4 w-4 shrink-0" />
+                  Every workspace keeps its own members, projects, screenshots and billing.
+                </div>
+              )}
             </>
           ) : (
             <>
               <h2 className="font-display text-2xl font-bold tracking-tight">Welcome back</h2>
-              <p className="mt-1 text-sm text-muted-foreground">Sign in to your workspace to continue.</p>
+              <p className="mt-1 text-sm text-muted-foreground">Sign in with your email and password.</p>
 
               <form onSubmit={onSubmit} className="mt-8 space-y-4">
-                <div className="space-y-1.5">
-                  <label htmlFor="login-workspace" className="text-sm font-medium">Workspace</label>
-                  <Input
-                    ref={workspaceRef}
-                    id="login-workspace"
-                    value={workspace}
-                    onChange={(e) => setWorkspace(e.target.value)}
-                    placeholder="Your workspace name"
-                    autoComplete="organization"
-                    aria-invalid={failure?.kind === "unknown-workspace" ? true : undefined}
-                    aria-describedby={failure?.kind === "unknown-workspace" ? `${errorId} login-workspace-hint` : "login-workspace-hint"}
-                  />
-                  <p id="login-workspace-hint" className="text-xs text-muted-foreground">The name your workspace was created with.</p>
-                </div>
                 <div className="space-y-1.5">
                   <label htmlFor="login-email" className="text-sm font-medium">Email</label>
                   <Input
@@ -508,7 +522,7 @@ export default function LoginPage() {
                     onClick={() => setMode("signup")}
                     className="mt-1 rounded text-sm font-semibold text-primary-strong hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                   >
-                    Create a workspace →
+                    {inviteToken ? "Create an account →" : "Create a workspace →"}
                   </button>
                 </div>
               </div>

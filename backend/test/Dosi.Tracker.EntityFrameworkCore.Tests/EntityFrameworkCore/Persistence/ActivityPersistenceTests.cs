@@ -4,7 +4,7 @@ using Dosi.Tracker.Activities;
 using Microsoft.EntityFrameworkCore;
 using Shouldly;
 using Volo.Abp.Domain.Repositories;
-using Volo.Abp.MultiTenancy;
+using Dosi.Tracker.Workspaces;
 using Xunit;
 
 namespace Dosi.Tracker.EntityFrameworkCore.Persistence;
@@ -17,12 +17,12 @@ public class ActivityPersistenceTests : TrackerEntityFrameworkCoreTestBase
     private static readonly DateTime Start = new(2026, 7, 20, 9, 0, 0, DateTimeKind.Utc);
 
     private readonly IRepository<Activity, Guid> _activityRepository;
-    private readonly ICurrentTenant _currentTenant;
+    private readonly ICurrentWorkspace _currentWorkspace;
 
     public ActivityPersistenceTests()
     {
         _activityRepository = GetRequiredService<IRepository<Activity, Guid>>();
-        _currentTenant = GetRequiredService<ICurrentTenant>();
+        _currentWorkspace = GetRequiredService<ICurrentWorkspace>();
     }
 
     private Task InsertAsync(Guid tenantId, Guid userId, Guid clientActivityId, DateTime start)
@@ -39,7 +39,7 @@ public class ActivityPersistenceTests : TrackerEntityFrameworkCoreTestBase
         var userId = Guid.NewGuid();
         var clientId = Guid.NewGuid();
 
-        using (_currentTenant.Change(tenantId))
+        using (_currentWorkspace.Change(tenantId))
         {
             await InsertAsync(tenantId, userId, clientId, Start);
 
@@ -59,7 +59,7 @@ public class ActivityPersistenceTests : TrackerEntityFrameworkCoreTestBase
         var tenantId = Guid.NewGuid();
         var clientId = Guid.NewGuid();
 
-        using (_currentTenant.Change(tenantId))
+        using (_currentWorkspace.Change(tenantId))
         {
             await InsertAsync(tenantId, Guid.NewGuid(), clientId, Start);
             await InsertAsync(tenantId, Guid.NewGuid(), clientId, Start);
@@ -76,7 +76,7 @@ public class ActivityPersistenceTests : TrackerEntityFrameworkCoreTestBase
         var deviceId = Guid.NewGuid();
         var id = Guid.NewGuid();
 
-        using (_currentTenant.Change(tenantId))
+        using (_currentWorkspace.Change(tenantId))
         {
             await WithUnitOfWorkAsync(() => _activityRepository.InsertAsync(
                 new Activity(id, tenantId, Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Start, Start.AddMinutes(10))

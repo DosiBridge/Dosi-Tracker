@@ -12,8 +12,13 @@ using Volo.Abp.Identity.EntityFrameworkCore;
 using Volo.Abp.PermissionManagement.EntityFrameworkCore;
 using Volo.Abp.SettingManagement.EntityFrameworkCore;
 using Volo.Abp.OpenIddict.EntityFrameworkCore;
-using Volo.Abp.TenantManagement;
-using Volo.Abp.TenantManagement.EntityFrameworkCore;
+using System;
+using System.Linq.Expressions;
+using Dosi.Tracker.Workspaces;
+using Microsoft.EntityFrameworkCore.ChangeTracking;
+using Microsoft.EntityFrameworkCore.Metadata;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+using Volo.Abp;
 using Dosi.Tracker.Projects;
 using Dosi.Tracker.Activities;
 using Dosi.Tracker.Presence;
@@ -21,11 +26,9 @@ using Dosi.Tracker.Presence;
 namespace Dosi.Tracker.EntityFrameworkCore;
 
 [ReplaceDbContext(typeof(IIdentityDbContext))]
-[ReplaceDbContext(typeof(ITenantManagementDbContext))]
 [ConnectionStringName("Default")]
 public class TrackerDbContext :
     AbpDbContext<TrackerDbContext>,
-    ITenantManagementDbContext,
     IIdentityDbContext
 {
     /* Add DbSet properties for your Aggregate Roots / Entities here. */
@@ -41,6 +44,9 @@ public class TrackerDbContext :
     public DbSet<Dosi.Tracker.SaaS.Subscription> Subscriptions { get; set; }
     public DbSet<Dosi.Tracker.Billing.Invoice> Invoices { get; set; }
     public DbSet<Dosi.Tracker.Notifications.Notification> Notifications { get; set; }
+    public DbSet<Workspace> Workspaces { get; set; }
+    public DbSet<WorkspaceMember> WorkspaceMembers { get; set; }
+    public DbSet<WorkspaceInvitation> WorkspaceInvitations { get; set; }
 
     #region Entities from the modules
 
@@ -65,10 +71,6 @@ public class TrackerDbContext :
     public DbSet<IdentityUserDelegation> UserDelegations { get; set; }
     public DbSet<IdentitySession> Sessions { get; set; }
 
-    // Tenant Management
-    public DbSet<Tenant> Tenants { get; set; }
-    public DbSet<TenantConnectionString> TenantConnectionStrings { get; set; }
-
     #endregion
 
     public TrackerDbContext(DbContextOptions<TrackerDbContext> options)
@@ -90,19 +92,41 @@ public class TrackerDbContext :
         builder.ConfigureFeatureManagement();
         builder.ConfigureIdentity();
         builder.ConfigureOpenIddict();
-        builder.ConfigureTenantManagement();
         builder.ConfigureBlobStoring();
 
-        builder.Entity<Tenant>(b =>
+        builder.Entity<Workspace>(b =>
         {
-            // A workspace name is what people sign in to, so two live workspaces never share one: the database backstop
-            // for concurrent sign-ups (WorkspaceAppService answers the violation with DuplicateTenantName). Deleted
-            // workspaces keep their rows, hence the filter.
-            var nameIndex = b.HasIndex(x => x.NormalizedName).IsUnique();
-            if (builder.IsUsingPostgreSql() || builder.IsUsingSqlite())
-            {
-                nameIndex.HasFilter("\"IsDeleted\" = false");
-            }
+            b.ToTable(TrackerConsts.DbTablePrefix + "Workspaces", TrackerConsts.DbSchema);
+            b.ConfigureByConvention();
+            b.Property(x => x.Name).IsRequired().HasMaxLength(WorkspaceConsts.MaxNameLength);
+            b.Property(x => x.NormalizedName).IsRequired().HasMaxLength(WorkspaceConsts.MaxNameLength);
+            // The backstop for concurrent creations of the same name (Tracker:DuplicateWorkspaceName).
+            b.HasIndex(x => x.NormalizedName).IsUnique();
+        });
+
+        builder.Entity<WorkspaceMember>(b =>
+        {
+            b.ToTable(TrackerConsts.DbTablePrefix + "WorkspaceMembers", TrackerConsts.DbSchema);
+            b.ConfigureByConvention();
+            b.Property(x => x.Role).IsRequired().HasMaxLength(16);
+            b.Property(x => x.Status).IsRequired().HasMaxLength(16);
+            b.HasIndex(x => new { x.WorkspaceId, x.UserId }).IsUnique();
+            b.HasIndex(x => x.UserId);
+            b.HasOne<Workspace>().WithMany().HasForeignKey(x => x.WorkspaceId).IsRequired();
+        });
+
+        builder.Entity<WorkspaceInvitation>(b =>
+        {
+            b.ToTable(TrackerConsts.DbTablePrefix + "WorkspaceInvitations", TrackerConsts.DbSchema);
+            b.ConfigureByConvention();
+            b.Property(x => x.Email).IsRequired().HasMaxLength(256);
+            b.Property(x => x.NormalizedEmail).IsRequired().HasMaxLength(256);
+            b.Property(x => x.Role).IsRequired().HasMaxLength(16);
+            b.Property(x => x.ProjectRole).HasMaxLength(64);
+            b.Property(x => x.TokenHash).IsRequired().HasMaxLength(64);
+            b.HasIndex(x => x.TokenHash).IsUnique();
+            b.HasIndex(x => new { x.WorkspaceId, x.NormalizedEmail });
+            b.HasOne<Workspace>().WithMany().HasForeignKey(x => x.WorkspaceId).IsRequired();
         });
 
         /* Configure your own tables/entities inside here */
@@ -123,8 +147,8 @@ public class TrackerDbContext :
             b.ConfigureByConvention();
             b.Property(x => x.Role).IsRequired().HasMaxLength(64);
             // A person joins a project once: the backstop when two adds of the same person race past the service's
-            // check (Tracker:DuplicateProjectMember). NULLS NOT DISTINCT (PostgreSQL 15+) covers the host side too.
-            b.HasIndex(x => new { x.TenantId, x.ProjectId, x.UserId }).IsUnique().AreNullsDistinct(false);
+            // check (Tracker:DuplicateProjectMember).
+            b.HasIndex(x => new { x.WorkspaceId, x.ProjectId, x.UserId }).IsUnique();
         });
 
         builder.Entity<ProjectMemberRate>(b =>
@@ -132,7 +156,7 @@ public class TrackerDbContext :
             b.ToTable(TrackerConsts.DbTablePrefix + "ProjectMemberRates", TrackerConsts.DbSchema);
             b.ConfigureByConvention();
             // Payroll looks up the rate in effect at a block's start: the member's latest EffectiveFrom <= StartedAt.
-            b.HasIndex(x => new { x.TenantId, x.ProjectId, x.UserId, x.EffectiveFrom });
+            b.HasIndex(x => new { x.WorkspaceId, x.ProjectId, x.UserId, x.EffectiveFrom });
         });
 
         builder.Entity<Activity>(b =>
@@ -145,14 +169,13 @@ public class TrackerDbContext :
             b.Property(x => x.DeviceName).HasMaxLength(ActivityConsts.MaxDeviceNameLength);
             b.Property(x => x.TimeZone).HasMaxLength(ActivityConsts.MaxTimeZoneLength);
             b.Property(x => x.EndReason).HasMaxLength(ActivityConsts.MaxEndReasonLength);
-            b.HasIndex(x => new { x.TenantId, x.UserId, x.StartedAt }).IsDescending(false, false, true);
-            b.HasIndex(x => new { x.TenantId, x.ProjectId, x.StartedAt }).IsDescending(false, false, true);
-            b.HasIndex(x => new { x.TenantId, x.StartedAt }).IsDescending(false, true); // Tenant-wide reports and lists
-            // Idempotency, per member: the backstop for concurrent retries across server instances. NULLS NOT DISTINCT
-            // (PostgreSQL 15+) keeps it for host users too, whose TenantId is null.
-            b.HasIndex(x => new { x.TenantId, x.UserId, x.ClientActivityId }).IsUnique().AreNullsDistinct(false);
+            b.HasIndex(x => new { x.WorkspaceId, x.UserId, x.StartedAt }).IsDescending(false, false, true);
+            b.HasIndex(x => new { x.WorkspaceId, x.ProjectId, x.StartedAt }).IsDescending(false, false, true);
+            b.HasIndex(x => new { x.WorkspaceId, x.StartedAt }).IsDescending(false, true); // Workspace-wide reports and lists
+            // Idempotency, per member: the backstop for concurrent retries across server instances.
+            b.HasIndex(x => new { x.WorkspaceId, x.UserId, x.ClientActivityId }).IsUnique();
             // Lookup only (not unique): a client id already used by another member is refused (ActivityClientIdConflict).
-            b.HasIndex(x => new { x.TenantId, x.ClientActivityId });
+            b.HasIndex(x => new { x.WorkspaceId, x.ClientActivityId });
             b.HasMany(x => x.Screenshots).WithOne().HasForeignKey(x => x.ActivityId).IsRequired();
         });
 
@@ -160,7 +183,7 @@ public class TrackerDbContext :
         {
             b.ToTable(TrackerConsts.DbTablePrefix + "Screenshots", TrackerConsts.DbSchema);
             b.ConfigureByConvention();
-            b.HasIndex(x => new { x.TenantId, x.CapturedAt }).IsDescending(false, true);
+            b.HasIndex(x => new { x.WorkspaceId, x.CapturedAt }).IsDescending(false, true);
             b.Property(x => x.StorageUrl).IsRequired().HasMaxLength(512);
             b.Property(x => x.Kind).IsRequired().HasMaxLength(16);
         });
@@ -176,8 +199,8 @@ public class TrackerDbContext :
             b.Property(x => x.Status).IsRequired().HasMaxLength(AgentPresenceConsts.MaxStatusLength);
             b.Property(x => x.CurrentApp).HasMaxLength(AgentPresenceConsts.MaxCurrentAppLength);
             b.Property(x => x.TimeZone).HasMaxLength(ActivityConsts.MaxTimeZoneLength);
-            // One row per agent install; NULLS NOT DISTINCT (PostgreSQL 15+) keeps that true for host users, whose TenantId is null.
-            b.HasIndex(x => new { x.TenantId, x.UserId, x.DeviceId }).IsUnique().AreNullsDistinct(false);
+            // One row per agent install.
+            b.HasIndex(x => new { x.WorkspaceId, x.UserId, x.DeviceId }).IsUnique();
         });
 
         // New Domains
@@ -193,6 +216,7 @@ public class TrackerDbContext :
             b.ToTable(TrackerConsts.DbTablePrefix + "Subscriptions", TrackerConsts.DbSchema);
             b.ConfigureByConvention();
             b.Property(x => x.Status).IsRequired().HasMaxLength(32);
+            b.HasIndex(x => x.WorkspaceId);
         });
 
         builder.Entity<Dosi.Tracker.Billing.Invoice>(b =>
@@ -201,8 +225,8 @@ public class TrackerDbContext :
             b.ConfigureByConvention();
             b.Property(x => x.Status).IsRequired().HasMaxLength(32);
 
-            // At most one live invoice per tenant and billing period: the database backstop for concurrent sweeps.
-            var periodIndex = b.HasIndex(x => new { x.TenantId, x.BillingPeriodStart }).IsUnique();
+            // At most one live invoice per workspace and billing period: the database backstop for concurrent sweeps.
+            var periodIndex = b.HasIndex(x => new { x.WorkspaceId, x.BillingPeriodStart }).IsUnique();
             if (builder.IsUsingPostgreSql() || builder.IsUsingSqlite())
             {
                 // Partial index (both providers support the filter): legacy invoices without a period and
@@ -216,6 +240,46 @@ public class TrackerDbContext :
             b.ToTable(TrackerConsts.DbTablePrefix + "Notifications", TrackerConsts.DbSchema);
             b.ConfigureByConvention();
             b.Property(x => x.Message).IsRequired().HasMaxLength(512);
+            b.HasIndex(x => new { x.WorkspaceId, x.UserId });
         });
+    }
+
+    protected bool IsWorkspaceFilterEnabled => DataFilter?.IsEnabled<IWorkspaceScoped>() ?? false;
+
+    protected Guid? CurrentWorkspaceId => LazyServiceProvider?.LazyGetService<ICurrentWorkspace>()?.Id;
+
+    protected override bool ShouldFilterEntity<TEntity>(IMutableEntityType entityType)
+    {
+        return typeof(IWorkspaceScoped).IsAssignableFrom(typeof(TEntity)) || base.ShouldFilterEntity<TEntity>(entityType);
+    }
+
+    protected override Expression<Func<TEntity, bool>>? CreateFilterExpression<TEntity>(
+        ModelBuilder modelBuilder,
+        EntityTypeBuilder<TEntity> entityTypeBuilder)
+    {
+        var expression = base.CreateFilterExpression<TEntity>(modelBuilder, entityTypeBuilder);
+        if (typeof(IWorkspaceScoped).IsAssignableFrom(typeof(TEntity)))
+        {
+            Expression<Func<TEntity, bool>> workspaceFilter =
+                e => !IsWorkspaceFilterEnabled || EF.Property<Guid>(e, nameof(IWorkspaceScoped.WorkspaceId)) == CurrentWorkspaceId;
+            expression = expression == null
+                ? workspaceFilter
+                : QueryFilterExpressionHelper.CombineExpressions(expression, workspaceFilter);
+        }
+
+        return expression;
+    }
+
+    /// <summary>A new workspace-scoped row without a workspace gets the current one; without a current workspace it
+    /// is refused (<c>Tracker:WorkspaceRequired</c>).</summary>
+    protected override void ApplyAbpConceptsForAddedEntity(EntityEntry entry)
+    {
+        if (entry.Entity is IWorkspaceScoped scoped && scoped.WorkspaceId == Guid.Empty)
+        {
+            var workspaceId = CurrentWorkspaceId ?? throw new BusinessException(TrackerDomainErrorCodes.WorkspaceRequired);
+            entry.Property(nameof(IWorkspaceScoped.WorkspaceId)).CurrentValue = workspaceId;
+        }
+
+        base.ApplyAbpConceptsForAddedEntity(entry);
     }
 }

@@ -30,13 +30,12 @@ describe("SignInDetails", () => {
   it("lists what the agent asks for, each copyable, and Copy all copies every labelled line", async () => {
     const user = userEvent.setup();
     render(
-      <SignInDetails workspaceName="RealCo" email="sam@realco.test" secret={{ label: <>One-time password</>, value: "Dt1!abc" }}>
+      <SignInDetails email="sam@realco.test" secret={{ label: <>One-time password</>, value: "Dt1!abc" }}>
         Share it securely.
       </SignInDetails>,
     );
 
     expect(screen.getByText(AGENT_SERVER_URL)).toBeInTheDocument();
-    expect(screen.getByText("RealCo")).toBeInTheDocument();
     expect(screen.getByText("Dt1!abc")).toBeInTheDocument();
     expect(screen.getByText(/\/download$/)).toBeInTheDocument();
 
@@ -47,7 +46,6 @@ describe("SignInDetails", () => {
     const text = await navigator.clipboard.readText();
     expect(text.split("\n")).toEqual([
       `Server address: ${AGENT_SERVER_URL}`,
-      "Workspace: RealCo",
       "Email: sam@realco.test",
       "One-time password: Dt1!abc",
       `Desktop agent: ${window.location.origin}/download`,
@@ -56,7 +54,7 @@ describe("SignInDetails", () => {
   });
 
   it("leaves out what it doesn't have", () => {
-    render(<SignInDetails workspaceName="RealCo" agentLink={false} />);
+    render(<SignInDetails agentLink={false} />);
     expect(screen.queryByText("Email")).not.toBeInTheDocument();
     expect(screen.queryByText("Desktop agent")).not.toBeInTheDocument();
   });
@@ -66,7 +64,7 @@ describe("SignInDetails", () => {
   });
 
   it("a11y: the details list has no axe violations", async () => {
-    const { container } = render(<SignInDetails workspaceName="RealCo" email="sam@realco.test" secret={{ label: <>One-time password</>, value: "x" }} />);
+    const { container } = render(<SignInDetails email="sam@realco.test" secret={{ label: <>One-time password</>, value: "x" }} />);
     expect(await axe(container)).toHaveNoViolations();
   });
 });

@@ -28,6 +28,13 @@ export interface AppConfiguration {
   auth?: {
     grantedPolicies?: Record<string, boolean> | null;
   } | null;
+  /** The workspace in scope (from /api/app/workspaces/mine), added by the loader; absent for the platform console. */
+  currentWorkspace?: {
+    id: string;
+    name: string;
+    /** owner | manager | member */
+    role?: string | null;
+  } | null;
 }
 
 /** GET /api/app/workspace/current-subscription. */
@@ -45,6 +52,9 @@ export interface ApiPlanDto {
   maxSeats?: number | null;
   trialDays?: number | null;
 }
+
+/** The global role of the platform operator (no workspace). */
+export const PLATFORM_ADMIN_ROLE = "platform-admin";
 
 export const PERMISSION = {
   viewAllActivities: "Tracker.Activities.ViewAll",
@@ -66,9 +76,14 @@ export function isAuthenticatedConfig(config: unknown): config is AppConfigurati
   return !!c && typeof c === "object" && c.currentUser?.isAuthenticated === true && !!c.currentUser?.id;
 }
 
-/** A host (platform-side) session: no tenant in scope. */
+/** A platform-side session: no workspace in scope. */
 export function isHostConfig(config: AppConfiguration): boolean {
-  return !config.currentUser?.tenantId && !config.currentTenant?.id;
+  return !config.currentWorkspace?.id && !config.currentUser?.tenantId && !config.currentTenant?.id;
+}
+
+/** The global platform operator (role platform-admin or the Platform permission). */
+export function isPlatformAdminConfig(config: AppConfiguration): boolean {
+  return hasRole(config, PLATFORM_ADMIN_ROLE) || granted(config, PERMISSION.platform);
 }
 
 /**
@@ -86,9 +101,11 @@ export function resolveLiveRole(config: AppConfiguration, options: { clientOnly?
   if (isHostConfig(config)) {
     // Host side: the platform operator (Tracker.Platform, or the host admin).
     // Any other host-side account has no tenant and no platform rights.
-    return granted(config, PERMISSION.platform) || hasRole(config, "admin") ? "host" : "worker";
+    return isPlatformAdminConfig(config) || hasRole(config, "admin") ? "host" : "worker";
   }
-  if (hasRole(config, "admin")) return "owner";
+  const workspaceRole = (config.currentWorkspace?.role ?? "").toLowerCase();
+  if (workspaceRole === "owner" || hasRole(config, "admin")) return "owner";
+  if (workspaceRole === "manager") return "admin";
   if (granted(config, PERMISSION.manageTeam) || granted(config, PERMISSION.viewAllActivities)) return "admin";
   return options.clientOnly ? "client" : "worker";
 }
@@ -173,7 +190,8 @@ export const LIVE_PENDING_WORKSPACE_ID = `${LIVE_WORKSPACE_PREFIX}pending`;
 
 /** Stable id for the live workspace. */
 export function liveWorkspaceId(config: AppConfiguration): string {
-  return config.currentTenant?.id ? `${LIVE_WORKSPACE_PREFIX}tenant-${config.currentTenant.id}` : `${LIVE_WORKSPACE_PREFIX}platform`;
+  const id = config.currentWorkspace?.id ?? config.currentTenant?.id;
+  return id ? `${LIVE_WORKSPACE_PREFIX}tenant-${id}` : `${LIVE_WORKSPACE_PREFIX}platform`;
 }
 
 /**
@@ -191,7 +209,7 @@ export function buildLiveWorkspace(
   now: Date,
   counts: { seatsUsed: number; projectsUsed: number } = { seatsUsed: 0, projectsUsed: 0 },
 ): Workspace {
-  const name = (config.currentTenant?.name ?? "").trim() || (isHostConfig(config) ? "Platform" : "Workspace");
+  const name = (config.currentWorkspace?.name ?? config.currentTenant?.name ?? "").trim() || (isHostConfig(config) ? "Platform" : "Workspace");
   const plan = subscription?.planId ? (plans ?? []).find((p) => p.id === subscription.planId) ?? null : null;
   const status = subscriptionStatus(subscription?.status);
   const maxSeats = typeof plan?.maxSeats === "number" ? plan.maxSeats : null;

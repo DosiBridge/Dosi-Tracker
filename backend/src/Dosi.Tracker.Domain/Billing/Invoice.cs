@@ -1,11 +1,11 @@
 using System;
 using Volo.Abp.Data;
 using Volo.Abp.Domain.Entities.Auditing;
-using Volo.Abp.MultiTenancy;
+using Dosi.Tracker.Workspaces;
 
 namespace Dosi.Tracker.Billing;
 
-public class Invoice : FullAuditedAggregateRoot<Guid>, IMultiTenant
+public class Invoice : FullAuditedAggregateRoot<Guid>, IWorkspaceScoped
 {
     public const string PendingStatus = "pending";
     public const string PaidStatus = "paid";
@@ -20,20 +20,20 @@ public class Invoice : FullAuditedAggregateRoot<Guid>, IMultiTenant
     /// period of a later unpaid invoice nor keeps the workspace suspended once that one is paid.</summary>
     public const string OverdueExcusedProperty = "OverdueExcused";
 
-    public Guid? TenantId { get; protected set; }
+    public Guid WorkspaceId { get; protected set; }
     public decimal Amount { get; set; }
     public string Status { get; set; } // paid, pending, failed
     public DateTime DueDate { get; set; }
 
-    /// <summary>UTC start of the billed month; at most one invoice per tenant and period (null on legacy invoices).</summary>
+    /// <summary>UTC start of the billed month; at most one invoice per workspace and period (null on legacy invoices).</summary>
     public DateTime? BillingPeriodStart { get; set; }
 
     protected Invoice() { }
 
-    public Invoice(Guid id, Guid? tenantId, decimal amount, DateTime dueDate)
+    public Invoice(Guid id, Guid workspaceId, decimal amount, DateTime dueDate)
         : base(id)
     {
-        TenantId = tenantId;
+        WorkspaceId = workspaceId;
         Amount = amount;
         DueDate = dueDate;
         Status = PendingStatus;

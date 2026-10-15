@@ -33,7 +33,7 @@ interface Overview {
 }
 
 interface ApiOverview {
-  tenantCount: number;
+  workspaceCount: number;
   activeSubscriptions: number;
   trialingSubscriptions: number;
   mrr: number;
@@ -56,7 +56,7 @@ export default function HostOverviewPage() {
     try {
       const o = (await getApi("/api/app/platform/overview")) as ApiOverview;
       setLive({
-        tenants: o.tenantCount,
+        tenants: o.workspaceCount,
         activeSubs: o.activeSubscriptions,
         trialing: o.trialingSubscriptions,
         mrr: o.mrr,

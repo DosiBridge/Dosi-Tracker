@@ -9,8 +9,7 @@ using Volo.Abp.Data;
 using Volo.Abp.DistributedLocking;
 using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Linq;
-using Volo.Abp.MultiTenancy;
-using Volo.Abp.TenantManagement;
+using Dosi.Tracker.Workspaces;
 using Volo.Abp.Threading;
 using Volo.Abp.Timing;
 using Volo.Abp.Uow;
@@ -22,7 +21,7 @@ namespace Dosi.Tracker.Billing;
 /// so frequent restarts never postpone billing; the sweep is idempotent (at most one invoice per workspace and
 /// billing period). Only <c>active</c> subscriptions of existing workspaces are billable: a trial, a past_due
 /// workspace and a deleted workspace are never invoiced. Sweeps do not overlap (named lock, held across replicas
-/// when a distributed lock provider is configured), and the unique index on (tenant, billing period) settles any
+/// when a distributed lock provider is configured), and the unique index on (workspace, billing period) settles any
 /// race that remains: the losing insert is recognized as "already invoiced", not as a failure.
 /// </summary>
 public class InvoiceGenerationWorker : AsyncPeriodicBackgroundWorkerBase
@@ -60,10 +59,10 @@ public class InvoiceGenerationWorker : AsyncPeriodicBackgroundWorkerBase
 
         var uowManager = serviceProvider.GetRequiredService<IUnitOfWorkManager>();
         var dataFilter = serviceProvider.GetRequiredService<IDataFilter>();
-        var currentTenant = serviceProvider.GetRequiredService<ICurrentTenant>();
+        var currentWorkspace = serviceProvider.GetRequiredService<ICurrentWorkspace>();
         var asyncExecuter = serviceProvider.GetRequiredService<IAsyncQueryableExecuter>();
         var subscriptionRepository = serviceProvider.GetRequiredService<IRepository<Subscription, Guid>>();
-        var tenantRepository = serviceProvider.GetRequiredService<IRepository<Tenant, Guid>>();
+        var workspaceRepository = serviceProvider.GetRequiredService<IRepository<Workspace, Guid>>();
         var invoiceGenerator = serviceProvider.GetRequiredService<InvoiceGenerator>();
 
         // One period for the whole sweep, even if it runs across midnight at the end of a month.
@@ -71,16 +70,16 @@ public class InvoiceGenerationWorker : AsyncPeriodicBackgroundWorkerBase
 
         Subscription[] billable;
         using (var readUow = uowManager.Begin(requiresNew: true))
-        using (dataFilter.Disable<IMultiTenant>())
+        using (dataFilter.Disable<IWorkspaceScoped>())
         {
             var subscriptions = await subscriptionRepository.GetQueryableAsync();
-            var tenants = await tenantRepository.GetQueryableAsync(); // soft-delete filtered: deleted workspaces drop out
+            var workspaces = await workspaceRepository.GetQueryableAsync();
             billable = (await asyncExecuter.ToListAsync(subscriptions.Where(s =>
-                s.Status == BillableStatus && tenants.Any(t => t.Id == s.TenantId)))).ToArray();
+                s.Status == BillableStatus && workspaces.Any(w => w.Id == s.WorkspaceId)))).ToArray();
             await readUow.CompleteAsync();
         }
 
-        // One UoW per tenant so a single tenant's failure can't roll back other tenants'
+        // One UoW per workspace so a single workspace's failure can't roll back other workspaces'
         // invoices or abort the rest of the sweep.
         var result = new InvoiceSweepResult();
         foreach (var subscription in billable)
@@ -90,7 +89,7 @@ public class InvoiceGenerationWorker : AsyncPeriodicBackgroundWorkerBase
                 Invoice? invoice;
                 using (var uow = uowManager.Begin(requiresNew: true))
                 {
-                    using (currentTenant.Change(subscription.TenantId))
+                    using (currentWorkspace.Change(subscription.WorkspaceId))
                     {
                         invoice = await invoiceGenerator.GenerateForPeriodAsync(subscription, periodStart);
                     }
@@ -102,26 +101,26 @@ public class InvoiceGenerationWorker : AsyncPeriodicBackgroundWorkerBase
                 {
                     result.Generated++;
                     Logger.LogInformation(
-                        "Invoice {InvoiceId} ({Amount}) generated for tenant {TenantId}.",
-                        invoice.Id, invoice.Amount, subscription.TenantId);
+                        "Invoice {InvoiceId} ({Amount}) generated for workspace {WorkspaceId}.",
+                        invoice.Id, invoice.Amount, subscription.WorkspaceId);
                 }
             }
             catch (Exception ex)
             {
-                if (await IsInvoicedAsync(uowManager, currentTenant, invoiceGenerator, subscription, periodStart))
+                if (await IsInvoicedAsync(uowManager, currentWorkspace, invoiceGenerator, subscription, periodStart))
                 {
                     // Another sweep inserted this period's invoice between our check and our insert.
                     result.AlreadyInvoiced++;
                     Logger.LogInformation(
-                        "Tenant {TenantId} was invoiced for {Period:yyyy-MM} by another sweep.",
-                        subscription.TenantId, periodStart);
+                        "Workspace {WorkspaceId} was invoiced for {Period:yyyy-MM} by another sweep.",
+                        subscription.WorkspaceId, periodStart);
                     continue;
                 }
 
                 result.Failed++;
                 Logger.LogError(ex,
-                    "Failed to generate the monthly invoice for tenant {TenantId}; continuing with the rest.",
-                    subscription.TenantId);
+                    "Failed to generate the monthly invoice for workspace {WorkspaceId}; continuing with the rest.",
+                    subscription.WorkspaceId);
             }
         }
 
@@ -130,7 +129,7 @@ public class InvoiceGenerationWorker : AsyncPeriodicBackgroundWorkerBase
 
     private async Task<bool> IsInvoicedAsync(
         IUnitOfWorkManager uowManager,
-        ICurrentTenant currentTenant,
+        ICurrentWorkspace currentWorkspace,
         InvoiceGenerator invoiceGenerator,
         Subscription subscription,
         DateTime periodStart)
@@ -140,9 +139,9 @@ public class InvoiceGenerationWorker : AsyncPeriodicBackgroundWorkerBase
             // A fresh unit of work: the failed one's database context (and transaction) is unusable.
             using var uow = uowManager.Begin(requiresNew: true);
             bool invoiced;
-            using (currentTenant.Change(subscription.TenantId))
+            using (currentWorkspace.Change(subscription.WorkspaceId))
             {
-                invoiced = await invoiceGenerator.IsInvoicedAsync(subscription.TenantId, periodStart);
+                invoiced = await invoiceGenerator.IsInvoicedAsync(subscription.WorkspaceId, periodStart);
             }
 
             await uow.CompleteAsync();
@@ -151,8 +150,8 @@ public class InvoiceGenerationWorker : AsyncPeriodicBackgroundWorkerBase
         catch (Exception ex)
         {
             Logger.LogWarning(ex,
-                "Could not check whether tenant {TenantId} is already invoiced for {Period:yyyy-MM}.",
-                subscription.TenantId, periodStart);
+                "Could not check whether workspace {WorkspaceId} is already invoiced for {Period:yyyy-MM}.",
+                subscription.WorkspaceId, periodStart);
             return false;
         }
     }

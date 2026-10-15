@@ -15,7 +15,7 @@ using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Guids;
 using Volo.Abp.Identity;
 using Volo.Abp.Modularity;
-using Volo.Abp.MultiTenancy;
+using Dosi.Tracker.Workspaces;
 using Xunit;
 
 namespace Dosi.Tracker.SaaS;
@@ -32,8 +32,7 @@ public abstract class SubscriptionManagerTests<TStartupModule> : TrackerDomainTe
     private readonly IRepository<Project, Guid> _projects;
     private readonly IRepository<ProjectMember, Guid> _members;
     private readonly IdentityUserManager _userManager;
-    private readonly IdentityRoleManager _roleManager;
-    private readonly ICurrentTenant _currentTenant;
+    private readonly ICurrentWorkspace _currentWorkspace;
     private readonly IGuidGenerator _guidGenerator;
 
     protected SubscriptionManagerTests()
@@ -47,8 +46,7 @@ public abstract class SubscriptionManagerTests<TStartupModule> : TrackerDomainTe
         _projects = GetRequiredService<IRepository<Project, Guid>>();
         _members = GetRequiredService<IRepository<ProjectMember, Guid>>();
         _userManager = GetRequiredService<IdentityUserManager>();
-        _roleManager = GetRequiredService<IdentityRoleManager>();
-        _currentTenant = GetRequiredService<ICurrentTenant>();
+        _currentWorkspace = GetRequiredService<ICurrentWorkspace>();
         _guidGenerator = GetRequiredService<IGuidGenerator>();
     }
 
@@ -59,7 +57,7 @@ public abstract class SubscriptionManagerTests<TStartupModule> : TrackerDomainTe
 
     private async Task<T> InWorkspaceAsync<T>(Guid? tenantId, Func<Task<T>> action)
     {
-        using (_currentTenant.Change(tenantId))
+        using (_currentWorkspace.Change(tenantId))
         {
             return await WithUnitOfWorkAsync(action);
         }
@@ -67,7 +65,7 @@ public abstract class SubscriptionManagerTests<TStartupModule> : TrackerDomainTe
 
     private async Task InWorkspaceAsync(Guid? tenantId, Func<Task> action)
     {
-        using (_currentTenant.Change(tenantId))
+        using (_currentWorkspace.Change(tenantId))
         {
             await WithUnitOfWorkAsync(action);
         }
@@ -86,7 +84,7 @@ public abstract class SubscriptionManagerTests<TStartupModule> : TrackerDomainTe
 
     private Task<Subscription> GetSubscriptionAsync(Guid tenantId)
     {
-        return InWorkspaceAsync(tenantId, () => _subscriptions.FirstAsync(s => s.TenantId == tenantId));
+        return InWorkspaceAsync(tenantId, () => _subscriptions.FirstAsync(s => s.WorkspaceId == tenantId));
     }
 
     private Task<Invoice> InvoiceAsync(Guid tenantId, DateTime dueDate, decimal amount = 12m)
@@ -97,22 +95,17 @@ public abstract class SubscriptionManagerTests<TStartupModule> : TrackerDomainTe
     private Task<SubscriptionReviewOutcome> ReviewAsync(Guid tenantId)
     {
         return InWorkspaceAsync(tenantId, async () =>
-            await _manager.ReviewAsync(await _subscriptions.FirstAsync(s => s.TenantId == tenantId)));
+            await _manager.ReviewAsync(await _subscriptions.FirstAsync(s => s.WorkspaceId == tenantId)));
     }
 
-    /// <summary>A workspace owner: an account in the workspace's "admin" role.</summary>
-    private Task<Guid> CreateOwnerAsync(Guid tenantId, string userName, bool active = true)
+    /// <summary>A workspace owner: an account with an active owner membership.</summary>
+    private async Task<Guid> CreateOwnerAsync(Guid tenantId, string userName, bool active = true)
     {
-        return InWorkspaceAsync(tenantId, async () =>
+        var userId = await WithUnitOfWorkAsync(async () =>
         {
-            if (await _roleManager.FindByNameAsync(TrackerRoles.Admin) == null)
-            {
-                (await _roleManager.CreateAsync(new IdentityRole(_guidGenerator.Create(), TrackerRoles.Admin, tenantId))).Succeeded.ShouldBeTrue();
-            }
-
-            var user = new IdentityUser(_guidGenerator.Create(), userName, $"{userName}@owner.test", tenantId);
+            var name = $"{userName}-{Guid.NewGuid():N}";
+            var user = new IdentityUser(_guidGenerator.Create(), name, $"{name}@owner.test");
             (await _userManager.CreateAsync(user)).Succeeded.ShouldBeTrue();
-            (await _userManager.AddToRoleAsync(user, TrackerRoles.Admin)).Succeeded.ShouldBeTrue();
             if (!active)
             {
                 user.SetIsActive(false);
@@ -121,6 +114,8 @@ public abstract class SubscriptionManagerTests<TStartupModule> : TrackerDomainTe
 
             return user.Id;
         });
+        await ServiceProvider.AddWorkspaceMemberAsync(userId, WorkspaceRoles.Owner, tenantId);
+        return userId;
     }
 
     private Task<List<Notification>> NotificationsOfAsync(Guid tenantId, Guid userId)
@@ -197,7 +192,7 @@ public abstract class SubscriptionManagerTests<TStartupModule> : TrackerDomainTe
 
         var created = await InWorkspaceAsync(tenantId, () => _manager.ChangePlanAsync(business));
 
-        created.TenantId.ShouldBe(tenantId);
+        created.WorkspaceId.ShouldBe(tenantId);
         created.Status.ShouldBe(Subscription.ActiveStatus);
         (await GetSubscriptionAsync(tenantId)).PlanId.ShouldBe(business.Id);
     }
@@ -213,12 +208,14 @@ public abstract class SubscriptionManagerTests<TStartupModule> : TrackerDomainTe
         for (var i = 0; i < 4; i++)
         {
             // Four people of the workspace (seats are held by accounts) tracking on the project.
-            await InWorkspaceAsync(tenantId, async () =>
+            var userId = await InWorkspaceAsync(tenantId, async () =>
             {
-                var user = new IdentityUser(_guidGenerator.Create(), $"busy{i}", $"busy{i}@busy.test", tenantId);
+                var user = new IdentityUser(_guidGenerator.Create(), $"busy{i}", $"busy{i}@busy.test");
                 (await _userManager.CreateAsync(user)).Succeeded.ShouldBeTrue();
                 await _members.InsertAsync(new ProjectMember(_guidGenerator.Create(), tenantId, projectId, user.Id));
+                return user.Id;
             });
+            await ServiceProvider.AddWorkspaceMemberAsync(userId, WorkspaceRoles.Member, tenantId);
         }
 
         var free = await PlanAsync(Plan.FreePlanName); // 3 seats

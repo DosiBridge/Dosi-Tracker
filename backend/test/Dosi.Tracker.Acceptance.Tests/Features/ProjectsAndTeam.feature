@@ -26,8 +26,8 @@ Feature: Projects and team management
     When I add another worker
     Then adding is rejected because the seat limit is reached
 
-  Scenario: Inviting a new email creates a user with a one-time password
+  Scenario: Inviting an email without an account creates a pending invitation
     Given I have created a project called "Website"
     When I invite "new.worker@acme.test" as a "Worker"
-    Then a new user is created with a one-time password
-    And the invitee is a member of the project
+    Then a pending invitation link is returned
+    And no account exists yet for "new.worker@acme.test"

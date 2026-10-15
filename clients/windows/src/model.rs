@@ -216,6 +216,12 @@ pub struct Activity {
     /// activity %.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub injected_input_events: Option<u32>,
+    /// HMAC-SHA256 of the payload bytes as queued locally (base64url, no pad).
+    /// Set at enqueue time; the server verifies before accepting the block.
+    /// Absent on rows queued before signing was introduced or in tests that
+    /// construct Activity values directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_signature: Option<String>,
 }
 
 impl Activity {
@@ -250,6 +256,7 @@ impl Activity {
             screenshot_captured_at: None,
             screenshot_blurred: None,
             injected_input_events: None,
+            payload_signature: None,
         }
     }
 

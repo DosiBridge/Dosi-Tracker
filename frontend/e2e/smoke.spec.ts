@@ -18,10 +18,18 @@ test("login page renders its sign-in form @smoke", async ({ browser, baseURL }) 
   const page = await context.newPage();
   await page.goto(`${baseURL}/login`);
   await expect(page.getByRole("heading", { name: "Welcome back" })).toBeVisible();
-  await expect(page.getByPlaceholder("Your workspace name")).toBeVisible();
+  await expect(page.getByPlaceholder("Your workspace name")).toHaveCount(0);
   await expect(page.getByText("Email", { exact: true })).toBeVisible();
   await expect(page.getByText("Password", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Sign in" })).toBeEnabled();
+  await context.close();
+});
+
+test("an invitation link opens without a session @smoke", async ({ browser, baseURL }) => {
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  await page.goto(`${baseURL}/invite/some-token`);
+  await expect(page).toHaveURL(/\/invite\/some-token$/);
   await context.close();
 });
 

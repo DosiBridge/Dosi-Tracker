@@ -1,40 +1,111 @@
 using System;
+using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
+using Dosi.Tracker.Workspaces;
 using Volo.Abp.Auditing;
 
 namespace Dosi.Tracker.SaaS;
 
-/// <summary>Self-service SaaS signup: creates an isolated tenant, seeds its admin
-/// user and starts a subscription on the chosen plan.</summary>
-public class RegisterWorkspaceDto
+/// <summary>Self-service sign-up (<c>POST /api/app/workspace/register</c>): creates the account and either a new
+/// workspace it owns, or — with <see cref="InviteToken"/> — joins the workspace that invited this email.</summary>
+public class RegisterWorkspaceDto : IValidatableObject
 {
-    [Required]
     [MaxLength(64)]
-    public string Name { get; set; }
+    public string? FirstName { get; set; }
+
+    [MaxLength(64)]
+    public string? Surname { get; set; }
 
     [Required]
     [EmailAddress]
     [MaxLength(256)]
-    public string AdminEmail { get; set; }
+    public string Email { get; set; } = string.Empty;
 
     /// <summary>Must satisfy the password policy. Never written to the audit log.</summary>
     [Required]
     [MaxLength(128)]
     [DisableAuditing]
-    public string AdminPassword { get; set; }
+    public string Password { get; set; } = string.Empty;
 
-    /// <summary>Plan name as listed by <c>GET /api/app/workspace/available-plans</c>; defaults to Free.
-    /// Ignored when <see cref="PlanId"/> is given.</summary>
-    [MaxLength(64)]
-    public string? PlanName { get; set; }
+    /// <summary>Required unless <see cref="InviteToken"/> is given.</summary>
+    [MaxLength(WorkspaceConsts.MaxNameLength)]
+    public string? WorkspaceName { get; set; }
 
     /// <summary>Id of a plan listed by <c>GET /api/app/workspace/available-plans</c> (optional; preferred over
     /// <see cref="PlanName"/>). Self-service sign-up accepts free plans and plans with a trial.</summary>
     public Guid? PlanId { get; set; }
+
+    /// <summary>Plan name; defaults to Free. Ignored when <see cref="PlanId"/> is given.</summary>
+    [MaxLength(64)]
+    public string? PlanName { get; set; }
+
+    /// <summary>The token of an invitation sent to <see cref="Email"/>: the account joins that workspace instead of
+    /// creating one.</summary>
+    [MaxLength(128)]
+    public string? InviteToken { get; set; }
+
+    public IEnumerable<ValidationResult> Validate(ValidationContext validationContext)
+    {
+        if (string.IsNullOrWhiteSpace(InviteToken) && string.IsNullOrWhiteSpace(WorkspaceName))
+        {
+            yield return new ValidationResult("The workspace name is required.", new[] { nameof(WorkspaceName) });
+        }
+    }
 }
 
 public class WorkspaceRegistrationResultDto
 {
-    public Guid TenantId { get; set; }
-    public string Name { get; set; }
+    public Guid WorkspaceId { get; set; }
+    public string WorkspaceName { get; set; } = string.Empty;
+
+    /// <summary>The new account's user name (its email); sign in with the email.</summary>
+    public string UserName { get; set; } = string.Empty;
+}
+
+/// <summary>A workspace the signed-in user is an active member of (<c>GET /api/app/workspaces/mine</c>).</summary>
+public class MyWorkspaceDto
+{
+    public Guid Id { get; set; }
+    public string Name { get; set; } = string.Empty;
+
+    /// <summary><c>owner</c> | <c>manager</c> | <c>member</c>.</summary>
+    public string Role { get; set; } = string.Empty;
+
+    public string? PlanName { get; set; }
+    public bool IsOwner { get; set; }
+}
+
+public class CreateWorkspaceDto
+{
+    [Required]
+    [MaxLength(WorkspaceConsts.MaxNameLength)]
+    public string Name { get; set; } = string.Empty;
+
+    public Guid? PlanId { get; set; }
+}
+
+public class CreatedWorkspaceDto
+{
+    public Guid Id { get; set; }
+    public string Name { get; set; } = string.Empty;
+}
+
+/// <summary><c>GET /api/app/invitations/{token}</c> (anonymous).</summary>
+public class InvitationInfoDto
+{
+    public string WorkspaceName { get; set; } = string.Empty;
+    public string Email { get; set; } = string.Empty;
+
+    /// <summary>The workspace role the invitee gets.</summary>
+    public string Role { get; set; } = string.Empty;
+
+    /// <summary>True once it expired or was used.</summary>
+    public bool Expired { get; set; }
+}
+
+public class AcceptInvitationResultDto
+{
+    public Guid WorkspaceId { get; set; }
+    public string WorkspaceName { get; set; } = string.Empty;
+    public string Role { get; set; } = string.Empty;
 }

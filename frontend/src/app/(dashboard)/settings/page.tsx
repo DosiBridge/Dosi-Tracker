@@ -251,6 +251,7 @@ function ProfileCard({ live, onSaved }: { live: boolean; onSaved: () => void }) 
             </div>
           </div>
         </div>
+        <p className="rounded-lg bg-muted/60 px-3 py-2 text-xs text-muted-foreground">Your profile is shared across all your workspaces.</p>
         {live && profileLoading && (
           <p role="status" className="text-sm text-muted-foreground">
             Loading profile…
@@ -268,14 +269,14 @@ function ProfileCard({ live, onSaved }: { live: boolean; onSaved: () => void }) 
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <Field label="First name" value={profileForm.name} onChange={(v) => setProfileField("name", v)} autoComplete="given-name" />
             <Field label="Surname" value={profileForm.surname} onChange={(v) => setProfileField("surname", v)} autoComplete="family-name" />
-            <Field label="Email" value={profileForm.email} onChange={(v) => setProfileField("email", v)} autoComplete="email" type="email" />
+            <Field label="Email" value={profileForm.email} readOnly autoComplete="email" type="email" />
             <Field label="Username" value={profileForm.userName} onChange={(v) => setProfileField("userName", v)} autoComplete="username" />
             <Field label="Phone number" value={profileForm.phoneNumber} onChange={(v) => setProfileField("phoneNumber", v)} autoComplete="tel" type="tel" />
           </div>
         ) : !live ? (
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <Field label="Full name" defaultValue={currentUser.name} autoComplete="name" />
-            <Field label="Email" defaultValue={currentUser.email} autoComplete="email" type="email" />
+            <Field label="Email" value={currentUser.email} readOnly autoComplete="email" type="email" />
             <Field label="Designation" defaultValue={currentUser.designation} autoComplete="organization-title" />
           </div>
         ) : null}
@@ -306,6 +307,7 @@ function Field({
   onChange,
   autoComplete,
   type = "text",
+  readOnly = false,
 }: {
   label: string;
   defaultValue?: string;
@@ -313,6 +315,8 @@ function Field({
   onChange?: (value: string) => void;
   autoComplete?: string;
   type?: string;
+  /** Shown but not editable (the email: it identifies the account everywhere). */
+  readOnly?: boolean;
 }) {
   // Generated id keeps the label programmatically associated with its input,
   // so assistive tech announces the field by name.
@@ -322,7 +326,9 @@ function Field({
       <label htmlFor={id} className="text-sm font-medium">
         {label}
       </label>
-      {onChange ? (
+      {readOnly ? (
+        <Input id={id} type={type} value={value ?? ""} readOnly aria-readonly="true" className="bg-muted/50" autoComplete={autoComplete} />
+      ) : onChange ? (
         <Input id={id} type={type} value={value ?? ""} onChange={(e) => onChange(e.target.value)} autoComplete={autoComplete} />
       ) : (
         <Input id={id} type={type} defaultValue={defaultValue} autoComplete={autoComplete} />

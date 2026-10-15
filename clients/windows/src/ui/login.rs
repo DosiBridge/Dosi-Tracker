@@ -8,12 +8,11 @@ use super::widgets::{self, ButtonKind, Callout, Icon, Tone};
 use super::{format, TrackerApp};
 use crate::api::{classify_token_failure, AuthError};
 use crate::config::{normalize_server_url, AppConfig, ServerUrlError};
-use crate::state::{Command, SharedState, TrackerStatus};
+use crate::state::{Command, SharedState, TrackerStatus, WorkspaceChoice};
 use crate::theme;
 
 /// What the sign-in form holds between frames.
 pub(super) struct LoginForm {
-    pub workspace: String,
     pub email: String,
     pub password: String,
     pub show_password: bool,
@@ -36,7 +35,6 @@ impl LoginForm {
     /// (no `config.toml`, no installer option): the address must be typed.
     pub fn new(configured_server: &str) -> Self {
         Self {
-            workspace: String::new(),
             email: String::new(),
             password: String::new(),
             show_password: false,
@@ -59,8 +57,8 @@ pub(super) enum SignInProblem {
     ServerAddress,
     /// No answer from the server (DNS, connection, certificate, timeout).
     Unreachable,
-    /// The server could not open the workspace named.
-    Workspace,
+    /// Signed in, but the account is in no workspace yet.
+    NoWorkspace,
     /// Too many attempts in a short time.
     Throttled,
     /// The server failed, or answered with something that is not a sign-in.
@@ -72,7 +70,8 @@ pub(super) enum SignInProblem {
     Refused,
 }
 
-const WORKSPACE_PREFIX: &str = "The server could not open this workspace";
+/// A 429 worded with its `Retry-After`.
+const THROTTLED_PREFIX: &str = "Too many attempts";
 const SERVER_ERROR_PREFIXES: [&str; 3] =
     ["The server had a problem", "Sign-in failed (HTTP", "The server sent an unexpected sign-in response"];
 /// How `Worker::expire` words it.
@@ -84,10 +83,10 @@ impl SignInProblem {
         let message = message.trim();
         if message == AuthError::Offline(String::new()).user_message() {
             SignInProblem::Unreachable
-        } else if message == classify_token_failure(429, "").user_message() {
+        } else if message == classify_token_failure(429, "").user_message() || message.starts_with(THROTTLED_PREFIX) {
             SignInProblem::Throttled
-        } else if message.starts_with(WORKSPACE_PREFIX) {
-            SignInProblem::Workspace
+        } else if message == crate::worker::NO_WORKSPACE {
+            SignInProblem::NoWorkspace
         } else if SERVER_ERROR_PREFIXES.iter().any(|prefix| message.starts_with(prefix)) {
             SignInProblem::ServerError
         } else if message.starts_with(EXPIRED_PREFIX) {
@@ -107,7 +106,7 @@ impl SignInProblem {
         match self {
             SignInProblem::ServerAddress => "Check the server address",
             SignInProblem::Unreachable => "Can't reach the server",
-            SignInProblem::Workspace => "Workspace not found",
+            SignInProblem::NoWorkspace => "No workspace yet",
             SignInProblem::Throttled => "Too many sign-in attempts",
             SignInProblem::ServerError => "The server couldn't sign you in",
             SignInProblem::Expired => "",
@@ -116,7 +115,7 @@ impl SignInProblem {
     }
 
     pub fn tone(self) -> Tone {
-        if self == SignInProblem::Expired {
+        if matches!(self, SignInProblem::Expired | SignInProblem::NoWorkspace) {
             Tone::Warning
         } else {
             Tone::Danger
@@ -127,14 +126,6 @@ impl SignInProblem {
     pub fn concerns_server(self) -> bool {
         matches!(self, SignInProblem::ServerAddress | SignInProblem::Unreachable)
     }
-}
-
-/// A hint under a refusal of the email or password: ABP answers the same way
-/// when the workspace is wrong (the account lives in another one).
-fn refusal_hint(message: &str) -> Option<&'static str> {
-    let lower = message.to_lowercase();
-    (lower.contains("username or password") || lower.contains("email or password"))
-        .then_some("Check the workspace name too — an account belongs to one workspace.")
 }
 
 impl TrackerApp {
@@ -187,6 +178,13 @@ impl TrackerApp {
 
     fn login_form(&mut self, ui: &mut egui::Ui, snapshot: &SharedState) {
         self.sync_login_form(snapshot);
+        if !snapshot.workspace_choices.is_empty() {
+            theme::card(20).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                self.workspace_picker(ui, snapshot);
+            });
+            return;
+        }
         ui.vertical_centered(|ui| {
             theme::logo_mark(ui, 52.0);
             ui.add_space(10.0);
@@ -205,11 +203,6 @@ impl TrackerApp {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 6.0;
 
-            field_label(ui, "Workspace");
-            let workspace = text_field(ui, &mut self.login.workspace, "e.g. acme");
-            submit |= enter_pressed(ui, &workspace);
-            ui.add_space(8.0);
-
             field_label(ui, "Email");
             let email = text_field(ui, &mut self.login.email, "you@company.com");
             submit |= enter_pressed(ui, &email);
@@ -225,6 +218,14 @@ impl TrackerApp {
             if let Some(error) = &snapshot.login_error {
                 ui.add_space(4.0);
                 self.error_callout(ui, error);
+                if SignInProblem::of(error) == SignInProblem::NoWorkspace {
+                    let ready = self.dashboard_available(snapshot);
+                    let response = widgets::button(ui, ButtonKind::Secondary, Some(Icon::External), "Open dashboard", Some(ui.available_width()), ready);
+                    let clicked = if ready { response.clicked() } else { response.on_hover_text(super::DASHBOARD_UNSET).clicked() };
+                    if clicked {
+                        self.open_dashboard(snapshot);
+                    }
+                }
             }
 
             ui.add_space(10.0);
@@ -238,7 +239,8 @@ impl TrackerApp {
                 if let Ok(server) = server {
                     self.login.attempted_server = Some(server.clone());
                     self.send(Command::SignIn {
-                        workspace: self.login.workspace.trim().to_string(),
+                        // The server lists this account's workspaces.
+                        workspace: None,
                         username: self.login.email.trim().to_string(),
                         password: self.login.password.clone(),
                         // Saved with the sign-in when it differs from the configured one.
@@ -331,7 +333,6 @@ impl TrackerApp {
         let tried = self.login.attempted_server.as_deref().map(|server| format!("Tried {server}"));
         let detail = match problem {
             SignInProblem::Unreachable => tried.as_deref(),
-            SignInProblem::Refused => refusal_hint(error),
             _ => None,
         };
         let title = problem.title();
@@ -340,6 +341,29 @@ impl TrackerApp {
             problem.tone(),
             &Callout { title: (!title.is_empty()).then_some(title), body: error, detail, action: None },
         );
+    }
+
+    /// "Choose a workspace" after signing in to an account in several.
+    pub(super) fn workspace_picker(&mut self, ui: &mut egui::Ui, snapshot: &SharedState) {
+        ui.spacing_mut().item_spacing.y = 6.0;
+        ui.label(egui::RichText::new("Choose a workspace").font(theme::semibold(15.0)).color(theme::INK));
+        widgets::muted(ui, "Your account is in more than one workspace. You can switch later in Settings.");
+        ui.add_space(4.0);
+        let mut chosen = None;
+        for (index, choice) in snapshot.workspace_choices.iter().enumerate() {
+            let label = workspace_label(choice);
+            let enabled = !choice.is_current && !snapshot.signing_in;
+            if widgets::button(ui, ButtonKind::Secondary, None, &label, Some(ui.available_width()), enabled).clicked() {
+                chosen = Some(index);
+            }
+        }
+        ui.add_space(4.0);
+        let back = ui.vertical_centered(|ui| widgets::link(ui, "Back", theme::PRIMARY_STRONG).clicked()).inner;
+        if let Some(index) = chosen {
+            self.send(Command::ChooseWorkspace { index });
+        } else if back {
+            self.send(Command::CancelWorkspaceChoice);
+        }
     }
 
     /// The saved password stopped working: ask for it again, for the same
@@ -402,7 +426,8 @@ impl TrackerApp {
             if submit && can_submit {
                 self.login.attempted_server = Some(snapshot.server_url.clone()).filter(|s| !s.trim().is_empty());
                 self.send(Command::SignIn {
-                    workspace: snapshot.workspace.trim().to_string(),
+                    // The workspace saved with this account is picked again.
+                    workspace: None,
                     username: snapshot.display_name.trim().to_string(),
                     password: self.login.password.clone(),
                     // The server saved with this account.
@@ -437,7 +462,7 @@ impl TrackerApp {
                     snapshot.display_name
                 )
             } else {
-                "Then sign in with another workspace or email.".to_owned()
+                "Then sign in with another email.".to_owned()
             };
             widgets::muted(ui, &detail);
             ui.add_space(4.0);
@@ -456,13 +481,26 @@ impl TrackerApp {
             }
             if confirm {
                 self.login.confirm_switch = false;
-                self.login.workspace.clear();
                 self.login.email.clear();
                 self.login.password.clear();
                 self.send(Command::SignOut { at: chrono::Utc::now() });
             }
         });
     }
+}
+
+/// How the pickers name a workspace: its name, the user's role, and whether
+/// it is the current one.
+pub(super) fn workspace_label(choice: &WorkspaceChoice) -> String {
+    let name = if choice.name.trim().is_empty() { "Unnamed workspace" } else { choice.name.trim() };
+    let mut label = name.to_owned();
+    if let Some(role) = choice.role.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
+        label.push_str(&format!("  ·  {role}"));
+    }
+    if choice.is_current {
+        label.push_str("  (current)");
+    }
+    label
 }
 
 fn field_label(ui: &mut egui::Ui, text: &str) {
@@ -488,7 +526,6 @@ fn enter_pressed(ui: &egui::Ui, field: &egui::Response) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::workspace_unavailable;
 
     #[test]
     fn every_failure_class_of_the_api_client_is_told_apart() {
@@ -497,8 +534,7 @@ mod tests {
         assert_eq!(of(classify_token_failure(429, "")), SignInProblem::Throttled);
         assert_eq!(of(classify_token_failure(503, "")), SignInProblem::ServerError);
         assert_eq!(of(classify_token_failure(404, "")), SignInProblem::ServerError);
-        assert_eq!(of(workspace_unavailable("")), SignInProblem::Workspace);
-        assert_eq!(of(workspace_unavailable("There is no tenant with the given name: acme")), SignInProblem::Workspace);
+        assert_eq!(SignInProblem::of(crate::worker::NO_WORKSPACE), SignInProblem::NoWorkspace);
         let refused = r#"{"error":"invalid_grant","error_description":"Invalid username or password!"}"#;
         assert_eq!(of(classify_token_failure(400, refused)), SignInProblem::Refused);
         let locked = r#"{"error":"invalid_grant","error_description":"The user account has been locked out."}"#;
@@ -533,10 +569,18 @@ mod tests {
     }
 
     #[test]
-    fn a_wrong_password_hints_at_the_workspace() {
-        assert!(refusal_hint("Invalid username or password!").is_some());
-        assert!(refusal_hint("Incorrect email or password.").is_some());
-        assert!(refusal_hint("The user account has been locked out.").is_none());
+    fn throttled_workspace_lookups_read_as_throttling() {
+        assert_eq!(SignInProblem::of("Too many attempts, try again in 42 s."), SignInProblem::Throttled);
+        assert_eq!(SignInProblem::of("Invalid email or password."), SignInProblem::Refused);
+    }
+
+    #[test]
+    fn the_picker_names_the_role_and_the_current_workspace() {
+        let choice = |name: &str, role: Option<&str>, is_current| WorkspaceChoice { name: name.into(), role: role.map(Into::into), is_current };
+        assert_eq!(workspace_label(&choice("Acme", None, false)), "Acme");
+        assert_eq!(workspace_label(&choice("Acme", Some("Owner"), false)), "Acme  ·  Owner");
+        assert_eq!(workspace_label(&choice("Globex", Some("Member"), true)), "Globex  ·  Member  (current)");
+        assert_eq!(workspace_label(&choice(" ", Some(" "), false)), "Unnamed workspace");
     }
 
     #[test]

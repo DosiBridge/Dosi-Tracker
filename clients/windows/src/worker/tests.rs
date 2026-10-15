@@ -100,7 +100,7 @@ fn one_shot_server(status: &'static str, body: &'static str) -> String {
 #[tokio::test]
 async fn refused_credentials_are_a_rejected_sign_in() {
     let refused = r#"{"error":"invalid_grant","error_description":"Invalid username or password!"}"#;
-    let mut client = ApiClient::new(one_shot_server("400 Bad Request", refused), "a@b.c".into(), "x".into(), String::new());
+    let mut client = ApiClient::new(one_shot_server("400 Bad Request", refused), "a@b.c".into(), "x".into());
     let error = client.login().await.expect_err("the server refuses");
     assert!(is_auth_rejection(&error));
     assert_eq!(friendly_login_error(&error), "Invalid username or password!");
@@ -108,7 +108,7 @@ async fn refused_credentials_are_a_rejected_sign_in() {
 
 #[tokio::test]
 async fn a_server_error_is_not_a_rejected_sign_in() {
-    let mut client = ApiClient::new(one_shot_server("503 Service Unavailable", ""), "a@b.c".into(), "x".into(), String::new());
+    let mut client = ApiClient::new(one_shot_server("503 Service Unavailable", ""), "a@b.c".into(), "x".into());
     let error = client.login().await.expect_err("the server fails");
     assert!(!is_auth_rejection(&error));
 }
@@ -116,14 +116,14 @@ async fn a_server_error_is_not_a_rejected_sign_in() {
 #[tokio::test]
 async fn an_unreachable_server_is_not_a_rejected_sign_in() {
     // Nothing listens on port 9 (discard) locally: a real connect error.
-    let mut client = ApiClient::new("http://127.0.0.1:9", "a@b.c".into(), "x".into(), String::new());
+    let mut client = ApiClient::new("http://127.0.0.1:9", "a@b.c".into(), "x".into());
     let error = client.login().await.expect_err("nothing is listening");
     assert!(!is_auth_rejection(&error));
 }
 
 #[test]
 fn accounts_never_show_their_password() {
-    let account = Account { server: "https://t.example".into(), workspace: "acme".into(), username: "a@acme.com".into(), password: "s3cr3t".into() };
+    let account = Account::new("https://t.example".into(), "a@acme.com".into(), "s3cr3t".into()).in_workspace("w1", "Acme");
     let shown = format!("{account:?}");
     assert!(!shown.contains("s3cr3t") && shown.contains("a@acme.com"), "{shown}");
 }
@@ -314,7 +314,9 @@ fn project(id: &str, idle_minutes: u32) -> Project {
 
 /// A saved sign-in whose project list was resolved an hour ago.
 fn saved(projects: Vec<Project>, remembered: Option<&str>) -> Credentials {
-    let mut saved = Credentials::new("acme".into(), "alice@acme.com".into(), "pw".into(), None);
+    let mut saved = Credentials::new("alice@acme.com".into(), "pw".into(), None);
+    saved.workspace_id = Some("w1".into());
+    saved.workspace_name = "Acme".into();
     saved.project_id = remembered.map(str::to_owned);
     saved.projects = Some(ProjectCache { resolved_at: at("09:00:00"), projects });
     saved
@@ -381,7 +383,7 @@ impl Harness {
     }
 
     fn owner(&self) -> String {
-        storage::owner_key("acme", "alice@acme.com")
+        storage::owner_key("alice@acme.com")
     }
 
     /// The queued blocks, oldest first.
@@ -593,7 +595,7 @@ fn time_away_can_be_kept_after_the_sign_in_expired() {
 #[test]
 fn upload_events_of_the_previous_account_are_ignored() {
     let mut h = tracking();
-    let other = storage::owner_key("acme", "bob@acme.com");
+    let other = storage::owner_key("bob@acme.com");
     h.worker.on_upload(UploadEvent::Projects { owner: other.clone(), projects: vec![project("p9", 5)] });
     h.worker.on_upload(UploadEvent::SignInExpired { owner: other, reason: "Invalid username or password!".into() });
     h.worker.publish();
@@ -898,19 +900,22 @@ fn a_refused_password_stops_tracking_keeps_the_queue_and_asks_for_it_again() {
     assert_eq!(h.spans(), [(at("10:00:00"), at("10:05:00"), Some(EndReason::SignOut))]);
     let snapshot = h.state.snapshot();
     assert!(snapshot.login_error.unwrap().contains("Invalid username or password!"));
-    assert_eq!((snapshot.display_name.as_str(), snapshot.workspace.as_str()), ("alice@acme.com", "acme"), "prefilled");
+    assert_eq!((snapshot.display_name.as_str(), snapshot.workspace.as_str()), ("alice@acme.com", "Acme"), "prefilled");
     assert!(h.upload_commands().iter().any(|c| matches!(c, UploadCommand::Account(None))));
     assert!(h.control_requests().iter().any(|r| matches!(r, ControlRequest::UseAccount(None))));
     assert!(h.heartbeats().is_empty(), "no heartbeats without a sign-in");
 
     // The password, entered again.
-    h.command(at("10:10:00"), Command::SignIn { workspace: "acme".into(), username: "alice@acme.com".into(), password: "new".into(), server: None });
+    h.command(at("10:10:00"), Command::SignIn { workspace: None, username: "alice@acme.com".into(), password: "new".into(), server: None });
     let account = match h.control_requests().pop() {
         Some(ControlRequest::SignIn(account)) => account,
         other => panic!("expected a sign-in check, got {other:?}"),
     };
     assert_eq!(account.server, AppConfig::default().api_base_url);
-    h.worker.on_control(ControlEvent::SignedIn { account, projects: Ok(vec![project("p1", 5)]) });
+    // The saved workspace is picked again among several.
+    let workspaces = vec![Workspace { id: "w0".into(), name: "Other".into(), role: None, plan_name: None, is_owner: false },
+        Workspace { id: "w1".into(), name: "Acme".into(), role: None, plan_name: None, is_owner: false }];
+    h.worker.on_control(ControlEvent::SignedIn { account, workspaces: Ok(workspaces) });
     h.worker.publish();
     assert_eq!(h.status(), TrackerStatus::Tracking);
     assert_eq!(h.tracking_since(), Some(at("10:10:00")));
@@ -923,7 +928,7 @@ fn a_sign_in_with_a_server_address_saves_it() {
     let mut h = harness_at(at("10:00:00"), None, false, None);
     assert_eq!(h.status(), TrackerStatus::SignedOut);
     h.command(at("10:00:00"), Command::SignIn {
-        workspace: "acme".into(),
+        workspace: None,
         username: "alice@acme.com".into(),
         password: "pw".into(),
         server: Some("ftp://nope".into()),
@@ -932,7 +937,7 @@ fn a_sign_in_with_a_server_address_saves_it() {
     assert!(h.control_requests().is_empty());
 
     h.command(at("10:00:05"), Command::SignIn {
-        workspace: "acme".into(),
+        workspace: None,
         username: "alice@acme.com".into(),
         password: "pw".into(),
         server: Some("tracker.acme.com/".into()),
@@ -942,7 +947,9 @@ fn a_sign_in_with_a_server_address_saves_it() {
         other => panic!("expected a sign-in check, got {other:?}"),
     };
     assert_eq!(account.server, "https://tracker.acme.com");
-    h.worker.on_control(ControlEvent::SignedIn { account, projects: Ok(vec![project("a", 5), project("b", 5)]) });
+    let only = Workspace { id: "w1".into(), name: "Acme".into(), role: None, plan_name: None, is_owner: false };
+    h.worker.on_control(ControlEvent::SignedIn { account, workspaces: Ok(vec![only]) });
+    h.worker.on_control(ControlEvent::Projects(vec![project("a", 5), project("b", 5)]));
     h.worker.publish();
     let snapshot = h.state.snapshot();
     assert_eq!(snapshot.status, TrackerStatus::ChooseProject, "a first sign-in with several projects asks");
@@ -1043,14 +1050,13 @@ fn an_autostart_that_starts_tracking_says_so() {
 async fn e2e_capture_upload_and_totals() {
     let env = |key: &str| std::env::var(key).unwrap_or_else(|_| panic!("{key} is not set"));
     let cfg = AppConfig { api_base_url: env("DOSI_E2E_URL"), ..AppConfig::default() };
-    let account = Account {
-        server: cfg.api_base_url.clone(),
-        workspace: env("DOSI_E2E_WORKSPACE"),
-        username: env("DOSI_E2E_USER"),
-        password: env("DOSI_E2E_PASSWORD"),
-    };
+    let account = Account::new(cfg.api_base_url.clone(), env("DOSI_E2E_USER"), env("DOSI_E2E_PASSWORD"));
     let mut client = account.client(&ServerClock::default());
     client.login().await.expect("sign-in");
+    let wanted = env("DOSI_E2E_WORKSPACE");
+    let workspaces = client.workspaces_mine().await.expect("workspaces");
+    let workspace = workspaces.iter().find(|w| w.id == wanted || w.name.eq_ignore_ascii_case(&wanted)).expect("the workspace is listed");
+    client.set_workspace(Some(workspace.id.clone()));
     let projects = client.my_projects().await.expect("projects");
     let project = projects.iter().find(|p| p.id == env("DOSI_E2E_PROJECT")).expect("the project is listed");
     let session = session_for(project, &cfg);
@@ -1074,7 +1080,7 @@ async fn e2e_capture_upload_and_totals() {
         description: Some("e2e"),
     };
     let activity = Machine::snapshot(&tracker, &spec, screen);
-    store.enqueue(&activity, &owner).unwrap();
+    store.enqueue(&activity, &owner, &workspace.id).unwrap();
     let queued = store.pending_batch(&owner, 0, 1).unwrap().remove(0).1;
     println!(
         "queued: {} windows, {} timeline minutes, screenshot {}, thumb {}, keys {}, clicks {}, {:?}%",
@@ -1128,7 +1134,7 @@ fn e2e_pause_resume_flow() {
     };
 
     tx.send(Command::SignIn {
-        workspace: env("DOSI_E2E_WORKSPACE"),
+        workspace: std::env::var("DOSI_E2E_WORKSPACE").ok(),
         username: env("DOSI_E2E_USER"),
         password: env("DOSI_E2E_PASSWORD"),
         server: None,
@@ -1190,4 +1196,214 @@ fn starting_a_stretch_resets_the_clocks_and_clears_a_pause() {
     assert!(s.paused_since.is_none() && s.resume_at.is_none());
     assert_eq!((s.tracking_since, s.block_started_at), (Some(at("10:10:00")), Some(at("10:10:00"))));
     assert_eq!(s.next_capture_at, Some(at("10:20:00")), "a full interval until the block is saved");
+}
+
+// ---- Choosing the workspace -----------------------------------------------------------
+
+fn workspace(id: &str, name: &str) -> Workspace {
+    Workspace { id: id.into(), name: name.into(), role: Some("Member".into()), plan_name: None, is_owner: false }
+}
+
+/// Type the email and password; the server accepts them.
+fn typed_sign_in(h: &mut Harness, workspace: Option<&str>) -> Account {
+    h.command(at("10:00:00"), Command::SignIn {
+        workspace: workspace.map(Into::into),
+        username: "alice@acme.com".into(),
+        password: "pw".into(),
+        server: None,
+    });
+    assert!(h.state.snapshot().signing_in);
+    match h.control_requests().pop() {
+        Some(ControlRequest::SignIn(account)) => {
+            assert_eq!((account.username.as_str(), account.password.as_str(), account.workspace_id.as_deref()), ("alice@acme.com", "pw", None));
+            account
+        }
+        other => panic!("expected a sign-in check, got {other:?}"),
+    }
+}
+
+/// The account the worker now uses, as handed to the control task.
+fn used_account(h: &mut Harness) -> Account {
+    h.control_requests()
+        .into_iter()
+        .rev()
+        .find_map(|r| match r {
+            ControlRequest::UseAccount(Some(account)) => Some(account),
+            _ => None,
+        })
+        .expect("an account in use")
+}
+
+#[test]
+fn no_workspace_asks_to_create_one_or_be_invited() {
+    let mut h = harness_at(at("10:00:00"), None, false, None);
+    let account = typed_sign_in(&mut h, None);
+    h.worker.on_control(ControlEvent::SignedIn { account, workspaces: Ok(vec![]) });
+    h.worker.publish();
+    let snapshot = h.state.snapshot();
+    assert_eq!(snapshot.login_error.as_deref(), Some(NO_WORKSPACE));
+    assert!(!snapshot.signing_in && snapshot.workspace_choices.is_empty());
+    assert_eq!(snapshot.status, TrackerStatus::SignedOut);
+    assert!(h.worker.saved.is_none());
+}
+
+#[test]
+fn one_workspace_is_used_at_once_and_remembered() {
+    let mut h = harness_at(at("10:00:00"), None, false, None);
+    let account = typed_sign_in(&mut h, None);
+    h.worker.on_control(ControlEvent::SignedIn { account, workspaces: Ok(vec![workspace("w1", "Acme")]) });
+    let used = used_account(&mut h);
+    assert_eq!((used.workspace_id.as_deref(), used.workspace_name.as_str()), (Some("w1"), "Acme"));
+    h.worker.on_control(ControlEvent::Projects(vec![project("p1", 5)]));
+    h.worker.publish();
+    assert_eq!(h.status(), TrackerStatus::Tracking);
+    let saved = h.worker.saved.as_ref().unwrap();
+    assert_eq!((saved.workspace_id.as_deref(), saved.workspace_name.as_str()), (Some("w1"), "Acme"));
+    assert_eq!(h.state.snapshot().workspace, "Acme");
+    h.machine.input_at(at("10:04:30"));
+    h.tick(at("10:05:00"));
+    h.command(at("10:05:00"), Command::Pause { resume_after: None, at: at("10:05:00") });
+    assert_eq!(h.worker.store.pending_rows(&h.owner(), 0, 10).unwrap()[0].workspace_id, "w1", "blocks are queued in their workspace");
+}
+
+#[test]
+fn several_workspaces_are_offered_with_their_roles_and_the_chosen_one_is_used() {
+    let mut h = harness_at(at("10:00:00"), None, false, None);
+    let account = typed_sign_in(&mut h, None);
+    let mut globex = workspace("w2", "Globex");
+    globex.role = Some("Owner".into());
+    h.worker.on_control(ControlEvent::SignedIn { account, workspaces: Ok(vec![workspace("w1", "Acme"), globex]) });
+    let snapshot = h.state.snapshot();
+    assert_eq!(snapshot.workspace_choices.len(), 2);
+    assert_eq!(snapshot.workspace_choices[1].role.as_deref(), Some("Owner"));
+    assert!(!snapshot.signing_in && snapshot.status == TrackerStatus::SignedOut);
+    assert!(h.worker.saved.is_none(), "nothing saved before a workspace is chosen");
+
+    h.command(at("10:00:10"), Command::ChooseWorkspace { index: 1 });
+    assert_eq!(used_account(&mut h).workspace_id.as_deref(), Some("w2"));
+    assert!(h.state.snapshot().workspace_choices.is_empty());
+    assert_eq!(h.worker.saved.as_ref().unwrap().workspace_id.as_deref(), Some("w2"));
+}
+
+#[test]
+fn a_named_workspace_is_picked_without_asking() {
+    let mut h = harness_at(at("10:00:00"), None, false, None);
+    let account = typed_sign_in(&mut h, Some("globex"));
+    h.worker.on_control(ControlEvent::SignedIn { account, workspaces: Ok(vec![workspace("w1", "Acme"), workspace("w2", "Globex")]) });
+    assert_eq!(used_account(&mut h).workspace_id.as_deref(), Some("w2"));
+
+    let mut h = harness_at(at("10:00:00"), None, false, None);
+    let account = typed_sign_in(&mut h, Some("w1"));
+    h.worker.on_control(ControlEvent::SignedIn { account, workspaces: Ok(vec![workspace("w1", "Acme"), workspace("w2", "Globex")]) });
+    assert_eq!(used_account(&mut h).workspace_id.as_deref(), Some("w1"), "by id too");
+}
+
+#[test]
+fn going_back_from_the_picker_forgets_the_sign_in() {
+    let mut h = harness_at(at("10:00:00"), None, false, None);
+    let account = typed_sign_in(&mut h, None);
+    h.worker.on_control(ControlEvent::SignedIn { account, workspaces: Ok(vec![workspace("a", "A"), workspace("b", "B")]) });
+    h.command(at("10:00:05"), Command::CancelWorkspaceChoice);
+    assert!(h.worker.pending.is_none() && h.worker.choices.is_empty());
+    assert!(h.state.snapshot().workspace_choices.is_empty());
+    h.command(at("10:00:06"), Command::ChooseWorkspace { index: 0 });
+    assert!(h.control_requests().is_empty());
+}
+
+#[test]
+fn a_saved_sign_in_of_an_older_build_must_sign_in_again() {
+    let mut old = saved(vec![project("p1", 5)], None);
+    old.workspace_id = None;
+    let h = harness_at(at("10:00:00"), Some(old), false, None);
+    assert_eq!(h.status(), TrackerStatus::SignedOut);
+}
+
+fn list_workspaces(h: &mut Harness) {
+    h.control_requests();
+    h.upload_commands();
+    h.command(at("10:01:00"), Command::SwitchWorkspace);
+    assert!(h.state.snapshot().finding_workspaces);
+    assert!(matches!(h.control_requests().pop(), Some(ControlRequest::MyWorkspaces)));
+    h.worker.on_control(ControlEvent::MyWorkspaces(Ok(vec![workspace("w1", "Acme"), workspace("w2", "Globex")])));
+    let snapshot = h.state.snapshot();
+    assert!(snapshot.workspace_choices[0].is_current && !snapshot.workspace_choices[1].is_current);
+}
+
+#[test]
+fn switching_workspace_saves_the_block_and_keeps_the_sign_in() {
+    let mut h = tracking();
+    let tokens = h.worker.account.as_ref().unwrap().tokens.clone();
+    list_workspaces(&mut h);
+    h.machine.input_at(at("10:01:59"));
+    h.command(at("10:02:01"), Command::SwitchToWorkspace { index: 1, at: at("10:02:00") });
+    assert!(h.farewells.try_recv().is_err(), "no sign-out");
+    let rows = h.worker.store.pending_rows(&h.owner(), 0, 10).unwrap();
+    assert_eq!((rows[0].activity.ended_at, rows[0].workspace_id.as_str()), (at("10:02:00"), "w1"), "queued in the old workspace");
+
+    let requests = h.control_requests();
+    assert!(!requests.iter().any(|r| matches!(r, ControlRequest::SignIn(_))), "no new token, no password");
+    let used = requests.iter().rev().find_map(|r| match r {
+        ControlRequest::UseAccount(Some(account)) => Some(account.clone()),
+        _ => None,
+    });
+    let used = used.expect("the new workspace is used");
+    assert_eq!(used.workspace_id.as_deref(), Some("w2"));
+    assert!(used.tokens == tokens, "the same token");
+    assert!(requests.iter().any(|r| matches!(r, ControlRequest::RefreshProjects)));
+    assert!(h.upload_commands().iter().any(|c| matches!(c, UploadCommand::Account(Some(a)) if a.workspace_id.as_deref() == Some("w2"))));
+
+    let saved = h.worker.saved.as_ref().unwrap();
+    assert_eq!((saved.workspace_id.as_deref(), saved.workspace_name.as_str(), saved.project_id.as_deref()), (Some("w2"), "Globex", None));
+    assert!(saved.projects.is_none());
+    let snapshot = h.state.snapshot();
+    assert_eq!((snapshot.status, snapshot.workspace.as_str()), (TrackerStatus::Connecting, "Globex"));
+    assert!(snapshot.projects.is_empty() && snapshot.workspace_choices.is_empty());
+
+    h.worker.on_control(ControlEvent::Projects(vec![project("p7", 5), project("p8", 5)]));
+    h.worker.publish();
+    assert_eq!(h.status(), TrackerStatus::ChooseProject);
+}
+
+#[test]
+fn switching_with_no_other_workspace_says_so() {
+    let mut h = tracking();
+    h.command(at("10:01:00"), Command::SwitchWorkspace);
+    h.worker.on_control(ControlEvent::MyWorkspaces(Ok(vec![workspace("w1", "Acme")])));
+    let snapshot = h.state.snapshot();
+    assert_eq!(snapshot.workspace_note.as_deref(), Some(ONE_WORKSPACE));
+    assert!(!snapshot.finding_workspaces && snapshot.workspace_choices.is_empty());
+    assert_eq!(h.status(), TrackerStatus::Tracking, "still signed in");
+}
+
+#[test]
+fn losing_access_to_the_workspace_stops_tracking_and_asks_for_another() {
+    let mut h = tracking();
+    h.machine.input_at(at("10:04:00"));
+    h.machine.set(at("10:04:00"));
+    h.control_requests();
+    h.worker.on_upload(UploadEvent::WorkspaceLost { owner: h.owner(), workspace_id: "w-other".into() });
+    h.worker.publish();
+    assert_eq!(h.status(), TrackerStatus::Tracking, "rows of another workspace: not about this one");
+
+    h.worker.on_control(ControlEvent::WorkspaceLost("w1".into()));
+    h.worker.publish();
+    let snapshot = h.state.snapshot();
+    assert_eq!(snapshot.status, TrackerStatus::ChooseProject);
+    assert!(snapshot.tracking_since.is_none());
+    assert_eq!(snapshot.workspace_lost.as_deref(), Some("Acme"));
+    assert_eq!(snapshot.workspace_note.as_deref(), Some("You no longer have access to Acme."));
+    assert!(snapshot.notices.iter().any(|n| matches!(&n.kind, NoticeKind::WorkspaceLost { name } if name == "Acme")));
+    assert!(snapshot.finding_workspaces);
+    assert!(h.control_requests().iter().any(|r| matches!(r, ControlRequest::MyWorkspaces)), "the picker is opened");
+    let rows = h.worker.store.pending_rows(&h.owner(), 0, 10).unwrap();
+    assert_eq!((rows[0].activity.ended_at, rows[0].workspace_id.as_str()), (at("10:04:00"), "w1"), "the work is kept, waiting");
+    assert!(h.heartbeats().is_empty(), "no heartbeat without a workspace");
+
+    // Another workspace is chosen: tracking can start there.
+    h.worker.on_control(ControlEvent::MyWorkspaces(Ok(vec![workspace("w2", "Globex")])));
+    h.command(at("10:05:00"), Command::SwitchToWorkspace { index: 0, at: at("10:05:00") });
+    h.worker.on_control(ControlEvent::Projects(vec![project("p9", 5)]));
+    h.worker.publish();
+    let snapshot = h.state.snapshot();
+    assert_eq!((snapshot.status, snapshot.workspace.as_str(), snapshot.workspace_lost.as_deref()), (TrackerStatus::Tracking, "Globex", None));
 }

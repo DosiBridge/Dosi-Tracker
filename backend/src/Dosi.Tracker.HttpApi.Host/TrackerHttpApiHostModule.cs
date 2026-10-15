@@ -21,7 +21,7 @@ using Microsoft.AspNetCore.Extensions.DependencyInjection;
 using OpenIddict.Validation.AspNetCore;
 using OpenIddict.Server.AspNetCore;
 using Dosi.Tracker.EntityFrameworkCore;
-using Dosi.Tracker.MultiTenancy;
+using Dosi.Tracker.Workspaces;
 using Dosi.Tracker.HealthChecks;
 using Dosi.Tracker.Security;
 using Microsoft.OpenApi;
@@ -30,7 +30,6 @@ using Volo.Abp.Studio;
 using Volo.Abp.Account;
 using Volo.Abp.Account.Web;
 using Volo.Abp.AspNetCore.Auditing;
-using Volo.Abp.AspNetCore.MultiTenancy;
 using Volo.Abp.AspNetCore.Mvc;
 using Volo.Abp.Autofac;
 using Volo.Abp.Localization;
@@ -58,7 +57,6 @@ namespace Dosi.Tracker;
     typeof(AbpStudioClientAspNetCoreModule),
     typeof(AbpAspNetCoreMvcUiLeptonXLiteThemeModule),
     typeof(AbpAutofacModule),
-    typeof(AbpAspNetCoreMultiTenancyModule),
     typeof(TrackerApplicationModule),
     typeof(TrackerEntityFrameworkCoreModule),
     typeof(AbpAccountWebOpenIddictModule),
@@ -148,6 +146,7 @@ public class TrackerHttpApiHostModule : AbpModule
         ConfigureRequestSizeLimits(context);
         ConfigureAuditing();
         ConfigureLegacyAgentCompatibility();
+        ConfigureWorkspaceRequirement();
     }
 
     /// <summary>Answers desktop agents installed before shared contract v2 in shapes they can read (see
@@ -155,6 +154,14 @@ public class TrackerHttpApiHostModule : AbpModule
     private void ConfigureLegacyAgentCompatibility()
     {
         Configure<MvcOptions>(options => options.Filters.Add(new LegacyAgentSummaryResultFilter()));
+    }
+
+    /// <summary>Tracker endpoints that work inside a workspace answer 400 Tracker:WorkspaceRequired without one.</summary>
+    private void ConfigureWorkspaceRequirement()
+    {
+        Configure<MvcOptions>(options => options.Filters.Add(new WorkspaceRequiredFilter(
+            typeof(TrackerApplicationModule).Assembly,
+            typeof(TrackerHttpApiModule).Assembly)));
     }
 
     /// <summary>Every running desktop agent sends a presence heartbeat each minute (shared contract §3). Recording each
@@ -496,13 +503,10 @@ public class TrackerHttpApiHostModule : AbpModule
         app.UseAuthentication();
         app.UseAbpOpenIddictValidation();
 
-        if (MultiTenancyConsts.IsEnabled)
-        {
-            app.UseMultiTenancy();
-        }
-
         app.UseUnitOfWork();
         app.UseDynamicClaims();
+        // X-Workspace-Id: the workspace the request works in (the caller must be an active member of it).
+        app.UseWorkspaceResolution();
         app.UseAuthorization();
 
         // The API map is not published in production unless App:SwaggerEnabled says so.

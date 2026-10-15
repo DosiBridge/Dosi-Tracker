@@ -1,7 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   REFRESH_TOKEN_STORAGE_KEY,
-  TENANT_STORAGE_KEY,
+  WORKSPACE_STORAGE_KEY,
+  currentWorkspaceId,
+  isWorkspaceFreePath,
+  setCurrentWorkspace,
+  clearCurrentWorkspace,
   TOKEN_EXPIRES_STORAGE_KEY,
   TOKEN_STORAGE_KEY,
   agoLabel,
@@ -11,7 +15,6 @@ import {
   readStorage,
   referenceNow,
   removeStorage,
-  storedTenantName,
   tokenExpiresAt,
   writeStorage,
 } from "./live-session";
@@ -110,12 +113,24 @@ describe("session token facts", () => {
     expect(canRenewSession()).toBe(true);
   });
 
-  it("storedTenantName is the trimmed workspace the session signed in with, or null for the platform account", () => {
-    expect(storedTenantName()).toBeNull();
-    localStorage.setItem(TENANT_STORAGE_KEY, "  Acme Corp ");
-    expect(storedTenantName()).toBe("Acme Corp");
-    localStorage.setItem(TENANT_STORAGE_KEY, "   ");
-    expect(storedTenantName()).toBeNull();
+  it("currentWorkspaceId is the stored workspace GUID; demo ids and junk never count", () => {
+    expect(currentWorkspaceId()).toBeNull();
+    setCurrentWorkspace("3f2504e0-4f89-11d3-9a0c-0305e82c3301");
+    expect(localStorage.getItem(WORKSPACE_STORAGE_KEY)).toBe("3f2504e0-4f89-11d3-9a0c-0305e82c3301");
+    expect(currentWorkspaceId()).toBe("3f2504e0-4f89-11d3-9a0c-0305e82c3301");
+    localStorage.setItem(WORKSPACE_STORAGE_KEY, "w1");
+    expect(currentWorkspaceId()).toBeNull();
+    setCurrentWorkspace("3f2504e0-4f89-11d3-9a0c-0305e82c3301");
+    clearCurrentWorkspace();
+    expect(currentWorkspaceId()).toBeNull();
+  });
+
+  it("knows the pages that need no workspace", () => {
+    expect(isWorkspaceFreePath("/workspaces")).toBe(true);
+    expect(isWorkspaceFreePath("/invite/abc")).toBe(true);
+    expect(isWorkspaceFreePath("/login")).toBe(true);
+    expect(isWorkspaceFreePath("/dashboard")).toBe(false);
+    expect(isWorkspaceFreePath("/invitesomething")).toBe(false);
   });
 });
 

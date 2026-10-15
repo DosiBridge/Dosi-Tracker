@@ -38,10 +38,10 @@ public abstract class ProjectAppServiceTests<TStartupModule> : TrackerApplicatio
         var projectId = _guidGenerator.Create();
         await WithUnitOfWorkAsync(async () =>
         {
-            await _projectRepository.InsertAsync(new Project(projectId, null, title));
+            await _projectRepository.InsertAsync(new Project(projectId, TrackerTestConsts.WorkspaceId, title));
             foreach (var role in roles)
             {
-                await _memberRepository.InsertAsync(new ProjectMember(_guidGenerator.Create(), null, projectId, CurrentUserId, role));
+                await _memberRepository.InsertAsync(new ProjectMember(_guidGenerator.Create(), TrackerTestConsts.WorkspaceId, projectId, CurrentUserId, role));
             }
         });
         return projectId;
@@ -295,17 +295,6 @@ public abstract class ProjectAppServiceTests<TStartupModule> : TrackerApplicatio
         var mine = await _projectAppService.GetMyProjectsAsync();
 
         mine.Select(p => p.Id).ShouldBe(new[] { legacyLabel, managed, tracked }); // ordered by title
-    }
-
-    [Fact]
-    public async Task MyProjects_Should_List_A_Project_Once_Even_With_A_Duplicated_Membership()
-    {
-        var duplicated = await SeedProjectWithCallerAsync("Duplicated", ProjectMemberRoles.Worker, ProjectMemberRoles.Worker);
-        var mixed = await SeedProjectWithCallerAsync("Mixed", ProjectMemberRoles.Client, ProjectMemberRoles.Worker);
-
-        var mine = await _projectAppService.GetMyProjectsAsync();
-
-        mine.Select(p => p.Id).ShouldBe(new[] { duplicated, mixed });
     }
 
     [Fact]

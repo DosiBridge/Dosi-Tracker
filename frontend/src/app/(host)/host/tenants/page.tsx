@@ -35,18 +35,16 @@ import { toast } from "@/components/toast";
 import { useSession } from "@/components/session-provider";
 import {
   activateSubscription,
-  changeTenantPlan,
-  delApi,
+  changeWorkspacePlan,
   getApi,
-  getTenantSubscriptions,
+  getWorkspaceSubscriptions,
   markInvoicePaid,
-  postApi,
   suspendSubscription,
 } from "@/hooks/useApi";
 import { ownerOf, planColor, tenantMetrics, type TenantMetrics } from "@/lib/host-data";
 import { asItems } from "@/lib/live-dataset";
 import { subscriptionStatus } from "@/lib/live-identity";
-import type { PlanDto, PlatformInvoiceDto, TenantSubscriptionDto } from "@/lib/api-contract";
+import type { PlanDto, PlatformInvoiceDto, WorkspaceSubscriptionDto } from "@/lib/api-contract";
 import {
   fmtLimit,
   invoicesFor,
@@ -65,7 +63,7 @@ import { colorFromString } from "@/lib/utils";
 
 const usd = (n: number | null) => (n === null ? "Custom" : `$${Math.round(n).toLocaleString()}`);
 
-/** Shape of GET /api/multi-tenancy/tenants items (ABP tenant management). */
+/** A live workspace as the platform lists it (from workspace-subscriptions). */
 interface LiveTenant {
   id: string;
   name: string;
@@ -92,7 +90,7 @@ const toWorkspace = (t: LiveTenant, i: number): Workspace => ({
 });
 
 /** A table row; `sub` is the live tenant's subscription when the server reports it. */
-type Row = { ws: Workspace; m: TenantMetrics; live: boolean; sub: TenantSubscriptionDto | null };
+type Row = { ws: Workspace; m: TenantMetrics; live: boolean; sub: WorkspaceSubscriptionDto | null };
 
 const statusTone: Record<SubscriptionStatus, "success" | "warning" | "danger"> = {
   active: "success",
@@ -117,11 +115,11 @@ interface Billing {
   plans: PlanDto[] | null;
   invoices: PlatformInvoiceDto[] | null;
   /** By tenant id; null when unknown (the call failed, or an older server doesn't offer it). */
-  subscriptions: Map<string, TenantSubscriptionDto> | null;
+  subscriptions: Map<string, WorkspaceSubscriptionDto> | null;
 }
 
 /** A live tenant's subscription status, or null when it has none (or none is reported). */
-function liveStatusOf(sub: TenantSubscriptionDto | null | undefined): SubscriptionStatus | null {
+function liveStatusOf(sub: WorkspaceSubscriptionDto | null | undefined): SubscriptionStatus | null {
   return sub?.status ? subscriptionStatus(sub.status) : null;
 }
 
@@ -137,9 +135,6 @@ export default function HostTenantsPage() {
   const [createOpen, setCreateOpen] = useState(false);
   const [newName, setNewName] = useState("");
   const [newPlan, setNewPlan] = useState<PlanId>("starter");
-  const [newAdminEmail, setNewAdminEmail] = useState("");
-  const [newAdminPassword, setNewAdminPassword] = useState("");
-  const [creating, setCreating] = useState(false);
 
   // Live mode: real tenants from the backend when a session token exists.
   // null = mock mode (no token, still loading, or the tenants call failed/403'd).
@@ -151,8 +146,8 @@ export default function HostTenantsPage() {
   const fetchTenants = useCallback(async () => {
     setLiveLoading(true);
     try {
-      const items = (await getApi("/api/multi-tenancy/tenants?MaxResultCount=1000")) as LiveTenant[];
-      setLiveTenants(Array.isArray(items) ? items : []);
+      const items = (await getWorkspaceSubscriptions()) ?? [];
+      setLiveTenants(items.map((w) => ({ id: w.workspaceId, name: w.workspaceName })));
       setLiveFailed(false);
     } catch {
       // Live: show an error with retry — never the demo tenants.
@@ -167,14 +162,14 @@ export default function HostTenantsPage() {
     const [plansRes, invoicesRes, subscriptionsRes] = await Promise.allSettled([
       getApi("/api/app/platform/plans"),
       getApi("/api/app/platform/invoices?MaxResultCount=1000"),
-      getTenantSubscriptions(),
+      getWorkspaceSubscriptions(),
     ]);
     setBilling({
       plans: plansRes.status === "fulfilled" ? asItems<PlanDto>(plansRes.value) : null,
       invoices: invoicesRes.status === "fulfilled" ? asItems<PlatformInvoiceDto>(invoicesRes.value) : null,
       subscriptions:
         subscriptionsRes.status === "fulfilled" && subscriptionsRes.value
-          ? new Map(subscriptionsRes.value.map((s) => [s.tenantId, s]))
+          ? new Map(subscriptionsRes.value.map((s) => [s.workspaceId, s]))
           : null,
     });
   }, []);
@@ -219,34 +214,7 @@ export default function HostTenantsPage() {
   async function onCreate(e: React.FormEvent) {
     e.preventDefault();
     if (!newName.trim()) return;
-    if (isLive) {
-      if (!newAdminEmail.trim() || !newAdminPassword) return;
-      setCreating(true);
-      const name = newName.trim();
-      try {
-        const created = (await postApi("/api/multi-tenancy/tenants", {
-          name,
-          adminEmailAddress: newAdminEmail.trim(),
-          adminPassword: newAdminPassword,
-        })) as { id?: string } | null;
-        setCreateOpen(false);
-        setNewName("");
-        setNewAdminEmail("");
-        setNewAdminPassword("");
-        toast({ title: "Tenant created", description: `${name} is now provisioned.`, tone: "success" });
-        await fetchTenants();
-        if (created?.id) setSelectedId(created.id);
-      } catch (err) {
-        toast({
-          title: "Failed to create tenant",
-          description: requestErrorText(err, "Something went wrong."),
-          tone: "danger",
-        });
-      } finally {
-        setCreating(false);
-      }
-      return;
-    }
+    if (isLive) return; // workspaces are created by their owners
     const ws = createWorkspace(newName.trim(), newPlan);
     setCreateOpen(false);
     setNewName("");
@@ -363,9 +331,11 @@ export default function HostTenantsPage() {
         title="Tenants"
         description={initialLiveLoading ? "Loading tenants…" : `${rows.length} of ${allRows.length} workspaces on the platform.`}
         actions={
-          <Button onClick={() => setCreateOpen(true)}>
-            <Plus className="h-4 w-4" /> New tenant
-          </Button>
+          isLive ? undefined : (
+            <Button onClick={() => setCreateOpen(true)}>
+              <Plus className="h-4 w-4" /> New tenant
+            </Button>
+          )
         }
       />
 
@@ -419,38 +389,7 @@ export default function HostTenantsPage() {
             </label>
             <Input id={`${formId}-name`} value={newName} onChange={(e) => setNewName(e.target.value)} placeholder="Acme Corp" autoFocus required />
           </div>
-          {isLive ? (
-            <>
-              <div className="space-y-1.5">
-                <label htmlFor={`${formId}-email`} className="text-sm font-medium">
-                  Admin email
-                </label>
-                <Input
-                  id={`${formId}-email`}
-                  type="email"
-                  value={newAdminEmail}
-                  onChange={(e) => setNewAdminEmail(e.target.value)}
-                  placeholder="admin@acme.com"
-                  autoComplete="off"
-                  required
-                />
-              </div>
-              <div className="space-y-1.5">
-                <label htmlFor={`${formId}-admin-pw`} className="text-sm font-medium">
-                  Admin password
-                </label>
-                <Input
-                  id={`${formId}-admin-pw`}
-                  type="password"
-                  value={newAdminPassword}
-                  onChange={(e) => setNewAdminPassword(e.target.value)}
-                  placeholder="••••••••"
-                  autoComplete="off"
-                  required
-                />
-              </div>
-            </>
-          ) : (
+          {(
             <div className="space-y-1.5">
               <label htmlFor={`${formId}-plan`} className="text-sm font-medium">
                 Plan
@@ -468,8 +407,8 @@ export default function HostTenantsPage() {
             <Button type="button" variant="outline" onClick={() => setCreateOpen(false)}>
               Cancel
             </Button>
-            <Button type="submit" disabled={!newName.trim() || creating || (isLive && (!newAdminEmail.trim() || !newAdminPassword))}>
-              {creating ? "Creating…" : "Create tenant"}
+            <Button type="submit" disabled={!newName.trim()}>
+              Create tenant
             </Button>
           </div>
         </form>
@@ -486,21 +425,7 @@ export default function HostTenantsPage() {
         onImpersonate={doImpersonate}
         onUpdate={updateWorkspace}
         onDelete={async (id) => {
-          if (isLive) {
-            try {
-              await delApi(`/api/multi-tenancy/tenants/${id}`);
-              setSelectedId(null);
-              toast({ title: "Tenant deleted", tone: "danger" });
-              await Promise.all([fetchTenants(), fetchBilling()]);
-            } catch (err) {
-              toast({
-                title: "Failed to delete tenant",
-                description: requestErrorText(err, "Something went wrong."),
-                tone: "danger",
-              });
-            }
-            return;
-          }
+          if (isLive) return;
           deleteWorkspace(id);
           setSelectedId(null);
           toast({ title: "Tenant deleted", tone: "danger" });
@@ -532,7 +457,7 @@ function TenantDrawer({
   live: boolean;
   billing: Billing;
   /** The live tenant's subscription, when the server reports subscriptions. */
-  subscription: TenantSubscriptionDto | null;
+  subscription: WorkspaceSubscriptionDto | null;
   onBillingChanged: () => Promise<void>;
   onClose: () => void;
   onImpersonate: (ws: Workspace) => void;
@@ -561,7 +486,7 @@ function TenantDrawer({
   const suspendWho = seats === null ? "Its members" : `Its ${seats.toLocaleString("en-US")} ${seats === 1 ? "member" : "members"}`;
   const livePlans = [...(billing.plans ?? [])].sort((a, b) => a.pricePerUser - b.pricePerUser || a.name.localeCompare(b.name));
   const liveInvoices = (billing.invoices ?? [])
-    .filter((inv) => inv.tenantId === ws.id)
+    .filter((inv) => inv.workspaceId === ws.id)
     .sort((a, b) => Date.parse(b.dueDate) - Date.parse(a.dueDate))
     .slice(0, 6);
 
@@ -570,7 +495,7 @@ function TenantDrawer({
     setBusy(true);
     try {
       if (pending.kind === "plan") {
-        await changeTenantPlan(ws.id, pending.plan.id);
+        await changeWorkspacePlan(ws.id, pending.plan.id);
         toast({ tone: "success", title: `${ws.name} moved to ${pending.plan.name}`, description: "Seat limits and billing follow the new plan from now on." });
         setPlanChoice("");
       } else if (pending.kind === "activate") {
@@ -827,7 +752,8 @@ function TenantDrawer({
           </>
         )}
 
-        {/* Danger zone */}
+        {/* Danger zone (demo only: live workspaces are deleted by their owners) */}
+        {!live && (
         <div className="rounded-xl border border-danger/30 bg-danger/5 p-3">
           <div className="text-sm font-medium text-danger-on-tint">Danger zone</div>
           <p className="mt-0.5 text-xs text-muted-foreground">
@@ -862,6 +788,7 @@ function TenantDrawer({
             </Button>
           )}
         </div>
+        )}
       </div>
 
       <ConfirmDialog

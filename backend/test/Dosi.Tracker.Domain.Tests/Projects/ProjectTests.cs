@@ -9,7 +9,7 @@ public class ProjectTests
     [Fact]
     public void New_Project_Should_Have_Sensible_Defaults()
     {
-        var project = new Project(Guid.NewGuid(), null, "Website Redesign");
+        var project = new Project(Guid.NewGuid(), TrackerTestConsts.WorkspaceId, "Website Redesign");
 
         project.Title.ShouldBe("Website Redesign");
         project.IntervalMinutes.ShouldBe(10);
@@ -23,7 +23,7 @@ public class ProjectTests
     [Fact]
     public void New_Project_Should_Detect_Idle_After_5_Minutes_And_Not_Blur_Screenshots()
     {
-        var project = new Project(Guid.NewGuid(), null, "Website");
+        var project = new Project(Guid.NewGuid(), TrackerTestConsts.WorkspaceId, "Website");
 
         project.IdleThresholdMinutes.ShouldBe(5);
         project.BlurScreenshots.ShouldBeFalse();
@@ -34,7 +34,7 @@ public class ProjectTests
     {
         // Privacy-first: everything on EXCEPT the webcam. Pinned exactly so a flipped default
         // (e.g. webcam silently on) is caught.
-        var project = new Project(Guid.NewGuid(), null, "Website");
+        var project = new Project(Guid.NewGuid(), TrackerTestConsts.WorkspaceId, "Website");
 
         project.AllowScreenshot.ShouldBeTrue();
         project.AllowWebcam.ShouldBeFalse();
@@ -47,7 +47,7 @@ public class ProjectTests
     [Fact]
     public void Archive_And_Unarchive_Should_Toggle_The_Flag()
     {
-        var project = new Project(Guid.NewGuid(), null, "Website");
+        var project = new Project(Guid.NewGuid(), TrackerTestConsts.WorkspaceId, "Website");
         var archivedAt = new DateTime(2026, 7, 20, 17, 5, 0, DateTimeKind.Utc);
 
         project.Archive(archivedAt);
@@ -63,7 +63,7 @@ public class ProjectTests
     public void Archiving_Again_Should_Keep_The_Original_Archive_Moment()
     {
         // Blocks are accepted up to ArchivedAt, so a repeated archive must never move the cut-off later.
-        var project = new Project(Guid.NewGuid(), null, "Website");
+        var project = new Project(Guid.NewGuid(), TrackerTestConsts.WorkspaceId, "Website");
         var first = new DateTime(2026, 7, 20, 17, 5, 0, DateTimeKind.Utc);
 
         project.Archive(first);
@@ -77,7 +77,7 @@ public class ProjectTests
     public void Archive_Should_Stamp_A_Legacy_Archived_Project_That_Has_No_Moment()
     {
         // Archived before ArchivedAt existed (flag only): archiving again records the moment.
-        var project = new Project(Guid.NewGuid(), null, "Website") { IsArchived = true };
+        var project = new Project(Guid.NewGuid(), TrackerTestConsts.WorkspaceId, "Website") { IsArchived = true };
         var archivedAt = new DateTime(2026, 7, 20, 17, 5, 0, DateTimeKind.Utc);
 
         project.Archive(archivedAt);
@@ -88,7 +88,7 @@ public class ProjectTests
     [Fact]
     public void Unarchive_Then_Archive_Should_Record_The_New_Moment()
     {
-        var project = new Project(Guid.NewGuid(), null, "Website");
+        var project = new Project(Guid.NewGuid(), TrackerTestConsts.WorkspaceId, "Website");
         var first = new DateTime(2026, 7, 20, 17, 5, 0, DateTimeKind.Utc);
 
         project.Archive(first);
@@ -108,7 +108,7 @@ public class ProjectTests
 
         var rate = new ProjectMemberRate(Guid.NewGuid(), tenantId, projectId, userId, 30.5m, effectiveFrom);
 
-        rate.TenantId.ShouldBe(tenantId);
+        rate.WorkspaceId.ShouldBe(tenantId);
         rate.ProjectId.ShouldBe(projectId);
         rate.UserId.ShouldBe(userId);
         rate.HourlyRate.ShouldBe(30.5m);
@@ -118,7 +118,7 @@ public class ProjectTests
     [Fact]
     public void New_ProjectMember_Should_Default_To_Worker_Role()
     {
-        var member = new ProjectMember(Guid.NewGuid(), null, Guid.NewGuid(), Guid.NewGuid());
+        var member = new ProjectMember(Guid.NewGuid(), TrackerTestConsts.WorkspaceId, Guid.NewGuid(), Guid.NewGuid());
 
         member.Role.ShouldBe("Worker");
     }

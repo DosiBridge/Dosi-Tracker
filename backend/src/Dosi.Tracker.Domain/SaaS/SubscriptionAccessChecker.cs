@@ -4,11 +4,12 @@ using System.Threading.Tasks;
 using Dosi.Tracker.Billing;
 using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Domain.Services;
+using Dosi.Tracker.Workspaces;
 
 namespace Dosi.Tracker.SaaS;
 
 /// <inheritdoc cref="ISubscriptionAccessChecker"/>
-public class SubscriptionAccessChecker : DomainService, ISubscriptionAccessChecker
+public class SubscriptionAccessChecker : TrackerDomainService, ISubscriptionAccessChecker
 {
     private readonly IRepository<Subscription, Guid> _subscriptionRepository;
     private readonly IRepository<Invoice, Guid> _invoiceRepository;
@@ -23,12 +24,13 @@ public class SubscriptionAccessChecker : DomainService, ISubscriptionAccessCheck
 
     public virtual async Task<bool> IsUsableAsync()
     {
-        if (CurrentTenant.Id == null)
+        var workspaceId = CurrentWorkspace.Id;
+        if (workspaceId == null)
         {
-            return true; // The host (platform) has no subscription of its own.
+            return true; // Outside a workspace there is no subscription to enforce.
         }
 
-        var subscription = await _subscriptionRepository.FirstOrDefaultAsync(s => s.TenantId == CurrentTenant.Id);
+        var subscription = await _subscriptionRepository.FirstOrDefaultAsync(s => s.WorkspaceId == workspaceId);
         if (subscription == null)
         {
             return true; // Nothing to enforce, as for seat limits.
@@ -60,8 +62,9 @@ public class SubscriptionAccessChecker : DomainService, ISubscriptionAccessCheck
     public virtual async Task<DateTime?> GetPastDueGraceEndAsync()
     {
         // A workspace has few unpaid invoices; the excused flag is an extra property, so it is filtered here.
+        var workspaceId = CurrentWorkspace.Id;
         var unpaid = await _invoiceRepository.GetListAsync(
-            i => i.TenantId == CurrentTenant.Id && i.Status != Invoice.PaidStatus);
+            i => i.WorkspaceId == workspaceId && i.Status != Invoice.PaidStatus);
         var oldestDueDate = unpaid
             .Where(i => !i.IsOverdueExcused())
             .Select(i => (DateTime?)i.DueDate)

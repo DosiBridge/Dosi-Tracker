@@ -10,19 +10,16 @@ using Volo.Abp.DistributedLocking;
 using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Domain.Services;
 using Volo.Abp.Identity;
-using Volo.Abp.MultiTenancy;
+using Dosi.Tracker.Workspaces;
 
 namespace Dosi.Tracker.SaaS;
 
 /// <summary>
 /// The one definition of an occupied seat, shared by the plan's seat limit (team service), the monthly invoice and the
-/// platform console: a distinct user with an active account in the workspace who holds a tracked membership (any role
-/// but <see cref="TrackerRoles.ClientProjectRole"/>) on a project that still exists. Clients follow projects without
-/// tracking and take no seat; deleting or deactivating an account (removal from the workspace) frees its seat even
-/// where a membership row was left behind; and a membership whose user has no account in the workspace (a stray id)
-/// never occupies, or bills, a seat.
+/// platform console: a distinct active member of the workspace (with an active account) who holds a tracked project
+/// membership (any role but <see cref="TrackerRoles.ClientProjectRole"/>) on a project of that workspace that still exists.
 /// </summary>
-public class SeatCounter : DomainService
+public class SeatCounter : TrackerDomainService
 {
     /// <summary>How long a change that may take a seat waits for another one of the same workspace to finish.</summary>
     public static readonly TimeSpan SeatLockTimeout = TimeSpan.FromSeconds(30);
@@ -30,6 +27,7 @@ public class SeatCounter : DomainService
     private readonly IRepository<ProjectMember, Guid> _memberRepository;
     private readonly IRepository<Project, Guid> _projectRepository;
     private readonly IRepository<IdentityUser, Guid> _userRepository;
+    private readonly IRepository<WorkspaceMember, Guid> _workspaceMemberRepository;
     private readonly IRepository<Subscription, Guid> _subscriptionRepository;
     private readonly IRepository<Plan, Guid> _planRepository;
     private readonly IDataFilter _dataFilter;
@@ -39,6 +37,7 @@ public class SeatCounter : DomainService
         IRepository<ProjectMember, Guid> memberRepository,
         IRepository<Project, Guid> projectRepository,
         IRepository<IdentityUser, Guid> userRepository,
+        IRepository<WorkspaceMember, Guid> workspaceMemberRepository,
         IRepository<Subscription, Guid> subscriptionRepository,
         IRepository<Plan, Guid> planRepository,
         IDataFilter dataFilter,
@@ -47,14 +46,15 @@ public class SeatCounter : DomainService
         _memberRepository = memberRepository;
         _projectRepository = projectRepository;
         _userRepository = userRepository;
+        _workspaceMemberRepository = workspaceMemberRepository;
         _subscriptionRepository = subscriptionRepository;
         _planRepository = planRepository;
         _dataFilter = dataFilter;
         _distributedLock = distributedLock;
     }
 
-    /// <summary>The name of the lock that serializes the seat-taking changes of a workspace (null: the host).</summary>
-    public static string SeatLockName(Guid? tenantId) => $"Tracker:Seats:{tenantId?.ToString("N") ?? "host"}";
+    /// <summary>The name of the lock that serializes the seat-taking changes of a workspace.</summary>
+    public static string SeatLockName(Guid? workspaceId) => $"Tracker:Seats:{workspaceId?.ToString("N") ?? "none"}";
 
     /// <summary>
     /// Serializes the changes that can take a seat in the current workspace — adding or inviting a member, turning a
@@ -65,7 +65,7 @@ public class SeatCounter : DomainService
     /// </summary>
     public virtual async Task<IAbpDistributedLockHandle> LockAsync()
     {
-        var handle = await _distributedLock.TryAcquireAsync(SeatLockName(CurrentTenant.Id), SeatLockTimeout);
+        var handle = await _distributedLock.TryAcquireAsync(SeatLockName(CurrentWorkspace.Id), SeatLockTimeout);
         return handle ?? throw new AbpException(
             "Another change of this workspace's team is still being saved; try again in a moment.");
     }
@@ -84,20 +84,19 @@ public class SeatCounter : DomainService
         return await AsyncExecuter.AnyAsync(seatMemberships.Where(m => m.UserId == userId));
     }
 
-    /// <summary>Occupied seats of every workspace (host aggregation), keyed by tenant id. Workspaces without
-    /// an occupied seat are absent; memberships on the host side (no tenant) are ignored.</summary>
-    public virtual async Task<Dictionary<Guid, int>> CountByTenantAsync()
+    /// <summary>Occupied seats of every workspace (platform aggregation), keyed by workspace id. Workspaces without
+    /// an occupied seat are absent.</summary>
+    public virtual async Task<Dictionary<Guid, int>> CountByWorkspaceAsync()
     {
-        using (_dataFilter.Disable<IMultiTenant>())
+        using (_dataFilter.Disable<IWorkspaceScoped>())
         {
             var seatMemberships = await GetSeatMembershipsAsync();
             var seats = await AsyncExecuter.ToListAsync(seatMemberships
-                .Where(m => m.TenantId != null)
-                .Select(m => new { m.TenantId, m.UserId })
+                .Select(m => new { m.WorkspaceId, m.UserId })
                 .Distinct());
 
             return seats
-                .GroupBy(s => s.TenantId!.Value)
+                .GroupBy(s => s.WorkspaceId)
                 .ToDictionary(g => g.Key, g => g.Count());
         }
     }
@@ -148,23 +147,27 @@ public class SeatCounter : DomainService
 
     private async Task<Plan?> FindCurrentPlanAsync()
     {
-        var subscription = await _subscriptionRepository.FirstOrDefaultAsync(s => s.TenantId == CurrentTenant.Id);
+        var workspaceId = CurrentWorkspace.Id;
+        var subscription = await _subscriptionRepository.FirstOrDefaultAsync(s => s.WorkspaceId == workspaceId);
         return subscription == null ? null : await _planRepository.FindAsync(subscription.PlanId);
     }
 
     /// <summary>Memberships that occupy a seat: a tracked role (not Client, whatever its case or surrounding spaces) on
-    /// a live project of the membership's workspace, held by an active account of that workspace. The deletion checks
-    /// are explicit, so the result is the same whether or not the caller disabled the soft-delete filter.</summary>
+    /// a live project of the membership's workspace, held by an active member of that workspace with an active account.
+    /// The deletion checks are explicit, so the result is the same whether or not the caller disabled the soft-delete
+    /// filter.</summary>
     protected virtual async Task<IQueryable<ProjectMember>> GetSeatMembershipsAsync()
     {
         var members = await _memberRepository.GetQueryableAsync();
         var projects = await _projectRepository.GetQueryableAsync();
         var users = await _userRepository.GetQueryableAsync();
+        var workspaceMembers = await _workspaceMemberRepository.GetQueryableAsync();
         var clientRole = TrackerRoles.ClientProjectRole.ToUpperInvariant();
 
         return members.Where(m =>
             m.Role.Trim().ToUpper() != clientRole &&
-            projects.Any(p => p.Id == m.ProjectId && p.TenantId == m.TenantId && !p.IsDeleted) &&
-            users.Any(u => u.Id == m.UserId && u.TenantId == m.TenantId && !u.IsDeleted && u.IsActive));
+            projects.Any(p => p.Id == m.ProjectId && p.WorkspaceId == m.WorkspaceId && !p.IsDeleted) &&
+            workspaceMembers.Any(w => w.WorkspaceId == m.WorkspaceId && w.UserId == m.UserId && w.Status == WorkspaceMemberStatus.Active) &&
+            users.Any(u => u.Id == m.UserId && !u.IsDeleted && u.IsActive));
     }
 }

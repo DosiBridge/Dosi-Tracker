@@ -5,6 +5,7 @@ using Dosi.Tracker.Acceptance.Support;
 using Dosi.Tracker.Notifications;
 using Dosi.Tracker.SaaS;
 using Dosi.Tracker.Teams;
+using Dosi.Tracker.Workspaces;
 using Reqnroll;
 using Shouldly;
 using Volo.Abp;
@@ -26,7 +27,7 @@ public sealed class ProjectsAndTeamSteps
         _state = state;
     }
 
-    /// <summary>A person with an account in the workspace (members must be existing users of it).</summary>
+    /// <summary>An active member of the workspace (only members join its projects).</summary>
     private async Task<Guid> CreateUserAsync()
     {
         var userId = Guid.NewGuid();
@@ -35,6 +36,7 @@ public sealed class ProjectsAndTeamSteps
         {
             var userManager = _app.Resolve<IdentityUserManager>();
             (await userManager.CreateAsync(new IdentityUser(userId, userName, userName + "@acme.test"))).Succeeded.ShouldBeTrue();
+            await _app.Resolve<WorkspaceMembershipManager>().AddAsync(TrackerTestConsts.WorkspaceId, userId, WorkspaceRoles.Member);
         });
         return userId;
     }
@@ -63,7 +65,7 @@ public sealed class ProjectsAndTeamSteps
             var subscriptions = _app.Resolve<IRepository<Subscription, Guid>>();
             var guids = _app.Resolve<IGuidGenerator>();
             var plan = await plans.FirstAsync(p => p.Name == planName);
-            await subscriptions.InsertAsync(new Subscription(guids.Create(), null, plan.Id));
+            await subscriptions.InsertAsync(new Subscription(guids.Create(), TrackerTestConsts.WorkspaceId, plan.Id));
         });
     }
 
@@ -189,20 +191,18 @@ public sealed class ProjectsAndTeamSteps
             .Code.ShouldBe(TrackerDomainErrorCodes.SeatLimitReached);
     }
 
-    [Then(@"a new user is created with a one-time password")]
-    public void ThenANewUserIsCreatedWithAOneTimePassword()
+    [Then(@"a pending invitation link is returned")]
+    public void ThenAPendingInvitationLinkIsReturned()
     {
         var result = _state.Result<InviteMemberResultDto>();
-        result.UserCreated.ShouldBeTrue();
-        result.InitialPassword.ShouldNotBeNullOrWhiteSpace();
+        result.Added.ShouldBeFalse();
+        result.InvitePath.ShouldNotBeNull().ShouldStartWith("/invite/");
     }
 
-    [Then(@"the invitee is a member of the project")]
-    public async Task ThenTheInviteeIsAMemberOfTheProject()
+    [Then(@"no account exists yet for ""(.*)""")]
+    public async Task ThenNoAccountExistsYetFor(string email)
     {
-        var result = _state.Result<InviteMemberResultDto>();
-        var team = _app.Resolve<ITeamAppService>();
-        var members = await team.GetProjectMembersAsync(_state.ProjectId);
-        members.Items.ShouldContain(m => m.UserId == result.Member.UserId);
+        var user = await _app.WithUow(() => _app.Resolve<IdentityUserManager>().FindByEmailAsync(email));
+        user.ShouldBeNull();
     }
 }

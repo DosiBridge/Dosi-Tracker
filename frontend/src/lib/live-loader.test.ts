@@ -11,6 +11,7 @@ import {
   MAX_LIVE_ACTIVITY_ROWS,
   PULSE_LOOKBACK_MS,
   SessionExpiredError,
+  WorkspaceRequiredError,
   type LiveGetter,
   type LivePageGetter,
 } from "./live-loader";
@@ -540,5 +541,64 @@ describe("identity", () => {
     const data = await loadLiveSession(backend({ members: team, projects: [], ...plan }), NOW, { getPage: activityServer([]).getPage, browserZone: "UTC" });
     expect(data.identity).toEqual({ userId: OWNER, tenantId: "t-1", tenantName: "RealCo", userName: "mira@realco.test" });
     expect(data.loadedAt).toBe(NOW.toISOString());
+  });
+});
+
+describe("loadLiveSession — the workspace chosen with X-Workspace-Id", () => {
+  const WS = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+  const globalUser = (roles: string[] = [], policies: Record<string, boolean> = {}) => ({
+    currentUser: { isAuthenticated: true, id: OWNER, tenantId: null, userName: "mira", email: "mira@realco.test", roles },
+    currentTenant: { id: null },
+    auth: { grantedPolicies: policies },
+  });
+  const empty = { "/api/app/": [] };
+
+  it("takes the workspace's name and the caller's role in it from workspaces/mine", async () => {
+    const get = getter({
+      ...empty,
+      "/api/abp/application-configuration": globalUser(),
+      "/api/app/workspaces/mine": [
+        { id: WS.toUpperCase(), name: "RealCo", role: "manager" },
+        { id: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", name: "Other", role: "owner" },
+      ],
+    });
+    const data = await loadLiveSession(get, NOW, { workspaceId: WS });
+    expect(data.workspace.name).toBe("RealCo");
+    expect(data.user.role).toBe("admin");
+    expect(data.identity.tenantId?.toLowerCase()).toBe(WS);
+  });
+
+  it("maps owner → owner and member → worker", async () => {
+    const owner = await loadLiveSession(
+      getter({ ...empty, "/api/abp/application-configuration": globalUser(), "/api/app/workspaces/mine": [{ id: WS, name: "A", role: "owner" }] }),
+      NOW,
+      { workspaceId: WS },
+    );
+    expect(owner.user.role).toBe("owner");
+    const member = await loadLiveSession(
+      getter({ ...empty, "/api/abp/application-configuration": globalUser(), "/api/app/workspaces/mine": [{ id: WS, name: "A", role: "member" }] }),
+      NOW,
+      { workspaceId: WS },
+    );
+    expect(member.user.role).toBe("worker");
+  });
+
+  it("no workspace chosen, or one no longer theirs: WorkspaceRequiredError", async () => {
+    const get = getter({ "/api/abp/application-configuration": globalUser(), "/api/app/workspaces/mine": [] });
+    await expect(loadLiveSession(get, NOW, { workspaceId: null })).rejects.toBeInstanceOf(WorkspaceRequiredError);
+    await expect(loadLiveSession(get, NOW, { workspaceId: WS })).rejects.toBeInstanceOf(WorkspaceRequiredError);
+  });
+
+  it("the platform admin with no workspace gets the console", async () => {
+    const get = getter({ "/api/abp/application-configuration": globalUser(["platform-admin"]) });
+    const data = await loadLiveSession(get, NOW, { workspaceId: null });
+    expect(data.user.role).toBe("host");
+    expect(get).toHaveBeenCalledTimes(1);
+  });
+
+  it("fetchLiveIdentity carries the chosen workspace, so a renewal is the same identity", async () => {
+    const get = getter({ "/api/abp/application-configuration": globalUser() });
+    const a = await fetchLiveIdentity(get, WS);
+    expect(isSameIdentity(a!, { userId: OWNER, tenantId: WS.toUpperCase(), tenantName: "RealCo", userName: "mira" })).toBe(true);
   });
 });

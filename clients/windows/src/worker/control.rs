@@ -13,7 +13,7 @@ use chrono::{DateTime, Local, Utc};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
-use crate::api::{ApiClient, ApiError, AuthError, ServerClock};
+use crate::api::{ApiClient, ApiError, AuthError, ServerClock, Workspace};
 use crate::model::{Heartbeat, Project};
 use crate::state::StateHandle;
 
@@ -31,12 +31,14 @@ const WEEK_HISTORY_TTL: chrono::TimeDelta = chrono::TimeDelta::minutes(30);
 
 #[derive(Debug)]
 pub enum ControlRequest {
-    /// Check a sign-in the user typed: sign in, then fetch the projects. Only
-    /// a sign-in the server accepted replaces the current account.
+    /// Check a sign-in the user typed: sign in, then list the user's
+    /// workspaces. Only a sign-in the server accepted is used.
     SignIn(Account),
-    /// Use this account from now on without checking it first (a saved
-    /// sign-in), or none.
+    /// Use this account (and its workspace) from now on without checking it
+    /// first, or none.
     UseAccount(Option<Account>),
+    /// The signed-in user's workspaces.
+    MyWorkspaces,
     RefreshProjects,
     RefreshTotals,
     Heartbeat(Box<Heartbeat>),
@@ -52,8 +54,12 @@ pub struct Farewell {
 
 #[derive(Debug)]
 pub enum ControlEvent {
-    SignedIn { account: Account, projects: Result<Vec<Project>, ApiError> },
+    /// The server accepted the sign-in; `account` holds its token.
+    SignedIn { account: Account, workspaces: Result<Vec<Workspace>, ApiError> },
     SignInFailed(AuthError),
+    MyWorkspaces(Result<Vec<Workspace>, String>),
+    /// 403 `Tracker:NotWorkspaceMember` for this workspace.
+    WorkspaceLost(String),
     Projects(Vec<Project>),
     ProjectsFailed(ApiError),
     /// The server no longer accepts the saved password.
@@ -143,6 +149,10 @@ impl Control {
     fn report(&self, error: &ApiError) {
         if let ApiError::Auth(AuthError::Rejected(reason)) = error {
             self.emit(ControlEvent::SignInExpired(reason.clone()));
+        } else if let ApiError::NotWorkspaceMember(_) = error {
+            if let Some(workspace) = self.client.as_ref().and_then(ApiClient::workspace_id) {
+                self.emit(ControlEvent::WorkspaceLost(workspace.to_owned()));
+            }
         } else if matches!(error, ApiError::Offline(_)) {
             self.emit(ControlEvent::Reachable(false));
         } else {
@@ -157,15 +167,23 @@ impl Control {
                 let mut candidate = account.client(&self.clock);
                 match candidate.login().await {
                     Ok(()) => {
-                        let projects = candidate.my_projects().await;
+                        let workspaces = candidate.workspaces_mine().await;
                         self.client = Some(candidate);
-                        self.emit(ControlEvent::SignedIn { account, projects });
+                        self.emit(ControlEvent::SignedIn { account, workspaces });
                     }
                     Err(error) => self.emit(ControlEvent::SignInFailed(error)),
                 }
             }
             ControlRequest::UseAccount(account) => {
                 self.client = account.map(|account| account.client(&self.clock));
+            }
+            ControlRequest::MyWorkspaces => {
+                let Some(client) = self.client.as_mut() else { return };
+                let found = client.workspaces_mine().await;
+                if let Err(error) = &found {
+                    self.report(error);
+                }
+                self.emit(ControlEvent::MyWorkspaces(found.map_err(|e| api_message(&e))));
             }
             ControlRequest::RefreshProjects => {
                 let Some(client) = self.client.as_mut() else { return };
@@ -209,6 +227,15 @@ impl Control {
         }
         self.client = None;
         let _ = farewell.done.send(());
+    }
+}
+
+fn api_message(error: &ApiError) -> String {
+    match error {
+        ApiError::Auth(e) => e.user_message(),
+        ApiError::Offline(_) => AuthError::Offline(String::new()).user_message(),
+        ApiError::Http { error: Some(abp), .. } => abp.summary().unwrap_or_else(|| error.to_string()),
+        other => other.to_string(),
     }
 }
 
@@ -290,7 +317,7 @@ mod tests {
     }
 
     fn account(url: &str) -> Account {
-        Account { server: url.into(), workspace: "acme".into(), username: "alice@acme.com".into(), password: "pw".into() }
+        Account::new(url.into(), "alice@acme.com".into(), "pw".into()).in_workspace("w1", "Acme")
     }
 
     async fn next(events: &mut UnboundedReceiver<ControlEvent>) -> ControlEvent {
@@ -300,14 +327,14 @@ mod tests {
     #[tokio::test]
     async fn a_sign_in_is_checked_before_it_is_used() {
         let token = r#"{"access_token":"t","expires_in":3600}"#;
-        let url = canned_server(vec![http("200 OK", token), http("200 OK", "[]")]);
+        let url = canned_server(vec![http("200 OK", token), http("200 OK", r#"[{"id":"w1","name":"Acme"}]"#)]);
         let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
         let link = spawn(StateHandle::new(), ServerClock::default(), tx);
         link.send(ControlRequest::SignIn(account(&url)));
         match next(&mut events).await {
-            ControlEvent::SignedIn { account, projects } => {
+            ControlEvent::SignedIn { account, workspaces } => {
                 assert_eq!(account.username, "alice@acme.com");
-                assert!(projects.unwrap().is_empty());
+                assert_eq!(workspaces.unwrap()[0].name, "Acme");
             }
             other => panic!("expected a sign-in, got {other:?}"),
         }
@@ -363,5 +390,21 @@ mod tests {
         let started = std::time::Instant::now();
         link.farewell(None, Duration::from_secs(5)).await;
         assert!(started.elapsed() < Duration::from_secs(2), "not stuck behind the 30 s request");
+    }
+
+    #[tokio::test]
+    async fn losing_the_workspace_is_reported() {
+        let token = r#"{"access_token":"t","expires_in":3600}"#;
+        let lost = r#"{"error":{"code":"Tracker:NotWorkspaceMember","message":"No access"}}"#;
+        let url = canned_server(vec![http("200 OK", token), http("403 Forbidden", lost)]);
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let link = spawn(StateHandle::new(), ServerClock::default(), tx);
+        link.send(ControlRequest::UseAccount(Some(account(&url))));
+        link.send(ControlRequest::RefreshProjects);
+        match next(&mut events).await {
+            ControlEvent::WorkspaceLost(workspace) => assert_eq!(workspace, "w1"),
+            other => panic!("expected the workspace lost, got {other:?}"),
+        }
+        assert!(matches!(next(&mut events).await, ControlEvent::ProjectsFailed(ApiError::NotWorkspaceMember(_))));
     }
 }

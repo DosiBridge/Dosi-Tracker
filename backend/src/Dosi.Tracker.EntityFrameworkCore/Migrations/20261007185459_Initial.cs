@@ -385,29 +385,6 @@ namespace Dosi.Tracker.Migrations
                 });
 
             migrationBuilder.CreateTable(
-                name: "AbpTenants",
-                columns: table => new
-                {
-                    Id = table.Column<Guid>(type: "uuid", nullable: false),
-                    Name = table.Column<string>(type: "character varying(64)", maxLength: 64, nullable: false),
-                    NormalizedName = table.Column<string>(type: "character varying(64)", maxLength: 64, nullable: false),
-                    EntityVersion = table.Column<int>(type: "integer", nullable: false),
-                    ExtraProperties = table.Column<string>(type: "text", nullable: false),
-                    ConcurrencyStamp = table.Column<string>(type: "character varying(40)", maxLength: 40, nullable: false),
-                    CreationTime = table.Column<DateTime>(type: "timestamp without time zone", nullable: false),
-                    CreatorId = table.Column<Guid>(type: "uuid", nullable: true),
-                    LastModificationTime = table.Column<DateTime>(type: "timestamp without time zone", nullable: true),
-                    LastModifierId = table.Column<Guid>(type: "uuid", nullable: true),
-                    IsDeleted = table.Column<bool>(type: "boolean", nullable: false, defaultValue: false),
-                    DeleterId = table.Column<Guid>(type: "uuid", nullable: true),
-                    DeletionTime = table.Column<DateTime>(type: "timestamp without time zone", nullable: true)
-                },
-                constraints: table =>
-                {
-                    table.PrimaryKey("PK_AbpTenants", x => x.Id);
-                });
-
-            migrationBuilder.CreateTable(
                 name: "AbpUserDelegations",
                 columns: table => new
                 {
@@ -464,6 +441,236 @@ namespace Dosi.Tracker.Migrations
                 constraints: table =>
                 {
                     table.PrimaryKey("PK_AbpUsers", x => x.Id);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "AppActivities",
+                columns: table => new
+                {
+                    Id = table.Column<Guid>(type: "uuid", nullable: false),
+                    WorkspaceId = table.Column<Guid>(type: "uuid", nullable: false),
+                    UserId = table.Column<Guid>(type: "uuid", nullable: false),
+                    ProjectId = table.Column<Guid>(type: "uuid", nullable: false),
+                    ClientActivityId = table.Column<Guid>(type: "uuid", nullable: false),
+                    StartedAt = table.Column<DateTime>(type: "timestamp without time zone", nullable: false),
+                    EndedAt = table.Column<DateTime>(type: "timestamp without time zone", nullable: false),
+                    Productivity = table.Column<int>(type: "integer", nullable: true),
+                    MouseClicks = table.Column<int>(type: "integer", nullable: false),
+                    KeyboardHits = table.Column<int>(type: "integer", nullable: false),
+                    Description = table.Column<string>(type: "text", nullable: true),
+                    ActiveWindowsJson = table.Column<string>(type: "text", nullable: false),
+                    RunningProgramsJson = table.Column<string>(type: "text", nullable: false),
+                    TimelineJson = table.Column<string>(type: "text", nullable: false),
+                    Platform = table.Column<string>(type: "character varying(16)", maxLength: 16, nullable: true),
+                    OsVersion = table.Column<string>(type: "character varying(64)", maxLength: 64, nullable: true),
+                    AgentVersion = table.Column<string>(type: "character varying(32)", maxLength: 32, nullable: true),
+                    DeviceId = table.Column<Guid>(type: "uuid", nullable: true),
+                    DeviceName = table.Column<string>(type: "character varying(128)", maxLength: 128, nullable: true),
+                    TimeZone = table.Column<string>(type: "character varying(64)", maxLength: 64, nullable: true),
+                    UtcOffsetMinutes = table.Column<int>(type: "integer", nullable: true),
+                    IdleSeconds = table.Column<int>(type: "integer", nullable: true),
+                    EndReason = table.Column<string>(type: "character varying(16)", maxLength: 16, nullable: true),
+                    ClockSkewSeconds = table.Column<int>(type: "integer", nullable: true),
+                    InjectedInputEvents = table.Column<int>(type: "integer", nullable: true),
+                    ExtraProperties = table.Column<string>(type: "text", nullable: false),
+                    ConcurrencyStamp = table.Column<string>(type: "character varying(40)", maxLength: 40, nullable: false),
+                    CreationTime = table.Column<DateTime>(type: "timestamp without time zone", nullable: false),
+                    CreatorId = table.Column<Guid>(type: "uuid", nullable: true)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_AppActivities", x => x.Id);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "AppAgentPresences",
+                columns: table => new
+                {
+                    Id = table.Column<Guid>(type: "uuid", nullable: false),
+                    WorkspaceId = table.Column<Guid>(type: "uuid", nullable: false),
+                    UserId = table.Column<Guid>(type: "uuid", nullable: false),
+                    DeviceId = table.Column<Guid>(type: "uuid", nullable: false),
+                    DeviceName = table.Column<string>(type: "character varying(128)", maxLength: 128, nullable: true),
+                    Platform = table.Column<string>(type: "character varying(16)", maxLength: 16, nullable: true),
+                    OsVersion = table.Column<string>(type: "character varying(64)", maxLength: 64, nullable: true),
+                    AgentVersion = table.Column<string>(type: "character varying(32)", maxLength: 32, nullable: true),
+                    Status = table.Column<string>(type: "character varying(16)", maxLength: 16, nullable: false),
+                    ProjectId = table.Column<Guid>(type: "uuid", nullable: true),
+                    StatusSince = table.Column<DateTime>(type: "timestamp without time zone", nullable: true),
+                    LastSeenAt = table.Column<DateTime>(type: "timestamp without time zone", nullable: false),
+                    CurrentApp = table.Column<string>(type: "character varying(256)", maxLength: 256, nullable: true),
+                    TimeZone = table.Column<string>(type: "character varying(64)", maxLength: 64, nullable: true),
+                    UtcOffsetMinutes = table.Column<int>(type: "integer", nullable: true),
+                    CreationTime = table.Column<DateTime>(type: "timestamp without time zone", nullable: false),
+                    CreatorId = table.Column<Guid>(type: "uuid", nullable: true)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_AppAgentPresences", x => x.Id);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "AppInvoices",
+                columns: table => new
+                {
+                    Id = table.Column<Guid>(type: "uuid", nullable: false),
+                    WorkspaceId = table.Column<Guid>(type: "uuid", nullable: false),
+                    Amount = table.Column<decimal>(type: "numeric", nullable: false),
+                    Status = table.Column<string>(type: "character varying(32)", maxLength: 32, nullable: false),
+                    DueDate = table.Column<DateTime>(type: "timestamp without time zone", nullable: false),
+                    BillingPeriodStart = table.Column<DateTime>(type: "timestamp without time zone", nullable: true),
+                    ExtraProperties = table.Column<string>(type: "text", nullable: false),
+                    ConcurrencyStamp = table.Column<string>(type: "character varying(40)", maxLength: 40, nullable: false),
+                    CreationTime = table.Column<DateTime>(type: "timestamp without time zone", nullable: false),
+                    CreatorId = table.Column<Guid>(type: "uuid", nullable: true),
+                    LastModificationTime = table.Column<DateTime>(type: "timestamp without time zone", nullable: true),
+                    LastModifierId = table.Column<Guid>(type: "uuid", nullable: true),
+                    IsDeleted = table.Column<bool>(type: "boolean", nullable: false, defaultValue: false),
+                    DeleterId = table.Column<Guid>(type: "uuid", nullable: true),
+                    DeletionTime = table.Column<DateTime>(type: "timestamp without time zone", nullable: true)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_AppInvoices", x => x.Id);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "AppNotifications",
+                columns: table => new
+                {
+                    Id = table.Column<Guid>(type: "uuid", nullable: false),
+                    WorkspaceId = table.Column<Guid>(type: "uuid", nullable: false),
+                    UserId = table.Column<Guid>(type: "uuid", nullable: false),
+                    Message = table.Column<string>(type: "character varying(512)", maxLength: 512, nullable: false),
+                    IsRead = table.Column<bool>(type: "boolean", nullable: false),
+                    ExtraProperties = table.Column<string>(type: "text", nullable: false),
+                    ConcurrencyStamp = table.Column<string>(type: "character varying(40)", maxLength: 40, nullable: false),
+                    CreationTime = table.Column<DateTime>(type: "timestamp without time zone", nullable: false),
+                    CreatorId = table.Column<Guid>(type: "uuid", nullable: true)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_AppNotifications", x => x.Id);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "AppPlans",
+                columns: table => new
+                {
+                    Id = table.Column<Guid>(type: "uuid", nullable: false),
+                    Name = table.Column<string>(type: "character varying(64)", maxLength: 64, nullable: false),
+                    PricePerUser = table.Column<decimal>(type: "numeric", nullable: false),
+                    MaxSeats = table.Column<int>(type: "integer", nullable: false),
+                    TrialDays = table.Column<int>(type: "integer", nullable: false),
+                    ExtraProperties = table.Column<string>(type: "text", nullable: false),
+                    ConcurrencyStamp = table.Column<string>(type: "character varying(40)", maxLength: 40, nullable: false),
+                    CreationTime = table.Column<DateTime>(type: "timestamp without time zone", nullable: false),
+                    CreatorId = table.Column<Guid>(type: "uuid", nullable: true),
+                    LastModificationTime = table.Column<DateTime>(type: "timestamp without time zone", nullable: true),
+                    LastModifierId = table.Column<Guid>(type: "uuid", nullable: true),
+                    IsDeleted = table.Column<bool>(type: "boolean", nullable: false, defaultValue: false),
+                    DeleterId = table.Column<Guid>(type: "uuid", nullable: true),
+                    DeletionTime = table.Column<DateTime>(type: "timestamp without time zone", nullable: true)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_AppPlans", x => x.Id);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "AppProjectMemberRates",
+                columns: table => new
+                {
+                    Id = table.Column<Guid>(type: "uuid", nullable: false),
+                    WorkspaceId = table.Column<Guid>(type: "uuid", nullable: false),
+                    ProjectId = table.Column<Guid>(type: "uuid", nullable: false),
+                    UserId = table.Column<Guid>(type: "uuid", nullable: false),
+                    HourlyRate = table.Column<decimal>(type: "numeric", nullable: false),
+                    EffectiveFrom = table.Column<DateTime>(type: "timestamp without time zone", nullable: false),
+                    CreationTime = table.Column<DateTime>(type: "timestamp without time zone", nullable: false),
+                    CreatorId = table.Column<Guid>(type: "uuid", nullable: true)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_AppProjectMemberRates", x => x.Id);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "AppProjects",
+                columns: table => new
+                {
+                    Id = table.Column<Guid>(type: "uuid", nullable: false),
+                    WorkspaceId = table.Column<Guid>(type: "uuid", nullable: false),
+                    Title = table.Column<string>(type: "character varying(128)", maxLength: 128, nullable: false),
+                    Description = table.Column<string>(type: "character varying(2048)", maxLength: 2048, nullable: true),
+                    Color = table.Column<string>(type: "character varying(7)", maxLength: 7, nullable: false),
+                    IntervalMinutes = table.Column<int>(type: "integer", nullable: false),
+                    IsArchived = table.Column<bool>(type: "boolean", nullable: false),
+                    ArchivedAt = table.Column<DateTime>(type: "timestamp without time zone", nullable: true),
+                    AllowScreenshot = table.Column<bool>(type: "boolean", nullable: false),
+                    AllowWebcam = table.Column<bool>(type: "boolean", nullable: false),
+                    AllowKeyboard = table.Column<bool>(type: "boolean", nullable: false),
+                    AllowMouse = table.Column<bool>(type: "boolean", nullable: false),
+                    AllowActiveWindow = table.Column<bool>(type: "boolean", nullable: false),
+                    AllowRunningPrograms = table.Column<bool>(type: "boolean", nullable: false),
+                    IdleThresholdMinutes = table.Column<int>(type: "integer", nullable: false),
+                    BlurScreenshots = table.Column<bool>(type: "boolean", nullable: false),
+                    ExtraProperties = table.Column<string>(type: "text", nullable: false),
+                    ConcurrencyStamp = table.Column<string>(type: "character varying(40)", maxLength: 40, nullable: false),
+                    CreationTime = table.Column<DateTime>(type: "timestamp without time zone", nullable: false),
+                    CreatorId = table.Column<Guid>(type: "uuid", nullable: true),
+                    LastModificationTime = table.Column<DateTime>(type: "timestamp without time zone", nullable: true),
+                    LastModifierId = table.Column<Guid>(type: "uuid", nullable: true),
+                    IsDeleted = table.Column<bool>(type: "boolean", nullable: false, defaultValue: false),
+                    DeleterId = table.Column<Guid>(type: "uuid", nullable: true),
+                    DeletionTime = table.Column<DateTime>(type: "timestamp without time zone", nullable: true)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_AppProjects", x => x.Id);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "AppSubscriptions",
+                columns: table => new
+                {
+                    Id = table.Column<Guid>(type: "uuid", nullable: false),
+                    WorkspaceId = table.Column<Guid>(type: "uuid", nullable: false),
+                    PlanId = table.Column<Guid>(type: "uuid", nullable: false),
+                    Status = table.Column<string>(type: "character varying(32)", maxLength: 32, nullable: false),
+                    TrialEndsAt = table.Column<DateTime>(type: "timestamp without time zone", nullable: true),
+                    ExtraProperties = table.Column<string>(type: "text", nullable: false),
+                    ConcurrencyStamp = table.Column<string>(type: "character varying(40)", maxLength: 40, nullable: false),
+                    CreationTime = table.Column<DateTime>(type: "timestamp without time zone", nullable: false),
+                    CreatorId = table.Column<Guid>(type: "uuid", nullable: true),
+                    LastModificationTime = table.Column<DateTime>(type: "timestamp without time zone", nullable: true),
+                    LastModifierId = table.Column<Guid>(type: "uuid", nullable: true),
+                    IsDeleted = table.Column<bool>(type: "boolean", nullable: false, defaultValue: false),
+                    DeleterId = table.Column<Guid>(type: "uuid", nullable: true),
+                    DeletionTime = table.Column<DateTime>(type: "timestamp without time zone", nullable: true)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_AppSubscriptions", x => x.Id);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "AppWorkspaces",
+                columns: table => new
+                {
+                    Id = table.Column<Guid>(type: "uuid", nullable: false),
+                    Name = table.Column<string>(type: "character varying(64)", maxLength: 64, nullable: false),
+                    NormalizedName = table.Column<string>(type: "character varying(64)", maxLength: 64, nullable: false),
+                    ExtraProperties = table.Column<string>(type: "text", nullable: false),
+                    ConcurrencyStamp = table.Column<string>(type: "character varying(40)", maxLength: 40, nullable: false),
+                    CreationTime = table.Column<DateTime>(type: "timestamp without time zone", nullable: false),
+                    CreatorId = table.Column<Guid>(type: "uuid", nullable: true),
+                    LastModificationTime = table.Column<DateTime>(type: "timestamp without time zone", nullable: true),
+                    LastModifierId = table.Column<Guid>(type: "uuid", nullable: true)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_AppWorkspaces", x => x.Id);
                 });
 
             migrationBuilder.CreateTable(
@@ -652,25 +859,6 @@ namespace Dosi.Tracker.Migrations
                 });
 
             migrationBuilder.CreateTable(
-                name: "AbpTenantConnectionStrings",
-                columns: table => new
-                {
-                    TenantId = table.Column<Guid>(type: "uuid", nullable: false),
-                    Name = table.Column<string>(type: "character varying(64)", maxLength: 64, nullable: false),
-                    Value = table.Column<string>(type: "character varying(1024)", maxLength: 1024, nullable: false)
-                },
-                constraints: table =>
-                {
-                    table.PrimaryKey("PK_AbpTenantConnectionStrings", x => new { x.TenantId, x.Name });
-                    table.ForeignKey(
-                        name: "FK_AbpTenantConnectionStrings_AbpTenants_TenantId",
-                        column: x => x.TenantId,
-                        principalTable: "AbpTenants",
-                        principalColumn: "Id",
-                        onDelete: ReferentialAction.Cascade);
-                });
-
-            migrationBuilder.CreateTable(
                 name: "AbpUserClaims",
                 columns: table => new
                 {
@@ -821,6 +1009,113 @@ namespace Dosi.Tracker.Migrations
                         name: "FK_AbpUserTokens_AbpUsers_UserId",
                         column: x => x.UserId,
                         principalTable: "AbpUsers",
+                        principalColumn: "Id",
+                        onDelete: ReferentialAction.Cascade);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "AppScreenshots",
+                columns: table => new
+                {
+                    Id = table.Column<Guid>(type: "uuid", nullable: false),
+                    WorkspaceId = table.Column<Guid>(type: "uuid", nullable: false),
+                    ActivityId = table.Column<Guid>(type: "uuid", nullable: false),
+                    Kind = table.Column<string>(type: "character varying(16)", maxLength: 16, nullable: false),
+                    StorageUrl = table.Column<string>(type: "character varying(512)", maxLength: 512, nullable: false),
+                    Blurred = table.Column<bool>(type: "boolean", nullable: false),
+                    CapturedAt = table.Column<DateTime>(type: "timestamp without time zone", nullable: false),
+                    SizeBytes = table.Column<long>(type: "bigint", nullable: false),
+                    ContentType = table.Column<string>(type: "text", nullable: false),
+                    CreationTime = table.Column<DateTime>(type: "timestamp without time zone", nullable: false),
+                    CreatorId = table.Column<Guid>(type: "uuid", nullable: true)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_AppScreenshots", x => x.Id);
+                    table.ForeignKey(
+                        name: "FK_AppScreenshots_AppActivities_ActivityId",
+                        column: x => x.ActivityId,
+                        principalTable: "AppActivities",
+                        principalColumn: "Id",
+                        onDelete: ReferentialAction.Cascade);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "AppProjectMembers",
+                columns: table => new
+                {
+                    Id = table.Column<Guid>(type: "uuid", nullable: false),
+                    WorkspaceId = table.Column<Guid>(type: "uuid", nullable: false),
+                    ProjectId = table.Column<Guid>(type: "uuid", nullable: false),
+                    UserId = table.Column<Guid>(type: "uuid", nullable: false),
+                    Role = table.Column<string>(type: "character varying(64)", maxLength: 64, nullable: false),
+                    HourlyRate = table.Column<decimal>(type: "numeric", nullable: false),
+                    CreationTime = table.Column<DateTime>(type: "timestamp without time zone", nullable: false),
+                    CreatorId = table.Column<Guid>(type: "uuid", nullable: true)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_AppProjectMembers", x => x.Id);
+                    table.ForeignKey(
+                        name: "FK_AppProjectMembers_AppProjects_ProjectId",
+                        column: x => x.ProjectId,
+                        principalTable: "AppProjects",
+                        principalColumn: "Id",
+                        onDelete: ReferentialAction.Cascade);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "AppWorkspaceInvitations",
+                columns: table => new
+                {
+                    Id = table.Column<Guid>(type: "uuid", nullable: false),
+                    WorkspaceId = table.Column<Guid>(type: "uuid", nullable: false),
+                    Email = table.Column<string>(type: "character varying(256)", maxLength: 256, nullable: false),
+                    NormalizedEmail = table.Column<string>(type: "character varying(256)", maxLength: 256, nullable: false),
+                    Role = table.Column<string>(type: "character varying(16)", maxLength: 16, nullable: false),
+                    ProjectId = table.Column<Guid>(type: "uuid", nullable: true),
+                    ProjectRole = table.Column<string>(type: "character varying(64)", maxLength: 64, nullable: true),
+                    HourlyRate = table.Column<decimal>(type: "numeric", nullable: true),
+                    TokenHash = table.Column<string>(type: "character varying(64)", maxLength: 64, nullable: false),
+                    ExpiresAt = table.Column<DateTime>(type: "timestamp without time zone", nullable: false),
+                    AcceptedAt = table.Column<DateTime>(type: "timestamp without time zone", nullable: true),
+                    AcceptedUserId = table.Column<Guid>(type: "uuid", nullable: true),
+                    ExtraProperties = table.Column<string>(type: "text", nullable: false),
+                    ConcurrencyStamp = table.Column<string>(type: "character varying(40)", maxLength: 40, nullable: false),
+                    CreationTime = table.Column<DateTime>(type: "timestamp without time zone", nullable: false),
+                    CreatorId = table.Column<Guid>(type: "uuid", nullable: true)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_AppWorkspaceInvitations", x => x.Id);
+                    table.ForeignKey(
+                        name: "FK_AppWorkspaceInvitations_AppWorkspaces_WorkspaceId",
+                        column: x => x.WorkspaceId,
+                        principalTable: "AppWorkspaces",
+                        principalColumn: "Id",
+                        onDelete: ReferentialAction.Cascade);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "AppWorkspaceMembers",
+                columns: table => new
+                {
+                    Id = table.Column<Guid>(type: "uuid", nullable: false),
+                    WorkspaceId = table.Column<Guid>(type: "uuid", nullable: false),
+                    UserId = table.Column<Guid>(type: "uuid", nullable: false),
+                    Role = table.Column<string>(type: "character varying(16)", maxLength: 16, nullable: false),
+                    Status = table.Column<string>(type: "character varying(16)", maxLength: 16, nullable: false),
+                    JoinedAt = table.Column<DateTime>(type: "timestamp without time zone", nullable: false),
+                    CreationTime = table.Column<DateTime>(type: "timestamp without time zone", nullable: false),
+                    CreatorId = table.Column<Guid>(type: "uuid", nullable: true)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_AppWorkspaceMembers", x => x.Id);
+                    table.ForeignKey(
+                        name: "FK_AppWorkspaceMembers_AppWorkspaces_WorkspaceId",
+                        column: x => x.WorkspaceId,
+                        principalTable: "AppWorkspaces",
                         principalColumn: "Id",
                         onDelete: ReferentialAction.Cascade);
                 });
@@ -1093,16 +1388,6 @@ namespace Dosi.Tracker.Migrations
                 unique: true);
 
             migrationBuilder.CreateIndex(
-                name: "IX_AbpTenants_Name",
-                table: "AbpTenants",
-                column: "Name");
-
-            migrationBuilder.CreateIndex(
-                name: "IX_AbpTenants_NormalizedName",
-                table: "AbpTenants",
-                column: "NormalizedName");
-
-            migrationBuilder.CreateIndex(
                 name: "IX_AbpUserClaims_UserId",
                 table: "AbpUserClaims",
                 column: "UserId");
@@ -1146,6 +1431,113 @@ namespace Dosi.Tracker.Migrations
                 name: "IX_AbpUsers_UserName",
                 table: "AbpUsers",
                 column: "UserName");
+
+            migrationBuilder.CreateIndex(
+                name: "IX_AppActivities_WorkspaceId_ClientActivityId",
+                table: "AppActivities",
+                columns: new[] { "WorkspaceId", "ClientActivityId" });
+
+            migrationBuilder.CreateIndex(
+                name: "IX_AppActivities_WorkspaceId_ProjectId_StartedAt",
+                table: "AppActivities",
+                columns: new[] { "WorkspaceId", "ProjectId", "StartedAt" },
+                descending: new[] { false, false, true });
+
+            migrationBuilder.CreateIndex(
+                name: "IX_AppActivities_WorkspaceId_StartedAt",
+                table: "AppActivities",
+                columns: new[] { "WorkspaceId", "StartedAt" },
+                descending: new[] { false, true });
+
+            migrationBuilder.CreateIndex(
+                name: "IX_AppActivities_WorkspaceId_UserId_ClientActivityId",
+                table: "AppActivities",
+                columns: new[] { "WorkspaceId", "UserId", "ClientActivityId" },
+                unique: true);
+
+            migrationBuilder.CreateIndex(
+                name: "IX_AppActivities_WorkspaceId_UserId_StartedAt",
+                table: "AppActivities",
+                columns: new[] { "WorkspaceId", "UserId", "StartedAt" },
+                descending: new[] { false, false, true });
+
+            migrationBuilder.CreateIndex(
+                name: "IX_AppAgentPresences_WorkspaceId_UserId_DeviceId",
+                table: "AppAgentPresences",
+                columns: new[] { "WorkspaceId", "UserId", "DeviceId" },
+                unique: true);
+
+            migrationBuilder.CreateIndex(
+                name: "IX_AppInvoices_WorkspaceId_BillingPeriodStart",
+                table: "AppInvoices",
+                columns: new[] { "WorkspaceId", "BillingPeriodStart" },
+                unique: true,
+                filter: "\"BillingPeriodStart\" IS NOT NULL AND \"IsDeleted\" = false");
+
+            migrationBuilder.CreateIndex(
+                name: "IX_AppNotifications_WorkspaceId_UserId",
+                table: "AppNotifications",
+                columns: new[] { "WorkspaceId", "UserId" });
+
+            migrationBuilder.CreateIndex(
+                name: "IX_AppProjectMemberRates_WorkspaceId_ProjectId_UserId_Effectiv~",
+                table: "AppProjectMemberRates",
+                columns: new[] { "WorkspaceId", "ProjectId", "UserId", "EffectiveFrom" });
+
+            migrationBuilder.CreateIndex(
+                name: "IX_AppProjectMembers_ProjectId",
+                table: "AppProjectMembers",
+                column: "ProjectId");
+
+            migrationBuilder.CreateIndex(
+                name: "IX_AppProjectMembers_WorkspaceId_ProjectId_UserId",
+                table: "AppProjectMembers",
+                columns: new[] { "WorkspaceId", "ProjectId", "UserId" },
+                unique: true);
+
+            migrationBuilder.CreateIndex(
+                name: "IX_AppScreenshots_ActivityId",
+                table: "AppScreenshots",
+                column: "ActivityId");
+
+            migrationBuilder.CreateIndex(
+                name: "IX_AppScreenshots_WorkspaceId_CapturedAt",
+                table: "AppScreenshots",
+                columns: new[] { "WorkspaceId", "CapturedAt" },
+                descending: new[] { false, true });
+
+            migrationBuilder.CreateIndex(
+                name: "IX_AppSubscriptions_WorkspaceId",
+                table: "AppSubscriptions",
+                column: "WorkspaceId");
+
+            migrationBuilder.CreateIndex(
+                name: "IX_AppWorkspaceInvitations_TokenHash",
+                table: "AppWorkspaceInvitations",
+                column: "TokenHash",
+                unique: true);
+
+            migrationBuilder.CreateIndex(
+                name: "IX_AppWorkspaceInvitations_WorkspaceId_NormalizedEmail",
+                table: "AppWorkspaceInvitations",
+                columns: new[] { "WorkspaceId", "NormalizedEmail" });
+
+            migrationBuilder.CreateIndex(
+                name: "IX_AppWorkspaceMembers_UserId",
+                table: "AppWorkspaceMembers",
+                column: "UserId");
+
+            migrationBuilder.CreateIndex(
+                name: "IX_AppWorkspaceMembers_WorkspaceId_UserId",
+                table: "AppWorkspaceMembers",
+                columns: new[] { "WorkspaceId", "UserId" },
+                unique: true);
+
+            migrationBuilder.CreateIndex(
+                name: "IX_AppWorkspaces_NormalizedName",
+                table: "AppWorkspaces",
+                column: "NormalizedName",
+                unique: true);
 
             migrationBuilder.CreateIndex(
                 name: "IX_OpenIddictApplications_ClientId",
@@ -1242,9 +1634,6 @@ namespace Dosi.Tracker.Migrations
                 name: "AbpSettings");
 
             migrationBuilder.DropTable(
-                name: "AbpTenantConnectionStrings");
-
-            migrationBuilder.DropTable(
                 name: "AbpUserClaims");
 
             migrationBuilder.DropTable(
@@ -1269,6 +1658,36 @@ namespace Dosi.Tracker.Migrations
                 name: "AbpUserTokens");
 
             migrationBuilder.DropTable(
+                name: "AppAgentPresences");
+
+            migrationBuilder.DropTable(
+                name: "AppInvoices");
+
+            migrationBuilder.DropTable(
+                name: "AppNotifications");
+
+            migrationBuilder.DropTable(
+                name: "AppPlans");
+
+            migrationBuilder.DropTable(
+                name: "AppProjectMemberRates");
+
+            migrationBuilder.DropTable(
+                name: "AppProjectMembers");
+
+            migrationBuilder.DropTable(
+                name: "AppScreenshots");
+
+            migrationBuilder.DropTable(
+                name: "AppSubscriptions");
+
+            migrationBuilder.DropTable(
+                name: "AppWorkspaceInvitations");
+
+            migrationBuilder.DropTable(
+                name: "AppWorkspaceMembers");
+
+            migrationBuilder.DropTable(
                 name: "OpenIddictScopes");
 
             migrationBuilder.DropTable(
@@ -1281,9 +1700,6 @@ namespace Dosi.Tracker.Migrations
                 name: "AbpEntityChanges");
 
             migrationBuilder.DropTable(
-                name: "AbpTenants");
-
-            migrationBuilder.DropTable(
                 name: "AbpOrganizationUnits");
 
             migrationBuilder.DropTable(
@@ -1291,6 +1707,15 @@ namespace Dosi.Tracker.Migrations
 
             migrationBuilder.DropTable(
                 name: "AbpUsers");
+
+            migrationBuilder.DropTable(
+                name: "AppProjects");
+
+            migrationBuilder.DropTable(
+                name: "AppActivities");
+
+            migrationBuilder.DropTable(
+                name: "AppWorkspaces");
 
             migrationBuilder.DropTable(
                 name: "OpenIddictAuthorizations");

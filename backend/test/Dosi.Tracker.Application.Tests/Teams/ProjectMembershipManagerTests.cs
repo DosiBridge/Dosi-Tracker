@@ -5,7 +5,7 @@ using Shouldly;
 using Volo.Abp;
 using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Modularity;
-using Volo.Abp.MultiTenancy;
+using Dosi.Tracker.Workspaces;
 using Xunit;
 
 namespace Dosi.Tracker.Teams;
@@ -22,7 +22,7 @@ public abstract class ProjectMembershipManagerTests<TStartupModule> : TrackerApp
     private readonly IRepository<Project, Guid> _projects;
     private readonly IRepository<ProjectMember, Guid> _members;
     private readonly IRepository<ProjectMemberRate, Guid> _rates;
-    private readonly ICurrentTenant _currentTenant;
+    private readonly ICurrentWorkspace _currentWorkspace;
 
     protected ProjectMembershipManagerTests()
     {
@@ -30,7 +30,7 @@ public abstract class ProjectMembershipManagerTests<TStartupModule> : TrackerApp
         _projects = GetRequiredService<IRepository<Project, Guid>>();
         _members = GetRequiredService<IRepository<ProjectMember, Guid>>();
         _rates = GetRequiredService<IRepository<ProjectMemberRate, Guid>>();
-        _currentTenant = GetRequiredService<ICurrentTenant>();
+        _currentWorkspace = GetRequiredService<ICurrentWorkspace>();
     }
 
     [Fact]
@@ -40,7 +40,7 @@ public abstract class ProjectMembershipManagerTests<TStartupModule> : TrackerApp
         var tenantId = Guid.NewGuid();
         var userId = Guid.NewGuid();
 
-        using (_currentTenant.Change(tenantId))
+        using (_currentWorkspace.Change(tenantId))
         {
             var projectId = await WithUnitOfWorkAsync(async () =>
                 (await _projects.InsertAsync(new Project(Guid.NewGuid(), tenantId, "Website"), autoSave: true)).Id);
@@ -68,7 +68,7 @@ public abstract class ProjectMembershipManagerTests<TStartupModule> : TrackerApp
         var tenantId = Guid.NewGuid();
         var userId = Guid.NewGuid();
 
-        using (_currentTenant.Change(tenantId))
+        using (_currentWorkspace.Change(tenantId))
         {
             var website = await WithUnitOfWorkAsync(async () =>
                 (await _projects.InsertAsync(new Project(Guid.NewGuid(), tenantId, "Website"), autoSave: true)).Id);

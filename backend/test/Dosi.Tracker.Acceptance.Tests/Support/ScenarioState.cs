@@ -13,7 +13,7 @@ public sealed class ScenarioState
     /// <summary>The fixed current-user id impersonated by the test principal accessor (the acting owner/admin).</summary>
     public static readonly Guid CurrentUserId = Guid.Parse("2e701e62-0953-4dd3-910b-dc6cc93ccb0d");
 
-    public Guid TenantId { get; set; }
+    public Guid WorkspaceId { get; set; }
     public string? WorkspaceName { get; set; }
     public Guid ProjectId { get; set; }
 

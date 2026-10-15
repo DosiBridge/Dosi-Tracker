@@ -17,7 +17,17 @@ import {
   activateSubscription,
   addProjectMember,
   changeMyPassword,
-  changeTenantPlan,
+  changeWorkspacePlan,
+  changeWorkspaceRole,
+  createWorkspaceApi,
+  getInvitations,
+  getMyWorkspacesApi,
+  leaveWorkspaceApi,
+  registerWorkspaceApi,
+  getInvitationApi,
+  acceptInvitationApi,
+  revokeInvitation,
+  workspaceHeaderFor,
   delApi,
   getAllPagesApi,
   getApi,
@@ -30,7 +40,7 @@ import {
   getPayrollReport,
   getProjectMembers,
   getTeamPresence,
-  getTenantSubscriptions,
+  getWorkspaceSubscriptions,
   getWorkspaceSettings,
   inviteMember,
   loginApi,
@@ -40,7 +50,6 @@ import {
   putApi,
   removeMemberFromWorkspace,
   removeProjectMember,
-  resetMemberPassword,
   suspendSubscription,
   updateActivityNote,
   updateMyPreferences,
@@ -283,20 +292,20 @@ describe("contract v2 endpoints", () => {
     expect(await getAuthedBlobUrl("/api/app/activity/screenshot/c1/content")).toBe("blob:capture");
   });
 
-  it("tenant subscriptions (host): the list, or null where an older server has no such endpoint", async () => {
-    fetchMock.mockResolvedValue(res({ items: [{ tenantId: "t1", tenantName: "Acme", seatsUsed: 8 }] }));
-    expect(await getTenantSubscriptions()).toEqual([{ tenantId: "t1", tenantName: "Acme", seatsUsed: 8 }]);
-    expect(calledPath()).toBe("/api/app/platform/tenant-subscriptions");
+  it("workspace subscriptions (platform): the list, or null where an older server has no such endpoint", async () => {
+    fetchMock.mockResolvedValue(res({ items: [{ workspaceId: "t1", workspaceName: "Acme", seatsUsed: 8 }] }));
+    expect(await getWorkspaceSubscriptions()).toEqual([{ workspaceId: "t1", workspaceName: "Acme", seatsUsed: 8 }]);
+    expect(calledPath()).toBe("/api/app/platform/workspace-subscriptions");
     fetchMock.mockResolvedValue(res({ error: { message: "Not found" } }, 404));
-    expect(await getTenantSubscriptions()).toBeNull();
+    expect(await getWorkspaceSubscriptions()).toBeNull();
     fetchMock.mockResolvedValue(res({ error: { message: "Server error" } }, 500));
-    await expect(getTenantSubscriptions()).rejects.toBeInstanceOf(ApiError);
+    await expect(getWorkspaceSubscriptions()).rejects.toBeInstanceOf(ApiError);
   });
 
-  it("suspend (host): POSTs with the tenant in the query", async () => {
+  it("suspend (platform): POSTs with the workspace in the query", async () => {
     fetchMock.mockResolvedValue(res(undefined, 204));
     await suspendSubscription("t&1");
-    expect(calledPath()).toBe("/api/app/platform/suspend-subscription?tenantId=t%261");
+    expect(calledPath()).toBe("/api/app/platform/suspend-subscription?workspaceId=t%261");
     expect(calledInit().method).toBe("POST");
   });
 
@@ -308,11 +317,11 @@ describe("contract v2 endpoints", () => {
     expect(JSON.parse(String(calledInit().body))).toEqual({ description: "Fixing login" });
   });
 
-  it("team: reset a password, remove from the workspace, change your own", async () => {
-    fetchMock.mockResolvedValue(res({ initialPassword: "one-time" }));
-    expect(await resetMemberPassword("u 1")).toEqual({ initialPassword: "one-time" });
-    expect(calledPath(0)).toBe("/api/app/team/reset-password?userId=u%201");
-    expect(calledInit(0).method).toBe("POST");
+  it("team: change a workspace role, remove from the workspace, change your own password", async () => {
+    fetchMock.mockResolvedValue(res({ userId: "u 1", role: "manager" }));
+    expect(await changeWorkspaceRole("u 1", "manager")).toEqual({ userId: "u 1", role: "manager" });
+    expect(calledPath(0)).toBe("/api/app/team/workspace-role?userId=u%201&role=manager");
+    expect(calledInit(0).method).toBe("PUT");
 
     fetchMock.mockResolvedValue(res(undefined, 204));
     await removeMemberFromWorkspace("u1");
@@ -410,12 +419,12 @@ describe("contract v2 endpoints", () => {
 
   it("host: change a plan, activate a subscription, mark an invoice paid", async () => {
     fetchMock.mockResolvedValue(res(undefined, 204));
-    await changeTenantPlan("t1", "p2");
+    await changeWorkspacePlan("t1", "p2");
     await activateSubscription("t1");
     await markInvoicePaid("i1");
     expect([0, 1, 2].map((n) => calledPath(n))).toEqual([
-      "/api/app/platform/change-tenant-plan?tenantId=t1&planId=p2",
-      "/api/app/platform/activate-subscription?tenantId=t1",
+      "/api/app/platform/change-workspace-plan?workspaceId=t1&planId=p2",
+      "/api/app/platform/activate-subscription?workspaceId=t1",
       "/api/app/platform/mark-invoice-paid?invoiceId=i1",
     ]);
     expect([0, 1, 2].map((n) => calledInit(n).method)).toEqual(["POST", "POST", "POST"]);
@@ -439,22 +448,113 @@ describe("contract v2 endpoints", () => {
   });
 });
 
+describe("workspaces and X-Workspace-Id", () => {
+  const WS = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+  const header = (n = 0) => (calledInit(n).headers as Record<string, string>)["X-Workspace-Id"];
+
+  it("sends the current workspace on every scoped call, and never on unscoped ones", async () => {
+    localStorage.setItem("dosi-token", "tok");
+    localStorage.setItem("dosi-workspace", WS);
+    fetchMock.mockImplementation(async () => res([]));
+    await getApi("/api/app/project");
+    await getApi("/api/abp/application-configuration?IncludeLocalizationResources=false");
+    await getAuthedBlobUrl("/api/app/activity/screenshot/c1/content").catch(() => null);
+    await getMyWorkspacesApi();
+    await postApi("/api/app/workspaces", { name: "x" });
+    await getApi("/api/account/my-profile");
+    await postApi("/api/app/invitations/tok/accept", {});
+    expect([0, 1, 2].map(header)).toEqual([WS, WS, WS]);
+    expect([3, 4, 5, 6].map(header)).toEqual([undefined, undefined, undefined, undefined]);
+    expect(workspaceHeaderFor("/connect/token")).toBeNull();
+    expect(workspaceHeaderFor("/api/app/workspace/register")).toBeNull();
+    expect(workspaceHeaderFor("/api/app/workspace/settings")).toBe(WS);
+  });
+
+  it("sends no header without a chosen workspace (or with a demo id)", async () => {
+    localStorage.setItem("dosi-token", "tok");
+    fetchMock.mockResolvedValue(res([]));
+    await getApi("/api/app/project");
+    localStorage.setItem("dosi-workspace", "w1");
+    await getApi("/api/app/project");
+    expect([0, 1].map(header)).toEqual([undefined, undefined]);
+  });
+
+  it("a 403 NotWorkspaceMember forgets the workspace and goes to the chooser", async () => {
+    localStorage.setItem("dosi-token", "tok");
+    localStorage.setItem("dosi-workspace", WS);
+    const assign = vi.fn();
+    vi.stubGlobal("location", { ...window.location, pathname: "/dashboard", assign });
+    fetchMock.mockResolvedValue(res({ error: { code: "Tracker:NotWorkspaceMember", message: "Not a member" } }, 403));
+    await expect(getApi("/api/app/project")).rejects.toMatchObject({ status: 403, code: "Tracker:NotWorkspaceMember" });
+    expect(localStorage.getItem("dosi-workspace")).toBeNull();
+    expect(assign).toHaveBeenCalledWith("/workspaces");
+  });
+
+  it("lists, creates and leaves workspaces", async () => {
+    localStorage.setItem("dosi-token", "tok");
+    fetchMock.mockResolvedValueOnce(res([{ id: WS, name: "Acme", role: "owner", planName: "Free", isOwner: true }]));
+    expect(await getMyWorkspacesApi()).toEqual([{ id: WS, name: "Acme", role: "owner", planName: "Free", isOwner: true }]);
+    expect(calledPath(0)).toBe("/api/app/workspaces/mine");
+    fetchMock.mockResolvedValueOnce(res({ id: WS, name: "Beta" }));
+    expect(await createWorkspaceApi("Beta", "p1")).toEqual({ id: WS, name: "Beta" });
+    expect(calledPath(1)).toBe("/api/app/workspaces");
+    expect(JSON.parse(String(calledInit(1).body))).toEqual({ name: "Beta", planId: "p1" });
+    fetchMock.mockResolvedValueOnce(res(undefined, 204));
+    await leaveWorkspaceApi(WS);
+    expect(calledPath(2)).toBe(`/api/app/workspaces/${WS}/leave`);
+    expect(calledInit(2).method).toBe("POST");
+  });
+
+  it("registers anonymously and reads/accepts invitations", async () => {
+    localStorage.setItem("dosi-token", "tok");
+    localStorage.setItem("dosi-workspace", WS);
+    fetchMock.mockResolvedValueOnce(res({ workspaceId: WS, workspaceName: "Acme", userName: "ana" }));
+    const input = { email: "ana@acme.test", password: "pw", workspaceName: "Acme", planName: "Free" };
+    expect(await registerWorkspaceApi(input)).toEqual({ workspaceId: WS, workspaceName: "Acme", userName: "ana" });
+    expect(calledPath(0)).toBe("/api/app/workspace/register");
+    expect((calledInit(0).headers as Record<string, string>).Authorization).toBeUndefined();
+    expect(header(0)).toBeUndefined();
+    fetchMock.mockResolvedValueOnce(res({ error: { code: "Tracker:EmailAlreadyRegistered", message: "taken" } }, 409));
+    await expect(registerWorkspaceApi(input)).rejects.toMatchObject({ status: 409, code: "Tracker:EmailAlreadyRegistered" });
+
+    fetchMock.mockResolvedValueOnce(res({ workspaceName: "Acme", email: "b@x.test", role: "member", expired: false }));
+    expect(await getInvitationApi("t 1")).toMatchObject({ workspaceName: "Acme" });
+    expect(calledPath(2)).toBe("/api/app/invitations/t%201");
+    fetchMock.mockResolvedValueOnce(res({ workspaceId: WS, workspaceName: "Acme", role: "member" }));
+    expect(await acceptInvitationApi("t1")).toMatchObject({ workspaceId: WS });
+    expect(calledPath(3)).toBe("/api/app/invitations/t1/accept");
+  });
+
+  it("lists and revokes pending invitations", async () => {
+    localStorage.setItem("dosi-token", "tok");
+    fetchMock.mockResolvedValueOnce(res({ items: [{ id: "i1", email: "b@x.test", role: "member", expiresAt: "2026-10-20T00:00:00Z" }] }));
+    expect(await getInvitations()).toHaveLength(1);
+    expect(calledPath(0)).toBe("/api/app/team/invitations");
+    fetchMock.mockResolvedValueOnce(res(undefined, 204));
+    await revokeInvitation("i1");
+    expect(calledPath(1)).toBe("/api/app/team/i1/invitation");
+    expect(calledInit(1).method).toBe("DELETE");
+  });
+});
+
 describe("loginApi", () => {
-  it("stores the token and tenant and sets the middleware cookie", async () => {
+  it("stores the token (no workspace in it) and sets the middleware cookie; sign-out keeps the last workspace", async () => {
+    localStorage.setItem("dosi-workspace", "3f2504e0-4f89-11d3-9a0c-0305e82c3301");
     fetchMock.mockResolvedValue(res({ access_token: "tok", expires_in: 120 }));
-    expect(await loginApi("ana@acme.test", "pw", "acme")).toBe("tok");
+    expect(await loginApi("ana@acme.test", "pw")).toBe("tok");
     expect(localStorage.getItem("dosi-token")).toBe("tok");
-    expect(localStorage.getItem("dosi-tenant")).toBe("acme");
-    expect(calledPath()).toBe("/connect/token?__tenant=acme");
+    expect(calledPath()).toBe("/connect/token");
+    expect(String(calledInit().body)).not.toContain("__tenant");
     expect(document.cookie).toContain("dosi-token=1");
     logoutApi();
     expect(localStorage.getItem("dosi-token")).toBeNull();
+    expect(localStorage.getItem("dosi-workspace")).toBe("3f2504e0-4f89-11d3-9a0c-0305e82c3301");
     expect(document.cookie).not.toContain("dosi-token=1");
   });
 
   it("reports rejected credentials as such, with the server's reason", async () => {
     fetchMock.mockResolvedValue(res({ error: "invalid_grant", error_description: "Invalid username or password!" }, 400));
-    const error = await loginApi("ana@acme.test", "wrong", "acme").catch((e: unknown) => e);
+    const error = await loginApi("ana@acme.test", "wrong").catch((e: unknown) => e);
     expect(error).toBeInstanceOf(InvalidCredentialsError);
     expect(error).toMatchObject({
       message: "Invalid credentials or login failed",
@@ -523,25 +623,24 @@ describe("session renewal (refresh token)", () => {
   it("signs in with offline_access and keeps the refresh token; the session flag outlives the hour", async () => {
     const cookieWrites = vi.spyOn(Document.prototype, "cookie", "set");
     fetchMock.mockResolvedValue(tokens("tok", "r1", 3600));
-    await loginApi("ana@acme.test", "pw", "acme");
-    expect(new URLSearchParams(String(calledInit().body)).get("scope")).toBe("Tracker offline_access");
+    await loginApi("ana@acme.test", "pw");
+    expect(new URLSearchParams(String(calledInit().body)).get("scope")).toBe("openid profile email roles offline_access Tracker");
     expect(localStorage.getItem("dosi-refresh-token")).toBe("r1");
     expect(Number(localStorage.getItem("dosi-token-expires-at"))).toBeGreaterThan(Date.now() + 3_500_000);
     expect(cookieWrites.mock.calls.at(-1)?.[0]).toContain(`Max-Age=${14 * 24 * 3600}`);
 
     // A server that issues no refresh token: the flag lasts as long as the access token, as before.
     fetchMock.mockResolvedValue(tokens("tok2", undefined, 120));
-    await loginApi("ana@acme.test", "pw", "acme");
+    await loginApi("ana@acme.test", "pw");
     expect(localStorage.getItem("dosi-refresh-token")).toBeNull();
     expect(cookieWrites.mock.calls.at(-1)?.[0]).toContain("Max-Age=120");
   });
 
   it("a 401 renews the session once and retries the request with the new token", async () => {
     signedIn();
-    localStorage.setItem("dosi-tenant", "acme");
     renewingServer();
     expect(await getApi("/api/app/x")).toEqual([1]);
-    expect(paths()).toEqual(["/api/app/x", "/connect/token?__tenant=acme", "/api/app/x"]);
+    expect(paths()).toEqual(["/api/app/x", "/connect/token", "/api/app/x"]);
     expect(Object.fromEntries(new URLSearchParams(String(calledInit(1).body)))).toEqual({
       grant_type: "refresh_token",
       refresh_token: "r1",

@@ -10,7 +10,7 @@ public class NotificationTests
     public void New_Notification_Should_Start_Unread()
     {
         var userId = Guid.NewGuid();
-        var notification = new Notification(Guid.NewGuid(), null, userId, "Weekly report is ready");
+        var notification = new Notification(Guid.NewGuid(), TrackerTestConsts.WorkspaceId, userId, "Weekly report is ready");
 
         notification.UserId.ShouldBe(userId);
         notification.Message.ShouldBe("Weekly report is ready");

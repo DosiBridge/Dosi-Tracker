@@ -1,22 +1,22 @@
 using System;
 using Volo.Abp.Domain.Entities.Auditing;
-using Volo.Abp.MultiTenancy;
+using Dosi.Tracker.Workspaces;
 
 namespace Dosi.Tracker.Notifications;
 
-public class Notification : CreationAuditedAggregateRoot<Guid>, IMultiTenant
+public class Notification : CreationAuditedAggregateRoot<Guid>, IWorkspaceScoped
 {
-    public Guid? TenantId { get; protected set; }
+    public Guid WorkspaceId { get; protected set; }
     public Guid UserId { get; set; }
     public string Message { get; set; }
     public bool IsRead { get; set; }
     
     protected Notification() { }
     
-    public Notification(Guid id, Guid? tenantId, Guid userId, string message) 
+    public Notification(Guid id, Guid workspaceId, Guid userId, string message) 
         : base(id)
     {
-        TenantId = tenantId;
+        WorkspaceId = workspaceId;
         UserId = userId;
         Message = message;
         IsRead = false;

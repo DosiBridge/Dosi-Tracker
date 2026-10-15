@@ -1,10 +1,10 @@
 using System;
 using Volo.Abp.Domain.Entities.Auditing;
-using Volo.Abp.MultiTenancy;
+using Dosi.Tracker.Workspaces;
 
 namespace Dosi.Tracker.Activities;
 
-public class Screenshot : CreationAuditedEntity<Guid>, IMultiTenant
+public class Screenshot : CreationAuditedEntity<Guid>, IWorkspaceScoped
 {
     public const string ScreenKind = "screen";
     public const string WebcamKind = "webcam";
@@ -12,7 +12,7 @@ public class Screenshot : CreationAuditedEntity<Guid>, IMultiTenant
     /// <summary>A small JPEG rendition of the block's screen capture, used for list thumbnails.</summary>
     public const string ThumbKind = "thumb";
 
-    public Guid? TenantId { get; set; }
+    public Guid WorkspaceId { get; set; }
     public Guid ActivityId { get; set; }
     public string Kind { get; set; } // "screen", "thumb" or "webcam"
     public string StorageUrl { get; set; } // Blob name (S3/R2 key or database blob name)
@@ -27,7 +27,7 @@ public class Screenshot : CreationAuditedEntity<Guid>, IMultiTenant
 
     public Screenshot(
         Guid id,
-        Guid? tenantId,
+        Guid workspaceId,
         Guid activityId,
         string storageUrl,
         DateTime capturedAt,
@@ -36,7 +36,7 @@ public class Screenshot : CreationAuditedEntity<Guid>, IMultiTenant
         string kind = ScreenKind)
     {
         Id = id;
-        TenantId = tenantId;
+        WorkspaceId = workspaceId;
         ActivityId = activityId;
         StorageUrl = storageUrl;
         CapturedAt = capturedAt;

@@ -1,16 +1,16 @@
 using System;
 using Volo.Abp.Domain.Entities.Auditing;
-using Volo.Abp.MultiTenancy;
+using Dosi.Tracker.Workspaces;
 
 namespace Dosi.Tracker.Presence;
 
 /// <summary>
 /// The live state of one desktop agent install (a user on a device), refreshed by the agent's heartbeats.
-/// There is at most one row per (tenant, user, device); <see cref="LastSeenAt"/> tells whether it is online.
+/// There is at most one row per (workspace, user, device); <see cref="LastSeenAt"/> tells whether it is online.
 /// </summary>
-public class AgentPresence : CreationAuditedEntity<Guid>, IMultiTenant
+public class AgentPresence : CreationAuditedEntity<Guid>, IWorkspaceScoped
 {
-    public Guid? TenantId { get; set; }
+    public Guid WorkspaceId { get; set; }
     public Guid UserId { get; set; }
 
     /// <summary>Random id generated once per agent install.</summary>
@@ -43,10 +43,10 @@ public class AgentPresence : CreationAuditedEntity<Guid>, IMultiTenant
     {
     }
 
-    public AgentPresence(Guid id, Guid? tenantId, Guid userId, Guid deviceId, string status, DateTime lastSeenAt)
+    public AgentPresence(Guid id, Guid workspaceId, Guid userId, Guid deviceId, string status, DateTime lastSeenAt)
     {
         Id = id;
-        TenantId = tenantId;
+        WorkspaceId = workspaceId;
         UserId = userId;
         DeviceId = deviceId;
         Status = status;

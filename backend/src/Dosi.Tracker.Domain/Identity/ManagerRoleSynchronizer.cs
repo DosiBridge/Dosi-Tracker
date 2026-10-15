@@ -2,76 +2,60 @@ using System;
 using System.Linq;
 using System.Threading.Tasks;
 using Dosi.Tracker.Projects;
-using Microsoft.AspNetCore.Identity;
-using Microsoft.Extensions.Logging;
+using Dosi.Tracker.Workspaces;
 using Volo.Abp.Domain.Repositories;
-using Volo.Abp.Domain.Services;
-using Volo.Abp.Identity;
 
 namespace Dosi.Tracker.Identity;
 
 /// <summary>
-/// Keeps the workspace-wide Identity <see cref="TrackerRoles.Manager"/> role in line with project memberships: an
-/// Admin/Manager membership confers it, and it is taken away again once the user holds no such membership on a
-/// project that still exists. Without the revocation a removed team lead would keep seeing every member's activity,
-/// screenshots and webcam frames.
+/// Keeps the workspace role in line with project memberships: an Admin/Manager project membership makes a member a
+/// workspace manager, and the manager role is taken away again once they hold no such membership on a project that
+/// still exists. An owner is never demoted (nor promoted) here.
 /// </summary>
-public class ManagerRoleSynchronizer : DomainService
+public class ManagerRoleSynchronizer : TrackerDomainService
 {
-    private readonly ManagerRoleProvisioner _provisioner;
-    private readonly IdentityUserManager _userManager;
+    private readonly IRepository<WorkspaceMember, Guid> _workspaceMemberRepository;
     private readonly IRepository<ProjectMember, Guid> _memberRepository;
     private readonly IRepository<Project, Guid> _projectRepository;
 
     public ManagerRoleSynchronizer(
-        ManagerRoleProvisioner provisioner,
-        IdentityUserManager userManager,
+        IRepository<WorkspaceMember, Guid> workspaceMemberRepository,
         IRepository<ProjectMember, Guid> memberRepository,
         IRepository<Project, Guid> projectRepository)
     {
-        _provisioner = provisioner;
-        _userManager = userManager;
+        _workspaceMemberRepository = workspaceMemberRepository;
         _memberRepository = memberRepository;
         _projectRepository = projectRepository;
     }
 
-    /// <summary>Gives the user the "manager" role (created on demand for workspaces that predate it). A membership for a
-    /// user id that has no Identity account is left as a plain membership.</summary>
+    /// <summary>Makes the user a manager of the current workspace (an active plain member only).</summary>
     public virtual async Task GrantAsync(Guid userId)
     {
-        var user = await _userManager.FindByIdAsync(userId.ToString());
-        if (user == null)
+        var member = await FindActiveAsync(userId);
+        if (member == null || member.Role != WorkspaceRoles.Member)
         {
-            Logger.LogWarning("Cannot grant the '{Role}' role: user {UserId} does not exist.", TrackerRoles.Manager, userId);
             return;
         }
 
-        await _provisioner.EnsureAsync();
-
-        if (!await _userManager.IsInRoleAsync(user, TrackerRoles.Manager))
-        {
-            (await _userManager.AddToRoleAsync(user, TrackerRoles.Manager)).CheckErrors();
-        }
+        member.SetRole(WorkspaceRoles.Manager);
+        await _workspaceMemberRepository.UpdateAsync(member, autoSave: true);
     }
 
-    /// <summary>Drops the "manager" role unless the user is still Admin/Manager on a project that has not been deleted.
+    /// <summary>Makes a manager a plain member again unless they still hold an Admin/Manager project membership.
     /// Call it after the membership change has been saved: the check reads the database.</summary>
     public virtual async Task RevokeIfUnusedAsync(Guid userId)
     {
-        if (await HoldsManagerMembershipAsync(userId))
+        var member = await FindActiveAsync(userId);
+        if (member == null || member.Role != WorkspaceRoles.Manager || await HoldsManagerMembershipAsync(userId))
         {
             return;
         }
 
-        var user = await _userManager.FindByIdAsync(userId.ToString());
-        if (user != null && await _userManager.IsInRoleAsync(user, TrackerRoles.Manager))
-        {
-            (await _userManager.RemoveFromRoleAsync(user, TrackerRoles.Manager)).CheckErrors();
-        }
+        member.SetRole(WorkspaceRoles.Member);
+        await _workspaceMemberRepository.UpdateAsync(member, autoSave: true);
     }
 
-    /// <summary>Whether the user is Admin/Manager on at least one project that still exists (soft-deleted projects, and
-    /// memberships left behind by them, do not count).</summary>
+    /// <summary>Whether the user is Admin/Manager on at least one project of the current workspace that still exists.</summary>
     public virtual async Task<bool> HoldsManagerMembershipAsync(Guid userId)
     {
         var memberQuery = await _memberRepository.GetQueryableAsync();
@@ -84,5 +68,17 @@ public class ManagerRoleSynchronizer : DomainService
             select member.Role);
 
         return roles.Any(TrackerRoles.IsManagerProjectRole);
+    }
+
+    private async Task<WorkspaceMember?> FindActiveAsync(Guid userId)
+    {
+        var workspaceId = CurrentWorkspace.Id;
+        if (workspaceId == null)
+        {
+            return null;
+        }
+
+        return await _workspaceMemberRepository.FirstOrDefaultAsync(m =>
+            m.WorkspaceId == workspaceId && m.UserId == userId && m.Status == WorkspaceMemberStatus.Active);
     }
 }

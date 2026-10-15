@@ -265,6 +265,15 @@ describe("settings page — live profile", () => {
     expect(body.concurrencyStamp).toBe("stamp-1");
   });
 
+  it("the profile is global: says so, and the email can't be edited here", async () => {
+    stubLiveBackend();
+    localStorage.setItem("dosi-token", "live-token");
+    renderAsRole(<SettingsPage />, "owner", { withToasts: true });
+    await screen.findByDisplayValue("Rahman");
+    expect(screen.getByText("Your profile is shared across all your workspaces.")).toBeInTheDocument();
+    expect(screen.getByLabelText("Email")).toHaveAttribute("readonly");
+  });
+
   it("a second save carries the concurrency stamp the first save returned (no stale-stamp failure)", async () => {
     stubLiveBackend();
     localStorage.setItem("dosi-token", "live-token");

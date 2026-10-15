@@ -9,7 +9,7 @@ use super::widgets::{self, ButtonKind, Icon, Tone};
 use super::{format, section, TrackerApp};
 use crate::prefs::{GOAL_MAX_HOURS, GOAL_MIN_HOURS};
 use crate::shell;
-use crate::state::{Command, SharedState};
+use crate::state::{Command, SharedState, TrackerStatus};
 use crate::theme;
 
 impl TrackerApp {
@@ -181,7 +181,7 @@ impl TrackerApp {
                     ui.add_space(3.0);
                     ui.add(egui::Label::new(egui::RichText::new(&snapshot.display_name).font(theme::semibold(14.0)).color(theme::INK)).truncate());
                     let workspace = if snapshot.workspace.trim().is_empty() {
-                        "Host account".to_owned()
+                        "No workspace chosen".to_owned()
                     } else {
                         format!("Workspace: {}", snapshot.workspace.trim())
                     };
@@ -193,6 +193,7 @@ impl TrackerApp {
             divider(ui);
             info_row(ui, Icon::External, "Web dashboard", &dashboard);
             ui.add_space(4.0);
+            self.switch_workspace(ui, snapshot);
 
             if self.confirm_sign_out {
                 theme::inset(12).show(ui, |ui| {
@@ -242,6 +243,44 @@ impl TrackerApp {
                 }
             }
         });
+    }
+
+    /// "Switch workspace": the user's workspaces; one click moves tracking there.
+    fn switch_workspace(&mut self, ui: &mut egui::Ui, snapshot: &SharedState) {
+        if snapshot.display_name.trim().is_empty() || snapshot.status == TrackerStatus::SignInExpired {
+            return;
+        }
+        if let Some(note) = &snapshot.workspace_note {
+            widgets::muted(ui, note);
+        }
+        if snapshot.workspace_choices.is_empty() {
+            let finding = snapshot.finding_workspaces;
+            let label = if finding { "Looking up workspaces…" } else { "Switch workspace" };
+            if widgets::button(ui, ButtonKind::Secondary, None, label, Some(ui.available_width()), !finding).clicked() {
+                self.send(Command::SwitchWorkspace);
+            }
+            return;
+        }
+        let mut action = None;
+        theme::inset(12).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 6.0;
+            ui.label(egui::RichText::new("Switch workspace").font(theme::semibold(15.0)).color(theme::INK));
+            for (index, choice) in snapshot.workspace_choices.iter().enumerate() {
+                let label = super::login::workspace_label(choice);
+                if widgets::button(ui, ButtonKind::Secondary, None, &label, Some(ui.available_width()), !choice.is_current).clicked() {
+                    action = Some(Some(index));
+                }
+            }
+            if snapshot.workspace_lost.is_none() && ui.vertical_centered(|ui| widgets::link(ui, "Back", theme::PRIMARY_STRONG).clicked()).inner {
+                action = Some(None);
+            }
+        });
+        match action {
+            None => {}
+            Some(None) => self.send(Command::CancelWorkspaceChoice),
+            Some(Some(index)) => self.send(Command::SwitchToWorkspace { index, at: chrono::Utc::now() }),
+        }
     }
 
     fn support_card(&mut self, ui: &mut egui::Ui) {

@@ -1019,12 +1019,13 @@ function DayScheduleView({
   live?: boolean;
   legend: React.ReactNode;
 }) {
-  const PX_PER_MIN = 1.1;
+  const PX_PER_MIN = 2.0;
   const start = span.start;
   const range = span.end - span.start;
   const height = range * PX_PER_MIN;
   const hours = Array.from({ length: Math.floor(range / 60) + 1 }, (_, i) => start + i * 60);
   const [selected, setSelected] = useState<DaySegment | null>(null);
+  const lanes = useMemo(() => layoutLanes(segments, start, PX_PER_MIN), [segments, start]);
 
   return (
     <Card>
@@ -1036,8 +1037,8 @@ function DayScheduleView({
         <p className="mb-3 text-xs text-muted-foreground">
           {live ? "Tap any block for details." : "Tap any block for details and open tabs."}
         </p>
-        <div className="-mx-1 overflow-x-auto overscroll-x-contain px-1">
-          <div className="flex min-w-[280px]">
+        <div className="-mx-1 max-h-[640px] overflow-x-auto overflow-y-auto overscroll-contain px-1">
+          <div className="flex min-w-[280px] py-2">
             <div className="relative w-12 shrink-0 sm:w-14" style={{ height }}>
               {hours.map((h) => (
                 <span
@@ -1069,7 +1070,14 @@ function DayScheduleView({
                 />
               ))}
               {segments.map((s) => (
-                <ScheduleBlock key={s.id} seg={s} axisStart={start} pxPerMin={PX_PER_MIN} onSelect={setSelected} />
+                <ScheduleBlock
+                  key={s.id}
+                  seg={s}
+                  axisStart={start}
+                  pxPerMin={PX_PER_MIN}
+                  lane={lanes.get(s.id) ?? { index: 0, count: 1 }}
+                  onSelect={setSelected}
+                />
               ))}
             </div>
           </div>
@@ -1086,22 +1094,59 @@ function activityText(seg: DaySegment, suffix = ""): string {
   return seg.measured === false ? "Not measured" : `${seg.productivity}%${suffix}`;
 }
 
+const MIN_BLOCK_PX = 26;
+
+type Lane = { index: number; count: number };
+
+/** Blocks stretched to the minimum height can collide; put colliding blocks side by side. */
+function layoutLanes(segments: DaySegment[], axisStart: number, pxPerMin: number): Map<string, Lane> {
+  const items = segments
+    .map((s) => {
+      const top = (s.startMin - axisStart) * pxPerMin;
+      return { id: s.id, top, bottom: top + Math.max(MIN_BLOCK_PX, s.minutes * pxPerMin) };
+    })
+    .sort((a, b) => a.top - b.top);
+  const result = new Map<string, Lane>();
+  let cluster: { id: string; lane: number }[] = [];
+  let laneBottoms: number[] = [];
+  let clusterBottom = -Infinity;
+  const flush = () => {
+    for (const c of cluster) result.set(c.id, { index: c.lane, count: laneBottoms.length });
+    cluster = [];
+    laneBottoms = [];
+  };
+  for (const it of items) {
+    if (it.top >= clusterBottom) flush();
+    let lane = laneBottoms.findIndex((b) => b <= it.top);
+    if (lane === -1) lane = laneBottoms.push(it.bottom) - 1;
+    else laneBottoms[lane] = it.bottom;
+    cluster.push({ id: it.id, lane });
+    clusterBottom = Math.max(clusterBottom, it.bottom);
+  }
+  flush();
+  return result;
+}
+
 function ScheduleBlock({
   seg,
   axisStart,
   pxPerMin,
+  lane,
   onSelect,
 }: {
   seg: DaySegment;
   axisStart: number;
   pxPerMin: number;
+  lane: Lane;
   onSelect: (seg: DaySegment) => void;
 }) {
   const top = (seg.startMin - axisStart) * pxPerMin;
-  const height = Math.max(18, seg.minutes * pxPerMin);
+  const height = Math.max(MIN_BLOCK_PX, seg.minutes * pxPerMin);
+  const GAP = 6;
+  const widthPct = 100 / lane.count;
   const isPassive = seg.type === "idle" || seg.type === "break";
   const color = segmentColor(seg);
-  const compact = height < 34;
+  const compact = height < 44;
   const label = isPassive ? seg.type.charAt(0).toUpperCase() + seg.type.slice(1) : seg.app;
 
   return (
@@ -1110,12 +1155,14 @@ function ScheduleBlock({
       onClick={() => onSelect(seg)}
       title={`${fmtMin(seg.startMin)}–${fmtMin(seg.endMin)} · ${label}${isPassive ? "" : ` · ${activityText(seg)}`}${seg.tabs ? ` · ${seg.tabs.length} tabs` : ""} — click for details`}
       className={cn(
-        "absolute left-1.5 right-1.5 flex flex-col overflow-hidden rounded-md border-l-[3px] px-2 py-1 text-left transition-all hover:z-10 hover:brightness-[1.03] hover:ring-1 hover:ring-primary/40 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary",
+        "absolute flex flex-col overflow-hidden rounded-md border-l-[3px] px-2 py-1 text-left transition-all hover:z-10 hover:brightness-[1.03] hover:ring-1 hover:ring-primary/40 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary",
         isPassive && "opacity-80"
       )}
       style={{
-        top,
-        height,
+        top: top + 1,
+        height: height - 2,
+        left: `calc(${lane.index * widthPct}% + ${GAP}px)`,
+        width: `calc(${widthPct}% - ${GAP * 1.5}px)`,
         borderLeftColor: color,
         background: isPassive ? "var(--color-muted)" : `${color}1f`,
       }}

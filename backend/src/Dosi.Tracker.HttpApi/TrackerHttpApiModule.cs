@@ -9,7 +9,6 @@ using Volo.Abp.Identity;
 using Volo.Abp.Modularity;
 using Volo.Abp.PermissionManagement.HttpApi;
 using Volo.Abp.Localization;
-using Volo.Abp.TenantManagement;
 
 namespace Dosi.Tracker;
 
@@ -19,7 +18,6 @@ namespace Dosi.Tracker;
     typeof(AbpSettingManagementHttpApiModule),
     typeof(AbpAccountHttpApiModule),
     typeof(AbpIdentityHttpApiModule),
-    typeof(AbpTenantManagementHttpApiModule),
     typeof(AbpFeatureManagementHttpApiModule)
     )]
 public class TrackerHttpApiModule : AbpModule
@@ -74,6 +72,15 @@ public class TrackerHttpApiModule : AbpModule
             options.Map(TrackerDomainErrorCodes.InvalidUser, HttpStatusCode.NotFound);
             options.Map(TrackerDomainErrorCodes.CannotModifySelf, HttpStatusCode.Forbidden);
             options.Map(TrackerDomainErrorCodes.RoleNotAllowed, HttpStatusCode.Forbidden);
+            options.Map(TrackerDomainErrorCodes.WorkspaceRequired, HttpStatusCode.BadRequest);
+            options.Map(TrackerDomainErrorCodes.NotWorkspaceMember, HttpStatusCode.Forbidden);
+            options.Map(TrackerDomainErrorCodes.EmailAlreadyRegistered, HttpStatusCode.Conflict);
+            options.Map(TrackerDomainErrorCodes.DuplicateWorkspaceName, HttpStatusCode.Conflict);
+            options.Map(TrackerDomainErrorCodes.LastOwnerCannotLeave, HttpStatusCode.Conflict);
+            options.Map(TrackerDomainErrorCodes.InvitationNotFound, HttpStatusCode.NotFound);
+            options.Map(TrackerDomainErrorCodes.InvitationExpired, HttpStatusCode.Gone);
+            options.Map(TrackerDomainErrorCodes.InvitationEmailMismatch, HttpStatusCode.Forbidden);
+            options.Map(TrackerDomainErrorCodes.AlreadyWorkspaceMember, HttpStatusCode.Conflict);
         });
     }
 }

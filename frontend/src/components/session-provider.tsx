@@ -8,16 +8,18 @@ import type { ActivityCoverage, User } from "@/lib/types";
 import { getApi, getPagedApi, loginApi, logoutApi, refreshAccessToken } from "@/hooks/useApi";
 import {
   SESSION_UNAUTHORIZED_EVENT,
-  TENANT_STORAGE_KEY,
   TOKEN_EXPIRES_STORAGE_KEY,
   TOKEN_STORAGE_KEY,
+  WORKSPACE_STORAGE_KEY,
   canRenewSession,
+  clearCurrentWorkspace,
+  currentWorkspaceId,
   isLiveSession,
   readStorage,
   redirectToLogin,
+  redirectToWorkspaceChooser,
   reloadPage,
   removeStorage,
-  storedTenantName,
   tokenExpiresAt,
   writeStorage,
 } from "@/lib/live-session";
@@ -28,6 +30,7 @@ import {
   isSameIdentity,
   loadLiveSession,
   SessionExpiredError,
+  WorkspaceRequiredError,
   type LiveIdentity,
   type LiveSessionData,
 } from "@/lib/live-loader";
@@ -133,7 +136,8 @@ interface SessionContextValue {
 
 const SessionContext = createContext<SessionContextValue | null>(null);
 const USER_KEY = "dosi-user";
-const WS_KEY = "dosi-workspace";
+/** Shared with the live session: a demo workspace id here is never sent (only GUIDs are). */
+const WS_KEY = WORKSPACE_STORAGE_KEY;
 const WS_CREATED_KEY = "dosi-workspaces-created";
 const WS_PATCH_KEY = "dosi-workspaces-patches";
 const WS_DELETED_KEY = "dosi-workspaces-deleted";
@@ -374,7 +378,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
       const token = readStorage(TOKEN_STORAGE_KEY);
       const now = new Date();
       try {
-        const data = await loadLiveSession(getApi, now, { getPage: getPagedApi, previous });
+        const data = await loadLiveSession(getApi, now, { getPage: getPagedApi, previous, workspaceId: currentWorkspaceId() });
         if (seq !== loadSeq.current) return null;
         // Another account signed in from another tab: start over rather than mix two sessions.
         if (lastLoad.current && !isSameIdentity(lastLoad.current.identity, data.identity)) {
@@ -404,6 +408,14 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
         return data.user;
       } catch (err) {
         if (seq !== loadSeq.current) return null;
+        if (err instanceof WorkspaceRequiredError) {
+          clearCurrentWorkspace();
+          clearLiveState();
+          setLiveError(err.message);
+          setLiveStatus("error");
+          redirectToWorkspaceChooser();
+          return null;
+        }
         if (err instanceof SessionExpiredError) {
           if (silent && lastLoad.current) {
             // The token ran out under a page someone is using: keep the page and ask them to sign in again.
@@ -474,7 +486,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
     if (!current) return;
     let identity;
     try {
-      identity = await fetchLiveIdentity(getApi);
+      identity = await fetchLiveIdentity(getApi, currentWorkspaceId());
     } catch {
       return; // unreachable for now; the next check or refresh decides
     }
@@ -519,8 +531,8 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
         }
         return;
       }
-      if (event.key === TENANT_STORAGE_KEY && wasLive && event.newValue && event.newValue !== event.oldValue) {
-        // A sign-in to another workspace: this tab's screens belong to the old one.
+      if (event.key === WS_KEY && wasLive && event.newValue && event.newValue !== event.oldValue) {
+        // Another tab switched workspace: this tab's screens belong to the old one.
         reloadPage();
         return;
       }
@@ -745,10 +757,8 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
       const last = lastLoad.current;
       if (!last) return { ok: false, failure: { kind: "server" } };
       const username = last.identity.userName || last.user.email;
-      // The workspace exactly as it was typed at sign-in, else the workspace's own name.
-      const tenant = last.identity.tenantId ? (storedTenantName() ?? last.identity.tenantName ?? undefined) : undefined;
       try {
-        await loginApi(username, password, tenant);
+        await loginApi(username, password);
       } catch (err) {
         return { ok: false, failure: classifySignInError(err) };
       }

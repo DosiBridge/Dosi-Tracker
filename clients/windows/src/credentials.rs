@@ -27,11 +27,19 @@ const PROJECT_CACHE_MAX_FUTURE: TimeDelta = TimeDelta::minutes(10);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Credentials {
-    /// Workspace (tenant) name; empty for a host account.
+    /// The workspace tracked in (`X-Workspace-Id`). A sign-in saved by an
+    /// older build has none and must sign in again.
     #[serde(default)]
-    pub workspace: String,
+    pub workspace_id: Option<String>,
+    /// Its name, for display.
+    #[serde(default)]
+    pub workspace_name: String,
+    /// The email (or user name) typed at sign-in.
     pub username: String,
     pub password: String,
+    /// Renews the access token without the password.
+    #[serde(default)]
+    pub refresh_token: Option<String>,
     /// Project the user last chose, so tracking resumes where it left off.
     #[serde(default)]
     pub project_id: Option<String>,
@@ -53,11 +61,13 @@ pub struct Credentials {
 
 impl Credentials {
     /// A fresh sign-in, with nothing remembered yet.
-    pub fn new(workspace: String, username: String, password: String, server: Option<String>) -> Self {
+    pub fn new(username: String, password: String, server: Option<String>) -> Self {
         Self {
-            workspace,
+            workspace_id: None,
+            workspace_name: String::new(),
             username,
             password,
+            refresh_token: None,
             project_id: None,
             server,
             projects: None,
@@ -66,14 +76,14 @@ impl Credentials {
         }
     }
 
-    /// The account, as the offline queue tags its rows.
+    /// The user, as the offline queue tags its rows.
     pub fn owner_key(&self) -> String {
-        crate::storage::owner_key(&self.workspace, &self.username)
+        crate::storage::owner_key(&self.username)
     }
 
-    /// Is this the same account (workspace and user, compared as the server does)?
-    pub fn same_account(&self, workspace: &str, username: &str) -> bool {
-        self.owner_key() == crate::storage::owner_key(workspace, username)
+    /// Is this the same user (compared as the server does)?
+    pub fn same_account(&self, username: &str) -> bool {
+        self.owner_key() == crate::storage::owner_key(username)
     }
 
     /// The saved project list, if it may still be used at `now`.
@@ -251,9 +261,10 @@ mod tests {
 
     #[test]
     fn credentials_serialize_with_optional_project() {
-        let json = br#"{"username":"a","password":"b"}"#; // legacy blob: no workspace field
+        let json = br#"{"workspace":"acme","username":"a","password":"b"}"#; // saved by an older build
         let parsed: Credentials = serde_json::from_slice(json).expect("project_id is optional");
         assert_eq!(parsed.username, "a");
+        assert!(parsed.workspace_id.is_none() && parsed.refresh_token.is_none(), "must sign in again");
         assert!(parsed.project_id.is_none());
         // Nothing the newer builds remember is required either.
         assert!(parsed.server.is_none() && parsed.projects.is_none() && parsed.pause.is_none() && parsed.task_note.is_none());
@@ -272,14 +283,21 @@ mod tests {
     fn everything_remembered_survives_an_encrypted_round_trip() {
         let path = std::env::temp_dir().join(format!("dosi-credentials-{}.bin", uuid::Uuid::new_v4()));
         let at = DateTime::parse_from_rfc3339("2026-10-05T09:00:00Z").unwrap().with_timezone(&Utc);
-        let mut saved = Credentials::new("acme".into(), "alice@acme.com".into(), "pw".into(), Some("https://tracker.acme.com".into()));
+        let mut saved = Credentials::new("alice@acme.com".into(), "pw".into(), Some("https://tracker.acme.com".into()));
+        saved.workspace_id = Some("w1".into());
+        saved.workspace_name = "Acme".into();
+        saved.refresh_token = Some("r3fr3sh".into());
         saved.project_id = Some("p2".into());
         saved.projects = Some(ProjectCache { resolved_at: at, projects: vec![project("p1"), project("p2")] });
         saved.pause = Some(SavedPause { since: at, until: Some(at + TimeDelta::minutes(15)) });
         saved.task_note = Some("Invoice export".into());
         save_at(&path, &saved).unwrap();
 
+        let raw = std::fs::read(&path).unwrap();
+        assert!(!raw.windows(7).any(|w| w == b"r3fr3sh"), "the refresh token is encrypted too");
         let back = load_from(&path).expect("decrypts");
+        assert_eq!((back.workspace_id.as_deref(), back.workspace_name.as_str()), (Some("w1"), "Acme"));
+        assert_eq!(back.refresh_token.as_deref(), Some("r3fr3sh"));
         assert_eq!(back.server.as_deref(), Some("https://tracker.acme.com"));
         assert_eq!(back.project_id.as_deref(), Some("p2"));
         let cache = back.projects.as_ref().unwrap();
@@ -299,7 +317,7 @@ mod tests {
     #[test]
     fn the_project_list_is_usable_offline_for_seven_days() {
         let at = DateTime::parse_from_rfc3339("2026-10-05T09:00:00Z").unwrap().with_timezone(&Utc);
-        let mut saved = Credentials::new(String::new(), "a".into(), "b".into(), None);
+        let mut saved = Credentials::new("a".into(), "b".into(), None);
         assert!(saved.usable_projects(at).is_none(), "nothing saved yet");
         saved.projects = Some(ProjectCache { resolved_at: at, projects: vec![project("p1")] });
         assert_eq!(saved.usable_projects(at + TimeDelta::days(6)).map(<[Project]>::len), Some(1));
@@ -310,11 +328,10 @@ mod tests {
 
     #[test]
     fn accounts_compare_like_the_server() {
-        let saved = Credentials::new("Acme".into(), "Alice@Acme.com".into(), "pw".into(), None);
-        assert!(saved.same_account(" acme ", "alice@acme.com"));
-        assert!(!saved.same_account("acme", "bob@acme.com"));
-        assert!(!saved.same_account("", "alice@acme.com"));
-        assert_eq!(saved.owner_key(), crate::storage::owner_key("acme", "alice@acme.com"));
+        let saved = Credentials::new("Alice@Acme.com".into(), "pw".into(), None);
+        assert!(saved.same_account(" alice@acme.com "));
+        assert!(!saved.same_account("bob@acme.com"));
+        assert_eq!(saved.owner_key(), crate::storage::owner_key("alice@acme.com"));
     }
 }
 

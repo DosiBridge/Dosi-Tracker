@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 using Dosi.Tracker.Data;
+using Dosi.Tracker.Permissions;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Shouldly;
@@ -12,15 +13,14 @@ using Volo.Abp.Domain.Repositories;
 using Volo.Abp.DynamicProxy;
 using Volo.Abp.Identity;
 using Volo.Abp.Modularity;
-using Volo.Abp.MultiTenancy;
-using Volo.Abp.TenantManagement;
+using Volo.Abp.PermissionManagement;
 using Xunit;
 
 namespace Dosi.Tracker.Identity;
 
 /// <summary>
-/// Administrators are seeded only into a brand-new host or workspace. Re-running the seed (every DbMigrator run does)
-/// must never bring back a template <c>admin</c> / <c>1q2w3E*</c> account where the owner renamed or removed it.
+/// The platform administrator (global role <c>platform-admin</c>) is seeded only into a brand-new database. Re-running
+/// the seed (every DbMigrator run does) must never bring back a template <c>admin</c> / <c>1q2w3E*</c> account.
 /// </summary>
 public abstract class AdminSeedingTests<TStartupModule> : TrackerDomainTestBase<TStartupModule>
     where TStartupModule : IAbpModule
@@ -28,16 +28,12 @@ public abstract class AdminSeedingTests<TStartupModule> : TrackerDomainTestBase<
     private const string ConfiguredHostEmail = "platform@dosi.test";
     private const string ConfiguredHostPassword = "Configured-Pa55";
 
-    private readonly IDataSeeder _dataSeeder;
     private readonly IIdentityUserRepository _userRepository;
-    private readonly ICurrentTenant _currentTenant;
     private readonly IDataFilter _dataFilter;
 
     protected AdminSeedingTests()
     {
-        _dataSeeder = GetRequiredService<IDataSeeder>();
         _userRepository = GetRequiredService<IIdentityUserRepository>();
-        _currentTenant = GetRequiredService<ICurrentTenant>();
         _dataFilter = GetRequiredService<IDataFilter>();
     }
 
@@ -53,19 +49,10 @@ public abstract class AdminSeedingTests<TStartupModule> : TrackerDomainTestBase<
             .Build());
     }
 
-    /// <summary>Seeds a workspace the way ABP's tenant creation (and the old DbMigrator) did: with explicit admin credentials.</summary>
-    private Task SeedWithAdminCredentialsAsync(Guid tenantId, string password = "1q2w3E*")
-    {
-        return _dataSeeder.SeedAsync(new DataSeedContext(tenantId)
-            .WithProperty(IdentityDataSeedContributor.AdminEmailPropertyName, "admin@abp.io")
-            .WithProperty(IdentityDataSeedContributor.AdminPasswordPropertyName, password));
-    }
-
-    private Task<List<IdentityUser>> UsersOfAsync(Guid? tenantId, bool includeDeleted = false)
+    private Task<List<IdentityUser>> UsersAsync(bool includeDeleted = false)
     {
         return WithUnitOfWorkAsync(async () =>
         {
-            using (_currentTenant.Change(tenantId))
             using (includeDeleted ? _dataFilter.Disable<ISoftDelete>() : null)
             {
                 return await _userRepository.GetListAsync(sorting: nameof(IdentityUser.UserName));
@@ -73,17 +60,16 @@ public abstract class AdminSeedingTests<TStartupModule> : TrackerDomainTestBase<
         });
     }
 
-    private Task UpdateUserAsync(Guid tenantId, string userName, Func<IdentityUserManager, IdentityUser, Task> change)
+    private Task HardDeleteAllUsersAsync()
     {
         return WithUnitOfWorkAsync(async () =>
         {
-            using (_currentTenant.Change(tenantId))
+            using (_dataFilter.Disable<ISoftDelete>())
             {
-                var userManager = GetRequiredService<IdentityUserManager>();
-                var found = await userManager.FindByNameAsync(userName);
-                found.ShouldNotBeNull();
-                // Loaded with its details (roles, claims, …): deleting a user clears them.
-                await change(userManager, await userManager.GetByIdAsync(found.Id));
+                foreach (var user in await _userRepository.GetListAsync(sorting: nameof(IdentityUser.UserName)))
+                {
+                    await _userRepository.HardDeleteAsync(user);
+                }
             }
         });
     }
@@ -96,113 +82,39 @@ public abstract class AdminSeedingTests<TStartupModule> : TrackerDomainTestBase<
     }
 
     [Fact]
-    public async Task A_New_Workspace_Should_Get_Its_Administrator()
+    public async Task The_First_Administrator_Should_Be_A_Platform_Admin()
     {
-        var tenantId = Guid.NewGuid();
-
-        await SeedWithAdminCredentialsAsync(tenantId, "Owner-Chosen-1");
-
-        var admin = (await UsersOfAsync(tenantId)).ShouldHaveSingleItem();
+        var admin = (await UsersAsync()).ShouldHaveSingleItem(); // seeded when the test application started
         admin.UserName.ShouldBe("admin");
-        admin.ShouldChangePasswordOnNextLogin.ShouldBeFalse(); // the owner chose it
+        admin.ShouldChangePasswordOnNextLogin.ShouldBeTrue(); // the template password
+
         await WithUnitOfWorkAsync(async () =>
         {
-            using (_currentTenant.Change(tenantId))
-            {
-                var userManager = GetRequiredService<IdentityUserManager>();
-                var stored = await userManager.GetByIdAsync(admin.Id);
-                (await userManager.IsInRoleAsync(stored, TrackerRoles.Admin)).ShouldBeTrue();
-                (await userManager.CheckPasswordAsync(stored, "Owner-Chosen-1")).ShouldBeTrue();
-            }
+            var userManager = GetRequiredService<IdentityUserManager>();
+            var stored = await userManager.GetByIdAsync(admin.Id);
+            (await userManager.GetRolesAsync(stored)).ShouldBe(new[] { TrackerRoles.PlatformAdmin });
         });
     }
 
     [Fact]
-    public async Task An_Administrator_Created_With_The_Template_Password_Should_Have_To_Change_It()
+    public async Task The_Platform_Admin_Role_Should_Hold_The_Platform_Permission_But_No_Workspace_Permission()
     {
-        // E.g. a workspace the host created in the console and gave the template password.
-        var tenantId = Guid.NewGuid();
-
-        await SeedWithAdminCredentialsAsync(tenantId);
-
-        var admin = (await UsersOfAsync(tenantId)).ShouldHaveSingleItem();
-        admin.ShouldChangePasswordOnNextLogin.ShouldBeTrue();
-    }
-
-    [Fact]
-    public async Task A_Workspace_Whose_Admin_Was_Renamed_Should_Not_Get_A_New_One()
-    {
-        var tenantId = Guid.NewGuid();
-        await SeedWithAdminCredentialsAsync(tenantId, "Owner-Chosen-1");
-        await UpdateUserAsync(tenantId, "admin", async (userManager, user) =>
-            (await userManager.SetUserNameAsync(user, "jane")).Succeeded.ShouldBeTrue());
-
-        await SeedWithAdminCredentialsAsync(tenantId);
-
-        (await UsersOfAsync(tenantId)).ShouldHaveSingleItem().UserName.ShouldBe("jane");
-    }
-
-    [Fact]
-    public async Task A_Workspace_Whose_Users_Were_All_Deleted_Should_Not_Get_One_Either()
-    {
-        var tenantId = Guid.NewGuid();
-        await SeedWithAdminCredentialsAsync(tenantId, "Owner-Chosen-1");
-        await UpdateUserAsync(tenantId, "admin", async (userManager, user) =>
-            (await userManager.DeleteAsync(user)).Succeeded.ShouldBeTrue());
-
-        await SeedWithAdminCredentialsAsync(tenantId);
-
-        (await UsersOfAsync(tenantId)).ShouldBeEmpty();
-        (await UsersOfAsync(tenantId, includeDeleted: true)).ShouldHaveSingleItem().IsDeleted.ShouldBeTrue();
-    }
-
-    [Fact]
-    public async Task No_Administrator_Should_Be_Created_While_Admin_Creation_Is_Suppressed()
-    {
-        var tenantId = Guid.NewGuid();
-
-        using (TrackerIdentityDataSeeder.SuppressAdminCreation())
-        {
-            TrackerIdentityDataSeeder.IsAdminCreationSuppressed.ShouldBeTrue();
-            await SeedWithAdminCredentialsAsync(tenantId);
-        }
-
-        TrackerIdentityDataSeeder.IsAdminCreationSuppressed.ShouldBeFalse();
-        (await UsersOfAsync(tenantId)).ShouldBeEmpty();
-
-        await SeedWithAdminCredentialsAsync(tenantId, "Owner-Chosen-1");
-        (await UsersOfAsync(tenantId)).ShouldHaveSingleItem();
-    }
-
-    [Fact]
-    public async Task The_Migrator_Should_Seed_Existing_Workspaces_Without_Creating_Administrators()
-    {
-        var tenant = await WithUnitOfWorkAsync(async () =>
-        {
-            var created = await GetRequiredService<ITenantManager>().CreateAsync("emptyco");
-            return await GetRequiredService<ITenantRepository>().InsertAsync(created, autoSave: true);
-        });
-
-        await GetRequiredService<TrackerDbMigrationService>().SeedTenantAsync(tenant);
-
-        (await UsersOfAsync(tenant.Id)).ShouldBeEmpty();
-
-        // The other seeds still ran for the workspace: it has its "manager" role.
         await WithUnitOfWorkAsync(async () =>
         {
-            using (_currentTenant.Change(tenant.Id))
-            {
-                (await GetRequiredService<IdentityRoleManager>().FindByNameAsync(TrackerRoles.Manager)).ShouldNotBeNull();
-            }
+            var grants = await GetRequiredService<IPermissionGrantRepository>()
+                .GetListAsync("R", TrackerRoles.PlatformAdmin);
+            var names = grants.Select(g => g.Name).ToList();
+
+            names.ShouldContain(TrackerPermissions.Platform.Default);
+            names.ShouldNotContain(TrackerPermissions.Team.Manage);
+            names.ShouldNotContain(TrackerPermissions.Activities.ViewAll);
+            names.ShouldNotContain(TrackerPermissions.Billing.Default);
         });
     }
 
     [Fact]
-    public async Task The_Migrator_Should_Leave_A_Renamed_Host_Administrator_Alone()
+    public async Task The_Migrator_Should_Leave_A_Renamed_Administrator_Alone()
     {
-        var before = await UsersOfAsync(null);
-        before.ShouldContain(u => u.UserName == "admin"); // seeded when the test application started
-
         await WithUnitOfWorkAsync(async () =>
         {
             var userManager = GetRequiredService<IdentityUserManager>();
@@ -212,22 +124,44 @@ public abstract class AdminSeedingTests<TStartupModule> : TrackerDomainTestBase<
 
         await GetRequiredService<TrackerDbMigrationService>().SeedHostAsync();
 
-        var after = await UsersOfAsync(null);
-        after.Count.ShouldBe(before.Count);
-        after.ShouldNotContain(u => u.UserName == "admin");
+        (await UsersAsync()).ShouldHaveSingleItem().UserName.ShouldBe("platform-owner");
     }
 
     [Fact]
-    public async Task The_Migrator_Should_Create_The_First_Host_Administrator_From_Configuration()
+    public async Task A_Database_Whose_Users_Were_All_Deleted_Should_Not_Get_A_New_Administrator()
     {
-        // A host database without any user: what the very first DbMigrator run sees.
         await WithUnitOfWorkAsync(async () =>
         {
-            foreach (var user in await _userRepository.GetListAsync(sorting: nameof(IdentityUser.UserName)))
-            {
-                await _userRepository.HardDeleteAsync(user);
-            }
+            var userManager = GetRequiredService<IdentityUserManager>();
+            var admin = await userManager.FindByNameAsync("admin");
+            (await userManager.DeleteAsync(await userManager.GetByIdAsync(admin!.Id))).Succeeded.ShouldBeTrue();
         });
+
+        await GetRequiredService<TrackerDbMigrationService>().SeedHostAsync();
+
+        (await UsersAsync()).ShouldBeEmpty();
+        (await UsersAsync(includeDeleted: true)).ShouldHaveSingleItem().IsDeleted.ShouldBeTrue();
+    }
+
+    [Fact]
+    public async Task No_Administrator_Should_Be_Created_While_Admin_Creation_Is_Suppressed()
+    {
+        await HardDeleteAllUsersAsync();
+
+        using (TrackerIdentityDataSeeder.SuppressAdminCreation())
+        {
+            TrackerIdentityDataSeeder.IsAdminCreationSuppressed.ShouldBeTrue();
+            await GetRequiredService<TrackerDbMigrationService>().SeedHostAsync();
+        }
+
+        TrackerIdentityDataSeeder.IsAdminCreationSuppressed.ShouldBeFalse();
+        (await UsersAsync()).ShouldBeEmpty();
+    }
+
+    [Fact]
+    public async Task The_Migrator_Should_Create_The_First_Administrator_From_Configuration()
+    {
+        await HardDeleteAllUsersAsync();
 
         var migrator = GetRequiredService<TrackerDbMigrationService>();
         var context = migrator.CreateHostSeedContext();
@@ -237,14 +171,16 @@ public abstract class AdminSeedingTests<TStartupModule> : TrackerDomainTestBase<
 
         await migrator.SeedHostAsync();
 
-        var admin = (await UsersOfAsync(null)).ShouldHaveSingleItem();
+        var admin = (await UsersAsync()).ShouldHaveSingleItem();
         admin.UserName.ShouldBe("admin");
         admin.Email.ShouldBe(ConfiguredHostEmail);
         admin.ShouldChangePasswordOnNextLogin.ShouldBeFalse();
         await WithUnitOfWorkAsync(async () =>
         {
             var userManager = GetRequiredService<IdentityUserManager>();
-            (await userManager.CheckPasswordAsync(await userManager.GetByIdAsync(admin.Id), ConfiguredHostPassword)).ShouldBeTrue();
+            var stored = await userManager.GetByIdAsync(admin.Id);
+            (await userManager.CheckPasswordAsync(stored, ConfiguredHostPassword)).ShouldBeTrue();
+            (await userManager.IsInRoleAsync(stored, TrackerRoles.PlatformAdmin)).ShouldBeTrue();
         });
     }
 }

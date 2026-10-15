@@ -5,7 +5,7 @@ using System.Threading.Tasks;
 using Microsoft.Extensions.DependencyInjection;
 using Shouldly;
 using Volo.Abp.Modularity;
-using Volo.Abp.MultiTenancy;
+using Dosi.Tracker.Workspaces;
 using Volo.Abp.Security.Claims;
 using Xunit;
 
@@ -15,13 +15,13 @@ public abstract class WorkspaceSettingsManagerTests<TStartupModule> : TrackerDom
     where TStartupModule : IAbpModule
 {
     private readonly WorkspaceSettingsManager _settings;
-    private readonly ICurrentTenant _currentTenant;
+    private readonly ICurrentWorkspace _currentWorkspace;
     private readonly ICurrentPrincipalAccessor _principalAccessor;
 
     protected WorkspaceSettingsManagerTests()
     {
         _settings = GetRequiredService<WorkspaceSettingsManager>();
-        _currentTenant = GetRequiredService<ICurrentTenant>();
+        _currentWorkspace = GetRequiredService<ICurrentWorkspace>();
         _principalAccessor = GetRequiredService<ICurrentPrincipalAccessor>();
     }
 
@@ -32,7 +32,7 @@ public abstract class WorkspaceSettingsManagerTests<TStartupModule> : TrackerDom
 
     private async Task<T> InWorkspaceAsync<T>(Guid? tenantId, Func<Task<T>> action)
     {
-        using (_currentTenant.Change(tenantId))
+        using (_currentWorkspace.Change(tenantId))
         {
             return await WithUnitOfWorkAsync(action);
         }
@@ -40,7 +40,7 @@ public abstract class WorkspaceSettingsManagerTests<TStartupModule> : TrackerDom
 
     private async Task InWorkspaceAsync(Guid? tenantId, Func<Task> action)
     {
-        using (_currentTenant.Change(tenantId))
+        using (_currentWorkspace.Change(tenantId))
         {
             await WithUnitOfWorkAsync(action);
         }

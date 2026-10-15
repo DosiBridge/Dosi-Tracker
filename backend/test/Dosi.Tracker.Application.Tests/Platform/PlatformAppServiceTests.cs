@@ -15,9 +15,9 @@ using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Guids;
 using Volo.Abp.Identity;
 using Volo.Abp.Modularity;
-using Volo.Abp.MultiTenancy;
-using Volo.Abp.TenantManagement;
+using Dosi.Tracker.Workspaces;
 using Volo.Abp.Validation;
+using System.Collections.Generic;
 using Xunit;
 
 namespace Dosi.Tracker.Platform;
@@ -31,11 +31,9 @@ public abstract class PlatformAppServiceTests<TStartupModule> : TrackerApplicati
     private readonly IRepository<Invoice, Guid> _invoices;
     private readonly IRepository<Project, Guid> _projects;
     private readonly IRepository<ProjectMember, Guid> _members;
-    private readonly ITenantManager _tenantManager;
-    private readonly ITenantRepository _tenantRepository;
     private readonly IdentityUserManager _userManager;
     private readonly IGuidGenerator _guidGenerator;
-    private readonly ICurrentTenant _currentTenant;
+    private readonly ICurrentWorkspace _currentWorkspace;
 
     protected PlatformAppServiceTests()
     {
@@ -45,11 +43,9 @@ public abstract class PlatformAppServiceTests<TStartupModule> : TrackerApplicati
         _invoices = GetRequiredService<IRepository<Invoice, Guid>>();
         _projects = GetRequiredService<IRepository<Project, Guid>>();
         _members = GetRequiredService<IRepository<ProjectMember, Guid>>();
-        _tenantManager = GetRequiredService<ITenantManager>();
-        _tenantRepository = GetRequiredService<ITenantRepository>();
         _userManager = GetRequiredService<IdentityUserManager>();
         _guidGenerator = GetRequiredService<IGuidGenerator>();
-        _currentTenant = GetRequiredService<ICurrentTenant>();
+        _currentWorkspace = GetRequiredService<ICurrentWorkspace>();
     }
 
     protected override void AfterAddApplication(IServiceCollection services)
@@ -62,53 +58,58 @@ public abstract class PlatformAppServiceTests<TStartupModule> : TrackerApplicati
         return WithUnitOfWorkAsync(() => _plans.FirstAsync(p => p.Name == name));
     }
 
-    /// <summary>A workspace (tenant) on the given plan. Tenant and subscription are saved together, so the
-    /// default-subscription handler leaves the subscription as given.</summary>
+    /// <summary>A workspace on the given plan.</summary>
     private async Task<Guid> CreateWorkspaceAsync(string name, string planName, string status, DateTime? trialEndsAt = null)
     {
         var plan = await PlanAsync(planName);
-        return await WithUnitOfWorkAsync(async () =>
+        var workspaceId = await ServiceProvider.CreateWorkspaceAsync(name);
+        using (_currentWorkspace.Change(workspaceId))
         {
-            var tenant = await _tenantManager.CreateAsync(name);
-            await _tenantRepository.InsertAsync(tenant);
-            using (_currentTenant.Change(tenant.Id))
+            await WithUnitOfWorkAsync(() => _subscriptions.InsertAsync(new Subscription(_guidGenerator.Create(), workspaceId, plan.Id)
             {
-                await _subscriptions.InsertAsync(new Subscription(_guidGenerator.Create(), tenant.Id, plan.Id)
-                {
-                    Status = status,
-                    TrialEndsAt = trialEndsAt
-                });
-            }
+                Status = status,
+                TrialEndsAt = trialEndsAt
+            }));
+        }
 
-            return tenant.Id;
-        });
+        return workspaceId;
     }
 
-    /// <summary>A new project of the workspace with <paramref name="count"/> new members, each a person with an account
-    /// in the workspace (what a seat is); returns the project id.</summary>
+    /// <summary>A new project of the workspace with <paramref name="count"/> new members, each an active member of the
+    /// workspace (what a seat is); returns the project id.</summary>
     private async Task<Guid> AddSeatsAsync(Guid tenantId, int count)
     {
-        using (_currentTenant.Change(tenantId))
+        var userIds = new List<Guid>();
+        Guid projectId;
+        using (_currentWorkspace.Change(tenantId))
         {
-            return await WithUnitOfWorkAsync(async () =>
+            projectId = await WithUnitOfWorkAsync(async () =>
             {
                 var project = await _projects.InsertAsync(new Project(_guidGenerator.Create(), tenantId, "Work"));
                 for (var i = 0; i < count; i++)
                 {
                     var userName = $"member-{Guid.NewGuid():N}";
-                    var user = new IdentityUser(_guidGenerator.Create(), userName, $"{userName}@seats.test", tenantId);
+                    var user = new IdentityUser(_guidGenerator.Create(), userName, $"{userName}@seats.test");
                     (await _userManager.CreateAsync(user)).Succeeded.ShouldBeTrue();
                     await _members.InsertAsync(new ProjectMember(_guidGenerator.Create(), tenantId, project.Id, user.Id));
+                    userIds.Add(user.Id);
                 }
 
                 return project.Id;
             });
         }
+
+        foreach (var userId in userIds)
+        {
+            await ServiceProvider.AddWorkspaceMemberAsync(userId, WorkspaceRoles.Member, tenantId);
+        }
+
+        return projectId;
     }
 
-    private async Task<Invoice> InvoiceAsync(Guid? tenantId, decimal amount, DateTime dueDate, DateTime? billingPeriodStart = null)
+    private async Task<Invoice> InvoiceAsync(Guid tenantId, decimal amount, DateTime dueDate, DateTime? billingPeriodStart = null)
     {
-        using (_currentTenant.Change(tenantId))
+        using (_currentWorkspace.Change(tenantId))
         {
             return await WithUnitOfWorkAsync(() => _invoices.InsertAsync(
                 new Invoice(_guidGenerator.Create(), tenantId, amount, dueDate) { BillingPeriodStart = billingPeriodStart }));
@@ -117,21 +118,16 @@ public abstract class PlatformAppServiceTests<TStartupModule> : TrackerApplicati
 
     private async Task<Subscription> SubscriptionOfAsync(Guid tenantId)
     {
-        using (_currentTenant.Change(tenantId))
+        using (_currentWorkspace.Change(tenantId))
         {
-            return await WithUnitOfWorkAsync(() => _subscriptions.FirstAsync(s => s.TenantId == tenantId));
+            return await WithUnitOfWorkAsync(() => _subscriptions.FirstAsync(s => s.WorkspaceId == tenantId));
         }
-    }
-
-    private Task DeleteWorkspaceAsync(Guid tenantId)
-    {
-        return GetRequiredService<ITenantAppService>().DeleteAsync(tenantId);
     }
 
     // ---- Overview ----
 
     [Fact]
-    public async Task Overview_Should_Aggregate_Subscriptions_Invoices_And_Plans_Across_Tenants()
+    public async Task Overview_Should_Aggregate_Subscriptions_Invoices_And_Plans_Across_Workspaces()
     {
         var tenantA = await CreateWorkspaceAsync("alpha", "Starter", Subscription.ActiveStatus);
         await CreateWorkspaceAsync("beta", "Starter", Subscription.TrialingStatus, DateTime.UtcNow.AddDays(7));
@@ -139,7 +135,7 @@ public abstract class PlatformAppServiceTests<TStartupModule> : TrackerApplicati
 
         var overview = await _platform.GetOverviewAsync();
 
-        overview.TenantCount.ShouldBe(2);
+        overview.WorkspaceCount.ShouldBe(3); // with the seeded test workspace
         overview.ActiveSubscriptions.ShouldBe(1);
         overview.TrialingSubscriptions.ShouldBe(1);
         overview.Plans.Single(p => p.Name == "Starter").SubscriberCount.ShouldBe(2);
@@ -167,30 +163,11 @@ public abstract class PlatformAppServiceTests<TStartupModule> : TrackerApplicati
     }
 
     [Fact]
-    public async Task Overview_Should_Leave_Out_Deleted_Workspaces()
-    {
-        var kept = await CreateWorkspaceAsync("kept", "Starter", Subscription.ActiveStatus);
-        var deleted = await CreateWorkspaceAsync("deleted", "Business", Subscription.ActiveStatus);
-        await AddSeatsAsync(kept, 1);
-        await AddSeatsAsync(deleted, 8);
-
-        await DeleteWorkspaceAsync(deleted);
-
-        var overview = await _platform.GetOverviewAsync();
-        overview.TenantCount.ShouldBe(1);
-        overview.ActiveSubscriptions.ShouldBe(1);
-        overview.PaidSeats.ShouldBe(1);
-        overview.Mrr.ShouldBe(6m);
-        overview.Plans.Single(p => p.Name == "Business").SubscriberCount.ShouldBe(0);
-    }
-
-    [Fact]
     public async Task Overview_Should_Ignore_Subscriptions_Without_A_Workspace()
     {
-        // e.g. a workspace deleted before deletions canceled subscriptions: it has no tenant row any more.
         var orphanTenant = Guid.NewGuid();
         var starter = await PlanAsync("Starter");
-        using (_currentTenant.Change(orphanTenant))
+        using (_currentWorkspace.Change(orphanTenant))
         {
             await WithUnitOfWorkAsync(() => _subscriptions.InsertAsync(
                 new Subscription(_guidGenerator.Create(), orphanTenant, starter.Id) { Status = Subscription.ActiveStatus }));
@@ -204,14 +181,14 @@ public abstract class PlatformAppServiceTests<TStartupModule> : TrackerApplicati
     }
 
     [Fact]
-    public async Task Overview_Should_Not_Fail_On_Memberships_Created_On_The_Host_Side()
+    public async Task Overview_Should_Not_Count_Memberships_Of_People_Outside_The_Workspace()
     {
         var paying = await CreateWorkspaceAsync("payco", "Starter", Subscription.ActiveStatus);
         await AddSeatsAsync(paying, 2);
         await WithUnitOfWorkAsync(async () =>
         {
-            var hostProject = await _projects.InsertAsync(new Project(_guidGenerator.Create(), null, "Host trial"));
-            await _members.InsertAsync(new ProjectMember(_guidGenerator.Create(), null, hostProject.Id, Guid.NewGuid()));
+            var hostProject = await _projects.InsertAsync(new Project(_guidGenerator.Create(), TrackerTestConsts.WorkspaceId, "Host trial"));
+            await _members.InsertAsync(new ProjectMember(_guidGenerator.Create(), TrackerTestConsts.WorkspaceId, hostProject.Id, Guid.NewGuid()));
         });
 
         var overview = await _platform.GetOverviewAsync();
@@ -226,7 +203,7 @@ public abstract class PlatformAppServiceTests<TStartupModule> : TrackerApplicati
         var paying = await CreateWorkspaceAsync("payco", "Starter", Subscription.ActiveStatus);
         await AddSeatsAsync(paying, 2);
         var deletedProject = await AddSeatsAsync(paying, 3);
-        using (_currentTenant.Change(paying))
+        using (_currentWorkspace.Change(paying))
         {
             await WithUnitOfWorkAsync(() => _projects.DeleteAsync(deletedProject));
         }
@@ -283,7 +260,7 @@ public abstract class PlatformAppServiceTests<TStartupModule> : TrackerApplicati
     }
 
     [Fact]
-    public async Task DeletePlan_Should_Refuse_While_Any_Tenant_Subscribes_To_It()
+    public async Task DeletePlan_Should_Refuse_While_Any_Workspace_Subscribes_To_It()
     {
         var plan = await _platform.CreatePlanAsync(new CreateUpdatePlanDto
         {
@@ -296,102 +273,76 @@ public abstract class PlatformAppServiceTests<TStartupModule> : TrackerApplicati
         (await _platform.GetPlansAsync()).Items.ShouldContain(p => p.Id == plan.Id);
     }
 
-    [Fact]
-    public async Task A_Plan_Used_Only_By_Deleted_Workspaces_Should_Be_Deletable()
-    {
-        var plan = await _platform.CreatePlanAsync(new CreateUpdatePlanDto
-        {
-            Name = "Sunset", PricePerUser = 4m, MaxSeats = 10, TrialDays = 0
-        });
-        var workspace = await CreateWorkspaceAsync("sunsetco", "Sunset", Subscription.ActiveStatus);
-        await DeleteWorkspaceAsync(workspace);
-
-        await _platform.DeletePlanAsync(plan.Id);
-
-        (await _platform.GetPlansAsync()).Items.ShouldNotContain(p => p.Id == plan.Id);
-    }
-
     // ---- Invoices and users ----
 
     [Fact]
-    public async Task Invoices_Should_Be_Paged_Newest_Due_Date_First_Across_Tenants()
+    public async Task Invoices_Should_Be_Paged_Newest_Due_Date_First_Across_Workspaces()
     {
         var tenantA = await CreateWorkspaceAsync("alpha", "Starter", Subscription.ActiveStatus);
         var goneTenant = Guid.NewGuid(); // a workspace that no longer exists
         await InvoiceAsync(tenantA, 3, new DateTime(2026, 3, 1, 0, 0, 0, DateTimeKind.Utc));
         await InvoiceAsync(goneTenant, 5, new DateTime(2026, 5, 1, 0, 0, 0, DateTimeKind.Utc));
         await InvoiceAsync(tenantA, 4, new DateTime(2026, 4, 1, 0, 0, 0, DateTimeKind.Utc), new DateTime(2026, 4, 1, 0, 0, 0, DateTimeKind.Utc));
-        await InvoiceAsync(null, 2, new DateTime(2026, 2, 1, 0, 0, 0, DateTimeKind.Utc));
+        await InvoiceAsync(tenantA, 2, new DateTime(2026, 2, 1, 0, 0, 0, DateTimeKind.Utc));
 
         var first = await _platform.GetInvoicesAsync(new PagedAndSortedResultRequestDto { SkipCount = 0, MaxResultCount = 2 });
         first.TotalCount.ShouldBe(4);
         first.Items.Select(i => i.DueDate.Month).ShouldBe(new[] { 5, 4 });
-        first.Items[0].TenantId.ShouldBe(goneTenant);
-        first.Items[0].TenantName.ShouldBe(PlatformAppService.DeletedWorkspaceName);
+        first.Items[0].WorkspaceId.ShouldBe(goneTenant);
+        first.Items[0].WorkspaceName.ShouldBe(PlatformAppService.DeletedWorkspaceName);
         first.Items[0].BillingPeriodStart.ShouldBeNull();
-        first.Items[1].TenantName.ShouldBe("alpha");
+        first.Items[1].WorkspaceName.ShouldBe("alpha");
         first.Items[1].BillingPeriodStart.ShouldBe(new DateTime(2026, 4, 1, 0, 0, 0, DateTimeKind.Utc));
 
         var second = await _platform.GetInvoicesAsync(new PagedAndSortedResultRequestDto { SkipCount = 2, MaxResultCount = 2 });
         second.TotalCount.ShouldBe(4);
         second.Items.Select(i => i.DueDate.Month).ShouldBe(new[] { 3, 2 });
-        second.Items[1].TenantName.ShouldBe(PlatformAppService.HostName); // no tenant at all
+        second.Items[1].WorkspaceName.ShouldBe("alpha");
     }
 
     [Fact]
-    public async Task Users_Should_List_Accounts_Across_Tenants_With_Their_Workspace()
+    public async Task Users_Should_List_Global_Accounts_With_Their_Workspaces()
     {
-        // Registering a workspace provisions a tenant with its own admin user.
-        await GetRequiredService<IWorkspaceAppService>().RegisterAsync(new RegisterWorkspaceDto
+        var result = await GetRequiredService<IWorkspaceAppService>().RegisterAsync(new RegisterWorkspaceDto
         {
-            Name = "acme",
-            AdminEmail = "owner@acme.test",
-            AdminPassword = "1q2w3E*acme",
+            WorkspaceName = "acme",
+            Email = "owner@acme.test",
+            Password = "1q2w3E*acme",
             PlanName = "Free"
         });
+        var userId = await WithUnitOfWorkAsync(async () => (await _userManager.FindByEmailAsync("owner@acme.test"))!.Id);
+        await ServiceProvider.AddWorkspaceMemberAsync(userId, WorkspaceRoles.Member);
 
         var page = await _platform.GetUsersAsync(new PagedAndSortedResultRequestDto { MaxResultCount = 100 });
 
         page.TotalCount.ShouldBeGreaterThan(0);
-        page.Items.ShouldContain(u => u.Email == "owner@acme.test" && u.TenantName == "acme");
+        var owner = page.Items.Single(u => u.Email == "owner@acme.test");
+        owner.WorkspaceNames.ShouldBe(new[] { "acme", TrackerTestConsts.WorkspaceName });
+        result.WorkspaceName.ShouldBe("acme");
     }
 
-    [Fact]
-    public async Task Users_Of_A_Deleted_Workspace_Should_Be_Labelled_As_Such()
-    {
-        var result = await GetRequiredService<IWorkspaceAppService>().RegisterAsync(new RegisterWorkspaceDto
-        {
-            Name = "goneco",
-            AdminEmail = "owner@goneco.test",
-            AdminPassword = "1q2w3E*gone"
-        });
-        await DeleteWorkspaceAsync(result.TenantId);
-
-        var page = await _platform.GetUsersAsync(new PagedAndSortedResultRequestDto { MaxResultCount = 100 });
-
-        page.Items.ShouldContain(u => u.Email == "owner@goneco.test" && u.TenantName == PlatformAppService.DeletedWorkspaceName);
-    }
-
-    // ---- Tenant subscriptions ----
+    // ---- Workspace subscriptions ----
 
     [Fact]
-    public async Task Tenant_Subscriptions_Should_List_Every_Workspace_With_Its_Plan_Status_And_Seats()
+    public async Task Workspace_Subscriptions_Should_List_Every_Workspace_With_Its_Plan_Status_And_Seats()
     {
         var beta = await CreateWorkspaceAsync("beta", "Business", Subscription.TrialingStatus, DateTime.UtcNow.AddDays(9));
         var alpha = await CreateWorkspaceAsync("alpha", "Starter", Subscription.ActiveStatus);
         await AddSeatsAsync(alpha, 2);
 
-        var items = (await _platform.GetTenantSubscriptionsAsync()).Items;
+        var all = (await _platform.GetWorkspaceSubscriptionsAsync()).Items;
+        all.Single(i => i.WorkspaceId == TrackerTestConsts.WorkspaceId).SubscriptionId.ShouldBeNull();
+        var items = all.Where(i => i.WorkspaceId != TrackerTestConsts.WorkspaceId).ToList();
 
-        items.Select(i => i.TenantName).ShouldBe(new[] { "alpha", "beta" });
+        items.Select(i => i.WorkspaceName).ShouldBe(new[] { "alpha", "beta" });
         var a = items[0];
-        a.TenantId.ShouldBe(alpha);
+        a.WorkspaceId.ShouldBe(alpha);
         a.PlanName.ShouldBe("Starter");
         a.Status.ShouldBe(Subscription.ActiveStatus);
         a.SeatsUsed.ShouldBe(2);
         a.MaxSeats.ShouldBe(25);
         var b = items[1];
-        b.TenantId.ShouldBe(beta);
+        b.WorkspaceId.ShouldBe(beta);
         b.Status.ShouldBe(Subscription.TrialingStatus);
         b.TrialEndsAt.ShouldNotBeNull();
         b.SeatsUsed.ShouldBe(0);
@@ -405,7 +356,7 @@ public abstract class PlatformAppServiceTests<TStartupModule> : TrackerApplicati
         var tenantId = await CreateWorkspaceAsync("trialco", "Starter", Subscription.TrialingStatus, DateTime.UtcNow.AddDays(3));
         var free = await PlanAsync(Plan.FreePlanName);
 
-        var subscription = await _platform.ChangeTenantPlanAsync(tenantId, free.Id);
+        var subscription = await _platform.ChangeWorkspacePlanAsync(tenantId, free.Id);
 
         subscription.PlanId.ShouldBe(free.Id);
         subscription.Status.ShouldBe(Subscription.ActiveStatus);
@@ -418,7 +369,7 @@ public abstract class PlatformAppServiceTests<TStartupModule> : TrackerApplicati
         var tenantId = await CreateWorkspaceAsync("trialco", "Starter", Subscription.TrialingStatus, DateTime.UtcNow.AddDays(3));
         var business = await PlanAsync("Business");
 
-        var subscription = await _platform.ChangeTenantPlanAsync(tenantId, business.Id);
+        var subscription = await _platform.ChangeWorkspacePlanAsync(tenantId, business.Id);
 
         subscription.PlanId.ShouldBe(business.Id);
         subscription.Status.ShouldBe(Subscription.TrialingStatus);
@@ -431,9 +382,9 @@ public abstract class PlatformAppServiceTests<TStartupModule> : TrackerApplicati
         var tenantId = await CreateWorkspaceAsync("trialco", "Starter", Subscription.TrialingStatus, DateTime.UtcNow.AddDays(3));
         var business = await PlanAsync("Business");
 
-        (await Should.ThrowAsync<BusinessException>(() => _platform.ChangeTenantPlanAsync(tenantId, Guid.NewGuid())))
+        (await Should.ThrowAsync<BusinessException>(() => _platform.ChangeWorkspacePlanAsync(tenantId, Guid.NewGuid())))
             .Code.ShouldBe(TrackerDomainErrorCodes.PlanNotFound);
-        await Should.ThrowAsync<EntityNotFoundException>(() => _platform.ChangeTenantPlanAsync(Guid.NewGuid(), business.Id));
+        await Should.ThrowAsync<EntityNotFoundException>(() => _platform.ChangeWorkspacePlanAsync(Guid.NewGuid(), business.Id));
     }
 
     [Fact]
@@ -443,7 +394,7 @@ public abstract class PlatformAppServiceTests<TStartupModule> : TrackerApplicati
         await AddSeatsAsync(tenantId, 4);
         var free = await PlanAsync(Plan.FreePlanName); // 3 seats
 
-        var exception = await Should.ThrowAsync<BusinessException>(() => _platform.ChangeTenantPlanAsync(tenantId, free.Id));
+        var exception = await Should.ThrowAsync<BusinessException>(() => _platform.ChangeWorkspacePlanAsync(tenantId, free.Id));
 
         exception.Code.ShouldBe(TrackerDomainErrorCodes.SeatLimitReached);
         (await SubscriptionOfAsync(tenantId)).PlanId.ShouldBe((await PlanAsync("Starter")).Id);
@@ -453,13 +404,13 @@ public abstract class PlatformAppServiceTests<TStartupModule> : TrackerApplicati
     public async Task Changing_The_Plan_Of_A_Workspace_Without_A_Subscription_Should_Start_One()
     {
         var tenantId = await CreateWorkspaceAsync("bareco", "Starter", Subscription.ActiveStatus);
-        using (_currentTenant.Change(tenantId))
+        using (_currentWorkspace.Change(tenantId))
         {
-            await WithUnitOfWorkAsync(() => _subscriptions.DeleteAsync(s => s.TenantId == tenantId));
+            await WithUnitOfWorkAsync(() => _subscriptions.DeleteAsync(s => s.WorkspaceId == tenantId));
         }
         var business = await PlanAsync("Business");
 
-        var subscription = await _platform.ChangeTenantPlanAsync(tenantId, business.Id);
+        var subscription = await _platform.ChangeWorkspacePlanAsync(tenantId, business.Id);
 
         subscription.Status.ShouldBe(Subscription.ActiveStatus);
         (await SubscriptionOfAsync(tenantId)).PlanId.ShouldBe(business.Id);
@@ -473,7 +424,7 @@ public abstract class PlatformAppServiceTests<TStartupModule> : TrackerApplicati
         var subscription = await _platform.ActivateSubscriptionAsync(tenantId);
 
         subscription.Status.ShouldBe(Subscription.ActiveStatus);
-        using (_currentTenant.Change(tenantId))
+        using (_currentWorkspace.Change(tenantId))
         {
             (await WithUnitOfWorkAsync(() => GetRequiredService<ISubscriptionAccessChecker>().IsUsableAsync())).ShouldBeTrue();
         }
@@ -489,7 +440,7 @@ public abstract class PlatformAppServiceTests<TStartupModule> : TrackerApplicati
         var subscription = await _platform.SuspendSubscriptionAsync(tenantId);
 
         subscription.Status.ShouldBe(Subscription.SuspendedStatus);
-        using (_currentTenant.Change(tenantId))
+        using (_currentWorkspace.Change(tenantId))
         {
             (await WithUnitOfWorkAsync(() => GetRequiredService<ISubscriptionAccessChecker>().IsUsableAsync())).ShouldBeFalse();
         }
@@ -512,7 +463,7 @@ public abstract class PlatformAppServiceTests<TStartupModule> : TrackerApplicati
 
         paid.Id.ShouldBe(invoice.Id);
         paid.Status.ShouldBe(Invoice.PaidStatus);
-        paid.TenantName.ShouldBe("lateco");
+        paid.WorkspaceName.ShouldBe("lateco");
         (await SubscriptionOfAsync(tenantId)).Status.ShouldBe(Subscription.ActiveStatus);
 
         // Idempotent.
@@ -526,101 +477,61 @@ public abstract class PlatformAppServiceTests<TStartupModule> : TrackerApplicati
         await Should.ThrowAsync<EntityNotFoundException>(() => _platform.MarkInvoicePaidAsync(Guid.NewGuid()));
     }
 
-    // ---- Tenant lifecycle and access ----
+    // ---- Lifecycle and access ----
 
     [Fact]
-    public async Task Tenant_Created_From_The_Host_Console_Gets_A_Free_Subscription_And_A_Manager_Role()
-    {
-        var tenant = await GetRequiredService<ITenantAppService>().CreateAsync(
-            new TenantCreateDto
-            {
-                Name = "consoleco",
-                AdminEmailAddress = "owner@consoleco.test",
-                AdminPassword = "1q2w3E*console"
-            });
-
-        using (_currentTenant.Change(tenant.Id))
-        {
-            await WithUnitOfWorkAsync(async () =>
-            {
-                var subscriptions = await _subscriptions.GetListAsync(s => s.TenantId == tenant.Id);
-                var subscription = subscriptions.ShouldHaveSingleItem();
-                var free = await _plans.FirstAsync(p => p.Name == Plan.FreePlanName);
-                subscription.PlanId.ShouldBe(free.Id);
-                subscription.Status.ShouldBe("active");
-
-                var roles = await GetRequiredService<Volo.Abp.Identity.IIdentityRoleRepository>().GetListAsync();
-                roles.ShouldContain(r => r.Name == Dosi.Tracker.Identity.TrackerRoles.Manager && r.TenantId == tenant.Id);
-            });
-        }
-    }
-
-    [Fact]
-    public async Task Workspace_Sign_Up_Keeps_Its_Own_Plan_And_Gets_A_Manager_Role()
+    public async Task Workspace_Sign_Up_Keeps_Its_Own_Plan()
     {
         var result = await GetRequiredService<IWorkspaceAppService>().RegisterAsync(new RegisterWorkspaceDto
         {
-            Name = "starterco",
-            AdminEmail = "owner@starterco.test",
-            AdminPassword = "1q2w3E*starter",
+            WorkspaceName = "starterco",
+            Email = "owner@starterco.test",
+            Password = "1q2w3E*starter",
             PlanName = "Starter"
         });
 
-        using (_currentTenant.Change(result.TenantId))
+        using (_currentWorkspace.Change(result.WorkspaceId))
         {
             await WithUnitOfWorkAsync(async () =>
             {
-                // The tenant-created handler must not add a second (Free) subscription.
-                var subscription = (await _subscriptions.GetListAsync(s => s.TenantId == result.TenantId)).ShouldHaveSingleItem();
+                var subscription = (await _subscriptions.GetListAsync(s => s.WorkspaceId == result.WorkspaceId)).ShouldHaveSingleItem();
                 subscription.Status.ShouldBe("trialing");
                 (await _plans.GetAsync(subscription.PlanId)).Name.ShouldBe("Starter");
-
-                var roles = await GetRequiredService<Volo.Abp.Identity.IIdentityRoleRepository>().GetListAsync();
-                roles.ShouldContain(r => r.Name == Dosi.Tracker.Identity.TrackerRoles.Manager);
             });
         }
     }
 
     [Fact]
-    public async Task Deleting_A_Workspace_From_The_Host_Console_Should_Stop_Its_Billing()
-    {
-        var tenantId = await CreateWorkspaceAsync("doomed", "Business", Subscription.ActiveStatus);
-
-        await DeleteWorkspaceAsync(tenantId);
-
-        (await GetRequiredService<InvoiceGenerationWorker>().GenerateInvoicesAsync(ServiceProvider)).Generated.ShouldBe(0);
-        (await _platform.GetTenantSubscriptionsAsync()).Items.ShouldNotContain(i => i.TenantId == tenantId);
-    }
-
-    [Fact]
-    public async Task Platform_Permission_Should_Be_Host_Only_And_Manager_Permissions_Defined()
+    public async Task Workspace_Role_Permissions_Should_Be_Defined()
     {
         var definitions = GetRequiredService<Volo.Abp.Authorization.Permissions.IPermissionDefinitionManager>();
 
-        var platform = await definitions.GetAsync(Dosi.Tracker.Permissions.TrackerPermissions.Platform.Default);
-        platform.MultiTenancySide.ShouldBe(MultiTenancySides.Host);
-
-        foreach (var name in Dosi.Tracker.Identity.TrackerRoles.ManagerPermissions)
+        (await definitions.GetOrNullAsync(Dosi.Tracker.Permissions.TrackerPermissions.Platform.Default)).ShouldNotBeNull();
+        foreach (var name in WorkspaceRoles.OwnerPermissions.Concat(WorkspaceRoles.ManagerPermissions))
         {
             (await definitions.GetOrNullAsync(name)).ShouldNotBeNull(name);
         }
+
+        WorkspaceRoles.OwnerPermissions.ShouldNotContain(Dosi.Tracker.Permissions.TrackerPermissions.Platform.Default);
+        WorkspaceRoles.ManagerPermissions.ShouldNotContain(Dosi.Tracker.Permissions.TrackerPermissions.Billing.Default);
+        WorkspaceRoles.PermissionsOf(WorkspaceRoles.Member).ShouldBeEmpty();
     }
 
     [Fact]
-    public async Task Platform_Console_Should_Be_Refused_To_A_Tenant_Scoped_Caller()
+    public async Task The_Platform_Console_Should_Work_Across_Every_Workspace_Whatever_The_Current_One()
     {
-        using (_currentTenant.Change(Guid.NewGuid()))
+        var alpha = await CreateWorkspaceAsync("alpha", "Starter", Subscription.ActiveStatus);
+        await InvoiceAsync(alpha, 7m, DateTime.UtcNow.AddDays(3));
+
+        using (_currentWorkspace.Change(TrackerTestConsts.WorkspaceId))
         {
-            await Should.ThrowAsync<AbpAuthorizationException>(() => _platform.GetOverviewAsync());
-            await Should.ThrowAsync<AbpAuthorizationException>(
-                () => _platform.GetInvoicesAsync(new PagedAndSortedResultRequestDto()));
-            await Should.ThrowAsync<AbpAuthorizationException>(
-                () => _platform.GetUsersAsync(new PagedAndSortedResultRequestDto()));
-            await Should.ThrowAsync<AbpAuthorizationException>(() => _platform.GetTenantSubscriptionsAsync());
-            await Should.ThrowAsync<AbpAuthorizationException>(() => _platform.ChangeTenantPlanAsync(Guid.NewGuid(), Guid.NewGuid()));
-            await Should.ThrowAsync<AbpAuthorizationException>(() => _platform.ActivateSubscriptionAsync(Guid.NewGuid()));
-            await Should.ThrowAsync<AbpAuthorizationException>(() => _platform.SuspendSubscriptionAsync(Guid.NewGuid()));
-            await Should.ThrowAsync<AbpAuthorizationException>(() => _platform.MarkInvoicePaidAsync(Guid.NewGuid()));
+            (await _platform.GetInvoicesAsync(new PagedAndSortedResultRequestDto())).Items
+                .ShouldContain(i => i.WorkspaceId == alpha);
+        }
+
+        using (_currentWorkspace.Change(null))
+        {
+            (await _platform.GetWorkspaceSubscriptionsAsync()).Items.ShouldContain(i => i.WorkspaceId == alpha);
         }
     }
 }

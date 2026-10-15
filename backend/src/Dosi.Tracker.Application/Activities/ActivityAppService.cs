@@ -21,10 +21,12 @@ using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Uow;
 using Volo.Abp.Users;
 
+using Dosi.Tracker.Workspaces;
+
 namespace Dosi.Tracker.Activities;
 
 [Authorize]
-public class ActivityAppService : ApplicationService, IActivityAppService
+public class ActivityAppService : TrackerAppService, IActivityAppService
 {
     /// <summary>Largest decoded screen capture accepted (a JPEG at most 1920 px wide is typically 150-500 KB).
     /// Larger, invalid or disallowed captures are dropped (logged); the time block itself is always stored.</summary>
@@ -102,7 +104,7 @@ public class ActivityAppService : ApplicationService, IActivityAppService
 
         // One upload per member at a time, from the checks below until the block is committed: a retry racing
         // its original, or two devices uploading overlapping blocks, cannot both pass the duplicate and overlap
-        // checks. The unique (TenantId, UserId, ClientActivityId) index stays the backstop across server instances
+        // checks. The unique (WorkspaceId, UserId, ClientActivityId) index stays the backstop across server instances
         // when no distributed lock provider is configured.
         await using var ingestLock = await _distributedLock.TryAcquireAsync(IngestLockName(userId), IngestLockTimeout);
         if (ingestLock == null)
@@ -314,7 +316,7 @@ public class ActivityAppService : ApplicationService, IActivityAppService
 
         // Coarse DB filter, then the exact check. An overlap longer than AllowedOverlap implies both range bounds,
         // and a stored block (at most MaxBlockLength long) that reaches past this one's start began at most
-        // MaxBlockLength earlier, which keeps the scan to a few rows of the (TenantId, UserId, StartedAt) index.
+        // MaxBlockLength earlier, which keeps the scan to a few rows of the (WorkspaceId, UserId, StartedAt) index.
         var earliestStart = start - MaxBlockLength;
         var overlapFrom = start + AllowedOverlap;
         var overlapTo = end - AllowedOverlap;
@@ -348,7 +350,7 @@ public class ActivityAppService : ApplicationService, IActivityAppService
         // The constructor enforces a non-empty client id and EndedAt > StartedAt.
         return new Activity(
             GuidGenerator.Create(),
-            CurrentTenant.Id,
+            CurrentWorkspace.GetId(),
             userId,
             input.ProjectId,
             input.ClientActivityId,
@@ -615,7 +617,7 @@ public class ActivityAppService : ApplicationService, IActivityAppService
     /// cannot poison the caller's). The blobs are written first and the rows referencing them in one final save,
     /// so a failed blob write leaves no row behind; on any failure the blobs already written are deleted again and
     /// the error propagates, so the agent keeps the block queued and retries it. The one failure answered as success
-    /// is the duplicate-upload race: when the unique (TenantId, UserId, ClientActivityId) index refused the row
+    /// is the duplicate-upload race: when the unique (WorkspaceId, UserId, ClientActivityId) index refused the row
     /// because a concurrent upload of the same block was stored first, that block is returned (idempotency).
     /// </summary>
     private async Task<ActivityDto> StoreAsync(Activity activity, List<PendingCapture> captures)
@@ -634,7 +636,7 @@ public class ActivityAppService : ApplicationService, IActivityAppService
 
                 screenshots.Add(new Screenshot(
                     GuidGenerator.Create(),
-                    activity.TenantId,
+                    activity.WorkspaceId,
                     activity.Id,
                     blobName,
                     capture.CapturedAt,

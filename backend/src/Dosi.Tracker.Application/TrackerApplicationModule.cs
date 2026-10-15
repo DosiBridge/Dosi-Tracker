@@ -6,7 +6,6 @@ using Volo.Abp.Mapperly;
 using Volo.Abp.FeatureManagement;
 using Volo.Abp.Modularity;
 using Microsoft.Extensions.DependencyInjection;
-using Volo.Abp.TenantManagement;
 
 namespace Dosi.Tracker;
 
@@ -17,7 +16,6 @@ namespace Dosi.Tracker;
     typeof(AbpFeatureManagementApplicationModule),
     typeof(AbpIdentityApplicationModule),
     typeof(AbpAccountApplicationModule),
-    typeof(AbpTenantManagementApplicationModule),
     typeof(AbpSettingManagementApplicationModule)
     )]
 public class TrackerApplicationModule : AbpModule

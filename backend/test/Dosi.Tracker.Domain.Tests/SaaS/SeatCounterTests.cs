@@ -9,7 +9,7 @@ using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Guids;
 using Volo.Abp.Identity;
 using Volo.Abp.Modularity;
-using Volo.Abp.MultiTenancy;
+using Dosi.Tracker.Workspaces;
 using Xunit;
 
 namespace Dosi.Tracker.SaaS;
@@ -23,7 +23,7 @@ public abstract class SeatCounterTests<TStartupModule> : TrackerDomainTestBase<T
     private readonly IRepository<Subscription, Guid> _subscriptions;
     private readonly IRepository<Plan, Guid> _plans;
     private readonly IdentityUserManager _userManager;
-    private readonly ICurrentTenant _currentTenant;
+    private readonly ICurrentWorkspace _currentWorkspace;
     private readonly IGuidGenerator _guidGenerator;
 
     protected SeatCounterTests()
@@ -34,7 +34,7 @@ public abstract class SeatCounterTests<TStartupModule> : TrackerDomainTestBase<T
         _subscriptions = GetRequiredService<IRepository<Subscription, Guid>>();
         _plans = GetRequiredService<IRepository<Plan, Guid>>();
         _userManager = GetRequiredService<IdentityUserManager>();
-        _currentTenant = GetRequiredService<ICurrentTenant>();
+        _currentWorkspace = GetRequiredService<ICurrentWorkspace>();
         _guidGenerator = GetRequiredService<IGuidGenerator>();
     }
 
@@ -45,7 +45,7 @@ public abstract class SeatCounterTests<TStartupModule> : TrackerDomainTestBase<T
 
     private async Task<T> InWorkspaceAsync<T>(Guid? tenantId, Func<Task<T>> action)
     {
-        using (_currentTenant.Change(tenantId))
+        using (_currentWorkspace.Change(tenantId))
         {
             return await WithUnitOfWorkAsync(action);
         }
@@ -53,43 +53,47 @@ public abstract class SeatCounterTests<TStartupModule> : TrackerDomainTestBase<T
 
     private async Task InWorkspaceAsync(Guid? tenantId, Func<Task> action)
     {
-        using (_currentTenant.Change(tenantId))
+        using (_currentWorkspace.Change(tenantId))
         {
             await WithUnitOfWorkAsync(action);
         }
     }
 
-    private Task<Guid> CreateProjectAsync(Guid? tenantId)
+    private Task<Guid> CreateProjectAsync(Guid tenantId)
     {
         return InWorkspaceAsync(tenantId, async () =>
             (await _projects.InsertAsync(new Project(_guidGenerator.Create(), tenantId, "Seats"))).Id);
     }
 
-    private Task AddMemberAsync(Guid? tenantId, Guid projectId, Guid userId, string role = "Worker")
+    private Task AddMemberAsync(Guid tenantId, Guid projectId, Guid userId, string role = "Worker")
     {
         return InWorkspaceAsync(tenantId, () =>
             _members.InsertAsync(new ProjectMember(_guidGenerator.Create(), tenantId, projectId, userId, role)));
     }
 
-    private Task<Guid> CreateUserAsync(Guid? tenantId, string userName)
+    /// <summary>A new account that is an active member of the workspace.</summary>
+    private async Task<Guid> CreateUserAsync(Guid tenantId, string userName)
     {
-        return InWorkspaceAsync(tenantId, async () =>
+        var userId = await WithUnitOfWorkAsync(async () =>
         {
-            var user = new IdentityUser(_guidGenerator.Create(), userName, $"{userName}@seats.test", tenantId);
+            var name = $"{userName}-{Guid.NewGuid():N}";
+            var user = new IdentityUser(_guidGenerator.Create(), name, $"{name}@seats.test");
             (await _userManager.CreateAsync(user)).Succeeded.ShouldBeTrue();
             return user.Id;
         });
+        await ServiceProvider.AddWorkspaceMemberAsync(userId, WorkspaceRoles.Member, tenantId);
+        return userId;
     }
 
     /// <summary>A new person of the workspace (an active account) as a worker on the project; returns their id.</summary>
-    private async Task<Guid> AddSeatHolderAsync(Guid? tenantId, Guid projectId)
+    private async Task<Guid> AddSeatHolderAsync(Guid tenantId, Guid projectId)
     {
         var userId = await CreateUserAsync(tenantId, $"member-{Guid.NewGuid():N}");
         await AddMemberAsync(tenantId, projectId, userId);
         return userId;
     }
 
-    private Task<int> CountAsync(Guid? tenantId)
+    private Task<int> CountAsync(Guid tenantId)
     {
         return InWorkspaceAsync(tenantId, () => _seatCounter.CountAsync());
     }
@@ -162,7 +166,7 @@ public abstract class SeatCounterTests<TStartupModule> : TrackerDomainTestBase<T
     [Fact]
     public async Task A_Membership_Without_An_Account_In_The_Workspace_Should_Not_Take_A_Seat()
     {
-        // A stray user id (e.g. added before members were validated), or the account of another workspace, bills nothing.
+        // A stray user id, or a member of another workspace only, bills nothing.
         var tenantId = Guid.NewGuid();
         var otherTenantId = Guid.NewGuid();
         var project = await CreateProjectAsync(tenantId);
@@ -211,25 +215,41 @@ public abstract class SeatCounterTests<TStartupModule> : TrackerDomainTestBase<T
     }
 
     [Fact]
-    public async Task Count_By_Tenant_Should_Group_Workspaces_And_Ignore_Host_Memberships()
+    public async Task Count_By_Workspace_Should_Group_Workspaces()
     {
         var tenantA = Guid.NewGuid();
         var tenantB = Guid.NewGuid();
         var projectA = await CreateProjectAsync(tenantA);
         var secondProjectA = await CreateProjectAsync(tenantA);
         var projectB = await CreateProjectAsync(tenantB);
-        var hostProject = await CreateProjectAsync(null);
         var onTwoProjects = await AddSeatHolderAsync(tenantA, projectA);
         await AddMemberAsync(tenantA, secondProjectA, onTwoProjects);
         await AddSeatHolderAsync(tenantA, projectA);
         await AddSeatHolderAsync(tenantB, projectB);
-        await AddSeatHolderAsync(null, hostProject);
 
-        var seats = await InWorkspaceAsync(null, () => _seatCounter.CountByTenantAsync());
+        var seats = await InWorkspaceAsync(null, () => _seatCounter.CountByWorkspaceAsync());
 
         seats.Count.ShouldBe(2);
         seats[tenantA].ShouldBe(2);
         seats[tenantB].ShouldBe(1);
+    }
+
+    [Fact]
+    public async Task A_Member_Removed_From_The_Workspace_Should_Free_Their_Seat()
+    {
+        var tenantId = Guid.NewGuid();
+        var project = await CreateProjectAsync(tenantId);
+        var leaver = await AddSeatHolderAsync(tenantId, project);
+        await AddSeatHolderAsync(tenantId, project);
+
+        await WithUnitOfWorkAsync(async () =>
+        {
+            var member = await GetRequiredService<WorkspaceMembershipManager>().FindAsync(tenantId, leaver);
+            await GetRequiredService<WorkspaceMembershipManager>().RemoveAsync(member!);
+        });
+
+        (await CountAsync(tenantId)).ShouldBe(1);
+        (await InWorkspaceAsync(tenantId, () => _seatCounter.HoldsSeatAsync(leaver))).ShouldBeFalse();
     }
 
     [Fact]

@@ -3,7 +3,7 @@
 //
 // Business rule under test: a member can connect the desktop agent with only
 // what the web app shows them — the server address (agents can't guess it),
-// their workspace and email — and is pointed at the agent for their computer.
+// and their email — and is pointed at the agent for their computer.
 vi.mock("next/navigation", () => import("@/test/next-navigation-stub"));
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
@@ -44,7 +44,7 @@ function browseFrom(platform: string) {
 
 describe("Feature: Connecting a desktop agent", () => {
   describe("Scenario: The Download page gives the sign-in details", () => {
-    it("Given a live member When they open Download Then the server address, workspace and email are shown, each copyable", async () => {
+    it("Given a live member When they open Download Then the server address and email are shown (no workspace), each copyable", async () => {
       localStorage.setItem("dosi-token", "jwt-live");
       fetchMock.mockImplementation(async (input) => {
         const url = String(input).replace(API, "");
@@ -64,13 +64,11 @@ describe("Feature: Connecting a desktop agent", () => {
 
       const details = (await screen.findByRole("heading", { name: /what the agent asks for/i })).closest("section")!;
       expect(within(details).getByText(AGENT_SERVER_URL)).toBeInTheDocument();
-      expect(await within(details).findByText("RealCo")).toBeInTheDocument();
-      expect(within(details).getByText("sam@realco.test")).toBeInTheDocument();
+      expect(within(details).queryByText("RealCo")).not.toBeInTheDocument();
+      expect(await within(details).findByText("sam@realco.test")).toBeInTheDocument();
 
       await user.click(within(details).getByRole("button", { name: /copy server address/i }));
       expect(await navigator.clipboard.readText()).toBe(AGENT_SERVER_URL);
-      await user.click(within(details).getByRole("button", { name: /copy workspace/i }));
-      expect(await navigator.clipboard.readText()).toBe("RealCo");
     });
   });
 

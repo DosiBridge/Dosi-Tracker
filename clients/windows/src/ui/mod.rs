@@ -121,6 +121,8 @@ pub struct TrackerApp {
     autostart_enabled: bool,
     settings_error: Option<String>,
     confirm_sign_out: bool,
+    /// The lost workspace last shown: a new loss opens Settings' picker once.
+    lost_seen: Option<String>,
     /// This computer as the workspace sees it.
     device: DeviceInfo,
     /// "Asia/Dhaka (UTC+06:00)", and when it was read.
@@ -212,6 +214,7 @@ impl TrackerApp {
             autostart_enabled: autostart::is_enabled(),
             settings_error: None,
             confirm_sign_out: false,
+            lost_seen: None,
             device: DeviceInfo::collect(),
             zone: None,
             toasts: Vec::new(),
@@ -672,7 +675,7 @@ fn sync_status(snapshot: &SharedState) -> (Tone, String) {
 fn notice_tone(kind: &NoticeKind) -> Tone {
     match kind {
         NoticeKind::TrackingStartedAutomatically { .. } | NoticeKind::ChooseProject => Tone::Info,
-        NoticeKind::ProjectUnavailable { .. } | NoticeKind::QueueReset { .. } => Tone::Warning,
+        NoticeKind::ProjectUnavailable { .. } | NoticeKind::QueueReset { .. } | NoticeKind::WorkspaceLost { .. } => Tone::Warning,
         NoticeKind::SignInExpired => Tone::Danger,
     }
 }
@@ -685,6 +688,7 @@ fn notice_title(kind: &NoticeKind) -> &'static str {
         NoticeKind::ProjectUnavailable { .. } => "Project no longer available",
         NoticeKind::QueueReset { .. } => "Local queue reset",
         NoticeKind::SignInExpired => "Sign-in expired",
+        NoticeKind::WorkspaceLost { .. } => "Workspace access removed",
     }
 }
 
@@ -810,6 +814,12 @@ impl eframe::App for TrackerApp {
             self.login_view(ui, &snapshot);
         } else {
             self.login.confirm_switch = false;
+            if snapshot.workspace_lost != self.lost_seen {
+                self.lost_seen = snapshot.workspace_lost.clone();
+                if self.lost_seen.is_some() {
+                    self.view = View::Settings;
+                }
+            }
             self.signed_in_layout(ui, &snapshot, now);
         }
     }

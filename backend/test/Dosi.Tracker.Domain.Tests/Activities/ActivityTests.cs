@@ -40,7 +40,7 @@ public class ActivityTests
         var activity = new Activity(
             Guid.NewGuid(), TestTenantId, TestUserId, TestProjectId, clientActivityId, start, end);
 
-        activity.TenantId.ShouldBe(TestTenantId);
+        activity.WorkspaceId.ShouldBe(TestTenantId);
         activity.UserId.ShouldBe(TestUserId);
         activity.ProjectId.ShouldBe(TestProjectId);
         activity.ClientActivityId.ShouldBe(clientActivityId);

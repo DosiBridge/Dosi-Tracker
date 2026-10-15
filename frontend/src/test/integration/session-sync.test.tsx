@@ -103,7 +103,7 @@ const tokenResponse = (accessToken: string, refreshToken?: string) =>
 
 function signIn(token = "jwt-live") {
   localStorage.setItem("dosi-token", token);
-  localStorage.setItem("dosi-tenant", "RealCo");
+  localStorage.setItem("dosi-workspace", "RealCo");
 }
 
 /** Another tab changing storage (the event never fires in the tab that wrote). */
@@ -147,13 +147,13 @@ describe("other tabs", () => {
     expect(redirectToLogin).toHaveBeenCalledTimes(1);
   });
 
-  it("a sign-in to another workspace in another tab reloads this one", async () => {
+  it("switching workspace in another tab reloads this one", async () => {
     liveBackend();
     signIn();
     renderWithProviders(<Probe />);
     await waitFor(() => expect(screen.getByTestId("status")).toHaveTextContent("ready"));
 
-    fromAnotherTab("dosi-tenant", "RealCo", "OtherCo");
+    fromAnotherTab("dosi-workspace", "RealCo", "OtherCo");
 
     expect(reloadPage).toHaveBeenCalledTimes(1);
   });
@@ -303,7 +303,7 @@ describe("session expiry", () => {
     await waitFor(() => expect(localStorage.getItem("dosi-token")).toBe("jwt-renewed"));
     const renewal = calls(fetch, "/connect/token").find(([, init]) => String(init?.body).includes("grant_type=refresh_token"));
     expect(renewal).toBeDefined();
-    expect(String(renewal?.[0])).toContain("__tenant=RealCo");
+    expect(String(renewal?.[0])).toBe(`${API}/connect/token`);
     expect(localStorage.getItem("dosi-refresh-token")).toBe("rt-2");
     await waitFor(() => expect(screen.getByTestId("expiry")).toHaveTextContent("ok"));
   });
@@ -381,7 +381,7 @@ describe("session expiry", () => {
     });
     expect(result).toEqual({ ok: true });
     const attempt = calls(fetch, "/connect/token").at(-1);
-    expect(String(attempt?.[0])).toBe(`${API}/connect/token?__tenant=RealCo`);
+    expect(String(attempt?.[0])).toBe(`${API}/connect/token`);
     const body = new URLSearchParams(String(attempt?.[1]?.body));
     expect(body.get("username")).toBe("mira");
     expect(body.get("password")).toBe("right");

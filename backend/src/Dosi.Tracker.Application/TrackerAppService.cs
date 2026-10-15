@@ -1,4 +1,5 @@
-﻿using Dosi.Tracker.Localization;
+using Dosi.Tracker.Localization;
+using Dosi.Tracker.Workspaces;
 using Volo.Abp.Application.Services;
 
 namespace Dosi.Tracker;
@@ -11,4 +12,6 @@ public abstract class TrackerAppService : ApplicationService
     {
         LocalizationResource = typeof(TrackerResource);
     }
+
+    protected ICurrentWorkspace CurrentWorkspace => LazyServiceProvider.LazyGetRequiredService<ICurrentWorkspace>();
 }

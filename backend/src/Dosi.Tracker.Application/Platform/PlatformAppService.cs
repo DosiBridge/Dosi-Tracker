@@ -15,24 +15,22 @@ using Volo.Abp.Data;
 using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Guids;
 using Volo.Abp.Identity;
-using Volo.Abp.MultiTenancy;
-using Volo.Abp.TenantManagement;
+using Dosi.Tracker.Workspaces;
 using Volo.Abp.Validation;
 
 namespace Dosi.Tracker.Platform;
 
-/// <summary>Host console. Requires the host-only <see cref="TrackerPermissions.Platform.Default"/> permission
-/// (granted to the host "admin" role by ABP's permission seeding) AND a host-side caller.</summary>
+/// <summary>Platform console. Requires <see cref="TrackerPermissions.Platform.Default"/>, which only the global
+/// platform-admin role holds; it works across every workspace (the workspace data filter is disabled).</summary>
 [Authorize(TrackerPermissions.Platform.Default)]
+[WorkspaceNotRequired]
 public class PlatformAppService : TrackerAppService, IPlatformAppService
 {
-    /// <summary>Workspace name shown for host-side rows (no tenant).</summary>
-    public const string HostName = "Host";
-
-    /// <summary>Workspace name shown for rows of a tenant that no longer exists.</summary>
+    /// <summary>Workspace name shown for rows of a workspace that no longer exists.</summary>
     public const string DeletedWorkspaceName = "Deleted workspace";
 
-    private readonly ITenantRepository _tenantRepository;
+    private readonly IRepository<Workspace, Guid> _workspaceRepository;
+    private readonly IRepository<WorkspaceMember, Guid> _workspaceMemberRepository;
     private readonly IRepository<Subscription, Guid> _subscriptionRepository;
     private readonly IRepository<Plan, Guid> _planRepository;
     private readonly IRepository<Invoice, Guid> _invoiceRepository;
@@ -43,7 +41,8 @@ public class PlatformAppService : TrackerAppService, IPlatformAppService
     private readonly SubscriptionManager _subscriptionManager;
 
     public PlatformAppService(
-        ITenantRepository tenantRepository,
+        IRepository<Workspace, Guid> workspaceRepository,
+        IRepository<WorkspaceMember, Guid> workspaceMemberRepository,
         IRepository<Subscription, Guid> subscriptionRepository,
         IRepository<Plan, Guid> planRepository,
         IRepository<Invoice, Guid> invoiceRepository,
@@ -53,7 +52,8 @@ public class PlatformAppService : TrackerAppService, IPlatformAppService
         SeatCounter seatCounter,
         SubscriptionManager subscriptionManager)
     {
-        _tenantRepository = tenantRepository;
+        _workspaceRepository = workspaceRepository;
+        _workspaceMemberRepository = workspaceMemberRepository;
         _subscriptionRepository = subscriptionRepository;
         _planRepository = planRepository;
         _invoiceRepository = invoiceRepository;
@@ -66,22 +66,20 @@ public class PlatformAppService : TrackerAppService, IPlatformAppService
 
     public async Task<PlatformOverviewDto> GetOverviewAsync()
     {
-        EnsureHost();
-
-        var tenantNames = await GetTenantNamesAsync();
+        var workspaceNames = await GetWorkspaceNamesAsync();
         var plans = await _planRepository.GetListAsync();
 
-        // Host aggregation: see every tenant's subscriptions and invoices, not just the host's.
-        using (_dataFilter.Disable<IMultiTenant>())
+        // Platform aggregation: every workspace's subscriptions and invoices.
+        using (_dataFilter.Disable<IWorkspaceScoped>())
         {
             // Customers only: a deleted (or unknown) workspace's subscription is neither revenue nor a subscriber.
             var subscriptions = (await _subscriptionRepository.GetListAsync())
-                .Where(s => s.TenantId.HasValue && tenantNames.ContainsKey(s.TenantId.Value))
+                .Where(s => workspaceNames.ContainsKey(s.WorkspaceId))
                 .ToList();
             var invoices = await _invoiceRepository.GetListAsync();
 
-            // Occupied (billable) seats per tenant: the same count the invoice and the seat limit use.
-            var seatsByTenant = await _seatCounter.CountByTenantAsync();
+            // Occupied (billable) seats per workspace: the same count the invoice and the seat limit use.
+            var seatsByWorkspace = await _seatCounter.CountByWorkspaceAsync();
 
             decimal mrr = 0m;
             var paidSeats = 0;
@@ -93,14 +91,14 @@ public class PlatformAppService : TrackerAppService, IPlatformAppService
                 {
                     continue; // An unknown or free plan pays nothing: neither revenue nor paid seats.
                 }
-                var seats = Math.Max(1, seatsByTenant.GetValueOrDefault(sub.TenantId!.Value));
+                var seats = Math.Max(1, seatsByWorkspace.GetValueOrDefault(sub.WorkspaceId));
                 mrr += plan.PricePerUser * seats;
                 paidSeats += seats;
             }
 
             return new PlatformOverviewDto
             {
-                TenantCount = tenantNames.Count,
+                WorkspaceCount = workspaceNames.Count,
                 ActiveSubscriptions = subscriptions.Count(s => s.Status == Subscription.ActiveStatus),
                 TrialingSubscriptions = subscriptions.Count(s => s.Status == Subscription.TrialingStatus),
                 Mrr = mrr,
@@ -123,9 +121,7 @@ public class PlatformAppService : TrackerAppService, IPlatformAppService
 
     public async Task<PagedResultDto<PlatformInvoiceDto>> GetInvoicesAsync(PagedAndSortedResultRequestDto input)
     {
-        EnsureHost();
-
-        using (_dataFilter.Disable<IMultiTenant>())
+        using (_dataFilter.Disable<IWorkspaceScoped>())
         {
             // Count and page in the database; only the requested page is materialized.
             var query = await _invoiceRepository.GetQueryableAsync();
@@ -135,10 +131,10 @@ public class PlatformAppService : TrackerAppService, IPlatformAppService
                 .ThenBy(i => i.Id) // stable order across pages
                 .PageBy(input.SkipCount, input.MaxResultCount));
 
-            var tenantNames = await GetTenantNamesAsync();
+            var workspaceNames = await GetWorkspaceNamesAsync();
 
             var items = page
-                .Select(i => ToPlatformInvoiceDto(i, tenantNames))
+                .Select(i => ToPlatformInvoiceDto(i, workspaceNames))
                 .ToList();
 
             return new PagedResultDto<PlatformInvoiceDto>(totalCount, items);
@@ -147,35 +143,38 @@ public class PlatformAppService : TrackerAppService, IPlatformAppService
 
     public async Task<PagedResultDto<PlatformUserDto>> GetUsersAsync(PagedAndSortedResultRequestDto input)
     {
-        EnsureHost();
+        var workspaceNames = await GetWorkspaceNamesAsync();
+        var count = await _userRepository.GetCountAsync();
+        var users = await _userRepository.GetListAsync(
+            sorting: nameof(IdentityUser.UserName),
+            maxResultCount: input.MaxResultCount,
+            skipCount: input.SkipCount);
 
-        var tenantNames = await GetTenantNamesAsync();
+        var userIds = users.Select(u => u.Id).ToList();
+        var memberships = (await _workspaceMemberRepository.GetListAsync(m =>
+                userIds.Contains(m.UserId) && m.Status == WorkspaceMemberStatus.Active))
+            .GroupBy(m => m.UserId)
+            .ToDictionary(g => g.Key, g => g.Select(m => m.WorkspaceId).ToList());
 
-        using (_dataFilter.Disable<IMultiTenant>())
+        var items = users.Select(u => new PlatformUserDto
         {
-            var count = await _userRepository.GetCountAsync();
-            var users = await _userRepository.GetListAsync(
-                sorting: nameof(IdentityUser.UserName),
-                maxResultCount: input.MaxResultCount,
-                skipCount: input.SkipCount);
+            Id = u.Id,
+            UserName = u.UserName,
+            Email = u.Email,
+            Name = u.Name,
+            IsActive = u.IsActive,
+            WorkspaceNames = (memberships.GetValueOrDefault(u.Id) ?? new List<Guid>())
+                .Where(workspaceNames.ContainsKey)
+                .Select(id => workspaceNames[id])
+                .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
+                .ToList()
+        }).ToList();
 
-            var items = users.Select(u => new PlatformUserDto
-            {
-                Id = u.Id,
-                UserName = u.UserName,
-                Email = u.Email,
-                Name = u.Name,
-                TenantId = u.TenantId,
-                TenantName = ResolveTenantName(u.TenantId, tenantNames)
-            }).ToList();
-
-            return new PagedResultDto<PlatformUserDto>(count, items);
-        }
+        return new PagedResultDto<PlatformUserDto>(count, items);
     }
 
     public async Task<ListResultDto<PlanDto>> GetPlansAsync()
     {
-        EnsureHost();
         var plans = await _planRepository.GetListAsync();
         return new ListResultDto<PlanDto>(
             ObjectMapper.Map<List<Plan>, List<PlanDto>>(plans.OrderBy(p => p.PricePerUser).ToList()));
@@ -183,7 +182,6 @@ public class PlatformAppService : TrackerAppService, IPlatformAppService
 
     public async Task<PlanDto> CreatePlanAsync(CreateUpdatePlanDto input)
     {
-        EnsureHost();
         var name = input.Name.Trim();
         await CheckPlanNameIsFreeAsync(name, exceptPlanId: null);
 
@@ -194,7 +192,6 @@ public class PlatformAppService : TrackerAppService, IPlatformAppService
 
     public async Task<PlanDto> UpdatePlanAsync(Guid id, CreateUpdatePlanDto input)
     {
-        EnsureHost();
         var plan = await _planRepository.GetAsync(id);
         var name = input.Name.Trim();
         await CheckPlanNameIsFreeAsync(name, exceptPlanId: id);
@@ -209,18 +206,16 @@ public class PlatformAppService : TrackerAppService, IPlatformAppService
 
     public async Task DeletePlanAsync(Guid id)
     {
-        EnsureHost();
-
         // A plan still referenced by any workspace's subscription cannot be removed (it would orphan
         // seat limits, billing and the overview's plan counts). Check across every existing workspace.
-        var tenantNames = await GetTenantNamesAsync();
+        var workspaceNames = await GetWorkspaceNamesAsync();
         List<Subscription> subscribers;
-        using (_dataFilter.Disable<IMultiTenant>())
+        using (_dataFilter.Disable<IWorkspaceScoped>())
         {
             subscribers = await _subscriptionRepository.GetListAsync(s => s.PlanId == id);
         }
 
-        var inUse = subscribers.Count(s => s.TenantId.HasValue && tenantNames.ContainsKey(s.TenantId.Value));
+        var inUse = subscribers.Count(s => workspaceNames.ContainsKey(s.WorkspaceId));
         if (inUse > 0)
         {
             throw new BusinessException(TrackerDomainErrorCodes.PlanInUse)
@@ -231,49 +226,46 @@ public class PlatformAppService : TrackerAppService, IPlatformAppService
         await _planRepository.DeleteAsync(id);
     }
 
-    public async Task<ListResultDto<TenantSubscriptionDto>> GetTenantSubscriptionsAsync()
+    public async Task<ListResultDto<WorkspaceSubscriptionDto>> GetWorkspaceSubscriptionsAsync()
     {
-        EnsureHost();
-
-        var tenants = await _tenantRepository.GetListAsync();
+        var workspaces = await _workspaceRepository.GetListAsync();
         var plans = (await _planRepository.GetListAsync()).ToDictionary(p => p.Id);
 
-        using (_dataFilter.Disable<IMultiTenant>())
+        using (_dataFilter.Disable<IWorkspaceScoped>())
         {
-            var subscriptions = (await _subscriptionRepository.GetListAsync(s => s.TenantId != null))
-                .GroupBy(s => s.TenantId!.Value)
+            var subscriptions = (await _subscriptionRepository.GetListAsync())
+                .GroupBy(s => s.WorkspaceId)
                 .ToDictionary(g => g.Key, g => g.OrderByDescending(s => s.CreationTime).First());
-            var seatsByTenant = await _seatCounter.CountByTenantAsync();
+            var seatsByWorkspace = await _seatCounter.CountByWorkspaceAsync();
 
-            var items = tenants
-                .OrderBy(t => t.Name)
-                .Select(t =>
+            var items = workspaces
+                .OrderBy(w => w.Name)
+                .Select(w =>
                 {
-                    var subscription = subscriptions.GetValueOrDefault(t.Id);
+                    var subscription = subscriptions.GetValueOrDefault(w.Id);
                     var plan = subscription == null ? null : plans.GetValueOrDefault(subscription.PlanId);
-                    return new TenantSubscriptionDto
+                    return new WorkspaceSubscriptionDto
                     {
-                        TenantId = t.Id,
-                        TenantName = t.Name,
+                        WorkspaceId = w.Id,
+                        WorkspaceName = w.Name,
                         SubscriptionId = subscription?.Id,
                         PlanId = subscription?.PlanId,
                         PlanName = plan?.Name,
                         Status = subscription?.Status,
                         TrialEndsAt = subscription?.TrialEndsAt,
-                        SeatsUsed = seatsByTenant.GetValueOrDefault(t.Id),
+                        SeatsUsed = seatsByWorkspace.GetValueOrDefault(w.Id),
                         MaxSeats = plan?.MaxSeats
                     };
                 })
                 .ToList();
 
-            return new ListResultDto<TenantSubscriptionDto>(items);
+            return new ListResultDto<WorkspaceSubscriptionDto>(items);
         }
     }
 
-    public async Task<SubscriptionDto> ChangeTenantPlanAsync(Guid tenantId, Guid planId)
+    public async Task<SubscriptionDto> ChangeWorkspacePlanAsync(Guid workspaceId, Guid planId)
     {
-        EnsureHost();
-        await _tenantRepository.GetAsync(tenantId, includeDetails: false);
+        await _workspaceRepository.GetAsync(workspaceId);
 
         var plan = await _planRepository.FindAsync(planId);
         if (plan == null)
@@ -282,7 +274,7 @@ public class PlatformAppService : TrackerAppService, IPlatformAppService
                 .WithData("planId", planId);
         }
 
-        using (CurrentTenant.Change(tenantId))
+        using (CurrentWorkspace.Change(workspaceId))
         {
             var subscription = await _subscriptionManager.ChangePlanAsync(plan);
             return ObjectMapper.Map<Subscription, SubscriptionDto>(subscription);
@@ -290,14 +282,12 @@ public class PlatformAppService : TrackerAppService, IPlatformAppService
     }
 
     /// <inheritdoc />
-    /// <remarks><paramref name="tenantId"/> is optional only so that ABP keeps it in the query string
-    /// (<c>?tenantId=</c>, the route of the shared contract) instead of a <c>/{tenantId}</c> route segment.</remarks>
-    public async Task<SubscriptionDto> ActivateSubscriptionAsync([Optional] Guid tenantId)
+    /// <remarks><paramref name="workspaceId"/> is optional only so that ABP keeps it in the query string.</remarks>
+    public async Task<SubscriptionDto> ActivateSubscriptionAsync([Optional] Guid workspaceId)
     {
-        EnsureHost();
-        await _tenantRepository.GetAsync(tenantId, includeDetails: false);
+        await _workspaceRepository.GetAsync(workspaceId);
 
-        using (CurrentTenant.Change(tenantId))
+        using (CurrentWorkspace.Change(workspaceId))
         {
             var subscription = await _subscriptionManager.ActivateAsync();
             return ObjectMapper.Map<Subscription, SubscriptionDto>(subscription);
@@ -305,14 +295,12 @@ public class PlatformAppService : TrackerAppService, IPlatformAppService
     }
 
     /// <inheritdoc />
-    /// <remarks><paramref name="tenantId"/> is optional only so that ABP keeps it in the query string
-    /// (<c>?tenantId=</c>) instead of a <c>/{tenantId}</c> route segment.</remarks>
-    public async Task<SubscriptionDto> SuspendSubscriptionAsync([Optional] Guid tenantId)
+    /// <remarks><paramref name="workspaceId"/> is optional only so that ABP keeps it in the query string.</remarks>
+    public async Task<SubscriptionDto> SuspendSubscriptionAsync([Optional] Guid workspaceId)
     {
-        EnsureHost();
-        await _tenantRepository.GetAsync(tenantId, includeDetails: false);
+        await _workspaceRepository.GetAsync(workspaceId);
 
-        using (CurrentTenant.Change(tenantId))
+        using (CurrentWorkspace.Change(workspaceId))
         {
             var subscription = await _subscriptionManager.SuspendAsync();
             return ObjectMapper.Map<Subscription, SubscriptionDto>(subscription);
@@ -324,20 +312,18 @@ public class PlatformAppService : TrackerAppService, IPlatformAppService
     /// (<c>?invoiceId=</c>, the route of the shared contract) instead of a <c>/{invoiceId}</c> route segment.</remarks>
     public async Task<PlatformInvoiceDto> MarkInvoicePaidAsync([Optional] Guid invoiceId)
     {
-        EnsureHost();
-
         Invoice invoice;
-        using (_dataFilter.Disable<IMultiTenant>())
+        using (_dataFilter.Disable<IWorkspaceScoped>())
         {
             invoice = await _invoiceRepository.GetAsync(invoiceId);
         }
 
-        using (CurrentTenant.Change(invoice.TenantId))
+        using (CurrentWorkspace.Change(invoice.WorkspaceId))
         {
             await _subscriptionManager.MarkInvoicePaidAsync(invoice);
         }
 
-        return ToPlatformInvoiceDto(invoice, await GetTenantNamesAsync());
+        return ToPlatformInvoiceDto(invoice, await GetWorkspaceNamesAsync());
     }
 
     /// <summary>Plan names are unique (case-insensitively): sign-up can choose a plan by name.</summary>
@@ -360,13 +346,13 @@ public class PlatformAppService : TrackerAppService, IPlatformAppService
         }
     }
 
-    private static PlatformInvoiceDto ToPlatformInvoiceDto(Invoice invoice, IReadOnlyDictionary<Guid, string> tenantNames)
+    private static PlatformInvoiceDto ToPlatformInvoiceDto(Invoice invoice, IReadOnlyDictionary<Guid, string> workspaceNames)
     {
         return new PlatformInvoiceDto
         {
             Id = invoice.Id,
-            TenantId = invoice.TenantId,
-            TenantName = ResolveTenantName(invoice.TenantId, tenantNames),
+            WorkspaceId = invoice.WorkspaceId,
+            WorkspaceName = workspaceNames.TryGetValue(invoice.WorkspaceId, out var name) ? name : DeletedWorkspaceName,
             Amount = invoice.Amount,
             Status = invoice.Status,
             DueDate = invoice.DueDate,
@@ -374,29 +360,8 @@ public class PlatformAppService : TrackerAppService, IPlatformAppService
         };
     }
 
-    /// <summary>"Host" for host-side rows; "Deleted workspace" when the tenant no longer exists.</summary>
-    private static string ResolveTenantName(Guid? tenantId, IReadOnlyDictionary<Guid, string> tenantNames)
+    private async Task<Dictionary<Guid, string>> GetWorkspaceNamesAsync()
     {
-        if (!tenantId.HasValue)
-        {
-            return HostName;
-        }
-
-        return tenantNames.TryGetValue(tenantId.Value, out var name) ? name : DeletedWorkspaceName;
-    }
-
-    /// <summary>Names of the existing (not deleted) workspaces, by tenant id.</summary>
-    private async Task<Dictionary<Guid, string>> GetTenantNamesAsync()
-    {
-        return (await _tenantRepository.GetListAsync()).ToDictionary(t => t.Id, t => t.Name);
-    }
-
-    /// <summary>The platform console is for host administrators; a tenant-scoped caller is refused.</summary>
-    private void EnsureHost()
-    {
-        if (CurrentTenant.Id != null)
-        {
-            throw new AbpAuthorizationException("The platform console is available to host administrators only.");
-        }
+        return (await _workspaceRepository.GetListAsync()).ToDictionary(w => w.Id, w => w.Name);
     }
 }

@@ -1,13 +1,13 @@
 using System;
 using System.Collections.Generic;
 using Volo.Abp.Domain.Entities.Auditing;
-using Volo.Abp.MultiTenancy;
+using Dosi.Tracker.Workspaces;
 
 namespace Dosi.Tracker.Projects;
 
-public class Project : FullAuditedAggregateRoot<Guid>, IMultiTenant
+public class Project : FullAuditedAggregateRoot<Guid>, IWorkspaceScoped
 {
-    public Guid? TenantId { get; set; }
+    public Guid WorkspaceId { get; set; }
     public string Title { get; set; }
     public string? Description { get; set; } // Optional: not every project needs one
     public string Color { get; set; }
@@ -38,10 +38,10 @@ public class Project : FullAuditedAggregateRoot<Guid>, IMultiTenant
     {
     }
 
-    public Project(Guid id, Guid? tenantId, string title, int intervalMinutes = 10, string color = ProjectConsts.DefaultColor)
+    public Project(Guid id, Guid workspaceId, string title, int intervalMinutes = 10, string color = ProjectConsts.DefaultColor)
         : base(id)
     {
-        TenantId = tenantId;
+        WorkspaceId = workspaceId;
         Title = title;
         IntervalMinutes = intervalMinutes;
         Color = color;

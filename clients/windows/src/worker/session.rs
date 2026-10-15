@@ -123,6 +123,8 @@ pub struct Facts {
     pub sign_in_expired: bool,
     pub paused: bool,
     pub has_session: bool,
+    /// Signed in, but no workspace to track in (access to it was lost).
+    pub no_workspace: bool,
     /// A project list is known (from the server, or saved).
     pub projects_known: bool,
     /// The first answer from the server is still awaited.
@@ -146,7 +148,7 @@ pub fn status(facts: &Facts) -> TrackerStatus {
     } else if facts.paused {
         TrackerStatus::Paused
     } else if !facts.has_session {
-        if facts.projects_known {
+        if facts.projects_known || facts.no_workspace {
             TrackerStatus::ChooseProject
         } else if facts.contacting {
             TrackerStatus::Connecting

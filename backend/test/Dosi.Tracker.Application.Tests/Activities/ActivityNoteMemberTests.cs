@@ -43,7 +43,7 @@ public abstract class ActivityNoteMemberTests<TStartupModule> : TrackerApplicati
     private async Task<Activity> SeedBlockAsync(Guid userId, DateTime start)
     {
         var activity = new Activity(
-            _guidGenerator.Create(), null, userId, _guidGenerator.Create(), Guid.NewGuid(), start, start.AddMinutes(10))
+            _guidGenerator.Create(), TrackerTestConsts.WorkspaceId, userId, _guidGenerator.Create(), Guid.NewGuid(), start, start.AddMinutes(10))
         {
             Description = "Initial note"
         };

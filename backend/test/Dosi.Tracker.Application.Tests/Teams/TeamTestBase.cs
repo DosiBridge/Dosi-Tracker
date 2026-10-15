@@ -9,14 +9,15 @@ using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Guids;
 using Volo.Abp.Identity;
 using Volo.Abp.Modularity;
+using Dosi.Tracker.Workspaces;
 using Xunit;
 
 namespace Dosi.Tracker.Teams;
 
 /// <summary>
-/// Shared set-up for the team tests. The test principal (FakeCurrentPrincipalAccessor) is given an Identity account in
-/// <see cref="CallerRole"/> before every test: a workspace owner by default, since the owner-only rules are enforced in
-/// the service and not by the (always-allow) test authorization.
+/// Shared set-up for the team tests. The test principal (FakeCurrentPrincipalAccessor) is given an account and a
+/// membership of the test workspace in <see cref="CallerRole"/> before every test: an owner by default, since the
+/// owner-only rules are enforced in the service and not by the (always-allow) test authorization.
 /// </summary>
 public abstract class TeamTestBase<TStartupModule> : TrackerApplicationTestBase<TStartupModule>, IAsyncLifetime
     where TStartupModule : IAbpModule
@@ -35,9 +36,8 @@ public abstract class TeamTestBase<TStartupModule> : TrackerApplicationTestBase<
         GuidGenerator = GetRequiredService<IGuidGenerator>();
     }
 
-    /// <summary>The caller's Identity role: <see cref="TrackerRoles.Admin"/> (workspace owner),
-    /// <see cref="TrackerRoles.Manager"/> (team lead), or null for a caller without an Identity account.</summary>
-    protected virtual string? CallerRole => TrackerRoles.Admin;
+    /// <summary>The caller's workspace role (<see cref="WorkspaceRoles"/>), or null for a caller without an account.</summary>
+    protected virtual string? CallerRole => WorkspaceRoles.Owner;
 
     public virtual async Task InitializeAsync()
     {
@@ -52,31 +52,34 @@ public abstract class TeamTestBase<TStartupModule> : TrackerApplicationTestBase<
         return Task.CompletedTask;
     }
 
-    /// <summary>An active user of the (host) workspace, optionally in an Identity role.</summary>
-    protected Task<IdentityUser> CreateUserAsync(
+    /// <summary>An account that is an active member of the test workspace with <paramref name="role"/> (a plain member
+    /// by default), unless <paramref name="member"/> is false.</summary>
+    protected async Task<IdentityUser> CreateUserAsync(
         string userName,
         string? role = null,
         Guid? id = null,
         bool emailConfirmed = false,
-        string? email = null)
+        string? email = null,
+        bool member = true)
     {
-        return WithUnitOfWorkAsync(async () =>
+        var user = await WithUnitOfWorkAsync(async () =>
         {
             var userManager = GetRequiredService<IdentityUserManager>();
-            var user = new IdentityUser(id ?? GuidGenerator.Create(), userName, email ?? $"{userName}@acme.test")
+            var created = new IdentityUser(id ?? GuidGenerator.Create(), userName, email ?? $"{userName}@acme.test")
             {
                 Name = userName.ToUpperInvariant()
             };
-            user.SetEmailConfirmed(emailConfirmed);
-            (await userManager.CreateAsync(user)).Succeeded.ShouldBeTrue();
-
-            if (role != null)
-            {
-                (await userManager.AddToRoleAsync(user, role)).Succeeded.ShouldBeTrue();
-            }
-
-            return user;
+            created.SetEmailConfirmed(emailConfirmed);
+            (await userManager.CreateAsync(created)).Succeeded.ShouldBeTrue();
+            return created;
         });
+
+        if (member)
+        {
+            await ServiceProvider.AddWorkspaceMemberAsync(user.Id, role ?? WorkspaceRoles.Member);
+        }
+
+        return user;
     }
 
     protected Task<IdentityUser?> FindUserAsync(Guid userId)
@@ -84,13 +87,16 @@ public abstract class TeamTestBase<TStartupModule> : TrackerApplicationTestBase<
         return WithUnitOfWorkAsync(() => GetRequiredService<IIdentityUserRepository>().FindAsync(userId));
     }
 
-    protected Task<bool> IsInRoleAsync(Guid userId, string role)
+    /// <summary>Whether the user is an active member of the test workspace with this role.</summary>
+    protected async Task<bool> IsInRoleAsync(Guid userId, string role)
     {
-        return WithUnitOfWorkAsync(async () =>
-        {
-            var roles = await GetRequiredService<IIdentityUserRepository>().GetRoleNamesAsync(userId);
-            return roles.Contains(role);
-        });
+        var member = await ServiceProvider.FindWorkspaceMemberAsync(userId);
+        return member is { IsActive: true } && member.Role == role;
+    }
+
+    protected async Task<bool> IsActiveMemberAsync(Guid userId)
+    {
+        return (await ServiceProvider.FindWorkspaceMemberAsync(userId))?.IsActive == true;
     }
 
     protected async Task<Guid> CreateProjectAsync(string title = "Team Test Project")

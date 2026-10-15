@@ -60,16 +60,16 @@ public abstract class MemberScopingTests<TStartupModule> : TrackerApplicationTes
 
         await WithUnitOfWorkAsync(async () =>
         {
-            await _projectRepository.InsertAsync(new Project(mine, null, "Mine"));
-            await _projectRepository.InsertAsync(new Project(foreign, null, "Foreign"));
-            await _memberRepository.InsertAsync(new ProjectMember(_guidGenerator.Create(), null, mine, CurrentUserId));
-            await _memberRepository.InsertAsync(new ProjectMember(_guidGenerator.Create(), null, mine, OtherUserId));
-            await _memberRepository.InsertAsync(new ProjectMember(_guidGenerator.Create(), null, foreign, OtherUserId));
+            await _projectRepository.InsertAsync(new Project(mine, TrackerTestConsts.WorkspaceId, "Mine"));
+            await _projectRepository.InsertAsync(new Project(foreign, TrackerTestConsts.WorkspaceId, "Foreign"));
+            await _memberRepository.InsertAsync(new ProjectMember(_guidGenerator.Create(), TrackerTestConsts.WorkspaceId, mine, CurrentUserId));
+            await _memberRepository.InsertAsync(new ProjectMember(_guidGenerator.Create(), TrackerTestConsts.WorkspaceId, mine, OtherUserId));
+            await _memberRepository.InsertAsync(new ProjectMember(_guidGenerator.Create(), TrackerTestConsts.WorkspaceId, foreign, OtherUserId));
 
             await _activityRepository.InsertAsync(new Activity(
-                _guidGenerator.Create(), null, CurrentUserId, mine, Guid.NewGuid(), Day.AddHours(9), Day.AddHours(9).AddMinutes(10)));
+                _guidGenerator.Create(), TrackerTestConsts.WorkspaceId, CurrentUserId, mine, Guid.NewGuid(), Day.AddHours(9), Day.AddHours(9).AddMinutes(10)));
             await _activityRepository.InsertAsync(new Activity(
-                _guidGenerator.Create(), null, OtherUserId, mine, Guid.NewGuid(), Day.AddHours(9), Day.AddHours(9).AddMinutes(20)));
+                _guidGenerator.Create(), TrackerTestConsts.WorkspaceId, OtherUserId, mine, Guid.NewGuid(), Day.AddHours(9), Day.AddHours(9).AddMinutes(20)));
         });
 
         return (mine, foreign);
@@ -109,6 +109,8 @@ public abstract class MemberScopingTests<TStartupModule> : TrackerApplicationTes
             (await userManager.CreateAsync(new IdentityUser(CurrentUserId, "me", "me@acme.test"))).Succeeded.ShouldBeTrue();
             (await userManager.CreateAsync(new IdentityUser(OtherUserId, "colleague", "colleague@acme.test"))).Succeeded.ShouldBeTrue();
         });
+        await ServiceProvider.AddWorkspaceMemberAsync(CurrentUserId, Dosi.Tracker.Workspaces.WorkspaceRoles.Member);
+        await ServiceProvider.AddWorkspaceMemberAsync(OtherUserId, Dosi.Tracker.Workspaces.WorkspaceRoles.Member);
 
         var members = await GetRequiredService<ITeamAppService>().GetMembersAsync();
 

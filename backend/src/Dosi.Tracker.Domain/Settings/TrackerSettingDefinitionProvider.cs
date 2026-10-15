@@ -30,6 +30,6 @@ public class TrackerSettingDefinitionProvider : SettingDefinitionProvider
             DefaultValueSettingValueProvider.ProviderName,
             ConfigurationSettingValueProvider.ProviderName,
             GlobalSettingValueProvider.ProviderName,
-            TenantSettingValueProvider.ProviderName);
+            WorkspaceSettingValueProvider.ProviderName);
     }
 }

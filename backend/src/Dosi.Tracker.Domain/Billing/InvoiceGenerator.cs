@@ -10,7 +10,7 @@ namespace Dosi.Tracker.Billing;
 /// Generates the monthly per-seat invoice for a subscription: the plan's per-user price times the workspace's
 /// occupied seats (<see cref="SeatCounter"/>; at least one, the owner always occupies a seat), due
 /// <see cref="PaymentTermDays"/> days later. A workspace gets at most one invoice per billing period (calendar
-/// month, <see cref="Invoice.BillingPeriodStart"/>); a unique index on (tenant, period) backs this up when two
+/// month, <see cref="Invoice.BillingPeriodStart"/>); a unique index on (workspace, period) backs this up when two
 /// sweeps race.
 /// </summary>
 public class InvoiceGenerator : DomainService
@@ -32,7 +32,7 @@ public class InvoiceGenerator : DomainService
         _seatCounter = seatCounter;
     }
 
-    /// <summary>Creates this month's invoice for the (current-tenant) subscription
+    /// <summary>Creates this month's invoice for the (current-workspace) subscription
     /// unless one already exists or the plan is free. Returns the invoice, or null.</summary>
     public virtual Task<Invoice?> GenerateForCurrentMonthAsync(Subscription subscription)
     {
@@ -40,7 +40,7 @@ public class InvoiceGenerator : DomainService
     }
 
     /// <summary>Creates the invoice of the billing period containing <paramref name="periodStart"/> for the
-    /// (current-tenant) subscription unless the period is already invoiced or the plan is free or unknown.
+    /// (current-workspace) subscription unless the period is already invoiced or the plan is free or unknown.
     /// Returns the invoice (saved with the caller's unit of work), or null.</summary>
     public virtual async Task<Invoice?> GenerateForPeriodAsync(Subscription subscription, DateTime periodStart)
     {
@@ -51,7 +51,7 @@ public class InvoiceGenerator : DomainService
         }
 
         var billingPeriodStart = Invoice.GetBillingPeriodStart(periodStart);
-        if (await IsInvoicedAsync(subscription.TenantId, billingPeriodStart))
+        if (await IsInvoicedAsync(subscription.WorkspaceId, billingPeriodStart))
         {
             return null;
         }
@@ -60,7 +60,7 @@ public class InvoiceGenerator : DomainService
 
         var invoice = new Invoice(
             GuidGenerator.Create(),
-            subscription.TenantId,
+            subscription.WorkspaceId,
             plan.PricePerUser * seatCount,
             Clock.Now.AddDays(PaymentTermDays))
         {
@@ -73,12 +73,12 @@ public class InvoiceGenerator : DomainService
 
     /// <summary>True when the workspace already has an invoice for the billing period containing
     /// <paramref name="periodStart"/>, counting a legacy invoice (no period) created during that month.</summary>
-    public virtual async Task<bool> IsInvoicedAsync(Guid? tenantId, DateTime periodStart)
+    public virtual async Task<bool> IsInvoicedAsync(Guid workspaceId, DateTime periodStart)
     {
         var start = Invoice.GetBillingPeriodStart(periodStart);
         var end = start.AddMonths(1);
         return await _invoiceRepository.AnyAsync(i =>
-            i.TenantId == tenantId &&
+            i.WorkspaceId == workspaceId &&
             (i.BillingPeriodStart == start ||
              (i.BillingPeriodStart == null && i.CreationTime >= start && i.CreationTime < end)));
     }

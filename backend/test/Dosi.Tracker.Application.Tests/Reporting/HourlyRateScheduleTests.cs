@@ -15,7 +15,7 @@ public class HourlyRateScheduleTests
 
     private static ProjectMemberRate Rate(decimal hourlyRate, DateTime effectiveFrom, DateTime? recordedAt = null)
     {
-        var rate = new ProjectMemberRate(Guid.NewGuid(), null, ProjectId, UserId, hourlyRate, effectiveFrom);
+        var rate = new ProjectMemberRate(Guid.NewGuid(), TrackerTestConsts.WorkspaceId, ProjectId, UserId, hourlyRate, effectiveFrom);
         ObjectHelper.TrySetProperty(rate, r => r.CreationTime, () => recordedAt ?? effectiveFrom);
         return rate;
     }

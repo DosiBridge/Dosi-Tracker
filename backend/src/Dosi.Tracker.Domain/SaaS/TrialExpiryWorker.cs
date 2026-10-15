@@ -9,8 +9,7 @@ using Volo.Abp.Data;
 using Volo.Abp.DistributedLocking;
 using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Linq;
-using Volo.Abp.MultiTenancy;
-using Volo.Abp.TenantManagement;
+using Dosi.Tracker.Workspaces;
 using Volo.Abp.Threading;
 using Volo.Abp.Timing;
 using Volo.Abp.Uow;
@@ -56,45 +55,45 @@ public class TrialExpiryWorker : AsyncPeriodicBackgroundWorkerBase
 
         var uowManager = serviceProvider.GetRequiredService<IUnitOfWorkManager>();
         var dataFilter = serviceProvider.GetRequiredService<IDataFilter>();
-        var currentTenant = serviceProvider.GetRequiredService<ICurrentTenant>();
+        var currentWorkspace = serviceProvider.GetRequiredService<ICurrentWorkspace>();
         var asyncExecuter = serviceProvider.GetRequiredService<IAsyncQueryableExecuter>();
         var subscriptionRepository = serviceProvider.GetRequiredService<IRepository<Subscription, Guid>>();
         var invoiceRepository = serviceProvider.GetRequiredService<IRepository<Invoice, Guid>>();
-        var tenantRepository = serviceProvider.GetRequiredService<IRepository<Tenant, Guid>>();
+        var workspaceRepository = serviceProvider.GetRequiredService<IRepository<Workspace, Guid>>();
         var subscriptionManager = serviceProvider.GetRequiredService<SubscriptionManager>();
         var now = serviceProvider.GetRequiredService<IClock>().Now;
 
         // Only subscriptions with something to do: trials ending within the reminder window (or ended), and
         // active workspaces with an unpaid invoice past its due date.
-        (Guid Id, Guid? TenantId)[] candidates;
+        (Guid Id, Guid WorkspaceId)[] candidates;
         using (var readUow = uowManager.Begin(requiresNew: true))
-        using (dataFilter.Disable<IMultiTenant>())
+        using (dataFilter.Disable<IWorkspaceScoped>())
         {
             var reminderHorizon = now.AddDays(Subscription.TrialReminderDays);
             var subscriptions = await subscriptionRepository.GetQueryableAsync();
             var invoices = await invoiceRepository.GetQueryableAsync();
-            var tenants = await tenantRepository.GetQueryableAsync(); // soft-delete filtered: deleted workspaces drop out
+            var workspaces = await workspaceRepository.GetQueryableAsync();
 
             var rows = await asyncExecuter.ToListAsync(subscriptions
-                .Where(s => tenants.Any(t => t.Id == s.TenantId))
+                .Where(s => workspaces.Any(w => w.Id == s.WorkspaceId))
                 .Where(s =>
                     (s.Status == Subscription.TrialingStatus && s.TrialEndsAt != null && s.TrialEndsAt <= reminderHorizon) ||
                     (s.Status == Subscription.ActiveStatus && invoices.Any(i =>
-                        i.TenantId == s.TenantId && i.Status != Invoice.PaidStatus && i.DueDate < now)))
-                .Select(s => new { s.Id, s.TenantId }));
-            candidates = rows.Select(r => (r.Id, r.TenantId)).ToArray();
+                        i.WorkspaceId == s.WorkspaceId && i.Status != Invoice.PaidStatus && i.DueDate < now)))
+                .Select(s => new { s.Id, s.WorkspaceId }));
+            candidates = rows.Select(r => (r.Id, r.WorkspaceId)).ToArray();
 
             await readUow.CompleteAsync();
         }
 
         // One UoW per workspace so one failure neither rolls back nor stops the others.
         var result = new SubscriptionSweepResult();
-        foreach (var (subscriptionId, tenantId) in candidates)
+        foreach (var (subscriptionId, workspaceId) in candidates)
         {
             try
             {
                 using var uow = uowManager.Begin(requiresNew: true);
-                using (currentTenant.Change(tenantId))
+                using (currentWorkspace.Change(workspaceId))
                 {
                     var subscription = await subscriptionRepository.GetAsync(subscriptionId);
                     result.Add(await subscriptionManager.ReviewAsync(subscription));
@@ -106,8 +105,8 @@ public class TrialExpiryWorker : AsyncPeriodicBackgroundWorkerBase
             {
                 result.Failed++;
                 Logger.LogError(ex,
-                    "Failed to review subscription {SubscriptionId} of tenant {TenantId}; continuing with the rest.",
-                    subscriptionId, tenantId);
+                    "Failed to review subscription {SubscriptionId} of workspace {WorkspaceId}; continuing with the rest.",
+                    subscriptionId, workspaceId);
             }
         }
 

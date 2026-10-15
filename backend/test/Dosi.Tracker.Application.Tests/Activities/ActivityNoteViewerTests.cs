@@ -29,7 +29,7 @@ public abstract class ActivityNoteViewerTests<TStartupModule> : TrackerApplicati
     public async Task UpdateNote_Should_Refuse_Another_Members_Block()
     {
         var start = DateTime.UtcNow.AddDays(-1);
-        var block = new Activity(Guid.NewGuid(), null, OtherUserId, Guid.NewGuid(), Guid.NewGuid(), start, start.AddMinutes(10))
+        var block = new Activity(Guid.NewGuid(), TrackerTestConsts.WorkspaceId, OtherUserId, Guid.NewGuid(), Guid.NewGuid(), start, start.AddMinutes(10))
         {
             Description = "Initial note"
         };

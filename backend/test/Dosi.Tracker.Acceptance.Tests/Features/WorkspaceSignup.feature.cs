@@ -24,9 +24,9 @@ namespace Dosi.Tracker.Features
         
         private static string[] featureTags = ((string[])(null));
         
-        private static global::Reqnroll.FeatureInfo featureInfo = new global::Reqnroll.FeatureInfo(new global::System.Globalization.CultureInfo("en-US"), "Features", "Workspace signup", "  A new customer self-registers a workspace. Registration provisions an isolated " +
-                "tenant,\r\n  an administrator account, and a subscription on the chosen plan — tri" +
-                "aling for paid plans,\r\n  active immediately for Free.", global::Reqnroll.ProgrammingLanguage.CSharp, featureTags);
+        private static global::Reqnroll.FeatureInfo featureInfo = new global::Reqnroll.FeatureInfo(new global::System.Globalization.CultureInfo("en-US"), "Features", "Workspace signup", "  A new customer signs up. Sign-up creates their account, a workspace they own, a" +
+                "nd a\r\n  subscription on the chosen plan — trialing for paid plans, active immedi" +
+                "ately for Free.", global::Reqnroll.ProgrammingLanguage.CSharp, featureTags);
         
         private Xunit.Abstractions.ITestOutputHelper _testOutputHelper;
         
@@ -137,7 +137,7 @@ namespace Dosi.Tracker.Features
             string[] tagsOfScenario = ((string[])(null));
             global::System.Collections.Specialized.OrderedDictionary argumentsOfScenario = new global::System.Collections.Specialized.OrderedDictionary();
             global::Reqnroll.ScenarioInfo scenarioInfo = new global::Reqnroll.ScenarioInfo("Registering on a paid plan starts a trial", null, tagsOfScenario, argumentsOfScenario, featureTags);
-#line 6
+#line 5
   this.ScenarioInitialize(scenarioInfo);
 #line hidden
             if ((global::Reqnroll.TagHelper.ContainsIgnoreTag(scenarioInfo.CombinedTags) || global::Reqnroll.TagHelper.ContainsIgnoreTag(featureTags)))
@@ -147,17 +147,17 @@ namespace Dosi.Tracker.Features
             else
             {
                 await this.ScenarioStartAsync();
-#line 7
+#line 6
     await testRunner.WhenAsync("I register the workspace \"acme\" for admin \"owner@acme.test\" on the \"Starter\" plan" +
                         "", ((string)(null)), ((global::Reqnroll.Table)(null)), "When ");
 #line hidden
+#line 7
+    await testRunner.ThenAsync("the workspace is created", ((string)(null)), ((global::Reqnroll.Table)(null)), "Then ");
+#line hidden
 #line 8
-    await testRunner.ThenAsync("the workspace is created with its own tenant", ((string)(null)), ((global::Reqnroll.Table)(null)), "Then ");
+    await testRunner.AndAsync("\"owner@acme.test\" owns the workspace", ((string)(null)), ((global::Reqnroll.Table)(null)), "And ");
 #line hidden
 #line 9
-    await testRunner.AndAsync("the tenant has an administrator \"owner@acme.test\"", ((string)(null)), ((global::Reqnroll.Table)(null)), "And ");
-#line hidden
-#line 10
     await testRunner.AndAsync("the subscription is \"trialing\"", ((string)(null)), ((global::Reqnroll.Table)(null)), "And ");
 #line hidden
             }
@@ -172,7 +172,7 @@ namespace Dosi.Tracker.Features
             string[] tagsOfScenario = ((string[])(null));
             global::System.Collections.Specialized.OrderedDictionary argumentsOfScenario = new global::System.Collections.Specialized.OrderedDictionary();
             global::Reqnroll.ScenarioInfo scenarioInfo = new global::Reqnroll.ScenarioInfo("Registering on the Free plan activates immediately", null, tagsOfScenario, argumentsOfScenario, featureTags);
-#line 12
+#line 11
   this.ScenarioInitialize(scenarioInfo);
 #line hidden
             if ((global::Reqnroll.TagHelper.ContainsIgnoreTag(scenarioInfo.CombinedTags) || global::Reqnroll.TagHelper.ContainsIgnoreTag(featureTags)))
@@ -182,11 +182,11 @@ namespace Dosi.Tracker.Features
             else
             {
                 await this.ScenarioStartAsync();
-#line 13
+#line 12
     await testRunner.WhenAsync("I register the workspace \"freeco\" for admin \"owner@freeco.test\" on the \"Free\" pla" +
                         "n", ((string)(null)), ((global::Reqnroll.Table)(null)), "When ");
 #line hidden
-#line 14
+#line 13
     await testRunner.ThenAsync("the subscription is \"active\"", ((string)(null)), ((global::Reqnroll.Table)(null)), "Then ");
 #line hidden
             }
@@ -201,7 +201,7 @@ namespace Dosi.Tracker.Features
             string[] tagsOfScenario = ((string[])(null));
             global::System.Collections.Specialized.OrderedDictionary argumentsOfScenario = new global::System.Collections.Specialized.OrderedDictionary();
             global::Reqnroll.ScenarioInfo scenarioInfo = new global::Reqnroll.ScenarioInfo("Registering on an unknown plan is rejected", null, tagsOfScenario, argumentsOfScenario, featureTags);
-#line 16
+#line 15
   this.ScenarioInitialize(scenarioInfo);
 #line hidden
             if ((global::Reqnroll.TagHelper.ContainsIgnoreTag(scenarioInfo.CombinedTags) || global::Reqnroll.TagHelper.ContainsIgnoreTag(featureTags)))
@@ -211,11 +211,11 @@ namespace Dosi.Tracker.Features
             else
             {
                 await this.ScenarioStartAsync();
-#line 17
+#line 16
     await testRunner.WhenAsync("I register the workspace \"nope\" for admin \"owner@nope.test\" on the \"Platinum\" pla" +
                         "n", ((string)(null)), ((global::Reqnroll.Table)(null)), "When ");
 #line hidden
-#line 18
+#line 17
     await testRunner.ThenAsync("registration is rejected because the plan does not exist", ((string)(null)), ((global::Reqnroll.Table)(null)), "Then ");
 #line hidden
             }

@@ -1,12 +1,12 @@
 using System;
 using Volo.Abp.Domain.Entities.Auditing;
-using Volo.Abp.MultiTenancy;
+using Dosi.Tracker.Workspaces;
 
 namespace Dosi.Tracker.Projects;
 
-public class ProjectMember : CreationAuditedEntity<Guid>, IMultiTenant
+public class ProjectMember : CreationAuditedEntity<Guid>, IWorkspaceScoped
 {
-    public Guid? TenantId { get; set; }
+    public Guid WorkspaceId { get; set; }
     public Guid ProjectId { get; set; }
     public Guid UserId { get; set; }
     public string Role { get; set; } // Worker, Admin, etc.
@@ -18,10 +18,10 @@ public class ProjectMember : CreationAuditedEntity<Guid>, IMultiTenant
     {
     }
 
-    public ProjectMember(Guid id, Guid? tenantId, Guid projectId, Guid userId, string role = "Worker", decimal hourlyRate = 0m)
+    public ProjectMember(Guid id, Guid workspaceId, Guid projectId, Guid userId, string role = "Worker", decimal hourlyRate = 0m)
     {
         Id = id;
-        TenantId = tenantId;
+        WorkspaceId = workspaceId;
         ProjectId = projectId;
         UserId = userId;
         Role = role;

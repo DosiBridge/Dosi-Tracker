@@ -7,7 +7,7 @@ Feature: Connecting a desktop agent
   Scenario: The Download page gives the sign-in details
     Given a signed-in member of a live workspace
     When they open the Download page
-    Then it shows the server address to paste into the agent, the workspace name and their email
+    Then it shows the server address to paste into the agent and their email (no workspace name is needed)
     And each can be copied
 
   Scenario: The agent for this computer is recommended

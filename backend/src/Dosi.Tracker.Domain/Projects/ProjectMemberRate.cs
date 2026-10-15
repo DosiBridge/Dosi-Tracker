@@ -1,6 +1,6 @@
 using System;
 using Volo.Abp.Domain.Entities.Auditing;
-using Volo.Abp.MultiTenancy;
+using Dosi.Tracker.Workspaces;
 
 namespace Dosi.Tracker.Projects;
 
@@ -9,9 +9,9 @@ namespace Dosi.Tracker.Projects;
 /// block with the latest rate whose <see cref="EffectiveFrom"/> is not after the block's start, so changing
 /// a rate never re-prices time tracked before the change. Rows are only ever appended.
 /// </summary>
-public class ProjectMemberRate : CreationAuditedEntity<Guid>, IMultiTenant
+public class ProjectMemberRate : CreationAuditedEntity<Guid>, IWorkspaceScoped
 {
-    public Guid? TenantId { get; set; }
+    public Guid WorkspaceId { get; set; }
     public Guid ProjectId { get; set; }
     public Guid UserId { get; set; }
 
@@ -25,10 +25,10 @@ public class ProjectMemberRate : CreationAuditedEntity<Guid>, IMultiTenant
     {
     }
 
-    public ProjectMemberRate(Guid id, Guid? tenantId, Guid projectId, Guid userId, decimal hourlyRate, DateTime effectiveFrom)
+    public ProjectMemberRate(Guid id, Guid workspaceId, Guid projectId, Guid userId, decimal hourlyRate, DateTime effectiveFrom)
     {
         Id = id;
-        TenantId = tenantId;
+        WorkspaceId = workspaceId;
         ProjectId = projectId;
         UserId = userId;
         HourlyRate = hourlyRate;

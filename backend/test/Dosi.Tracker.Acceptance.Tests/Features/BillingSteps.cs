@@ -33,7 +33,7 @@ public sealed class BillingSteps
             var plans = _app.Resolve<IRepository<Plan, Guid>>();
             var guids = _app.Resolve<IGuidGenerator>();
             var plan = await plans.FirstAsync(p => p.Name == planName);
-            _state.Subscription = new Subscription(guids.Create(), null, plan.Id);
+            _state.Subscription = new Subscription(guids.Create(), TrackerTestConsts.WorkspaceId, plan.Id);
         });
     }
 
@@ -42,18 +42,20 @@ public sealed class BillingSteps
     {
         await _app.WithUow(async () =>
         {
+            var memberships = _app.Resolve<Dosi.Tracker.Workspaces.WorkspaceMembershipManager>();
             var projects = _app.Resolve<IRepository<Project, Guid>>();
             var members = _app.Resolve<IRepository<ProjectMember, Guid>>();
             var userManager = _app.Resolve<IdentityUserManager>();
             var guids = _app.Resolve<IGuidGenerator>();
             var projectId = guids.Create();
-            await projects.InsertAsync(new Project(projectId, null, "Billable Project"));
+            await projects.InsertAsync(new Project(projectId, TrackerTestConsts.WorkspaceId, "Billable Project"));
             for (var i = 0; i < count; i++)
             {
                 // A seat is a person with an account in the workspace who tracks time on a project.
                 var person = new IdentityUser(guids.Create(), $"person{i}", $"person{i}@acme.test");
                 (await userManager.CreateAsync(person)).Succeeded.ShouldBeTrue();
-                await members.InsertAsync(new ProjectMember(guids.Create(), null, projectId, person.Id));
+                await members.InsertAsync(new ProjectMember(guids.Create(), TrackerTestConsts.WorkspaceId, projectId, person.Id));
+                await memberships.AddAsync(TrackerTestConsts.WorkspaceId, person.Id, Dosi.Tracker.Workspaces.WorkspaceRoles.Member);
             }
         });
     }

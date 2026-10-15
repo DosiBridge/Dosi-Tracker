@@ -4,22 +4,20 @@ using System.ComponentModel.DataAnnotations;
 using System.Linq;
 using System.Threading.Tasks;
 using Dosi.Tracker.Identity;
+using Dosi.Tracker.Projects;
 using Dosi.Tracker.Settings;
+using Dosi.Tracker.Teams;
+using Dosi.Tracker.Workspaces;
 using Microsoft.AspNetCore.Authorization;
-using Microsoft.Extensions.Options;
 using Volo.Abp;
 using Volo.Abp.Application.Dtos;
-using Volo.Abp.Application.Services;
 using Volo.Abp.Authorization;
 using Volo.Abp.Data;
-using Volo.Abp.DistributedLocking;
 using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Identity;
-using Volo.Abp.MultiTenancy;
-using Volo.Abp.TenantManagement;
 using Volo.Abp.Uow;
+using Volo.Abp.Users;
 using Volo.Abp.Validation;
-using IdentityOptions = Microsoft.AspNetCore.Identity.IdentityOptions;
 
 namespace Dosi.Tracker.SaaS;
 
@@ -28,66 +26,60 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
 {
     public const string DefaultPlanName = Plan.FreePlanName;
 
-    /// <summary>ABP's error code for a workspace name already in use (raised by its tenant validator).</summary>
-    public const string DuplicateTenantNameErrorCode = "Volo.Abp.TenantManagement:DuplicateTenantName";
-
-    /// <summary>Prefix of the lock that serializes sign-ups of the same workspace name.</summary>
-    public const string RegistrationLockPrefix = "Tracker:WorkspaceRegistration:";
-
-    /// <summary>User name ABP's identity seeder gives a new workspace's owner.</summary>
-    private const string OwnerUserName = "admin";
-
-    /// <summary>How long a sign-up waits for another sign-up of the same name to finish.</summary>
-    private static readonly TimeSpan RegistrationLockTimeout = TimeSpan.FromSeconds(30);
-
     private readonly IRepository<Subscription, Guid> _subscriptionRepository;
     private readonly IRepository<Plan, Guid> _planRepository;
-    private readonly ITenantManager _tenantManager;
-    private readonly ITenantRepository _tenantRepository;
-    private readonly ITenantNormalizer _tenantNormalizer;
-    private readonly IDataSeeder _dataSeeder;
-    private readonly IdentityUserManager _userManager;
-    private readonly IOptions<IdentityOptions> _identityOptions;
-    private readonly IAbpDistributedLock _distributedLock;
-    private readonly SubscriptionManager _subscriptionManager;
+    private readonly IRepository<Workspace, Guid> _workspaceRepository;
+    private readonly IRepository<WorkspaceMember, Guid> _memberRepository;
+    private readonly IRepository<WorkspaceInvitation, Guid> _invitationRepository;
+    private readonly WorkspaceManager _workspaceManager;
+    private readonly WorkspaceMembershipManager _memberships;
     private readonly WorkspaceSettingsManager _workspaceSettings;
+    private readonly TrackerAccountFactory _accounts;
+    private readonly WorkspaceJoiner _joiner;
+    private readonly ProjectMembershipManager _projectMemberships;
+    private readonly SeatCounter _seatCounter;
+    private readonly IdentityUserManager _userManager;
 
     public WorkspaceAppService(
         IRepository<Subscription, Guid> subscriptionRepository,
         IRepository<Plan, Guid> planRepository,
-        ITenantManager tenantManager,
-        ITenantRepository tenantRepository,
-        ITenantNormalizer tenantNormalizer,
-        IDataSeeder dataSeeder,
-        IdentityUserManager userManager,
-        IOptions<IdentityOptions> identityOptions,
-        IAbpDistributedLock distributedLock,
-        SubscriptionManager subscriptionManager,
-        WorkspaceSettingsManager workspaceSettings)
+        IRepository<Workspace, Guid> workspaceRepository,
+        IRepository<WorkspaceMember, Guid> memberRepository,
+        IRepository<WorkspaceInvitation, Guid> invitationRepository,
+        WorkspaceManager workspaceManager,
+        WorkspaceMembershipManager memberships,
+        WorkspaceSettingsManager workspaceSettings,
+        TrackerAccountFactory accounts,
+        WorkspaceJoiner joiner,
+        ProjectMembershipManager projectMemberships,
+        SeatCounter seatCounter,
+        IdentityUserManager userManager)
     {
         _subscriptionRepository = subscriptionRepository;
         _planRepository = planRepository;
-        _tenantManager = tenantManager;
-        _tenantRepository = tenantRepository;
-        _tenantNormalizer = tenantNormalizer;
-        _dataSeeder = dataSeeder;
-        _userManager = userManager;
-        _identityOptions = identityOptions;
-        _distributedLock = distributedLock;
-        _subscriptionManager = subscriptionManager;
+        _workspaceRepository = workspaceRepository;
+        _memberRepository = memberRepository;
+        _invitationRepository = invitationRepository;
+        _workspaceManager = workspaceManager;
+        _memberships = memberships;
         _workspaceSettings = workspaceSettings;
+        _accounts = accounts;
+        _joiner = joiner;
+        _projectMemberships = projectMemberships;
+        _seatCounter = seatCounter;
+        _userManager = userManager;
     }
 
     public async Task<SubscriptionDto?> GetCurrentSubscriptionAsync()
     {
-        var subscription = await _subscriptionRepository.FirstOrDefaultAsync(s => s.TenantId == CurrentTenant.Id);
-        if (subscription == null) return null;
-
-        return ObjectMapper.Map<Subscription, SubscriptionDto>(subscription);
+        var workspaceId = CurrentWorkspace.GetId();
+        var subscription = await _subscriptionRepository.FirstOrDefaultAsync(s => s.WorkspaceId == workspaceId);
+        return subscription == null ? null : ObjectMapper.Map<Subscription, SubscriptionDto>(subscription);
     }
 
-    /// <summary>Anonymous: the sign-up page offers the plans as the host currently defines them.</summary>
+    /// <summary>Anonymous: the sign-up page offers the plans as the platform currently defines them.</summary>
     [AllowAnonymous]
+    [WorkspaceNotRequired]
     public async Task<ListResultDto<PlanDto>> GetAvailablePlansAsync()
     {
         var plans = (await _planRepository.GetListAsync())
@@ -98,7 +90,6 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
         var dtos = ObjectMapper.Map<List<Plan>, List<PlanDto>>(plans);
         foreach (var dto in dtos)
         {
-            // Anonymous callers see the offer, not which platform administrator edited it.
             dto.CreatorId = null;
             dto.LastModifierId = null;
             dto.DeleterId = null;
@@ -108,46 +99,227 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
     }
 
     [AllowAnonymous]
+    [WorkspaceNotRequired]
     public async Task<WorkspaceRegistrationResultDto> RegisterAsync(RegisterWorkspaceDto input)
     {
-        var plan = await GetSignUpPlanAsync(input);
-        await CheckOwnerPasswordAsync(input);
+        await _accounts.EnsureEmailIsFreeAsync(input.Email);
+        await _accounts.CheckPasswordAsync(input.Email, input.Password, nameof(RegisterWorkspaceDto.Password));
 
-        var name = input.Name.Trim();
-        var normalizedName = _tenantNormalizer.NormalizeName(name) ?? name;
-
-        // Sign-ups of the same name run one at a time (across replicas when a distributed lock provider is
-        // configured), and the lock is held until the new workspace is committed, so the name check can't be raced.
-        await using var nameLock = await _distributedLock.TryAcquireAsync(RegistrationLockPrefix + normalizedName, RegistrationLockTimeout);
-        if (nameLock == null)
+        if (!input.InviteToken.IsNullOrWhiteSpace())
         {
-            throw DuplicateTenantName(normalizedName); // Another sign-up of this name is still running.
+            return await RegisterWithInvitationAsync(input);
         }
 
+        var plan = await GetSignUpPlanAsync(input.PlanId, input.PlanName);
+        var name = input.WorkspaceName!.Trim();
+
+        await using var nameLock = await _workspaceManager.LockNameAsync(name);
         using var uow = UnitOfWorkManager.Begin(requiresNew: true, isTransactional: true);
 
-        var tenant = await CreateTenantAsync(name, normalizedName);
-        using (CurrentTenant.Change(tenant.Id, tenant.Name))
+        if (await _workspaceManager.IsNameTakenAsync(name))
         {
-            // Seeds the tenant's admin user (Identity), admin role and its permissions.
-            await _dataSeeder.SeedAsync(new DataSeedContext(tenant.Id)
-                .WithProperty(IdentityDataSeedContributor.AdminEmailPropertyName, input.AdminEmail)
-                .WithProperty(IdentityDataSeedContributor.AdminPasswordPropertyName, input.AdminPassword));
-
-            await _subscriptionRepository.InsertAsync(_subscriptionManager.CreateForNewWorkspace(tenant.Id, plan));
+            throw WorkspaceManager.DuplicateName(name);
         }
 
+        var user = await _accounts.CreateAsync(input.Email, input.Password, input.FirstName, input.Surname);
+        var workspace = await _workspaceManager.CreateAsync(name, user.Id, plan);
         await uow.CompleteAsync();
 
         return new WorkspaceRegistrationResultDto
         {
-            TenantId = tenant.Id,
-            Name = tenant.Name
+            WorkspaceId = workspace.Id,
+            WorkspaceName = workspace.Name,
+            UserName = user.UserName
         };
+    }
+
+    private async Task<WorkspaceRegistrationResultDto> RegisterWithInvitationAsync(RegisterWorkspaceDto input)
+    {
+        var invitation = await GetUsableInvitationAsync(input.InviteToken!);
+        if (!invitation.IsFor(input.Email))
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.InvitationEmailMismatch);
+        }
+
+        using (CurrentWorkspace.Change(invitation.WorkspaceId))
+        {
+            await using var seatLock = await _seatCounter.LockAsync();
+            using var uow = UnitOfWorkManager.Begin(requiresNew: true, isTransactional: true);
+
+            var user = await _accounts.CreateAsync(input.Email, input.Password, input.FirstName, input.Surname);
+            var workspace = await AcceptAsync(invitation, user.Id);
+            await uow.CompleteAsync();
+
+            return new WorkspaceRegistrationResultDto
+            {
+                WorkspaceId = workspace.Id,
+                WorkspaceName = workspace.Name,
+                UserName = user.UserName
+            };
+        }
+    }
+
+    [WorkspaceNotRequired]
+    [RemoteService(IsEnabled = false)]
+    public async Task<List<MyWorkspaceDto>> GetMineAsync()
+    {
+        var userId = CurrentUser.GetId();
+        var members = await _memberRepository.GetQueryableAsync();
+        var workspaces = await _workspaceRepository.GetQueryableAsync();
+
+        var rows = await AsyncExecuter.ToListAsync(
+            from m in members
+            join w in workspaces on m.WorkspaceId equals w.Id
+            where m.UserId == userId && m.Status == WorkspaceMemberStatus.Active
+            select new { w.Id, w.Name, m.Role });
+
+        var ids = rows.Select(r => r.Id).ToList();
+        Dictionary<Guid, Guid> planIds;
+        using (DataFilter.Disable<IWorkspaceScoped>())
+        {
+            planIds = (await _subscriptionRepository.GetListAsync(s => ids.Contains(s.WorkspaceId)))
+                .GroupBy(s => s.WorkspaceId)
+                .ToDictionary(g => g.Key, g => g.OrderByDescending(s => s.CreationTime).First().PlanId);
+        }
+
+        var plans = (await _planRepository.GetListAsync()).ToDictionary(p => p.Id, p => p.Name);
+
+        return rows
+            .Select(r => new MyWorkspaceDto
+            {
+                Id = r.Id,
+                Name = r.Name,
+                Role = r.Role,
+                IsOwner = r.Role == WorkspaceRoles.Owner,
+                PlanName = planIds.TryGetValue(r.Id, out var planId) ? plans.GetValueOrDefault(planId) : null
+            })
+            .OrderBy(w => w.Name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    [WorkspaceNotRequired]
+    [RemoteService(IsEnabled = false)]
+    public async Task<CreatedWorkspaceDto> CreateAsync(CreateWorkspaceDto input)
+    {
+        var plan = await GetSignUpPlanAsync(input.PlanId, null);
+        var name = input.Name.Trim();
+
+        await using var nameLock = await _workspaceManager.LockNameAsync(name);
+        using var uow = UnitOfWorkManager.Begin(requiresNew: true, isTransactional: true);
+        var workspace = await _workspaceManager.CreateAsync(name, CurrentUser.GetId(), plan);
+        await uow.CompleteAsync();
+
+        return new CreatedWorkspaceDto { Id = workspace.Id, Name = workspace.Name };
+    }
+
+    [WorkspaceNotRequired]
+    [RemoteService(IsEnabled = false)]
+    public async Task LeaveAsync(Guid id)
+    {
+        var userId = CurrentUser.GetId();
+        var member = await _memberships.FindActiveAsync(id, userId)
+                     ?? throw new BusinessException(TrackerDomainErrorCodes.NotWorkspaceMember);
+
+        using (CurrentWorkspace.Change(id))
+        {
+            await _memberships.RemoveAsync(member);
+            await _projectMemberships.RemoveAllOfUserAsync(userId);
+        }
+    }
+
+    [AllowAnonymous]
+    [WorkspaceNotRequired]
+    [RemoteService(IsEnabled = false)]
+    public async Task<InvitationInfoDto> GetInvitationAsync(string token)
+    {
+        var invitation = await FindInvitationAsync(token)
+                         ?? throw new BusinessException(TrackerDomainErrorCodes.InvitationNotFound);
+        var workspace = await _workspaceRepository.GetAsync(invitation.WorkspaceId);
+
+        return new InvitationInfoDto
+        {
+            WorkspaceName = workspace.Name,
+            Email = invitation.Email,
+            Role = invitation.Role,
+            Expired = !invitation.IsUsable(Clock.Now)
+        };
+    }
+
+    [WorkspaceNotRequired]
+    [RemoteService(IsEnabled = false)]
+    public async Task<AcceptInvitationResultDto> AcceptInvitationAsync(string token)
+    {
+        var invitation = await GetUsableInvitationAsync(token);
+        var user = await _userManager.GetByIdAsync(CurrentUser.GetId());
+        if (!invitation.IsFor(user.Email))
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.InvitationEmailMismatch);
+        }
+
+        using (CurrentWorkspace.Change(invitation.WorkspaceId))
+        {
+            await using var seatLock = await _seatCounter.LockAsync();
+            using var uow = UnitOfWorkManager.Begin(requiresNew: true, isTransactional: true);
+            var workspace = await AcceptAsync(invitation, user.Id);
+            var role = (await _memberships.FindActiveAsync(workspace.Id, user.Id))!.Role;
+            await uow.CompleteAsync();
+
+            return new AcceptInvitationResultDto { WorkspaceId = workspace.Id, WorkspaceName = workspace.Name, Role = role };
+        }
+    }
+
+    /// <summary>Joins the invitation's workspace (the current one) and uses the invitation up.</summary>
+    private async Task<Workspace> AcceptAsync(WorkspaceInvitation invitation, Guid userId)
+    {
+        var workspace = await _workspaceRepository.GetAsync(invitation.WorkspaceId);
+        var existing = await _memberships.FindActiveAsync(workspace.Id, userId);
+        var projectId = invitation.ProjectId;
+        if (projectId.HasValue)
+        {
+            var projectRepository = LazyServiceProvider.LazyGetRequiredService<IRepository<Project, Guid>>();
+            if (await projectRepository.FindAsync(projectId.Value) == null)
+            {
+                projectId = null; // The project was deleted since: the invitation still opens the workspace.
+            }
+            else if (existing != null && await LazyServiceProvider.LazyGetRequiredService<IRepository<ProjectMember, Guid>>()
+                         .AnyAsync(m => m.ProjectId == projectId && m.UserId == userId))
+            {
+                projectId = null;
+            }
+        }
+
+        await _joiner.JoinAsync(userId, invitation.Role, projectId, invitation.ProjectRole, invitation.HourlyRate ?? 0m);
+        invitation.MarkAccepted(userId, Clock.Now);
+        await _invitationRepository.UpdateAsync(invitation, autoSave: true);
+        return workspace;
+    }
+
+    private Task<WorkspaceInvitation?> FindInvitationAsync(string token)
+    {
+        if (token.IsNullOrWhiteSpace())
+        {
+            return Task.FromResult<WorkspaceInvitation?>(null);
+        }
+
+        var hash = WorkspaceInvitation.HashToken(token);
+        return _invitationRepository.FirstOrDefaultAsync(i => i.TokenHash == hash);
+    }
+
+    private async Task<WorkspaceInvitation> GetUsableInvitationAsync(string token)
+    {
+        var invitation = await FindInvitationAsync(token)
+                         ?? throw new BusinessException(TrackerDomainErrorCodes.InvitationNotFound);
+        if (!invitation.IsUsable(Clock.Now))
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.InvitationExpired);
+        }
+
+        return invitation;
     }
 
     public async Task<WorkspaceSettingsDto> GetSettingsAsync()
     {
+        CurrentWorkspace.GetId();
         return new WorkspaceSettingsDto
         {
             DefaultTimeZone = await _workspaceSettings.GetDefaultTimeZoneAsync(),
@@ -157,12 +329,9 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
 
     public async Task<WorkspaceSettingsDto> UpdateSettingsAsync(WorkspaceSettingsDto input)
     {
-        if (CurrentTenant.Id == null)
-        {
-            throw new AbpAuthorizationException("Workspace settings exist inside a workspace only.");
-        }
-
-        if (!CurrentUser.IsInRole(TrackerRoles.Admin))
+        var workspaceId = CurrentWorkspace.GetId();
+        var member = await _memberships.FindActiveAsync(workspaceId, CurrentUser.GetId());
+        if (member is not { IsOwner: true })
         {
             throw new AbpAuthorizationException("Only the workspace owner can change the workspace settings.");
         }
@@ -173,8 +342,6 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
         await _workspaceSettings.SetDefaultTimeZoneAsync(timeZone);
         await _workspaceSettings.SetNewProjectDefaultsAsync(defaults);
 
-        // Answer with what was stored rather than reading it back: ABP's setting cache may still serve a value
-        // removed in this unit of work (an unset time zone) until the unit of work completes.
         return new WorkspaceSettingsDto
         {
             DefaultTimeZone = timeZone,
@@ -182,6 +349,7 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
         };
     }
 
+    [WorkspaceNotRequired]
     public async Task<MyPreferencesDto> GetMyPreferencesAsync()
     {
         return new MyPreferencesDto
@@ -190,35 +358,34 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
         };
     }
 
+    [WorkspaceNotRequired]
     public async Task<MyPreferencesDto> UpdateMyPreferencesAsync(MyPreferencesDto input)
     {
         var timeZone = NormalizeTimeZone(input.TimeZone, nameof(MyPreferencesDto.TimeZone));
         await _workspaceSettings.SetUserTimeZoneAsync(timeZone);
-
-        // What was stored (see UpdateSettingsAsync for why it is not read back).
         return new MyPreferencesDto { TimeZone = timeZone };
     }
 
-    /// <summary>The plan chosen at sign-up: by id, else by name, else the default (Free). Self-service sign-up
-    /// accepts free plans and plans with a trial; a paid plan without one would start active with nothing paid.</summary>
-    private async Task<Plan> GetSignUpPlanAsync(RegisterWorkspaceDto input)
+    /// <summary>The plan chosen at sign-up: by id, else by name, else the default (Free). Self-service accepts free
+    /// plans and plans with a trial; a paid plan without one would start active with nothing paid.</summary>
+    private async Task<Plan> GetSignUpPlanAsync(Guid? planId, string? planNameInput)
     {
         Plan? plan;
         string member;
-        if (input.PlanId.HasValue)
+        if (planId.HasValue)
         {
             member = nameof(RegisterWorkspaceDto.PlanId);
-            plan = await _planRepository.FindAsync(input.PlanId.Value);
+            plan = await _planRepository.FindAsync(planId.Value);
             if (plan == null)
             {
                 throw new BusinessException(TrackerDomainErrorCodes.PlanNotFound)
-                    .WithData("planId", input.PlanId.Value);
+                    .WithData("planId", planId.Value);
             }
         }
         else
         {
             member = nameof(RegisterWorkspaceDto.PlanName);
-            var planName = input.PlanName.IsNullOrWhiteSpace() ? DefaultPlanName : input.PlanName!.Trim();
+            var planName = planNameInput.IsNullOrWhiteSpace() ? DefaultPlanName : planNameInput!.Trim();
             plan = await _planRepository.FirstOrDefaultAsync(p => p.Name == planName);
             if (plan == null)
             {
@@ -237,64 +404,6 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
         }
 
         return plan;
-    }
-
-    /// <summary>The owner's password must meet the identity password policy (length, required characters, …):
-    /// ABP's data seeder creates the owner account without checking it.</summary>
-    private async Task CheckOwnerPasswordAsync(RegisterWorkspaceDto input)
-    {
-        await _identityOptions.SetAsync(); // load the policy from the settings
-
-        var owner = new IdentityUser(GuidGenerator.Create(), OwnerUserName, input.AdminEmail);
-        var errors = new List<ValidationResult>();
-        foreach (var validator in _userManager.PasswordValidators)
-        {
-            var result = await validator.ValidateAsync(_userManager, owner, input.AdminPassword);
-            errors.AddRange(result.Errors.Select(error =>
-                new ValidationResult(error.Description, new[] { nameof(RegisterWorkspaceDto.AdminPassword) })));
-        }
-
-        if (errors.Count > 0)
-        {
-            throw new AbpValidationException(errors);
-        }
-    }
-
-    /// <summary>Creates and saves the tenant. ABP's validator refuses a name already in use; a concurrent sign-up
-    /// that commits the same name first (the unique index on the normalized name rejects our insert) gets the same
-    /// error rather than a server error.</summary>
-    private async Task<Tenant> CreateTenantAsync(string name, string normalizedName)
-    {
-        var tenant = await _tenantManager.CreateAsync(name);
-        try
-        {
-            await _tenantRepository.InsertAsync(tenant, autoSave: true);
-        }
-        catch (Exception ex) when (ex is not BusinessException)
-        {
-            if (await IsTenantNameTakenAsync(normalizedName))
-            {
-                throw DuplicateTenantName(normalizedName);
-            }
-
-            throw;
-        }
-
-        return tenant;
-    }
-
-    private async Task<bool> IsTenantNameTakenAsync(string normalizedName)
-    {
-        // A fresh unit of work: the failed insert leaves the current one's database context (and transaction) unusable.
-        using var uow = UnitOfWorkManager.Begin(requiresNew: true);
-        var taken = await _tenantRepository.FindByNameAsync(normalizedName, includeDetails: false) != null;
-        await uow.CompleteAsync();
-        return taken;
-    }
-
-    private static BusinessException DuplicateTenantName(string normalizedName)
-    {
-        return new BusinessException(DuplicateTenantNameErrorCode).WithData("Name", normalizedName);
     }
 
     private static NewProjectDefaultsDto ToDto(NewProjectDefaults defaults)

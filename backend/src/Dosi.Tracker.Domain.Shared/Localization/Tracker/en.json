@@ -37,6 +37,15 @@
     "Tracker:ReportRangeInvalid": "The report range must end after it starts and span at most {maxDays} days.",
     "Tracker:InvalidUser": "The user does not exist in this workspace.",
     "Tracker:CannotModifySelf": "You cannot make this change to your own account or membership.",
-    "Tracker:RoleNotAllowed": "Only the workspace owner can grant this role, change hourly rates or manage an owner's account."
+    "Tracker:RoleNotAllowed": "Only the workspace owner can grant this role, change hourly rates or manage an owner's account.",
+    "Tracker:WorkspaceRequired": "Choose a workspace: send its id in the X-Workspace-Id header.",
+    "Tracker:NotWorkspaceMember": "You are not a member of this workspace.",
+    "Tracker:EmailAlreadyRegistered": "An account with this email already exists. Sign in and create the workspace from inside the app.",
+    "Tracker:DuplicateWorkspaceName": "A workspace with this name already exists.",
+    "Tracker:LastOwnerCannotLeave": "You are the workspace's last owner. Make someone else an owner before leaving.",
+    "Tracker:InvitationNotFound": "This invitation does not exist.",
+    "Tracker:InvitationExpired": "This invitation has expired or was already used.",
+    "Tracker:InvitationEmailMismatch": "This invitation was sent to a different email address.",
+    "Tracker:AlreadyWorkspaceMember": "This person is already a member of the workspace."
   }
 }

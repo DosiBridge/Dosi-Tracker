@@ -24,7 +24,14 @@ import {
   activityNoteRoute,
   canEditActivityNote,
   captureExtension,
-  changeTenantPlanRoute,
+  changeWorkspacePlanRoute,
+  workspaceRoleRoute,
+  revokeInvitationRoute,
+  TEAM_INVITATIONS_ROUTE,
+  WORKSPACE_ROUTES,
+  leaveWorkspaceRoute,
+  invitationRoute,
+  acceptInvitationRoute,
   collectPages,
   endReasonLabel,
   isPresenceOnline,
@@ -43,9 +50,8 @@ import {
   removeMemberRoute,
   reportingQuery,
   reportingRoute,
-  resetPasswordRoute,
   suspendSubscriptionRoute,
-  TENANT_SUBSCRIPTIONS_ROUTE,
+  WORKSPACE_SUBSCRIPTIONS_ROUTE,
   toPagedResult,
   updateMemberRoute,
   withPaging,
@@ -59,7 +65,12 @@ const TO = new Date("2026-07-08T00:00:00.000Z");
 /** The architecture spec's rule: a route is served when it equals or extends a contract entry. */
 function served(route: string): boolean {
   const path = route.split("?")[0].replace(/\/+$/, "");
-  return contract.endpoints.some((e) => path === e || path.startsWith(`${e}/`));
+  return contract.endpoints.some((e) => {
+    if (path === e || path.startsWith(`${e}/`)) return true;
+    if (!e.includes("{")) return false;
+    const pattern = new RegExp(`^${e.split("/").map((seg) => (/^\{[^/}]+\}$/.test(seg) ? "[^/]+" : seg)).join("/")}(?:/|$)`);
+    return pattern.test(path);
+  });
 }
 
 describe("routes", () => {
@@ -74,20 +85,26 @@ describe("routes", () => {
       projectMembersRoute("p1"),
       updateMemberRoute("p1", "u1"),
       removeMemberRoute("m1"),
-      resetPasswordRoute("u1"),
       removeFromWorkspaceRoute("u1"),
-      changeTenantPlanRoute("t1", "p1"),
+      workspaceRoleRoute("u1", "manager"),
+      TEAM_INVITATIONS_ROUTE,
+      revokeInvitationRoute("i1"),
+      ...Object.values(WORKSPACE_ROUTES),
+      leaveWorkspaceRoute("w1"),
+      invitationRoute("tok"),
+      acceptInvitationRoute("tok"),
+      changeWorkspacePlanRoute("t1", "p1"),
       activateSubscriptionRoute("t1"),
       suspendSubscriptionRoute("t1"),
-      TENANT_SUBSCRIPTIONS_ROUTE,
+      WORKSPACE_SUBSCRIPTIONS_ROUTE,
       markInvoicePaidRoute("i1"),
     ];
     expect(routes.filter((r) => !served(r))).toEqual([]);
   });
 
-  it("builds the host's subscription routes with the tenant in the query", () => {
-    expect(suspendSubscriptionRoute("t&1")).toBe("/api/app/platform/suspend-subscription?tenantId=t%261");
-    expect(TENANT_SUBSCRIPTIONS_ROUTE).toBe("/api/app/platform/tenant-subscriptions");
+  it("builds the platform's subscription routes with the workspace in the query", () => {
+    expect(suspendSubscriptionRoute("t&1")).toBe("/api/app/platform/suspend-subscription?workspaceId=t%261");
+    expect(WORKSPACE_SUBSCRIPTIONS_ROUTE).toBe("/api/app/platform/workspace-subscriptions");
   });
 
   it("puts ids where the backend binds them, encoded", () => {
@@ -96,10 +113,13 @@ describe("routes", () => {
     expect(updateMemberRoute("p1", "u&1")).toBe("/api/app/team/member?projectId=p1&userId=u%261");
     expect(removeMemberRoute("m1")).toBe("/api/app/team/member/m1");
     expect(activityNoteRoute("a/1")).toBe("/api/app/activity/a%2F1/note");
-    expect(resetPasswordRoute("u 1")).toBe("/api/app/team/reset-password?userId=u%201");
+    expect(workspaceRoleRoute("u 1", "owner")).toBe("/api/app/team/workspace-role?userId=u%201&role=owner");
+    expect(revokeInvitationRoute("i1")).toBe("/api/app/team/i1/invitation");
+    expect(leaveWorkspaceRoute("w1")).toBe("/api/app/workspaces/w1/leave");
+    expect(acceptInvitationRoute("a b")).toBe("/api/app/invitations/a%20b/accept");
     expect(removeFromWorkspaceRoute("u1")).toBe("/api/app/team/from-workspace?userId=u1");
-    expect(changeTenantPlanRoute("t&1", "p=2")).toBe("/api/app/platform/change-tenant-plan?tenantId=t%261&planId=p%3D2");
-    expect(activateSubscriptionRoute("t1")).toBe("/api/app/platform/activate-subscription?tenantId=t1");
+    expect(changeWorkspacePlanRoute("t&1", "p=2")).toBe("/api/app/platform/change-workspace-plan?workspaceId=t%261&planId=p%3D2");
+    expect(activateSubscriptionRoute("t1")).toBe("/api/app/platform/activate-subscription?workspaceId=t1");
     expect(markInvoicePaidRoute("i1")).toBe("/api/app/platform/mark-invoice-paid?invoiceId=i1");
   });
 
@@ -361,18 +381,16 @@ describe("labels and rules", () => {
     expect(OWNER_ONLY_ROLES).toEqual(["Admin", "Manager"]);
   });
 
-  it("offers a password reset and removal only where the server allows them", () => {
+  it("offers a role change (owners) and removal only where the server allows them", () => {
     const base = { canManageTeam: true, callerIsOwner: false, targetIsOwner: false, isSelf: false };
-    expect(memberAccountActions(base)).toEqual({ canResetPassword: true, canRemoveFromWorkspace: true });
-    // An owner's password only by another owner; an owner is never removed.
-    expect(memberAccountActions({ ...base, targetIsOwner: true })).toEqual({ canResetPassword: false, canRemoveFromWorkspace: false });
+    expect(memberAccountActions(base)).toEqual({ canChangeWorkspaceRole: false, canRemoveFromWorkspace: true });
+    expect(memberAccountActions({ ...base, targetIsOwner: true })).toEqual({ canChangeWorkspaceRole: false, canRemoveFromWorkspace: false });
     expect(memberAccountActions({ ...base, targetIsOwner: true, callerIsOwner: true })).toEqual({
-      canResetPassword: true,
+      canChangeWorkspaceRole: true,
       canRemoveFromWorkspace: false,
     });
-    // Never yourself (change your own password instead), never without Team.Manage.
-    expect(memberAccountActions({ ...base, isSelf: true, callerIsOwner: true })).toEqual({ canResetPassword: false, canRemoveFromWorkspace: false });
-    expect(memberAccountActions({ ...base, canManageTeam: false })).toEqual({ canResetPassword: false, canRemoveFromWorkspace: false });
+    expect(memberAccountActions({ ...base, isSelf: true, callerIsOwner: true })).toEqual({ canChangeWorkspaceRole: false, canRemoveFromWorkspace: false });
+    expect(memberAccountActions({ ...base, canManageTeam: false })).toEqual({ canChangeWorkspaceRole: false, canRemoveFromWorkspace: false });
   });
 
   it("accepts only #rrggbb project colours", () => {
@@ -385,6 +403,7 @@ describe("labels and rules", () => {
     expect(TRACKER_ERROR_STATUS["Tracker:RoleNotAllowed"]).toBe(403);
     expect(TRACKER_ERROR_STATUS["Tracker:InvalidUser"]).toBe(404);
     expect(TRACKER_ERROR_STATUS["Tracker:ActivityInFuture"]).toBe(425);
-    expect(Object.keys(TRACKER_ERROR_STATUS)).toHaveLength(20);
+    expect(Object.keys(TRACKER_ERROR_STATUS)).toHaveLength(29);
+    expect(TRACKER_ERROR_STATUS["Tracker:NotWorkspaceMember"]).toBe(403);
   });
 });

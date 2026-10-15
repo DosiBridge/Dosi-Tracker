@@ -7,7 +7,7 @@ using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Guids;
 using Volo.Abp.Identity;
 using Volo.Abp.Modularity;
-using Volo.Abp.MultiTenancy;
+using Dosi.Tracker.Workspaces;
 using Volo.Abp.Validation;
 using Xunit;
 
@@ -35,7 +35,7 @@ public abstract class PresenceAppServiceTests<TStartupModule> : TrackerApplicati
 
     private async Task<Guid> SeedProjectAsync(string title = "Website redesign", Action<Project>? configure = null)
     {
-        var project = new Project(_guidGenerator.Create(), null, title);
+        var project = new Project(_guidGenerator.Create(), TrackerTestConsts.WorkspaceId, title);
         configure?.Invoke(project);
         await WithUnitOfWorkAsync(() => _projectRepository.InsertAsync(project));
         return project.Id;
@@ -45,7 +45,7 @@ public abstract class PresenceAppServiceTests<TStartupModule> : TrackerApplicati
     {
         return WithUnitOfWorkAsync(async () =>
         {
-            var user = new IdentityUser(id, userName, $"{userName}@acme.test", tenantId) { Name = name, Surname = surname };
+            var user = new IdentityUser(id, userName, $"{userName}@acme.test") { Name = name, Surname = surname };
             (await GetRequiredService<IdentityUserManager>().CreateAsync(user)).Succeeded.ShouldBeTrue();
             return user;
         });
@@ -54,7 +54,7 @@ public abstract class PresenceAppServiceTests<TStartupModule> : TrackerApplicati
     private Task InsertPresenceAsync(Guid userId, Guid deviceId, DateTime lastSeenAt, Guid? tenantId = null, string? deviceName = null)
     {
         return WithUnitOfWorkAsync(() => _presenceRepository.InsertAsync(
-            new AgentPresence(_guidGenerator.Create(), tenantId, userId, deviceId, "tracking", lastSeenAt) { DeviceName = deviceName }));
+            new AgentPresence(_guidGenerator.Create(), tenantId ?? TrackerTestConsts.WorkspaceId, userId, deviceId, "tracking", lastSeenAt) { DeviceName = deviceName }));
     }
 
     private Task<AgentPresence> GetDeviceAsync(Guid deviceId) =>
@@ -90,7 +90,7 @@ public abstract class PresenceAppServiceTests<TStartupModule> : TrackerApplicati
 
         var stored = await GetDeviceAsync(deviceId);
         stored.UserId.ShouldBe(CurrentUserId);
-        stored.TenantId.ShouldBeNull();
+        stored.WorkspaceId.ShouldBe(TrackerTestConsts.WorkspaceId);
         stored.DeviceName.ShouldBe("DESKTOP-42");
         stored.Platform.ShouldBe("windows");
         stored.OsVersion.ShouldBe("Windows 11 Pro 23H2 (10.0.22631)");
@@ -436,7 +436,7 @@ public abstract class PresenceAppServiceTests<TStartupModule> : TrackerApplicati
         await InsertPresenceAsync(CurrentUserId, Guid.NewGuid(), DateTime.UtcNow);
 
         var otherTenantId = Guid.NewGuid();
-        using (GetRequiredService<ICurrentTenant>().Change(otherTenantId))
+        using (GetRequiredService<ICurrentWorkspace>().Change(otherTenantId))
         {
             var carol = await CreateUserAsync(_guidGenerator.Create(), "carol", tenantId: otherTenantId);
             await InsertPresenceAsync(carol.Id, Guid.NewGuid(), DateTime.UtcNow, otherTenantId);

@@ -10,8 +10,7 @@ using Volo.Abp.DistributedLocking;
 using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Guids;
 using Volo.Abp.Modularity;
-using Volo.Abp.MultiTenancy;
-using Volo.Abp.TenantManagement;
+using Dosi.Tracker.Workspaces;
 using Volo.Abp.Threading;
 using Xunit;
 
@@ -21,23 +20,19 @@ public abstract class TrialExpiryWorkerTests<TStartupModule> : TrackerDomainTest
     where TStartupModule : IAbpModule
 {
     private readonly TrialExpiryWorker _worker;
-    private readonly ITenantManager _tenantManager;
-    private readonly ITenantRepository _tenantRepository;
     private readonly IRepository<Subscription, Guid> _subscriptions;
     private readonly IRepository<Invoice, Guid> _invoices;
     private readonly IRepository<Plan, Guid> _plans;
-    private readonly ICurrentTenant _currentTenant;
+    private readonly ICurrentWorkspace _currentWorkspace;
     private readonly IGuidGenerator _guidGenerator;
 
     protected TrialExpiryWorkerTests()
     {
         _worker = GetRequiredService<TrialExpiryWorker>();
-        _tenantManager = GetRequiredService<ITenantManager>();
-        _tenantRepository = GetRequiredService<ITenantRepository>();
         _subscriptions = GetRequiredService<IRepository<Subscription, Guid>>();
         _invoices = GetRequiredService<IRepository<Invoice, Guid>>();
         _plans = GetRequiredService<IRepository<Plan, Guid>>();
-        _currentTenant = GetRequiredService<ICurrentTenant>();
+        _currentWorkspace = GetRequiredService<ICurrentWorkspace>();
         _guidGenerator = GetRequiredService<IGuidGenerator>();
     }
 
@@ -51,27 +46,22 @@ public abstract class TrialExpiryWorkerTests<TStartupModule> : TrackerDomainTest
     {
         var starter = await WithUnitOfWorkAsync(() => _plans.FirstAsync(p => p.Name == "Starter"));
 
-        // Tenant and subscription in one unit of work: the default-subscription handler then leaves it alone.
-        return await WithUnitOfWorkAsync(async () =>
+        var workspaceId = await ServiceProvider.CreateWorkspaceAsync(name);
+        using (_currentWorkspace.Change(workspaceId))
         {
-            var tenant = await _tenantManager.CreateAsync(name);
-            await _tenantRepository.InsertAsync(tenant);
-            using (_currentTenant.Change(tenant.Id))
+            await WithUnitOfWorkAsync(() => _subscriptions.InsertAsync(new Subscription(_guidGenerator.Create(), workspaceId, starter.Id)
             {
-                await _subscriptions.InsertAsync(new Subscription(_guidGenerator.Create(), tenant.Id, starter.Id)
-                {
-                    Status = status,
-                    TrialEndsAt = trialEndsAt
-                });
-            }
+                Status = status,
+                TrialEndsAt = trialEndsAt
+            }));
+        }
 
-            return tenant.Id;
-        });
+        return workspaceId;
     }
 
     private async Task InvoiceAsync(Guid tenantId, DateTime dueDate)
     {
-        using (_currentTenant.Change(tenantId))
+        using (_currentWorkspace.Change(tenantId))
         {
             await WithUnitOfWorkAsync(() => _invoices.InsertAsync(new Invoice(_guidGenerator.Create(), tenantId, 6m, dueDate)));
         }
@@ -79,9 +69,9 @@ public abstract class TrialExpiryWorkerTests<TStartupModule> : TrackerDomainTest
 
     private async Task<Subscription> GetSubscriptionAsync(Guid tenantId)
     {
-        using (_currentTenant.Change(tenantId))
+        using (_currentWorkspace.Change(tenantId))
         {
-            return await WithUnitOfWorkAsync(() => _subscriptions.FirstAsync(s => s.TenantId == tenantId));
+            return await WithUnitOfWorkAsync(() => _subscriptions.FirstAsync(s => s.WorkspaceId == tenantId));
         }
     }
 
@@ -120,9 +110,9 @@ public abstract class TrialExpiryWorkerTests<TStartupModule> : TrackerDomainTest
     [Fact]
     public async Task Subscriptions_Of_Workspaces_That_No_Longer_Exist_Should_Be_Skipped()
     {
-        var orphanTenantId = Guid.NewGuid(); // no tenant row: a workspace deleted before cancellation existed
+        var orphanTenantId = Guid.NewGuid(); // no workspace row
         var starter = await WithUnitOfWorkAsync(() => _plans.FirstAsync(p => p.Name == "Starter"));
-        using (_currentTenant.Change(orphanTenantId))
+        using (_currentWorkspace.Change(orphanTenantId))
         {
             await WithUnitOfWorkAsync(() => _subscriptions.InsertAsync(
                 new Subscription(_guidGenerator.Create(), orphanTenantId, starter.Id) { TrialEndsAt = DateTime.UtcNow.AddDays(-1) }));

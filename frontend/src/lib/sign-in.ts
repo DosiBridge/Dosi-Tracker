@@ -131,7 +131,7 @@ export function formatWait(seconds: number): string {
 export function signInFailureMessage(failure: SignInFailure, options: { workspace?: string | null; secondsLeft?: number } = {}): string {
   switch (failure.kind) {
     case "invalid":
-      return "That email, password or workspace didn't match. Check them and try again.";
+      return "That email or password didn't match. Check them and try again.";
     case "unknown-workspace":
       return options.workspace
         ? `We couldn't find an active workspace named “${options.workspace}”. Check the spelling — it's the name the workspace was created with.`
@@ -173,17 +173,16 @@ export function failureField(failure: SignInFailure): "workspace" | "credentials
 export const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "https://localhost:6006";
 
 /** The OAuth client the web signs in as and the scopes it asks for (as hooks/useApi's loginApi does). */
-export const WEB_SIGN_IN_CLIENT = { clientId: "Tracker_App", scope: "Tracker offline_access" } as const;
+export const WEB_SIGN_IN_CLIENT = { clientId: "Tracker_App", scope: "openid profile email roles offline_access Tracker" } as const;
 
-/** The token endpoint for a workspace account (named in `__tenant`) or for the platform account. */
-export function tokenEndpoint(tenant?: string | null, baseUrl: string = API_BASE_URL): string {
-  return tenant ? `${baseUrl}/connect/token?__tenant=${encodeURIComponent(tenant)}` : `${baseUrl}/connect/token`;
+/** The token endpoint. Accounts are global: no workspace is named at sign-in. */
+export function tokenEndpoint(baseUrl: string = API_BASE_URL): string {
+  return `${baseUrl}/connect/token`;
 }
 
 export interface ChangeAtSignInRequest {
   /** fetch, injected so the exchange is testable. */
   fetch: (input: string, init: RequestInit) => Promise<Response>;
-  /** The token endpoint, `__tenant` query included for a workspace account. */
   tokenUrl: string;
   clientId: string;
   scope: string;
@@ -264,3 +263,43 @@ export async function changePasswordAtSignIn(req: ChangeAtSignInRequest): Promis
   // A refused change is the server's password rules talking: show its words.
   return { ok: false, failure, message: failure.kind === "invalid" ? asText(refused.error_description) : null };
 }
+
+/* ----------------------------- Workspaces ----------------------------- */
+
+export type WorkspaceRole = "owner" | "manager" | "member";
+
+/** GET /api/app/workspaces/mine item. */
+export interface WorkspaceMembership {
+  id: string;
+  name: string;
+  role: WorkspaceRole | string;
+  planName?: string | null;
+  isOwner?: boolean;
+}
+
+export const WORKSPACE_ROLE_LABELS: Record<WorkspaceRole, string> = { owner: "Owner", manager: "Manager", member: "Member" };
+
+export function workspaceRoleLabel(role: string | null | undefined): string {
+  const r = (role ?? "").toLowerCase() as WorkspaceRole;
+  return WORKSPACE_ROLE_LABELS[r] ?? "Member";
+}
+
+export function workspaceInitial(w: Pick<WorkspaceMembership, "name">): string {
+  return (w.name.trim().charAt(0) || "?").toUpperCase();
+}
+
+export type WorkspaceLanding =
+  | { kind: "create" }
+  | { kind: "select"; id: string }
+  | { kind: "choose" };
+
+/** After sign-in: none → create one; one → open it; several → the last used one if still a member, else choose. */
+export function pickWorkspace(mine: readonly WorkspaceMembership[], lastUsed: string | null): WorkspaceLanding {
+  if (mine.length === 0) return { kind: "create" };
+  if (mine.length === 1) return { kind: "select", id: mine[0].id };
+  const last = lastUsed ? mine.find((w) => w.id.toLowerCase() === lastUsed.toLowerCase()) : undefined;
+  return last ? { kind: "select", id: last.id } : { kind: "choose" };
+}
+
+export const EMAIL_ALREADY_REGISTERED_MESSAGE =
+  "You already have an account — sign in and create a new workspace from the sidebar.";

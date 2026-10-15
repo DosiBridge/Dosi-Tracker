@@ -67,7 +67,7 @@ public abstract class ReportingTestBase<TStartupModule> : TrackerApplicationTest
         var projectId = _guidGenerator.Create();
         await WithUnitOfWorkAsync(async () =>
         {
-            var project = new Project(projectId, null, title, intervalMinutes: 10);
+            var project = new Project(projectId, TrackerTestConsts.WorkspaceId, title, intervalMinutes: 10);
             if (archived || archivedAt.HasValue)
             {
                 project.Archive(archivedAt ?? LongAgo);
@@ -88,7 +88,7 @@ public abstract class ReportingTestBase<TStartupModule> : TrackerApplicationTest
     {
         return WithUnitOfWorkAsync(async () =>
         {
-            var member = new ProjectMember(_guidGenerator.Create(), null, projectId, userId, role, hourlyRate);
+            var member = new ProjectMember(_guidGenerator.Create(), TrackerTestConsts.WorkspaceId, projectId, userId, role, hourlyRate);
             ObjectHelper.TrySetProperty(member, m => m.CreationTime, () => joinedAt ?? LongAgo);
             await _memberRepository.InsertAsync(member);
         });
@@ -106,7 +106,7 @@ public abstract class ReportingTestBase<TStartupModule> : TrackerApplicationTest
     protected Task AddRateAsync(Guid projectId, Guid userId, decimal hourlyRate, DateTime effectiveFrom)
     {
         return WithUnitOfWorkAsync(() => _rateRepository.InsertAsync(
-            new ProjectMemberRate(_guidGenerator.Create(), null, projectId, userId, hourlyRate, effectiveFrom)));
+            new ProjectMemberRate(_guidGenerator.Create(), TrackerTestConsts.WorkspaceId, projectId, userId, hourlyRate, effectiveFrom)));
     }
 
     /// <summary>An Identity account (active unless told otherwise).</summary>
@@ -140,7 +140,7 @@ public abstract class ReportingTestBase<TStartupModule> : TrackerApplicationTest
         Guid projectId, DateTime start, double minutes, Guid? userId = null, int? productivity = 80, Action<Activity>? configure = null)
     {
         var block = new Activity(
-            _guidGenerator.Create(), null, userId ?? CurrentUserId, projectId, Guid.NewGuid(), start, start.AddMinutes(minutes))
+            _guidGenerator.Create(), TrackerTestConsts.WorkspaceId, userId ?? CurrentUserId, projectId, Guid.NewGuid(), start, start.AddMinutes(minutes))
         {
             Productivity = productivity,
             MouseClicks = 10,

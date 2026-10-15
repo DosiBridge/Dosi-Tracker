@@ -5,7 +5,6 @@
     "/api/abp/application-configuration",
     "/api/account/my-profile",
     "/api/identity/users",
-    "/api/multi-tenancy/tenants",
     "/api/app/workspace/register",
     "/api/app/workspace/current-subscription",
     "/api/app/workspace/available-plans",
@@ -33,17 +32,21 @@
     "/api/app/reporting/payroll",
     "/api/app/reporting/hourly",
     "/api/app/reporting/devices",
-    "/api/app/team/reset-password",
     "/api/app/team/from-workspace",
     "/api/account/my-profile/change-password",
     "/api/app/workspace/settings",
     "/api/app/workspace/my-preferences",
-    "/api/app/platform/change-tenant-plan",
     "/api/app/platform/activate-subscription",
     "/api/app/platform/mark-invoice-paid",
     "/api/app/platform/plan",
     "/api/app/platform/{id}/plan",
-    "/api/app/platform/tenant-subscriptions",
-    "/api/app/platform/suspend-subscription"
+    "/api/app/platform/suspend-subscription",
+    "/api/app/workspaces",
+    "/api/app/invitations",
+    "/api/app/team/workspace-role",
+    "/api/app/team/invitations",
+    "/api/app/team/{id}/invitation",
+    "/api/app/platform/change-workspace-plan",
+    "/api/app/platform/workspace-subscriptions"
   ]
 }

@@ -5,7 +5,7 @@ using Dosi.Tracker.Projects;
 using Dosi.Tracker.Reporting;
 using Shouldly;
 using Volo.Abp.Domain.Repositories;
-using Volo.Abp.MultiTenancy;
+using Dosi.Tracker.Workspaces;
 using Xunit;
 
 namespace Dosi.Tracker.EntityFrameworkCore.Persistence;
@@ -16,12 +16,12 @@ public class ProjectMemberRatePersistenceTests : TrackerEntityFrameworkCoreTestB
     private static readonly DateTime October = new(2026, 10, 1, 0, 0, 0, DateTimeKind.Utc);
 
     private readonly IRepository<ProjectMemberRate, Guid> _rateRepository;
-    private readonly ICurrentTenant _currentTenant;
+    private readonly ICurrentWorkspace _currentWorkspace;
 
     public ProjectMemberRatePersistenceTests()
     {
         _rateRepository = GetRequiredService<IRepository<ProjectMemberRate, Guid>>();
-        _currentTenant = GetRequiredService<ICurrentTenant>();
+        _currentWorkspace = GetRequiredService<ICurrentWorkspace>();
     }
 
     [Fact]
@@ -31,7 +31,7 @@ public class ProjectMemberRatePersistenceTests : TrackerEntityFrameworkCoreTestB
         var projectId = Guid.NewGuid();
         var userId = Guid.NewGuid();
 
-        using (_currentTenant.Change(tenantId))
+        using (_currentWorkspace.Change(tenantId))
         {
             await WithUnitOfWorkAsync(async () =>
             {
@@ -50,7 +50,7 @@ public class ProjectMemberRatePersistenceTests : TrackerEntityFrameworkCoreTestB
             history[0].HourlyRate.ShouldBe(20m);
             history[1].HourlyRate.ShouldBe(30.25m);
             history[1].EffectiveFrom.ShouldBe(October);
-            history.ShouldAllBe(r => r.TenantId == tenantId && r.CreationTime != default(DateTime));
+            history.ShouldAllBe(r => r.WorkspaceId == tenantId && r.CreationTime != default(DateTime));
         }
     }
 
@@ -63,7 +63,7 @@ public class ProjectMemberRatePersistenceTests : TrackerEntityFrameworkCoreTestB
         var projectId = Guid.NewGuid();
         var userId = Guid.NewGuid();
 
-        using (_currentTenant.Change(tenantId))
+        using (_currentWorkspace.Change(tenantId))
         {
             await WithUnitOfWorkAsync(async () =>
             {
@@ -93,18 +93,18 @@ public class ProjectMemberRatePersistenceTests : TrackerEntityFrameworkCoreTestB
         var tenantA = Guid.NewGuid();
         var tenantB = Guid.NewGuid();
 
-        using (_currentTenant.Change(tenantA))
+        using (_currentWorkspace.Change(tenantA))
         {
             await WithUnitOfWorkAsync(() => _rateRepository.InsertAsync(
                 new ProjectMemberRate(Guid.NewGuid(), tenantA, Guid.NewGuid(), Guid.NewGuid(), 15m, October)));
         }
 
-        using (_currentTenant.Change(tenantB))
+        using (_currentWorkspace.Change(tenantB))
         {
             (await WithUnitOfWorkAsync(() => _rateRepository.GetCountAsync())).ShouldBe(0);
         }
 
-        using (_currentTenant.Change(tenantA))
+        using (_currentWorkspace.Change(tenantA))
         {
             (await WithUnitOfWorkAsync(() => _rateRepository.GetCountAsync())).ShouldBe(1);
         }

@@ -28,4 +28,14 @@ public static class TrackerDomainErrorCodes
 
     /// <summary>The caller may not grant the requested project role.</summary>
     public const string RoleNotAllowed = "Tracker:RoleNotAllowed";
+
+    public const string WorkspaceRequired = "Tracker:WorkspaceRequired";
+    public const string NotWorkspaceMember = "Tracker:NotWorkspaceMember";
+    public const string EmailAlreadyRegistered = "Tracker:EmailAlreadyRegistered";
+    public const string DuplicateWorkspaceName = "Tracker:DuplicateWorkspaceName";
+    public const string LastOwnerCannotLeave = "Tracker:LastOwnerCannotLeave";
+    public const string InvitationNotFound = "Tracker:InvitationNotFound";
+    public const string InvitationExpired = "Tracker:InvitationExpired";
+    public const string InvitationEmailMismatch = "Tracker:InvitationEmailMismatch";
+    public const string AlreadyWorkspaceMember = "Tracker:AlreadyWorkspaceMember";
 }

@@ -42,7 +42,7 @@ public abstract class PresenceMemberTests<TStartupModule> : TrackerApplicationTe
         await CreateUserAsync(CurrentUserId, "ana");
         await CreateUserAsync(colleagueId, "bob");
         await WithUnitOfWorkAsync(() => GetRequiredService<IRepository<AgentPresence, Guid>>().InsertAsync(
-            new AgentPresence(Guid.NewGuid(), null, colleagueId, Guid.NewGuid(), "tracking", DateTime.UtcNow)));
+            new AgentPresence(Guid.NewGuid(), TrackerTestConsts.WorkspaceId, colleagueId, Guid.NewGuid(), "tracking", DateTime.UtcNow)));
 
         var ownDevice = Guid.NewGuid();
         await GetRequiredService<IPresenceAppService>().HeartbeatAsync(new HeartbeatDto { DeviceId = ownDevice, Status = "break" });

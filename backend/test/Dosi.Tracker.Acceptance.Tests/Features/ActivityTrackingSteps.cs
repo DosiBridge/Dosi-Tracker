@@ -49,7 +49,7 @@ public sealed class ActivityTrackingSteps
             var projects = _app.Resolve<IRepository<Project, Guid>>();
             var id = Guid.NewGuid();
             // Inserted directly, with no ProjectMember for the current user.
-            await projects.InsertAsync(new Project(id, null, "Foreign Project"));
+            await projects.InsertAsync(new Project(id, TrackerTestConsts.WorkspaceId, "Foreign Project"));
             _state.ProjectId = id;
         });
     }

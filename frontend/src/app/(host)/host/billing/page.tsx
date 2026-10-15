@@ -71,8 +71,7 @@ export default function HostBillingPage() {
         mrr: overview?.mrr ?? 0,
         rows: items.map((i) => ({
           id: i.id,
-          // A row whose tenant has no name any more belongs to a deleted workspace, not to the host.
-          tenant: i.tenantName || (i.tenantId ? "Deleted workspace" : "Host"),
+          tenant: i.workspaceName || "Deleted workspace",
           amount: Number(i.amount) || 0,
           status: i.status,
           date: (i.dueDate ?? "").slice(0, 10),

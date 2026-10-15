@@ -252,7 +252,7 @@ describe("architecture spec: persistence boundaries", () => {
    *  - lib/live-session: THE storage layer. Its safe wrappers (readStorage /
    *    writeStorage / removeStorage, which never throw when the browser
    *    blocks site data) carry every session read and write: useApi's tokens
-   *    and tenant, SessionProvider's demo state, tenant-data's created
+   *    and current workspace (dosi-workspace), SessionProvider's demo state, tenant-data's created
    *    projects and the theme. It is also the single live-mode probe
    *    (`isLiveSession()` reads dosi-token): do NOT reintroduce an inline one.
    *  - The static pre-hydration theme script in app/layout.
@@ -447,8 +447,6 @@ describe("architecture spec: secret scanning", () => {
      * an inlined credential.
      */
     const SECRET_PATTERN = /(password|secret|api[_-]?key|bearer\s+[a-z0-9])/i;
-    // How the lexer marks a template literal's `${…}` placeholder.
-    const PLACEHOLDER = String.fromCharCode(0);
     // Each entry was read in context and is benign: UI copy, an <input type>,
     // a demo app name, or a DOM id/aria-label for a password FIELD (a label
     // for the box, never a value that goes in it).
@@ -462,12 +460,11 @@ describe("architecture spec: secret scanning", () => {
       "Hide password", // aria-label on the reveal toggle
       "Forgot password?", // link copy
       // Sign-in error copy. Names the fields, carries no credential value.
-      "That email, password or workspace didn't match. Check them and try again.",
+      "That email or password didn't match. Check them and try again.",
       // Backend ROUTES (lib/api-contract.ts), declared in api-contract.json: the
-      // self-service change and the manager's reset. Paths, never credentials —
+      // self-service change. Paths, never credentials —
       // the passwords travel in the request body / response, never in source.
       "/api/account/my-profile/change-password",
-      `/api/app/team/reset-password?userId=${PLACEHOLDER}`,
       // "Forgot password?" guidance; \u0000 is the support-address placeholder.
       "Contact your workspace owner to reset your password. Workspace owners: email \u0000.",
       // HTML autocomplete tokens on password FIELDS (sign-in, the session's
@@ -516,8 +513,10 @@ describe("architecture spec: route-permission consistency", () => {
    * Intentionally outside the navAccess matrix:
    *  - "/"       → redirect stub straight to /dashboard (which IS guarded).
    *  - "/login"  → the public sign-in page; it must be reachable logged-out.
+   *  - "/workspaces" → the workspace chooser: signed in, but before any workspace (so before any role).
+   *  - "/invite/[token]" → an invitation link; it must open logged-out.
    */
-  const PUBLIC_ROUTES = new Set<string>(["/", "/login"]);
+  const PUBLIC_ROUTES = new Set<string>(["/", "/login", "/workspaces", "/invite/[token]"]);
 
   it("has a real page behind every navAccess permission (no phantom permissions)", () => {
     // RULE 9a — a navAccess key with no page is dead configuration that

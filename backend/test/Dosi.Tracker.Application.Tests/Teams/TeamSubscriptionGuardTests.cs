@@ -32,10 +32,10 @@ public abstract class TeamSubscriptionGuardTests<TStartupModule> : TeamTestBase<
         var projectId = GuidGenerator.Create();
         await WithUnitOfWorkAsync(async () =>
         {
-            await GetRequiredService<IRepository<Project, Guid>>().InsertAsync(new Project(projectId, null, "Existing"));
+            await GetRequiredService<IRepository<Project, Guid>>().InsertAsync(new Project(projectId, TrackerTestConsts.WorkspaceId, "Existing"));
             var members = GetRequiredService<IRepository<ProjectMember, Guid>>();
-            await members.InsertAsync(new ProjectMember(GuidGenerator.Create(), null, projectId, CurrentUserId, ProjectMemberRoles.Admin));
-            await members.InsertAsync(new ProjectMember(GuidGenerator.Create(), null, projectId, memberId));
+            await members.InsertAsync(new ProjectMember(GuidGenerator.Create(), TrackerTestConsts.WorkspaceId, projectId, CurrentUserId, ProjectMemberRoles.Admin));
+            await members.InsertAsync(new ProjectMember(GuidGenerator.Create(), TrackerTestConsts.WorkspaceId, projectId, memberId));
         });
         return projectId;
     }
@@ -68,9 +68,9 @@ public abstract class TeamSubscriptionGuardTests<TStartupModule> : TeamTestBase<
         var projectId = GuidGenerator.Create();
         await WithUnitOfWorkAsync(async () =>
         {
-            await GetRequiredService<IRepository<Project, Guid>>().InsertAsync(new Project(projectId, null, "Existing"));
+            await GetRequiredService<IRepository<Project, Guid>>().InsertAsync(new Project(projectId, TrackerTestConsts.WorkspaceId, "Existing"));
             await GetRequiredService<IRepository<ProjectMember, Guid>>().InsertAsync(
-                new ProjectMember(GuidGenerator.Create(), null, projectId, client.Id, ProjectMemberRoles.Client));
+                new ProjectMember(GuidGenerator.Create(), TrackerTestConsts.WorkspaceId, projectId, client.Id, ProjectMemberRoles.Client));
         });
 
         (await Should.ThrowAsync<BusinessException>(() => TeamAppService.UpdateMemberAsync(
@@ -89,7 +89,6 @@ public abstract class TeamSubscriptionGuardTests<TStartupModule> : TeamTestBase<
         (await TeamAppService.GetProjectMembersAsync(projectId)).Items.Count.ShouldBe(2);
         (await TeamAppService.UpdateMemberAsync(projectId, member.Id, new UpdateProjectMemberDto { Role = "Client" }))
             .Role.ShouldBe("Client");
-        (await TeamAppService.ResetPasswordAsync(member.Id)).InitialPassword.ShouldNotBeNullOrWhiteSpace();
 
         await TeamAppService.RemoveFromWorkspaceAsync(member.Id);
         (await GetMembershipsOfUserAsync(member.Id)).ShouldBeEmpty();

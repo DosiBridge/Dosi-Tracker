@@ -11,12 +11,15 @@
 //! | network, 5xx, 404/405/408/429, a 4xx without a code | kept; retried after 30 s, doubling up to 30 min (`Retry-After` honoured) |
 //! | sign-in refused | kept; uploads stop, the worker asks for the password |
 //! | 402 subscription inactive | kept; retried hourly |
+//! | 403 not a workspace member | kept; that workspace's rows wait, the worker asks for another workspace |
 //! | 403 not a member / 409 archived | the projects are fetched again: parked if the project is gone, else kept |
 //! | 425 in the future | kept; retried in 5 minutes (the clock is ahead) |
 //! | 413, capture too large/invalid | the images are stripped and it is sent again at once |
 //! | overlap, id conflict, too long/old, invalid range, validation | parked with the server's reason |
 //!
-//! `sentAt` is stamped by the API client on every attempt.
+//! Each row is sent to the workspace it was recorded in (`X-Workspace-Id`),
+//! whichever workspace is tracked now. `sentAt` is stamped by the API client
+//! on every attempt.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -108,6 +111,8 @@ pub enum UploadEvent {
     /// Rows of `owner` were parked (rejected by the server): the project list
     /// is worth fetching again (CONTRACT §2: after any 403/409).
     Parked { owner: String, count: u32 },
+    /// `owner` is no longer a member of `workspace_id`.
+    WorkspaceLost { owner: String, workspace_id: String },
 }
 
 /// How a pass ended.
@@ -413,11 +418,14 @@ impl Uploader {
             return PassEnd::Idle;
         };
         let owner = current.owner.clone();
+        let tracked_workspace = current.account.workspace_id.clone();
         let mut cursor = 0;
         let mut uploaded = 0u32;
         let mut parked = 0u32;
-        // The project list, once fetched in this pass (after a 403/409).
-        let mut listed: Option<Vec<Project>> = None;
+        // A workspace's project list, once fetched in this pass (after a 403/409).
+        let mut listed: Option<(String, Vec<Project>)> = None;
+        // Workspaces this user lost access to: their rows wait.
+        let mut blocked: Vec<String> = Vec::new();
 
         let end = loop {
             if uploaded + parked > 0 {
@@ -427,7 +435,7 @@ impl Uploader {
             if deadline.is_some_and(|by| Instant::now() >= by) {
                 break PassEnd::Waiting;
             }
-            let row = match store.pending_batch(&owner, cursor, 1) {
+            let row = match store.pending_rows(&owner, cursor, 1) {
                 Ok(mut rows) => rows.pop(),
                 Err(e) => {
                     tracing::error!(?e, "could not read the local queue");
@@ -435,10 +443,25 @@ impl Uploader {
                     break PassEnd::StoreFailed;
                 }
             };
-            let Some((id, activity)) = row else {
-                break PassEnd::Drained;
+            let Some(row) = row else {
+                if blocked.is_empty() {
+                    break PassEnd::Drained;
+                }
+                // Only rows of workspaces this user lost remain: they wait.
+                let delay = self.backoff.next(None);
+                let next = Utc::now() + chrono::Duration::from_std(delay).unwrap_or_default();
+                let reason = "No access to the workspace these blocks were recorded in.".to_owned();
+                self.not_before = Some(Instant::now() + delay);
+                self.state.update(|s| s.upload_issue = Some(UploadIssue::Retrying { next_attempt_at: next, reason }));
+                break PassEnd::Waiting;
             };
+            let (id, activity, workspace) = (row.id, row.activity, row.workspace_id);
             cursor = id;
+            if blocked.contains(&workspace) {
+                continue;
+            }
+            current.client.set_workspace(Some(workspace.clone()));
+            let tracked = tracked_workspace.as_deref() == Some(workspace.as_str());
 
             let error = match current.client.submit_activity(&activity).await {
                 Ok(()) => {
@@ -487,12 +510,24 @@ impl Uploader {
                     }
                     Err(e) => Wait::Backoff { reason: format!("could not strip the images: {e}"), retry_after: None },
                 },
+                SubmitError::NotWorkspaceMember(message) => {
+                    tracing::warn!(id, %workspace, "no longer a member of the block's workspace; its blocks wait");
+                    let _ = store.note_attempt(id, Some(&message));
+                    if tracked {
+                        let _ = self.events.send(UploadEvent::WorkspaceLost { owner: owner.clone(), workspace_id: workspace.clone() });
+                    }
+                    blocked.push(workspace);
+                    continue;
+                }
                 SubmitError::ProjectUnavailable { code, message } => {
-                    if listed.is_none() {
+                    if listed.as_ref().is_none_or(|(of, _)| *of != workspace) {
+                        listed = None;
                         match current.client.my_projects().await {
                             Ok(projects) => {
-                                let _ = self.events.send(UploadEvent::Projects { owner: owner.clone(), projects: projects.clone() });
-                                listed = Some(projects);
+                                if tracked {
+                                    let _ = self.events.send(UploadEvent::Projects { owner: owner.clone(), projects: projects.clone() });
+                                }
+                                listed = Some((workspace.clone(), projects));
                             }
                             Err(e) if e.is_auth_rejected() => {
                                 let _ = store.note_attempt(id, Some(&e.to_string()));
@@ -505,7 +540,7 @@ impl Uploader {
                         }
                     }
                     match &listed {
-                        Some(projects) if !projects.iter().any(|p| p.id == activity.project_id) => {
+                        Some((_, projects)) if !projects.iter().any(|p| p.id == activity.project_id) => {
                             // The project is really gone: this block can
                             // never be accepted.
                             if !park(store, &self.state, id, &message) {
@@ -691,12 +726,7 @@ mod tests {
         let (tx, events) = tokio::sync::mpsc::unbounded_channel();
         let state = StateHandle::new();
         let store = Storage::open(":memory:", None).unwrap();
-        let account = Account {
-            server: url.to_string(),
-            workspace: "acme".into(),
-            username: "alice@acme.com".into(),
-            password: "pw".into(),
-        };
+        let account = Account::new(url.to_string(), "alice@acme.com".into(), "pw".into()).in_workspace("w1", "Acme");
         let owner = account.owner();
         let mut uploader = Uploader::new(PathBuf::from(":memory:"), Some(store), state.clone(), ServerClock::default(), Arc::new(|| {}), tx);
         uploader.set_account(account);
@@ -712,7 +742,11 @@ mod tests {
                 activity.screenshot_thumb_jpg_base64 = Some("/9j/dGh1bWI=".into());
                 activity.screenshot_captured_at = Some(now - chrono::Duration::minutes(5));
             }
-            self.store().enqueue(&activity, &self.owner).unwrap()
+            self.queue_in("w1", activity)
+        }
+
+        fn queue_in(&self, workspace: &str, activity: Activity) -> i64 {
+            self.store().enqueue(&activity, &self.owner, workspace).unwrap()
         }
 
         fn store(&self) -> &Storage {
@@ -892,9 +926,9 @@ mod tests {
     async fn rows_of_another_account_are_never_uploaded() {
         let (url, requests) = canned_server(vec![token_ok()]);
         let mut h = harness(&url);
-        let bob = crate::storage::owner_key("acme", "bob@acme.com");
+        let bob = crate::storage::owner_key("bob@acme.com");
         let now = Utc::now();
-        h.store().enqueue(&Activity::new("p1", now - chrono::Duration::minutes(10), now), &bob).unwrap();
+        h.store().enqueue(&Activity::new("p1", now - chrono::Duration::minutes(10), now), &bob, "w1").unwrap();
         assert!(!h.uploader.ready());
         assert_eq!(h.uploader.drain(None).await, PassEnd::Drained);
         assert_eq!(requests.try_iter().count(), 0, "nothing was sent");
@@ -908,5 +942,59 @@ mod tests {
         assert_eq!(h.uploader.drain(Some(Instant::now())).await, PassEnd::Waiting);
         assert_eq!(requests.try_iter().count(), 0);
         assert_eq!(h.rows()[0].status, RowStatus::Queued);
+    }
+
+    fn header_of(request: &str, name: &str) -> Option<String> {
+        let head = &request[..request.find("
+
+").unwrap_or(request.len())];
+        head.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim().eq_ignore_ascii_case(name).then(|| value.trim().to_owned())
+        })
+    }
+
+    #[tokio::test]
+    async fn rows_upload_to_the_workspace_they_were_recorded_in_after_a_switch() {
+        let (url, requests) = canned_server(vec![token_ok(), http("200 OK", &[], "{}"), http("200 OK", &[], "{}")]);
+        let mut h = harness(&url);
+        let now = Utc::now();
+        h.queue_in("wA", Activity::new("pa", now - chrono::Duration::minutes(20), now - chrono::Duration::minutes(10)));
+        // Switched to workspace B: the same user and token, another workspace.
+        let switched = h.uploader.current.as_ref().unwrap().account.clone().in_workspace("wB", "Globex");
+        h.uploader.set_account(switched);
+        h.queue_in("wB", Activity::new("pb", now - chrono::Duration::minutes(10), now));
+
+        assert_eq!(h.uploader.drain(None).await, PassEnd::Drained);
+        let requests: Vec<String> = requests.try_iter().collect();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(header_of(&requests[0], "x-workspace-id"), None, "the token request");
+        assert_eq!((header_of(&requests[1], "x-workspace-id").as_deref(), body_of(&requests[1])["projectId"].as_str()), (Some("wA"), Some("pa")));
+        assert_eq!((header_of(&requests[2], "x-workspace-id").as_deref(), body_of(&requests[2])["projectId"].as_str()), (Some("wB"), Some("pb")));
+        assert!(h.rows().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rows_of_a_lost_workspace_wait_and_the_rest_go_up() {
+        let lost = abp("Tracker:NotWorkspaceMember", "You are not a member of this workspace.");
+        let (url, requests) = canned_server(vec![token_ok(), http("403 Forbidden", &[], &lost), http("200 OK", &[], "{}")]);
+        let mut h = harness(&url);
+        let now = Utc::now();
+        let kept = h.queue("p1", false);
+        h.queue_in("w1", Activity::new("p1", now - chrono::Duration::minutes(30), now - chrono::Duration::minutes(20)));
+        h.queue_in("w2", Activity::new("p2", now - chrono::Duration::minutes(40), now - chrono::Duration::minutes(30)));
+
+        assert_eq!(h.uploader.drain(None).await, PassEnd::Waiting);
+        let requests: Vec<String> = requests.try_iter().collect();
+        assert_eq!(requests.len(), 3, "one try in w1, then w2's row; w1's second row is not tried");
+        assert_eq!(header_of(&requests[2], "x-workspace-id").as_deref(), Some("w2"));
+        let rows = h.rows();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.status == RowStatus::Queued), "never parked: {rows:?}");
+        assert_eq!(rows.iter().find(|r| r.id == kept).unwrap().reason.as_deref(), Some("You are not a member of this workspace."));
+        assert_eq!(h.waits_for(), Some(30));
+        let events: Vec<UploadEvent> = std::iter::from_fn(|| h.events.try_recv().ok()).collect();
+        assert!(events.iter().any(|e| matches!(e, UploadEvent::WorkspaceLost { workspace_id, .. } if workspace_id == "w1")), "{events:?}");
+        assert!(events.iter().any(|e| matches!(e, UploadEvent::Uploaded(1))), "{events:?}");
     }
 }

@@ -6,6 +6,7 @@ using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Guids;
 using Volo.Abp.Identity;
 using Volo.Abp.Modularity;
+using Dosi.Tracker.Workspaces;
 using Xunit;
 
 namespace Dosi.Tracker.Identity;
@@ -26,7 +27,7 @@ public abstract class ManagerRoleSynchronizerTests<TStartupModule> : TrackerDoma
         _guidGenerator = GetRequiredService<IGuidGenerator>();
     }
 
-    /// <summary>A team lead (Identity "manager" role) who is <paramref name="role"/> on a new project.</summary>
+    /// <summary>A team lead (workspace manager) who is <paramref name="role"/> on a new project.</summary>
     private async Task<(Guid UserId, Guid ProjectId)> SeedLeadAsync(string role)
     {
         var userId = _guidGenerator.Create();
@@ -37,18 +38,30 @@ public abstract class ManagerRoleSynchronizerTests<TStartupModule> : TrackerDoma
             var userManager = GetRequiredService<IdentityUserManager>();
             var user = new IdentityUser(userId, "lead", "lead@acme.test");
             (await userManager.CreateAsync(user)).Succeeded.ShouldBeTrue();
-            await _projectRepository.InsertAsync(new Project(projectId, null, "Led project"));
-            await _memberRepository.InsertAsync(new ProjectMember(_guidGenerator.Create(), null, projectId, userId, role));
+            await _projectRepository.InsertAsync(new Project(projectId, TrackerTestConsts.WorkspaceId, "Led project"));
+            await _memberRepository.InsertAsync(new ProjectMember(_guidGenerator.Create(), TrackerTestConsts.WorkspaceId, projectId, userId, role));
         });
+        await ServiceProvider.AddWorkspaceMemberAsync(userId, WorkspaceRoles.Member);
         await WithUnitOfWorkAsync(() => _synchronizer.GrantAsync(userId));
 
         return (userId, projectId);
     }
 
-    private Task<bool> IsManagerAsync(Guid userId)
+    private async Task<bool> IsManagerAsync(Guid userId)
     {
-        return WithUnitOfWorkAsync(async () =>
-            (await GetRequiredService<IIdentityUserRepository>().GetRoleNamesAsync(userId)).Contains(TrackerRoles.Manager));
+        return (await ServiceProvider.FindWorkspaceMemberAsync(userId))?.Role == WorkspaceRoles.Manager;
+    }
+
+    [Fact]
+    public async Task An_Owner_Should_Never_Be_Demoted_Or_Promoted()
+    {
+        var (userId, _) = await SeedLeadAsync("Worker");
+        await ServiceProvider.AddWorkspaceMemberAsync(userId, WorkspaceRoles.Owner);
+
+        await WithUnitOfWorkAsync(() => _synchronizer.RevokeIfUnusedAsync(userId));
+        await WithUnitOfWorkAsync(() => _synchronizer.GrantAsync(userId));
+
+        (await ServiceProvider.FindWorkspaceMemberAsync(userId))!.Role.ShouldBe(WorkspaceRoles.Owner);
     }
 
     [Fact]
