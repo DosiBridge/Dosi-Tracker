@@ -1,6 +1,6 @@
 # Dosi-Tracker — PM Status Report & Evidence Matrix
 
-> **Document Class:** Production Readiness Audit & Status Tracking (Phase 1 Follow-up)  
+> **Document Class:** Production Readiness Audit & Status Tracking (Phase 1 Follow-up 2)  
 > **Status Date:** October 18, 2026  
 > **Auditor / Implementation Engineer:** Antigravity Pair Engineer  
 > **Supervisor:** PM / QA Operator  
@@ -10,7 +10,7 @@
 
 ## 1. Executive Status & Audit Summary
 
-Following a comprehensive audit of the Dosi-Tracker codebase against product documentation (`DOCUMENTATION.md`, `docs/AS_BUILT.md`, `docs/PRODUCTION_READINESS.md`, `docs/SECURITY.md`, `docs/RUNBOOK.md`, `docs/QUALITY.md`, and `ENGINEERING_BLUEPRINT.md`), the repository status has been verified using real local toolchains and truthful evidence boundaries.
+Following independent review by the PM/QA operator and follow-up verification across the Dosi-Tracker codebase against product documentation (`DOCUMENTATION.md`, `docs/AS_BUILT.md`, `docs/PRODUCTION_READINESS.md`, `docs/SECURITY.md`, `docs/RUNBOOK.md`, `docs/QUALITY.md`, and `ENGINEERING_BLUEPRINT.md`), repository evidence is tracked with strict technical boundaries.
 
 ### Key Audit Findings & Evidence Distinctions:
 1. **Pipeline Core is Real (Synthetic / Test-Host Verified)**:
@@ -20,23 +20,22 @@ Following a comprehensive audit of the Dosi-Tracker codebase against product doc
 2. **Frontend Integration (Component & Simulated Session Verified)**:
    - Next.js 16 dashboard includes comprehensive UI flows for workspace signups, login, projects, team member rates, real-clock reporting (`/api/app/reporting/summary`), and presence monitors.
    - Tests run in Node.js / jsdom using mocked fetch handlers (`useApi`), memory datasets, and `@testing-library/react`.
-   - This proves component contracts, accessibility compliance, and state transitions, but does **not** substitute for live end-to-end browser testing over WAN.
+   - **Accessibility Boundary**: Automated `jest-axe` checks in jsdom and programmatic contrast calculations cover only automated, programmatic accessibility invariants. Axe in jsdom does **not** prove full WCAG 2.1 AA/AAA compliance; real-browser keyboard focus management, screen reader announcements, focus traps, visual layout reflow, and assistive tech audits remain open.
 3. **Desktop Agent Reality & Strict OS Evidence Separation**:
-   - **Windows Client**: Mature Rust desktop client source with 345 passing cargo unit/integration tests.
+   - **Windows Client**: Source code present (`clients/windows`) with 345 passing cargo unit/integration tests.
      - *Evidence Reality*: Cargo tests verify models, SQLite queue FIFO ordering, exponential backoff, poison row parking (`synced = 2`), and synthetic worker state machines.
-     - *Crucial Distinction*: Cargo tests use mock inputs and synthetic structures; they do **NOT** verify native interactive hardware execution (live display capture via DXGI/GDI, live global low-level keyboard/mouse hooks, or live Win32 focus events on an active desktop session).
-   - **macOS Client**: Complete Swift 5.9 source code present under `clients/macos/` using `ScreenCaptureKit`, `AVFoundation`, and `Accessibility` APIs.
-     - *Evidence Reality*: Source presence is **NOT** runtime validation. CI configuration files (`.github/workflows/macos.yml`) are not proof tests ran.
-     - *Crucial Distinction*: On this Windows 11 host, Swift toolchain and macOS hardware are absent; native build, test execution, and runtime validation remain unexecuted and outstanding.
+     - *Crucial Distinction*: Source presence is **not** proof of complete implementation. Cargo tests use mock inputs and synthetic structures; they do **NOT** verify native interactive hardware execution (live display capture via DXGI/GDI, live global low-level keyboard/mouse hooks, or live Win32 focus events on an active desktop session). Native runtime, per-user consent UI, packaging, and signing remain open.
+   - **macOS Client**: Swift 5.9 source code present under `clients/macos/` using `ScreenCaptureKit`, `AVFoundation`, and `Accessibility` APIs.
+     - *Evidence Reality*: Source presence is **NOT** runtime validation or complete implementation. CI configuration files (`.github/workflows/macos.yml`) are not proof tests ran.
+     - *Crucial Distinction*: On this Windows 11 host, Swift toolchain and macOS hardware are absent; native build, test execution, TCC consent handling, packaging, notarization, and runtime validation remain unexecuted and outstanding.
    - **Linux Client**: **Explicit Architectural Gap**.
-     - No Linux client crate existed (`clients/linux` was not present).
-     - Both backend and frontend previously hardcoded a two-platform assumption (`"windows"` and `"macos"` only), actively discarding `"linux"` payloads.
-4. **Phase 1 Baseline & Follow-up Actions Completed**:
-   - Backend `ActivityConsts.Platforms` and frontend contracts (`api-contract.ts`, `types.ts`, `devices.ts`, `analytics.ts`, `report-math.ts`, `live-dataset.ts`) updated to accept and normalize `"linux"`.
-   - Corrected accessibility contrast regression: replaced low-contrast Linux color `#e97b35` (2.86:1 on white) with `#cb6e17` (3.63:1 on `#ffffff`, 4.43:1 on `#1a2226`), satisfying the $\ge 3:1$ requirement on both card themes.
-   - Added automated regression testing importing actual `PLATFORM_COLORS` source constants.
-   - Added explicit Linux `platformMix` regression test in `analytics.test.ts`.
-   - Split backend Linux tests into dedicated independent `[Fact]` methods (`Create_Should_Accept_And_Store_Linux_Platform` in `ActivityAppServiceTests.cs` and `Heartbeat_Should_Accept_And_Store_Linux_Platform` in `PresenceAppServiceTests.cs`), executed by the concrete EF Core host harness (`EfCoreActivityAppServiceTests` and `EfCorePresenceAppServiceTests`).
+     - No Linux client crate exists (`clients/linux` is not yet created).
+4. **Phase 1 Follow-up Refinements Completed**:
+   - Fixed accessibility contrast regression: replaced low-contrast Linux color `#e97b35` (2.86:1 on white) with `#cb6e17` (3.63:1 on `#ffffff`, 4.43:1 on `#1a2226`).
+   - Derived actual `--card` background tokens dynamically from [globals.css](file:///d:/Github%20Projects/DosiBridge/Open%20Source/Dosi-Tracker/frontend/src/app/globals.css) in [analytics-charts.test.ts](file:///d:/Github%20Projects/DosiBridge/Open%20Source/Dosi-Tracker/frontend/src/components/reports/analytics-charts.test.ts) rather than hardcoding literals.
+   - Added guards against stale literals, malformed tokens, and media-query print overrides (`.dark .work-report`).
+   - Explicitly prefixed every test in `analytics-charts.test.ts` with `a11y:`, ensuring `npm run test:a11y` explicitly matches and executes all 9 contrast/token tests.
+   - Split backend Linux tests into independent `[Fact]` methods executed by concrete EF Core host harness.
 
 ---
 
@@ -65,19 +64,19 @@ Following a comprehensive audit of the Dosi-Tracker codebase against product doc
 | **Time Reporting** | Tracked time & productivity duration-weighted math | **Implemented (Unit Verified)** | `ReportingAppService.cs`, `analytics.ts`, `work-report.ts` |
 | | Calendar & timezone normalization (IANA conversion) | **Implemented (Unit Verified)** | `AgentContextNormalizer.cs`, `TimeZoneIds.cs`, `time-zone.ts` |
 | | Member work rhythm & hourly distribution | **Implemented (Unit Verified)** | `ReportingAppServiceTests.cs`, `analytics-charts.tsx` |
-| **Native Permissions** | Windows low-level input counting (no raw keys) | **Implemented (Synthetic Only)** | `clients/windows/src/worker.rs` (rdev event counter in source; unit tested via simulated events; native hardware hooks unverified) |
-| | Windows active window & process enumeration | **Implemented (Synthetic Only)** | `EnumWindows` visible-window enumeration in source; native interactive window enumeration unverified |
-| | macOS Screen Recording, Accessibility, Camera TCC | **Implemented (Source Only)** | `clients/macos/Sources/DosiTracker/Capture/ScreenCaptureService.swift`; runtime execution unverified |
+| **Native Permissions** | Windows low-level input counting (no raw keys) | **Source Present (Synthetic Only)** | `clients/windows/src/worker.rs` (rdev event counter in source; unit tested via simulated events; native hardware hooks and consent unverified) |
+| | Windows active window & process enumeration | **Source Present (Synthetic Only)** | `EnumWindows` visible-window enumeration in source; native interactive window enumeration unverified |
+| | macOS Screen Recording, Accessibility, Camera TCC | **Source Present Only** | `clients/macos/Sources/DosiTracker/Capture/ScreenCaptureService.swift`; runtime execution and TCC consent unverified |
 | | Linux X11/Wayland input & display handling | **Unresolved Gap** | `clients/linux` crate not yet created; Wayland portal session required |
-| **Packaging & Dist** | Windows NSIS installer & uninstaller | **Implemented (Source Only)** | `clients/windows/installer/dosi-tracker.nsi`, autostart registry configuration |
-| | Windows Authenticode code signing | **Outstanding Prerequisite** | Unsigned in local development builds; code signing certificate required. SmartScreen must not be bypassed in production. |
-| | macOS App Bundle & Hardened Runtime | **Implemented (Source Only)** | `clients/macos/scripts/build-app.sh`; Apple Developer ID signing and notarization are outstanding prerequisites. |
+| **Packaging & Dist** | Windows NSIS installer & uninstaller | **Partial (Source Script)** | `clients/windows/installer/dosi-tracker.nsi`; packaging and silent install/uninstall unverified in CI |
+| | Windows Authenticode code signing | **Outstanding Prerequisite** | Unsigned in local builds; code signing certificate required. Signing does not guarantee immediate elimination of SmartScreen warnings (reputation accumulation required); SmartScreen must not be bypassed. |
+| | macOS App Bundle & Hardened Runtime | **Partial (Source Script)** | `clients/macos/scripts/build-app.sh`; Apple Developer ID signing and notarization are outstanding prerequisites. |
 | | Linux packaging (.deb, AppImage, Flatpak) | **Unresolved Gap** | No Linux package configuration exists |
 | **Observability & Ops**| Serilog structured logging & health checks | **Implemented (Test-Host Verified)** | `HttpApi.Host/Program.cs`, `/health-status` endpoint |
 | | Prometheus metrics / OpenTelemetry tracing | **Unresolved Gap** | No Prometheus scraper or OTel exporter configured |
 | | Automated screenshot & activity retention cleanup | **Unresolved Gap** | Retention limits defined in host settings, but periodic pruning background worker not wired |
-| **Accessibility** | WCAG 2.1 AA jest-axe & Playwright axe scans | **Implemented (Unit Verified)** | Vitest a11y suite (49 passed axe assertions across dashboard components) |
-| | Machine contrast verification on card tokens | **Implemented (Unit Verified)** | `analytics-charts.test.ts` asserts every member of `PLATFORM_COLORS` $\ge 3:1$ against `#ffffff` and `#1a2226` |
+| **Accessibility** | Programmatic component axe & machine contrast checks | **Partially Verified (Automated in jsdom)** | Automated `jest-axe` checks in jsdom and programmatic contrast calculations pass (53 a11y tests); does NOT prove full WCAG compliance. Real-browser keyboard traps, screen reader verification, zoom reflow, and manual assistive audits remain open. |
+| | Machine contrast verification on card tokens | **Implemented (Unit Verified)** | `analytics-charts.test.ts` derives actual `--card` tokens from `globals.css` and asserts every member of `PLATFORM_COLORS` $\ge 3:1$ against `#ffffff` and `#1a2226` |
 
 ---
 
@@ -95,6 +94,7 @@ Following a comprehensive audit of the Dosi-Tracker codebase against product doc
    - The agent is an observer, not an actor. It must never synthesize mouse movements, inject keypresses, or generate fake activity to simulate presence.
 4. **No Raw Keystrokes or Cadence Logging**:
    - Both Windows (`clients/windows/src/worker.rs`) and macOS (`clients/macos/.../InputMonitoringService.swift`) agents strictly discard keycodes, virtual keys, unicode characters, and inter-keystroke intervals. Only monotonic counts of keyboard events are stored in the SQLite block.
+   - *Legal Precision*: Recording monotonic event tallies rather than raw keycodes is a privacy-conscious data minimization measure, but does **not** by itself establish legal compliance with GDPR, CCPA, or labor laws. Compliance depends on lawful basis, employee notice, data processing agreements, proportional monitoring policies, and data subject rights.
 5. **No Silent Webcam Capture**:
    - Project settings default `AllowWebcam = false`. When enabled on the server, webcam captures require local user consent, visible indicator, and capture only discrete downscaled JPEGs once per interval.
 6. **No Default Hardware Fingerprinting**:
@@ -117,89 +117,89 @@ To maintain absolute technical truth, evidence is divided into six concrete dime
 
 | Evidence Dimension | Windows (Rust) | macOS (Swift) | Linux (Target) |
 |---|---|---|---|
-| **1. Implemented Source** | ✅ Complete (`clients/windows`: egui UI, Win32 hooks, xcap, DPAPI, SQLite queue) | ✅ Complete (`clients/macos`: SwiftUI, ScreenCaptureKit, Keychain, SQLite queue) | ❌ **Unresolved Gap** (`clients/linux` crate not yet created) |
+| **1. Implemented Source** | ⚠️ Source present (`clients/windows`: egui UI, Win32 hooks, xcap, DPAPI, SQLite queue); per-user consent UI, native hardware capture, packaging, and signing are NOT complete and remain open | ⚠️ Source present (`clients/macos`: SwiftUI, ScreenCaptureKit, Keychain, SQLite queue); source presence is NOT proof of complete implementation; TCC consent, runtime execution, packaging, and notarization remain open | ❌ **Unresolved Gap** (`clients/linux` crate not yet created) |
 | **2. Synthetic / Mock Unit Tests** | ✅ Complete (345 cargo tests passing: queue FIFO, backoff, parser, models) | ⚠️ Unverified locally (Swift test files present in source; not executed locally) | ❌ 0 tests (No crate) |
 | **3. Toolchain / Compile / Build** | ✅ Verified locally (Rustc / Cargo 1.97.1 on Windows 11 host) | ❌ Unverified locally (Host lacks macOS toolchain / Xcode) | ❌ Unverified locally (Host lacks Linux build container / environment) |
 | **4. Native Interactive Runtime** | ⚠️ **Outstanding** (Unit tests run synthetically; interactive Win32 desktop session unverified) | ⚠️ **Outstanding** (Requires physical macOS execution environment) | ❌ **Outstanding** (Requires Linux X11/Wayland execution environment) |
 | **5. Packaging / Install / Uninstall** | ⚠️ Partial (NSIS `.nsi` script present; silent install/uninstall unverified in CI) | ⚠️ Partial (`build-app.sh` creates bundle; DMG packaging unverified) | ❌ **Unresolved Gap** (No `.deb`, AppImage, or Flatpak manifest) |
-| **6. Code Signing & Notarization** | ⚠️ **Outstanding Prerequisite** (Unsigned; Authenticode EV cert required; SmartScreen must not be bypassed) | ⚠️ **Outstanding Prerequisite** (Unsigned; Apple Developer ID & Notarization required) | ⚠️ **Outstanding Prerequisite** (GPG package signing required) |
+| **6. Code Signing & Notarization** | ⚠️ **Outstanding Prerequisite** (Unsigned; Authenticode cert required; signing does not guarantee immediate SmartScreen elimination; SmartScreen must not be bypassed) | ⚠️ **Outstanding Prerequisite** (Unsigned; Apple Developer ID & Notarization required) | ⚠️ **Outstanding Prerequisite** (GPG package signing required) |
 
 ---
 
 ## 5. Actual Baseline Test Execution Matrix
 
-All tests were executed on the local environment without assumptions.
+### A. Operator Independently Verified (Windows SSH Session)
+The PM/QA operator independently verified the following checks on commit `3e5ed99`:
+1. **Clean Working Tree & HEAD**: Verified key-based SSH, clean tree, and HEAD commit `3e5ed99`.
+2. **Concrete EF Core Linux Tests**:
+   - `EfCorePresenceAppServiceTests.Heartbeat_Should_Accept_And_Store_Linux_Platform`: **Passed**
+   - `EfCoreActivityAppServiceTests.Create_Should_Accept_And_Store_Linux_Platform`: **Passed**
+   - Exit code: **0** (synthetic/test-host results, not native runtime).
+3. **Frontend Validation Gate (`npm run validate`)**:
+   - TypeScript typecheck: **0 errors**
+   - ESLint: **0 errors**, 3 pre-existing warnings (under 45 ceiling)
+   - Vitest: **1,961 tests in 92 files passed**
+   - Architecture spec: **12 passed**, dependency graph clean
+   - Exit code: **0** (synthetic/test-host results in jsdom, not live browser WAN).
+
+### B. Worker-Reported Suite Executions
 
 | Tier / Suite | Target Command | Tests Passed | Tests Failed | Skipped / Ignored | Execution Time | Exit Code | Notes |
 |---|---|:---:|:---:|:---:|:---:|:---:|---|
-| **Windows Client** | `cargo test` in `clients/windows` | **345** | 0 | 5 | 6.12s | **0** | 5 ignored tests are end-to-end integration tests requiring a live backend and interactive desktop session. |
-| **Backend Domain Tests**| `dotnet test` (Domain.Tests) | **60** | 0 | 0 | 0.08s | **0** | In-memory domain invariants and entity validations. |
-| **Backend Host Tests** | `dotnet test` (HttpApi.Host.Tests) | **116** | 0 | 0 | 0.43s | **0** | HTTP routing, rate limiting, and controller filters. |
-| **Backend App Tests** | `dotnet test` (Application.Tests) | **166** | 0 | 0 | 0.31s | **0** | Abstract application service tests and normalizers (`AgentContextNormalizerTests`). |
-| **Backend EF Core Tests**| `dotnet test` (EntityFrameworkCore.Tests) | **466** | 0 | 0 | 2m 34s | **0** | Concrete SQLite EF Core host harness. Includes newly split `Create_Should_Accept_And_Store_Linux_Platform` and `Heartbeat_Should_Accept_And_Store_Linux_Platform` (increased from 464 to 466). |
-| **Backend Acceptance** | `dotnet test` (Acceptance.Tests) | **15** | 0 | 0 | 13.0s | **0** | BDD multi-step workflow acceptance scenarios. |
-| **Backend Total** | `dotnet test backend/Dosi.Tracker.slnx` | **823** | 0 | 0 | 2m 48s | **0** | **Reconciled count**: 820 baseline + 1 normalizer test (Phase 1) + 2 split EF Core Linux tests = 823 tests. |
-| **Frontend Vitest** | `npm test` in `frontend` | **1,961** | 0 | 0 | 33.76s | **0** | 92 test files. Includes 5 new tests in `analytics-charts.test.ts` and 1 new test in `analytics.test.ts`. |
-| **Frontend Accessibility**| `npm run test:a11y` in `frontend` | **49** | 0 | 1912 skipped | 23.09s | **0** | Runs all axe component tests and machine-contrast regressions (`PLATFORM_COLORS` $\ge 3:1$). |
+| **Windows Client** | `cargo test` in `clients/windows` | **345** | 0 | 5 | 6.12s | **0** | Worker-reported; 5 ignored tests require live backend and interactive desktop session. |
+| **Backend Domain Tests**| `dotnet test` (Domain.Tests) | **60** | 0 | 0 | 0.08s | **0** | Worker-reported; domain invariants and entity validations. |
+| **Backend Host Tests** | `dotnet test` (HttpApi.Host.Tests) | **116** | 0 | 0 | 0.43s | **0** | Worker-reported; HTTP routing, rate limiting, and controller filters. |
+| **Backend App Tests** | `dotnet test` (Application.Tests) | **166** | 0 | 0 | 0.31s | **0** | Worker-reported; abstract application service tests and normalizers. |
+| **Backend EF Core Tests**| `dotnet test` (EntityFrameworkCore.Tests) | **466** | 0 | 0 | 2m 34s | **0** | Worker-reported; concrete SQLite EF Core host harness. Includes the two independently verified Linux tests. |
+| **Backend Acceptance** | `dotnet test` (Acceptance.Tests) | **15** | 0 | 0 | 13.0s | **0** | Worker-reported; BDD multi-step workflow acceptance scenarios. |
+| **Backend Total** | `dotnet test backend/Dosi.Tracker.slnx` | **823** | 0 | 0 | 2m 48s | **0** | Worker-reported full backend suite. |
+| **Frontend Vitest (Full)** | `npm test` in `frontend` | **1,965** | 0 | 0 | 49.04s | **0** | 92 test files. Includes 9 tests in `analytics-charts.test.ts` (+4 guard tests added) and 1 test in `analytics.test.ts`. |
+| **Frontend Accessibility**| `npm run test:a11y` in `frontend` | **53** | 0 | 1912 skipped | 22.26s | **0** | Matches `--testNamePattern a11y`. Now explicitly executes all 9 tests in `analytics-charts.test.ts` (up from 49). |
 | **Frontend TypeCheck** | `npm run typecheck` | N/A | 0 errors | 0 | 5.2s | **0** | TypeScript 5 strict compilation with no emit. |
 | **Frontend ESLint** | `npm run lint` | N/A | 0 errors | 3 warnings (max 45)| 18.0s | **0** | 3 pre-existing warnings in unedited files. |
-| **Frontend Architecture**| `npm run test:arch` | **12** | 0 | 0 | 0.67s | **0** | Dependency cruiser layering and `architecture.spec.ts` content invariants. |
+| **Frontend Architecture**| `npm run test:arch` | **12** | 0 | 0 | 0.72s | **0** | Dependency cruiser layering and `architecture.spec.ts` content invariants. |
 
 ---
 
-## 6. Implementation & Follow-up Actions (Phase 1 Follow-up)
+## 6. Implementation & Follow-up Actions (Phase 1 Follow-up 2)
 
 ### Problems Identified in PM Review:
-1. **Accessibility Contrast Regression**:
-   - `frontend/src/components/reports/analytics-charts.tsx` previously selected `#e97b35` for Linux.
-   - On light card background (`#ffffff`), this yielded only 2.857:1 contrast, failing the $\ge 3:1$ requirement.
-2. **Missing Automated Contrast Regression**:
-   - No automated test checked `PLATFORM_COLORS` contrast on actual light (`#ffffff`) and dark (`#1a2226`) card design tokens.
-3. **Missing Linux `platformMix` Regression**:
-   - `frontend/src/lib/analytics.test.ts` did not assert Linux durations, device counts, member counts, or ordering alongside Windows/macOS/unknown.
-4. **Bolted-on Backend Linux Test Cases**:
-   - Linux assertions had been appended to negative "unusable context" tests in `ActivityAppServiceTests.cs` and `PresenceAppServiceTests.cs` rather than running as independent test methods.
-5. **Hidden Two-Platform Assumptions in Frontend**:
-   - `frontend/src/lib/types.ts` (`DevicePlatform`), `analytics.ts` (`platformOf`), `report-math.ts` (`DevicePlatform`, `platformOf`), and `live-dataset.ts` (`PLATFORMS`) still restricted platform values to `"windows"` and `"macos"`.
-6. **Documentation Ambiguities**:
-   - Windows cargo test results were described as verifying native interactive capture rather than synthetic units.
-   - macOS source presence was conflated with runtime verification.
-   - Idempotency key was inaccurately documented as `(WorkspaceId, ClientActivityId)` instead of the unique index `(WorkspaceId, UserId, ClientActivityId)`.
-   - SmartScreen guidance suggested bypass rather than marking code signing as an outstanding prerequisite.
+1. **Hardcoded Background Tokens in Contrast Tests**:
+   - `analytics-charts.test.ts` previously hardcoded `#ffffff` and `#1a2226` as literals rather than deriving the real CSS tokens from `globals.css`.
+2. **Missing Proof of Contrast Test Inclusion in `test:a11y`**:
+   - `npm run test:a11y` filters tests by `--testNamePattern a11y`. The contrast tests lacked explicit `a11y:` prefixes in their test names, leaving claims of their execution ambiguous.
+3. **Overclaimed Implementation Completeness & WCAG Compliance**:
+   - Windows and macOS clients were labeled as "Complete" based on source presence alone, ignoring missing runtime and packaging validation.
+   - Blanket claims suggested automated axe in jsdom established full WCAG compliance.
+   - Code signing was claimed to eliminate SmartScreen warnings (which requires reputation accumulation).
+   - Event counting was associated with legal compliance without supporting organizational evidence.
 
 ### Solutions Applied & Verified:
-1. **Accessible Linux Color Selection**:
-   - Selected `#cb6e17` for Linux in `analytics-charts.tsx`.
-   - Contrast on `#ffffff` (light card): **3.63:1** ($\ge 3:1$).
-   - Contrast on `#1a2226` (dark card): **4.43:1** ($\ge 3:1$).
-2. **Automated Accessibility Contrast Test**:
-   - Created `frontend/src/components/reports/analytics-charts.test.ts`.
-   - Directly imports source `PLATFORM_COLORS` constant (no duplicated driftable colors).
-   - Verifies all platform keys (`windows`, `macos`, `linux`, `unknown`) achieve $\ge 3:1$ contrast against actual `--card` tokens (`#ffffff` and `#1a2226`).
-3. **Dedicated `platformMix` Linux Regression**:
-   - Added `platformMix orders Windows, macOS, Linux, and Not reported, computing durations, devices, members, and apportioned shares` in `analytics.test.ts`.
-   - Asserts exact ordering (`["windows", "macos", "linux", null]`), device counts (2), member counts (1), durations (150m), and whole-percentage shares.
-4. **Independent Backend Test Methods**:
-   - Split Linux activity creation into `[Fact] public async Task Create_Should_Accept_And_Store_Linux_Platform()` in `ActivityAppServiceTests.cs`.
-   - Split Linux heartbeat into `[Fact] public async Task Heartbeat_Should_Accept_And_Store_Linux_Platform()` in `PresenceAppServiceTests.cs`.
-   - Verified concrete execution under `EfCoreActivityAppServiceTests` and `EfCorePresenceAppServiceTests` (466 passing tests).
-5. **Full Platform Normalization Alignment**:
-   - Updated `types.ts`, `analytics.ts`, `report-math.ts`, and `live-dataset.ts` to include `"linux"` across all platform types and parsers.
-6. **Truthful Documentation Updates**:
-   - Corrected `PM_STATUS.md` and `PM_EXECUTION_PLAN.md` with explicit evidence dimensions, corrected idempotency key indexes, and clarified privacy guardrails.
+1. **Dynamic Background Token Parsing from CSS**:
+   - In [analytics-charts.test.ts](file:///d:/Github%20Projects/DosiBridge/Open%20Source/Dosi-Tracker/frontend/src/components/reports/analytics-charts.test.ts), implemented `extractCardTokens` to parse `:root` (`#ffffff`) and `.dark` (`#1a2226`) `--card` tokens directly from `src/app/globals.css`.
+   - Added guards verifying that synthetic token changes are picked up, missing/malformed tokens throw descriptive errors, and print overrides (`.dark .work-report`) are not accidentally selected.
+2. **Explicit `a11y:` Test Naming & Verified Execution**:
+   - Prefixed every test in `analytics-charts.test.ts` with `a11y:`.
+   - Verified that `npm run test:a11y` executes all 9 contrast/token tests, passing 53 a11y tests total.
+3. **Truthful Documentation Boundaries**:
+   - Clarified that source presence is not complete implementation.
+   - Separated operator independently verified results from worker-reported claims.
+   - Clarified that automated axe and contrast tests in jsdom do not prove full WCAG compliance.
+   - Clarified that Authenticode signing builds reputation but does not guarantee immediate SmartScreen warning elimination.
+   - Clarified that monotonic event counting is data minimization, not full legal compliance.
 
 ---
 
 ## 7. Recommended Safe Next Bounded Phase
 
-### Recommended Phase: Bounded Linux Client Architecture Spike (`clients/linux`)
-- **Safe Next Scope**:
-  1. Initialize `clients/linux` Rust crate structure matching domain models and SQLite queue schema.
-  2. Implement display server detection (detect X11 vs Wayland).
-  3. Implement Wayland consent policy: explicitly report unsupported window/input metrics as **unavailable** (`null`) rather than fabricating zero metrics or attempting root privilege escalation.
-  4. Implement X11 basic capture spike using user-space interfaces.
-  5. Provide non-interactive unit tests (`cargo test`) for models, queue, and backoff logic.
-- **Constraints**:
-  - No deployment, no upstream push, no paid resources.
-  - Do not attempt root/evdev/uinput privilege escalation.
-  - Keep all changes strictly local and bounded.
+### Recommended Phase: Bounded Consent & Capability Audit
+- **Scope**:
+  1. Define and audit user consent contracts across desktop platforms:
+     - Require an explicit local user opt-in before activating screen, webcam, or activity monitors.
+     - Ensure the client interface prominently displays active capture state and visible controls ("Start", "Pause", "Resume", "Quit").
+  2. Audit Wayland capability detection:
+     - Map unsupported Wayland capabilities (e.g. global input counting without root, active-window title sniffing) to an **explicitly unavailable** status (`null`).
+     - Prohibit zero-metric fabrication (reporting 0 clicks/keys when the sensor is simply unavailable).
+     - Prohibit root, `sudo`, `evdev`, or `uinput` privilege escalation as a default operational mode.
+  3. No Linux collection adapter or device enrollment rewrite should be undertaken prior to completing this consent and capability audit.
+- **Constraints**: Preparation only; no push, no public release, no deployment. Preserves existing codebase integrity.
