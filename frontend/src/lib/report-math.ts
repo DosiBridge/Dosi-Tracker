@@ -1133,7 +1133,7 @@ export function formatClock(minutes: number | null | undefined): string {
 
 /* ----------------------------- Devices ----------------------------- */
 
-export type DevicePlatform = "windows" | "macos";
+export type DevicePlatform = "windows" | "macos" | "linux";
 
 /** What a device's agent reported most recently (presence), else over the period (device report). */
 export interface DeviceLine {
@@ -1166,7 +1166,7 @@ export const DEVICE_ONLINE_SECONDS = 150;
 
 function platformOf(value: unknown): DevicePlatform | null {
   const p = typeof value === "string" ? value.trim().toLowerCase() : "";
-  return p === "windows" || p === "macos" ? p : null;
+  return p === "windows" || p === "macos" || p === "linux" ? p : null;
 }
 
 /** Devices are told apart per member (the server groups by member + device too). */

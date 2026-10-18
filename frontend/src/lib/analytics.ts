@@ -196,7 +196,7 @@ function endReasonOf(value: unknown): ActivityEndReason | null {
 
 function platformOf(value: unknown): AgentPlatform | null {
   const p = typeof value === "string" ? value.trim().toLowerCase() : "";
-  return p === "windows" || p === "macos" ? p : null;
+  return p === "windows" || p === "macos" || p === "linux" ? p : null;
 }
 
 /** A UTC offset in minutes within the contract's −840…840, or null. */

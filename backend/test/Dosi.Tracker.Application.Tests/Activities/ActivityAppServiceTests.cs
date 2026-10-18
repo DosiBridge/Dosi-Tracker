@@ -753,11 +753,18 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
         created.EndReason.ShouldBeNull();
         created.IdleSeconds.ShouldBeNull();
         created.InjectedInputEvents.ShouldBeNull();
+    }
 
-        var linuxInput = NewInput(startedAt: BaseDay.AddHours(14));
-        linuxInput.Platform = "linux";
-        var linuxCreated = await SubmitAsync(linuxInput);
-        linuxCreated.Platform.ShouldBe("linux");
+    [Fact]
+    public async Task Create_Should_Accept_And_Store_Linux_Platform()
+    {
+        var input = NewInput();
+        input.Platform = "linux";
+
+        var created = await SubmitAsync(input);
+
+        created.Id.ShouldNotBe(Guid.Empty);
+        created.Platform.ShouldBe("linux");
     }
 
     [Fact]

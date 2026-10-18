@@ -1113,7 +1113,7 @@ export function AppsChart({ apps, fmt }: { apps: AppStat[]; fmt: Fmt }) {
 export const PLATFORM_COLORS: Record<"windows" | "macos" | "linux" | "unknown", string> = {
   windows: "#2d6fd4",
   macos: "#937cf1",
-  linux: "#e97b35",
+  linux: "#cb6e17",
   unknown: "#768390",
 };
 

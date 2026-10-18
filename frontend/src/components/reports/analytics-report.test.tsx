@@ -547,7 +547,7 @@ describe("Work Analytics (demo)", () => {
       expect(devices).toHaveTextContent("No device details were reported for this period.");
     } else {
       const items = within(within(devices).getByRole("list", { name: "Tracked time by platform" })).getAllByRole("listitem");
-      expect(items.map((li) => li.textContent?.match(/^(Windows|macOS|Not reported)/)?.[1])).toEqual(shares.map((s) => s.label));
+      expect(items.map((li) => li.textContent?.match(/^(Windows|macOS|Linux|Not reported)/)?.[1])).toEqual(shares.map((s) => s.label));
       expect(items.map((li) => li.textContent?.match(/(\d+)%$/)?.[1])).toEqual(shares.map((s) => String(s.share)));
     }
   });

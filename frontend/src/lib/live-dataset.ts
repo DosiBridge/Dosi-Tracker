@@ -366,7 +366,7 @@ function wholeNumber(value: unknown): number | undefined {
   return Number.isFinite(n) ? Math.round(n) : undefined;
 }
 
-const PLATFORMS: readonly DevicePlatform[] = ["windows", "macos"];
+const PLATFORMS: readonly DevicePlatform[] = ["windows", "macos", "linux"];
 
 /** The contract's offset range: UTC−14:00 … UTC+14:00. */
 const MAX_UTC_OFFSET_MINUTES = 840;

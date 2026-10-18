@@ -345,7 +345,7 @@ describe("agent data v2 (contract §5)", () => {
 
   it("drops what the server would have stored as null, and clamps idle time to the block", () => {
     const a = mapApiActivity(
-      dto({ platform: "linux", endReason: "coffee", utcOffsetMinutes: 900, idleSeconds: 99_999, injectedInputEvents: -3, osVersion: "   " }),
+      dto({ platform: "freebsd", endReason: "coffee", utcOffsetMinutes: 900, idleSeconds: 99_999, injectedInputEvents: -3, osVersion: "   " }),
     );
     expect(a?.platform).toBeUndefined();
     expect(a?.endReason).toBeUndefined();
@@ -353,6 +353,9 @@ describe("agent data v2 (contract §5)", () => {
     expect(a?.osVersion).toBeUndefined();
     expect(a?.idleSeconds).toBe(1800); // the 30-minute block
     expect(a?.injectedInputEvents).toBe(0);
+
+    const linuxActivity = mapApiActivity(dto({ platform: "linux" }));
+    expect(linuxActivity?.platform).toBe("linux");
   });
 
   it("an older agent's block carries none of the new fields, and no note", () => {

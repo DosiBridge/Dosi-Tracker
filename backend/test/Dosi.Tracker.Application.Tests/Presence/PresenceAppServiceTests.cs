@@ -344,7 +344,11 @@ public abstract class PresenceAppServiceTests<TStartupModule> : TrackerApplicati
         stored.Platform.ShouldBeNull();
         stored.TimeZone.ShouldBeNull();
         stored.UtcOffsetMinutes.ShouldBeNull();
+    }
 
+    [Fact]
+    public async Task Heartbeat_Should_Accept_And_Store_Linux_Platform()
+    {
         var linuxDeviceId = Guid.NewGuid();
         await _presenceAppService.HeartbeatAsync(new HeartbeatDto
         {

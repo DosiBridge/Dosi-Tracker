@@ -656,6 +656,23 @@ describe("devices", () => {
     expect(platformMix([])).toEqual([]);
   });
 
+  it("platformMix orders Windows, macOS, Linux, and Not reported, computing durations, devices, members, and apportioned shares", () => {
+    const rows = parseDevices([
+      { userId: "u-win", deviceId: "d-win-1", platform: "windows", trackedMinutes: 300 },
+      { userId: "u-mac", deviceId: "d-mac-1", platform: "macos", trackedMinutes: 150 },
+      { userId: "u-lin", deviceId: "d-lin-1", platform: "linux", trackedMinutes: 100 },
+      { userId: "u-lin", deviceId: "d-lin-2", platform: "Linux", trackedMinutes: 50 },
+      { userId: "u-unk", deviceId: "d-unk-1", trackedMinutes: 50 },
+    ]);
+
+    expect(platformMix(rows)).toEqual([
+      { platform: "windows", label: "Windows", devices: 1, members: 1, minutes: 300, share: 46 },
+      { platform: "macos", label: "macOS", devices: 1, members: 1, minutes: 150, share: 23 },
+      { platform: "linux", label: "Linux", devices: 2, members: 1, minutes: 150, share: 23 },
+      { platform: null, label: "Not reported", devices: 1, members: 1, minutes: 50, share: 8 },
+    ]);
+  });
+
   it("gathers the same rows from blocks that carry device details", () => {
     const blocks = blocksOf(
       dto("a", "u1", "p1", "2026-09-28T09:00:00Z", 30, { platform: "windows", deviceId: "d1", agentVersion: "0.1.0" }),

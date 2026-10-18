@@ -5,7 +5,7 @@ export type Role = "host" | "admin" | "owner" | "worker" | "client";
  * as the wire's `platform` (api-contract AgentPlatform). Declared here rather
  * than imported so this leaf module never depends on the API layer.
  */
-export type DevicePlatform = "windows" | "macos";
+export type DevicePlatform = "windows" | "macos" | "linux";
 
 /** Why a block ended — the same values as the wire's `endReason` (api-contract ActivityEndReason). */
 export type BlockEndReason =
