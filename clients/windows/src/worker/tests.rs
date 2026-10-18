@@ -191,6 +191,7 @@ struct FakeMachine {
     captures: Mutex<u32>,
     fraction: Mutex<f64>,
     device: DeviceInfo,
+    tracking_active: std::sync::atomic::AtomicBool,
 }
 
 impl FakeMachine {
@@ -208,6 +209,7 @@ impl FakeMachine {
                 platform: "windows",
                 agent_version: "9.9.9",
             },
+            tracking_active: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -230,6 +232,10 @@ impl FakeMachine {
 
     fn captures(&self) -> u32 {
         *self.captures.lock().unwrap()
+    }
+
+    fn is_tracking_active(&self) -> bool {
+        self.tracking_active.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -298,6 +304,10 @@ impl Machine for FakeMachine {
 
     fn random_fraction(&self) -> f64 {
         *self.fraction.lock().unwrap()
+    }
+
+    fn set_tracking_active(&self, active: bool) {
+        self.tracking_active.store(active, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -1406,4 +1416,22 @@ fn losing_access_to_the_workspace_stops_tracking_and_asks_for_another() {
     h.worker.publish();
     let snapshot = h.state.snapshot();
     assert_eq!((snapshot.status, snapshot.workspace.as_str(), snapshot.workspace_lost.as_deref()), (TrackerStatus::Tracking, "Globex", None));
+}
+
+#[test]
+fn tracking_active_follows_pause_and_resume_lifecycle() {
+    let h_unsigned = harness_at(at("10:00:00"), None, false, None);
+    assert!(!h_unsigned.machine.is_tracking_active(), "sensors must start inactive before sign-in");
+
+    let mut h = tracking();
+    assert!(h.machine.is_tracking_active(), "sensors must activate when tracking project session");
+
+    h.command(at("10:05:00"), Command::Pause { resume_after: None, at: at("10:05:00") });
+    assert!(!h.machine.is_tracking_active(), "sensors must deactivate immediately when paused");
+
+    h.command(at("10:10:00"), Command::Resume { at: at("10:10:00") });
+    assert!(h.machine.is_tracking_active(), "sensors must reactivate upon resume");
+
+    h.command(at("10:15:00"), Command::SignOut { at: at("10:15:00") });
+    assert!(!h.machine.is_tracking_active(), "sensors must deactivate upon sign-out");
 }

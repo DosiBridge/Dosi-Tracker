@@ -51,10 +51,12 @@ Dosi-Tracker is an open-source, multi-tenant team activity and time-tracking sys
 ```mermaid
 flowchart TD
     P1[Phase 1: Baseline Audit & Cross-Platform Alignment] --> P2[Phase 2: Consent & Capability Audit]
-    P2 --> P3[Phase 3: Schema Nullability Alignment & Linux Spike]
-    P3 --> P4[Phase 4: Cryptographic Device Enrollment & Revocation]
-    P4 --> P5[Phase 5: Data Retention & Automated Purge Workers]
-    P5 --> P6[Phase 6: Native Packaging, Signing & Update Pipeline]
+    P2 --> P3[Phase 3: P0 Sensor Lifecycle Gating & Schema Nullability]
+    P3 --> P4[Phase 4: Multi-Workspace Account Lifecycle & Isolation Hardening]
+    P4 --> P5[Phase 5: Linux Unprivileged Agent Spike]
+    P5 --> P6[Phase 6: Cryptographic Device Enrollment & Revocation]
+    P6 --> P7[Phase 7: Data Retention & Purge Workers]
+    P7 --> P8[Phase 8: Native Packaging, Signing & Distribution]
 ```
 
 ### Phase 1: Baseline Audit, Toolchain Verification & Cross-Platform Contract (Completed in Prior Sprint)
@@ -80,19 +82,36 @@ flowchart TD
   3. **End-to-End Metric Nullability Obstacles**: Identified non-nullable `int` fields in backend entity (`Activity.cs:20-21`) and DTOs (`CreateActivityDto.cs:40-43`, `ActivityDto.cs:17-18`), non-nullable client models (`model.rs:157-158`, `ActivityPayload.swift:197-198`), and frontend clamping (`live-dataset.ts:444`, `work-report.ts:1259`). Documented migration path to honest `null` states separating measured zero, denied, unsupported, temporarily unavailable, and paused.
   4. **Truthful Linux X11/Wayland Matrix**: Documented `xdg-desktop-portal` ScreenCast session cancellation and close signals, compositor client isolation rendering Wayland global input and window titles unsupported, and strict prohibition on root, `sudo`, `evdev`, and `uinput` bypasses.
 
-### Phase 3: Schema Nullability Alignment & Linux Desktop Agent Architecture Spike
-- **Objective**: Eliminate non-nullable zero-metric obstacles across backend and frontend, then establish the unprivileged `clients/linux` component.
+### Phase 3: P0 Privacy Sensor Lifecycle Gating & Schema Nullability Alignment
+- **Objective**: Eliminate background sensor sampling during pause/inactive states, implement active tracking gating across Windows tracking subsystems, and align backend/frontend nullability schemas.
 - **Deliverables**:
-  1. Align `Activity.cs`, `CreateActivityDto.cs`, `ActivityDto.cs`, and EF Core migration to support nullable `int? MouseClicks` and `int? KeyboardHits` without defaulting to zero.
-  2. Update frontend live dataset and work report calculations to render "—" / "Not Measured" when counts are null.
-  3. Create `clients/linux` Rust crate sharing domain models and SQLite queue schema with `clients/windows`.
-  4. Implement display server detection: detect X11 (`DISPLAY`) vs Wayland (`WAYLAND_DISPLAY`).
-  5. X11 Engine: user-space display snapshot (`xcap` / `XShmGetImage`) and active window tracking (`_NET_ACTIVE_WINDOW`).
-  6. Wayland Engine: `org.freedesktop.portal.ScreenCast` via D-Bus and PipeWire for consent-based screen capture.
-  7. Fallback & Graceful Degradation: Under Wayland, report global input counting and active-window tracking as **explicitly unsupported / unavailable** (`null`), never as fabricated zero metrics. Do not escalate to root, sudo, evdev, or uinput.
-  8. SQLite offline queue identical to Windows/macOS with idempotent client activity ID and poison-row parking (`synced = 2`).
+  1. **Active Tracking Gating in `UsageRecorder` & `InputCounter`**:
+     - Implement atomic active-tracking flag in `UsageRecorder` and `InputCounter`.
+     - When tracking is inactive, paused, away, locked, or signed out, foreground window sampling and input event logging are deactivated; samples are dropped immediately without memory buffering.
+     - Wire `Machine::set_tracking_active` through `Tracker` and `Worker` lifecycle state transitions.
+     - Add unit and regression tests verifying zero slice retention and zero event accumulation while inactive or paused.
+  2. **Schema & DTO Nullability Migration**:
+     - Align `Activity.cs`, `CreateActivityDto.cs`, `ActivityDto.cs`, and EF Core migration to support nullable `int? MouseClicks` and `int? KeyboardHits` without defaulting to zero.
+     - Update frontend live dataset and work report calculations to render "—" / "Not Measured" when counts are null.
 
-### Phase 4: Cryptographic Device Enrollment, Mutual Session Verification & Revocation
+### Phase 4: Multi-Workspace Account Lifecycle & Isolation Hardening
+- **Objective**: Ensure complete Notion-like multi-workspace account management, robust server-side authorization, invitation lifecycles, and cross-workspace isolation.
+- **Deliverables**:
+  1. Comprehensive invitation token lifecycle (single-use, revocation, expiration, accept/decline flows).
+  2. Server-enforced role transitions, preventing self-promotion and last-owner orphaning across all endpoints.
+  3. Strict tenant boundary verification: concrete EF Core and HTTP integration tests validating that user in Workspace A cannot access Workspace B resources under forged headers.
+  4. Browser E2E suite validating authenticated multi-workspace creation, switching, and invitation acceptance.
+
+### Phase 5: Linux Unprivileged Agent Architecture Spike
+- **Objective**: Establish the unprivileged `clients/linux` Rust crate supporting X11 and Wayland without root, sudo, evdev, or uinput escalation.
+- **Deliverables**:
+  1. Detect X11 (`DISPLAY`) vs Wayland (`WAYLAND_DISPLAY`).
+  2. X11 Engine: user-space display snapshot (`xcap` / `XShmGetImage`) and active window tracking (`_NET_ACTIVE_WINDOW`).
+  3. Wayland Engine: `org.freedesktop.portal.ScreenCast` via D-Bus and PipeWire for consent-based screen capture.
+  4. Fallback & Graceful Degradation: Under Wayland, report global input counting and active-window tracking as **explicitly unsupported / unavailable** (`null`), never as fabricated zero metrics.
+  5. SQLite offline queue identical to Windows/macOS with idempotent client activity ID and poison-row parking (`synced = 2`).
+
+### Phase 6: Cryptographic Device Enrollment, Mutual Session Verification & Revocation
 - **Objective**: Move beyond self-reported random `DeviceId` GUIDs to a cryptographic device authorization lifecycle.
 - **Deliverables**:
   1. Device Key Generation: Desktop agent generates an Ed25519 or ECDSA keypair stored in OS secure vault (Windows DPAPI, macOS Keychain, Linux Secret Service API / libsecret).
@@ -100,7 +119,7 @@ flowchart TD
   3. Device Revocation API: `POST /api/app/devices/{id}/revoke` allowing workspace owners/admins and users to revoke any authorized agent install.
   4. Middleware / Filter: Ingestion endpoints (`/api/app/activity`, `/api/app/presence/heartbeat`) verify device active status; revoked devices receive `403 Tracker:DeviceRevoked`.
 
-### Phase 5: Automated Data Retention, Pruning Workers & Storage Optimization
+### Phase 7: Automated Data Retention, Pruning Workers & Storage Optimization
 - **Objective**: Automate data retention policies across PostgreSQL tables and S3/R2 blob containers.
 - **Deliverables**:
   1. Background Worker (`DataRetentionWorker` in ABP): Periodic sweep honoring workspace retention settings (e.g. 30, 90, 180, 365 days).
@@ -108,7 +127,7 @@ flowchart TD
   3. Activity Compaction: Roll up expired minute-bucket activity into summarized hourly/daily aggregates before archival.
   4. Erasure Endpoint: Allow user or administrator-initiated erasure of personal screenshot artifacts.
 
-### Phase 6: Native Packaging, Signed Distribution & Secure Auto-Update Strategy
+### Phase 8: Native Packaging, Signed Distribution & Secure Auto-Update Strategy
 - **Objective**: Production-grade installers, signed executables, and secure update manifests for all three platforms.
 - **Deliverables**:
   1. **Windows**: Authenticode code-signing configuration for NSIS installer (`dosi-tracker-setup.exe`). Signing begins reputation accumulation but does not guarantee immediate SmartScreen elimination; SmartScreen must not be bypassed in production.

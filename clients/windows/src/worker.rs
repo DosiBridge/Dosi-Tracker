@@ -206,6 +206,8 @@ pub trait Machine: Send + Sync {
     fn current_app(&self) -> Option<String>;
     /// A uniformly random fraction in `[0, 1)` (the screenshot moment).
     fn random_fraction(&self) -> f64;
+    /// Turn active sensor collection on or off (usage sampler and input counting).
+    fn set_tracking_active(&self, active: bool);
 }
 
 impl Machine for Tracker {
@@ -272,6 +274,10 @@ impl Machine for Tracker {
 
     fn random_fraction(&self) -> f64 {
         blocks::random_fraction()
+    }
+
+    fn set_tracking_active(&self, active: bool) {
+        Tracker::set_tracking_active(self, active);
     }
 }
 
@@ -1873,6 +1879,7 @@ impl Worker {
     fn publish(&mut self) {
         let view = self.view();
         let status = view.status;
+        self.machine.set_tracking_active(status == TrackerStatus::Tracking);
         if self.published.as_ref() != Some(&view) {
             let v = view.clone();
             self.state.update(|s| {

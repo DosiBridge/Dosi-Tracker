@@ -7,6 +7,7 @@
 //! so memory grows with window switches, not with time.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -45,9 +46,18 @@ pub struct UsageSlice {
     pub end_ms: i64,
 }
 
-#[derive(Default)]
 pub struct UsageRecorder {
     inner: Mutex<Inner>,
+    active: AtomicBool,
+}
+
+impl Default for UsageRecorder {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(Inner::default()),
+            active: AtomicBool::new(false),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -61,10 +71,30 @@ impl UsageRecorder {
         Self::default()
     }
 
+    /// Turn active tracking on or off. When inactive (e.g. paused, signed out,
+    /// away, or before project selection), foreground window samples are dropped
+    /// without recording window titles or application names into memory buffers.
+    pub fn set_active(&self, active: bool) {
+        self.active.store(active, Ordering::SeqCst);
+        if !active {
+            // Discard any partial timing anchor so inactive time cannot be
+            // credited to the next sample when tracking resumes.
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.last_sample_ms = None;
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::SeqCst)
+    }
+
     /// Credit the time since the previous sample to `window` (the one in front
     /// now). `None` — no foreground window, e.g. the secure desktop — credits
-    /// nobody.
+    /// nobody. When tracking is inactive, samples are dropped immediately.
     pub fn record(&self, now_ms: i64, window: Option<WindowInfo>) {
+        if !self.is_active() {
+            return;
+        }
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let Some(last) = inner.last_sample_ms else {
             inner.last_sample_ms = Some(now_ms);
@@ -120,14 +150,16 @@ impl UsageRecorder {
     }
 }
 
-/// Start the background sampler. It only reads the foreground window, so it
-/// never needs to stop: while paused or signed out its samples simply fall
-/// outside any recorded block.
+/// Start the background sampler. It only reads the foreground window while
+/// tracking is active: while paused, signed out, or unstarted, it sleeps
+/// without executing foreground window queries.
 pub fn spawn_sampler(recorder: Arc<UsageRecorder>) {
     let spawned = std::thread::Builder::new()
         .name("usage-sampler".into())
         .spawn(move || loop {
-            recorder.record(chrono::Utc::now().timestamp_millis(), super::active_window::current());
+            if recorder.is_active() {
+                recorder.record(chrono::Utc::now().timestamp_millis(), super::active_window::current());
+            }
             std::thread::sleep(SAMPLE_EVERY);
         });
     if let Err(e) = spawned {
@@ -416,6 +448,7 @@ mod tests {
     #[test]
     fn samples_credit_the_window_in_front_and_merge_repeats() {
         let rec = UsageRecorder::new();
+        rec.set_active(true);
         rec.record(T0_MS, window("code.exe", "main.rs")); // first sample: nothing to credit yet
         rec.record(T0_MS + 3_000, window("code.exe", "main.rs"));
         rec.record(T0_MS + 6_000, window("code.exe", "main.rs"));
@@ -436,6 +469,7 @@ mod tests {
     #[test]
     fn long_gaps_and_stale_samples_are_not_credited() {
         let rec = UsageRecorder::new();
+        rec.set_active(true);
         rec.record(T0_MS, window("code.exe", ""));
         rec.record(T0_MS + 120_000, window("code.exe", "")); // machine slept
         rec.record(T0_MS + 119_000, window("code.exe", "")); // racing, older sample
@@ -446,6 +480,7 @@ mod tests {
     #[test]
     fn slices_are_clipped_to_the_block() {
         let rec = UsageRecorder::new();
+        rec.set_active(true);
         rec.record(T0_MS, window("a.exe", ""));
         rec.record(T0_MS + 10_000, window("a.exe", ""));
         assert_eq!(
@@ -654,5 +689,45 @@ mod tests {
         assert_eq!(timeline[0].keyboard_hits, 1);
         assert_eq!(timeline[0].app_name, None);
         assert!(minute_timeline(T0, T0, &[], &[], &[], &[]).is_empty());
+    }
+
+    #[test]
+    fn inactive_recorder_drops_samples_and_keeps_slices_empty() {
+        let rec = UsageRecorder::new();
+        assert!(!rec.is_active(), "UsageRecorder must default to inactive (opt-in)");
+        rec.record(T0_MS, window("secret.exe", "Confidential Document"));
+        rec.record(T0_MS + 3_000, window("secret.exe", "Confidential Document"));
+        assert!(
+            rec.slices_between(0, i64::MAX).is_empty(),
+            "an inactive UsageRecorder must drop samples and never buffer window titles"
+        );
+    }
+
+    #[test]
+    fn activating_recorder_records_samples_and_deactivation_clears_timing_anchor() {
+        let rec = UsageRecorder::new();
+        rec.set_active(true);
+        assert!(rec.is_active());
+        rec.record(T0_MS, window("code.exe", "main.rs"));
+        rec.record(T0_MS + 3_000, window("code.exe", "main.rs"));
+        assert_eq!(rec.slices_between(0, i64::MAX), vec![slice("code.exe", "main.rs", 0, 3)]);
+
+        // Deactivating (e.g. paused) clears timing anchor and drops samples
+        rec.set_active(false);
+        rec.record(T0_MS + 6_000, window("browser.exe", "Personal Email"));
+        rec.record(T0_MS + 9_000, window("browser.exe", "Personal Email"));
+        assert_eq!(rec.slices_between(0, i64::MAX), vec![slice("code.exe", "main.rs", 0, 3)]);
+
+        // Reactivating resumes recording cleanly without back-crediting paused time
+        rec.set_active(true);
+        rec.record(T0_MS + 12_000, window("code.exe", "main.rs")); // anchor sample
+        rec.record(T0_MS + 15_000, window("code.exe", "main.rs")); // 3s credited
+        assert_eq!(
+            rec.slices_between(0, i64::MAX),
+            vec![
+                slice("code.exe", "main.rs", 0, 3),
+                slice("code.exe", "main.rs", 12, 15),
+            ]
+        );
     }
 }

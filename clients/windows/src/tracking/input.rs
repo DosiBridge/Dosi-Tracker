@@ -10,7 +10,7 @@
 //! go silent while Windows still sees input.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -55,7 +55,6 @@ const RECENT_INPUT_MS: i64 = 60_000;
 /// timeline and the per-app breakdown always agree, and input made before a
 /// block (while paused, signed out, or on another project) can never leak
 /// into it.
-#[derive(Default)]
 pub struct InputCounter {
     key_presses: EventLog,
     mouse_clicks: EventLog,
@@ -64,6 +63,22 @@ pub struct InputCounter {
     injected_keyboard: CountLog,
     injected_mouse: CountLog,
     health: HookHealth,
+    active: AtomicBool,
+}
+
+impl Default for InputCounter {
+    fn default() -> Self {
+        Self {
+            key_presses: EventLog::default(),
+            mouse_clicks: EventLog::default(),
+            keyboard_activity: ActivityLog::default(),
+            mouse_activity: ActivityLog::default(),
+            injected_keyboard: CountLog::default(),
+            injected_mouse: CountLog::default(),
+            health: HookHealth::default(),
+            active: AtomicBool::new(false),
+        }
+    }
 }
 
 impl InputCounter {
@@ -71,12 +86,29 @@ impl InputCounter {
         Self::default()
     }
 
+    /// Turn active tracking on or off. When inactive (e.g. paused, signed out,
+    /// away, or before project selection), key presses and clicks are dropped
+    /// without recording timestamps into memory buffers.
+    pub fn set_active(&self, active: bool) {
+        self.active.store(active, Ordering::SeqCst);
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::SeqCst)
+    }
+
     fn record_key_press(&self, at_ms: i64) {
+        if !self.is_active() {
+            return;
+        }
         self.key_presses.record(at_ms);
         self.keyboard_activity.mark(at_ms.div_euclid(1000));
     }
 
     fn record_click(&self, at_ms: i64) {
+        if !self.is_active() {
+            return;
+        }
         self.mouse_clicks.record(at_ms);
         self.mouse_activity.mark(at_ms.div_euclid(1000));
     }
@@ -84,6 +116,9 @@ impl InputCounter {
     /// Mouse movement / wheel: counts as activity (reading and scrolling is
     /// work) but not as a click.
     fn record_mouse_activity(&self, at_ms: i64) {
+        if !self.is_active() {
+            return;
+        }
         self.mouse_activity.mark(at_ms.div_euclid(1000));
     }
 
@@ -413,6 +448,9 @@ impl InputFilter {
         counter.health.saw_event(at_ms);
         let second = at_ms.div_euclid(1000);
         if injected {
+            if !counter.is_active() {
+                return;
+            }
             // Seen, reported, never counted as the user's input.
             match input {
                 RawInput::KeyDown(_) => counter.injected_keyboard.add(second),
@@ -1033,6 +1071,7 @@ mod tests {
     #[test]
     fn counts_are_taken_over_a_window() {
         let counter = InputCounter::new();
+        counter.set_active(true);
         let before = Utc::now() - chrono::Duration::seconds(1);
         let now_ms = || Utc::now().timestamp_millis();
         counter.record_key_press(now_ms());
@@ -1103,6 +1142,7 @@ mod tests {
     /// Feed `events` (input, injected, ms after T0) through a fresh filter.
     fn feed(events: &[(RawInput, bool, i64)]) -> InputCounter {
         let counter = InputCounter::new();
+        counter.set_active(true);
         let mut filter = InputFilter::default();
         for &(input, injected, ms) in events {
             filter.apply(&counter, input, injected, T0_MS + ms);
@@ -1404,5 +1444,50 @@ mod tests {
         assert_eq!(idle_millis(now, last), 150);
         // Long after several wraps, the 64-bit count is still taken modulo 2^32.
         assert_eq!(idle_millis((5u64 << 32) + 1_000, 0), 1_000);
+    }
+
+    #[test]
+    fn inactive_counter_drops_input_events_and_keeps_logs_empty() {
+        let counter = InputCounter::new();
+        assert!(!counter.is_active(), "InputCounter must default to inactive (opt-in)");
+        let mut filter = InputFilter::default();
+        let t0 = Utc::now();
+        let t0_ms = t0.timestamp_millis();
+
+        // Feed keyboard and mouse events into inactive counter
+        filter.apply(&counter, RawInput::KeyDown(0x41), false, t0_ms);
+        filter.apply(&counter, RawInput::ButtonDown, false, t0_ms + 100);
+        filter.apply(&counter, RawInput::Move, false, t0_ms + 200);
+
+        let t_end = t0 + chrono::Duration::seconds(5);
+        assert_eq!(counter.key_presses_between(t0, t_end), Vec::<i64>::new());
+        assert_eq!(counter.clicks_between(t0, t_end), Vec::<i64>::new());
+        assert_eq!(counter.counts_between(t0, t_end), (0, 0));
+        assert_eq!(counter.active_seconds(t0, t_end, true, true), Vec::<i64>::new());
+    }
+
+    #[test]
+    fn activating_counter_accumulates_events_and_deactivating_halts_collection() {
+        let counter = InputCounter::new();
+        counter.set_active(true);
+        assert!(counter.is_active());
+        let mut filter = InputFilter::default();
+        let t0 = Utc::now();
+        let t0_ms = t0.timestamp_millis();
+
+        filter.apply(&counter, RawInput::KeyDown(0x41), false, t0_ms);
+        filter.apply(&counter, RawInput::ButtonDown, false, t0_ms + 100);
+
+        let t_mid = t0 + chrono::Duration::seconds(5);
+        assert_eq!(counter.counts_between(t0, t_mid), (1, 1));
+
+        // Deactivate (e.g. paused)
+        counter.set_active(false);
+        filter.apply(&counter, RawInput::KeyDown(0x42), false, t0_ms + 6_000);
+        filter.apply(&counter, RawInput::ButtonDown, false, t0_ms + 6_100);
+
+        let t_end = t0 + chrono::Duration::seconds(10);
+        // Still only 1 key press and 1 click recorded; paused events dropped
+        assert_eq!(counter.counts_between(t0, t_end), (1, 1));
     }
 }

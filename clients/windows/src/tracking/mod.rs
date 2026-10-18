@@ -84,6 +84,19 @@ impl Tracker {
         self.usage.clone()
     }
 
+    /// Turn active sensor collection on or off across both the foreground-window
+    /// usage recorder and the low-level input counter. When inactive, samples
+    /// and events are dropped immediately without memory buffering.
+    pub fn set_tracking_active(&self, active: bool) {
+        self.usage.set_active(active);
+        self.input.set_active(active);
+    }
+
+    #[cfg_attr(not(test), expect(dead_code, reason = "for UI and inspection"))]
+    pub fn is_tracking_active(&self) -> bool {
+        self.usage.is_active() && self.input.is_active()
+    }
+
     /// This device: install id, name, OS and agent version (also for the
     /// presence heartbeat).
     #[expect(dead_code, reason = "for the worker's presence heartbeat")]
@@ -582,5 +595,20 @@ mod tests {
         // Distinct blocks, distinct idempotency keys.
         assert_ne!(blocks[0].client_activity_id, blocks[1].client_activity_id);
         assert!(kept_idle_blocks("p1", at(T0), at(T0 + 30), TimeDelta::minutes(10), None, &device(), None).is_empty());
+    }
+
+    #[test]
+    fn tracker_active_gate_controls_both_usage_and_input() {
+        let tracker = Tracker::new();
+        assert!(!tracker.is_tracking_active(), "Tracker must default to inactive (opt-in)");
+        tracker.set_tracking_active(true);
+        assert!(tracker.is_tracking_active());
+        assert!(tracker.usage().is_active());
+        assert!(tracker.input().is_active());
+
+        tracker.set_tracking_active(false);
+        assert!(!tracker.is_tracking_active());
+        assert!(!tracker.usage().is_active());
+        assert!(!tracker.input().is_active());
     }
 }
