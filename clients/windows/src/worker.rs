@@ -33,7 +33,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::time::Instant;
 
 use crate::api::{ApiClient, ApiError, AuthError, ServerClock, TokenCell, Workspace};
-use crate::config::{normalize_server_url, AppConfig};
+use crate::config::{normalize_server_url, AppConfig, CapturePermissions};
 use crate::credentials::{self, Credentials, ProjectCache, SavedPause};
 use crate::model::{Activity, EndReason, Heartbeat, PresenceStatus, Project};
 use crate::power::{self, SleepDetector};
@@ -207,7 +207,10 @@ pub trait Machine: Send + Sync {
     /// A uniformly random fraction in `[0, 1)` (the screenshot moment).
     fn random_fraction(&self) -> f64;
     /// Turn active sensor collection on or off (usage sampler and input counting).
+    #[allow(dead_code)]
     fn set_tracking_active(&self, active: bool);
+    /// Apply effective sensor policy based on active tracking status and session permissions.
+    fn apply_sensor_policy(&self, active: bool, perms: Option<&CapturePermissions>);
 }
 
 impl Machine for Tracker {
@@ -278,6 +281,10 @@ impl Machine for Tracker {
 
     fn set_tracking_active(&self, active: bool) {
         Tracker::set_tracking_active(self, active);
+    }
+
+    fn apply_sensor_policy(&self, active: bool, perms: Option<&CapturePermissions>) {
+        Tracker::apply_sensor_policy(self, active, perms);
     }
 }
 
@@ -1739,6 +1746,8 @@ impl Worker {
     /// Quit: save the block in progress first — so whatever happens next it
     /// goes up on the next launch — then say "stopped" and upload what fits.
     async fn quit(&mut self, at: DateTime<Utc>) {
+        // Immediately halt all OS sensors before farewell heartbeats and upload draining
+        self.machine.apply_sensor_policy(false, None);
         let started = std::time::Instant::now();
         let now = self.now();
         let finished = self.blocks.end(at, now, EndReason::Quit);
@@ -1879,7 +1888,13 @@ impl Worker {
     fn publish(&mut self) {
         let view = self.view();
         let status = view.status;
-        self.machine.set_tracking_active(status == TrackerStatus::Tracking);
+        let is_tracking = status == TrackerStatus::Tracking;
+        let perms = if is_tracking {
+            self.session.as_ref().map(|s| &s.policy.perms)
+        } else {
+            None
+        };
+        self.machine.apply_sensor_policy(is_tracking, perms);
         if self.published.as_ref() != Some(&view) {
             let v = view.clone();
             self.state.update(|s| {

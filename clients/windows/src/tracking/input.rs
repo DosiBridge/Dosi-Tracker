@@ -64,6 +64,8 @@ pub struct InputCounter {
     injected_mouse: CountLog,
     health: HookHealth,
     active: AtomicBool,
+    allowed_keyboard: AtomicBool,
+    allowed_mouse: AtomicBool,
 }
 
 impl Default for InputCounter {
@@ -77,6 +79,8 @@ impl Default for InputCounter {
             injected_mouse: CountLog::default(),
             health: HookHealth::default(),
             active: AtomicBool::new(false),
+            allowed_keyboard: AtomicBool::new(false),
+            allowed_mouse: AtomicBool::new(false),
         }
     }
 }
@@ -91,14 +95,30 @@ impl InputCounter {
     /// without recording timestamps into memory buffers.
     pub fn set_active(&self, active: bool) {
         self.active.store(active, Ordering::SeqCst);
+        self.allowed_keyboard.store(active, Ordering::SeqCst);
+        self.allowed_mouse.store(active, Ordering::SeqCst);
     }
 
     pub fn is_active(&self) -> bool {
         self.active.load(Ordering::SeqCst)
     }
 
+    /// Configure effective sensor permissions for keyboard and mouse.
+    pub fn set_permissions(&self, keyboard: bool, mouse: bool) {
+        self.allowed_keyboard.store(keyboard, Ordering::SeqCst);
+        self.allowed_mouse.store(mouse, Ordering::SeqCst);
+    }
+
+    pub fn is_keyboard_allowed(&self) -> bool {
+        self.allowed_keyboard.load(Ordering::SeqCst)
+    }
+
+    pub fn is_mouse_allowed(&self) -> bool {
+        self.allowed_mouse.load(Ordering::SeqCst)
+    }
+
     fn record_key_press(&self, at_ms: i64) {
-        if !self.is_active() {
+        if !self.is_active() || !self.is_keyboard_allowed() {
             return;
         }
         self.key_presses.record(at_ms);
@@ -106,7 +126,7 @@ impl InputCounter {
     }
 
     fn record_click(&self, at_ms: i64) {
-        if !self.is_active() {
+        if !self.is_active() || !self.is_mouse_allowed() {
             return;
         }
         self.mouse_clicks.record(at_ms);
@@ -116,7 +136,7 @@ impl InputCounter {
     /// Mouse movement / wheel: counts as activity (reading and scrolling is
     /// work) but not as a click.
     fn record_mouse_activity(&self, at_ms: i64) {
-        if !self.is_active() {
+        if !self.is_active() || !self.is_mouse_allowed() {
             return;
         }
         self.mouse_activity.mark(at_ms.div_euclid(1000));
@@ -380,6 +400,13 @@ impl HookHealth {
         let last = *self.last_outage.lock().unwrap_or_else(|e| e.into_inner());
         !matches!(last, Some((from, to)) if from < end_ms && to > start_ms)
     }
+
+    /// Reset outage and silence clocks when sensors are stopped/deactivated.
+    fn reset_silence(&self) {
+        self.last_event_ms.store(0, Ordering::Relaxed);
+        self.unhealthy_since_ms.store(0, Ordering::Relaxed);
+        *self.last_outage.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
 }
 
 /// A low-level hook message, reduced to what is counted.
@@ -445,29 +472,44 @@ impl Default for InputFilter {
 
 impl InputFilter {
     fn apply(&mut self, counter: &InputCounter, input: RawInput, injected: bool, at_ms: i64) {
+        if !counter.is_active() {
+            return;
+        }
         counter.health.saw_event(at_ms);
         let second = at_ms.div_euclid(1000);
         if injected {
-            if !counter.is_active() {
-                return;
-            }
-            // Seen, reported, never counted as the user's input.
             match input {
-                RawInput::KeyDown(_) => counter.injected_keyboard.add(second),
-                RawInput::ButtonDown | RawInput::Move | RawInput::Wheel => counter.injected_mouse.add(second),
+                RawInput::KeyDown(_) => {
+                    if counter.is_keyboard_allowed() {
+                        counter.injected_keyboard.add(second);
+                    }
+                }
+                RawInput::ButtonDown | RawInput::Move | RawInput::Wheel => {
+                    if counter.is_mouse_allowed() {
+                        counter.injected_mouse.add(second);
+                    }
+                }
                 RawInput::KeyUp(_) | RawInput::ButtonUp => {}
             }
             return;
         }
         match input {
             RawInput::KeyDown(vk) => {
-                if self.key_down(vk, at_ms) {
+                if counter.is_keyboard_allowed() && self.key_down(vk, at_ms) {
                     counter.record_key_press(at_ms);
                 }
             }
             RawInput::KeyUp(vk) => self.key_down_at[(vk & 0xFF) as usize] = 0,
-            RawInput::ButtonDown => counter.record_click(at_ms),
-            RawInput::Move | RawInput::Wheel => counter.record_mouse_activity(at_ms),
+            RawInput::ButtonDown => {
+                if counter.is_mouse_allowed() {
+                    counter.record_click(at_ms);
+                }
+            }
+            RawInput::Move | RawInput::Wheel => {
+                if counter.is_mouse_allowed() {
+                    counter.record_mouse_activity(at_ms);
+                }
+            }
             RawInput::ButtonUp => {}
         }
     }
@@ -481,7 +523,7 @@ impl InputFilter {
     }
 
     /// Forget which keys are held (their key-ups may have been missed).
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.key_down_at = [0; 256];
     }
 }
@@ -729,6 +771,7 @@ pub fn active_minutes(active_seconds: &[i64], start: i64, end: i64) -> Vec<bool>
 /// calls them; the thread sleeps in `GetMessageW` otherwise), so they cost
 /// ~0% CPU while idle.
 #[cfg(windows)]
+#[cfg_attr(not(test), expect(dead_code, reason = "legacy/test hook starter"))]
 pub fn spawn_listener(counter: Arc<InputCounter>) {
     let for_thread = counter.clone();
     let spawned = std::thread::Builder::new()
@@ -744,6 +787,11 @@ pub fn spawn_listener(counter: Arc<InputCounter>) {
 #[cfg(not(windows))]
 pub fn spawn_listener(counter: Arc<InputCounter>) {
     counter.health.mark_unhealthy(1);
+}
+
+#[cfg(windows)]
+pub(crate) fn run_hooks_loop(counter: Arc<InputCounter>) {
+    hooks::run(counter);
 }
 
 #[cfg(windows)]
@@ -889,7 +937,15 @@ mod hooks {
         if let Some(hooks) = hooks.take() {
             uninstall(hooks);
         }
-        tracing::warn!("the input hook thread stopped");
+        CONTEXT.with(|context| {
+            if let Ok(mut context) = context.try_borrow_mut() {
+                if let Some(context) = context.as_mut() {
+                    context.filter.reset();
+                }
+            }
+        });
+        counter.health.reset_silence();
+        tracing::info!("the input hook thread stopped and unhooked successfully");
     }
 
     /// Windows silently unhooks a hook that times out too often, and a
@@ -897,6 +953,10 @@ mod hooks {
     /// hooks did not, reinstall them; when they provably missed the user's
     /// input, capture is reported unavailable until they deliver again.
     fn watchdog(counter: &InputCounter, hooks: &mut Option<Hooks>, watch: &mut Watchdog) {
+        if !counter.is_active() {
+            // Disabled when not actively tracking: never operate or reinstall hooks
+            return;
+        }
         let now = now_ms();
         let on_own_desktop = super::input_on_own_desktop();
         watch.own_desktop_since_ms = own_desktop_since(watch.own_desktop_since_ms, on_own_desktop, now);
@@ -1260,6 +1320,7 @@ mod tests {
         assert!(!counter.capture_available_between(at(T0 + 320), at(T0 + 480)));
 
         let mut filter = InputFilter::default();
+        counter.set_active(true);
         filter.apply(&counter, RawInput::Move, false, T0_MS + 1_200_000);
         assert!(counter.hook_healthy());
         assert!(!counter.capture_available_between(at(T0 + 600), at(T0 + 1_200)), "inside the outage");
@@ -1469,6 +1530,7 @@ mod tests {
     #[test]
     fn activating_counter_accumulates_events_and_deactivating_halts_collection() {
         let counter = InputCounter::new();
+        counter.set_permissions(true, true);
         counter.set_active(true);
         assert!(counter.is_active());
         let mut filter = InputFilter::default();
@@ -1489,5 +1551,54 @@ mod tests {
         let t_end = t0 + chrono::Duration::seconds(10);
         // Still only 1 key press and 1 click recorded; paused events dropped
         assert_eq!(counter.counts_between(t0, t_end), (1, 1));
+    }
+
+    #[test]
+    fn inactive_filter_does_not_update_health_or_key_down_state() {
+        let counter = InputCounter::new();
+        assert!(!counter.is_active());
+        let mut filter = InputFilter::default();
+        let t0_ms = 1_000_000;
+
+        // Apply key down while inactive
+        filter.apply(&counter, RawInput::KeyDown(0x41), false, t0_ms);
+        assert_eq!(counter.health.last_event_ms(), 0, "health must not record events while inactive");
+        assert_eq!(filter.key_down_at[0x41], 0, "key_down_at must not track keys while inactive");
+
+        // Now activate and apply
+        counter.set_permissions(true, true);
+        counter.set_active(true);
+        filter.apply(&counter, RawInput::KeyDown(0x41), false, t0_ms + 10);
+        assert_eq!(counter.health.last_event_ms(), t0_ms + 10);
+        assert_eq!(filter.key_down_at[0x41], t0_ms + 10);
+
+        // Reset clears held keys
+        filter.reset();
+        assert_eq!(filter.key_down_at[0x41], 0);
+    }
+
+    #[test]
+    fn per_sensor_permission_gating_in_filter() {
+        let counter = InputCounter::new();
+        counter.set_active(true);
+        // Keyboard allowed, mouse denied
+        counter.set_permissions(true, false);
+        let mut filter = InputFilter::default();
+        let t0 = Utc::now();
+        let t0_ms = t0.timestamp_millis();
+
+        filter.apply(&counter, RawInput::KeyDown(0x41), false, t0_ms);
+        filter.apply(&counter, RawInput::ButtonDown, false, t0_ms + 50);
+        filter.apply(&counter, RawInput::Move, false, t0_ms + 60);
+
+        let t_end = t0 + chrono::Duration::seconds(5);
+        assert_eq!(counter.counts_between(t0, t_end), (1, 0), "keyboard should record, mouse should drop");
+
+        // Switch: Mouse allowed, keyboard denied
+        counter.set_permissions(false, true);
+        filter.apply(&counter, RawInput::KeyDown(0x42), false, t0_ms + 100);
+        filter.apply(&counter, RawInput::ButtonDown, false, t0_ms + 150);
+
+        assert_eq!(counter.counts_between(t0, t_end), (1, 1), "second key dropped, mouse click recorded");
     }
 }

@@ -7,6 +7,7 @@
 
 pub mod active_window;
 pub mod input;
+pub mod lifecycle;
 pub mod screenshot;
 pub mod system;
 pub mod usage;
@@ -19,6 +20,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use crate::config::CapturePermissions;
 use crate::model::{Activity, EndReason, WindowInfo};
 use input::InputCounter;
+pub use lifecycle::{FakeSensorDriver, NativeSensorDriver, SensorDriver};
 use screenshot::ScreenCapture;
 use system::DeviceInfo;
 use usage::{UsageRecorder, UsageSlice};
@@ -59,17 +61,29 @@ pub struct Tracker {
     input: Arc<InputCounter>,
     usage: Arc<UsageRecorder>,
     device: DeviceInfo,
+    driver: Arc<dyn SensorDriver>,
 }
 
 impl Tracker {
     pub fn new() -> Self {
+        Self::with_driver(Arc::new(NativeSensorDriver::new()))
+    }
+
+    /// Construct a Tracker with an explicit sensor driver.
+    ///
+    /// Invariant: Constructor NEVER starts input hooks or window sampler!
+    /// Sensors remain completely stopped and unattached until explicit authorized activation.
+    pub fn with_driver(driver: Arc<dyn SensorDriver>) -> Self {
         let input = Arc::new(InputCounter::new());
-        // Start the global input hooks once; they run on their own thread and
-        // are fully event-driven, so they cost ~0% CPU while idle.
-        input::spawn_listener(input.clone());
         let usage = Arc::new(UsageRecorder::new());
-        usage::spawn_sampler(usage.clone());
-        Self { input, usage, device: DeviceInfo::collect() }
+        Self { input, usage, device: DeviceInfo::collect(), driver }
+    }
+
+    /// Construct a fake tracker for safe synthetic testing without OS hooks.
+    #[cfg_attr(not(test), expect(dead_code, reason = "for testing and inspection"))]
+    pub fn new_fake() -> (Self, Arc<FakeSensorDriver>) {
+        let driver = Arc::new(FakeSensorDriver::new());
+        (Self::with_driver(driver.clone()), driver)
     }
 
     /// Read-only access to input for the live view (counts and activity % of
@@ -84,17 +98,53 @@ impl Tracker {
         self.usage.clone()
     }
 
-    /// Turn active sensor collection on or off across both the foreground-window
-    /// usage recorder and the low-level input counter. When inactive, samples
-    /// and events are dropped immediately without memory buffering.
+    /// Access the underlying sensor driver.
+    #[expect(dead_code, reason = "for testing and inspection")]
+    pub fn driver(&self) -> Arc<dyn SensorDriver> {
+        self.driver.clone()
+    }
+
+    /// Apply effective sensor policy based on active tracking status and session permissions.
+    ///
+    /// When inactive or perms are None, detaches OS hooks and halts sampling immediately.
+    /// When active, attaches only the sensors explicitly permitted by policy.
+    pub fn apply_sensor_policy(&self, active: bool, perms: Option<&CapturePermissions>) {
+        let active_window = active && perms.is_some_and(|p| p.active_window);
+        let keyboard = active && perms.is_some_and(|p| p.keyboard);
+        let mouse = active && perms.is_some_and(|p| p.mouse);
+        let input_active = keyboard || mouse;
+
+        self.usage.set_active(active_window);
+        self.input.set_active(input_active);
+        self.input.set_permissions(keyboard, mouse);
+
+        if input_active {
+            self.driver.start_input(self.input.clone(), keyboard, mouse);
+        } else {
+            self.driver.stop_input();
+        }
+
+        if active_window {
+            self.driver.start_usage(self.usage.clone());
+        } else {
+            self.driver.stop_usage();
+        }
+    }
+
+    /// Turn active sensor collection on or off (legacy helper using default permissions).
+    #[expect(dead_code, reason = "for testing and inspection")]
     pub fn set_tracking_active(&self, active: bool) {
-        self.usage.set_active(active);
-        self.input.set_active(active);
+        if active {
+            let default_perms = CapturePermissions::default();
+            self.apply_sensor_policy(true, Some(&default_perms));
+        } else {
+            self.apply_sensor_policy(false, None);
+        }
     }
 
     #[cfg_attr(not(test), expect(dead_code, reason = "for UI and inspection"))]
     pub fn is_tracking_active(&self) -> bool {
-        self.usage.is_active() && self.input.is_active()
+        self.driver.is_input_running() || self.driver.is_usage_running()
     }
 
     /// This device: install id, name, OS and agent version (also for the
@@ -599,16 +649,54 @@ mod tests {
 
     #[test]
     fn tracker_active_gate_controls_both_usage_and_input() {
-        let tracker = Tracker::new();
+        let (tracker, driver) = Tracker::new_fake();
         assert!(!tracker.is_tracking_active(), "Tracker must default to inactive (opt-in)");
+        assert!(!driver.is_input_running());
+        assert!(!driver.is_usage_running());
+
         tracker.set_tracking_active(true);
         assert!(tracker.is_tracking_active());
+        assert!(driver.is_input_running());
+        assert!(driver.is_usage_running());
         assert!(tracker.usage().is_active());
         assert!(tracker.input().is_active());
 
         tracker.set_tracking_active(false);
         assert!(!tracker.is_tracking_active());
+        assert!(!driver.is_input_running());
+        assert!(!driver.is_usage_running());
         assert!(!tracker.usage().is_active());
         assert!(!tracker.input().is_active());
+    }
+
+    #[test]
+    fn tracker_per_sensor_permission_gating_with_fake_driver() {
+        let (tracker, driver) = Tracker::new_fake();
+        // Only active_window permitted
+        let perms = CapturePermissions {
+            keyboard: false,
+            mouse: false,
+            active_window: true,
+            screenshot: false,
+            webcam: false,
+            running_programs: false,
+            blur_screenshots: false,
+        };
+        tracker.apply_sensor_policy(true, Some(&perms));
+        assert!(!driver.is_input_running(), "input hooks must not start when keyboard and mouse are denied");
+        assert!(driver.is_usage_running(), "usage sampler should start when active_window is allowed");
+
+        // Only keyboard permitted
+        let perms2 = CapturePermissions {
+            keyboard: true,
+            mouse: false,
+            active_window: false,
+            ..perms
+        };
+        tracker.apply_sensor_policy(true, Some(&perms2));
+        assert!(driver.is_input_running(), "input hooks should start when keyboard is allowed");
+        assert!(!driver.is_usage_running(), "usage sampler must stop when active_window is denied");
+        assert!(driver.last_keyboard_allowed());
+        assert!(!driver.last_mouse_allowed());
     }
 }

@@ -18,6 +18,7 @@ use super::input::{active_minutes, bucket_of, bucket_seconds, minute_buckets, RE
 /// How often the foreground window is sampled. The query is a couple of
 /// Win32 calls, so this costs nothing measurable while giving per-app times
 /// accurate to a few seconds.
+#[allow(dead_code)]
 pub const SAMPLE_EVERY: Duration = Duration::from_secs(3);
 
 /// A gap between samples longer than this means the machine slept or the
@@ -153,6 +154,7 @@ impl UsageRecorder {
 /// Start the background sampler. It only reads the foreground window while
 /// tracking is active: while paused, signed out, or unstarted, it sleeps
 /// without executing foreground window queries.
+#[allow(dead_code)]
 pub fn spawn_sampler(recorder: Arc<UsageRecorder>) {
     let spawned = std::thread::Builder::new()
         .name("usage-sampler".into())

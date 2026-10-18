@@ -19,8 +19,8 @@ Dosi-Tracker is a multi-tenant work activity and time-tracking system designed a
 
 ### Evidence Classification Standard
 Every backlog item and verification check in this specification is categorized under one of five strict evidence levels:
-1. **[Verified]**: Independently verified locally by the PM / QA Operator with exact command outputs and clean exit code `0`.
-2. **[Worker-Reported]**: Unit/integration test suites executed and reported green by the implementation engineer in local environments; not yet independently run by operator.
+1. **[Verified]**: Independently verified locally by the PM / QA Operator with exact command outputs, exact commit SHA, and clean exit code `0`.
+2. **[Worker-Reported]**: Unit/integration test suites executed and reported green by the implementation engineer in local environments; not yet independently repeated by the PM operator.
 3. **[Source-Only]**: Code, configuration, or UI implementation exists in the repository, but runtime execution, end-to-end delivery, or native OS hooks remain unverified.
 4. **[Blocked]**: Implementation depends on external prerequisites (e.g., Apple Developer ID certificate, Authenticode EV cert, physical hardware/OS toolchain).
 5. **[Not Implemented]**: Feature or architectural component not yet present in codebase.
@@ -37,27 +37,35 @@ Every backlog item and verification check in this specification is categorized u
 - **REQ-WS-02: Multi-Workspace Membership & Listing**
   - *Requirement:* A user can view all active workspaces they belong to via `GET /api/app/workspaces/mine` and the dashboard workspace switcher.
   - *Code:* `backend/.../WorkspaceAppService.cs` (`GetMineAsync`), `frontend/src/components/layout/workspace-switcher.tsx`.
-  - *Evidence Level:* **[Verified]** (Frontend `workspace-switcher.live.test.tsx` 7 passed; backend unit tests).
+  - *Evidence Level:* **[Verified by PM @ 18db4d5]** (Frontend `workspace-switcher.live.test.tsx` 7 passed; Vitest exit 0).
 - **REQ-WS-03: Dynamic Workspace Creation**
   - *Requirement:* An authenticated user can create an additional workspace at any time; the creator is automatically assigned the `Owner` role.
   - *Code:* `backend/.../WorkspaceAppService.cs` (`CreateAsync`), `frontend/src/app/(dashboard)/workspaces/page.tsx`.
-  - *Evidence Level:* **[Verified]** (Frontend `workspace-switcher.live.test.tsx` creates workspace and plan).
+  - *Evidence Level:* **[Verified by PM @ 18db4d5]** (Frontend `workspaces.test.tsx` 2 passed; Vitest exit 0).
 - **REQ-WS-04: Workspace Switching & Context Switching**
   - *Requirement:* Switching active workspace updates cookies (`__Host-Dosi-Workspace`), headers (`X-Workspace-Id`), clears cache/queries, and swaps tenant roster.
   - *Code:* `frontend/src/components/session-provider.tsx`, `frontend/src/test/integration/tenant-switching.test.tsx`, `backend/.../CurrentWorkspace.cs`.
-  - *Evidence Level:* **[Verified]** (`tenant-switching.test.tsx` 8 passed).
+  - *Evidence Level:* **[Verified by PM @ 18db4d5]** (`tenant-switching.test.tsx` 8 passed; Vitest exit 0).
 - **REQ-WS-05: Workspace Invitations Lifecycle**
-  - *Requirement:* Admins/Owners invite members by email with single-use cryptographically secure tokens; invitee can inspect and accept/decline; duplicate invites rejected.
+  - *Requirement:* Admins/Owners invite members by email with single-use cryptographically secure tokens; invitee can inspect and accept; duplicate invites rejected.
   - *Code:* `backend/.../TeamAppService.cs` (`InviteMemberAsync`), `backend/.../WorkspaceAppService.cs` (`GetInvitationAsync`, `AcceptInvitationAsync`).
   - *Evidence Level:* **[Worker-Reported]** (`TeamAppServiceTests.cs`, `WorkspaceAppServiceTests.cs`).
 - **REQ-WS-06: Role Governance & Last-Owner Orphaning Guard**
   - *Requirement:* Roles include Owner, Admin, Member. Self-service role modification is forbidden (`403 Tracker:CannotModifySelf`). Leaving a workspace is supported (`LeaveAsync`), but the last owner is strictly prevented from leaving or being demoted (`403 Tracker:CannotLeaveLastOwner`).
   - *Code:* `backend/.../WorkspaceAppService.cs` (`LeaveAsync`), `backend/.../TeamAppService.cs` (`UpdateWorkspaceRoleAsync`, `RemoveFromWorkspaceAsync`).
   - *Evidence Level:* **[Worker-Reported]** (EF Core `EfCoreWorkspaceAppServiceTests`, `TeamOwnerRulesTests`).
+- **REQ-WS-07: Workspace Invitation Expiry, Revocation & Decline**
+  - *Requirement:* Invitations must enforce cryptographic token expiry (e.g., 7 days). Inviters and admins can explicitly revoke pending invitations. Recipients can decline invitations without joining.
+  - *Code:* `backend/.../WorkspaceAppService.cs`, `backend/.../TeamAppService.cs`.
+  - *Evidence Level:* **[Not Implemented / Backlog Gap]** (Accept flow present; decline, revocation, and TTL expiry endpoints open).
+- **REQ-WS-08: Safe Workspace Archive, Deletion & Settings Governance**
+  - *Requirement:* Workspace Owners can archive or safely schedule deletion with confirmation and a retention grace period. Deletion must be blocked if active billing subscriptions or un-archived member data exist. Workspace settings changes must be audited.
+  - *Code:* `backend/.../WorkspaceAppService.cs`.
+  - *Evidence Level:* **[Not Implemented / Backlog Gap]** (Hard deletion / soft-archive lifecycle open).
 
 ---
 
-### Priority 2: Tenant & Workspace Isolation
+## 3. Priority 2: Tenant & Workspace Isolation
 - **REQ-ISO-01: Backend Entity Query Scoping**
   - *Requirement:* Every tenant-scoped entity implements `IWorkspaceScoped`. ABP global query filters automatically restrict reads/writes to `CurrentWorkspace.Id`.
   - *Code:* `backend/.../DosiTrackerDbContext.cs`, `backend/.../CurrentWorkspace.cs`.
@@ -73,11 +81,15 @@ Every backlog item and verification check in this specification is categorized u
 - **REQ-ISO-04: Client & Cache Partitioning**
   - *Requirement:* Frontend SWR / query cache keys and desktop offline SQLite databases partition data by tenant workspace ID. Switching workspaces flushes stale requests.
   - *Code:* `frontend/src/hooks/useApi.ts`, `frontend/src/lib/tenant-data.ts`, `clients/windows/src/worker.rs`.
-  - *Evidence Level:* **[Verified]** (Frontend `tenant-switching.test.tsx`).
+  - *Evidence Level:* **[Verified by PM @ 18db4d5]** (Frontend `tenant-switching.test.tsx` 8 passed).
+- **REQ-ISO-05: Authenticated HTTP/Browser Negative Tenant Isolation**
+  - *Requirement:* Authenticated API requests and Next.js server actions must strictly enforce tenant boundaries against malicious parameter tampering (e.g., User from Workspace A attempting `GET /api/app/activity?workspaceId=WorkspaceB` or spoofing `X-Workspace-Id` header). Must return `403 Forbidden` and prevent data leakage.
+  - *Code:* `backend/.../CurrentWorkspace.cs`, `frontend/src/middleware.ts`.
+  - *Evidence Level:* **[Source-Only / Backlog Gap]** (Entity query filters exist in EF Core; comprehensive negative HTTP test suite open).
 
 ---
 
-### Priority 3: Tracker Product Core & Offline Queue
+## 4. Priority 3: Tracker Product Core & Offline Queue
 - **REQ-TRK-01: Time Block Recording & Idempotent Ingestion**
   - *Requirement:* Time blocks recorded in minute slices and uploaded to `POST /api/app/activity`. Idempotent unique index `(WorkspaceId, UserId, ClientActivityId)` prevents duplicate billing.
   - *Code:* `backend/.../ActivityAppService.cs`, `clients/windows/src/storage.rs`, `clients/macos/.../QueueDatabase.swift`.
@@ -89,43 +101,53 @@ Every backlog item and verification check in this specification is categorized u
 - **REQ-TRK-03: Timezone Normalization & Productivity Math**
   - *Requirement:* Server normalizes client timestamps against IANA workspace timezones. Duration-weighted productivity calculations exclude idle/break intervals.
   - *Code:* `backend/.../AgentContextNormalizer.cs`, `frontend/src/lib/report-math.ts`.
-  - *Evidence Level:* **[Worker-Reported]** (`ReportingAppServiceTests.cs`), **[Verified]** (`report-math.test.ts`).
+  - *Evidence Level:* **[Worker-Reported]** (`ReportingAppServiceTests.cs`, `report-math.test.ts`).
 - **REQ-TRK-04: Device Heartbeat & Presence**
   - *Requirement:* Periodic heartbeat (`POST /api/app/presence/heartbeat`) maintains online presence (150s timeout). Surplus/stale devices pruned.
   - *Code:* `backend/.../PresenceAppService.cs`.
-  - *Evidence Level:* **[Verified]** (`EfCorePresenceAppServiceTests.Heartbeat_Should_Accept_And_Store_Linux_Platform`).
+  - *Evidence Level:* **[Worker-Reported]** (`EfCorePresenceAppServiceTests.Heartbeat_Should_Accept_And_Store_Linux_Platform`).
 
 ---
 
-### Priority 4: Privacy & Surveillance Prevention Gate
+## 5. Priority 4: Privacy & Surveillance Prevention Gate
 - **REQ-PRV-01: Non-Stealth Desktop Agent & Visible User Controls**
   - *Requirement:* Desktop agent displays visible tray icon, active tracking banner, and prominent Start/Pause/Stop/Quit controls.
   - *Code:* `clients/windows/src/ui/mod.rs`, `clients/windows/src/tray.rs`.
   - *Evidence Level:* **[Worker-Reported]** (`tray::tests::tracking_view_offers_pause_and_shows_the_project`).
-- **REQ-PRV-02: Sensor Lifecycle & Pause/Stop Detachment**
-  - *Requirement:* Input hooks and foreground window samplers must NOT run at application launch or capture data when paused/stopped/signed out.
-  - *Code:* `clients/windows/src/tracking/usage.rs`, `clients/windows/src/tracking/input.rs`, `clients/windows/src/worker.rs`.
-  - *Evidence Level:* **[P0 In Progress]** (Active tracking gate implemented in Phase 3).
+- **REQ-PRV-02: Windows Sensor Lifecycle Foundation**
+  - *Requirement:* Injectable sensor driver decoupling. Construction (`Tracker::new()`) must NEVER install OS hooks or query foreground windows at startup. OS hooks (`NativeSensorDriver`) and usage samplers start only upon authorized tracking activation, and cleanly detach/stop upon pause, lock, away, workspace loss, sign-out, or quit. Detachment must be synchronous before returning (via `WM_QUIT` and thread join). Hook watchdog must not operate outside active collection. Inactive events drop before health or timing updates (`InputFilter::apply`).
+  - *Code:* `clients/windows/src/tracking/lifecycle.rs`, `clients/windows/src/tracking/input.rs`, `clients/windows/src/tracking/usage.rs`, `clients/windows/src/worker.rs`.
+  - *Evidence Level:* **[Worker-Reported (Synthetic Driver Verified)]** (73 focused synthetic tests across 6 suites pass exit 0; real native interactive Win32 desktop session hooks remain unverified in QA).
 - **REQ-PRV-03: Per-User Local Opt-In & Policy Intersection**
-  - *Requirement:* Admin project policies on the server (`allow_screenshot`, `allow_keyboard`, etc.) do not substitute for local user consent. Captures occur only if:
+  - *Requirement:* Server policy intersection alone (`ProjectPolicy ∩ LocalConsent`) does NOT constitute local user consent. Captures and sensing occur only if:
     $$\text{Effective} = \text{ProjectPolicy} \cap \text{LocalConsent}$$
+    Configuration defaults (`CapturePermissions`) do NOT constitute explicit consent.
   - *Code:* `clients/windows/src/worker/session.rs`, `docs/CONSENT_CAPABILITY_AUDIT.md`.
-  - *Evidence Level:* **[Source-Only]** (Policy intersection present; GUI toggles open).
+  - *Evidence Level:* **[Not Implemented / Backlog Gap]** (Policy intersection logic present in source; local interactive opt-in consent UI is missing; defaults cannot substitute for affirmative consent).
 - **REQ-PRV-04: Monotonic Counts Only — No Raw Keystrokes**
   - *Requirement:* Keyboard and mouse inputs are tallied as monotonic integer increments. Keycodes, text characters, clipboard contents, and inter-keystroke timing are discarded.
   - *Code:* `clients/windows/src/tracking/input.rs` (`InputFilter::apply`).
-  - *Evidence Level:* **[Worker-Reported]** (Cargo tests in `tracking::input::tests`).
+  - *Evidence Level:* **[Verified by PM @ 18db4d5]** (`tracking::input::tests::inactive_counter_drops_input_events_and_keeps_logs_empty`, `activating_counter_accumulates_events_and_deactivating_halts_collection`).
 - **REQ-PRV-05: Truthful Metric Nullability — No Fabricated Zeros**
   - *Requirement:* Denied or unsupported metrics must remain `null` end-to-end (DB, API, frontend), distinguishing measured zero (`0`) from unavailable (`null`).
   - *Code:* `docs/CONSENT_CAPABILITY_AUDIT.md` §4, `backend/.../Activity.cs`.
-  - *Evidence Level:* **[Not Implemented / Phase 3 Scope]**.
+  - *Evidence Level:* **[Not Implemented / Deferred to Reviewed Backend Phase]**.
+- **REQ-PRV-06: Explicit Local Interactive Consent UI & Capability Opt-In**
+  - *Requirement:* Dedicated desktop prompt explaining exactly what is collected (and what is never collected: raw text, passwords) with granular toggles. Fail-closed: missing consent disables the respective sensor.
+  - *Code:* `clients/windows/src/ui/mod.rs`.
+  - *Evidence Level:* **[Not Implemented / Backlog Gap]**.
+- **REQ-PRV-07: Idle & Away Recovery Semantics & Privacy Tradeoff**
+  - *Requirement:* Transitioning to `Away` state stops input hooks and foreground window samplers to preserve privacy. User return is detected via Windows system idle timer (`GetLastInputInfo`) without installing hooks.
+  - *Tradeoff:* The system-level idle clock does not distinguish between physical typing and software jigglers while away; this tradeoff avoids persistent background input surveillance.
+  - *Code:* `clients/windows/src/worker.rs`, `clients/windows/src/tracking/input.rs`.
+  - *Evidence Level:* **[Worker-Reported]** (Synthetically verified via `sensor_lifecycle_stops_on_away_and_resumes_on_return`).
 
 ---
 
-### Priority 5: Native Platform Clients
+## 6. Priority 5: Native Platform Clients
 - **REQ-CLI-01: Windows Desktop Agent (Rust)**
   - *Requirement:* Rust agent with Win32 low-level hooks, DPAPI credential security, xcap screen capture, MediaFoundation webcam, and local SQLite.
-  - *Evidence Level:* **[Worker-Reported]** (345 unit tests pass; native interactive session and code signing open).
+  - *Evidence Level:* **[Worker-Reported]** (Focused synthetic test suites pass; native interactive session, Authenticode code signing, and NSIS installation unverified).
 - **REQ-CLI-02: macOS Desktop Agent (Swift)**
   - *Requirement:* Swift native app with ScreenCaptureKit, Keychain, and Quartz event tap.
   - *Evidence Level:* **[Source-Only / Blocked]** (Source present; execution blocked on host lacking macOS toolchain/hardware; signing/notarization open).
@@ -135,36 +157,57 @@ Every backlog item and verification check in this specification is categorized u
 
 ---
 
-### Priority 6: Production Engineering & Operability
+## 7. Priority 6: Production Engineering & Operability
 - **REQ-OPS-01: Automated Frontend Quality Gates**
   - *Requirement:* Zero TypeScript errors, ESLint <= 45 warnings, 100% passing Vitest suite, zero dependency architecture violations.
-  - *Evidence Level:* **[Verified]** (Operator verified clean exit 0 on commit `59403f8`).
+  - *Evidence Level:* **[Verified by PM @ 18db4d5]** (`npm run typecheck` exit 0; focused 3-file Vitest suite 17 tests exit 0). Full 1,965-test suite is **[Worker-Reported (Historical)]**.
 - **REQ-OPS-02: Accessibility Invariants (Programmatic)**
   - *Requirement:* Programmatic axe component checks and machine contrast calculations ($\ge 3:1$ for graphics/cards).
-  - *Evidence Level:* **[Verified]** (53 a11y tests passed, operator verified). Note: real-browser assistive audits remain open.
+  - *Evidence Level:* **[Worker-Reported (Historical)]** (53 a11y tests passed in jsdom). Real-browser assistive audits remain open.
 - **REQ-OPS-03: Secrets Hygiene & Isolation**
   - *Requirement:* No plaintext secrets in repository or client builds. Test suites run against ephemeral SQLite in-memory databases only.
-  - *Evidence Level:* **[Verified]** (Checked across git tree).
+  - *Evidence Level:* **[Worker-Reported (Historical)]** (Checked across git tree).
 
 ---
 
-## 3. Traceable Verification Matrix
+## 8. Priority 7: Data Retention & Compliance Operations
+- **REQ-DAT-01: Activity & Screenshot Retention Cleanup Worker**
+  - *Requirement:* Background worker enforcing workspace retention policies (e.g. 30/90 days for screenshots, 1 year for activity summaries). Prunes both blob storage objects and database records.
+  - *Code:* `backend/.../BlobStoring`, `backend/.../ActivityAppService.cs`.
+  - *Evidence Level:* **[Not Implemented / Backlog Gap]** (Settings exist in host config; periodic pruning background worker not implemented).
+- **REQ-DAT-02: Data Export, Extraction & Disaster Recovery**
+  - *Requirement:* Workspace Owners can request full data export (CSV/JSON activity summaries + zip archive of screenshots) for compliance/GDPR. Export jobs execute asynchronously with signed download URLs. Automated database backup and restore procedures documented.
+  - *Evidence Level:* **[Not Implemented / Backlog Gap]**.
+
+---
+
+## 9. Traceable Verification Matrix
 
 | Req ID | Component | Implementation File(s) | Concrete Test Command | Evidence Status | Gaps / Outstanding Items |
 |---|---|---|---|:---:|---|
-| **REQ-WS-02** | Frontend | `workspace-switcher.tsx` | `npx vitest run src/components/layout/workspace-switcher.live.test.tsx` | **[Verified]** (7 passed) | Real browser Playwright E2E journey open |
-| **REQ-WS-04** | Frontend | `session-provider.tsx` | `npx vitest run src/test/integration/tenant-switching.test.tsx` | **[Verified]** (8 passed) | Browser navigation URL sync |
-| **REQ-WS-03** | Frontend | `workspaces/page.tsx` | `npx vitest run src/test/pages/workspaces.test.tsx` | **[Verified]** (2 passed) | Server error toast handling |
+| **REQ-WS-02** | Frontend | `workspace-switcher.tsx` | `npx vitest run src/components/layout/workspace-switcher.live.test.tsx` | **[Verified by PM @ 18db4d5]** (7 passed) | Real browser Playwright E2E journey open |
+| **REQ-WS-03** | Frontend | `workspaces/page.tsx` | `npx vitest run src/test/pages/workspaces.test.tsx` | **[Verified by PM @ 18db4d5]** (2 passed) | Server error toast handling |
+| **REQ-WS-04** | Frontend | `session-provider.tsx` | `npx vitest run src/test/integration/tenant-switching.test.tsx` | **[Verified by PM @ 18db4d5]** (8 passed) | Browser navigation URL sync |
 | **REQ-WS-05** | Backend | `TeamAppService.cs` | `dotnet test --filter TeamMembershipLifecycleTests` | **[Worker-Reported]** | Real SMTP invitation email delivery |
 | **REQ-WS-06** | Backend | `WorkspaceAppService.cs` | `dotnet test --filter EfCoreWorkspaceAppServiceTests` | **[Worker-Reported]** | Frontend leave-workspace confirmation modal |
+| **REQ-WS-07** | Backend | `WorkspaceAppService.cs` | Endpoints for decline, revoke, TTL | **[Not Implemented]** | Token expiry & decline endpoints |
+| **REQ-WS-08** | Backend | `WorkspaceAppService.cs` | Soft-delete & archive workflows | **[Not Implemented]** | Grace period & active billing checks |
 | **REQ-ISO-01**| Backend | `DosiTrackerDbContext.cs`| `dotnet test --filter WorkspacePersistenceTests` | **[Worker-Reported]** | Multi-node tenant cache invalidation |
+| **REQ-ISO-04**| Frontend | `tenant-switching.test.tsx`| `npx vitest run src/test/integration/tenant-switching.test.tsx` | **[Verified by PM @ 18db4d5]** (8 passed) | Browser multi-tab synchronization |
+| **REQ-ISO-05**| Backend / Web | `CurrentWorkspace.cs`, `middleware.ts` | Negative cross-workspace HTTP tests | **[Not Implemented]** | Header spoofing negative integration tests |
 | **REQ-TRK-01**| Backend | `ActivityAppService.cs` | `dotnet test --filter ActivityPersistenceTests` | **[Worker-Reported]** | S3/R2 direct multipart upload |
 | **REQ-TRK-02**| Windows | `uploader.rs`, `storage.rs`| `cargo test --bin dosi-tracker worker` | **[Worker-Reported]** | Interactive offline network simulation |
-| **REQ-TRK-04**| Backend | `PresenceAppService.cs` | `dotnet test --filter EfCorePresenceAppServiceTests` | **[Verified]** | WebSocket / SignalR push live presence |
-| **REQ-PRV-02**| Windows | `usage.rs`, `input.rs` | `cargo test --bin dosi-tracker tracking` | **[P0 In Progress]** | Synchronous hook detachment on pause |
-| **REQ-PRV-05**| Cross | `Activity.cs`, `types.ts` | Schema Migration + `npm test` | **[Not Implemented]** | DB column nullability migration |
-| **REQ-CLI-01**| Windows | `clients/windows/src` | `cargo test --bin dosi-tracker` | **[Worker-Reported]** | Authenticode code signing & NSIS packaging |
+| **REQ-TRK-04**| Backend | `PresenceAppService.cs` | `dotnet test --filter EfCorePresenceAppServiceTests` | **[Worker-Reported]** | WebSocket / SignalR push live presence |
+| **REQ-PRV-02**| Windows | `lifecycle.rs`, `input.rs`, `usage.rs`, `worker.rs` | `cargo test --bin dosi-tracker worker::tests::sensor_lifecycle` | **[Worker-Reported (Synthetic Driver Verified)]** (6 passed) | Native OS interactive Win32 desktop unverified |
+| **REQ-PRV-03**| Windows | `session.rs` | Policy intersection logic | **[Not Implemented]** | Local consent UI missing; defaults cannot substitute |
+| **REQ-PRV-04**| Windows | `input.rs` | `cargo test --bin dosi-tracker tracking::input::tests::inactive_counter_drops_input_events_and_keeps_logs_empty` | **[Verified by PM @ 18db4d5]** (1 passed, exit 0) | Real hook hardware injection ignored in test |
+| **REQ-PRV-05**| Cross | `Activity.cs`, `types.ts` | Schema Migration + `npm test` | **[Not Implemented]** | Deferred to reviewed backend migration phase |
+| **REQ-PRV-06**| Windows UI | `clients/windows/src/ui` | Interactive consent modal | **[Not Implemented]** | User prompt before first tracking session |
+| **REQ-PRV-07**| Windows | `worker.rs`, `input.rs` | `cargo test --bin dosi-tracker worker::tests::sensor_lifecycle_stops_on_away_and_resumes_on_return` | **[Worker-Reported]** (1 passed, exit 0) | Idle clock doesn't distinguish typing vs jiggler |
+| **REQ-CLI-01**| Windows | `clients/windows/src` | `cargo test --bin dosi-tracker` (focused) | **[Worker-Reported]** | Authenticode code signing & NSIS packaging |
 | **REQ-CLI-02**| macOS | `clients/macos/Sources` | `swift test` (macOS host) | **[Blocked]** | Requires macOS hardware & Apple Notarization |
 | **REQ-CLI-03**| Linux | `clients/linux` (greenfield) | Crate build + tests | **[Not Implemented]** | Greenfield implementation |
-| **REQ-OPS-01**| Frontend | Full frontend suite | `npm run validate` | **[Verified]** (1,965 passed) | Full CI pipeline setup |
-| **REQ-OPS-02**| Frontend | `analytics-charts.tsx` | `npm run test:a11y` | **[Verified]** (53 passed) | Manual screen reader / zoom audit |
+| **REQ-OPS-01**| Frontend | Full frontend suite | `npm run typecheck` | **[Verified by PM @ 18db4d5]** (exit 0) | Full CI pipeline setup |
+| **REQ-OPS-02**| Frontend | `analytics-charts.tsx` | `npm run test:a11y` | **[Worker-Reported (Historical)]** (53 passed) | Manual screen reader / zoom audit |
+| **REQ-DAT-01**| Backend | Background worker | Retention pruning test suite | **[Not Implemented]** | Periodic pruning job not implemented |
+| **REQ-DAT-02**| Backend | Export service | Asynchronous export & backup suite | **[Not Implemented]** | Async bulk zip & signed URL generator |
