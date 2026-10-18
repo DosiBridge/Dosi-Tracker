@@ -334,7 +334,7 @@ public abstract class PresenceAppServiceTests<TStartupModule> : TrackerApplicati
             DeviceId = deviceId,
             Status = "tracking",
             DeviceName = "\u0001\u0002",
-            Platform = "linux",
+            Platform = "freebsd",
             TimeZone = "Nowhere/Atlantis",
             UtcOffsetMinutes = 2000
         });
@@ -344,6 +344,15 @@ public abstract class PresenceAppServiceTests<TStartupModule> : TrackerApplicati
         stored.Platform.ShouldBeNull();
         stored.TimeZone.ShouldBeNull();
         stored.UtcOffsetMinutes.ShouldBeNull();
+
+        var linuxDeviceId = Guid.NewGuid();
+        await _presenceAppService.HeartbeatAsync(new HeartbeatDto
+        {
+            DeviceId = linuxDeviceId,
+            Status = "tracking",
+            Platform = "linux"
+        });
+        (await GetDeviceAsync(linuxDeviceId)).Platform.ShouldBe("linux");
     }
 
     // ---- Team ----

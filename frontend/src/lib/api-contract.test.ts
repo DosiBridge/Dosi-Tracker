@@ -323,7 +323,8 @@ describe("labels and rules", () => {
   it("names platforms, end reasons and presence statuses, and nothing unknown", () => {
     expect(platformLabel("windows")).toBe("Windows");
     expect(platformLabel("macos")).toBe("macOS");
-    expect(platformLabel("linux")).toBeNull();
+    expect(platformLabel("linux")).toBe("Linux");
+    expect(platformLabel("freebsd")).toBeNull();
     expect(platformLabel(null)).toBeNull();
     expect(endReasonLabel("lock")).toBe("Screen locked");
     expect(endReasonLabel("toString")).toBeNull();

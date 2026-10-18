@@ -108,7 +108,7 @@ function text(value: unknown): string | null {
 }
 
 function platformOf(value: unknown): AgentPlatform | null {
-  return value === "windows" || value === "macos" ? value : null;
+  return value === "windows" || value === "macos" || value === "linux" ? value : null;
 }
 
 function later(a: string | null, b: string | null): string | null {

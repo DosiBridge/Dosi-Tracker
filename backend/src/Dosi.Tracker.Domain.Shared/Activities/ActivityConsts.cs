@@ -26,7 +26,7 @@ public static class ActivityConsts
     public const int MaxMinuteActiveSeconds = 90;
 
     /// <summary>Known agent platforms (lower case); anything else is stored as null.</summary>
-    public static readonly string[] Platforms = { "windows", "macos" };
+    public static readonly string[] Platforms = { "windows", "macos", "linux" };
 
     /// <summary>Why a block ended; an unknown value is stored as null.</summary>
     public static readonly string[] EndReasons =

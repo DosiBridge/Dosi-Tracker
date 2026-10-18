@@ -731,7 +731,7 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
     public async Task Create_Should_Store_Unusable_Context_Values_As_Null_And_Keep_The_Block()
     {
         var input = NewInput();
-        input.Platform = "linux";
+        input.Platform = "freebsd";
         input.OsVersion = "   ";
         input.AgentVersion = "\u0001\u0002";
         input.DeviceId = Guid.Empty;
@@ -753,6 +753,11 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
         created.EndReason.ShouldBeNull();
         created.IdleSeconds.ShouldBeNull();
         created.InjectedInputEvents.ShouldBeNull();
+
+        var linuxInput = NewInput(startedAt: BaseDay.AddHours(14));
+        linuxInput.Platform = "linux";
+        var linuxCreated = await SubmitAsync(linuxInput);
+        linuxCreated.Platform.ShouldBe("linux");
     }
 
     [Fact]

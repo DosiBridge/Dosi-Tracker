@@ -1109,10 +1109,11 @@ export function AppsChart({ apps, fmt }: { apps: AppStat[]; fmt: Fmt }) {
 
 /* ----------------------------- Devices ----------------------------- */
 
-/** Platform colours: Windows blue, macOS lavender, unreported slate (each ≥ 3:1 on both themes' cards). */
-export const PLATFORM_COLORS: Record<"windows" | "macos" | "unknown", string> = {
+/** Platform colours: Windows blue, macOS lavender, Linux amber, unreported slate (each ≥ 3:1 on both themes' cards). */
+export const PLATFORM_COLORS: Record<"windows" | "macos" | "linux" | "unknown", string> = {
   windows: "#2d6fd4",
   macos: "#937cf1",
+  linux: "#e97b35",
   unknown: "#768390",
 };
 

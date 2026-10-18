@@ -224,13 +224,13 @@ export async function collectPages<T>(
 
 /* ----------------------------- §1 Upload a block (agents) ----------------------------- */
 
-export type AgentPlatform = "windows" | "macos";
+export type AgentPlatform = "windows" | "macos" | "linux";
 
-export const PLATFORM_LABELS: Record<AgentPlatform, string> = { windows: "Windows", macos: "macOS" };
+export const PLATFORM_LABELS: Record<AgentPlatform, string> = { windows: "Windows", macos: "macOS", linux: "Linux" };
 
-/** "Windows" / "macOS"; null for a missing or unknown platform. */
+/** "Windows" / "macOS" / "Linux"; null for a missing or unknown platform. */
 export function platformLabel(platform: string | null | undefined): string | null {
-  return platform === "windows" || platform === "macos" ? PLATFORM_LABELS[platform] : null;
+  return platform === "windows" || platform === "macos" || platform === "linux" ? PLATFORM_LABELS[platform] : null;
 }
 
 /** Why a block ended. */

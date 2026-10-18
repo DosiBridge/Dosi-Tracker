@@ -343,12 +343,13 @@ describe("readSessionDetails — what newer agents report about a block (contrac
       ...full,
       idleSeconds: -5,
       endReason: "teleported",
-      platform: "linux",
+      platform: "gameboy",
       utcOffsetMinutes: 2000,
       injectedInputEvents: "lots",
       captures: [{ id: "w", kind: "webcam" }, null],
     });
     expect(odd).toMatchObject({ idleSeconds: null, endReason: null, platform: null, utcOffsetMinutes: null, injectedInputEvents: null, capture: null });
+    expect(readSessionDetails({ ...full, platform: "linux" }).platform).toBe("linux");
     expect(readSessionDetails(null)).toEqual({ ...NO_SESSION_DETAILS, measured: false });
   });
 

@@ -145,6 +145,7 @@ describe("status words", () => {
 
   it("names the OS as reported, else the platform", () => {
     expect(osText({ platform: "macos", osVersion: null })).toBe("macOS");
+    expect(osText({ platform: "linux", osVersion: null })).toBe("Linux");
     expect(osText({ platform: null, osVersion: null })).toBe("Unknown OS");
     expect(osText({ platform: "windows", osVersion: "Windows 10" })).toBe("Windows 10");
   });

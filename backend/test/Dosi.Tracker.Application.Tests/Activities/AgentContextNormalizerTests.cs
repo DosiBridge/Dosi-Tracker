@@ -60,7 +60,8 @@ public class AgentContextNormalizerTests
     [Theory]
     [InlineData("windows", "windows")]
     [InlineData(" MacOS ", "macos")]
-    [InlineData("linux", null)]
+    [InlineData("linux", "linux")]
+    [InlineData("freebsd", null)]
     [InlineData("", null)]
     [InlineData(null, null)]
     public void NormalizePlatform_Should_Keep_Only_Known_Platforms(string? value, string? expected)

@@ -1293,9 +1293,9 @@ export interface PlatformShare {
   share: number;
 }
 
-/** Tracked time and devices per platform: Windows, macOS, then devices that didn't report one. */
+/** Tracked time and devices per platform: Windows, macOS, Linux, then devices that didn't report one. */
 export function platformMix(rows: readonly DeviceRow[]): PlatformShare[] {
-  const order: (AgentPlatform | null)[] = ["windows", "macos", null];
+  const order: (AgentPlatform | null)[] = ["windows", "macos", "linux", null];
   const groups = order.map((platform) => {
     const mine = rows.filter((r) => r.platform === platform);
     return {

@@ -17,7 +17,7 @@ public class AgentPresence : CreationAuditedEntity<Guid>, IWorkspaceScoped
     public Guid DeviceId { get; set; }
 
     public string? DeviceName { get; set; }
-    public string? Platform { get; set; } // "windows" | "macos"
+    public string? Platform { get; set; } // "windows" | "macos" | "linux"
     public string? OsVersion { get; set; }
     public string? AgentVersion { get; set; }
 
