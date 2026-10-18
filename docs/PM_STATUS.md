@@ -1,6 +1,6 @@
 # Dosi-Tracker — PM Status Report & Evidence Matrix
 
-> **Document Class:** Production Readiness Audit & Status Tracking (Phase 1 Follow-up 2)  
+> **Document Class:** Production Readiness Audit & Status Tracking (Phase 2: Consent & Capability Audit)
 > **Status Date:** October 18, 2026  
 > **Auditor / Implementation Engineer:** Antigravity Pair Engineer  
 > **Supervisor:** PM / QA Operator  
@@ -10,32 +10,26 @@
 
 ## 1. Executive Status & Audit Summary
 
-Following independent review by the PM/QA operator and follow-up verification across the Dosi-Tracker codebase against product documentation (`DOCUMENTATION.md`, `docs/AS_BUILT.md`, `docs/PRODUCTION_READINESS.md`, `docs/SECURITY.md`, `docs/RUNBOOK.md`, `docs/QUALITY.md`, and `ENGINEERING_BLUEPRINT.md`), repository evidence is tracked with strict technical boundaries.
+Following independent review and supervisory acceptance by the PM/QA operator of the contrast and evidence corrections at commit `59403f8`, this phase executed a comprehensive, evidence-based **consent & capability audit and implementation-ready specification** before implementing Linux collection or device enrollment redesign. The full audit findings and specifications are established in the dedicated artifact [docs/CONSENT_CAPABILITY_AUDIT.md](file:///d:/Github%20Projects/DosiBridge/Open%20Source/Dosi-Tracker/docs/CONSENT_CAPABILITY_AUDIT.md).
 
 ### Key Audit Findings & Evidence Distinctions:
-1. **Pipeline Core is Real (Synthetic / Test-Host Verified)**:
-   - Backend domain entities (`Activity`, `Screenshot`, `AgentPresence`, `Project`, `ProjectMember`, `Workspace`, `Subscription`, `Invoice`), app services, OpenIddict token endpoints, and screenshot decoding into ABP blob containers are implemented.
-   - Verification is conducted via concrete Entity Framework Core SQLite in-memory test host fixtures (`Dosi.Tracker.EntityFrameworkCore.Tests`) and simulated authentication principals.
-   - This proves source correctness and schema consistency, but does **not** constitute a live multi-node PostgreSQL / OpenIddict / S3 production cluster deployment verification.
-2. **Frontend Integration (Component & Simulated Session Verified)**:
-   - Next.js 16 dashboard includes comprehensive UI flows for workspace signups, login, projects, team member rates, real-clock reporting (`/api/app/reporting/summary`), and presence monitors.
-   - Tests run in Node.js / jsdom using mocked fetch handlers (`useApi`), memory datasets, and `@testing-library/react`.
-   - **Accessibility Boundary**: Automated `jest-axe` checks in jsdom and programmatic contrast calculations cover only automated, programmatic accessibility invariants. Axe in jsdom does **not** prove full WCAG 2.1 AA/AAA compliance; real-browser keyboard focus management, screen reader announcements, focus traps, visual layout reflow, and assistive tech audits remain open.
-3. **Desktop Agent Reality & Strict OS Evidence Separation**:
-   - **Windows Client**: Source code present (`clients/windows`) with 345 passing cargo unit/integration tests.
-     - *Evidence Reality*: Cargo tests verify models, SQLite queue FIFO ordering, exponential backoff, poison row parking (`synced = 2`), and synthetic worker state machines.
-     - *Crucial Distinction*: Source presence is **not** proof of complete implementation. Cargo tests use mock inputs and synthetic structures; they do **NOT** verify native interactive hardware execution (live display capture via DXGI/GDI, live global low-level keyboard/mouse hooks, or live Win32 focus events on an active desktop session). Native runtime, per-user consent UI, packaging, and signing remain open.
-   - **macOS Client**: Swift 5.9 source code present under `clients/macos/` using `ScreenCaptureKit`, `AVFoundation`, and `Accessibility` APIs.
-     - *Evidence Reality*: Source presence is **NOT** runtime validation or complete implementation. CI configuration files (`.github/workflows/macos.yml`) are not proof tests ran.
-     - *Crucial Distinction*: On this Windows 11 host, Swift toolchain and macOS hardware are absent; native build, test execution, TCC consent handling, packaging, notarization, and runtime validation remain unexecuted and outstanding.
-   - **Linux Client**: **Explicit Architectural Gap**.
-     - No Linux client crate exists (`clients/linux` is not yet created).
-4. **Phase 1 Follow-up Refinements Completed**:
-   - Fixed accessibility contrast regression: replaced low-contrast Linux color `#e97b35` (2.86:1 on white) with `#cb6e17` (3.63:1 on `#ffffff`, 4.43:1 on `#1a2226`).
-   - Derived actual `--card` background tokens dynamically from [globals.css](file:///d:/Github%20Projects/DosiBridge/Open%20Source/Dosi-Tracker/frontend/src/app/globals.css) in [analytics-charts.test.ts](file:///d:/Github%20Projects/DosiBridge/Open%20Source/Dosi-Tracker/frontend/src/components/reports/analytics-charts.test.ts) rather than hardcoding literals.
-   - Added guards against stale literals, malformed tokens, and media-query print overrides (`.dark .work-report`).
-   - Explicitly prefixed every test in `analytics-charts.test.ts` with `a11y:`, ensuring `npm run test:a11y` explicitly matches and executes all 9 contrast/token tests.
-   - Split backend Linux tests into independent `[Fact]` methods executed by concrete EF Core host harness.
+1. **Desktop Hook Lifetime vs User Consent (Source-Verified)**:
+   - **Windows Client**: `main.rs:125` invokes `Tracker::new()`, which unconditionally spawns `input::spawn_listener` (`WH_KEYBOARD_LL` and `WH_MOUSE_LL` hooks via `SetWindowsHookExW`) and `usage::spawn_sampler` (3s active window poll) at application launch **before** user authentication, project selection, or local consent.
+   - **macOS Client**: `AppDelegate.swift:86` invokes `services.start()`, which starts `inputMonitor` (`CGEvent.tapCreate` on dedicated `TapThread` with a 10s retry timer) and `activeApp` at application launch **before** local opt-in.
+   - **Paused/Stopped State Reality**: In both Windows (`worker.rs:1654`) and macOS (`TrackerWorker.swift:1262`), pausing or stopping tracking only halts block creation. It does **NOT** detach OS input hooks or stop background window monitoring; events continue logging into ring buffers and are merely discarded outside block boundaries.
+   - **Admin Policy vs Local Consent**: Administrative project settings on the server (`allow_screenshot`, `allow_keyboard`, etc.) and OS permission grants (macOS TCC prompts) do not constitute per-user application consent. The settings UI currently displays admin policy as read-only and lacks local interactive refusal controls.
+2. **End-to-End Metric Nullability Obstacles**:
+   - Concrete non-nullable primitive integer fields in `Activity.KeyboardHits` / `MouseClicks` ([Activity.cs:20-21](file:///d:/Github%20Projects/DosiBridge/Open%20Source/Dosi-Tracker/backend/src/Dosi.Tracker.Domain/Activities/Activity.cs#L20-L21)) and upload DTOs ([CreateActivityDto.cs:40-43](file:///d:/Github%20Projects/DosiBridge/Open%20Source/Dosi-Tracker/backend/src/Dosi.Tracker.Application.Contracts/Activities/CreateActivityDto.cs#L40-L43), [ActivityDto.cs:17-18](file:///d:/Github%20Projects/DosiBridge/Open%20Source/Dosi-Tracker/backend/src/Dosi.Tracker.Application.Contracts/Activities/ActivityDto.cs#L17-L18)) force unmeasured or denied input metrics to serialize/persist as `0`.
+   - Windows `Activity.keyboard_hits` ([model.rs:157](file:///d:/Github%20Projects/DosiBridge/Open%20Source/Dosi-Tracker/clients/windows/src/model.rs#L157)) and macOS `ActivityPayload.keyboardHits` ([ActivityPayload.swift:197](file:///d:/Github%20Projects/DosiBridge/Open%20Source/Dosi-Tracker/clients/macos/Sources/DosiTrackerCore/Models/ActivityPayload.swift#L197)) are primitive numbers, preventing client-side `null` transmission.
+   - Frontend ingestion ([live-dataset.ts:444](file:///d:/Github%20Projects/DosiBridge/Open%20Source/Dosi-Tracker/frontend/src/lib/live-dataset.ts#L444), [work-report.ts:1259](file:///d:/Github%20Projects/DosiBridge/Open%20Source/Dosi-Tracker/frontend/src/lib/work-report.ts#L1259)) coerces missing metrics to `0`.
+   - A formal state taxonomy is defined separating **measured zero**, **denied**, **unsupported**, **temporarily unavailable**, and **paused**.
+3. **Truthful Linux X11/Wayland Capability Matrix**:
+   - Wayland compositor client isolation prevents passive global input monitoring and active-window title sniffing without privilege escalation.
+   - Wayland screen capture requires `xdg-desktop-portal` ScreenCast session with explicit user display selection; cancellation (code 1) or session close must be recorded as `denied`/`unavailable`.
+   - Product policy strictly prohibits `root`, `sudo`, direct `/dev/input/event*` reading via `evdev`, and `uinput` bypasses.
+4. **Independent Operator Baseline Maintained**:
+   - Operator independently verified clean tree, commit `59403f8`, `test:a11y` (53 passed, 1912 skipped, all 9 analytics-charts token/contrast tests included, exit 0), and `validate` (1,965 passed in 92 files, exit 0).
+   - Full backend 823 and Windows cargo 345 remain worker-reported. Synthetic/jsdom only, no native collection.
 
 ---
 
@@ -129,18 +123,21 @@ To maintain absolute technical truth, evidence is divided into six concrete dime
 ## 5. Actual Baseline Test Execution Matrix
 
 ### A. Operator Independently Verified (Windows SSH Session)
-The PM/QA operator independently verified the following checks on commit `3e5ed99`:
-1. **Clean Working Tree & HEAD**: Verified key-based SSH, clean tree, and HEAD commit `3e5ed99`.
-2. **Concrete EF Core Linux Tests**:
-   - `EfCorePresenceAppServiceTests.Heartbeat_Should_Accept_And_Store_Linux_Platform`: **Passed**
-   - `EfCoreActivityAppServiceTests.Create_Should_Accept_And_Store_Linux_Platform`: **Passed**
-   - Exit code: **0** (synthetic/test-host results, not native runtime).
+The PM/QA operator independently verified the following checks on commit `59403f8`:
+1. **Clean Working Tree & HEAD**: Verified key-based SSH, clean tree, and unchanged HEAD commit `59403f8`.
+2. **Frontend Accessibility Suite (`npm run test:a11y`)**:
+   - Matches `--testNamePattern a11y`.
+   - **53 passed, 1912 skipped**, all 9 `analytics-charts.test.ts` token/contrast tests included, exit code **0**.
 3. **Frontend Validation Gate (`npm run validate`)**:
-   - TypeScript typecheck: **0 errors**
-   - ESLint: **0 errors**, 3 pre-existing warnings (under 45 ceiling)
-   - Vitest: **1,961 tests in 92 files passed**
-   - Architecture spec: **12 passed**, dependency graph clean
-   - Exit code: **0** (synthetic/test-host results in jsdom, not live browser WAN).
+   - TypeScript typecheck: **0 errors**, exit code **0**.
+   - ESLint: **0 errors**, 3 pre-existing warnings (under 45 ceiling), exit code **0**.
+   - Vitest: **1,965 tests in 92 files passed**, exit code **0**.
+   - Architecture spec: **12 passed with no dependency violations**, exit code **0**.
+   - Exit code: **0** (synthetic/jsdom only, no native collection).
+4. **Concrete EF Core Linux Tests**:
+   - `EfCorePresenceAppServiceTests.Heartbeat_Should_Accept_And_Store_Linux_Platform`: **Passed** (exit 0)
+   - `EfCoreActivityAppServiceTests.Create_Should_Accept_And_Store_Linux_Platform`: **Passed** (exit 0)
+   - Synthetic/test-host results, not native runtime.
 
 ### B. Worker-Reported Suite Executions
 
@@ -153,53 +150,50 @@ The PM/QA operator independently verified the following checks on commit `3e5ed9
 | **Backend EF Core Tests**| `dotnet test` (EntityFrameworkCore.Tests) | **466** | 0 | 0 | 2m 34s | **0** | Worker-reported; concrete SQLite EF Core host harness. Includes the two independently verified Linux tests. |
 | **Backend Acceptance** | `dotnet test` (Acceptance.Tests) | **15** | 0 | 0 | 13.0s | **0** | Worker-reported; BDD multi-step workflow acceptance scenarios. |
 | **Backend Total** | `dotnet test backend/Dosi.Tracker.slnx` | **823** | 0 | 0 | 2m 48s | **0** | Worker-reported full backend suite. |
-| **Frontend Vitest (Full)** | `npm test` in `frontend` | **1,965** | 0 | 0 | 49.04s | **0** | 92 test files. Includes 9 tests in `analytics-charts.test.ts` (+4 guard tests added) and 1 test in `analytics.test.ts`. |
-| **Frontend Accessibility**| `npm run test:a11y` in `frontend` | **53** | 0 | 1912 skipped | 22.26s | **0** | Matches `--testNamePattern a11y`. Now explicitly executes all 9 tests in `analytics-charts.test.ts` (up from 49). |
+| **Frontend Vitest (Full)** | `npm test` in `frontend` | **1,965** | 0 | 0 | 49.04s | **0** | 92 test files. Includes 9 tests in `analytics-charts.test.ts` and 1 test in `analytics.test.ts`. |
+| **Frontend Accessibility**| `npm run test:a11y` in `frontend` | **53** | 0 | 1912 skipped | 22.26s | **0** | Matches `--testNamePattern a11y`. All 9 tests in `analytics-charts.test.ts` included. |
 | **Frontend TypeCheck** | `npm run typecheck` | N/A | 0 errors | 0 | 5.2s | **0** | TypeScript 5 strict compilation with no emit. |
 | **Frontend ESLint** | `npm run lint` | N/A | 0 errors | 3 warnings (max 45)| 18.0s | **0** | 3 pre-existing warnings in unedited files. |
 | **Frontend Architecture**| `npm run test:arch` | **12** | 0 | 0 | 0.72s | **0** | Dependency cruiser layering and `architecture.spec.ts` content invariants. |
 
 ---
 
-## 6. Implementation & Follow-up Actions (Phase 1 Follow-up 2)
+## 6. Implementation & Follow-up Actions (Phase 2: Consent & Capability Audit)
 
-### Problems Identified in PM Review:
-1. **Hardcoded Background Tokens in Contrast Tests**:
-   - `analytics-charts.test.ts` previously hardcoded `#ffffff` and `#1a2226` as literals rather than deriving the real CSS tokens from `globals.css`.
-2. **Missing Proof of Contrast Test Inclusion in `test:a11y`**:
-   - `npm run test:a11y` filters tests by `--testNamePattern a11y`. The contrast tests lacked explicit `a11y:` prefixes in their test names, leaving claims of their execution ambiguous.
-3. **Overclaimed Implementation Completeness & WCAG Compliance**:
-   - Windows and macOS clients were labeled as "Complete" based on source presence alone, ignoring missing runtime and packaging validation.
-   - Blanket claims suggested automated axe in jsdom established full WCAG compliance.
-   - Code signing was claimed to eliminate SmartScreen warnings (which requires reputation accumulation).
-   - Event counting was associated with legal compliance without supporting organizational evidence.
-
-### Solutions Applied & Verified:
-1. **Dynamic Background Token Parsing from CSS**:
-   - In [analytics-charts.test.ts](file:///d:/Github%20Projects/DosiBridge/Open%20Source/Dosi-Tracker/frontend/src/components/reports/analytics-charts.test.ts), implemented `extractCardTokens` to parse `:root` (`#ffffff`) and `.dark` (`#1a2226`) `--card` tokens directly from `src/app/globals.css`.
-   - Added guards verifying that synthetic token changes are picked up, missing/malformed tokens throw descriptive errors, and print overrides (`.dark .work-report`) are not accidentally selected.
-2. **Explicit `a11y:` Test Naming & Verified Execution**:
-   - Prefixed every test in `analytics-charts.test.ts` with `a11y:`.
-   - Verified that `npm run test:a11y` executes all 9 contrast/token tests, passing 53 a11y tests total.
-3. **Truthful Documentation Boundaries**:
-   - Clarified that source presence is not complete implementation.
-   - Separated operator independently verified results from worker-reported claims.
-   - Clarified that automated axe and contrast tests in jsdom do not prove full WCAG compliance.
-   - Clarified that Authenticode signing builds reputation but does not guarantee immediate SmartScreen warning elimination.
-   - Clarified that monotonic event counting is data minimization, not full legal compliance.
+### Actions Completed in Current Sprint:
+1. **Established Full Audit Specification Artifact**:
+   - Authored [docs/CONSENT_CAPABILITY_AUDIT.md](file:///d:/Github%20Projects/DosiBridge/Open%20Source/Dosi-Tracker/docs/CONSENT_CAPABILITY_AUDIT.md) defining collection call chains, local opt-in contracts, end-to-end metric nullability tracing, and Linux X11/Wayland capability matrices.
+2. **Call Chain & Hook Lifetime Investigation**:
+   - Verified that Windows (`main.rs:125`, `tracking/mod.rs:69`, `input.rs:694-850`) and macOS (`AppDelegate.swift:86`, `AgentServices.swift:58-63`, `InputMonitor.swift:95-260`) spawn OS input hooks and window samplers at launch before local user consent or project selection.
+   - Proved that paused/stopped state does not detach hooks or stop background window monitoring; it merely discards output outside recorded blocks.
+   - Clarified that admin project policies and OS permission grants are not per-user application consent.
+3. **End-to-End Metric Nullability Obstacle Identification**:
+   - Traced non-nullable primitive integers in `Activity.KeyboardHits` / `MouseClicks` (`Activity.cs:20-21`, `CreateActivityDto.cs:40-43`, `ActivityDto.cs:17-18`, `model.rs:157-158`, `ActivityPayload.swift:197-198`).
+   - Defined formal 5-state taxonomy: **measured zero**, **denied**, **unsupported**, **temporarily unavailable**, and **paused**.
+4. **Truthful Linux X11/Wayland Capability Matrix**:
+   - Mapped Wayland compositor isolation rendering global input and active window titles unsupported without root.
+   - Documented `xdg-desktop-portal` ScreenCast session cancellation and close signals.
+   - Formally prohibited root, `sudo`, `evdev`, and `uinput` privilege elevation.
+5. **Policy & Constraint Documentation Correction**:
+   - In [PM_EXECUTION_PLAN.md](file:///d:/Github%20Projects/DosiBridge/Open%20Source/Dosi-Tracker/docs/PM_EXECUTION_PLAN.md), removed the unsupported blanket statement that privacy laws strictly prohibit all key logging; accurately framed the product prohibition without providing legal advice.
+   - Consistently labeled all previous native suite counts (Windows cargo 345, backend 823) as worker-reported.
 
 ---
 
 ## 7. Recommended Safe Next Bounded Phase
 
-### Recommended Phase: Bounded Consent & Capability Audit
-- **Scope**:
-  1. Define and audit user consent contracts across desktop platforms:
-     - Require an explicit local user opt-in before activating screen, webcam, or activity monitors.
-     - Ensure the client interface prominently displays active capture state and visible controls ("Start", "Pause", "Resume", "Quit").
-  2. Audit Wayland capability detection:
-     - Map unsupported Wayland capabilities (e.g. global input counting without root, active-window title sniffing) to an **explicitly unavailable** status (`null`).
-     - Prohibit zero-metric fabrication (reporting 0 clicks/keys when the sensor is simply unavailable).
-     - Prohibit root, `sudo`, `evdev`, or `uinput` privilege escalation as a default operational mode.
-  3. No Linux collection adapter or device enrollment rewrite should be undertaken prior to completing this consent and capability audit.
+### Recommended Phase: Phase 3 — Schema Nullability Alignment & Linux Desktop Architecture Spike
+- **Scope (Smallest Next Implementation Slice First)**:
+  1. **Backend Nullability Migration**:
+     - Update `Activity.cs`: change `MouseClicks` and `KeyboardHits` to `int?`.
+     - Update `CreateActivityDto.cs` and `ActivityDto.cs` to `int?`.
+     - Generate and apply EF Core migration for nullable columns.
+     - Update `ActivityAppService.cs` to store incoming nulls faithfully.
+  2. **Frontend Ingestion Handling**:
+     - Update `live-dataset.ts` and `work-report.ts` to preserve nulls and display "—" / "Not Measured" rather than coercing to 0.
+  3. **Verification Gate**:
+     - Verify both legacy numeric 0 and null metrics via EF Core host harness.
+     - Verify full frontend suite (`npm run validate`).
+  4. **Linux Component Creation (Subsequent Slice)**:
+     - Establish `clients/linux` crate with X11 display capture and Wayland portal session, without privilege escalation.
 - **Constraints**: Preparation only; no push, no public release, no deployment. Preserves existing codebase integrity.

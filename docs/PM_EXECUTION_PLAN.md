@@ -51,13 +51,13 @@ Dosi-Tracker is an open-source, multi-tenant team activity and time-tracking sys
 ```mermaid
 flowchart TD
     P1[Phase 1: Baseline Audit & Cross-Platform Alignment] --> P2[Phase 2: Consent & Capability Audit]
-    P2 --> P3[Phase 3: Linux Desktop Agent Architecture Spike]
+    P2 --> P3[Phase 3: Schema Nullability Alignment & Linux Spike]
     P3 --> P4[Phase 4: Cryptographic Device Enrollment & Revocation]
     P4 --> P5[Phase 5: Data Retention & Automated Purge Workers]
     P5 --> P6[Phase 6: Native Packaging, Signing & Update Pipeline]
 ```
 
-### Phase 1: Baseline Audit, Toolchain Verification & Cross-Platform Contract (Completed in Current Sprint)
+### Phase 1: Baseline Audit, Toolchain Verification & Cross-Platform Contract (Completed in Prior Sprint)
 - **Scope**:
   - Full codebase audit across backend, frontend, desktop clients, CI, and test suites.
   - Identification of platform gaps, stubbed endpoints, and security/privacy debts.
@@ -68,25 +68,29 @@ flowchart TD
   - Add dedicated Linux `platformMix` regression test in `analytics.test.ts`.
   - Split backend Linux test cases into independent `[Fact]` methods (`Create_Should_Accept_And_Store_Linux_Platform` and `Heartbeat_Should_Accept_And_Store_Linux_Platform`) executed by concrete EF Core host harness (`EfCoreActivityAppServiceTests` and `EfCorePresenceAppServiceTests`).
 - **Gating Evidence**:
-  - **Operator Independently Verified**: Clean working tree and commit `3e5ed99`; concrete EF Linux tests passed (2 passed, exit 0); frontend validate gate passed (`npm run validate`: typecheck clean, lint 0 errors / 3 warnings, 1,961 tests in 92 files passed, architecture 12 passed, dependency graph clean, exit 0).
-  - **Worker-Reported Suite Results**: Full backend 823 tests passed (60 Domain, 116 Host, 166 Application, 466 EntityFrameworkCore, 15 Acceptance); Windows client 345 cargo tests passed; frontend 1,965 vitest tests passed (53 a11y tests executed and passed under `npm run test:a11y`).
+  - **Operator Independently Verified (Commit `59403f8`)**: Clean working tree and commit `59403f8`; `npm run test:a11y` passed (53 passed, 1912 skipped, all 9 analytics-charts token/contrast tests included, exit 0); `npm run validate` passed (1,965 passed in 92 files, typecheck exit 0, lint 0 errors / 3 warnings, architecture 12 passed with no dependency violations, exit 0). Synthetic/jsdom only, no native collection.
+  - **Worker-Reported Suite Results**: Full backend 823 tests (60 Domain, 116 Host, 166 Application, 466 EntityFrameworkCore, 15 Acceptance) and Windows client 345 cargo tests remain worker-reported.
 
-### Phase 2: Bounded Consent & Capability Audit (Recommended Next Phase)
-- **Objective**: Establish explicit technical specifications for user consent and capability degradation before writing collection code.
-- **Deliverables**:
-  1. Desktop User Consent Specification: Define local opt-in UX, tray status, and user-initiated controls across Windows, macOS, and Linux.
-  2. Wayland Capability Matrix: Formally audit compositor APIs (PipeWire / `xdg-desktop-portal` for display; compositor-specific idle/input protocols). Map unsupported features to `null` (unavailable) rather than 0.
-  3. Privilege Boundary Enforcement: Formally disallow root/sudo, direct evdev event device access, or uinput escalation in agent designs.
+### Phase 2: Bounded Consent & Capability Audit (Completed in Current Sprint)
+- **Objective**: Establish an evidence-based consent and capability audit and implementation-ready specification before implementing Linux collection or device enrollment redesign.
+- **Completed Artifact**: Dedicated specification [docs/CONSENT_CAPABILITY_AUDIT.md](file:///d:/Github%20Projects/DosiBridge/Open%20Source/Dosi-Tracker/docs/CONSENT_CAPABILITY_AUDIT.md).
+- **Core Findings & Deliverables**:
+  1. **Source-Verified Call Chains**: Traced startup/shutdown for Windows (`main.rs:125`, `tracking/mod.rs:65-73`, `input.rs:694-850`, `usage.rs:126-136`) and macOS (`AppDelegate.swift:86`, `AgentServices.swift:58-63`, `InputMonitor.swift:95-260`). Proved that hooks start at launch prior to local opt-in, and that pause/stop merely stops querying ring buffers rather than detaching OS hooks or halting background sampling.
+  2. **Granular Local Opt-In Contract**: Defined default-safe opt-in contract for screenshots, webcam, input counts, active window, and running apps, with visible tray status, synchronous hook detachment on withdrawal, local preference persistence, and offline queue purge capability.
+  3. **End-to-End Metric Nullability Obstacles**: Identified non-nullable `int` fields in backend entity (`Activity.cs:20-21`) and DTOs (`CreateActivityDto.cs:40-43`, `ActivityDto.cs:17-18`), non-nullable client models (`model.rs:157-158`, `ActivityPayload.swift:197-198`), and frontend clamping (`live-dataset.ts:444`, `work-report.ts:1259`). Documented migration path to honest `null` states separating measured zero, denied, unsupported, temporarily unavailable, and paused.
+  4. **Truthful Linux X11/Wayland Matrix**: Documented `xdg-desktop-portal` ScreenCast session cancellation and close signals, compositor client isolation rendering Wayland global input and window titles unsupported, and strict prohibition on root, `sudo`, `evdev`, and `uinput` bypasses.
 
-### Phase 3: Linux Desktop Agent Architecture Spike (`clients/linux`)
-- **Objective**: Establish the official `clients/linux` component without claiming cross-compilation or using privilege escalation.
+### Phase 3: Schema Nullability Alignment & Linux Desktop Agent Architecture Spike
+- **Objective**: Eliminate non-nullable zero-metric obstacles across backend and frontend, then establish the unprivileged `clients/linux` component.
 - **Deliverables**:
-  1. Create `clients/linux` Rust crate sharing domain models and SQLite queue schema with `clients/windows`.
-  2. Implement display server detection: detect X11 (`DISPLAY`) vs Wayland (`WAYLAND_DISPLAY`).
-  3. X11 Engine: user-space display snapshot (`xcap` / `XShmGetImage`) and active window tracking (`_NET_ACTIVE_WINDOW`).
-  4. Wayland Engine: `org.freedesktop.portal.ScreenCast` via D-Bus and PipeWire for consent-based screen capture.
-  5. Fallback & Graceful Degradation: When Wayland compositor forbids global input tapping or active-window tracking without root, report capabilities as **explicitly unavailable** (`null`), never as fabricated zero metrics. Do not escalate to root, evdev, or uinput.
-  6. SQLite offline queue identical to Windows/macOS with idempotent client activity ID and poison-row parking (`synced = 2`).
+  1. Align `Activity.cs`, `CreateActivityDto.cs`, `ActivityDto.cs`, and EF Core migration to support nullable `int? MouseClicks` and `int? KeyboardHits` without defaulting to zero.
+  2. Update frontend live dataset and work report calculations to render "—" / "Not Measured" when counts are null.
+  3. Create `clients/linux` Rust crate sharing domain models and SQLite queue schema with `clients/windows`.
+  4. Implement display server detection: detect X11 (`DISPLAY`) vs Wayland (`WAYLAND_DISPLAY`).
+  5. X11 Engine: user-space display snapshot (`xcap` / `XShmGetImage`) and active window tracking (`_NET_ACTIVE_WINDOW`).
+  6. Wayland Engine: `org.freedesktop.portal.ScreenCast` via D-Bus and PipeWire for consent-based screen capture.
+  7. Fallback & Graceful Degradation: Under Wayland, report global input counting and active-window tracking as **explicitly unsupported / unavailable** (`null`), never as fabricated zero metrics. Do not escalate to root, sudo, evdev, or uinput.
+  8. SQLite offline queue identical to Windows/macOS with idempotent client activity ID and poison-row parking (`synced = 2`).
 
 ### Phase 4: Cryptographic Device Enrollment, Mutual Session Verification & Revocation
 - **Objective**: Move beyond self-reported random `DeviceId` GUIDs to a cryptographic device authorization lifecycle.
@@ -118,7 +122,7 @@ flowchart TD
 | Topic | Constraint | Architecture Decision |
 |---|---|---|
 | **OS Credentials** | Plaintext tokens or passwords in files are prohibited | Windows: DPAPI `CryptProtectData`. macOS: Keychain Services. Linux: Secret Service API (`libsecret`) / encrypted SQLite key. |
-| **Keystrokes** | Privacy regulations (GDPR, CCPA) strictly prohibit key logging | Agents record only atomic integer increments (`keyboard_events += 1`). No virtual key codes or ASCII values are logged or transmitted. Event counting is data minimization, not legal compliance. |
+| **Keystrokes** | Product policy strictly prohibits keystroke logging and text content capture | Agents record only atomic integer increments (`keyboard_events += 1`). No virtual key codes, ASCII characters, clipboard data, or inter-keystroke timing cadences are logged or transmitted. Monotonic event counting is an architectural data minimization constraint and does not constitute legal advice. |
 | **Webcam Security** | Biometric and camera capture requires explicit consent | Webcam captures are stored as discrete JPGs tagged `kind: webcam`. Project settings default to disabled; disabling on server hides historical webcam items from unauthorized roles. Per-user local consent and indicator required. |
 | **macOS Permissions** | macOS enforces sandbox and TCC privacy controls | Agent handles missing permissions gracefully: screen capture omitted if Screen Recording denied; input counts omitted if Accessibility denied; camera frame omitted if Camera denied. |
 | **Linux Wayland** | Compositor security prevents silent background screen grabs | Ingestion engine requires `xdg-desktop-portal` user consent session. If denied or unavailable, agent logs refusal and records capabilities as unavailable (`null`), without fabricating zeros or attempting privilege escalation. |
@@ -133,13 +137,13 @@ flowchart TD
    - Integration tests: In-memory SQLite with full ABP Unit of Work, data filters, and tenant isolation (`EntityFrameworkCore.Tests`, 466 tests).
    - Host route tests: HTTP controller status codes and rate limiting (`HttpApi.Host.Tests`, 116 tests).
    - Acceptance tests: BDD scenarios (`Acceptance.Tests`, 15 tests).
-   - Total backend test count: **823 tests** (all passing).
+   - Total backend test count: **823 tests** (all passing, worker-reported).
 2. **Frontend**:
    - Unit & Property tests: Business math and data transformations via Vitest and `fast-check` (`src/lib/*.test.ts`).
-   - Component & a11y tests: React Testing Library with `jest-axe` for programmatic accessibility and machine-contrast regressions (`analytics-charts.test.ts`). Total a11y tests executed by `npm run test:a11y`: **53 passed**.
-   - Architectural gate: `dependency-cruiser` checking layering rules and forbidden circular imports (`test:arch`, 12 tests).
-   - Total frontend test count: **1,965 tests** (all passing across 92 files).
+   - Component & a11y tests: React Testing Library with `jest-axe` for programmatic accessibility and machine-contrast regressions (`analytics-charts.test.ts`). Total a11y tests executed by `npm run test:a11y`: **53 passed** (operator-verified).
+   - Architectural gate: `dependency-cruiser` checking layering rules and forbidden circular imports (`test:arch`, 12 tests, operator-verified).
+   - Total frontend test count: **1,965 tests** (all passing across 92 files, operator-verified).
 3. **Windows Agent**:
-   - Crate tests: In-memory SQLite queue FIFO order, upload backoff doubling, poison row parking, session state machines, time math across DST/midnight boundaries (345 cargo tests passing, 5 ignored e2e).
+   - Crate tests: In-memory SQLite queue FIFO order, upload backoff doubling, poison row parking, session state machines, time math across DST/midnight boundaries (345 cargo tests passing, 5 ignored e2e, worker-reported).
 4. **macOS Agent**:
    - Swift Package tests: `DosiTrackerCoreTests` testing models, queue, date parsing, skew calculations, and upload retry logic (source present; local runtime execution unverified on Windows host).
