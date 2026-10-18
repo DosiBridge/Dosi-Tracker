@@ -56,6 +56,18 @@ impl DeviceInfo {
             agent_version: AGENT_VERSION,
         }
     }
+
+    /// Injected fixture device info for completely side-effect-free testing
+    /// without local filesystem access.
+    pub fn fixture() -> Self {
+        Self {
+            device_id: Some("00000000-0000-4000-8000-000000000001".into()),
+            device_name: Some("test-device".into()),
+            os_version: Some("Windows 10.0.0".into()),
+            platform: PLATFORM,
+            agent_version: AGENT_VERSION,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]

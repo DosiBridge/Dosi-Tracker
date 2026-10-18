@@ -253,7 +253,8 @@ impl FakeMachine {
     }
 
     fn is_tracking_active(&self) -> bool {
-        self.tracking_active.load(std::sync::atomic::Ordering::SeqCst)
+        self.input_running.load(std::sync::atomic::Ordering::SeqCst)
+            || self.usage_running.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn is_input_running(&self) -> bool {
@@ -422,9 +423,11 @@ fn harness_at(start: DateTime<Utc>, saved: Option<Credentials>, autostart: bool,
     let (control, control_rx, farewells) = ControlLink::detached();
     let (uploader, uploads) = UploaderHandle::detached();
     let store = Storage::open(":memory:", None).unwrap();
+    let mut cfg = AppConfig::default();
+    cfg.consent = crate::config::LocalConsent::Granted(CapturePermissions::default());
     let mut worker = Worker::new(
         state.clone(),
-        AppConfig::default(),
+        cfg,
         machine.clone(),
         Launch { autostart },
         Arc::new(|| {}),
@@ -1606,10 +1609,51 @@ async fn sensor_lifecycle_stops_on_quit_before_upload_grace() {
     assert!(h.machine.is_input_running());
     assert!(h.machine.is_usage_running());
 
-    h.worker.quit(at("10:05:00")).await;
-    assert!(!h.machine.is_tracking_active(), "quit must stop sensors immediately before upload grace");
-    assert!(!h.machine.is_input_running(), "quit must detach hooks before upload grace");
-    assert!(!h.machine.is_usage_running(), "quit must stop sampler before upload grace");
+    let machine = h.machine.clone();
+    let quit_task = tokio::spawn(async move {
+        h.worker.quit(at("10:05:00")).await;
+        h
+    });
+
+    // While quit is awaiting farewell and upload grace, assert that sensors were ALREADY halted!
+    tokio::time::sleep(Duration::from_millis(15)).await;
+    assert!(!machine.is_tracking_active(), "sensors must stop BEFORE waiting for farewell/upload grace");
+    assert!(!machine.is_input_running(), "input hooks must detach BEFORE waiting for farewell/upload grace");
+    assert!(!machine.is_usage_running(), "usage sampler must stop BEFORE waiting for farewell/upload grace");
+    assert_eq!(machine.input_stops(), 1);
+    assert_eq!(machine.usage_stops(), 1);
+
+    let h = quit_task.await.unwrap();
+    assert!(!h.machine.is_tracking_active());
+}
+
+#[test]
+fn worker_fails_closed_when_consent_is_absent() {
+    let machine = FakeMachine::new(at("10:00:00"));
+    let state = StateHandle::new();
+    let (control, _, _) = ControlLink::detached();
+    let (uploader, _) = UploaderHandle::detached();
+    let store = Storage::open(":memory:", None).unwrap();
+    let cfg = AppConfig::default(); // consent: LocalConsent::Absent
+    let mut worker = Worker::new(
+        state,
+        cfg,
+        machine.clone(),
+        Launch { autostart: false },
+        Arc::new(|| {}),
+        ServerClock::default(),
+        store,
+        control,
+        uploader,
+        None,
+    );
+    worker.start(Some(saved(vec![project("p1", 5)], None)), None);
+    worker.publish();
+    assert!(!machine.is_tracking_active(), "absent consent must fail closed");
+    assert!(!machine.is_input_running(), "input hooks must not start without consent");
+    assert!(!machine.is_usage_running(), "sampler must not start without consent");
+    assert_eq!(machine.input_starts(), 0);
+    assert_eq!(machine.usage_starts(), 0);
 }
 
 #[test]

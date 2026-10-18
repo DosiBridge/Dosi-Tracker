@@ -4,7 +4,7 @@
 
 use chrono::{DateTime, TimeDelta, Utc};
 
-use crate::config::{AppConfig, CapturePermissions};
+use crate::config::AppConfig;
 use crate::credentials::SavedPause;
 use crate::model::{PresenceStatus, Project};
 use crate::state::{CaptureFlags, TrackerStatus};
@@ -48,18 +48,10 @@ impl Session {
 }
 
 /// The session for `project`: the server's permissions win, but never enable
-/// what the local config forbade; blur is added by either.
+/// what the local config forbade, and require affirmative local user consent.
+/// If consent is absent or revoked, all captures fail closed (disabled).
 pub fn session_for(project: &Project, cfg: &AppConfig) -> Session {
-    let local = &cfg.capture;
-    let perms = CapturePermissions {
-        screenshot: project.allow_screenshot && local.screenshot,
-        webcam: project.allow_webcam && local.webcam,
-        keyboard: project.allow_keyboard && local.keyboard,
-        mouse: project.allow_mouse && local.mouse,
-        active_window: project.allow_active_window && local.active_window,
-        running_programs: project.allow_running_programs && local.running_programs,
-        blur_screenshots: project.blur_screenshots || local.blur_screenshots,
-    };
+    let perms = cfg.consent.effective_permissions(project, &cfg.capture);
     let interval_minutes = project.interval_minutes.clamp(5, 60) as i64;
     Session {
         title: project.title.clone(),
@@ -187,6 +179,7 @@ pub fn presence(status: TrackerStatus, timed_break: bool) -> Option<PresenceStat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::CapturePermissions;
 
     fn project(id: &str) -> Project {
         serde_json::from_value(serde_json::json!({
@@ -226,6 +219,7 @@ mod tests {
     #[test]
     fn the_session_combines_server_and_local_policy() {
         let mut cfg = AppConfig::default();
+        cfg.consent = crate::config::LocalConsent::Granted(CapturePermissions::default());
         cfg.capture.webcam = false;
         cfg.capture.blur_screenshots = true;
         let mut source = project("p1");
@@ -242,8 +236,54 @@ mod tests {
         assert_eq!(session.interval_minutes(), 60);
         assert!(session.capture_flags().blur_screenshots);
 
-        let session = session_for(&project("p2"), &AppConfig::default());
+        let mut cfg_p2 = AppConfig::default();
+        cfg_p2.consent = crate::config::LocalConsent::Granted(CapturePermissions::default());
+        let session = session_for(&project("p2"), &cfg_p2);
         assert_eq!(session.idle_threshold_minutes(), Some(5), "the server's default");
+    }
+
+    #[test]
+    fn session_for_fails_closed_when_consent_is_absent() {
+        let cfg = AppConfig::default(); // consent: LocalConsent::Absent
+        assert_eq!(cfg.consent, crate::config::LocalConsent::Absent);
+        let session = session_for(&project("p1"), &cfg);
+        let perms = &session.policy.perms;
+        assert!(!perms.screenshot);
+        assert!(!perms.keyboard);
+        assert!(!perms.mouse);
+        assert!(!perms.active_window);
+        assert!(!perms.webcam);
+        assert!(!perms.running_programs);
+    }
+
+    #[test]
+    fn session_for_fails_closed_when_consent_is_revoked() {
+        let mut cfg = AppConfig::default();
+        cfg.consent = crate::config::LocalConsent::Revoked;
+        let session = session_for(&project("p1"), &cfg);
+        let perms = &session.policy.perms;
+        assert!(!perms.screenshot);
+        assert!(!perms.keyboard);
+        assert!(!perms.mouse);
+        assert!(!perms.active_window);
+    }
+
+    #[test]
+    fn session_for_respects_granular_consent_toggles() {
+        let mut cfg = AppConfig::default();
+        let mut consent = CapturePermissions::default();
+        consent.keyboard = true;
+        consent.mouse = false;
+        consent.active_window = false;
+        consent.screenshot = false;
+        cfg.consent = crate::config::LocalConsent::Granted(consent);
+
+        let session = session_for(&project("p1"), &cfg);
+        let perms = &session.policy.perms;
+        assert!(perms.keyboard, "keyboard was granted");
+        assert!(!perms.mouse, "mouse was denied");
+        assert!(!perms.active_window, "active window was denied");
+        assert!(!perms.screenshot, "screenshot was denied");
     }
 
     fn at(s: &str) -> DateTime<Utc> {

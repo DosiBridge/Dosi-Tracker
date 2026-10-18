@@ -73,17 +73,21 @@ impl Tracker {
     ///
     /// Invariant: Constructor NEVER starts input hooks or window sampler!
     /// Sensors remain completely stopped and unattached until explicit authorized activation.
-    pub fn with_driver(driver: Arc<dyn SensorDriver>) -> Self {
+    pub fn with_driver_and_device(driver: Arc<dyn SensorDriver>, device: DeviceInfo) -> Self {
         let input = Arc::new(InputCounter::new());
         let usage = Arc::new(UsageRecorder::new());
-        Self { input, usage, device: DeviceInfo::collect(), driver }
+        Self { input, usage, device, driver }
     }
 
-    /// Construct a fake tracker for safe synthetic testing without OS hooks.
+    pub fn with_driver(driver: Arc<dyn SensorDriver>) -> Self {
+        Self::with_driver_and_device(driver, DeviceInfo::collect())
+    }
+
+    /// Construct a fake tracker for safe synthetic testing without OS hooks and without disk side effects.
     #[cfg_attr(not(test), expect(dead_code, reason = "for testing and inspection"))]
     pub fn new_fake() -> (Self, Arc<FakeSensorDriver>) {
         let driver = Arc::new(FakeSensorDriver::new());
-        (Self::with_driver(driver.clone()), driver)
+        (Self::with_driver_and_device(driver.clone(), DeviceInfo::fixture()), driver)
     }
 
     /// Read-only access to input for the live view (counts and activity % of
@@ -115,8 +119,7 @@ impl Tracker {
         let input_active = keyboard || mouse;
 
         self.usage.set_active(active_window);
-        self.input.set_active(input_active);
-        self.input.set_permissions(keyboard, mouse);
+        self.input.set_policy(input_active, keyboard, mouse);
 
         if input_active {
             self.driver.start_input(self.input.clone(), keyboard, mouse);
@@ -180,9 +183,14 @@ impl Tracker {
         let (started_at, ended_at) = (block.started_at, block.ended_at);
 
         // Credit the stretch since the last sample, so usage runs right up to
-        // the end of the block.
-        let window_now = active_window::current();
-        self.usage.record(ended_at.timestamp_millis(), window_now.clone());
+        // the end of the block, ONLY IF active_window is permitted and sampler is active.
+        let window_now = if perms.active_window && self.driver.is_usage_running() {
+            let win = active_window::current();
+            self.usage.record(ended_at.timestamp_millis(), win.clone());
+            win
+        } else {
+            None
+        };
 
         let measured = Measurements {
             key_presses: if perms.keyboard { self.input.key_presses_between(started_at, ended_at) } else { Vec::new() },
@@ -196,7 +204,7 @@ impl Tracker {
                 Vec::new()
             },
             window_now,
-            running_programs: if perms.running_programs {
+            running_programs: if perms.running_programs && self.driver.is_usage_running() {
                 active_window::running_programs().unwrap_or_else(|e| {
                     tracing::warn!(?e, "could not list running programs");
                     Vec::new()

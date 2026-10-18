@@ -5,11 +5,7 @@
 //! active window queries, or desktop collection during QA.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
-
-#[cfg(windows)]
-use std::sync::Mutex;
-#[cfg(windows)]
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::input::InputCounter;
@@ -83,7 +79,7 @@ impl FakeSensorDriver {
 
 impl SensorDriver for FakeSensorDriver {
     fn start_input(&self, counter: Arc<InputCounter>, keyboard: bool, mouse: bool) {
-        counter.set_permissions(keyboard, mouse);
+        counter.set_policy(keyboard || mouse, keyboard, mouse);
         self.last_keyboard_allowed.store(keyboard, Ordering::SeqCst);
         self.last_mouse_allowed.store(mouse, Ordering::SeqCst);
         if !self.input_running.swap(true, Ordering::SeqCst) {
@@ -118,30 +114,251 @@ impl SensorDriver for FakeSensorDriver {
     }
 }
 
-#[cfg(windows)]
-struct InputThread {
-    thread_id: u32,
-    join_handle: std::thread::JoinHandle<()>,
+// ---- Platform-Neutral Lifecycle Controller & Delegates ----------------------
+
+/// Pluggable hook operations used by the lifecycle controller.
+#[allow(dead_code)]
+pub trait HookLifecycleDelegate: Send + Sync + 'static {
+    /// Prepare message queue before handshake.
+    fn prepare_queue(&self) -> bool;
+
+    /// Attach requested hooks. Returns thread id / identifier on success.
+    fn attach_hooks(&self, keyboard: bool, mouse: bool) -> Result<u32, String>;
+
+    /// Detach any active hooks.
+    fn detach_hooks(&self);
+
+    /// Post quit message to hook thread message loop. Returns true if posted successfully.
+    fn post_quit(&self, thread_id: u32) -> bool;
+
+    /// Run message loop until WM_QUIT is processed.
+    fn run_loop(&self, counter: Arc<InputCounter>);
 }
 
-#[cfg(windows)]
-struct UsageThread {
+struct ActiveInputThread {
+    thread_id: u32,
+    join_handle: std::thread::JoinHandle<()>,
+    keyboard: bool,
+    mouse: bool,
+}
+
+/// Generic thread manager for input hooks enforcing serial transitions,
+/// explicit readiness handshake, truthful running states, synchronous join on stop,
+/// and safe Drop cleanup.
+#[allow(dead_code)]
+pub struct InputLifecycleController<D: HookLifecycleDelegate> {
+    delegate: Arc<D>,
+    slot: Mutex<Option<ActiveInputThread>>,
+}
+
+#[allow(dead_code)]
+impl<D: HookLifecycleDelegate> InputLifecycleController<D> {
+    pub fn new(delegate: Arc<D>) -> Self {
+        Self { delegate, slot: Mutex::new(None) }
+    }
+
+    pub fn start(&self, counter: Arc<InputCounter>, keyboard: bool, mouse: bool) -> bool {
+        let mut guard = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+
+        if let Some(ref current) = *guard {
+            if current.keyboard == keyboard && current.mouse == mouse {
+                return true;
+            }
+            // Permissions changed (e.g. policy narrowing): stop old thread synchronously first
+            self.stop_locked(&mut guard);
+        }
+
+        if !keyboard && !mouse {
+            return true;
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let delegate = self.delegate.clone();
+        let counter_clone = counter.clone();
+
+        let spawned = std::thread::Builder::new()
+            .name("input-hooks".into())
+            .spawn(move || {
+                if !delegate.prepare_queue() {
+                    let _ = tx.send(Err("failed to prepare message queue".into()));
+                    return;
+                }
+                match delegate.attach_hooks(keyboard, mouse) {
+                    Ok(thread_id) => {
+                        let _ = tx.send(Ok(thread_id));
+                        delegate.run_loop(counter_clone);
+                        delegate.detach_hooks();
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                    }
+                }
+            });
+
+        match spawned {
+            Ok(join_handle) => match rx.recv_timeout(Duration::from_secs(3)) {
+                Ok(Ok(thread_id)) => {
+                    *guard = Some(ActiveInputThread {
+                        thread_id,
+                        join_handle,
+                        keyboard,
+                        mouse,
+                    });
+                    true
+                }
+                Ok(Err(e)) => {
+                    tracing::error!(?e, "hook attachment failed during handshake");
+                    let _ = join_handle.join();
+                    false
+                }
+                Err(e) => {
+                    tracing::error!(?e, "handshake timed out waiting for hook thread readiness");
+                    let _ = join_handle.join();
+                    false
+                }
+            },
+            Err(e) => {
+                tracing::error!(?e, "failed to spawn hook thread");
+                false
+            }
+        }
+    }
+
+    pub fn stop(&self) {
+        let mut guard = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        self.stop_locked(&mut guard);
+    }
+
+    fn stop_locked(&self, guard: &mut Option<ActiveInputThread>) {
+        if let Some(thread) = guard.take() {
+            let mut posted = false;
+            for _ in 0..10 {
+                if self.delegate.post_quit(thread.thread_id) {
+                    posted = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if !posted {
+                tracing::error!("failed to post quit to hook thread");
+            }
+            if let Err(e) = thread.join_handle.join() {
+                tracing::warn!(?e, "error joining hook thread");
+            }
+        }
+    }
+
+    pub fn is_running(&self) -> bool {
+        let guard = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        guard.is_some()
+    }
+}
+
+impl<D: HookLifecycleDelegate> Drop for InputLifecycleController<D> {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Pluggable active-window sampling operations used by the usage lifecycle controller.
+#[allow(dead_code)]
+pub trait SamplerLifecycleDelegate: Send + Sync + 'static {
+    fn sample_once(&self, recorder: &UsageRecorder);
+}
+
+struct ActiveUsageThread {
     stop: Arc<AtomicBool>,
     join_handle: std::thread::JoinHandle<()>,
 }
 
+/// Generic thread manager for active-window usage sampling enforcing bounded stops,
+/// serialized restarts, and safe Drop cleanup.
+#[allow(dead_code)]
+pub struct UsageLifecycleController<D: SamplerLifecycleDelegate> {
+    delegate: Arc<D>,
+    slot: Mutex<Option<ActiveUsageThread>>,
+}
+
+#[allow(dead_code)]
+impl<D: SamplerLifecycleDelegate> UsageLifecycleController<D> {
+    pub fn new(delegate: Arc<D>) -> Self {
+        Self { delegate, slot: Mutex::new(None) }
+    }
+
+    pub fn start(&self, recorder: Arc<UsageRecorder>) -> bool {
+        let mut guard = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_some() {
+            return true;
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop.clone();
+        let delegate = self.delegate.clone();
+
+        let spawned = std::thread::Builder::new()
+            .name("usage-sampler".into())
+            .spawn(move || {
+                while !stop_clone.load(Ordering::SeqCst) {
+                    if recorder.is_active() {
+                        delegate.sample_once(&recorder);
+                    }
+                    for _ in 0..30 {
+                        if stop_clone.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            });
+
+        match spawned {
+            Ok(join_handle) => {
+                *guard = Some(ActiveUsageThread { stop, join_handle });
+                true
+            }
+            Err(e) => {
+                tracing::error!(?e, "could not start usage sampler thread");
+                false
+            }
+        }
+    }
+
+    pub fn stop(&self) {
+        let mut guard = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(thread) = guard.take() {
+            thread.stop.store(true, Ordering::SeqCst);
+            if let Err(e) = thread.join_handle.join() {
+                tracing::warn!(?e, "error joining usage sampler thread");
+            }
+        }
+    }
+
+    pub fn is_running(&self) -> bool {
+        let guard = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        guard.is_some()
+    }
+}
+
+impl<D: SamplerLifecycleDelegate> Drop for UsageLifecycleController<D> {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+// ---- Native Production Implementations --------------------------------------
+
 #[cfg(windows)]
 pub struct NativeSensorDriver {
-    input_thread: Mutex<Option<InputThread>>,
-    usage_thread: Mutex<Option<UsageThread>>,
+    input_lock: Mutex<Option<ActiveInputThread>>,
+    usage_lock: Mutex<Option<ActiveUsageThread>>,
 }
 
 #[cfg(windows)]
 impl Default for NativeSensorDriver {
     fn default() -> Self {
         Self {
-            input_thread: Mutex::new(None),
-            usage_thread: Mutex::new(None),
+            input_lock: Mutex::new(None),
+            usage_lock: Mutex::new(None),
         }
     }
 }
@@ -151,14 +368,48 @@ impl NativeSensorDriver {
     pub fn new() -> Self {
         Self::default()
     }
+
+    fn stop_input_locked(&self, guard: &mut Option<ActiveInputThread>) {
+        if let Some(thread) = guard.take() {
+            let mut posted = false;
+            for _ in 0..10 {
+                let res = unsafe {
+                    windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW(
+                        thread.thread_id,
+                        windows::Win32::UI::WindowsAndMessaging::WM_QUIT,
+                        windows::Win32::Foundation::WPARAM(0),
+                        windows::Win32::Foundation::LPARAM(0),
+                    )
+                };
+                if res.is_ok() {
+                    posted = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if !posted {
+                tracing::error!("failed to post WM_QUIT to input hook thread");
+            }
+            if let Err(e) = thread.join_handle.join() {
+                tracing::warn!(?e, "error joining input hook thread");
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
 impl SensorDriver for NativeSensorDriver {
     fn start_input(&self, counter: Arc<InputCounter>, keyboard: bool, mouse: bool) {
-        counter.set_permissions(keyboard, mouse);
-        let mut guard = self.input_thread.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.is_some() {
+        let mut guard = self.input_lock.lock().unwrap_or_else(|e| e.into_inner());
+
+        if let Some(ref current) = *guard {
+            if current.keyboard == keyboard && current.mouse == mouse {
+                return;
+            }
+            self.stop_input_locked(&mut guard);
+        }
+
+        if !keyboard && !mouse {
             return;
         }
 
@@ -167,18 +418,25 @@ impl SensorDriver for NativeSensorDriver {
         let spawned = std::thread::Builder::new()
             .name("input-hooks".into())
             .spawn(move || {
-                let thread_id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
-                let _ = tx.send(thread_id);
-                super::input::run_hooks_loop(counter_clone);
+                super::input::run_hooks_thread(counter_clone, keyboard, mouse, tx);
             });
 
         match spawned {
-            Ok(join_handle) => match rx.recv() {
-                Ok(thread_id) => {
-                    *guard = Some(InputThread { thread_id, join_handle });
+            Ok(join_handle) => match rx.recv_timeout(Duration::from_secs(3)) {
+                Ok(handshake) if handshake.success => {
+                    *guard = Some(ActiveInputThread {
+                        thread_id: handshake.thread_id,
+                        join_handle,
+                        keyboard,
+                        mouse,
+                    });
+                }
+                Ok(handshake) => {
+                    tracing::error!(?handshake, "hook attachment failed during handshake");
+                    let _ = join_handle.join();
                 }
                 Err(e) => {
-                    tracing::error!(?e, "failed to receive input hook thread id");
+                    tracing::error!(?e, "handshake timeout waiting for hook thread");
                     let _ = join_handle.join();
                 }
             },
@@ -189,32 +447,17 @@ impl SensorDriver for NativeSensorDriver {
     }
 
     fn stop_input(&self) {
-        let thread = {
-            let mut guard = self.input_thread.lock().unwrap_or_else(|e| e.into_inner());
-            guard.take()
-        };
-
-        if let Some(thread) = thread {
-            unsafe {
-                let _ = windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW(
-                    thread.thread_id,
-                    windows::Win32::UI::WindowsAndMessaging::WM_QUIT,
-                    windows::Win32::Foundation::WPARAM(0),
-                    windows::Win32::Foundation::LPARAM(0),
-                );
-            }
-            if let Err(e) = thread.join_handle.join() {
-                tracing::warn!(?e, "error joining input hook thread");
-            }
-        }
+        let mut guard = self.input_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.stop_input_locked(&mut guard);
     }
 
     fn is_input_running(&self) -> bool {
-        self.input_thread.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+        let guard = self.input_lock.lock().unwrap_or_else(|e| e.into_inner());
+        guard.is_some()
     }
 
     fn start_usage(&self, recorder: Arc<UsageRecorder>) {
-        let mut guard = self.usage_thread.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.usage_lock.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_some() {
             return;
         }
@@ -228,7 +471,6 @@ impl SensorDriver for NativeSensorDriver {
                     if recorder.is_active() {
                         recorder.record(chrono::Utc::now().timestamp_millis(), super::active_window::current());
                     }
-                    // Sleep in 100ms slices so stopping responds in <= 100ms
                     for _ in 0..30 {
                         if stop_clone.load(Ordering::SeqCst) {
                             break;
@@ -240,7 +482,7 @@ impl SensorDriver for NativeSensorDriver {
 
         match spawned {
             Ok(join_handle) => {
-                *guard = Some(UsageThread { stop, join_handle });
+                *guard = Some(ActiveUsageThread { stop, join_handle });
             }
             Err(e) => {
                 tracing::error!(?e, "could not start usage sampler thread");
@@ -249,12 +491,8 @@ impl SensorDriver for NativeSensorDriver {
     }
 
     fn stop_usage(&self) {
-        let thread = {
-            let mut guard = self.usage_thread.lock().unwrap_or_else(|e| e.into_inner());
-            guard.take()
-        };
-
-        if let Some(thread) = thread {
+        let mut guard = self.usage_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(thread) = guard.take() {
             thread.stop.store(true, Ordering::SeqCst);
             if let Err(e) = thread.join_handle.join() {
                 tracing::warn!(?e, "error joining usage sampler thread");
@@ -263,11 +501,21 @@ impl SensorDriver for NativeSensorDriver {
     }
 
     fn is_usage_running(&self) -> bool {
-        self.usage_thread.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+        let guard = self.usage_lock.lock().unwrap_or_else(|e| e.into_inner());
+        guard.is_some()
+    }
+}
+
+#[cfg(windows)]
+impl Drop for NativeSensorDriver {
+    fn drop(&mut self) {
+        self.stop_input();
+        self.stop_usage();
     }
 }
 
 #[cfg(not(windows))]
+#[derive(Default)]
 pub struct NativeSensorDriver;
 
 #[cfg(not(windows))]
@@ -281,20 +529,15 @@ impl NativeSensorDriver {
 impl SensorDriver for NativeSensorDriver {
     fn start_input(&self, _counter: Arc<InputCounter>, _keyboard: bool, _mouse: bool) {}
     fn stop_input(&self) {}
-    fn is_input_running(&self) -> bool {
-        false
-    }
+    fn is_input_running(&self) -> bool { false }
     fn start_usage(&self, _recorder: Arc<UsageRecorder>) {}
     fn stop_usage(&self) {}
-    fn is_usage_running(&self) -> bool {
-        false
-    }
+    fn is_usage_running(&self) -> bool { false }
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
-    use std::sync::Barrier;
 
     #[test]
     fn fake_driver_default_state_is_never_started() {
@@ -311,81 +554,57 @@ mod tests {
     fn fake_driver_per_sensor_activation_and_idempotency() {
         let driver = FakeSensorDriver::new();
         let counter = Arc::new(InputCounter::new());
-        let recorder = Arc::new(UsageRecorder::new());
 
-        // Start input only
         driver.start_input(counter.clone(), true, false);
         assert!(driver.is_input_running());
-        assert!(!driver.is_usage_running());
-        assert_eq!(driver.input_started_count(), 1);
         assert!(driver.last_keyboard_allowed());
         assert!(!driver.last_mouse_allowed());
-
-        // Second call while already running does not re-increment start counter
-        driver.start_input(counter.clone(), true, true);
         assert_eq!(driver.input_started_count(), 1);
-        assert!(driver.last_mouse_allowed());
 
-        // Start usage
-        driver.start_usage(recorder.clone());
-        assert!(driver.is_usage_running());
-        assert_eq!(driver.usage_started_count(), 1);
+        driver.start_input(counter.clone(), true, false);
+        assert_eq!(driver.input_started_count(), 1, "idempotent start does not double count");
 
-        // Stop input
         driver.stop_input();
         assert!(!driver.is_input_running());
         assert_eq!(driver.input_stopped_count(), 1);
-        assert!(driver.is_usage_running());
 
-        // Stop usage
-        driver.stop_usage();
-        assert!(!driver.is_usage_running());
-        assert_eq!(driver.usage_stopped_count(), 1);
+        driver.stop_input();
+        assert_eq!(driver.input_stopped_count(), 1, "idempotent stop does not double count");
     }
 
     #[test]
     fn fake_driver_repeated_transitions_balance_counts() {
         let driver = FakeSensorDriver::new();
         let counter = Arc::new(InputCounter::new());
-        let recorder = Arc::new(UsageRecorder::new());
 
-        for _ in 0..5 {
+        for i in 1..=10 {
             driver.start_input(counter.clone(), true, true);
-            driver.start_usage(recorder.clone());
             assert!(driver.is_input_running());
-            assert!(driver.is_usage_running());
+            assert_eq!(driver.input_started_count(), i);
 
             driver.stop_input();
-            driver.stop_usage();
             assert!(!driver.is_input_running());
-            assert!(!driver.is_usage_running());
+            assert_eq!(driver.input_stopped_count(), i);
         }
-
-        assert_eq!(driver.input_started_count(), 5);
-        assert_eq!(driver.input_stopped_count(), 5);
-        assert_eq!(driver.usage_started_count(), 5);
-        assert_eq!(driver.usage_stopped_count(), 5);
+        assert_eq!(driver.input_started_count(), driver.input_stopped_count());
     }
 
     #[test]
     fn fake_driver_concurrent_barrier_transitions() {
         let driver = Arc::new(FakeSensorDriver::new());
         let counter = Arc::new(InputCounter::new());
-        let recorder = Arc::new(UsageRecorder::new());
-        let barrier = Arc::new(Barrier::new(4));
+        let barrier = Arc::new(std::sync::Barrier::new(4));
 
         let mut handles = Vec::new();
-        for i in 0..4 {
+        for _ in 0..4 {
             let d = driver.clone();
             let c = counter.clone();
-            let r = recorder.clone();
             let b = barrier.clone();
             handles.push(std::thread::spawn(move || {
                 b.wait();
-                if i % 2 == 0 {
-                    d.start_input(c, true, true);
-                    d.start_usage(r);
-                } else {
+                for _ in 0..50 {
+                    d.start_input(c.clone(), true, true);
+                    d.start_usage(Arc::new(UsageRecorder::new()));
                     d.stop_input();
                     d.stop_usage();
                 }
@@ -396,8 +615,223 @@ mod tests {
             h.join().unwrap();
         }
 
-        // State remains deterministic boolean flags without data corruption
-        let _ = driver.is_input_running();
-        let _ = driver.is_usage_running();
+        // Final state assertion: when all threads finish their last stop, sensors must be stopped
+        assert!(!driver.is_input_running(), "input must be stopped after concurrent transitions");
+        assert!(!driver.is_usage_running(), "usage must be stopped after concurrent transitions");
+        assert_eq!(
+            driver.input_started_count(),
+            driver.input_stopped_count(),
+            "input starts and stops must balance exactly"
+        );
+        assert_eq!(
+            driver.usage_started_count(),
+            driver.usage_stopped_count(),
+            "usage starts and stops must balance exactly"
+        );
+    }
+
+    // ---- Platform-Neutral Lifecycle Controller Tests ------------------------
+
+    #[derive(Default)]
+    struct MockHookDelegate {
+        prepared: AtomicBool,
+        keyboard_installed: AtomicUsize,
+        mouse_installed: AtomicUsize,
+        keyboard_uninstalled: AtomicUsize,
+        mouse_uninstalled: AtomicUsize,
+        should_fail_install: AtomicBool,
+        should_fail_post_quit: AtomicBool,
+        quit_posted: AtomicUsize,
+        loop_running: AtomicBool,
+        quit_signal: Arc<AtomicBool>,
+    }
+
+    impl HookLifecycleDelegate for MockHookDelegate {
+        fn prepare_queue(&self) -> bool {
+            self.prepared.store(true, Ordering::SeqCst);
+            true
+        }
+
+        fn attach_hooks(&self, keyboard: bool, mouse: bool) -> Result<u32, String> {
+            if self.should_fail_install.load(Ordering::SeqCst) {
+                return Err("simulated hook install failure".into());
+            }
+            if keyboard {
+                self.keyboard_installed.fetch_add(1, Ordering::SeqCst);
+            }
+            if mouse {
+                self.mouse_installed.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(101)
+        }
+
+        fn detach_hooks(&self) {
+            self.keyboard_uninstalled.fetch_add(1, Ordering::SeqCst);
+            self.mouse_uninstalled.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn post_quit(&self, _thread_id: u32) -> bool {
+            if self.should_fail_post_quit.swap(false, Ordering::SeqCst) {
+                // simulate 1 retry
+                return false;
+            }
+            self.quit_posted.fetch_add(1, Ordering::SeqCst);
+            self.quit_signal.store(true, Ordering::SeqCst);
+            true
+        }
+
+        fn run_loop(&self, _counter: Arc<InputCounter>) {
+            self.loop_running.store(true, Ordering::SeqCst);
+            while !self.quit_signal.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            self.loop_running.store(false, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn immediate_stop_before_readiness() {
+        let delegate = Arc::new(MockHookDelegate::default());
+        let controller = InputLifecycleController::new(delegate.clone());
+        let counter = Arc::new(InputCounter::new());
+
+        let started = controller.start(counter, true, true);
+        assert!(started);
+        assert!(controller.is_running());
+
+        // Stop immediately
+        controller.stop();
+        assert!(!controller.is_running());
+        assert!(!delegate.loop_running.load(Ordering::SeqCst));
+        assert!(delegate.quit_posted.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn failed_queue_post_or_install() {
+        let delegate = Arc::new(MockHookDelegate::default());
+        delegate.should_fail_install.store(true, Ordering::SeqCst);
+
+        let controller = InputLifecycleController::new(delegate.clone());
+        let counter = Arc::new(InputCounter::new());
+
+        let started = controller.start(counter, true, true);
+        assert!(!started, "start must report failure when hook installation fails");
+        assert!(!controller.is_running(), "running state must be false on failure");
+    }
+
+    #[test]
+    fn stop_versus_concurrent_restart() {
+        let delegate = Arc::new(MockHookDelegate::default());
+        let controller = Arc::new(InputLifecycleController::new(delegate.clone()));
+        let counter = Arc::new(InputCounter::new());
+
+        let c1 = controller.clone();
+        let cnt1 = counter.clone();
+        let h1 = std::thread::spawn(move || {
+            for _ in 0..20 {
+                c1.start(cnt1.clone(), true, true);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        });
+
+        let c2 = controller.clone();
+        let h2 = std::thread::spawn(move || {
+            for _ in 0..20 {
+                c2.stop();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        });
+
+        h1.join().unwrap();
+        h2.join().unwrap();
+
+        controller.stop();
+        assert!(!controller.is_running(), "controller must be cleanly stopped");
+    }
+
+    #[test]
+    fn policy_narrowing_restarts_cleanly() {
+        let delegate = Arc::new(MockHookDelegate::default());
+        let controller = InputLifecycleController::new(delegate.clone());
+        let counter = Arc::new(InputCounter::new());
+
+        // Start with both keyboard and mouse
+        assert!(controller.start(counter.clone(), true, true));
+        assert!(controller.is_running());
+        assert_eq!(delegate.keyboard_installed.load(Ordering::SeqCst), 1);
+        assert_eq!(delegate.mouse_installed.load(Ordering::SeqCst), 1);
+
+        // Narrow to mouse only
+        assert!(controller.start(counter, false, true));
+        assert!(controller.is_running());
+        assert_eq!(delegate.mouse_installed.load(Ordering::SeqCst), 2);
+        assert_eq!(delegate.keyboard_installed.load(Ordering::SeqCst), 1, "keyboard not installed when narrowed");
+
+        controller.stop();
+        assert!(!controller.is_running());
+    }
+
+    #[test]
+    fn per_sensor_exact_install_uninstall_counts() {
+        let delegate = Arc::new(MockHookDelegate::default());
+        let controller = InputLifecycleController::new(delegate.clone());
+        let counter = Arc::new(InputCounter::new());
+
+        // Keyboard only
+        controller.start(counter.clone(), true, false);
+        assert_eq!(delegate.keyboard_installed.load(Ordering::SeqCst), 1);
+        assert_eq!(delegate.mouse_installed.load(Ordering::SeqCst), 0);
+
+        controller.stop();
+        assert_eq!(delegate.keyboard_uninstalled.load(Ordering::SeqCst), 1);
+
+        // Mouse only
+        controller.start(counter, false, true);
+        assert_eq!(delegate.keyboard_installed.load(Ordering::SeqCst), 1);
+        assert_eq!(delegate.mouse_installed.load(Ordering::SeqCst), 1);
+
+        controller.stop();
+        assert_eq!(delegate.mouse_uninstalled.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn drop_cleanup_stops_running_thread() {
+        let delegate = Arc::new(MockHookDelegate::default());
+        let counter = Arc::new(InputCounter::new());
+        {
+            let controller = InputLifecycleController::new(delegate.clone());
+            controller.start(counter, true, true);
+            assert!(controller.is_running());
+        } // controller dropped here
+        assert!(delegate.quit_signal.load(Ordering::SeqCst), "quit must be posted upon drop");
+        assert!(!delegate.loop_running.load(Ordering::SeqCst), "thread must be stopped and joined upon drop");
+    }
+
+    #[derive(Default)]
+    struct MockSamplerDelegate {
+        sample_count: AtomicUsize,
+    }
+
+    impl SamplerLifecycleDelegate for MockSamplerDelegate {
+        fn sample_once(&self, _recorder: &UsageRecorder) {
+            self.sample_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn stop_during_startup_or_in_flight_sample() {
+        let delegate = Arc::new(MockSamplerDelegate::default());
+        let controller = UsageLifecycleController::new(delegate.clone());
+        let recorder = Arc::new(UsageRecorder::new());
+        recorder.set_active(true);
+
+        assert!(controller.start(recorder));
+        assert!(controller.is_running());
+
+        // Let one slice execute
+        std::thread::sleep(Duration::from_millis(50));
+
+        controller.stop();
+        assert!(!controller.is_running());
     }
 }

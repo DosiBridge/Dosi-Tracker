@@ -27,9 +27,70 @@ pub struct AppConfig {
 
     /// Per-project capture permissions (defaults; server config wins).
     pub capture: CapturePermissions,
+
+    /// Explicit affirmative local consent from the interactive user on this device.
+    /// Invariant: Defaults to `LocalConsent::Absent` to fail closed until an explicit
+    /// user consent dialog slice is completed. Defaults/server policy never fabricate consent.
+    pub consent: LocalConsent,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Explicit affirmative local consent from the interactive user on this device.
+///
+/// Invariant: Configuration defaults or server-side project policies do NOT
+/// constitute local user consent. Captures and sensing occur only if:
+///   Effective = ProjectPolicy ∩ LocalConsent
+///
+/// Until a reviewed consent UI slice is completed, production runtime defaults
+/// to `LocalConsent::Absent`, causing all sensor collection to fail closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LocalConsent {
+    /// No affirmative consent has been granted by the local user yet.
+    Absent,
+    /// Explicit affirmative consent granted per capability by the user.
+    Granted(CapturePermissions),
+    /// Explicitly revoked by the user.
+    Revoked,
+}
+
+impl Default for LocalConsent {
+    fn default() -> Self {
+        LocalConsent::Absent
+    }
+}
+
+impl LocalConsent {
+    #[allow(dead_code)]
+    pub fn is_granted(&self) -> bool {
+        matches!(self, LocalConsent::Granted(_))
+    }
+
+    /// Compute effective permissions given server policy, local configuration, and this consent.
+    /// Fails closed: if consent is Absent or Revoked, all permissions are false.
+    pub fn effective_permissions(&self, project: &crate::model::Project, local_cfg: &CapturePermissions) -> CapturePermissions {
+        match self {
+            LocalConsent::Granted(consent) => CapturePermissions {
+                screenshot: project.allow_screenshot && local_cfg.screenshot && consent.screenshot,
+                webcam: project.allow_webcam && local_cfg.webcam && consent.webcam,
+                keyboard: project.allow_keyboard && local_cfg.keyboard && consent.keyboard,
+                mouse: project.allow_mouse && local_cfg.mouse && consent.mouse,
+                active_window: project.allow_active_window && local_cfg.active_window && consent.active_window,
+                running_programs: project.allow_running_programs && local_cfg.running_programs && consent.running_programs,
+                blur_screenshots: project.blur_screenshots || local_cfg.blur_screenshots || consent.blur_screenshots,
+            },
+            LocalConsent::Absent | LocalConsent::Revoked => CapturePermissions {
+                screenshot: false,
+                webcam: false,
+                keyboard: false,
+                mouse: false,
+                active_window: false,
+                running_programs: false,
+                blur_screenshots: true,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CapturePermissions {
     pub screenshot: bool,
@@ -118,6 +179,7 @@ impl Default for AppConfig {
             dashboard_url: "http://localhost:6005".to_string(), // the Next.js frontend (`npm run dev`)
             interval_minutes: 10,
             capture: CapturePermissions::default(),
+            consent: LocalConsent::Absent,
         }
     }
 }

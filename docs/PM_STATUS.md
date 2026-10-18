@@ -67,15 +67,23 @@ This correction introduces an injectable sensor driver foundation without archit
 | `clients/windows/src/tracking/input.rs` | Added `allowed_keyboard` and `allowed_mouse` atomic flags; early-exit in `InputFilter::apply` before health/timing; gated watchdog; added filter and watchdog tests. |
 | `clients/windows/src/tracking/usage.rs` | Gated `record` and sampler; annotated legacy helpers with `#[allow(dead_code)]`. |
 | `clients/windows/src/worker.rs` | Added `apply_sensor_policy` to `Machine` trait; wired in `Worker::publish` and immediate detachment in `Worker::quit`. |
-| `clients/windows/src/worker/tests.rs` | Added sensor lifecycle tracking to `FakeMachine`; added 6 new lifecycle regression tests. |
-| `docs/PRODUCT_ACCEPTANCE.md` | Reconciled evidence levels to distinguish PM-verified tests from worker-reported tests; expanded finite backlog gaps (invitation expiry/revocation, safe deletion, negative HTTP isolation, retention, local consent UI). |
-| `docs/PM_STATUS.md` | Detailed Step 1B correction, test provenance, exact commands, test counts, execution times, and exit codes. |
+| `clients/windows/src/config.rs` | Added `LocalConsent` enum (`Absent`, `Granted`, `Revoked`) defaulting to `Absent`; updated `session_for` to fail closed if consent is absent or revoked; derive `PartialEq, Eq` on `CapturePermissions`. |
+| `clients/windows/src/tracking/system.rs` | Added `DeviceInfo::fixture()` with mock constants for side-effect-free fake tracker construction without local filesystem access. |
+| `clients/windows/src/tracking/input.rs` | Added `InputCounter::set_policy` eliminating transient dual-permission grant; refactored `Hooks` to store optional handles (`Option<HHOOK>`); updated `install(keyboard, mouse)` and `watchdog` to attach only permitted hooks; added `run_hooks_thread` forcing Win32 message queue creation via `PeekMessageW(..., PM_NOREMOVE)` before sending thread ID handshake; updated `InputFilter::apply` to drop denied events before touching health or key timing. |
+| `clients/windows/src/tracking/lifecycle.rs` | Implemented platform-neutral `InputLifecycleController` and `UsageLifecycleController` with explicit queue-ready handshake, serial transitions under lock, bounded shutdown retry, truthful running state, and `Drop` cleanup; updated `NativeSensorDriver` to consume lifecycle controllers; expanded tests with 7 new synthetic lifecycle edge tests (11 total). |
+| `clients/windows/src/tracking/mod.rs` | Updated `Tracker::with_driver_and_device` and `Tracker::new_fake` to use `DeviceInfo::fixture()`; updated `apply_sensor_policy` to use `set_policy`; closed `Tracker::snapshot` bypass so `active_window::current` and `running_programs` are queried only when permitted and sampler is active. |
+| `clients/windows/src/worker/session.rs` | Evaluates effective permissions via `cfg.consent.effective_permissions`; added 3 consent tests. |
+| `clients/windows/src/worker/tests.rs` | Injected affirmative consent in `harness_at`; added task barrier in quit regression test proving sensor stop before upload wait; added `worker_fails_closed_when_consent_is_absent`; aligned `FakeMachine::is_tracking_active` with `Tracker::is_tracking_active`. |
+| `docs/PRODUCT_ACCEPTANCE.md` | Reconciled evidence levels to distinguish PM-verified tests from worker-reported tests; clarified that accumulator tests do not prove absence of raw keystrokes across the pipeline; noted fail-closed consent integration. |
+| `docs/PM_STATUS.md` | Recorded PM baselines at `18db4d5` and `8c1b201`, documented Step 1C hardening results and test provenance. |
 
 ---
 
 ## 3. Concrete Test Execution & Evidence Provenance
 
-### A. PM Independent Baseline (Verified at Commit `18db4d5`)
+### A. PM Independent Baselines
+
+#### 1. Baseline at Commit `18db4d5` (Verified by PM)
 
 | Suite / Command | Exact Command Line | Tests Passed | Exit Code | Provenance |
 |---|---|:---:|:---:|---|
@@ -87,25 +95,37 @@ This correction introduces an injectable sensor driver foundation without archit
 | **Frontend TypeScript Gate** | `npm run typecheck` in `frontend` | 0 errors | **0** | Verified by PM @ `18db4d5` |
 | **Frontend Workspace Tests** | `npx vitest run src/components/layout/workspace-switcher.live.test.tsx src/test/integration/tenant-switching.test.tsx src/test/pages/workspaces.test.tsx` | 17 | **0** | Verified by PM @ `18db4d5` |
 
+#### 2. Baseline at Commit `8c1b201` (Verified by PM)
+
+| Suite / Command | Exact Command Line | Tests Passed | Exit Code | Provenance |
+|---|---|:---:|:---:|---|
+| **Sensor Lifecycle Decoupling** | `cargo test --bin dosi-tracker tracking::lifecycle::tests` | 4 | **0** | Verified by PM @ `8c1b201` |
+| **Filter Inactive Health/Timing** | `cargo test --bin dosi-tracker tracking::input::tests::inactive_filter_does_not_update_health_or_key_down_state -- --exact` | 1 | **0** | Verified by PM @ `8c1b201` |
+| **Filter Per-Sensor Gating** | `cargo test --bin dosi-tracker tracking::input::tests::per_sensor_permission_gating_in_filter -- --exact` | 1 | **0** | Verified by PM @ `8c1b201` |
+
 ---
 
-### B. Worker-Reported Test Execution (Step 1B Correction at Current Working Tree)
+### B. Worker-Reported Test Execution (Step 1C Hardening at Current Working Tree)
 
-All tests executed with `RUST_BACKTRACE=1` in `clients/windows`. No real Win32 input hooks or window enumeration was invoked during execution.
+All tests executed with `RUST_BACKTRACE=1` in `clients/windows`. Synthetic QA only; no real Win32 input hooks, foreground window enumeration, desktop collection, screen capture, or webcam capture were invoked during execution.
 
 | Target Suite | Exact Command Line | Tests Passed | Ignored | Time | Exit Code | Evidence Level |
 |---|---|:---:|:---:|:---:|:---:|:---:|
-| **Compilation Gate** | `cargo check --bin dosi-tracker` | N/A | 0 errors, 0 warnings | 1.48s | **0** | **[Worker-Reported]** |
-| **Test Compilation Gate** | `cargo test --bin dosi-tracker --no-run` | N/A | 0 errors, 0 warnings | 7.82s | **0** | **[Worker-Reported]** |
-| **Sensor Lifecycle Suite** | `cargo test --bin dosi-tracker tracking::lifecycle::tests` | 4 | 0 | 0.00s | **0** | **[Worker-Reported]** |
+| **Compilation Gate** | `cargo check --bin dosi-tracker` | N/A | 0 errors, 0 warnings | 1.32s | **0** | **[Worker-Reported]** |
+| **Sensor Lifecycle Suite** | `cargo test --bin dosi-tracker tracking::lifecycle::tests` | 11 | 0 | 0.10s | **0** | **[Worker-Reported]** |
+| **Worker Session Suite** | `cargo test --bin dosi-tracker worker::session::tests` | 10 | 0 | 0.00s | **0** | **[Worker-Reported]** |
+| **Worker Sensor Lifecycle** | `cargo test --bin dosi-tracker worker::tests::sensor_lifecycle` | 6 | 0 | 2.02s | **0** | **[Worker-Reported]** |
+| **Worker Consent Fail-Closed**| `cargo test --bin dosi-tracker worker::tests::worker_fails_closed_when_consent_is_absent -- --exact` | 1 | 0 | 0.01s | **0** | **[Worker-Reported]** |
+| **Worker Pause/Resume** | `cargo test --bin dosi-tracker worker::tests::tracking_active_follows_pause_and_resume_lifecycle -- --exact` | 1 | 0 | 0.01s | **0** | **[Worker-Reported]** |
 | **Tracking Suite** | `cargo test --bin dosi-tracker tracking::tests` | 11 | 0 | 0.00s | **0** | **[Worker-Reported]** |
-| **Input Counter & Filter Suite** | `cargo test --bin dosi-tracker tracking::input::tests` | 35 | 1 | 0.01s | **0** | **[Worker-Reported]** |
+| **Input Counter & Filter** | `cargo test --bin dosi-tracker tracking::input::tests` | 35 | 1 | 0.01s | **0** | **[Worker-Reported]** |
 | **Usage Recorder Suite** | `cargo test --bin dosi-tracker tracking::usage::tests` | 16 | 0 | 0.00s | **0** | **[Worker-Reported]** |
-| **Worker Sensor Lifecycle** | `cargo test --bin dosi-tracker worker::tests::sensor_lifecycle` | 6 | 0 | 2.03s | **0** | **[Worker-Reported]** |
-| **Worker Pause/Resume** | `cargo test --bin dosi-tracker worker::tests::tracking_active_follows_pause_and_resume_lifecycle` | 1 | 0 | 0.01s | **0** | **[Worker-Reported]** |
-| **Total Focused Synthetic Tests**| Sum of focused suites above | **73** | 1 (`the_real_hooks_report_injected_input_as_injected`) | ~2.5s | **0** | **[Worker-Reported]** |
+| **Total Focused Synthetic Tests**| Sum of focused suites above | **91** | 1 (`the_real_hooks_report_injected_input_as_injected`) | ~2.6s | **0** | **[Worker-Reported]** |
 
-*Note on Ignored Test:* `tracking::input::tests::the_real_hooks_report_injected_input_as_injected` is marked `#[ignore]` in source because it requires installing live Win32 hooks and nudging the physical mouse cursor. It was intentionally not executed in QA.
+*Critical Evidentiary Notes:*
+1. **Raw Keystroke Boundary:** Accumulator gating tests prove monotonic count increment and drop behaviors in `InputCounter`, but do **NOT** prove complete end-to-end absence of raw keystrokes across serialization, local storage, or backend transmission.
+2. **Synchronous Native Detachment:** Native detachment is hardened in source via explicit Win32 queue initialization handshake (`PeekMessageW`), serial transitions under lock, bounded quit retries, thread join, and fail-closed consent; interactive Win32 desktop sessions and OS-level hook detach remain unverified in QA.
+3. *Ignored Test:* `tracking::input::tests::the_real_hooks_report_injected_input_as_injected` is marked `#[ignore]` in source because it requires installing live Win32 hooks and nudging the physical mouse cursor. It was intentionally not executed in QA.
 
 ---
 
@@ -113,10 +133,10 @@ All tests executed with `RUST_BACKTRACE=1` in `clients/windows`. No real Win32 i
 
 | Evidence Dimension | Windows (Rust) | macOS (Swift) | Linux (Target) |
 |---|---|---|---|
-| **1. Implemented Source** | ⚠️ Source present (`clients/windows`: egui UI, Win32 hooks, xcap, DPAPI, SQLite queue); sensor lifecycle foundation decoupled; native interactive hooks, packaging, and signing open | ⚠️ Source present (`clients/macos`: SwiftUI, ScreenCaptureKit, Keychain, SQLite queue); source presence is NOT proof of complete implementation; TCC consent, runtime execution, packaging, and notarization open | ❌ **Unresolved Gap** (`clients/linux` crate not yet created) |
-| **2. Synthetic / Mock Unit Tests** | ✅ Complete (**73 focused synthetic tests passing**, 0 warnings) | ⚠️ Unverified locally (Swift test files present in source; not executed locally) | ❌ 0 tests (No crate) |
+| **1. Implemented Source** | ⚠️ Source present (`clients/windows`: egui UI, Win32 hooks, xcap, DPAPI, SQLite queue); sensor lifecycle foundation decoupled and hardened with queue-ready handshake and fail-closed consent; native interactive hooks, packaging, and signing open | ⚠️ Source present (`clients/macos`: SwiftUI, ScreenCaptureKit, Keychain, SQLite queue); source presence is NOT proof of complete implementation; TCC consent, runtime execution, packaging, and notarization open | ❌ **Unresolved Gap** (`clients/linux` crate not yet created) |
+| **2. Synthetic / Mock Unit Tests** | ✅ Complete (**91 focused synthetic tests passing**, 0 warnings) | ⚠️ Unverified locally (Swift test files present in source; not executed locally) | ❌ 0 tests (No crate) |
 | **3. Toolchain / Compile / Build** | ✅ Verified locally (Rustc / Cargo 1.97.1 on Windows 11 host) | ❌ Unverified locally (Host lacks macOS toolchain / Xcode) | ❌ Unverified locally (Host lacks Linux build container / environment) |
-| **4. Native Interactive Runtime** | ⚠️ **Unverified** (Unit tests run synthetically via `FakeSensorDriver`; interactive Win32 desktop hooks unverified in QA) | ⚠️ **Outstanding** (Requires physical macOS execution environment) | ❌ **Outstanding** (Requires Linux X11/Wayland execution environment) |
+| **4. Native Interactive Runtime** | ⚠️ **Unverified** (Unit tests run synthetically via `FakeSensorDriver` and platform-neutral lifecycle mock; interactive Win32 desktop hooks unverified in QA) | ⚠️ **Outstanding** (Requires physical macOS execution environment) | ❌ **Outstanding** (Requires Linux X11/Wayland execution environment) |
 | **5. Packaging / Install / Uninstall** | ⚠️ Partial (NSIS `.nsi` script present; silent install/uninstall unverified in CI) | ⚠️ Partial (`build-app.sh` creates bundle; DMG packaging unverified) | ❌ **Unresolved Gap** (No `.deb`, AppImage, or Flatpak manifest) |
 | **6. Code Signing & Notarization** | ⚠️ **Outstanding Prerequisite** (Unsigned; Authenticode cert required; signing does not guarantee immediate SmartScreen elimination; SmartScreen must not be bypassed) | ⚠️ **Outstanding Prerequisite** (Unsigned; Apple Developer ID & Notarization required) | ⚠️ **Outstanding Prerequisite** (GPG package signing required) |
 
@@ -125,6 +145,7 @@ All tests executed with `RUST_BACKTRACE=1` in `clients/windows`. No real Win32 i
 ## 5. Next Steps
 
 1. **Awaiting PM Independent Review**:
-   - PM independently executes selected focused synthetic tests to verify Step 1B correction.
+   - PM independently executes selected focused synthetic tests to verify Step 1C hardening.
 2. **Subsequent Phasing (Strictly Awaiting Authorization)**:
    - Backend schema nullability migration (`Activity.cs` metric nullability) and cross-workspace tenant isolation tests remain deferred until PM authorization.
+

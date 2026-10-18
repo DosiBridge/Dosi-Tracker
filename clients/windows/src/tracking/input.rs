@@ -90,13 +90,27 @@ impl InputCounter {
         Self::default()
     }
 
+    /// Configure effective sensor policy and permissions.
+    /// Invariant: Eliminates transient grants by storing exact per-sensor permissions
+    /// before enabling the active collection flag.
+    pub fn set_policy(&self, active: bool, keyboard: bool, mouse: bool) {
+        if !active {
+            self.active.store(false, Ordering::SeqCst);
+            self.allowed_keyboard.store(false, Ordering::SeqCst);
+            self.allowed_mouse.store(false, Ordering::SeqCst);
+        } else {
+            self.allowed_keyboard.store(keyboard, Ordering::SeqCst);
+            self.allowed_mouse.store(mouse, Ordering::SeqCst);
+            self.active.store(keyboard || mouse, Ordering::SeqCst);
+        }
+    }
+
     /// Turn active tracking on or off. When inactive (e.g. paused, signed out,
     /// away, or before project selection), key presses and clicks are dropped
     /// without recording timestamps into memory buffers.
+    #[allow(dead_code)]
     pub fn set_active(&self, active: bool) {
-        self.active.store(active, Ordering::SeqCst);
-        self.allowed_keyboard.store(active, Ordering::SeqCst);
-        self.allowed_mouse.store(active, Ordering::SeqCst);
+        self.set_policy(active, active, active);
     }
 
     pub fn is_active(&self) -> bool {
@@ -104,6 +118,7 @@ impl InputCounter {
     }
 
     /// Configure effective sensor permissions for keyboard and mouse.
+    #[allow(dead_code)]
     pub fn set_permissions(&self, keyboard: bool, mouse: bool) {
         self.allowed_keyboard.store(keyboard, Ordering::SeqCst);
         self.allowed_mouse.store(mouse, Ordering::SeqCst);
@@ -475,41 +490,36 @@ impl InputFilter {
         if !counter.is_active() {
             return;
         }
+        // Denied sensors must not mutate health or key timing either.
+        let allowed = match input {
+            RawInput::KeyDown(_) | RawInput::KeyUp(_) => counter.is_keyboard_allowed(),
+            RawInput::ButtonDown | RawInput::ButtonUp | RawInput::Move | RawInput::Wheel => {
+                counter.is_mouse_allowed()
+            }
+        };
+        if !allowed {
+            return;
+        }
+
         counter.health.saw_event(at_ms);
         let second = at_ms.div_euclid(1000);
         if injected {
             match input {
-                RawInput::KeyDown(_) => {
-                    if counter.is_keyboard_allowed() {
-                        counter.injected_keyboard.add(second);
-                    }
-                }
-                RawInput::ButtonDown | RawInput::Move | RawInput::Wheel => {
-                    if counter.is_mouse_allowed() {
-                        counter.injected_mouse.add(second);
-                    }
-                }
+                RawInput::KeyDown(_) => counter.injected_keyboard.add(second),
+                RawInput::ButtonDown | RawInput::Move | RawInput::Wheel => counter.injected_mouse.add(second),
                 RawInput::KeyUp(_) | RawInput::ButtonUp => {}
             }
             return;
         }
         match input {
             RawInput::KeyDown(vk) => {
-                if counter.is_keyboard_allowed() && self.key_down(vk, at_ms) {
+                if self.key_down(vk, at_ms) {
                     counter.record_key_press(at_ms);
                 }
             }
             RawInput::KeyUp(vk) => self.key_down_at[(vk & 0xFF) as usize] = 0,
-            RawInput::ButtonDown => {
-                if counter.is_mouse_allowed() {
-                    counter.record_click(at_ms);
-                }
-            }
-            RawInput::Move | RawInput::Wheel => {
-                if counter.is_mouse_allowed() {
-                    counter.record_mouse_activity(at_ms);
-                }
-            }
+            RawInput::ButtonDown => counter.record_click(at_ms),
+            RawInput::Move | RawInput::Wheel => counter.record_mouse_activity(at_ms),
             RawInput::ButtonUp => {}
         }
     }
@@ -790,6 +800,11 @@ pub fn spawn_listener(counter: Arc<InputCounter>) {
 }
 
 #[cfg(windows)]
+#[allow(unused_imports)]
+pub(crate) use hooks::{install, run_hooks_thread, uninstall, Handshake, Hooks};
+
+#[cfg(windows)]
+#[allow(dead_code)]
 pub(crate) fn run_hooks_loop(counter: Arc<InputCounter>) {
     hooks::run(counter);
 }
@@ -826,34 +841,49 @@ mod hooks {
         static CONTEXT: RefCell<Option<Context>> = const { RefCell::new(None) };
     }
 
-    struct Hooks {
-        keyboard: HHOOK,
-        mouse: HHOOK,
+    pub struct Hooks {
+        pub keyboard: Option<HHOOK>,
+        pub mouse: Option<HHOOK>,
     }
 
     fn now_ms() -> i64 {
         Utc::now().timestamp_millis()
     }
 
-    fn install() -> windows::core::Result<Hooks> {
+    pub fn install(keyboard: bool, mouse: bool) -> windows::core::Result<Hooks> {
         unsafe {
             let module = GetModuleHandleW(PCWSTR::null())?;
             let instance = HINSTANCE(module.0);
-            let keyboard = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), instance, 0)?;
-            match SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), instance, 0) {
-                Ok(mouse) => Ok(Hooks { keyboard, mouse }),
-                Err(e) => {
-                    let _ = UnhookWindowsHookEx(keyboard);
-                    Err(e)
+            let keyboard_hook = if keyboard {
+                Some(SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), instance, 0)?)
+            } else {
+                None
+            };
+            let mouse_hook = if mouse {
+                match SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), instance, 0) {
+                    Ok(m) => Some(m),
+                    Err(e) => {
+                        if let Some(k) = keyboard_hook {
+                            let _ = UnhookWindowsHookEx(k);
+                        }
+                        return Err(e);
+                    }
                 }
-            }
+            } else {
+                None
+            };
+            Ok(Hooks { keyboard: keyboard_hook, mouse: mouse_hook })
         }
     }
 
-    fn uninstall(hooks: Hooks) {
+    pub fn uninstall(mut hooks: Hooks) {
         unsafe {
-            let _ = UnhookWindowsHookEx(hooks.keyboard);
-            let _ = UnhookWindowsHookEx(hooks.mouse);
+            if let Some(k) = hooks.keyboard.take() {
+                let _ = UnhookWindowsHookEx(k);
+            }
+            if let Some(m) = hooks.mouse.take() {
+                let _ = UnhookWindowsHookEx(m);
+            }
         }
     }
 
@@ -899,23 +929,49 @@ mod hooks {
         pointer_moved_ms: Option<i64>,
     }
 
-    /// The hook thread: install, then pump messages (which is what runs the
-    /// hooks) until the process ends, checking the hooks on a timer.
-    pub fn run(counter: Arc<InputCounter>) {
-        // Windows drops a hook that answers too slowly (LowLevelHooksTimeout),
-        // which a busy machine can cause; the procedures only take a
-        // timestamp, so running them ahead of ordinary work costs nothing.
+    #[derive(Debug, Clone, Copy)]
+    pub struct Handshake {
+        pub thread_id: u32,
+        pub success: bool,
+    }
+
+    /// Dedicated hook thread: sets up message queue, installs permitted hooks,
+    /// sends start handshake, pumps messages, and cleans up upon WM_QUIT.
+    pub fn run_hooks_thread(
+        counter: Arc<InputCounter>,
+        keyboard: bool,
+        mouse: bool,
+        ready_tx: std::sync::mpsc::Sender<Handshake>,
+    ) {
         if let Err(e) = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) } {
             tracing::debug!(?e, "could not raise the input hook thread's priority");
         }
+
+        // Win32 message queues are created lazily. Force creation BEFORE handshake.
+        let mut msg = MSG::default();
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::PeekMessageW(
+                &mut msg,
+                HWND::default(),
+                0,
+                0,
+                windows::Win32::UI::WindowsAndMessaging::PM_NOREMOVE,
+            );
+        }
+        let thread_id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+
         CONTEXT.with(|context| {
-            *context.borrow_mut() = Some(Context { counter: counter.clone(), filter: InputFilter::default() });
+            *context.borrow_mut() = Some(Context {
+                counter: counter.clone(),
+                filter: InputFilter::default(),
+            });
         });
+
         let started = now_ms();
-        let mut hooks = match install() {
-            Ok(hooks) => {
+        let mut hooks = match install(keyboard, mouse) {
+            Ok(h) => {
                 counter.health.hooks_installed(started);
-                Some(hooks)
+                Some(h)
             }
             Err(e) => {
                 tracing::error!(?e, "could not install the input hooks; activity cannot be measured");
@@ -923,12 +979,22 @@ mod hooks {
                 None
             }
         };
-        let mut watch = Watchdog { last_attempt_ms: started, own_desktop_since_ms: None, pointer: None, pointer_moved_ms: None };
 
-        // A thread timer: WM_TIMER arrives in this thread's queue.
+        let success = hooks.as_ref().is_some_and(|h| h.keyboard.is_some() || h.mouse.is_some() || (!keyboard && !mouse));
+        let _ = ready_tx.send(Handshake { thread_id, success });
+        if !success {
+            return;
+        }
+
+        let mut watch = Watchdog {
+            last_attempt_ms: started,
+            own_desktop_since_ms: None,
+            pointer: None,
+            pointer_moved_ms: None,
+        };
+
         unsafe { SetTimer(HWND::default(), 0, WATCHDOG_EVERY.as_millis() as u32, None) };
         let mut message = MSG::default();
-        // 0 is WM_QUIT, -1 an error.
         while unsafe { GetMessageW(&mut message, HWND::default(), 0, 0) }.0 > 0 {
             if message.message == WM_TIMER {
                 watchdog(&counter, &mut hooks, &mut watch);
@@ -948,13 +1014,30 @@ mod hooks {
         tracing::info!("the input hook thread stopped and unhooked successfully");
     }
 
+    /// Legacy run wrapper for tests.
+    #[allow(dead_code)]
+    pub fn run(counter: Arc<InputCounter>) {
+        let (tx, _) = std::sync::mpsc::channel();
+        run_hooks_thread(counter, true, true, tx);
+    }
+
     /// Windows silently unhooks a hook that times out too often, and a
     /// session change can leave it dead. When Windows has seen input the
     /// hooks did not, reinstall them; when they provably missed the user's
     /// input, capture is reported unavailable until they deliver again.
     fn watchdog(counter: &InputCounter, hooks: &mut Option<Hooks>, watch: &mut Watchdog) {
         if !counter.is_active() {
-            // Disabled when not actively tracking: never operate or reinstall hooks
+            if let Some(old) = hooks.take() {
+                uninstall(old);
+            }
+            return;
+        }
+        let keyboard = counter.is_keyboard_allowed();
+        let mouse = counter.is_mouse_allowed();
+        if !keyboard && !mouse {
+            if let Some(old) = hooks.take() {
+                uninstall(old);
+            }
             return;
         }
         let now = now_ms();
@@ -969,7 +1052,7 @@ mod hooks {
         let last_event = counter.health.last_event_ms();
         let check = WatchdogCheck {
             now_ms: now,
-            installed: hooks.is_some(),
+            installed: hooks.as_ref().is_some_and(|h| h.keyboard.is_some() || h.mouse.is_some()),
             last_hook_event_ms: last_event,
             last_input_ms: super::system_last_input_ms(now),
             own_desktop_since_ms: watch.own_desktop_since_ms,
@@ -985,13 +1068,10 @@ mod hooks {
                 tracing::warn!("the input hooks missed the user's input; reinstalling them");
                 counter.health.mark_unhealthy(last_event);
             } else {
-                // Virtual input (a jiggler) or an elevated window, most
-                // likely; reinstalling is cheap and rules out a dead hook.
                 tracing::debug!("Windows saw input the hooks did not; reinstalling them");
             }
             uninstall(old);
         }
-        // Keys held across the gap may have been released unseen.
         CONTEXT.with(|context| {
             if let Ok(mut context) = context.try_borrow_mut() {
                 if let Some(context) = context.as_mut() {
@@ -999,7 +1079,7 @@ mod hooks {
                 }
             }
         });
-        match install() {
+        match install(keyboard, mouse) {
             Ok(new) => {
                 counter.health.hooks_installed(now);
                 *hooks = Some(new);

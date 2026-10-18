@@ -115,19 +115,19 @@ Every backlog item and verification check in this specification is categorized u
   - *Code:* `clients/windows/src/ui/mod.rs`, `clients/windows/src/tray.rs`.
   - *Evidence Level:* **[Worker-Reported]** (`tray::tests::tracking_view_offers_pause_and_shows_the_project`).
 - **REQ-PRV-02: Windows Sensor Lifecycle Foundation**
-  - *Requirement:* Injectable sensor driver decoupling. Construction (`Tracker::new()`) must NEVER install OS hooks or query foreground windows at startup. OS hooks (`NativeSensorDriver`) and usage samplers start only upon authorized tracking activation, and cleanly detach/stop upon pause, lock, away, workspace loss, sign-out, or quit. Detachment must be synchronous before returning (via `WM_QUIT` and thread join). Hook watchdog must not operate outside active collection. Inactive events drop before health or timing updates (`InputFilter::apply`).
+  - *Requirement:* Injectable sensor driver decoupling. Construction (`Tracker::new()`) must NEVER install OS hooks or query foreground windows at startup. OS hooks (`NativeSensorDriver`) and usage samplers start only upon authorized tracking activation with affirmative local consent, and cleanly detach/stop upon pause, lock, away, workspace loss, sign-out, or quit. Message queue creation handshake (`PeekMessageW`), serial transitions under lock, bounded quit retries, and thread join guarantee synchronous detachment. Denied sensors must not attach handles or mutate health/key timing (`InputFilter::apply`).
   - *Code:* `clients/windows/src/tracking/lifecycle.rs`, `clients/windows/src/tracking/input.rs`, `clients/windows/src/tracking/usage.rs`, `clients/windows/src/worker.rs`.
-  - *Evidence Level:* **[Worker-Reported (Synthetic Driver Verified)]** (73 focused synthetic tests across 6 suites pass exit 0; real native interactive Win32 desktop session hooks remain unverified in QA).
+  - *Evidence Level:* **[PM-Verified @ 8c1b201 for initial decoupling (6 tests)]**, **[Worker-Reported for Step 1C Hardening (89 synthetic tests)]**; native interactive desktop runtime, packaging, and signing remain **[Unverified]**.
 - **REQ-PRV-03: Per-User Local Opt-In & Policy Intersection**
   - *Requirement:* Server policy intersection alone (`ProjectPolicy ∩ LocalConsent`) does NOT constitute local user consent. Captures and sensing occur only if:
     $$\text{Effective} = \text{ProjectPolicy} \cap \text{LocalConsent}$$
-    Configuration defaults (`CapturePermissions`) do NOT constitute explicit consent.
-  - *Code:* `clients/windows/src/worker/session.rs`, `docs/CONSENT_CAPABILITY_AUDIT.md`.
-  - *Evidence Level:* **[Not Implemented / Backlog Gap]** (Policy intersection logic present in source; local interactive opt-in consent UI is missing; defaults cannot substitute for affirmative consent).
+    Configuration defaults (`CapturePermissions`) do NOT constitute explicit consent. Production runtime defaults to `LocalConsent::Absent` and fails closed (all sensors disabled) until an explicit interactive consent UI slice is completed.
+  - *Code:* `clients/windows/src/config.rs`, `clients/windows/src/worker/session.rs`, `docs/CONSENT_CAPABILITY_AUDIT.md`.
+  - *Evidence Level:* **[Worker-Reported (Fail-Closed Backend/Session Integration)]** (Session tests and worker test verify fail-closed behavior on `Absent`/`Revoked`; interactive consent UI slice remains a backlog gap).
 - **REQ-PRV-04: Monotonic Counts Only — No Raw Keystrokes**
   - *Requirement:* Keyboard and mouse inputs are tallied as monotonic integer increments. Keycodes, text characters, clipboard contents, and inter-keystroke timing are discarded.
   - *Code:* `clients/windows/src/tracking/input.rs` (`InputFilter::apply`).
-  - *Evidence Level:* **[Verified by PM @ 18db4d5]** (`tracking::input::tests::inactive_counter_drops_input_events_and_keeps_logs_empty`, `activating_counter_accumulates_events_and_deactivating_halts_collection`).
+  - *Evidence Level:* **[Partial / Source Verified in Filter]**; note: accumulator gating tests prove monotonic count increment and drop behaviors in `InputCounter`, but do NOT prove absence of raw data across serialization, storage, or backend transmission. Full end-to-end audit remains open.
 - **REQ-PRV-05: Truthful Metric Nullability — No Fabricated Zeros**
   - *Requirement:* Denied or unsupported metrics must remain `null` end-to-end (DB, API, frontend), distinguishing measured zero (`0`) from unavailable (`null`).
   - *Code:* `docs/CONSENT_CAPABILITY_AUDIT.md` §4, `backend/.../Activity.cs`.
