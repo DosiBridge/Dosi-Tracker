@@ -145,7 +145,7 @@ impl Default for Facts {
             away: false,
             suspended: false,
             tracking: false,
-            consent: crate::config::LocalConsent::Granted(crate::config::CapturePermissions::default()),
+            consent: crate::config::LocalConsent::Granted(crate::config::ConsentedPermissions::default()),
         }
     }
 }
@@ -247,7 +247,7 @@ mod tests {
     #[test]
     fn the_session_combines_server_and_local_policy() {
         let mut cfg = AppConfig::default();
-        cfg.consent = crate::config::LocalConsent::Granted(CapturePermissions::default());
+        cfg.consent = crate::config::LocalConsent::Granted(CapturePermissions::default().into());
         cfg.capture.webcam = false;
         cfg.capture.blur_screenshots = true;
         let mut source = project("p1");
@@ -265,7 +265,7 @@ mod tests {
         assert!(session.capture_flags().blur_screenshots);
 
         let mut cfg_p2 = AppConfig::default();
-        cfg_p2.consent = crate::config::LocalConsent::Granted(CapturePermissions::default());
+        cfg_p2.consent = crate::config::LocalConsent::Granted(CapturePermissions::default().into());
         let session = session_for(&project("p2"), &cfg_p2);
         assert_eq!(session.idle_threshold_minutes(), Some(5), "the server's default");
     }
@@ -304,7 +304,7 @@ mod tests {
         consent.mouse = false;
         consent.active_window = false;
         consent.screenshot = false;
-        cfg.consent = crate::config::LocalConsent::Granted(consent);
+        cfg.consent = crate::config::LocalConsent::Granted(consent.into());
 
         let session = session_for(&project("p1"), &cfg);
         let perms = &session.policy.perms;

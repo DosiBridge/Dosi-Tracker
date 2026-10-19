@@ -47,7 +47,8 @@ pub enum LocalConsent {
     /// No affirmative consent has been granted by the local user yet.
     Absent,
     /// Explicit affirmative consent granted per capability by the user.
-    Granted(CapturePermissions),
+    /// Invariant: ConsentedPermissions uses strict default-deny schema (omitted fields default to false).
+    Granted(ConsentedPermissions),
     /// Explicitly revoked by the user.
     Revoked,
 }
@@ -58,6 +59,72 @@ impl Default for LocalConsent {
     }
 }
 
+/// Granular permissions consented to by the interactive user on this device.
+///
+/// Invariant: Default is ALWAYS strictly all-false (default-deny).
+/// When deserializing partial JSON (e.g. `{"Granted": {"keyboard": true}}`),
+/// any omitted fields default to `false`. Missing or partial consent NEVER
+/// broadens permissions or falls back to permissive config defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConsentedPermissions {
+    pub screenshot: bool,
+    pub webcam: bool,
+    pub keyboard: bool,
+    pub mouse: bool,
+    pub active_window: bool,
+    pub running_programs: bool,
+    pub blur_screenshots: bool,
+}
+
+impl Default for ConsentedPermissions {
+    fn default() -> Self {
+        Self {
+            screenshot: false,
+            webcam: false,
+            keyboard: false,
+            mouse: false,
+            active_window: false,
+            running_programs: false,
+            blur_screenshots: true,
+        }
+    }
+}
+
+impl ConsentedPermissions {
+    pub fn all_disabled() -> Self {
+        Self::default()
+    }
+}
+
+impl From<CapturePermissions> for ConsentedPermissions {
+    fn from(p: CapturePermissions) -> Self {
+        Self {
+            screenshot: p.screenshot,
+            webcam: p.webcam,
+            keyboard: p.keyboard,
+            mouse: p.mouse,
+            active_window: p.active_window,
+            running_programs: p.running_programs,
+            blur_screenshots: p.blur_screenshots,
+        }
+    }
+}
+
+impl From<ConsentedPermissions> for CapturePermissions {
+    fn from(c: ConsentedPermissions) -> Self {
+        Self {
+            screenshot: c.screenshot,
+            webcam: c.webcam,
+            keyboard: c.keyboard,
+            mouse: c.mouse,
+            active_window: c.active_window,
+            running_programs: c.running_programs,
+            blur_screenshots: c.blur_screenshots,
+        }
+    }
+}
+
 impl LocalConsent {
     pub const FILE_NAME: &str = "consent.json";
 
@@ -65,6 +132,7 @@ impl LocalConsent {
         crate::shell::data_dir().map(|d| d.join(Self::FILE_NAME))
     }
 
+    #[allow(dead_code)]
     pub fn load() -> Self {
         Self::data_path().map(|p| Self::load_from(&p)).unwrap_or(LocalConsent::Absent)
     }
@@ -85,18 +153,15 @@ impl LocalConsent {
         }
     }
 
+    #[allow(dead_code)]
     pub fn save(&self) -> anyhow::Result<()> {
         let path = Self::data_path().ok_or_else(|| anyhow::anyhow!("could not resolve user data directory"))?;
         self.save_to(&path)
     }
 
     pub fn save_to(&self, path: &Path) -> anyhow::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let data = serde_json::to_vec_pretty(self)?;
-        std::fs::write(path, data)?;
-        Ok(())
+        atomic_write_file(path, &data)
     }
 
     pub fn is_granted(&self) -> bool {
@@ -129,6 +194,142 @@ impl LocalConsent {
     }
 }
 
+/// Write data to an ephemeral temporary sibling file and atomically replace `path`.
+///
+/// On Windows, `std::fs::rename` uses `MoveFileExW(..., MOVEFILE_REPLACE_EXISTING)`,
+/// ensuring atomic replacement on the same volume without truncating or leaving
+/// partial bytes in `path` if writing or syncing fails.
+///
+/// If an error occurs during write, sync, or rename, the temporary file is deleted
+/// and the original file at `path` is preserved without modification.
+pub fn atomic_write_file(path: &Path, data: &[u8]) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let temp_name = format!(".tmp-consent-{}.tmp", uuid::Uuid::new_v4());
+    let temp_path = parent.join(temp_name);
+
+    let write_res = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+
+    if let Err(e) = write_res {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(anyhow::anyhow!("failed writing temp consent file: {e}"));
+    }
+
+    if let Err(e) = std::fs::rename(&temp_path, path) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(anyhow::anyhow!("failed atomically replacing consent file: {e}"));
+    }
+
+    Ok(())
+}
+
+/// Abstract storage boundary for LocalConsent persistence.
+/// Ensures tests never touch the real user's consent file and enables fault injection.
+pub trait ConsentStore: Send + Sync {
+    fn load(&self) -> LocalConsent;
+    fn save(&self, consent: &LocalConsent) -> anyhow::Result<()>;
+}
+
+/// Standard production file-based consent store with atomic replacement.
+pub struct FileConsentStore {
+    path: PathBuf,
+}
+
+impl FileConsentStore {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    pub fn production() -> Option<Self> {
+        LocalConsent::data_path().map(Self::new)
+    }
+
+    #[allow(dead_code)]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl ConsentStore for FileConsentStore {
+    fn load(&self) -> LocalConsent {
+        LocalConsent::load_from(&self.path)
+    }
+
+    fn save(&self, consent: &LocalConsent) -> anyhow::Result<()> {
+        consent.save_to(&self.path)
+    }
+}
+
+/// In-memory fake consent store with fault injection for deterministic testing.
+#[allow(dead_code)]
+#[derive(Debug, Default)]
+pub struct MemoryConsentStore {
+    consent: std::sync::Mutex<LocalConsent>,
+    fail_saves: std::sync::atomic::AtomicBool,
+    fail_loads: std::sync::atomic::AtomicBool,
+    save_count: std::sync::atomic::AtomicUsize,
+    load_count: std::sync::atomic::AtomicUsize,
+}
+
+#[allow(dead_code)]
+impl MemoryConsentStore {
+    pub fn new(initial: LocalConsent) -> Self {
+        Self {
+            consent: std::sync::Mutex::new(initial),
+            fail_saves: std::sync::atomic::AtomicBool::new(false),
+            fail_loads: std::sync::atomic::AtomicBool::new(false),
+            save_count: std::sync::atomic::AtomicUsize::new(0),
+            load_count: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    pub fn set_fail_saves(&self, fail: bool) {
+        self.fail_saves.store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn set_fail_loads(&self, fail: bool) {
+        self.fail_loads.store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn save_count(&self) -> usize {
+        self.save_count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn load_count(&self) -> usize {
+        self.load_count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl ConsentStore for MemoryConsentStore {
+    fn load(&self) -> LocalConsent {
+        self.load_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail_loads.load(std::sync::atomic::Ordering::SeqCst) {
+            return LocalConsent::Absent;
+        }
+        *self.consent.lock().unwrap()
+    }
+
+    fn save(&self, consent: &LocalConsent) -> anyhow::Result<()> {
+        self.save_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail_saves.load(std::sync::atomic::Ordering::SeqCst) {
+            anyhow::bail!("simulated consent disk persistence failure (fault injection)");
+        }
+        *self.consent.lock().unwrap() = *consent;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CapturePermissions {
@@ -146,6 +347,7 @@ pub struct CapturePermissions {
 
 impl CapturePermissions {
     /// Default-off configuration for initial explicit consent presentation.
+    #[allow(dead_code)]
     pub fn all_disabled() -> Self {
         Self {
             screenshot: false,
@@ -266,11 +468,9 @@ impl AppConfig {
         }
         let builder =
             builder.add_source(config::Environment::with_prefix("DOSI").separator("__"));
-        let mut app_config = Self::from_config(builder.build()?);
-        let persisted_consent = LocalConsent::load();
-        if persisted_consent != LocalConsent::Absent {
-            app_config.consent = persisted_consent;
-        }
+        let app_config = Self::from_config(builder.build()?);
+        // Local consent persistence is managed independently via `ConsentStore` in `Worker`
+        // to guarantee strict test isolation and failure-aware atomic transactions.
         Ok(app_config)
     }
 
@@ -454,4 +654,112 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn consent_partial_json_deserialization_default_deny() {
+        // Serde deserialization of partial JSON must default ALL omitted capabilities to false (default-deny).
+        // It must NOT broaden permissions or reuse permissive config defaults.
+        let json_partial = r#"{"Granted": {"keyboard": true}}"#;
+        let parsed: LocalConsent = serde_json::from_str(json_partial).expect("partial consent should parse");
+        match parsed {
+            LocalConsent::Granted(c) => {
+                assert!(c.keyboard, "keyboard was explicitly granted");
+                assert!(!c.mouse, "mouse omitted in json must default to false");
+                assert!(!c.screenshot, "screenshot omitted in json must default to false");
+                assert!(!c.webcam, "webcam omitted in json must default to false");
+                assert!(!c.active_window, "active_window omitted in json must default to false");
+                assert!(!c.running_programs, "running_programs omitted in json must default to false");
+                assert!(c.blur_screenshots, "blur_screenshots defaults to true for defense-in-depth");
+            }
+            other => panic!("expected Granted, got {other:?}"),
+        }
+
+        // Empty Granted object defaults everything to false
+        let json_empty_grant = r#"{"Granted": {}}"#;
+        let parsed: LocalConsent = serde_json::from_str(json_empty_grant).expect("empty grant should parse");
+        match parsed {
+            LocalConsent::Granted(c) => {
+                assert!(!c.keyboard);
+                assert!(!c.mouse);
+                assert!(!c.screenshot);
+                assert!(!c.webcam);
+                assert!(!c.active_window);
+                assert!(!c.running_programs);
+                assert!(c.blur_screenshots);
+            }
+            other => panic!("expected Granted, got {other:?}"),
+        }
+
+        // Explicit Absent
+        let json_absent = r#""Absent""#;
+        assert_eq!(serde_json::from_str::<LocalConsent>(json_absent).unwrap(), LocalConsent::Absent);
+
+        // Explicit Revoked
+        let json_revoked = r#""Revoked""#;
+        assert_eq!(serde_json::from_str::<LocalConsent>(json_revoked).unwrap(), LocalConsent::Revoked);
+
+        // Invalid JSON fails closed to error on parse
+        assert!(serde_json::from_str::<LocalConsent>(r#"{"Granted": 12345}"#).is_err());
+    }
+
+    #[test]
+    fn consent_atomic_file_replacement_and_durability() {
+        let dir = std::env::temp_dir().join(format!("dosi-test-atomic-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("consent.json");
+
+        // Write initial data
+        let initial_consent = LocalConsent::Granted(ConsentedPermissions {
+            keyboard: true,
+            mouse: false,
+            screenshot: false,
+            webcam: false,
+            active_window: false,
+            running_programs: false,
+            blur_screenshots: true,
+        });
+        initial_consent.save_to(&path).expect("initial atomic write must succeed");
+        assert_eq!(LocalConsent::load_from(&path), initial_consent);
+
+        // Atomic replacement with updated data
+        let updated_consent = LocalConsent::Revoked;
+        updated_consent.save_to(&path).expect("atomic replacement must succeed");
+        assert_eq!(LocalConsent::load_from(&path), updated_consent);
+
+        // Ensure no sibling temp files were left behind
+        let read_dir = std::fs::read_dir(&dir).expect("directory must be readable");
+        let entries: Vec<_> = read_dir.filter_map(Result::ok).collect();
+        assert_eq!(entries.len(), 1, "only the target file must exist; temp file removed");
+        assert_eq!(entries[0].file_name(), "consent.json");
+
+        // Attempting to write to an invalid path fails gracefully and leaves original untouched
+        let bad_path = path.join("subfile.json"); // path is a file, cannot be parent
+        let fail_res = LocalConsent::Absent.save_to(&bad_path);
+        assert!(fail_res.is_err(), "write to bad path must fail");
+        assert_eq!(LocalConsent::load_from(&path), updated_consent, "prior data preserved on failure");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn memory_consent_store_fault_injection() {
+        let store = MemoryConsentStore::new(LocalConsent::Absent);
+        assert_eq!(store.load(), LocalConsent::Absent);
+        assert_eq!(store.load_count(), 1);
+        assert_eq!(store.save_count(), 0);
+
+        // Save succeeds
+        let grant = LocalConsent::Granted(ConsentedPermissions::default());
+        store.save(&grant).expect("save should succeed");
+        assert_eq!(store.save_count(), 1);
+        assert_eq!(store.load(), grant);
+
+        // Fault injection: simulate disk write failure
+        store.set_fail_saves(true);
+        let fail_res = store.save(&LocalConsent::Revoked);
+        assert!(fail_res.is_err(), "simulated failure must return Err");
+        assert_eq!(store.save_count(), 2);
+        // Original grant in store is preserved
+        assert_eq!(store.load(), grant);
+    }
 }
+

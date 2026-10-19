@@ -114,49 +114,53 @@ This correction introduces an injectable sensor driver foundation without archit
 
 ---
 
-### B. Current Bounded Phase: Windows Explicit Local-Consent UX and Lifecycle Integration
+### B. PM Independent Review at Clean HEAD `fb80245ceb5cd6500e2f602f22c0a27a10be8095`
 
-This phase implements the complete Windows local-consent UX slice and worker lifecycle boundary, satisfying privacy prerequisites:
-1. **Clear Disclosure & Granular Opt-In (`clients/windows/src/ui/consent.rs` & `clients/windows/src/ui/settings.rs`)**:
-   - Explicit disclosure of what is collected and what is **NEVER collected** (raw keystrokes, typed text, clipboard, microphone, personal files).
-   - Granular opt-in toggles for:
-     - Keyboard & mouse input COUNTS
-     - Active application & window title context
-     - Periodic screenshots (+ local blurring)
-     - Webcam photos
-   - Default-off: upon fresh launch or revoked consent, all capability checkboxes default to unchecked (`false`).
-   - Pure, headless view model (`ConsentViewModel`) isolated for automated unit testing (`ui::consent::tests`).
-   - Interactive GUI verification in live Win32 display session was **NOT run in automation** and is explicitly reported as unverified.
-2. **Fail-Closed Persistence (`clients/windows/src/config.rs`)**:
-   - Persisted separately in `%APPDATA%\DosiTracker\consent.json` without modifying DPAPI credentials or `config.toml`, avoiding any secrets risk or authentication migration hazards.
-   - Missing or corrupted file fails closed to `LocalConsent::Absent`. No silent opt-in migration for existing installs.
-3. **Strict Policy Intersection (`Effective = ProjectPolicy ∩ LocalConsent`)**:
-   - Workspace policy can restrict but can never broaden user consent.
-   - If user denies or revokes a capability, sensor driver never starts even if permitted by workspace admin.
-   - Decline or revoke immediately terminates in-flight blocks and stops sensor drivers before acknowledgment/publishing.
-4. **Lifecycle & Transition Invariants (`clients/windows/src/worker.rs`)**:
-   - Opening settings, selecting a project/workspace, logging in, or restoring config does NOT start tracking.
-   - Truthful pause/resume: revoking consent while paused prevents resumption; system lock stops sensors, and revoking during lock prevents resumption upon unlock.
-   - Zero duplicate thread starts on repeated redundant commands.
+**Supervisory Determination:** PM INDEPENDENT SOURCE REVIEW FAILED — CORRECTION REQUIRED, NOT PHASE ACCEPTANCE.
+The claim that the consent prerequisite was complete was rejected. Four concrete source defects were identified:
+1. `clients/windows/src/config.rs`: `LocalConsent::Granted(CapturePermissions)` reused `CapturePermissions` which carries `#[serde(default)]` with historically permissive config defaults (`screenshot: true`, `keyboard: true`, `mouse: true`, etc.). Deserializing a partial Granted JSON payload silently broadened permissions and granted omitted sensors.
+2. `clients/windows/src/config.rs`: `LocalConsent::save_to` directly called `std::fs::write(path, data)`, risking partial writes or file corruption on failure and contradicting atomic durability.
+3. `clients/windows/src/worker.rs`: `update_consent` assigned the grant then ignored `let _ = self.cfg.consent.save()`. Write failure could start sensors without persistence or leave an old grant on disk after user revocation without surfacing errors.
+4. `clients/windows/src/worker/tests.rs`: Worker consent test commands called the production persistence handler, risking touching or corrupting the real user's `%APPDATA%\DosiTracker\consent.json`.
 
 ---
 
-### C. Worker-Reported Test Execution (Current Working Tree)
+### C. Corrective Implementation (Privacy Schema, Durability & Isolation)
 
-All tests executed with `RUST_BACKTRACE=1` in `clients/windows`. Synthetic QA only; no real Win32 input hooks, foreground window enumeration, desktop collection, screen capture, or webcam capture were invoked during execution.
+1. **Consent-Specific Default-Deny Schema (`ConsentedPermissions`)**:
+   - Greenfield `ConsentedPermissions` struct where `Default` strictly enforces all-false permissions (`screenshot: false, webcam: false, keyboard: false, mouse: false, active_window: false, running_programs: false, blur_screenshots: true`).
+   - `LocalConsent::Granted(ConsentedPermissions)` ensures partial JSON deserialization (e.g. `{"Granted": {"keyboard": true}}`) strictly defaults all omitted capabilities to `false`.
+   - Global config and server defaults in `CapturePermissions` remain untouched, preserving server/config compatibility.
+2. **Failure-Aware Atomic Replacement (`atomic_write_file`)**:
+   - Writes to a sibling ephemeral file (`.tmp-consent-<uuid>.tmp`) in the same directory, flushes data to disk via `file.sync_all()`, and executes atomic file replacement via `std::fs::rename` (Win32 `MoveFileExW(..., MOVEFILE_REPLACE_EXISTING)` semantics).
+   - If writing, syncing, or renaming fails, the temp file is removed and the prior valid file is preserved without corruption.
+   - *Durability limits documented honestly:* Atomic replacement guarantees all-or-nothing file replacement and crash consistency on standard Windows NTFS volumes; catastrophic sudden power-loss before hardware write-cache flushing or external antivirus filesystem lockouts can still cause I/O failures, which are surfaced to the user.
+3. **Safe Worker State Machine & Actionable Error Reporting**:
+   - `update_consent` enforces safe transitions:
+     - **Granting:** Consent is saved to disk *first*. If persistence fails, the grant is rejected, sensors are NOT started, and an actionable error (`consent_error`) and `consent_unsynced: true` are surfaced.
+     - **Revoking:** Sensors are immediately stopped in memory (`apply_sensor_policy(false, None)` and `reconcile(now, EndReason::Pause)`) before/regardless of disk save result. If disk save fails, the user is notified that revocation is active in-memory but non-durable on disk across restart, and `!self.consent_unsynced` in `should_track()` strictly prevents unintended tracking resumption.
+   - UI (`clients/windows/src/ui/settings.rs`) displays prominent critical alert banners when `consent_error` is set or `consent_unsynced` is true.
+4. **Injected Storage Boundary (`ConsentStore`)**:
+   - Introduced `ConsentStore: Send + Sync` trait with `FileConsentStore` (production) and `MemoryConsentStore` (in-memory fake with atomic counters and fault injection `set_fail_saves(bool)`).
+   - Decoupled `AppConfig::load()` from direct on-disk consent reading.
+   - `Worker::new` accepts injected `Arc<dyn ConsentStore>`. All synthetic test harnesses (`Harness::new`, `harness_at`, `harness_with_consent`) strictly inject `MemoryConsentStore`.
+   - Proved 100% test isolation: synthetic tests never access real `%APPDATA%\DosiTracker\consent.json`.
+
+---
+
+### D. Worker-Reported Test Execution (Current Working Tree)
+
+All tests executed in `clients/windows` with `RUST_BACKTRACE=1`. Synthetic QA only; no real Win32 input hooks, foreground window enumeration, desktop collection, screen capture, or webcam capture were invoked during execution.
 
 | Target Suite | Exact Command Line | Tests Passed | Ignored | Time | Exit Code | Evidence Level |
 |---|---|:---:|:---:|:---:|:---:|:---:|
-| **Compilation Gate** | `cargo check --bin dosi-tracker` | N/A | 0 errors, 0 warnings | 1.58s | **0** | **[Worker-Reported]** |
-| **UI Consent View Model** | `cargo test --bin dosi-tracker ui::consent::tests` | 6 | 0 | 0.00s | **0** | **[Worker-Reported]** |
-| **All Consent Tests (UI+Worker)** | `cargo test --bin dosi-tracker consent` | 21 | 0 | 0.02s | **0** | **[Worker-Reported]** |
+| **Compilation Gate** | `cargo check --bin dosi-tracker` | N/A | 0 errors, 0 warnings | 1.61s | **0** | **[Worker-Reported]** |
+| **Config & Atomic Persistence** | `cargo test --bin dosi-tracker config::tests` | 14 | 0 | 0.03s | **0** | **[Worker-Reported]** |
+| **All Consent Tests (UI+Worker)** | `cargo test --bin dosi-tracker consent` | 28 | 0 | 0.02s | **0** | **[Worker-Reported]** |
 | **Tracking Lifecycle Suite** | `cargo test --bin dosi-tracker tracking::lifecycle::tests` | 11 | 0 | 0.10s | **0** | **[Worker-Reported]** |
 | **Worker Session Suite** | `cargo test --bin dosi-tracker worker::session::tests` | 10 | 0 | 0.00s | **0** | **[Worker-Reported]** |
-| **UI Settings Privacy Tests** | `cargo test --bin dosi-tracker ui::settings::tests` | 2 | 0 | 0.00s | **0** | **[Worker-Reported]** |
-| **Input Counter & Filter** | `cargo test --bin dosi-tracker tracking::input::tests` | 35 | 1 | 0.01s | **0** | **[Worker-Reported]** |
-| **Usage Recorder Suite** | `cargo test --bin dosi-tracker tracking::usage::tests` | 16 | 0 | 0.00s | **0** | **[Worker-Reported]** |
 
-#### Detailed 11-Scenario Consent Lifecycle Test Matrix (`worker::tests::consent_*`)
+#### Detailed 15-Scenario Consent Lifecycle Test Matrix (`worker::tests::consent_*`)
 1. `consent_1_fresh_config_absent`: Fresh config with `LocalConsent::Absent` yields `TrackerStatus::ConsentRequired`, 0 sensor starts, 0 running drivers.
 2. `consent_2_legacy_config_absent`: Deserializing legacy empty JSON defaults to `LocalConsent::Absent`; missing `consent.json` fails closed to `Absent`.
 3. `consent_3_explicit_granular_grant`: Granting keyboard-only attaches input hooks for keyboard without mouse or active window samplers.
@@ -164,15 +168,14 @@ All tests executed with `RUST_BACKTRACE=1` in `clients/windows`. Synthetic QA on
 5. `consent_5_revoke_while_active`: Revoking while actively tracking immediately terminates in-flight blocks and detaches sensors before acknowledge.
 6. `consent_6_policy_narrowing`: User unchecking capability stops sampler; workspace policy disallowing keyboard/mouse stops input hooks immediately.
 7. `consent_7_project_workspace_logout_transition`: Sign-out stops sensors; signing in when consent is revoked does not auto-start tracking.
-8. `consent_8_persisted_explicit_choice`: Exact granular choices round-trip to disk with full fidelity via `save_to` and `load_from`.
+8. `consent_8_persisted_explicit_choice`: Exact granular choices round-trip to disk with full fidelity via atomic replacement.
 9. `consent_9_corrupted_config_fail_closed`: Empty file, malformed JSON, and schema corruptions in `consent.json` fail closed to `LocalConsent::Absent`.
 10. `consent_10_pause_resume_quit`: Truthful pause/resume; revoking while paused prevents resume; revoking during lock prevents resume on unlock.
 11. `consent_11_no_duplicate_thread_start_on_repeated_user_actions`: Repeated consent grants, resumes, and project picks never duplicate threads.
-
-*Critical Evidentiary Notes:*
-1. **Interactive UI Verification:** The interactive native egui window rendering and user clicking were **not tested via automated UI driver**; testing was conducted on the pure view model (`ConsentViewModel`) and controller (`Worker`). Interactive verification is reported as **[Not Run / Unverified]**. Do not invent UI automation evidence.
-2. **Raw Keystroke Boundary:** Monotonic count increment and drop behaviors are verified in `InputCounter`, but end-to-end proof across backend transmission remains open.
-3. *Ignored Test:* `tracking::input::tests::the_real_hooks_report_injected_input_as_injected` is marked `#[ignore]` in source to avoid installing live Win32 hooks or moving the cursor during test runs.
+12. `consent_12_grant_persistence_failure_blocks_sensors_and_reports_error`: Fault injection on grant save keeps sensors stopped (0 starts), sets `consent_error` and `consent_unsynced: true`.
+13. `consent_13_revoke_persistence_failure_stops_sensors_and_reports_non_durable`: Fault injection on revoke immediately stops sensors in memory, reports non-durable persistence error honestly, and blocks resume.
+14. `consent_14_fake_worker_isolation_proves_no_disk_access`: Proves all test harnesses use `MemoryConsentStore`, verifying save count increments in memory without touching filesystem.
+15. `consent_15_partial_grant_omitted_capabilities_strictly_default_deny`: Deserializing partial grant `{"Granted": {"mouse": true}}` enables mouse only while keyboard, active window, and screenshot remain strictly denied.
 
 ---
 
@@ -180,10 +183,10 @@ All tests executed with `RUST_BACKTRACE=1` in `clients/windows`. Synthetic QA on
 
 | Evidence Dimension | Windows (Rust) | macOS (Swift) | Linux (Target) |
 |---|---|---|---|
-| **1. Implemented Source** | ⚠️ Source present (`clients/windows`: egui UI, Win32 hooks, xcap, DPAPI, SQLite queue); explicit local consent UX & view model implemented; native interactive hooks, packaging, and signing open | ⚠️ Source present (`clients/macos`: SwiftUI, ScreenCaptureKit, Keychain, SQLite queue); source presence is NOT proof of complete implementation; TCC consent, runtime execution, packaging, and notarization open | ❌ **Unresolved Gap** (`clients/linux` crate not yet created) |
-| **2. Synthetic / Mock Unit Tests** | ✅ Complete (**102 focused synthetic tests passing**, 0 warnings) | ⚠️ Unverified locally (Swift test files present in source; not executed locally) | ❌ 0 tests (No crate) |
+| **1. Implemented Source** | ⚠️ Corrective source present (`clients/windows`: egui UI, Win32 hooks, xcap, DPAPI, SQLite queue, `ConsentedPermissions`, `ConsentStore`, `atomic_write_file`); native interactive hooks, packaging, and signing open | ⚠️ Source present (`clients/macos`: SwiftUI, ScreenCaptureKit, Keychain, SQLite queue); source presence is NOT proof of complete implementation; TCC consent, runtime execution, packaging, and notarization open | ❌ **Unresolved Gap** (`clients/linux` crate not yet created) |
+| **2. Synthetic / Mock Unit Tests** | ⚠️ **Worker-Reported Only** (28 consent tests, 11 lifecycle tests, 10 session tests, 14 config tests passing locally; awaiting PM independent review) | ⚠️ Unverified locally (Swift test files present in source; not executed locally) | ❌ 0 tests (No crate) |
 | **3. Toolchain / Compile / Build** | ✅ Verified locally (Rustc / Cargo 1.97.1 on Windows 11 host) | ❌ Unverified locally (Host lacks macOS toolchain / Xcode) | ❌ Unverified locally (Host lacks Linux build container / environment) |
-| **4. Native Interactive Runtime** | ⚠️ **Unverified** (Unit tests run synthetically via `FakeSensorDriver`, `ConsentViewModel`, and platform-neutral lifecycle mock; interactive Win32 desktop hooks unverified in QA) | ⚠️ **Outstanding** (Requires physical macOS execution environment) | ❌ **Outstanding** (Requires Linux X11/Wayland execution environment) |
+| **4. Native Interactive Runtime** | ⚠️ **Unverified** (Unit tests run synthetically via `FakeSensorDriver`, `MemoryConsentStore`, `ConsentViewModel`; interactive Win32 desktop hooks unverified in QA) | ⚠️ **Outstanding** (Requires physical macOS execution environment) | ❌ **Outstanding** (Requires Linux X11/Wayland execution environment) |
 | **5. Packaging / Install / Uninstall** | ⚠️ Partial (NSIS `.nsi` script present; silent install/uninstall unverified in CI) | ⚠️ Partial (`build-app.sh` creates bundle; DMG packaging unverified) | ❌ **Unresolved Gap** (No `.deb`, AppImage, or Flatpak manifest) |
 | **6. Code Signing & Notarization** | ⚠️ **Outstanding Prerequisite** (Unsigned; Authenticode cert required; signing does not guarantee immediate SmartScreen elimination; SmartScreen must not be bypassed) | ⚠️ **Outstanding Prerequisite** (Unsigned; Apple Developer ID & Notarization required) | ⚠️ **Outstanding Prerequisite** (GPG package signing required) |
 
@@ -192,8 +195,10 @@ All tests executed with `RUST_BACKTRACE=1` in `clients/windows`. Synthetic QA on
 ## 5. Next Steps
 
 1. **Awaiting PM Independent Review**:
-   - PM independently executes selected synthetic tests to verify the local consent UX and lifecycle integration slice.
-2. **Subsequent Phasing (Strictly Awaiting Authorization)**:
+   - PM independently executes selected synthetic tests to verify the corrective implementation slice (`config::tests`, `consent` tests, `tracking::lifecycle::tests`, `worker::session::tests`).
+2. **Subsequent Phasing (Strictly Awaiting PM Authorization)**:
    - Backend schema nullability migration (`Activity.cs` metric nullability) and cross-workspace tenant isolation tests remain deferred until PM authorization.
+   - Do NOT proceed to metric migrations or mark this phase passed until PM independently accepts.
+
 
 

@@ -10,7 +10,7 @@ use eframe::egui;
 use egui::{Align, CornerRadius, Layout, Rect, Sense, Stroke, Vec2};
 
 use super::widgets::{self, ButtonKind, Icon, Tone};
-use crate::config::{CapturePermissions, LocalConsent};
+use crate::config::{ConsentedPermissions, LocalConsent};
 use crate::theme;
 
 /// Effective capability status combining workspace policy and local consent.
@@ -50,7 +50,7 @@ impl CapabilityStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsentViewModel {
     pub current: LocalConsent,
-    pub draft: CapturePermissions,
+    pub draft: ConsentedPermissions,
 }
 
 impl ConsentViewModel {
@@ -58,8 +58,8 @@ impl ConsentViewModel {
     /// Invariant: when consent is Absent or Revoked, draft starts with all permissions OFF.
     pub fn new(current: LocalConsent) -> Self {
         let draft = match &current {
-            LocalConsent::Granted(p) => p.clone(),
-            LocalConsent::Absent | LocalConsent::Revoked => CapturePermissions::all_disabled(),
+            LocalConsent::Granted(p) => *p,
+            LocalConsent::Absent | LocalConsent::Revoked => ConsentedPermissions::all_disabled(),
         };
         Self { current, draft }
     }
@@ -103,21 +103,21 @@ impl ConsentViewModel {
 
     /// Grant consent using current draft toggles.
     pub fn grant(&mut self) -> LocalConsent {
-        let consent = LocalConsent::Granted(self.draft.clone());
+        let consent = LocalConsent::Granted(self.draft);
         self.current = consent.clone();
         consent
     }
 
     /// Explicitly decline consent.
     pub fn decline(&mut self) -> LocalConsent {
-        self.draft = CapturePermissions::all_disabled();
+        self.draft = ConsentedPermissions::all_disabled();
         self.current = LocalConsent::Revoked;
         LocalConsent::Revoked
     }
 
     /// Explicitly revoke previously granted consent.
     pub fn revoke(&mut self) -> LocalConsent {
-        self.draft = CapturePermissions::all_disabled();
+        self.draft = ConsentedPermissions::all_disabled();
         self.current = LocalConsent::Revoked;
         LocalConsent::Revoked
     }
@@ -299,7 +299,7 @@ mod tests {
 
     #[test]
     fn revoke_clears_active_grant() {
-        let mut initial = CapturePermissions::all_disabled();
+        let mut initial = ConsentedPermissions::all_disabled();
         initial.keyboard = true;
         let mut model = ConsentViewModel::new(LocalConsent::Granted(initial));
         assert!(model.is_granted());

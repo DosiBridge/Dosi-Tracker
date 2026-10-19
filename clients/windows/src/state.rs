@@ -364,6 +364,10 @@ pub struct SharedState {
     pub notices: Vec<Notice>,
     /// Current affirmative local user consent state.
     pub consent: crate::config::LocalConsent,
+    /// Persistence error from saving consent to disk (if any).
+    pub consent_error: Option<String>,
+    /// Whether in-memory consent differs from on-disk consent due to a write failure.
+    pub consent_unsynced: bool,
 }
 
 impl Default for SharedState {
@@ -411,6 +415,8 @@ impl Default for SharedState {
             workspace_lost: None,
             notices: Vec::new(),
             consent: crate::config::LocalConsent::Absent,
+            consent_error: None,
+            consent_unsynced: false,
         }
     }
 }

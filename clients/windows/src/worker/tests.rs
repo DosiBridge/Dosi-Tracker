@@ -4,7 +4,7 @@ use chrono::FixedOffset;
 
 use super::control::Farewell;
 use super::*;
-use crate::config::LocalConsent;
+use crate::config::{ConsentedPermissions, LocalConsent, MemoryConsentStore};
 use crate::tracking::{build_activity, Measurements, Zone};
 
 fn utc(s: &str) -> DateTime<Utc> {
@@ -416,6 +416,7 @@ struct Harness {
     farewells: UnboundedReceiver<Farewell>,
     uploads: UnboundedReceiver<UploadCommand>,
     state: StateHandle,
+    consent_store: Arc<MemoryConsentStore>,
 }
 
 fn harness_at(start: DateTime<Utc>, saved: Option<Credentials>, autostart: bool, credentials_file: Option<PathBuf>) -> Harness {
@@ -424,8 +425,10 @@ fn harness_at(start: DateTime<Utc>, saved: Option<Credentials>, autostart: bool,
     let (control, control_rx, farewells) = ControlLink::detached();
     let (uploader, uploads) = UploaderHandle::detached();
     let store = Storage::open(":memory:", None).unwrap();
+    let consent = crate::config::LocalConsent::Granted(CapturePermissions::default().into());
+    let consent_store = Arc::new(MemoryConsentStore::new(consent));
     let mut cfg = AppConfig::default();
-    cfg.consent = crate::config::LocalConsent::Granted(CapturePermissions::default());
+    cfg.consent = consent;
     let mut worker = Worker::new(
         state.clone(),
         cfg,
@@ -437,10 +440,11 @@ fn harness_at(start: DateTime<Utc>, saved: Option<Credentials>, autostart: bool,
         control,
         uploader,
         credentials_file,
+        consent_store.clone(),
     );
     worker.start(saved, None);
     worker.publish();
-    Harness { worker, machine, control: control_rx, farewells, uploads, state }
+    Harness { worker, machine, control: control_rx, farewells, uploads, state, consent_store }
 }
 
 fn harness_with_consent(start: DateTime<Utc>, saved: Option<Credentials>, consent: LocalConsent) -> Harness {
@@ -449,6 +453,7 @@ fn harness_with_consent(start: DateTime<Utc>, saved: Option<Credentials>, consen
     let (control, control_rx, farewells) = ControlLink::detached();
     let (uploader, uploads) = UploaderHandle::detached();
     let store = Storage::open(":memory:", None).unwrap();
+    let consent_store = Arc::new(MemoryConsentStore::new(consent));
     let mut cfg = AppConfig::default();
     cfg.consent = consent;
     let mut worker = Worker::new(
@@ -462,10 +467,11 @@ fn harness_with_consent(start: DateTime<Utc>, saved: Option<Credentials>, consen
         control,
         uploader,
         None,
+        consent_store.clone(),
     );
     worker.start(saved, None);
     worker.publish();
-    Harness { worker, machine, control: control_rx, farewells, uploads, state }
+    Harness { worker, machine, control: control_rx, farewells, uploads, state, consent_store }
 }
 
 /// Signed in and tracking "p1" (idle after 5 min) since 10:00.
@@ -1661,6 +1667,7 @@ fn worker_fails_closed_when_consent_is_absent() {
     let (uploader, _) = UploaderHandle::detached();
     let store = Storage::open(":memory:", None).unwrap();
     let cfg = AppConfig::default(); // consent: LocalConsent::Absent
+    let consent_store = Arc::new(MemoryConsentStore::new(LocalConsent::Absent));
     let mut worker = Worker::new(
         state,
         cfg,
@@ -1672,6 +1679,7 @@ fn worker_fails_closed_when_consent_is_absent() {
         control,
         uploader,
         None,
+        consent_store,
     );
     worker.start(Some(saved(vec![project("p1", 5)], None)), None);
     worker.publish();
@@ -1780,7 +1788,7 @@ fn consent_3_explicit_granular_grant() {
     assert_eq!(h.status(), TrackerStatus::ConsentRequired);
     assert_eq!(h.machine.input_starts(), 0);
 
-    let granular = CapturePermissions {
+    let granular = ConsentedPermissions {
         keyboard: true,
         mouse: false,
         active_window: false,
@@ -1820,7 +1828,7 @@ fn consent_5_revoke_while_active() {
     let mut h = harness_with_consent(
         at("10:00:00"),
         Some(saved(vec![project("p1", 5)], Some("p1"))),
-        LocalConsent::Granted(CapturePermissions::default()),
+        LocalConsent::Granted(CapturePermissions::default().into()),
     );
     assert_eq!(h.status(), TrackerStatus::Tracking);
     assert!(h.machine.is_input_running());
@@ -1840,14 +1848,14 @@ fn consent_6_policy_narrowing() {
     let mut h = harness_with_consent(
         at("10:00:00"),
         Some(saved(vec![project("p1", 5)], Some("p1"))),
-        LocalConsent::Granted(CapturePermissions::default()),
+        LocalConsent::Granted(CapturePermissions::default().into()),
     );
     assert_eq!(h.status(), TrackerStatus::Tracking);
     assert!(h.machine.is_input_running());
     assert!(h.machine.is_usage_running());
 
     // Narrowing by user consent (uncheck active_window)
-    let mut user_narrowed = CapturePermissions::default();
+    let mut user_narrowed: ConsentedPermissions = CapturePermissions::default().into();
     user_narrowed.active_window = false;
     h.command(at("10:01:00"), Command::UpdateConsent { consent: LocalConsent::Granted(user_narrowed) });
     assert_eq!(h.status(), TrackerStatus::Tracking);
@@ -1874,7 +1882,7 @@ fn consent_7_project_workspace_logout_transition() {
     let mut h = harness_with_consent(
         at("10:00:00"),
         Some(saved(vec![project("p1", 5), project("p2", 5)], Some("p1"))),
-        LocalConsent::Granted(CapturePermissions::default()),
+        LocalConsent::Granted(CapturePermissions::default().into()),
     );
     assert_eq!(h.status(), TrackerStatus::Tracking);
     assert!(h.machine.is_tracking_active());
@@ -1903,7 +1911,7 @@ fn consent_8_persisted_explicit_choice() {
     let dir = std::env::temp_dir().join(format!("dosi-test-consent-{}", uuid::Uuid::new_v4()));
     let path = dir.join("consent.json");
 
-    let grant = LocalConsent::Granted(CapturePermissions {
+    let grant = LocalConsent::Granted(ConsentedPermissions {
         screenshot: true,
         webcam: false,
         keyboard: true,
@@ -1946,7 +1954,7 @@ fn consent_10_pause_resume_quit() {
     let mut h = harness_with_consent(
         at("10:00:00"),
         Some(saved(vec![project("p1", 5)], Some("p1"))),
-        LocalConsent::Granted(CapturePermissions::default()),
+        LocalConsent::Granted(CapturePermissions::default().into()),
     );
     assert_eq!(h.status(), TrackerStatus::Tracking);
     assert!(h.machine.is_tracking_active());
@@ -1966,7 +1974,7 @@ fn consent_10_pause_resume_quit() {
     assert!(!h.machine.is_tracking_active());
 
     // Re-grant and resume
-    h.command(at("10:03:30"), Command::UpdateConsent { consent: LocalConsent::Granted(CapturePermissions::default()) });
+    h.command(at("10:03:30"), Command::UpdateConsent { consent: LocalConsent::Granted(CapturePermissions::default().into()) });
     assert_eq!(h.status(), TrackerStatus::Tracking);
     assert!(h.machine.is_tracking_active());
 
@@ -1987,7 +1995,7 @@ fn consent_11_no_duplicate_thread_start_on_repeated_user_actions() {
     let mut h = harness_with_consent(
         at("10:00:00"),
         Some(saved(vec![project("p1", 5)], Some("p1"))),
-        LocalConsent::Granted(CapturePermissions::default()),
+        LocalConsent::Granted(CapturePermissions::default().into()),
     );
     assert_eq!(h.status(), TrackerStatus::Tracking);
     let initial_input_starts = h.machine.input_starts();
@@ -1997,7 +2005,7 @@ fn consent_11_no_duplicate_thread_start_on_repeated_user_actions() {
     for i in 1..=5 {
         h.command(
             at(&format!("10:01:{:02}", i)),
-            Command::UpdateConsent { consent: LocalConsent::Granted(CapturePermissions::default()) },
+            Command::UpdateConsent { consent: LocalConsent::Granted(CapturePermissions::default().into()) },
         );
     }
     assert_eq!(h.machine.input_starts(), initial_input_starts, "no duplicate input starts on repeated grant");
@@ -2013,4 +2021,124 @@ fn consent_11_no_duplicate_thread_start_on_repeated_user_actions() {
     }
     assert_eq!(h.machine.input_starts(), initial_input_starts, "repeated redundant commands do not duplicate threads");
     assert_eq!(h.machine.usage_starts(), initial_usage_starts);
+}
+
+#[test]
+fn consent_12_grant_persistence_failure_blocks_sensors_and_reports_error() {
+    let mut h = harness_with_consent(
+        at("10:00:00"),
+        Some(saved(vec![project("p1", 5)], Some("p1"))),
+        LocalConsent::Absent,
+    );
+    assert_eq!(h.status(), TrackerStatus::ConsentRequired);
+    assert!(!h.machine.is_tracking_active());
+
+    // Inject disk write fault
+    h.consent_store.set_fail_saves(true);
+
+    let grant = ConsentedPermissions {
+        keyboard: true,
+        mouse: true,
+        screenshot: false,
+        webcam: false,
+        active_window: false,
+        running_programs: false,
+        blur_screenshots: true,
+    };
+    h.command(at("10:00:30"), Command::UpdateConsent { consent: LocalConsent::Granted(grant) });
+
+    // Invariant: granting must not start sensors until safely accepted/persisted!
+    assert_eq!(h.status(), TrackerStatus::ConsentRequired);
+    assert!(!h.machine.is_tracking_active(), "sensors must NOT start on persistence failure");
+    assert!(!h.machine.is_input_running(), "input hooks must NOT start");
+    assert!(!h.machine.is_usage_running(), "usage sampler must NOT start");
+    assert_eq!(h.machine.input_starts(), 0);
+    assert_eq!(h.machine.usage_starts(), 0);
+
+    // Error state surfaced actionably
+    let snapshot = h.state.snapshot();
+    assert!(snapshot.consent_error.is_some(), "persistence error must be reported");
+    assert!(snapshot.consent_unsynced, "consent_unsynced flag must be true");
+    assert_eq!(snapshot.consent, LocalConsent::Absent, "grant not accepted into state on write failure");
+}
+
+#[test]
+fn consent_13_revoke_persistence_failure_stops_sensors_and_reports_non_durable() {
+    let mut h = harness_with_consent(
+        at("10:00:00"),
+        Some(saved(vec![project("p1", 5)], Some("p1"))),
+        LocalConsent::Granted(CapturePermissions::default().into()),
+    );
+    assert_eq!(h.status(), TrackerStatus::Tracking);
+    assert!(h.machine.is_tracking_active());
+    assert!(h.machine.is_input_running());
+
+    // Inject disk write fault
+    h.consent_store.set_fail_saves(true);
+
+    // Revoke consent
+    h.command(at("10:01:00"), Command::UpdateConsent { consent: LocalConsent::Revoked });
+
+    // Invariant: revocation must stop sensors IMMEDIATELY even if disk fails!
+    assert_eq!(h.status(), TrackerStatus::ConsentRequired);
+    assert!(!h.machine.is_tracking_active(), "sensors must stop immediately on revoke");
+    assert!(!h.machine.is_input_running(), "input hooks must be detached");
+    assert!(!h.machine.is_usage_running(), "usage sampler must be stopped");
+    assert!(h.machine.input_stops() >= 1);
+
+    // State reports non-durable revocation clearly
+    let snapshot = h.state.snapshot();
+    assert!(snapshot.consent_error.is_some(), "error message must describe non-durable disk write");
+    let err_msg = snapshot.consent_error.as_ref().unwrap();
+    assert!(err_msg.contains("non-durable across app restart"), "error describes restart durability limit honestly");
+    assert!(snapshot.consent_unsynced, "consent_unsynced flag must be true");
+
+    // Unintended resume must be prevented while unsynced/revoked
+    h.command(at("10:02:00"), Command::Resume { at: at("10:02:00") });
+    assert_eq!(h.status(), TrackerStatus::ConsentRequired);
+    assert!(!h.machine.is_tracking_active(), "resume must be blocked while consent is unsynced/revoked");
+}
+
+#[test]
+fn consent_14_fake_worker_isolation_proves_no_disk_access() {
+    // Proves that fake worker constructors and tests interact strictly with MemoryConsentStore.
+    let mut h = harness_with_consent(
+        at("10:00:00"),
+        Some(saved(vec![project("p1", 5)], Some("p1"))),
+        LocalConsent::Absent,
+    );
+    assert_eq!(h.consent_store.load_count(), 1, "loaded from MemoryConsentStore on start");
+    assert_eq!(h.consent_store.save_count(), 0);
+
+    let grant = ConsentedPermissions::default();
+    h.command(at("10:00:30"), Command::UpdateConsent { consent: LocalConsent::Granted(grant) });
+    assert_eq!(h.consent_store.save_count(), 1, "saved to MemoryConsentStore on update");
+
+    h.command(at("10:01:00"), Command::UpdateConsent { consent: LocalConsent::Revoked });
+    assert_eq!(h.consent_store.save_count(), 2, "second save went to MemoryConsentStore");
+
+    // No real disk consent file touched: MemoryConsentStore keeps state in memory mutex
+    assert_eq!(h.consent_store.load(), LocalConsent::Revoked);
+}
+
+#[test]
+fn consent_15_partial_grant_omitted_capabilities_strictly_default_deny() {
+    // Prove that partial grant schema defaults ALL omitted capabilities strictly to false
+    let json_only_mouse = r#"{"Granted": {"mouse": true}}"#;
+    let consent: LocalConsent = serde_json::from_str(json_only_mouse).expect("partial json must deserialize");
+
+    let mut h = harness_with_consent(
+        at("10:00:00"),
+        Some(saved(vec![project("p1", 5)], Some("p1"))),
+        LocalConsent::Absent,
+    );
+    h.command(at("10:00:30"), Command::UpdateConsent { consent });
+    assert_eq!(h.status(), TrackerStatus::Tracking);
+
+    // Mouse was granted
+    assert!(h.machine.last_mouse.load(std::sync::atomic::Ordering::SeqCst), "mouse granted");
+    // All omitted capabilities are false:
+    assert!(!h.machine.last_keyboard.load(std::sync::atomic::Ordering::SeqCst), "keyboard omitted -> denied");
+    assert!(!h.machine.is_usage_running(), "active window omitted -> denied");
+    assert_eq!(h.machine.usage_starts(), 0);
 }

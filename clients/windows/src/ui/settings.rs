@@ -336,6 +336,26 @@ impl TrackerApp {
                 });
             });
 
+            if let Some(ref err) = snapshot.consent_error {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    widgets::icon(ui, Icon::Alert, 16.0, theme::DANGER);
+                    ui.label(
+                        egui::RichText::new(err)
+                            .font(theme::regular(12.0))
+                            .color(theme::DANGER),
+                    );
+                });
+            }
+
+            if snapshot.consent_unsynced {
+                ui.add_space(2.0);
+                widgets::muted(
+                    ui,
+                    "Persistence warning: In-memory consent does not match on-disk state due to a write failure.",
+                );
+            }
+
             ui.add_space(2.0);
             widgets::muted(
                 ui,
@@ -425,9 +445,9 @@ impl TrackerApp {
 
             let c = snapshot.capture;
             let user_granted = match &snapshot.consent {
-                crate::config::LocalConsent::Granted(p) => p.clone(),
+                crate::config::LocalConsent::Granted(p) => *p,
                 crate::config::LocalConsent::Absent | crate::config::LocalConsent::Revoked => {
-                    crate::config::CapturePermissions::all_disabled()
+                    crate::config::ConsentedPermissions::all_disabled()
                 }
             };
 

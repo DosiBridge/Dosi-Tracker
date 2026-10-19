@@ -33,7 +33,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::time::Instant;
 
 use crate::api::{ApiClient, ApiError, AuthError, ServerClock, TokenCell, Workspace};
-use crate::config::{normalize_server_url, AppConfig, CapturePermissions};
+use crate::config::{normalize_server_url, AppConfig, CapturePermissions, ConsentStore, FileConsentStore};
 use crate::credentials::{self, Credentials, ProjectCache, SavedPause};
 use crate::model::{Activity, EndReason, Heartbeat, PresenceStatus, Project};
 use crate::power::{self, SleepDetector};
@@ -441,6 +441,12 @@ async fn run(
     let (upload_events_tx, mut upload_events) = mpsc::unbounded_channel();
     let uploader = uploader::spawn(path, state.clone(), clock.clone(), repaint.clone(), upload_events_tx);
 
+    let consent_store: Arc<dyn ConsentStore> = Arc::new(
+        FileConsentStore::production().unwrap_or_else(|| {
+            FileConsentStore::new(PathBuf::from("consent.json"))
+        }),
+    );
+
     let mut worker = Worker::new(
         state,
         cfg,
@@ -452,6 +458,7 @@ async fn run(
         control,
         uploader,
         credentials_file,
+        consent_store,
     );
     worker.start(saved, opened.moved_aside);
     worker.publish();
@@ -545,6 +552,8 @@ struct View {
     server_reachable: bool,
     clock_skew_minutes: Option<i64>,
     consent: crate::config::LocalConsent,
+    consent_error: Option<String>,
+    consent_unsynced: bool,
 }
 
 struct Worker {
@@ -559,6 +568,9 @@ struct Worker {
     uploader: UploaderHandle,
     /// Where the sign-in is saved; `None` keeps it in memory only (tests).
     credentials_file: Option<PathBuf>,
+    consent_store: Arc<dyn ConsentStore>,
+    consent_error: Option<String>,
+    consent_unsynced: bool,
 
     /// The saved sign-in, with what it remembers; `None` when signed out.
     saved: Option<Credentials>,
@@ -626,6 +638,7 @@ impl Worker {
         control: ControlLink,
         uploader: UploaderHandle,
         credentials_file: Option<PathBuf>,
+        consent_store: Arc<dyn ConsentStore>,
     ) -> Self {
         let now = Instant::now();
         let presence_since = machine.now();
@@ -640,6 +653,9 @@ impl Worker {
             control,
             uploader,
             credentials_file,
+            consent_store,
+            consent_error: None,
+            consent_unsynced: false,
             saved: None,
             account: None,
             pending: None,
@@ -687,6 +703,11 @@ impl Worker {
     /// task note, and — when the server cannot be reached — the project list
     /// saved with it (at most a week old), so tracking starts offline too.
     fn start(&mut self, saved: Option<Credentials>, moved_aside: Option<PathBuf>) {
+        self.cfg.consent = self.consent_store.load();
+        if !self.cfg.consent.is_granted() {
+            self.machine.apply_sensor_policy(false, None);
+        }
+
         let now = self.now();
         let owner = saved.as_ref().map(Credentials::owner_key);
         // Reclaim space (old rejects, other accounts' expired rows, over-limit
@@ -847,6 +868,7 @@ impl Worker {
 
     fn should_track(&self) -> bool {
         self.cfg.consent.is_granted()
+            && !self.consent_unsynced
             && self.account.is_some()
             && !self.expired
             && self.session.is_some()
@@ -1257,32 +1279,81 @@ impl Worker {
     }
 
     fn update_consent(&mut self, consent: crate::config::LocalConsent) {
-        tracing::info!(?consent, "local consent updated by user");
-        self.cfg.consent = consent.clone();
-        let _ = self.cfg.consent.save();
-
+        tracing::info!(?consent, "local consent update requested by user");
         let now = self.now();
-        if let Some(current_session) = self.session.as_ref() {
-            let project_id = current_session.project_id().to_owned();
-            if let Some(project) = self.projects.iter().flatten().find(|p| p.id == project_id).cloned() {
-                let refreshed = session_for(&project, &self.cfg);
-                self.blocks.update_policy(refreshed.policy.clone());
-                self.session = Some(refreshed);
-            }
-        } else {
-            self.choose_session(now);
-        }
 
-        if !self.cfg.consent.is_granted() {
-            self.reconcile(now, EndReason::Pause);
-            self.machine.apply_sensor_policy(false, None);
-        } else if self.should_track() {
-            self.reconcile(now, EndReason::Interval);
-            if let Some(session) = self.session.as_ref() {
-                self.machine.apply_sensor_policy(true, Some(&session.policy.perms));
+        match &consent {
+            crate::config::LocalConsent::Granted(_) => {
+                // Defense-in-depth: Granting requires safe persistence before activation.
+                match self.consent_store.save(&consent) {
+                    Ok(()) => {
+                        self.cfg.consent = consent;
+                        self.consent_error = None;
+                        self.consent_unsynced = false;
+                        tracing::info!("consent successfully granted and persisted to disk");
+
+                        if let Some(current_session) = self.session.as_ref() {
+                            let project_id = current_session.project_id().to_owned();
+                            if let Some(project) = self.projects.iter().flatten().find(|p| p.id == project_id).cloned() {
+                                let refreshed = session_for(&project, &self.cfg);
+                                self.blocks.update_policy(refreshed.policy.clone());
+                                self.session = Some(refreshed);
+                            }
+                        } else {
+                            self.choose_session(now);
+                        }
+
+                        if self.should_track() {
+                            self.reconcile(now, EndReason::Interval);
+                            if let Some(session) = self.session.as_ref() {
+                                self.machine.apply_sensor_policy(true, Some(&session.policy.perms));
+                            }
+                        } else {
+                            self.machine.apply_sensor_policy(false, None);
+                        }
+                    }
+                    Err(e) => {
+                        let err_msg = format!("Failed to persist granted consent to disk: {e}. Sensors will not start.");
+                        tracing::error!(%err_msg);
+                        self.consent_error = Some(err_msg);
+                        self.consent_unsynced = true;
+                        // Fail closed: do NOT accept grant, sensors MUST remain stopped
+                        self.reconcile(now, EndReason::Pause);
+                        self.machine.apply_sensor_policy(false, None);
+                    }
+                }
             }
-        } else {
-            self.machine.apply_sensor_policy(false, None);
+            crate::config::LocalConsent::Revoked | crate::config::LocalConsent::Absent => {
+                // Immediate fail-safe revocation: stop sensors right now in-memory regardless of disk result.
+                self.cfg.consent = consent.clone();
+                self.reconcile(now, EndReason::Pause);
+                self.machine.apply_sensor_policy(false, None);
+
+                match self.consent_store.save(&consent) {
+                    Ok(()) => {
+                        self.consent_error = None;
+                        self.consent_unsynced = false;
+                        tracing::info!("consent revocation successfully persisted to disk");
+                    }
+                    Err(e) => {
+                        let err_msg = format!(
+                            "Consent revoked in-memory and sensors stopped, but disk persistence failed ({e}). Revocation is non-durable across app restart until disk write succeeds."
+                        );
+                        tracing::error!(%err_msg);
+                        self.consent_error = Some(err_msg);
+                        self.consent_unsynced = true;
+                    }
+                }
+
+                if let Some(current_session) = self.session.as_ref() {
+                    let project_id = current_session.project_id().to_owned();
+                    if let Some(project) = self.projects.iter().flatten().find(|p| p.id == project_id).cloned() {
+                        let refreshed = session_for(&project, &self.cfg);
+                        self.blocks.update_policy(refreshed.policy.clone());
+                        self.session = Some(refreshed);
+                    }
+                }
+            }
         }
 
         self.publish();
@@ -1916,6 +1987,8 @@ impl Worker {
             server_reachable: self.reachable,
             clock_skew_minutes: self.clock.skew_minutes(),
             consent: self.cfg.consent.clone(),
+            consent_error: self.consent_error.clone(),
+            consent_unsynced: self.consent_unsynced,
         }
     }
 
@@ -1952,6 +2025,8 @@ impl Worker {
                 s.server_reachable = v.server_reachable;
                 s.clock_skew_minutes = v.clock_skew_minutes;
                 s.consent = v.consent;
+                s.consent_error = v.consent_error;
+                s.consent_unsynced = v.consent_unsynced;
             });
             self.published = Some(view);
             (self.repaint)();
