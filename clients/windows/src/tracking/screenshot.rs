@@ -36,6 +36,7 @@ const BLUR_CELL: u32 = 16;
 const BLUR_SPREAD_CELLS: f32 = 1.5;
 
 /// One screen capture, base64-encoded for upload.
+#[derive(Debug, Clone)]
 pub struct ScreenCapture {
     /// JPEG of the screen, at most [`MAX_SCREEN_WIDTH`] wide.
     pub jpeg_base64: String,

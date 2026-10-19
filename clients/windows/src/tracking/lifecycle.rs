@@ -20,6 +20,7 @@ pub trait SensorDriver: Send + Sync {
     fn stop_input(&self);
 
     /// Whether input hooks are currently attached and running.
+    #[expect(dead_code, reason = "for inspection and tests")]
     fn is_input_running(&self) -> bool;
 
     /// Start the active-window foreground usage sampler.

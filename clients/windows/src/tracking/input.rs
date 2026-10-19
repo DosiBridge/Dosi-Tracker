@@ -132,7 +132,7 @@ impl InputCounter {
         self.allowed_mouse.load(Ordering::SeqCst)
     }
 
-    fn record_key_press(&self, at_ms: i64) {
+    pub(crate) fn record_key_press(&self, at_ms: i64) {
         if !self.is_active() || !self.is_keyboard_allowed() {
             return;
         }
@@ -140,7 +140,7 @@ impl InputCounter {
         self.keyboard_activity.mark(at_ms.div_euclid(1000));
     }
 
-    fn record_click(&self, at_ms: i64) {
+    pub(crate) fn record_click(&self, at_ms: i64) {
         if !self.is_active() || !self.is_mouse_allowed() {
             return;
         }

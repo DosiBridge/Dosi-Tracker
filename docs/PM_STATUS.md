@@ -176,14 +176,28 @@ At clean HEAD `cf4910d`, the PM independently inspected the diff and worker cons
      - All sensors are stopped immediately (`machine.apply_sensor_policy(false, None)`).
      - State marked unsynced (`consent_unsynced = true`), blocking tracking resumption (`!consent_unsynced` in `should_track()`).
      - Displayed consent in `self.cfg.consent` set to fail-closed state (`Absent` if previously Absent, otherwise `Revoked`), ensuring the UI does not falsely display accepted withdrawal or full success.
-     - Actionable alert surfaced: `"Failed to persist consent changes to disk: {e}. Tracking stopped (fail-closed) to prevent non-durable sensor operation. Changes/revocation are non-durable across app restart: prior on-disk consent remains and will reload on restart until disk save succeeds."`
-4. **Deterministic Blocking Store & Barrier Regressions**:
+     - Actionable alert surfaced: `"Failed to persist consent changes to disk: {e}. Tracking stopped (fail-closed) to prevent non-durable sensor operation. Changes/revocation are non-durable across app restart: prior on-disk consent remains and will reload on restart until disk save succ4. **Deterministic Blocking Store & Barrier Regressions**:
    - `MemoryConsentStore` augmented with `set_save_hook` to allow synchronous assertions and multi-threaded barrier synchronization while `save()` is blocked in flight.
    - 4 new synthetic regression tests added (`worker::tests::consent_16` through `consent_19`):
      - `consent_16`: Proves withdrawn sensors (keyboard, active_window, screenshot, webcam) are stopped *while save is blocked*, retained mouse remains active, and save completes with narrower policy.
      - `consent_17`: Mixed narrowing + expansion request proves withdrawn keyboard stops before save, newly requested webcam is NOT active during blocked save, and webcam activates only after persistence succeeds.
      - `consent_18`: Save failure proves fail-closed halt of all sensors, `consent_unsynced: true`, fail-closed `Revoked` displayed consent, restart durability warning, and resume rejection.
-     - `consent_19`: Multi-threaded `Arc<Barrier>` test proves the worker thread has stopped withdrawn sensors while literally suspended inside `consent_store.save()`.
+     - `consent_19`: Multi-threaded `Arc<Barrier>` test proves the worker thread has stopped withdrawn sensors while literally suspended inside `consent_store.save`.
+5. **Tracker Acquisition Boundary Hardening (`AcquisitionProvider` Seam & Explicit Authorization)**:
+   - Defect resolved: `Tracker` previously relied on `is_tracking_active()` (input OR usage driver running) and caller history (`BlockSpec.perms`) to decide on new captures, allowing withdrawn webcam or processes to be sampled if another sensor (e.g. mouse) was running, or suppressing webcam under a legitimate webcam-only policy.
+   - Decoupled acquisition from OS APIs via `AcquisitionProvider` trait (`NativeAcquisitionProvider` in production, `FakeAcquisitionProvider` with atomic call counters in tests).
+   - `Tracker` tracks explicit effective authorization state (`TrackerAuth: active + perms`), updated monotonically under lock by `apply_sensor_policy`.
+   - `Tracker::capture_screen` gates on `auth.active && auth.perms.screenshot` with conservative blur enforcement (`blur || auth.perms.blur_screenshots`).
+   - `Tracker::snapshot` strictly intersects historical block permissions with CURRENT effective authorization for every NEW acquisition (`current_window`, `running_programs`, `webcam_jpg_base64`, `screen`), while preserving legitimately authorized historical accumulators (keys, clicks, usage slices).
+   - `Tracker::current_app` returns `None` unless active tracking and `active_window` are currently authorized.
+   - Added 7 isolated regression tests exercised directly against production `Tracker` with `FakeAcquisitionProvider`:
+     - `tracker_consent_webcam_withdrawn_while_mouse_retained_stale_spec_zero_camera_calls`: Proves withdrawn webcam with stale spec results in 0 camera calls.
+     - `tracker_consent_screenshot_withdrawn_direct_capture_screen_zero_calls`: Proves withdrawn screenshot returns `None` and invokes 0 provider calls.
+     - `tracker_consent_running_programs_withdrawn_active_window_retained_zero_process_calls`: Proves withdrawn running programs with active window retained results in 0 process calls while window sample succeeds.
+     - `tracker_consent_inactive_or_paused_with_stale_spec_zero_acquisitions`: Proves inactive/paused state with stale spec results in 0 screen, camera, window, or process acquisitions.
+     - `tracker_consent_legitimately_active_webcam_only_policy_invokes_camera_without_input_or_usage_drivers`: Proves webcam-only policy activates camera provider despite input and usage drivers not running.
+     - `tracker_consent_held_block_safe_finalization_preserves_historical_accumulators_without_new_samples`: Proves held blocks finalized after revocation execute 0 new captures/samples while preserving historical keys, clicks, and slices.
+     - `tracker_consent_conservative_blur_applies_if_either_current_or_block_requires_blur`: Proves conservative blur is applied whenever current policy or block policy requires blur.
 
 ---
 
@@ -193,12 +207,14 @@ All tests executed in `clients/windows` with `RUST_BACKTRACE=1`. Synthetic QA on
 
 | Target Suite | Exact Command Line | Tests Passed | Ignored | Time | Exit Code | Evidence Level |
 |---|---|:---:|:---:|:---:|:---:|:---:|
-| **Compilation Gate** | `cargo check --bin dosi-tracker` | N/A | 0 errors, 0 warnings | 0.47s | **0** | **[Worker-Reported]** |
+| **Compilation Gate** | `cargo check --bin dosi-tracker --tests` | N/A | 0 errors, 0 warnings | 2.31s | **0** | **[Worker-Reported]** |
 | **Config & Atomic Persistence** | `cargo test --bin dosi-tracker config::tests` | 15 | 0 | 0.01s | **0** | **[Worker-Reported]** |
-| **All Consent Tests (UI+Worker)** | `cargo test --bin dosi-tracker consent` | 36 | 0 | 0.13s | **0** | **[Worker-Reported]** |
+| **All Consent Tests (UI+Worker+Tracker)** | `cargo test --bin dosi-tracker consent` | 43 | 0 | 0.02s | **0** | **[Worker-Reported]** |
+| **Tracking Subsystem & Boundary** | `cargo test --bin dosi-tracker tracking::tests` | 18 | 0 | 0.01s | **0** | **[Worker-Reported]** |
 | **Tracking Lifecycle Suite** | `cargo test --bin dosi-tracker tracking::lifecycle::tests` | 11 | 0 | 0.10s | **0** | **[Worker-Reported]** |
 | **Worker Session Suite** | `cargo test --bin dosi-tracker worker::session::tests` | 10 | 0 | 0.00s | **0** | **[Worker-Reported]** |
 | **Worker Blocks Suite** | `cargo test --bin dosi-tracker worker::blocks::tests` | 19 | 0 | 0.00s | **0** | **[Worker-Reported]** |
+| **Full Worker Test Suite** | `cargo test --bin dosi-tracker worker::tests` | 84 | 2 (e2e backend) | 2.06s | **0** | **[Worker-Reported]** |
 
 #### Detailed 22-Scenario Consent Lifecycle Test Matrix (`worker::tests::consent_*`)
 1. `consent_1_fresh_config_absent`: Fresh config with `LocalConsent::Absent` yields `TrackerStatus::ConsentRequired`, 0 sensor starts, 0 running drivers.
@@ -230,8 +246,8 @@ All tests executed in `clients/windows` with `RUST_BACKTRACE=1`. Synthetic QA on
 
 | Evidence Dimension | Windows (Rust) | macOS (Swift) | Linux (Target) |
 |---|---|---|---|
-| **1. Implemented Source** | ⚠️ Corrective source present (`clients/windows`: egui UI, Win32 hooks, xcap, DPAPI, SQLite queue, `ConsentedPermissions`, `ConsentStore`, `atomic_write_file`, monotonic narrowing); native interactive hooks, packaging, and signing open | ⚠️ Source present (`clients/macos`: SwiftUI, ScreenCaptureKit, Keychain, SQLite queue); source presence is NOT proof of complete implementation; TCC consent, runtime execution, packaging, and notarization open | ❌ **Unresolved Gap** (`clients/linux` crate not yet created) |
-| **2. Synthetic / Mock Unit Tests** | ⚠️ **Worker-Reported Only** (36 consent tests, 11 lifecycle tests, 10 session tests, 15 config tests, 19 block tests passing locally; awaiting PM independent review) | ⚠️ Unverified locally (Swift test files present in source; not executed locally) | ❌ 0 tests (No crate) |
+| **1. Implemented Source** | ⚠️ Corrective source present (`clients/windows`: egui UI, Win32 hooks, xcap, DPAPI, SQLite queue, `ConsentedPermissions`, `ConsentStore`, `atomic_write_file`, monotonic narrowing, `AcquisitionProvider` boundary); native interactive hooks, packaging, and signing open | ⚠️ Source present (`clients/macos`: SwiftUI, ScreenCaptureKit, Keychain, SQLite queue); source presence is NOT proof of complete implementation; TCC consent, runtime execution, packaging, and notarization open | ❌ **Unresolved Gap** (`clients/linux` crate not yet created) |
+| **2. Synthetic / Mock Unit Tests** | ⚠️ **Worker-Reported Only** (43 consent tests, 18 tracking tests, 11 lifecycle tests, 10 session tests, 15 config tests, 19 block tests passing locally; awaiting PM independent review) | ⚠️ Unverified locally (Swift test files present in source; not executed locally) | ❌ 0 tests (No crate) |
 | **3. Toolchain / Compile / Build** | ✅ Verified locally (Rustc / Cargo 1.97.1 on Windows 11 host) | ❌ Unverified locally (Host lacks macOS toolchain / Xcode) | ❌ Unverified locally (Host lacks Linux build container / environment) |
 | **4. Native Interactive Runtime** | ⚠️ **Unverified** (Unit tests run synthetically via `FakeSensorDriver`, `MemoryConsentStore`, `ConsentViewModel`; interactive Win32 desktop hooks unverified in QA) | ⚠️ **Outstanding** (Requires physical macOS execution environment) | ❌ **Outstanding** (Requires Linux X11/Wayland execution environment) |
 | **5. Packaging / Install / Uninstall** | ⚠️ Partial (NSIS `.nsi` script present; silent install/uninstall unverified in CI) | ⚠️ Partial (`build-app.sh` creates bundle; DMG packaging unverified) | ❌ **Unresolved Gap** (No `.deb`, AppImage, or Flatpak manifest) |

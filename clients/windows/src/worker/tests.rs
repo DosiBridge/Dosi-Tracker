@@ -268,8 +268,7 @@ impl FakeMachine {
     }
 
     fn is_tracking_active(&self) -> bool {
-        self.input_running.load(std::sync::atomic::Ordering::SeqCst)
-            || self.usage_running.load(std::sync::atomic::Ordering::SeqCst)
+        self.tracking_active.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn is_input_running(&self) -> bool {
@@ -343,12 +342,22 @@ impl Machine for FakeMachine {
     }
 
     fn capture_screen(&self, blur: bool) -> Option<ScreenCapture> {
+        let last_perms = self.last_perms.lock().unwrap().clone();
+        let (authorized, effective_blur) = if self.is_tracking_active() {
+            let perms = last_perms.unwrap_or_else(CapturePermissions::all_disabled);
+            (perms.screenshot, blur || perms.blur_screenshots)
+        } else {
+            (false, blur)
+        };
+        if !authorized {
+            return None;
+        }
         *self.captures.lock().unwrap() += 1;
         Some(ScreenCapture {
             jpeg_base64: "/9j/screen".into(),
             thumb_jpg_base64: Some("/9j/dGh1bWI=".into()),
             captured_at: self.now(),
-            blurred: blur,
+            blurred: effective_blur,
         })
     }
 
@@ -357,7 +366,12 @@ impl Machine for FakeMachine {
         if let Some(hook) = self.on_snapshot.lock().unwrap().as_ref() {
             hook();
         }
-        let window_now = if block.perms.active_window && self.usage_running.load(std::sync::atomic::Ordering::SeqCst) {
+        let current_perms = if self.is_tracking_active() {
+            self.last_perms.lock().unwrap().clone().unwrap_or_else(CapturePermissions::all_disabled)
+        } else {
+            CapturePermissions::all_disabled()
+        };
+        let window_now = if current_perms.active_window && block.perms.active_window && self.usage_running.load(std::sync::atomic::Ordering::SeqCst) {
             self.window_queries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Some(crate::model::WindowInfo {
                 app_name: "code.exe".into(),
@@ -369,7 +383,7 @@ impl Machine for FakeMachine {
         } else {
             None
         };
-        let running_programs = if block.perms.running_programs && self.usage_running.load(std::sync::atomic::Ordering::SeqCst) {
+        let running_programs = if current_perms.running_programs && block.perms.running_programs && self.usage_running.load(std::sync::atomic::Ordering::SeqCst) {
             self.process_queries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             vec![crate::model::WindowInfo {
                 app_name: "code.exe".into(),
@@ -381,7 +395,12 @@ impl Machine for FakeMachine {
         } else {
             Vec::new()
         };
-        let webcam_jpg_base64 = if block.perms.webcam && self.is_tracking_active() && block.captures_at_end() {
+        let screen = if current_perms.screenshot {
+            screen.filter(|c| c.blurred || !current_perms.blur_screenshots)
+        } else {
+            None
+        };
+        let webcam_jpg_base64 = if current_perms.webcam && block.perms.webcam && block.captures_at_end() {
             self.webcam_captures.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Some("/9j/synthetic_webcam".into())
         } else {
@@ -458,7 +477,12 @@ impl Machine for FakeMachine {
     }
 
     fn current_app(&self) -> Option<String> {
-        Some("code.exe".into())
+        let last_perms = self.last_perms.lock().unwrap().clone();
+        if self.is_tracking_active() && last_perms.is_some_and(|p| p.active_window) {
+            Some("code.exe".into())
+        } else {
+            None
+        }
     }
 
     fn random_fraction(&self) -> f64 {

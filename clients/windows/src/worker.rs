@@ -270,9 +270,7 @@ impl Machine for Tracker {
     }
 
     fn current_app(&self) -> Option<String> {
-        crate::tracking::active_window::current()
-            .map(|window| window.app_name)
-            .filter(|name| !name.is_empty())
+        Tracker::current_app(self)
     }
 
     fn random_fraction(&self) -> f64 {
