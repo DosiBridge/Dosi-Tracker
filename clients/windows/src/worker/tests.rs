@@ -383,7 +383,7 @@ impl Machine for FakeMachine {
         } else {
             None
         };
-        let running_programs = if current_perms.running_programs && block.perms.running_programs && self.usage_running.load(std::sync::atomic::Ordering::SeqCst) {
+        let running_programs = if current_perms.running_programs && block.perms.running_programs {
             self.process_queries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             vec![crate::model::WindowInfo {
                 app_name: "code.exe".into(),

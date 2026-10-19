@@ -115,6 +115,10 @@ pub struct FakeAcquisitionProvider {
     canned_webcam: Mutex<Option<String>>,
     canned_window: Mutex<Option<WindowInfo>>,
     canned_processes: Mutex<Option<Vec<WindowInfo>>>,
+    on_current_window: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    on_capture_screen: Mutex<Option<Box<dyn Fn(bool) + Send + Sync>>>,
+    on_capture_webcam: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    on_running_programs: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 #[allow(dead_code)]
@@ -138,6 +142,10 @@ impl FakeAcquisitionProvider {
                 window_title: "".into(),
                 ..Default::default()
             }])),
+            on_current_window: Mutex::new(None),
+            on_capture_screen: Mutex::new(None),
+            on_capture_webcam: Mutex::new(None),
+            on_running_programs: Mutex::new(None),
         }
     }
 
@@ -176,6 +184,22 @@ impl FakeAcquisitionProvider {
     pub fn set_canned_processes(&self, processes: Option<Vec<WindowInfo>>) {
         *self.canned_processes.lock().unwrap() = processes;
     }
+
+    pub fn set_on_current_window<F: Fn() + Send + Sync + 'static>(&self, f: F) {
+        *self.on_current_window.lock().unwrap() = Some(Box::new(f));
+    }
+
+    pub fn set_on_capture_screen<F: Fn(bool) + Send + Sync + 'static>(&self, f: F) {
+        *self.on_capture_screen.lock().unwrap() = Some(Box::new(f));
+    }
+
+    pub fn set_on_capture_webcam<F: Fn() + Send + Sync + 'static>(&self, f: F) {
+        *self.on_capture_webcam.lock().unwrap() = Some(Box::new(f));
+    }
+
+    pub fn set_on_running_programs<F: Fn() + Send + Sync + 'static>(&self, f: F) {
+        *self.on_running_programs.lock().unwrap() = Some(Box::new(f));
+    }
 }
 
 impl Default for FakeAcquisitionProvider {
@@ -188,6 +212,9 @@ impl AcquisitionProvider for FakeAcquisitionProvider {
     fn capture_screen(&self, blur: bool) -> anyhow::Result<ScreenCapture> {
         self.screen_calls.fetch_add(1, Ordering::SeqCst);
         self.last_blur.store(blur, Ordering::SeqCst);
+        if let Some(ref cb) = *self.on_capture_screen.lock().unwrap() {
+            cb(blur);
+        }
         if let Some(ref capture) = *self.canned_screen.lock().unwrap() {
             Ok(capture.clone())
         } else {
@@ -202,6 +229,9 @@ impl AcquisitionProvider for FakeAcquisitionProvider {
 
     fn capture_webcam(&self) -> anyhow::Result<String> {
         self.webcam_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(ref cb) = *self.on_capture_webcam.lock().unwrap() {
+            cb();
+        }
         if let Some(ref b64) = *self.canned_webcam.lock().unwrap() {
             Ok(b64.clone())
         } else {
@@ -211,11 +241,17 @@ impl AcquisitionProvider for FakeAcquisitionProvider {
 
     fn current_window(&self) -> Option<WindowInfo> {
         self.window_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(ref cb) = *self.on_current_window.lock().unwrap() {
+            cb();
+        }
         self.canned_window.lock().unwrap().clone()
     }
 
     fn running_programs(&self) -> anyhow::Result<Vec<WindowInfo>> {
         self.process_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(ref cb) = *self.on_running_programs.lock().unwrap() {
+            cb();
+        }
         if let Some(ref progs) = *self.canned_processes.lock().unwrap() {
             Ok(progs.clone())
         } else {
@@ -226,6 +262,7 @@ impl AcquisitionProvider for FakeAcquisitionProvider {
 
 #[derive(Debug, Clone)]
 struct TrackerAuth {
+    epoch: u64,
     active: bool,
     perms: CapturePermissions,
 }
@@ -233,6 +270,7 @@ struct TrackerAuth {
 impl Default for TrackerAuth {
     fn default() -> Self {
         Self {
+            epoch: 0,
             active: false,
             perms: CapturePermissions::all_disabled(),
         }
@@ -346,6 +384,12 @@ impl Tracker {
     /// failing closed to unauthorized for all capabilities.
     /// When active, attaches only the sensors explicitly permitted by policy and retains
     /// current effective authorization at the acquisition boundary.
+    ///
+    /// Synchronization Contract:
+    /// - Atomically updates `auth` under a write lock and increments `auth.epoch`.
+    /// - Because acquisition operations NEVER hold a read lock across provider calls,
+    ///   `apply_sensor_policy` is never blocked behind slow or blocking OS provider execution.
+    /// - Sensor drivers (`driver.stop_input`, `driver.stop_usage`) are stopped immediately.
     pub fn apply_sensor_policy(&self, active: bool, perms: Option<&CapturePermissions>) {
         let active_window = active && perms.is_some_and(|p| p.active_window);
         let keyboard = active && perms.is_some_and(|p| p.keyboard);
@@ -356,6 +400,7 @@ impl Tracker {
         // Fails closed to inactive and all-disabled when active is false or perms are None.
         {
             let mut auth = self.auth.write().unwrap();
+            auth.epoch = auth.epoch.wrapping_add(1);
             auth.active = active && perms.is_some();
             auth.perms = if active {
                 perms.cloned().unwrap_or_else(CapturePermissions::all_disabled)
@@ -400,14 +445,39 @@ impl Tracker {
 
     /// The app in front now (its executable name), queried through the acquisition provider
     /// ONLY IF actively tracking and active_window is authorized in current policy.
+    ///
+    /// Admission / Revocation Synchronization Contract:
+    /// - Evaluates authorization under a brief read lock, then drops the lock BEFORE
+    ///   delegating to the provider. This ensures `apply_sensor_policy` is never blocked
+    ///   behind slow foreground window queries.
+    /// - After the provider returns, verifies that active tracking and active_window
+    ///   remain authorized. If revoked while in flight, the result is discarded.
     pub fn current_app(&self) -> Option<String> {
-        let auth = self.auth.read().unwrap();
-        if !auth.active || !auth.perms.active_window {
+        let authorized = {
+            let auth = self.auth.read().unwrap();
+            auth.active && auth.perms.active_window
+        };
+        if !authorized {
             return None;
         }
-        self.acquisition.current_window()
-            .map(|w| w.app_name)
-            .filter(|name| !name.is_empty())
+
+        let win = self.acquisition.current_window()?;
+
+        // Post-admission verification: discard if revoked while in-flight.
+        let still_authorized = {
+            let auth = self.auth.read().unwrap();
+            auth.active && auth.perms.active_window
+        };
+        if !still_authorized {
+            return None;
+        }
+
+        let name = win.app_name;
+        if name.is_empty() {
+            None
+        } else {
+            Some(name)
+        }
     }
 
     /// This device: install id, name, OS and agent version (also for the
@@ -421,86 +491,161 @@ impl Tracker {
     /// inside the block — and hands the capture to [`Tracker::snapshot`] when
     /// the block ends.
     ///
-    /// Intersects with CURRENT effective authorization: if tracking is inactive
-    /// or screenshot capability is not currently authorized, no acquisition is
-    /// attempted (0 calls to provider) and `None` is returned.
-    /// Blur requirement is applied conservatively: blurred if either the caller
-    /// requested blur OR current effective policy requires blur.
+    /// Admission / Revocation Synchronization Contract:
+    /// 1. Gated on CURRENT effective authorization (`auth.active && auth.perms.screenshot`).
+    /// 2. If unauthorized, returns `None` immediately with 0 provider calls.
+    /// 3. Read lock is dropped before entering the provider so `apply_sensor_policy`
+    ///    is never delayed behind OS screenshot capture.
+    /// 4. Blur requirement is evaluated conservatively: blurred if either the caller
+    ///    requested blur OR current effective policy requires blur.
+    /// 5. Post-admission verification: If authorization was revoked or blur requirement
+    ///    was added while the provider was running, the capture is discarded (returns `None`).
+    ///
+    /// Note on native hardware limitation:
+    /// Synchronous OS screenshot capture cannot be cancelled mid-flight without unsafe aborts.
+    /// If revoked while in-flight, the provider call completes, but the result is dropped immediately
+    /// and never admitted into blocks or stored. Any subsequent capture attempt is rejected at admission.
     pub fn capture_screen(&self, blur: bool) -> Option<ScreenCapture> {
         let (authorized, effective_blur) = {
             let auth = self.auth.read().unwrap();
-            let authorized = auth.active && auth.perms.screenshot;
-            let effective_blur = blur || auth.perms.blur_screenshots;
-            (authorized, effective_blur)
+            (
+                auth.active && auth.perms.screenshot,
+                blur || auth.perms.blur_screenshots,
+            )
         };
 
         if !authorized {
             return None;
         }
 
-        match self.acquisition.capture_screen(effective_blur) {
-            Ok(capture) => Some(capture),
+        let capture = match self.acquisition.capture_screen(effective_blur) {
+            Ok(capture) => capture,
             Err(e) => {
                 tracing::warn!(?e, "screenshot capture failed");
-                None
+                return None;
             }
+        };
+
+        // Post-admission verification: check if revoked or tightened while in-flight
+        let still_valid = {
+            let auth = self.auth.read().unwrap();
+            auth.active && auth.perms.screenshot && (!auth.perms.blur_screenshots || capture.blurred)
+        };
+
+        if !still_valid {
+            tracing::debug!("screenshot completed after revocation or policy change; discarding capture");
+            return None;
         }
+
+        Some(capture)
     }
 
     /// Build the activity for `block`, with `screen` taken earlier by
     /// [`Tracker::capture_screen`] (if any).
     ///
-    /// Everything is taken over the block's window, so input and window usage
-    /// from before it (while paused, signed out, or on another project) can
-    /// never be attributed to it. A webcam photo is taken now, unless the
-    /// block ends with the machine locked, asleep, idle or shutting down.
+    /// Admission / Revocation Synchronization Contract:
+    /// - Each capability acquisition (`window_now`, `running_programs`, `webcam_jpg_base64`)
+    ///   performs its own admission check under a brief read lock immediately before calling the provider.
+    /// - NO single upfront authorization snapshot is reused across sequential steps.
+    /// - Read locks are NEVER held across provider calls, allowing concurrent `apply_sensor_policy`
+    ///   to stop native drivers without delay.
+    /// - If a capability is revoked while an earlier step was executing, subsequent steps are
+    ///   REJECTED AT ADMISSION (zero provider calls).
+    /// - If an admitted provider call completes after revocation took place while in-flight,
+    ///   the post-admission check discards the result.
+    /// - `running_programs` is queried whenever authorized by current policy and historical block,
+    ///   independent of the active_window usage driver state (avoiding inappropriate driver dependency).
+    /// - Historical accumulator data (`slices`, `key_presses`, `clicks`, `active_seconds`)
+    ///   recorded while consent was active is preserved in the emitted block without acquiring new data.
     pub fn snapshot(&self, block: &BlockSpec<'_>, screen: Option<ScreenCapture>) -> Activity {
         let perms = block.perms;
         let (started_at, ended_at) = (block.started_at, block.ended_at);
 
-        // Snapshot current effective authorization under lock.
-        let current_auth = self.auth.read().unwrap().clone();
-        let current_perms = if current_auth.active {
-            current_auth.perms
-        } else {
-            CapturePermissions::all_disabled()
+        // 1. Current window admission check: requires actively authorized in current policy,
+        // allowed in historical block, and usage sampler is running.
+        let admit_window = {
+            let auth = self.auth.read().unwrap();
+            auth.active && auth.perms.active_window && perms.active_window && self.driver.is_usage_running()
         };
-
-        // 1. Credit the stretch since the last sample, ONLY IF actively authorized
-        // in current policy, allowed in historical block, and usage sampler is running.
-        let window_now = if current_perms.active_window && perms.active_window && self.driver.is_usage_running() {
+        let window_now = if admit_window {
             let win = self.acquisition.current_window();
-            self.usage.record(ended_at.timestamp_millis(), win.clone());
-            win
+            let still_valid = {
+                let auth = self.auth.read().unwrap();
+                auth.active && auth.perms.active_window
+            };
+            if still_valid {
+                self.usage.record(ended_at.timestamp_millis(), win.clone());
+                win
+            } else {
+                None
+            }
         } else {
             None
         };
 
-        // 2. Running programs: only if actively authorized in current policy,
-        // allowed in historical block, and usage sampler is running.
-        let running_programs = if current_perms.running_programs && perms.running_programs && self.driver.is_usage_running() {
-            self.acquisition.running_programs().unwrap_or_else(|e| {
-                tracing::warn!(?e, "could not list running programs");
-                Vec::new()
-            })
+        // 2. Running programs admission check: requires actively authorized in current policy
+        // and allowed in historical block. Strictly independent of the active_window usage driver.
+        let admit_programs = {
+            let auth = self.auth.read().unwrap();
+            auth.active && auth.perms.running_programs && perms.running_programs
+        };
+        let running_programs = if admit_programs {
+            match self.acquisition.running_programs() {
+                Ok(progs) => {
+                    let still_valid = {
+                        let auth = self.auth.read().unwrap();
+                        auth.active && auth.perms.running_programs
+                    };
+                    if still_valid {
+                        progs
+                    } else {
+                        Vec::new()
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(?e, "could not list running programs");
+                    Vec::new()
+                }
+            }
         } else {
             Vec::new()
         };
 
-        // 3. Screen capture clamping: drop if screenshot withdrawn in current policy,
-        // and apply conservative blur (must be blurred if current policy requires blur).
-        let screen = if current_perms.screenshot {
-            screen.filter(|c| c.blurred || !current_perms.blur_screenshots)
-        } else {
-            None
+        // 3. Screen capture clamping: verify screen passed in from caller against CURRENT authorization
+        // and enforce conservative blur requirement.
+        let screen = {
+            let auth = self.auth.read().unwrap();
+            if auth.active && auth.perms.screenshot && perms.screenshot {
+                screen.filter(|c| c.blurred || !auth.perms.blur_screenshots)
+            } else {
+                None
+            }
         };
 
-        // 4. Webcam capture: requires actively authorized in current policy,
+        // 4. Webcam capture admission check: requires actively authorized in current policy,
         // allowed in historical block, and block allows capture at end.
-        let webcam_jpg_base64 = if current_perms.webcam && perms.webcam && block.captures_at_end() {
-            self.acquisition.capture_webcam()
-                .map_err(|e| tracing::warn!(?e, "webcam capture failed"))
-                .ok()
+        let admit_webcam = {
+            let auth = self.auth.read().unwrap();
+            auth.active && auth.perms.webcam && perms.webcam && block.captures_at_end()
+        };
+        let webcam_jpg_base64 = if admit_webcam {
+            match self.acquisition.capture_webcam() {
+                Ok(b64) => {
+                    let still_valid = {
+                        let auth = self.auth.read().unwrap();
+                        auth.active && auth.perms.webcam
+                    };
+                    if still_valid {
+                        Some(b64)
+                    } else {
+                        None
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(?e, "webcam capture failed");
+                    None
+                }
+            }
         } else {
             None
         };
@@ -1222,5 +1367,227 @@ mod tests {
         let activity2 = tracker.snapshot(&spec, Some(blurred_cap));
         assert!(activity2.screenshot_png_base64.is_some());
         assert_eq!(activity2.screenshot_blurred, Some(true));
+    }
+
+    #[test]
+    fn tracker_consent_snapshot_interleaving_revocation_prevents_new_webcam_admission() {
+        let (tracker, driver, acq) = Tracker::new_fake_with_acquisition();
+        let tracker = Arc::new(tracker);
+
+        // 1. Initial grant with active_window and webcam
+        let mut initial_perms = CapturePermissions::all_disabled();
+        initial_perms.active_window = true;
+        initial_perms.webcam = true;
+        tracker.apply_sensor_policy(true, Some(&initial_perms));
+        assert!(tracker.is_tracking_active());
+        assert!(driver.is_usage_running());
+
+        // 2. Set up deterministic channels to pause inside current_window
+        let (window_entered_tx, window_entered_rx) = std::sync::mpsc::channel();
+        let (revoke_done_tx, revoke_done_rx) = std::sync::mpsc::channel();
+        let revoke_done_rx = Arc::new(Mutex::new(revoke_done_rx));
+        let rx_for_hook = revoke_done_rx.clone();
+
+        acq.set_on_current_window(move || {
+            window_entered_tx.send(()).unwrap();
+            rx_for_hook.lock().unwrap().recv_timeout(std::time::Duration::from_secs(5)).expect("timeout waiting for revocation");
+        });
+
+        // 3. Stale block spec with active_window and webcam
+        let spec_perms = initial_perms;
+        let tracker_clone = tracker.clone();
+        let handle = std::thread::spawn(move || {
+            let spec = block(&spec_perms, Some(EndReason::Interval));
+            tracker_clone.snapshot(&spec, None)
+        });
+
+        // 4. Wait for snapshot to enter current_window
+        window_entered_rx.recv_timeout(std::time::Duration::from_secs(5)).expect("timeout waiting for current_window entry");
+
+        // 5. Concurrently revoke all consent while snapshot is paused in current_window
+        tracker.apply_sensor_policy(false, None);
+        assert!(!tracker.is_tracking_active());
+        assert!(!driver.is_usage_running());
+
+        // 6. Release current_window so snapshot can proceed
+        revoke_done_tx.send(()).unwrap();
+
+        // 7. Await snapshot completion
+        let activity = handle.join().expect("snapshot thread panicked");
+
+        // 8. In-flight window call completed, but was discarded on exit because revocation completed in flight
+        assert_eq!(acq.window_calls(), 1);
+        assert!(activity.active_windows.is_empty(), "in-flight window result must be dropped upon revocation");
+
+        // 9. PROVE ZERO NEW WEBCAM ADMISSIONS: capture_webcam must NEVER be admitted after withdrawal!
+        assert_eq!(acq.webcam_calls(), 0, "must NOT admit webcam call after withdrawal completed");
+        assert!(activity.webcam_jpg_base64.is_none());
+        assert_eq!(acq.process_calls(), 0);
+        assert_eq!(acq.screen_calls(), 0);
+    }
+
+    #[test]
+    fn tracker_consent_process_only_positive_regression() {
+        let (tracker, driver, acq) = Tracker::new_fake_with_acquisition();
+
+        // 1. Process-only active policy: running_programs = true, active_window/input denied
+        let mut process_only = CapturePermissions::all_disabled();
+        process_only.running_programs = true;
+        tracker.apply_sensor_policy(true, Some(&process_only));
+
+        // 2. Tracking is active, but usage and input drivers remain strictly stopped
+        assert!(tracker.is_tracking_active(), "tracker must be active for process-only grant");
+        assert!(!driver.is_usage_running(), "usage driver must NOT run when active_window is denied");
+        assert!(!driver.is_input_running(), "input driver must NOT run when input is denied");
+
+        // 3. Snapshot with block permitting running_programs
+        let spec = block(&process_only, Some(EndReason::Interval));
+        let activity = tracker.snapshot(&spec, None);
+
+        // 4. Exactly one synthetic process query on provider; zero window/camera/screen calls
+        assert_eq!(acq.process_calls(), 1, "exactly one process query admitted");
+        assert_eq!(acq.window_calls(), 0, "zero window calls");
+        assert_eq!(acq.webcam_calls(), 0, "zero webcam calls");
+        assert_eq!(acq.screen_calls(), 0, "zero screen calls");
+
+        // 5. Returned fixture is present in emitted activity
+        assert_eq!(activity.running_programs.len(), 1);
+        assert_eq!(activity.running_programs[0].app_name, "code.exe");
+        assert!(activity.active_windows.is_empty());
+    }
+
+    #[test]
+    fn tracker_consent_capture_screen_race_and_revocation_prevents_subsequent_admission() {
+        let (tracker, _driver, acq) = Tracker::new_fake_with_acquisition();
+        let tracker = Arc::new(tracker);
+
+        let mut perms = CapturePermissions::all_disabled();
+        perms.screenshot = true;
+        tracker.apply_sensor_policy(true, Some(&perms));
+
+        let (screen_entered_tx, screen_entered_rx) = std::sync::mpsc::channel();
+        let (revoke_done_tx, revoke_done_rx) = std::sync::mpsc::channel();
+        let revoke_done_rx = Arc::new(Mutex::new(revoke_done_rx));
+        let rx_for_hook = revoke_done_rx.clone();
+
+        acq.set_on_capture_screen(move |_blur| {
+            screen_entered_tx.send(()).unwrap();
+            rx_for_hook.lock().unwrap().recv_timeout(std::time::Duration::from_secs(5)).expect("timeout waiting for revocation");
+        });
+
+        let tracker_clone = tracker.clone();
+        let handle = std::thread::spawn(move || {
+            tracker_clone.capture_screen(false)
+        });
+
+        // Wait until provider is entered
+        screen_entered_rx.recv_timeout(std::time::Duration::from_secs(5)).expect("timeout waiting for capture_screen entry");
+
+        // Revoke screenshot capability while in-flight
+        tracker.apply_sensor_policy(false, None);
+        assert!(!tracker.is_tracking_active());
+
+        // Release in-flight capture
+        revoke_done_tx.send(()).unwrap();
+
+        let cap = handle.join().expect("thread panicked");
+        // In-flight capture completed on hardware/provider, but post-admission verification discards it
+        assert!(cap.is_none(), "in-flight capture must be discarded if revoked while in flight");
+        assert_eq!(acq.screen_calls(), 1);
+
+        // Subsequent call to capture_screen: rejected at admission (zero new provider calls)
+        let second_cap = tracker.capture_screen(false);
+        assert!(second_cap.is_none());
+        assert_eq!(acq.screen_calls(), 1, "zero subsequent admissions after withdrawal");
+    }
+
+    #[test]
+    fn tracker_consent_pause_and_partial_narrowing_during_snapshot() {
+        let (tracker, driver, acq) = Tracker::new_fake_with_acquisition();
+        let tracker = Arc::new(tracker);
+
+        let mut initial_perms = CapturePermissions::all_disabled();
+        initial_perms.active_window = true;
+        initial_perms.running_programs = true;
+        initial_perms.webcam = true;
+        tracker.apply_sensor_policy(true, Some(&initial_perms));
+
+        let (window_entered_tx, window_entered_rx) = std::sync::mpsc::channel();
+        let (narrow_done_tx, narrow_done_rx) = std::sync::mpsc::channel();
+        let narrow_done_rx = Arc::new(Mutex::new(narrow_done_rx));
+        let rx_for_hook = narrow_done_rx.clone();
+
+        acq.set_on_current_window(move || {
+            window_entered_tx.send(()).unwrap();
+            rx_for_hook.lock().unwrap().recv_timeout(std::time::Duration::from_secs(5)).expect("timeout waiting for narrowing");
+        });
+
+        let spec_perms = initial_perms;
+        let tracker_clone = tracker.clone();
+        let handle = std::thread::spawn(move || {
+            let spec = block(&spec_perms, Some(EndReason::Interval));
+            tracker_clone.snapshot(&spec, None)
+        });
+
+        window_entered_rx.recv_timeout(std::time::Duration::from_secs(5)).expect("timeout");
+
+        // Partial narrowing: revoke active_window and webcam, but RETAIN running_programs
+        let mut narrowed = CapturePermissions::all_disabled();
+        narrowed.running_programs = true;
+        tracker.apply_sensor_policy(true, Some(&narrowed));
+        assert!(!driver.is_usage_running(), "usage driver stopped when active_window revoked");
+
+        narrow_done_tx.send(()).unwrap();
+
+        let activity = handle.join().expect("snapshot thread panicked");
+
+        // 1. In-flight window call was discarded
+        assert_eq!(acq.window_calls(), 1);
+        assert!(activity.active_windows.is_empty());
+
+        // 2. Retained running_programs capability WAS admitted!
+        assert_eq!(acq.process_calls(), 1, "retained running_programs must be queried");
+        assert_eq!(activity.running_programs.len(), 1);
+
+        // 3. Withdrawn webcam was REJECTED at admission (zero calls!)
+        assert_eq!(acq.webcam_calls(), 0, "withdrawn webcam must not be called");
+        assert!(activity.webcam_jpg_base64.is_none());
+    }
+
+    #[test]
+    fn tracker_consent_no_deadlock_between_slow_provider_and_sensor_policy() {
+        let (tracker, _driver, acq) = Tracker::new_fake_with_acquisition();
+        let tracker = Arc::new(tracker);
+
+        let mut perms = CapturePermissions::all_disabled();
+        perms.active_window = true;
+        tracker.apply_sensor_policy(true, Some(&perms));
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let rx_for_hook = release_rx.clone();
+
+        acq.set_on_current_window(move || {
+            entered_tx.send(()).unwrap();
+            rx_for_hook.lock().unwrap().recv_timeout(std::time::Duration::from_secs(5)).expect("timeout waiting for release");
+        });
+
+        let tracker_clone = tracker.clone();
+        let handle = std::thread::spawn(move || {
+            tracker_clone.current_app()
+        });
+
+        entered_rx.recv_timeout(std::time::Duration::from_secs(5)).expect("timeout");
+
+        // Crucial test: apply_sensor_policy must NOT block while current_window is executing!
+        // We assert apply_sensor_policy completes immediately without deadlocking or waiting for release.
+        tracker.apply_sensor_policy(false, None);
+        assert!(!tracker.is_tracking_active());
+
+        // Now release the provider
+        release_tx.send(()).unwrap();
+        let app = handle.join().expect("thread panicked");
+        assert!(app.is_none(), "result discarded because revoked while in flight");
     }
 }

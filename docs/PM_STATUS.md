@@ -198,6 +198,19 @@ At clean HEAD `cf4910d`, the PM independently inspected the diff and worker cons
      - `tracker_consent_legitimately_active_webcam_only_policy_invokes_camera_without_input_or_usage_drivers`: Proves webcam-only policy activates camera provider despite input and usage drivers not running.
      - `tracker_consent_held_block_safe_finalization_preserves_historical_accumulators_without_new_samples`: Proves held blocks finalized after revocation execute 0 new captures/samples while preserving historical keys, clicks, and slices.
      - `tracker_consent_conservative_blur_applies_if_either_current_or_block_requires_blur`: Proves conservative blur is applied whenever current policy or block policy requires blur.
+6. **Per-Capability Admission/Revocation Synchronization & Decoupled Process Enumeration**:
+   - Defect 1 resolved: `Tracker::snapshot` previously cloned authorization once at method entry and reused it across sequential provider calls. If an earlier call (`current_window`) was delayed while revocation occurred, a subsequent fresh `capture_webcam` was admitted under stale permissions. Additionally, `current_app` previously held its read guard across provider execution, risking blocking `apply_sensor_policy`.
+   - Architectural resolution:
+     - Every capability entry point (`capture_screen`, `snapshot`'s `window_now`, `running_programs`, `webcam_jpg_base64`, and `current_app`) performs an atomic pre-admission check under a brief read lock immediately before delegating to the provider. No single upfront snapshot is reused across steps.
+     - Read locks are NEVER held across provider calls. `apply_sensor_policy` completes unconditionally and instantaneously under write lock, advancing the authorization epoch and halting OS hook/sampler threads without being blocked.
+     - Native hardware limitation documented honestly: Synchronous OS APIs (Windows MediaFoundation, GDI/xcap, EnumWindows) cannot be cancelled mid-flight without unsafe thread aborts. However, subsequent admissions are immediately blocked (zero provider calls), and any admitted in-flight capture that finishes post-revocation is verified on exit and discarded immediately.
+   - Defect 2 resolved: `snapshot` previously checked `driver.is_usage_running()` for `running_programs`, but `apply_sensor_policy` only starts that driver for `active_window`. Process enumeration was silently skipped under a valid `running_programs=true, active_window=false` grant. Decoupled `running_programs` from the active-window driver, querying the process list based strictly on active authorization without starting disallowed foreground samplers.
+   - Added 5 new deterministic concurrency and positive process regressions (12 total isolated regressions):
+     - `tracker_consent_snapshot_interleaving_revocation_prevents_new_webcam_admission`: Proves snapshot blocked in window query during revocation drops window result and admits zero new webcam calls.
+     - `tracker_consent_process_only_positive_regression`: Proves active process-only grant queries running programs (1 call, fixture present) while usage/input drivers remain strictly stopped and zero window/camera/screen calls occur.
+     - `tracker_consent_capture_screen_race_and_revocation_prevents_subsequent_admission`: Proves in-flight screen capture during revocation is discarded on return, and subsequent call is rejected at admission.
+     - `tracker_consent_pause_and_partial_narrowing_during_snapshot`: Proves partial narrowing during multi-step snapshot admits retained capability while rejecting withdrawn webcam.
+     - `tracker_consent_no_deadlock_between_slow_provider_and_sensor_policy`: Proves `apply_sensor_policy` completes immediately without deadlocking or waiting for in-flight provider calls.
 
 ---
 
@@ -207,10 +220,10 @@ All tests executed in `clients/windows` with `RUST_BACKTRACE=1`. Synthetic QA on
 
 | Target Suite | Exact Command Line | Tests Passed | Ignored | Time | Exit Code | Evidence Level |
 |---|---|:---:|:---:|:---:|:---:|:---:|
-| **Compilation Gate** | `cargo check --bin dosi-tracker --tests` | N/A | 0 errors, 0 warnings | 2.31s | **0** | **[Worker-Reported]** |
-| **Config & Atomic Persistence** | `cargo test --bin dosi-tracker config::tests` | 15 | 0 | 0.01s | **0** | **[Worker-Reported]** |
-| **All Consent Tests (UI+Worker+Tracker)** | `cargo test --bin dosi-tracker consent` | 43 | 0 | 0.02s | **0** | **[Worker-Reported]** |
-| **Tracking Subsystem & Boundary** | `cargo test --bin dosi-tracker tracking::tests` | 18 | 0 | 0.01s | **0** | **[Worker-Reported]** |
+| **Compilation Gate** | `cargo check --bin dosi-tracker --tests` | N/A | 0 errors, 0 warnings | 2.22s | **0** | **[Worker-Reported]** |
+| **Config & Atomic Persistence** | `cargo test --bin dosi-tracker config::tests` | 15 | 0 | 0.03s | **0** | **[Worker-Reported]** |
+| **All Consent Tests (UI+Worker+Tracker)** | `cargo test --bin dosi-tracker consent` | 48 | 0 | 0.03s | **0** | **[Worker-Reported]** |
+| **Tracking Subsystem & Boundary** | `cargo test --bin dosi-tracker tracking::tests` | 23 | 0 | 0.01s | **0** | **[Worker-Reported]** |
 | **Tracking Lifecycle Suite** | `cargo test --bin dosi-tracker tracking::lifecycle::tests` | 11 | 0 | 0.10s | **0** | **[Worker-Reported]** |
 | **Worker Session Suite** | `cargo test --bin dosi-tracker worker::session::tests` | 10 | 0 | 0.00s | **0** | **[Worker-Reported]** |
 | **Worker Blocks Suite** | `cargo test --bin dosi-tracker worker::blocks::tests` | 19 | 0 | 0.00s | **0** | **[Worker-Reported]** |
