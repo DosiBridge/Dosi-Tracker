@@ -204,6 +204,11 @@ struct FakeMachine {
     last_screenshot: std::sync::atomic::AtomicBool,
     last_webcam: std::sync::atomic::AtomicBool,
     last_perms: Mutex<Option<CapturePermissions>>,
+    webcam_captures: std::sync::atomic::AtomicUsize,
+    window_queries: std::sync::atomic::AtomicUsize,
+    process_queries: std::sync::atomic::AtomicUsize,
+    snapshot_calls: std::sync::atomic::AtomicUsize,
+    on_snapshot: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 impl FakeMachine {
@@ -233,6 +238,11 @@ impl FakeMachine {
             last_screenshot: std::sync::atomic::AtomicBool::new(false),
             last_webcam: std::sync::atomic::AtomicBool::new(false),
             last_perms: Mutex::new(None),
+            webcam_captures: std::sync::atomic::AtomicUsize::new(0),
+            window_queries: std::sync::atomic::AtomicUsize::new(0),
+            process_queries: std::sync::atomic::AtomicUsize::new(0),
+            snapshot_calls: std::sync::atomic::AtomicUsize::new(0),
+            on_snapshot: Mutex::new(None),
         })
     }
 
@@ -293,6 +303,26 @@ impl FakeMachine {
     fn is_webcam_allowed(&self) -> bool {
         self.last_webcam.load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    fn webcam_captures(&self) -> usize {
+        self.webcam_captures.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn window_queries(&self) -> usize {
+        self.window_queries.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn process_queries(&self) -> usize {
+        self.process_queries.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn snapshot_calls(&self) -> usize {
+        self.snapshot_calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn set_on_snapshot<F: Fn() + Send + Sync + 'static>(&self, f: F) {
+        *self.on_snapshot.lock().unwrap() = Some(Box::new(f));
+    }
 }
 
 impl Machine for FakeMachine {
@@ -323,17 +353,90 @@ impl Machine for FakeMachine {
     }
 
     fn snapshot(&self, block: &BlockSpec<'_>, screen: Option<ScreenCapture>) -> Activity {
+        self.snapshot_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(hook) = self.on_snapshot.lock().unwrap().as_ref() {
+            hook();
+        }
+        let window_now = if block.perms.active_window && self.usage_running.load(std::sync::atomic::Ordering::SeqCst) {
+            self.window_queries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(crate::model::WindowInfo {
+                app_name: "code.exe".into(),
+                window_title: "main.rs".into(),
+                seconds: None,
+                keyboard_hits: None,
+                mouse_clicks: None,
+            })
+        } else {
+            None
+        };
+        let running_programs = if block.perms.running_programs && self.usage_running.load(std::sync::atomic::Ordering::SeqCst) {
+            self.process_queries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            vec![crate::model::WindowInfo {
+                app_name: "code.exe".into(),
+                window_title: "code".into(),
+                seconds: None,
+                keyboard_hits: None,
+                mouse_clicks: None,
+            }]
+        } else {
+            Vec::new()
+        };
+        let webcam_jpg_base64 = if block.perms.webcam && self.is_tracking_active() && block.captures_at_end() {
+            self.webcam_captures.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some("/9j/synthetic_webcam".into())
+        } else {
+            None
+        };
+        let key_presses: Vec<i64> = if block.perms.keyboard {
+            self.inputs
+                .lock()
+                .unwrap()
+                .iter()
+                .copied()
+                .filter(|t| *t >= block.started_at && *t <= block.ended_at)
+                .map(|t| t.timestamp_millis())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let clicks: Vec<i64> = if block.perms.mouse {
+            self.inputs
+                .lock()
+                .unwrap()
+                .iter()
+                .copied()
+                .filter(|t| *t >= block.started_at && *t <= block.ended_at)
+                .map(|t| t.timestamp_millis())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let slices = if block.perms.active_window {
+            vec![crate::tracking::usage::UsageSlice {
+                app: "code.exe".into(),
+                title: "main.rs".into(),
+                start_ms: block.started_at.timestamp_millis(),
+                end_ms: block.ended_at.timestamp_millis(),
+            }]
+        } else {
+            Vec::new()
+        };
+        let active_seconds = if !key_presses.is_empty() || !clicks.is_empty() {
+            vec![block.started_at.timestamp()]
+        } else {
+            Vec::new()
+        };
         let measured = Measurements {
-            key_presses: Vec::new(),
-            clicks: Vec::new(),
-            active_seconds: Vec::new(),
+            key_presses,
+            clicks,
+            active_seconds,
             injected: 0,
             input_available: true,
-            slices: Vec::new(),
-            window_now: None,
-            running_programs: Vec::new(),
+            slices,
+            window_now,
+            running_programs,
             screen,
-            webcam_jpg_base64: None,
+            webcam_jpg_base64,
         };
         build_activity(block, measured, &self.device, Zone { time_zone: Some("UTC".into()), utc_offset_minutes: 0 })
     }
@@ -2415,3 +2518,197 @@ fn consent_19_multithreaded_barrier_proves_withdrawn_sensors_stopped_while_store
     assert_eq!(h.status(), TrackerStatus::Tracking);
     assert_eq!(h.consent_store.save_count(), 1);
 }
+
+#[test]
+fn consent_20_withdrawn_sensors_stopped_before_reconcile_record_blocks() {
+    let broad = ConsentedPermissions {
+        screenshot: true,
+        webcam: true,
+        keyboard: true,
+        mouse: true,
+        active_window: true,
+        running_programs: true,
+        blur_screenshots: true,
+    };
+    let mut h = harness_with_consent(
+        at("10:00:00"),
+        Some(saved(vec![project_allowing_all("p1", 5)], Some("p1"))),
+        LocalConsent::Granted(broad),
+    );
+    assert_eq!(h.status(), TrackerStatus::Tracking);
+    assert!(h.machine.is_tracking_active());
+    assert!(h.machine.is_input_running());
+    assert!(h.machine.is_usage_running());
+
+    // Deterministic channel-based synchronization asserting stopped drivers
+    // WHILE finalization/record is actively executing in machine.snapshot!
+    let (enter_tx, enter_rx) = std::sync::mpsc::channel::<()>();
+    let (exit_tx, exit_rx) = std::sync::mpsc::channel::<()>();
+    let exit_rx = Mutex::new(exit_rx);
+
+    h.machine.set_on_snapshot(move || {
+        let _ = enter_tx.send(());
+        let _ = exit_rx.lock().unwrap().recv();
+    });
+
+    let machine = h.machine.clone();
+
+    let worker_thread = std::thread::spawn(move || {
+        h.command(at("10:01:00"), Command::UpdateConsent { consent: LocalConsent::Revoked });
+        h
+    });
+
+    // Test coordinator: wait until worker reaches machine.snapshot during finalization/record
+    enter_rx.recv().expect("worker thread must enter snapshot during finalization");
+
+    // AT THIS EXACT MOMENT:
+    // The worker is actively executing record() -> snapshot().
+    // consent_store.save has NOT even been called yet.
+    // Assert native sensor drivers were ALREADY stopped ahead of reconcile/record:
+    assert!(!machine.is_tracking_active(), "tracking stopped before record/snapshot");
+    assert!(!machine.is_input_running(), "input driver stopped before record/snapshot");
+    assert!(!machine.is_usage_running(), "usage driver stopped before record/snapshot");
+    assert_eq!(machine.captures(), 0, "no screen captures taken while record is blocked");
+    assert_eq!(machine.webcam_captures(), 0, "no webcam captures taken while record is blocked");
+    assert_eq!(machine.window_queries(), 0, "no window queries taken while record is blocked");
+    assert_eq!(machine.process_queries(), 0, "no process queries taken while record is blocked");
+
+    // Release worker thread cleanly
+    drop(exit_tx);
+
+    let h = worker_thread.join().expect("worker thread must finish cleanly");
+    assert_eq!(h.status(), TrackerStatus::ConsentRequired);
+    assert_eq!(h.consent_store.save_count(), 1);
+    assert_eq!(h.consent_store.load(), LocalConsent::Revoked);
+    assert_eq!(h.machine.snapshot_calls(), 1, "exactly one snapshot during finalization");
+
+    assert_eq!(h.machine.captures(), 0, "final screen captures remain zero");
+    assert_eq!(h.machine.webcam_captures(), 0, "final webcam captures remain zero");
+    assert_eq!(h.machine.window_queries(), 0, "final window queries remain zero");
+    assert_eq!(h.machine.process_queries(), 0, "final process queries remain zero");
+}
+
+#[test]
+fn consent_21_held_blocks_do_not_acquire_withdrawn_screen_or_webcam_at_finalization() {
+    let broad = ConsentedPermissions {
+        screenshot: true,
+        webcam: true,
+        keyboard: true,
+        mouse: true,
+        active_window: true,
+        running_programs: true,
+        blur_screenshots: true,
+    };
+    let mut h = harness_with_consent(
+        at("10:00:00"),
+        Some(saved(vec![project_allowing_all("p1", 30)], Some("p1"))),
+        LocalConsent::Granted(broad),
+    );
+    assert_eq!(h.status(), TrackerStatus::Tracking);
+
+    // Record user input at 10:03:00 during the active block
+    h.machine.input_at(at("10:03:00"));
+
+    // Tick past block boundary (10:10:01) with last input at 10:03:00.
+    // Under 30-min idle threshold, the 10:00-10:10 block is held in stretch.held
+    h.tick(at("10:10:01"));
+    assert_eq!(h.queued().len(), 0, "first block is held awaiting user return");
+    let captures_before_revoke = h.machine.captures();
+
+    // At 10:12:00, user explicitly revokes consent while the block is held!
+    h.command(at("10:12:00"), Command::UpdateConsent { consent: LocalConsent::Revoked });
+
+    assert_eq!(h.status(), TrackerStatus::ConsentRequired);
+    assert_eq!(h.machine.snapshot_calls(), 2, "snapshots taken for both held and open block");
+
+    // Assert actual acquisition call counts on fake machine:
+    // Withdrawn sensors must NEVER perform fresh captures or queries at finalization
+    assert_eq!(h.machine.captures(), captures_before_revoke, "no new screen captures taken at finalization");
+    assert_eq!(h.machine.webcam_captures(), 0, "no webcam photos taken for held or open blocks");
+    assert_eq!(h.machine.window_queries(), 0, "no foreground window sampling after withdrawal");
+    assert_eq!(h.machine.process_queries(), 0, "no running programs listing after withdrawal");
+
+    // Verify retained historical work:
+    // Both the held block (10:00-10:10) and final sliver (10:10-10:12) are queued,
+    // retaining already-authorized historical time and input counts without fresh capture data.
+    let queued = h.queued();
+    assert_eq!(queued.len(), 2, "both held block and closing sliver were finalized");
+
+    let held_block = &queued[0];
+    assert_eq!(held_block.started_at, at("10:00:00"));
+    assert_eq!(held_block.ended_at, at("10:10:00"));
+    assert_eq!(held_block.keyboard_hits, 1, "authorized key hits in held block preserved");
+    assert_eq!(held_block.mouse_clicks, 1, "authorized clicks in held block preserved");
+    assert_eq!(held_block.active_windows.len(), 1, "authorized usage slice preserved");
+    assert_eq!(held_block.screenshot_png_base64, None, "no screenshot acquired on held block");
+    assert_eq!(held_block.webcam_jpg_base64, None, "no webcam acquired on held block");
+    assert!(held_block.running_programs.is_empty(), "no process sampling on held block");
+
+    let open_block = &queued[1];
+    assert_eq!(open_block.started_at, at("10:10:00"));
+    assert_eq!(open_block.ended_at, at("10:12:00"));
+    assert_eq!(open_block.screenshot_png_base64, None, "no screenshot acquired on open block");
+    assert_eq!(open_block.webcam_jpg_base64, None, "no webcam acquired on open block");
+    assert!(open_block.running_programs.is_empty(), "no process sampling on open block");
+}
+
+#[test]
+fn consent_22_mixed_narrowing_stops_withdrawn_sensors_before_reconcile_record_blocks() {
+    let broad = ConsentedPermissions {
+        screenshot: true,
+        webcam: true,
+        keyboard: true,
+        mouse: true,
+        active_window: true,
+        running_programs: true,
+        blur_screenshots: true,
+    };
+    let mut h = harness_with_consent(
+        at("10:00:00"),
+        Some(saved(vec![project_allowing_all("p1", 5)], Some("p1"))),
+        LocalConsent::Granted(broad),
+    );
+    assert_eq!(h.status(), TrackerStatus::Tracking);
+
+    // Record user input at 10:02:00
+    h.machine.input_at(at("10:02:00"));
+
+    let narrower = ConsentedPermissions {
+        screenshot: false,
+        webcam: false,
+        keyboard: false,
+        mouse: true,
+        active_window: false,
+        running_programs: false,
+        blur_screenshots: true,
+    };
+
+    // User narrows permissions while tracking:
+    h.command(at("10:05:00"), Command::UpdateConsent { consent: LocalConsent::Granted(narrower) });
+    assert_eq!(h.status(), TrackerStatus::Tracking);
+
+    // Native sensors for withdrawn capabilities are stopped immediately:
+    assert!(!h.machine.last_keyboard.load(std::sync::atomic::Ordering::SeqCst), "keyboard stopped");
+    assert!(!h.machine.is_usage_running(), "usage sampler stopped");
+    assert!(!h.machine.is_screenshot_allowed(), "screenshot disallowed");
+    assert!(!h.machine.is_webcam_allowed(), "webcam disallowed");
+    assert!(h.machine.last_mouse.load(std::sync::atomic::Ordering::SeqCst), "retained mouse still running");
+
+    // Now tick past 10:10 to finalize the block:
+    h.tick(at("10:10:01"));
+
+    // Assert zero acquisitions for withdrawn capabilities:
+    assert_eq!(h.machine.captures(), 0, "no screen captures taken at block boundary");
+    assert_eq!(h.machine.webcam_captures(), 0, "no webcam photos taken at block boundary");
+    assert_eq!(h.machine.window_queries(), 0, "no foreground window sampling at block boundary");
+    assert_eq!(h.machine.process_queries(), 0, "no process queries at block boundary");
+
+    let queued = h.queued();
+    assert_eq!(queued.len(), 1, "interval block recorded");
+    assert_eq!(queued[0].keyboard_hits, 0, "withdrawn keyboard count not populated");
+    assert_eq!(queued[0].mouse_clicks, 1, "retained mouse clicks preserved");
+    assert_eq!(queued[0].screenshot_png_base64, None, "no screenshot attached");
+    assert_eq!(queued[0].webcam_jpg_base64, None, "no webcam attached");
+    assert!(queued[0].running_programs.is_empty(), "no running programs attached");
+}
+

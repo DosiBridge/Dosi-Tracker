@@ -880,6 +880,19 @@ impl Worker {
             && self.shutting_down.is_none()
     }
 
+    /// Returns the currently active effective permissions consented by the user and permitted
+    /// by session/policy. If consent is absent, revoked, or unsynced (fail-closed), all permissions
+    /// are strictly false.
+    fn current_effective_perms(&self) -> CapturePermissions {
+        if !self.cfg.consent.is_granted() || self.consent_unsynced {
+            return CapturePermissions::all_disabled();
+        }
+        self.session
+            .as_ref()
+            .map(|s| s.policy.perms)
+            .unwrap_or_else(CapturePermissions::all_disabled)
+    }
+
     /// Start or stop the stretch to match the facts; a stop ends the block
     /// at `at` by `reason`.
     fn reconcile(&mut self, at: DateTime<Utc>, reason: EndReason) {
@@ -913,6 +926,7 @@ impl Worker {
             return;
         };
         let now = self.now();
+        let current_perms = self.current_effective_perms();
         let mut queued = 0;
         for block in finished {
             let late = now - block.ended_at > LATE;
@@ -920,21 +934,28 @@ impl Worker {
                 .take_screen(block.id)
                 .filter(|capture| capture.captured_at <= block.ended_at + CAPTURE_SLACK);
             // Ended before its screenshot moment: taken at the end instead —
-            // unless the machine is locked, asleep, idle or shutting down.
+            // unless the machine is locked, asleep, idle or shutting down,
+            // or screenshot permission has been withdrawn.
             let capture_now = taken.is_none()
                 && speed == Speed::Normal
                 && !late
                 && block.capture_at_end
                 && block.policy.perms.screenshot
+                && current_perms.screenshot
                 && block.end_reason.allows_capture_at_end();
             let screen = if capture_now {
-                self.machine.capture_screen(block.policy.perms.blur_screenshots)
-            } else {
+                self.machine.capture_screen(block.policy.perms.blur_screenshots || current_perms.blur_screenshots)
+            } else if current_perms.screenshot {
                 taken
+            } else {
+                None
             };
             let mut perms = block.policy.perms.clone();
-            if speed == Speed::Fast || late {
+            if speed == Speed::Fast || late || !current_perms.webcam {
                 perms.webcam = false;
+            }
+            if !current_perms.running_programs {
+                perms.running_programs = false;
             }
             let spec = BlockSpec {
                 project_id: &block.policy.project_id,
@@ -1014,7 +1035,12 @@ impl Worker {
     }
 
     fn capture(&mut self, id: BlockId) {
-        let blur = self.blocks.stretch().is_some_and(|s| s.block.policy.perms.blur_screenshots);
+        let current_perms = self.current_effective_perms();
+        if !current_perms.screenshot {
+            return;
+        }
+        let blur = current_perms.blur_screenshots
+            || self.blocks.stretch().is_some_and(|s| s.block.policy.perms.blur_screenshots);
         if let Some(screen) = self.machine.capture_screen(blur) {
             self.screens.push((id, screen));
         }
@@ -1307,15 +1333,15 @@ impl Worker {
             self.screens.clear();
         }
 
-        // Apply narrowed policy to native sensor drivers immediately
+        // Apply narrowed policy to native sensor drivers immediately BEFORE reconcile / record / persistence
         if self.should_track() {
-            self.reconcile(now, EndReason::Interval);
             if let Some(session) = self.session.as_ref() {
                 self.machine.apply_sensor_policy(true, Some(&session.policy.perms));
             }
+            self.reconcile(now, EndReason::Interval);
         } else {
-            self.reconcile(now, EndReason::Pause);
             self.machine.apply_sensor_policy(false, None);
+            self.reconcile(now, EndReason::Pause);
         }
 
         // Step 2: Now invoke persistence (which may block on slow I/O or fail)
@@ -1339,13 +1365,13 @@ impl Worker {
                 }
 
                 if self.should_track() {
-                    self.reconcile(now, EndReason::Interval);
                     if let Some(session) = self.session.as_ref() {
                         self.machine.apply_sensor_policy(true, Some(&session.policy.perms));
                     }
+                    self.reconcile(now, EndReason::Interval);
                 } else {
-                    self.reconcile(now, EndReason::Pause);
                     self.machine.apply_sensor_policy(false, None);
+                    self.reconcile(now, EndReason::Pause);
                 }
             }
             Err(e) => {
@@ -1376,8 +1402,8 @@ impl Worker {
                     }
                 }
 
-                self.reconcile(now, EndReason::Pause);
                 self.machine.apply_sensor_policy(false, None);
+                self.reconcile(now, EndReason::Pause);
                 self.screens.clear();
             }
         }

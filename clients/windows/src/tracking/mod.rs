@@ -213,7 +213,7 @@ impl Tracker {
                 Vec::new()
             },
             screen,
-            webcam_jpg_base64: if perms.webcam && block.captures_at_end() {
+            webcam_jpg_base64: if self.is_tracking_active() && perms.webcam && block.captures_at_end() {
                 webcam::capture_jpg_base64()
                     .map_err(|e| tracing::warn!(?e, "webcam capture failed"))
                     .ok()

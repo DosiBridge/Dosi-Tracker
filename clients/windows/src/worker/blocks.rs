@@ -250,13 +250,22 @@ impl Blocks {
         }
     }
 
-    /// Immediately narrows permissions on both the pending stretch policy and the current open block,
-    /// ensuring that any withdrawn capabilities (e.g. screenshots) cannot be scheduled or captured
-    /// during the current block.
+    /// Immediately narrows permissions on the pending stretch policy, the current open block,
+    /// and any held finished blocks awaiting release, ensuring that any withdrawn capabilities
+    /// (e.g. screenshots or webcam) cannot be scheduled or captured during finalization.
     pub fn narrow_block_permissions(&mut self, perms: &crate::config::CapturePermissions) {
         if let Some(stretch) = self.stretch.as_mut() {
             stretch.policy.perms = *perms;
             stretch.block.policy.perms = *perms;
+            for held in &mut stretch.held {
+                held.policy.perms.screenshot = held.policy.perms.screenshot && perms.screenshot;
+                held.policy.perms.webcam = held.policy.perms.webcam && perms.webcam;
+                held.policy.perms.running_programs = held.policy.perms.running_programs && perms.running_programs;
+                held.policy.perms.blur_screenshots = held.policy.perms.blur_screenshots || perms.blur_screenshots;
+                if !perms.screenshot {
+                    held.capture_at_end = false;
+                }
+            }
         }
     }
 
@@ -295,7 +304,7 @@ fn finish(block: &OpenBlock, end: DateTime<Utc>, reason: EndReason) -> FinishedB
         end_reason: reason,
         policy: block.policy.clone(),
         description: block.description.clone(),
-        capture_at_end: !block.captured && ended_at < block.capture_at,
+        capture_at_end: block.policy.perms.screenshot && !block.captured && ended_at < block.capture_at,
     }
 }
 
@@ -627,5 +636,29 @@ mod tests {
         none.perms.screenshot = false;
         no_screens.start(at("10:00:00"), none, None, 0.5);
         assert_eq!(no_screens.capture_due(at("10:09:00")), None);
+    }
+
+    #[test]
+    fn narrow_block_permissions_narrows_held_blocks() {
+        let mut blocks = started(10, Some(30));
+        // Tick past 10:10 with last input at 10:03; 10:00-10:10 block is held
+        blocks.tick(at("10:10:01"), Some(at("10:03:00")), &mut mid());
+        assert!(blocks.stretch().unwrap().holding(), "first block is held");
+
+        let mut narrower = policy(10, Some(30)).perms;
+        narrower.screenshot = false;
+        narrower.webcam = false;
+        narrower.running_programs = false;
+
+        blocks.narrow_block_permissions(&narrower);
+
+        let finished = blocks.end(at("10:12:00"), at("10:12:00"), EndReason::Pause);
+        assert_eq!(finished.len(), 2, "both held block and open block released");
+        for block in &finished {
+            assert!(!block.policy.perms.screenshot, "held and open screenshot disabled");
+            assert!(!block.policy.perms.webcam, "held and open webcam disabled");
+            assert!(!block.policy.perms.running_programs, "held and open running_programs disabled");
+            assert!(!block.capture_at_end, "held and open capture_at_end disabled");
+        }
     }
 }

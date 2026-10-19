@@ -195,12 +195,12 @@ All tests executed in `clients/windows` with `RUST_BACKTRACE=1`. Synthetic QA on
 |---|---|:---:|:---:|:---:|:---:|:---:|
 | **Compilation Gate** | `cargo check --bin dosi-tracker` | N/A | 0 errors, 0 warnings | 0.47s | **0** | **[Worker-Reported]** |
 | **Config & Atomic Persistence** | `cargo test --bin dosi-tracker config::tests` | 15 | 0 | 0.01s | **0** | **[Worker-Reported]** |
-| **All Consent Tests (UI+Worker)** | `cargo test --bin dosi-tracker consent` | 33 | 0 | 0.12s | **0** | **[Worker-Reported]** |
+| **All Consent Tests (UI+Worker)** | `cargo test --bin dosi-tracker consent` | 36 | 0 | 0.13s | **0** | **[Worker-Reported]** |
 | **Tracking Lifecycle Suite** | `cargo test --bin dosi-tracker tracking::lifecycle::tests` | 11 | 0 | 0.10s | **0** | **[Worker-Reported]** |
 | **Worker Session Suite** | `cargo test --bin dosi-tracker worker::session::tests` | 10 | 0 | 0.00s | **0** | **[Worker-Reported]** |
-| **Worker Blocks Suite** | `cargo test --bin dosi-tracker worker::blocks::tests` | 18 | 0 | 0.00s | **0** | **[Worker-Reported]** |
+| **Worker Blocks Suite** | `cargo test --bin dosi-tracker worker::blocks::tests` | 19 | 0 | 0.00s | **0** | **[Worker-Reported]** |
 
-#### Detailed 19-Scenario Consent Lifecycle Test Matrix (`worker::tests::consent_*`)
+#### Detailed 22-Scenario Consent Lifecycle Test Matrix (`worker::tests::consent_*`)
 1. `consent_1_fresh_config_absent`: Fresh config with `LocalConsent::Absent` yields `TrackerStatus::ConsentRequired`, 0 sensor starts, 0 running drivers.
 2. `consent_2_legacy_config_absent`: Deserializing legacy empty JSON defaults to `LocalConsent::Absent`; missing `consent.json` fails closed to `Absent`.
 3. `consent_3_explicit_granular_grant`: Granting keyboard-only attaches input hooks for keyboard without mouse or active window samplers.
@@ -220,6 +220,9 @@ All tests executed in `clients/windows` with `RUST_BACKTRACE=1`. Synthetic QA on
 17. `consent_17_mixed_narrowing_and_expansion_request_under_blocked_store`: Proves withdrawn permissions halt immediately while unpersisted expansions remain disabled until persistence succeeds.
 18. `consent_18_blocked_save_failure_fails_closed_and_prevents_resume`: Injected write failure proves fail-closed transition (all sensors stopped), `consent_unsynced: true`, honest restart warning, and resume prevention.
 19. `consent_19_multithreaded_barrier_proves_withdrawn_sensors_stopped_while_store_blocked`: Cross-thread barrier synchronization proves sensors are halted while the worker thread is suspended in `consent_store.save`.
+20. `consent_20_withdrawn_sensors_stopped_before_reconcile_record_blocks`: Deterministic channel synchronization proves native sensor drivers are stopped/narrowed *before* `reconcile` and `record` execute, with 0 driver queries or captures while `snapshot` is in flight.
+21. `consent_21_held_blocks_do_not_acquire_withdrawn_screen_or_webcam_at_finalization`: Proves held blocks released at revocation do not trigger new screenshot or webcam captures (0 new captures), purge buffered captures, yet preserve authorized historical time and key/click counts.
+22. `consent_22_mixed_narrowing_stops_withdrawn_sensors_before_reconcile_record_blocks`: Proves mixed narrowing stops withdrawn native drivers immediately ahead of reconciliation/tick, ensuring no fresh sampling occurs at block boundary while retained capabilities (e.g. mouse) continue.
 
 ---
 
@@ -228,7 +231,7 @@ All tests executed in `clients/windows` with `RUST_BACKTRACE=1`. Synthetic QA on
 | Evidence Dimension | Windows (Rust) | macOS (Swift) | Linux (Target) |
 |---|---|---|---|
 | **1. Implemented Source** | ⚠️ Corrective source present (`clients/windows`: egui UI, Win32 hooks, xcap, DPAPI, SQLite queue, `ConsentedPermissions`, `ConsentStore`, `atomic_write_file`, monotonic narrowing); native interactive hooks, packaging, and signing open | ⚠️ Source present (`clients/macos`: SwiftUI, ScreenCaptureKit, Keychain, SQLite queue); source presence is NOT proof of complete implementation; TCC consent, runtime execution, packaging, and notarization open | ❌ **Unresolved Gap** (`clients/linux` crate not yet created) |
-| **2. Synthetic / Mock Unit Tests** | ⚠️ **Worker-Reported Only** (33 consent tests, 11 lifecycle tests, 10 session tests, 15 config tests, 18 block tests passing locally; awaiting PM independent review) | ⚠️ Unverified locally (Swift test files present in source; not executed locally) | ❌ 0 tests (No crate) |
+| **2. Synthetic / Mock Unit Tests** | ⚠️ **Worker-Reported Only** (36 consent tests, 11 lifecycle tests, 10 session tests, 15 config tests, 19 block tests passing locally; awaiting PM independent review) | ⚠️ Unverified locally (Swift test files present in source; not executed locally) | ❌ 0 tests (No crate) |
 | **3. Toolchain / Compile / Build** | ✅ Verified locally (Rustc / Cargo 1.97.1 on Windows 11 host) | ❌ Unverified locally (Host lacks macOS toolchain / Xcode) | ❌ Unverified locally (Host lacks Linux build container / environment) |
 | **4. Native Interactive Runtime** | ⚠️ **Unverified** (Unit tests run synthetically via `FakeSensorDriver`, `MemoryConsentStore`, `ConsentViewModel`; interactive Win32 desktop hooks unverified in QA) | ⚠️ **Outstanding** (Requires physical macOS execution environment) | ❌ **Outstanding** (Requires Linux X11/Wayland execution environment) |
 | **5. Packaging / Install / Uninstall** | ⚠️ Partial (NSIS `.nsi` script present; silent install/uninstall unverified in CI) | ⚠️ Partial (`build-app.sh` creates bundle; DMG packaging unverified) | ❌ **Unresolved Gap** (No `.deb`, AppImage, or Flatpak manifest) |
