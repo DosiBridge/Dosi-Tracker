@@ -107,7 +107,7 @@ pub fn restored_pause(saved: Option<SavedPause>, now: DateTime<Utc>, launched_at
 }
 
 /// What decides the status.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct Facts {
     /// The local queue is unusable: nothing can be recorded.
     pub storage_failed: bool,
@@ -126,6 +126,28 @@ pub struct Facts {
     /// Asleep, or Windows is shutting down.
     pub suspended: bool,
     pub tracking: bool,
+    /// Affirmative local user consent state.
+    pub consent: crate::config::LocalConsent,
+}
+
+impl Default for Facts {
+    fn default() -> Self {
+        Self {
+            storage_failed: false,
+            signed_in: false,
+            sign_in_expired: false,
+            paused: false,
+            has_session: false,
+            no_workspace: false,
+            projects_known: false,
+            contacting: false,
+            locked: false,
+            away: false,
+            suspended: false,
+            tracking: false,
+            consent: crate::config::LocalConsent::Granted(crate::config::CapturePermissions::default()),
+        }
+    }
 }
 
 /// The status the window and the tray show; the first reason tracking is
@@ -137,6 +159,8 @@ pub fn status(facts: &Facts) -> TrackerStatus {
         TrackerStatus::SignedOut
     } else if facts.sign_in_expired {
         TrackerStatus::SignInExpired
+    } else if !facts.consent.is_granted() {
+        TrackerStatus::ConsentRequired
     } else if facts.paused {
         TrackerStatus::Paused
     } else if !facts.has_session {
@@ -170,7 +194,11 @@ pub fn presence(status: TrackerStatus, timed_break: bool) -> Option<PresenceStat
         TrackerStatus::Locked => PresenceStatus::Locked,
         TrackerStatus::ChooseProject => PresenceStatus::Choosing,
         TrackerStatus::Stopped => PresenceStatus::Stopped,
-        TrackerStatus::SignedOut | TrackerStatus::SignInExpired | TrackerStatus::Connecting | TrackerStatus::Offline => {
+        TrackerStatus::SignedOut
+        | TrackerStatus::SignInExpired
+        | TrackerStatus::Connecting
+        | TrackerStatus::Offline
+        | TrackerStatus::ConsentRequired => {
             return None
         }
     })

@@ -103,29 +103,76 @@ This correction introduces an injectable sensor driver foundation without archit
 | **Filter Inactive Health/Timing** | `cargo test --bin dosi-tracker tracking::input::tests::inactive_filter_does_not_update_health_or_key_down_state -- --exact` | 1 | **0** | Verified by PM @ `8c1b201` |
 | **Filter Per-Sensor Gating** | `cargo test --bin dosi-tracker tracking::input::tests::per_sensor_permission_gating_in_filter -- --exact` | 1 | **0** | Verified by PM @ `8c1b201` |
 
+#### 3. Baseline at Commit `95a4ba7` (Verified by PM)
+
+| Suite / Command | Exact Command Line | Tests Passed | Exit Code | Provenance |
+|---|---|:---:|:---:|---|
+| **Tracking Lifecycle Suite** | `cargo test --bin dosi-tracker tracking::lifecycle::tests` | 11 | **0** | Verified by PM @ `95a4ba7` |
+| **Worker Session Suite** | `cargo test --bin dosi-tracker worker::session::tests` | 10 | **0** | Verified by PM @ `95a4ba7` |
+
+*Supervisory Note on `95a4ba7`:* Bounded synthetic unit evidence ONLY. It is NOT acceptance of native hook detachment/runtime, full product readiness, or whole product readiness.
+
 ---
 
-### B. Worker-Reported Test Execution (Step 1C Hardening at Current Working Tree)
+### B. Current Bounded Phase: Windows Explicit Local-Consent UX and Lifecycle Integration
+
+This phase implements the complete Windows local-consent UX slice and worker lifecycle boundary, satisfying privacy prerequisites:
+1. **Clear Disclosure & Granular Opt-In (`clients/windows/src/ui/consent.rs` & `clients/windows/src/ui/settings.rs`)**:
+   - Explicit disclosure of what is collected and what is **NEVER collected** (raw keystrokes, typed text, clipboard, microphone, personal files).
+   - Granular opt-in toggles for:
+     - Keyboard & mouse input COUNTS
+     - Active application & window title context
+     - Periodic screenshots (+ local blurring)
+     - Webcam photos
+   - Default-off: upon fresh launch or revoked consent, all capability checkboxes default to unchecked (`false`).
+   - Pure, headless view model (`ConsentViewModel`) isolated for automated unit testing (`ui::consent::tests`).
+   - Interactive GUI verification in live Win32 display session was **NOT run in automation** and is explicitly reported as unverified.
+2. **Fail-Closed Persistence (`clients/windows/src/config.rs`)**:
+   - Persisted separately in `%APPDATA%\DosiTracker\consent.json` without modifying DPAPI credentials or `config.toml`, avoiding any secrets risk or authentication migration hazards.
+   - Missing or corrupted file fails closed to `LocalConsent::Absent`. No silent opt-in migration for existing installs.
+3. **Strict Policy Intersection (`Effective = ProjectPolicy ∩ LocalConsent`)**:
+   - Workspace policy can restrict but can never broaden user consent.
+   - If user denies or revokes a capability, sensor driver never starts even if permitted by workspace admin.
+   - Decline or revoke immediately terminates in-flight blocks and stops sensor drivers before acknowledgment/publishing.
+4. **Lifecycle & Transition Invariants (`clients/windows/src/worker.rs`)**:
+   - Opening settings, selecting a project/workspace, logging in, or restoring config does NOT start tracking.
+   - Truthful pause/resume: revoking consent while paused prevents resumption; system lock stops sensors, and revoking during lock prevents resumption upon unlock.
+   - Zero duplicate thread starts on repeated redundant commands.
+
+---
+
+### C. Worker-Reported Test Execution (Current Working Tree)
 
 All tests executed with `RUST_BACKTRACE=1` in `clients/windows`. Synthetic QA only; no real Win32 input hooks, foreground window enumeration, desktop collection, screen capture, or webcam capture were invoked during execution.
 
 | Target Suite | Exact Command Line | Tests Passed | Ignored | Time | Exit Code | Evidence Level |
 |---|---|:---:|:---:|:---:|:---:|:---:|
-| **Compilation Gate** | `cargo check --bin dosi-tracker` | N/A | 0 errors, 0 warnings | 1.32s | **0** | **[Worker-Reported]** |
-| **Sensor Lifecycle Suite** | `cargo test --bin dosi-tracker tracking::lifecycle::tests` | 11 | 0 | 0.10s | **0** | **[Worker-Reported]** |
+| **Compilation Gate** | `cargo check --bin dosi-tracker` | N/A | 0 errors, 0 warnings | 1.58s | **0** | **[Worker-Reported]** |
+| **UI Consent View Model** | `cargo test --bin dosi-tracker ui::consent::tests` | 6 | 0 | 0.00s | **0** | **[Worker-Reported]** |
+| **All Consent Tests (UI+Worker)** | `cargo test --bin dosi-tracker consent` | 21 | 0 | 0.02s | **0** | **[Worker-Reported]** |
+| **Tracking Lifecycle Suite** | `cargo test --bin dosi-tracker tracking::lifecycle::tests` | 11 | 0 | 0.10s | **0** | **[Worker-Reported]** |
 | **Worker Session Suite** | `cargo test --bin dosi-tracker worker::session::tests` | 10 | 0 | 0.00s | **0** | **[Worker-Reported]** |
-| **Worker Sensor Lifecycle** | `cargo test --bin dosi-tracker worker::tests::sensor_lifecycle` | 6 | 0 | 2.02s | **0** | **[Worker-Reported]** |
-| **Worker Consent Fail-Closed**| `cargo test --bin dosi-tracker worker::tests::worker_fails_closed_when_consent_is_absent -- --exact` | 1 | 0 | 0.01s | **0** | **[Worker-Reported]** |
-| **Worker Pause/Resume** | `cargo test --bin dosi-tracker worker::tests::tracking_active_follows_pause_and_resume_lifecycle -- --exact` | 1 | 0 | 0.01s | **0** | **[Worker-Reported]** |
-| **Tracking Suite** | `cargo test --bin dosi-tracker tracking::tests` | 11 | 0 | 0.00s | **0** | **[Worker-Reported]** |
+| **UI Settings Privacy Tests** | `cargo test --bin dosi-tracker ui::settings::tests` | 2 | 0 | 0.00s | **0** | **[Worker-Reported]** |
 | **Input Counter & Filter** | `cargo test --bin dosi-tracker tracking::input::tests` | 35 | 1 | 0.01s | **0** | **[Worker-Reported]** |
 | **Usage Recorder Suite** | `cargo test --bin dosi-tracker tracking::usage::tests` | 16 | 0 | 0.00s | **0** | **[Worker-Reported]** |
-| **Total Focused Synthetic Tests**| Sum of focused suites above | **91** | 1 (`the_real_hooks_report_injected_input_as_injected`) | ~2.6s | **0** | **[Worker-Reported]** |
+
+#### Detailed 11-Scenario Consent Lifecycle Test Matrix (`worker::tests::consent_*`)
+1. `consent_1_fresh_config_absent`: Fresh config with `LocalConsent::Absent` yields `TrackerStatus::ConsentRequired`, 0 sensor starts, 0 running drivers.
+2. `consent_2_legacy_config_absent`: Deserializing legacy empty JSON defaults to `LocalConsent::Absent`; missing `consent.json` fails closed to `Absent`.
+3. `consent_3_explicit_granular_grant`: Granting keyboard-only attaches input hooks for keyboard without mouse or active window samplers.
+4. `consent_4_decline_prevents_tracking`: Explicit decline sets `Revoked`, keeps status `ConsentRequired`, ignores project selection/resume attempts.
+5. `consent_5_revoke_while_active`: Revoking while actively tracking immediately terminates in-flight blocks and detaches sensors before acknowledge.
+6. `consent_6_policy_narrowing`: User unchecking capability stops sampler; workspace policy disallowing keyboard/mouse stops input hooks immediately.
+7. `consent_7_project_workspace_logout_transition`: Sign-out stops sensors; signing in when consent is revoked does not auto-start tracking.
+8. `consent_8_persisted_explicit_choice`: Exact granular choices round-trip to disk with full fidelity via `save_to` and `load_from`.
+9. `consent_9_corrupted_config_fail_closed`: Empty file, malformed JSON, and schema corruptions in `consent.json` fail closed to `LocalConsent::Absent`.
+10. `consent_10_pause_resume_quit`: Truthful pause/resume; revoking while paused prevents resume; revoking during lock prevents resume on unlock.
+11. `consent_11_no_duplicate_thread_start_on_repeated_user_actions`: Repeated consent grants, resumes, and project picks never duplicate threads.
 
 *Critical Evidentiary Notes:*
-1. **Raw Keystroke Boundary:** Accumulator gating tests prove monotonic count increment and drop behaviors in `InputCounter`, but do **NOT** prove complete end-to-end absence of raw keystrokes across serialization, local storage, or backend transmission.
-2. **Synchronous Native Detachment:** Native detachment is hardened in source via explicit Win32 queue initialization handshake (`PeekMessageW`), serial transitions under lock, bounded quit retries, thread join, and fail-closed consent; interactive Win32 desktop sessions and OS-level hook detach remain unverified in QA.
-3. *Ignored Test:* `tracking::input::tests::the_real_hooks_report_injected_input_as_injected` is marked `#[ignore]` in source because it requires installing live Win32 hooks and nudging the physical mouse cursor. It was intentionally not executed in QA.
+1. **Interactive UI Verification:** The interactive native egui window rendering and user clicking were **not tested via automated UI driver**; testing was conducted on the pure view model (`ConsentViewModel`) and controller (`Worker`). Interactive verification is reported as **[Not Run / Unverified]**. Do not invent UI automation evidence.
+2. **Raw Keystroke Boundary:** Monotonic count increment and drop behaviors are verified in `InputCounter`, but end-to-end proof across backend transmission remains open.
+3. *Ignored Test:* `tracking::input::tests::the_real_hooks_report_injected_input_as_injected` is marked `#[ignore]` in source to avoid installing live Win32 hooks or moving the cursor during test runs.
 
 ---
 
@@ -133,10 +180,10 @@ All tests executed with `RUST_BACKTRACE=1` in `clients/windows`. Synthetic QA on
 
 | Evidence Dimension | Windows (Rust) | macOS (Swift) | Linux (Target) |
 |---|---|---|---|
-| **1. Implemented Source** | ⚠️ Source present (`clients/windows`: egui UI, Win32 hooks, xcap, DPAPI, SQLite queue); sensor lifecycle foundation decoupled and hardened with queue-ready handshake and fail-closed consent; native interactive hooks, packaging, and signing open | ⚠️ Source present (`clients/macos`: SwiftUI, ScreenCaptureKit, Keychain, SQLite queue); source presence is NOT proof of complete implementation; TCC consent, runtime execution, packaging, and notarization open | ❌ **Unresolved Gap** (`clients/linux` crate not yet created) |
-| **2. Synthetic / Mock Unit Tests** | ✅ Complete (**91 focused synthetic tests passing**, 0 warnings) | ⚠️ Unverified locally (Swift test files present in source; not executed locally) | ❌ 0 tests (No crate) |
+| **1. Implemented Source** | ⚠️ Source present (`clients/windows`: egui UI, Win32 hooks, xcap, DPAPI, SQLite queue); explicit local consent UX & view model implemented; native interactive hooks, packaging, and signing open | ⚠️ Source present (`clients/macos`: SwiftUI, ScreenCaptureKit, Keychain, SQLite queue); source presence is NOT proof of complete implementation; TCC consent, runtime execution, packaging, and notarization open | ❌ **Unresolved Gap** (`clients/linux` crate not yet created) |
+| **2. Synthetic / Mock Unit Tests** | ✅ Complete (**102 focused synthetic tests passing**, 0 warnings) | ⚠️ Unverified locally (Swift test files present in source; not executed locally) | ❌ 0 tests (No crate) |
 | **3. Toolchain / Compile / Build** | ✅ Verified locally (Rustc / Cargo 1.97.1 on Windows 11 host) | ❌ Unverified locally (Host lacks macOS toolchain / Xcode) | ❌ Unverified locally (Host lacks Linux build container / environment) |
-| **4. Native Interactive Runtime** | ⚠️ **Unverified** (Unit tests run synthetically via `FakeSensorDriver` and platform-neutral lifecycle mock; interactive Win32 desktop hooks unverified in QA) | ⚠️ **Outstanding** (Requires physical macOS execution environment) | ❌ **Outstanding** (Requires Linux X11/Wayland execution environment) |
+| **4. Native Interactive Runtime** | ⚠️ **Unverified** (Unit tests run synthetically via `FakeSensorDriver`, `ConsentViewModel`, and platform-neutral lifecycle mock; interactive Win32 desktop hooks unverified in QA) | ⚠️ **Outstanding** (Requires physical macOS execution environment) | ❌ **Outstanding** (Requires Linux X11/Wayland execution environment) |
 | **5. Packaging / Install / Uninstall** | ⚠️ Partial (NSIS `.nsi` script present; silent install/uninstall unverified in CI) | ⚠️ Partial (`build-app.sh` creates bundle; DMG packaging unverified) | ❌ **Unresolved Gap** (No `.deb`, AppImage, or Flatpak manifest) |
 | **6. Code Signing & Notarization** | ⚠️ **Outstanding Prerequisite** (Unsigned; Authenticode cert required; signing does not guarantee immediate SmartScreen elimination; SmartScreen must not be bypassed) | ⚠️ **Outstanding Prerequisite** (Unsigned; Apple Developer ID & Notarization required) | ⚠️ **Outstanding Prerequisite** (GPG package signing required) |
 
@@ -145,7 +192,8 @@ All tests executed with `RUST_BACKTRACE=1` in `clients/windows`. Synthetic QA on
 ## 5. Next Steps
 
 1. **Awaiting PM Independent Review**:
-   - PM independently executes selected focused synthetic tests to verify Step 1C hardening.
+   - PM independently executes selected synthetic tests to verify the local consent UX and lifecycle integration slice.
 2. **Subsequent Phasing (Strictly Awaiting Authorization)**:
    - Backend schema nullability migration (`Activity.cs` metric nullability) and cross-workspace tenant isolation tests remain deferred until PM authorization.
+
 

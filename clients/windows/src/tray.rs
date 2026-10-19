@@ -171,7 +171,7 @@ impl TrayView {
         let signed_in = snapshot.status != TrackerStatus::SignedOut;
         // Signed in, with an account the server still accepts and a queue
         // that works: what the everyday actions need.
-        let usable = signed_in && !matches!(snapshot.status, TrackerStatus::SignInExpired | TrackerStatus::Stopped);
+        let usable = signed_in && !matches!(snapshot.status, TrackerStatus::SignInExpired | TrackerStatus::Stopped | TrackerStatus::ConsentRequired);
         let paused = snapshot.status == TrackerStatus::Paused;
         let can_pause = idle && format::can_pause(snapshot.status);
         let project = snapshot.current_project().map(|p| p.title.as_str());
@@ -181,7 +181,7 @@ impl TrayView {
             TrackerStatus::Paused | TrackerStatus::Away | TrackerStatus::Locked => Badge::Paused,
             TrackerStatus::Offline | TrackerStatus::Connecting | TrackerStatus::ChooseProject => Badge::Offline,
             TrackerStatus::SignedOut => Badge::SignedOut,
-            TrackerStatus::Stopped | TrackerStatus::SignInExpired => Badge::Stopped,
+            TrackerStatus::Stopped | TrackerStatus::SignInExpired | TrackerStatus::ConsentRequired => Badge::Stopped,
         };
 
         let since = |at: Option<DateTime<Utc>>| format::minutes_label(at.map_or(0, |at| (now - at).num_minutes().max(0) as u64));

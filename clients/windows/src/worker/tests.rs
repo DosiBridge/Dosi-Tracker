@@ -4,6 +4,7 @@ use chrono::FixedOffset;
 
 use super::control::Farewell;
 use super::*;
+use crate::config::LocalConsent;
 use crate::tracking::{build_activity, Measurements, Zone};
 
 fn utc(s: &str) -> DateTime<Utc> {
@@ -436,6 +437,31 @@ fn harness_at(start: DateTime<Utc>, saved: Option<Credentials>, autostart: bool,
         control,
         uploader,
         credentials_file,
+    );
+    worker.start(saved, None);
+    worker.publish();
+    Harness { worker, machine, control: control_rx, farewells, uploads, state }
+}
+
+fn harness_with_consent(start: DateTime<Utc>, saved: Option<Credentials>, consent: LocalConsent) -> Harness {
+    let machine = FakeMachine::new(start);
+    let state = StateHandle::new();
+    let (control, control_rx, farewells) = ControlLink::detached();
+    let (uploader, uploads) = UploaderHandle::detached();
+    let store = Storage::open(":memory:", None).unwrap();
+    let mut cfg = AppConfig::default();
+    cfg.consent = consent;
+    let mut worker = Worker::new(
+        state.clone(),
+        cfg,
+        machine.clone(),
+        Launch { autostart: false },
+        Arc::new(|| {}),
+        ServerClock::default(),
+        store,
+        control,
+        uploader,
+        None,
     );
     worker.start(saved, None);
     worker.publish();
@@ -1699,4 +1725,292 @@ fn sensor_lifecycle_handles_repeated_transitions_accurately() {
         assert_eq!(h.machine.input_starts(), i + 1);
         assert_eq!(h.machine.usage_starts(), i + 1);
     }
+}
+
+// ---- Local consent UX and lifecycle integration tests ---------------------------------
+
+#[test]
+fn consent_1_fresh_config_absent() {
+    let mut h = harness_with_consent(
+        at("10:00:00"),
+        Some(saved(vec![project("p1", 5)], Some("p1"))),
+        LocalConsent::Absent,
+    );
+    assert_eq!(h.status(), TrackerStatus::ConsentRequired);
+    assert!(h.tracking_since().is_none());
+    assert!(!h.machine.is_tracking_active());
+    assert!(!h.machine.is_input_running());
+    assert!(!h.machine.is_usage_running());
+    assert_eq!(h.machine.input_starts(), 0);
+    assert_eq!(h.machine.usage_starts(), 0);
+
+    h.tick(at("10:01:00"));
+    assert_eq!(h.status(), TrackerStatus::ConsentRequired);
+    assert_eq!(h.machine.input_starts(), 0);
+    assert_eq!(h.machine.usage_starts(), 0);
+}
+
+#[test]
+fn consent_2_legacy_config_absent() {
+    let cfg: AppConfig = serde_json::from_str("{}").expect("deserialization from empty json must succeed");
+    assert_eq!(cfg.consent, LocalConsent::Absent, "legacy config must fail closed to Absent");
+
+    let nonexistent = PathBuf::from("dosi_nonexistent_consent_file_12345.json");
+    let loaded = LocalConsent::load_from(&nonexistent);
+    assert_eq!(loaded, LocalConsent::Absent, "missing consent file must fail closed to Absent");
+
+    let h = harness_with_consent(
+        at("10:00:00"),
+        Some(saved(vec![project("p1", 5)], Some("p1"))),
+        cfg.consent,
+    );
+    assert_eq!(h.status(), TrackerStatus::ConsentRequired);
+    assert!(!h.machine.is_tracking_active());
+    assert_eq!(h.machine.input_starts(), 0);
+    assert_eq!(h.machine.usage_starts(), 0);
+}
+
+#[test]
+fn consent_3_explicit_granular_grant() {
+    let mut h = harness_with_consent(
+        at("10:00:00"),
+        Some(saved(vec![project("p1", 5)], Some("p1"))),
+        LocalConsent::Absent,
+    );
+    assert_eq!(h.status(), TrackerStatus::ConsentRequired);
+    assert_eq!(h.machine.input_starts(), 0);
+
+    let granular = CapturePermissions {
+        keyboard: true,
+        mouse: false,
+        active_window: false,
+        running_programs: false,
+        screenshot: false,
+        webcam: false,
+        blur_screenshots: false,
+    };
+    h.command(at("10:00:30"), Command::UpdateConsent { consent: LocalConsent::Granted(granular) });
+    assert_eq!(h.status(), TrackerStatus::Tracking);
+    assert!(h.machine.is_input_running(), "input hooks attached for keyboard");
+    assert!(h.machine.last_keyboard.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(!h.machine.last_mouse.load(std::sync::atomic::Ordering::SeqCst), "mouse not consented");
+    assert!(!h.machine.is_usage_running(), "active window not consented");
+    assert_eq!(h.machine.usage_starts(), 0);
+}
+
+#[test]
+fn consent_4_decline_prevents_tracking() {
+    let mut h = harness_with_consent(
+        at("10:00:00"),
+        Some(saved(vec![project("p1", 5)], Some("p1"))),
+        LocalConsent::Absent,
+    );
+    h.command(at("10:00:30"), Command::UpdateConsent { consent: LocalConsent::Revoked });
+    assert_eq!(h.status(), TrackerStatus::ConsentRequired);
+
+    h.command(at("10:01:00"), Command::SelectProject { project_id: "p1".into(), at: at("10:01:00") });
+    h.command(at("10:01:30"), Command::Resume { at: at("10:01:30") });
+    assert_eq!(h.status(), TrackerStatus::ConsentRequired);
+    assert_eq!(h.machine.input_starts(), 0);
+    assert_eq!(h.machine.usage_starts(), 0);
+}
+
+#[test]
+fn consent_5_revoke_while_active() {
+    let mut h = harness_with_consent(
+        at("10:00:00"),
+        Some(saved(vec![project("p1", 5)], Some("p1"))),
+        LocalConsent::Granted(CapturePermissions::default()),
+    );
+    assert_eq!(h.status(), TrackerStatus::Tracking);
+    assert!(h.machine.is_input_running());
+    assert!(h.machine.is_usage_running());
+
+    h.command(at("10:02:00"), Command::UpdateConsent { consent: LocalConsent::Revoked });
+    assert_eq!(h.status(), TrackerStatus::ConsentRequired);
+    assert!(!h.machine.is_tracking_active());
+    assert!(!h.machine.is_input_running());
+    assert!(!h.machine.is_usage_running());
+    assert!(h.machine.input_stops() >= 1);
+    assert!(h.machine.usage_stops() >= 1);
+}
+
+#[test]
+fn consent_6_policy_narrowing() {
+    let mut h = harness_with_consent(
+        at("10:00:00"),
+        Some(saved(vec![project("p1", 5)], Some("p1"))),
+        LocalConsent::Granted(CapturePermissions::default()),
+    );
+    assert_eq!(h.status(), TrackerStatus::Tracking);
+    assert!(h.machine.is_input_running());
+    assert!(h.machine.is_usage_running());
+
+    // Narrowing by user consent (uncheck active_window)
+    let mut user_narrowed = CapturePermissions::default();
+    user_narrowed.active_window = false;
+    h.command(at("10:01:00"), Command::UpdateConsent { consent: LocalConsent::Granted(user_narrowed) });
+    assert_eq!(h.status(), TrackerStatus::Tracking);
+    assert!(h.machine.is_input_running());
+    assert!(!h.machine.is_usage_running(), "usage stopped after user narrowed consent");
+    assert_eq!(h.machine.usage_stops(), 1);
+
+    // Narrowing by server project policy (disallow keyboard and mouse)
+    let restricted_project: Project = serde_json::from_value(serde_json::json!({
+        "id": "p1", "title": "Project p1", "intervalMinutes": 10,
+        "allowScreenshot": true, "allowWebcam": false,
+        "allowKeyboard": false, "allowMouse": false,
+        "allowActiveWindow": false, "allowRunningPrograms": false,
+        "blurScreenshots": true,
+    })).unwrap();
+    h.worker.on_control(ControlEvent::Projects(vec![restricted_project]));
+    h.worker.publish();
+    assert!(!h.machine.is_input_running(), "input stopped when workspace policy disallowed it");
+    assert!(h.machine.input_stops() >= 1);
+}
+
+#[test]
+fn consent_7_project_workspace_logout_transition() {
+    let mut h = harness_with_consent(
+        at("10:00:00"),
+        Some(saved(vec![project("p1", 5), project("p2", 5)], Some("p1"))),
+        LocalConsent::Granted(CapturePermissions::default()),
+    );
+    assert_eq!(h.status(), TrackerStatus::Tracking);
+    assert!(h.machine.is_tracking_active());
+
+    // Logout immediately stops sensors
+    h.command(at("10:05:00"), Command::SignOut { at: at("10:05:00") });
+    assert_eq!(h.status(), TrackerStatus::SignedOut);
+    assert!(!h.machine.is_tracking_active());
+    assert!(!h.machine.is_input_running());
+    assert!(!h.machine.is_usage_running());
+
+    // Logging in when consent is revoked does not auto-start
+    let h_revoked = harness_with_consent(
+        at("10:10:00"),
+        Some(saved(vec![project("p2", 5)], Some("p2"))),
+        LocalConsent::Revoked,
+    );
+    assert_eq!(h_revoked.status(), TrackerStatus::ConsentRequired);
+    assert!(!h_revoked.machine.is_tracking_active());
+    assert_eq!(h_revoked.machine.input_starts(), 0);
+    assert_eq!(h_revoked.machine.usage_starts(), 0);
+}
+
+#[test]
+fn consent_8_persisted_explicit_choice() {
+    let dir = std::env::temp_dir().join(format!("dosi-test-consent-{}", uuid::Uuid::new_v4()));
+    let path = dir.join("consent.json");
+
+    let grant = LocalConsent::Granted(CapturePermissions {
+        screenshot: true,
+        webcam: false,
+        keyboard: true,
+        mouse: false,
+        active_window: true,
+        running_programs: false,
+        blur_screenshots: true,
+    });
+    grant.save_to(&path).expect("save_to must succeed");
+
+    let loaded = LocalConsent::load_from(&path);
+    assert_eq!(loaded, grant, "loaded consent must match saved consent exactly");
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn consent_9_corrupted_config_fail_closed() {
+    let dir = std::env::temp_dir().join(format!("dosi-test-corrupt-{}", uuid::Uuid::new_v4()));
+    let path = dir.join("consent.json");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Empty file
+    std::fs::write(&path, b"").unwrap();
+    assert_eq!(LocalConsent::load_from(&path), LocalConsent::Absent);
+
+    // Corrupted JSON
+    std::fs::write(&path, b"{ not valid json ::: ").unwrap();
+    assert_eq!(LocalConsent::load_from(&path), LocalConsent::Absent);
+
+    // Invalid schema
+    std::fs::write(&path, b"{\"Granted\": 99999}").unwrap();
+    assert_eq!(LocalConsent::load_from(&path), LocalConsent::Absent);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn consent_10_pause_resume_quit() {
+    let mut h = harness_with_consent(
+        at("10:00:00"),
+        Some(saved(vec![project("p1", 5)], Some("p1"))),
+        LocalConsent::Granted(CapturePermissions::default()),
+    );
+    assert_eq!(h.status(), TrackerStatus::Tracking);
+    assert!(h.machine.is_tracking_active());
+
+    // Pause
+    h.command(at("10:02:00"), Command::Pause { resume_after: None, at: at("10:02:00") });
+    assert_eq!(h.status(), TrackerStatus::Paused);
+    assert!(!h.machine.is_tracking_active());
+
+    // Revoke consent while paused
+    h.command(at("10:02:30"), Command::UpdateConsent { consent: LocalConsent::Revoked });
+    assert_eq!(h.status(), TrackerStatus::ConsentRequired);
+
+    // Attempt to resume fails closed
+    h.command(at("10:03:00"), Command::Resume { at: at("10:03:00") });
+    assert_eq!(h.status(), TrackerStatus::ConsentRequired);
+    assert!(!h.machine.is_tracking_active());
+
+    // Re-grant and resume
+    h.command(at("10:03:30"), Command::UpdateConsent { consent: LocalConsent::Granted(CapturePermissions::default()) });
+    assert_eq!(h.status(), TrackerStatus::Tracking);
+    assert!(h.machine.is_tracking_active());
+
+    // System lock stops tracking
+    h.system(SystemEvent::Locked, at("10:04:00"));
+    assert_eq!(h.status(), TrackerStatus::Locked);
+    assert!(!h.machine.is_tracking_active());
+
+    // Revoke during lock
+    h.command(at("10:04:30"), Command::UpdateConsent { consent: LocalConsent::Revoked });
+    h.system(SystemEvent::Unlocked, at("10:05:00"));
+    assert_eq!(h.status(), TrackerStatus::ConsentRequired);
+    assert!(!h.machine.is_tracking_active(), "sensors must not restart after permission loss during lock");
+}
+
+#[test]
+fn consent_11_no_duplicate_thread_start_on_repeated_user_actions() {
+    let mut h = harness_with_consent(
+        at("10:00:00"),
+        Some(saved(vec![project("p1", 5)], Some("p1"))),
+        LocalConsent::Granted(CapturePermissions::default()),
+    );
+    assert_eq!(h.status(), TrackerStatus::Tracking);
+    let initial_input_starts = h.machine.input_starts();
+    let initial_usage_starts = h.machine.usage_starts();
+
+    // Repeated identical consent updates
+    for i in 1..=5 {
+        h.command(
+            at(&format!("10:01:{:02}", i)),
+            Command::UpdateConsent { consent: LocalConsent::Granted(CapturePermissions::default()) },
+        );
+    }
+    assert_eq!(h.machine.input_starts(), initial_input_starts, "no duplicate input starts on repeated grant");
+    assert_eq!(h.machine.usage_starts(), initial_usage_starts, "no duplicate usage starts on repeated grant");
+
+    // Repeated resume and project selection
+    for i in 1..=5 {
+        h.command(at(&format!("10:02:{:02}", i)), Command::Resume { at: at(&format!("10:02:{:02}", i)) });
+        h.command(
+            at(&format!("10:03:{:02}", i)),
+            Command::SelectProject { project_id: "p1".into(), at: at(&format!("10:03:{:02}", i)) },
+        );
+    }
+    assert_eq!(h.machine.input_starts(), initial_input_starts, "repeated redundant commands do not duplicate threads");
+    assert_eq!(h.machine.usage_starts(), initial_usage_starts);
 }

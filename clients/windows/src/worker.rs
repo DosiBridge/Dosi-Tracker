@@ -544,6 +544,7 @@ struct View {
     task_note: String,
     server_reachable: bool,
     clock_skew_minutes: Option<i64>,
+    consent: crate::config::LocalConsent,
 }
 
 struct Worker {
@@ -845,7 +846,8 @@ impl Worker {
     // ---- Tracking on or off ------------------------------------------------------
 
     fn should_track(&self) -> bool {
-        self.account.is_some()
+        self.cfg.consent.is_granted()
+            && self.account.is_some()
             && !self.expired
             && self.session.is_some()
             && self.pause.is_none()
@@ -1249,8 +1251,41 @@ impl Worker {
             }
             Command::ResolveAway { keep } => self.resolve_away(keep),
             Command::Shutdown { .. } => {}
+            Command::UpdateConsent { consent } => self.update_consent(consent),
         }
         self.state.update(|s| s.pending_action = None);
+    }
+
+    fn update_consent(&mut self, consent: crate::config::LocalConsent) {
+        tracing::info!(?consent, "local consent updated by user");
+        self.cfg.consent = consent.clone();
+        let _ = self.cfg.consent.save();
+
+        let now = self.now();
+        if let Some(current_session) = self.session.as_ref() {
+            let project_id = current_session.project_id().to_owned();
+            if let Some(project) = self.projects.iter().flatten().find(|p| p.id == project_id).cloned() {
+                let refreshed = session_for(&project, &self.cfg);
+                self.blocks.update_policy(refreshed.policy.clone());
+                self.session = Some(refreshed);
+            }
+        } else {
+            self.choose_session(now);
+        }
+
+        if !self.cfg.consent.is_granted() {
+            self.reconcile(now, EndReason::Pause);
+            self.machine.apply_sensor_policy(false, None);
+        } else if self.should_track() {
+            self.reconcile(now, EndReason::Interval);
+            if let Some(session) = self.session.as_ref() {
+                self.machine.apply_sensor_policy(true, Some(&session.policy.perms));
+            }
+        } else {
+            self.machine.apply_sensor_policy(false, None);
+        }
+
+        self.publish();
     }
 
     /// A click in the window is input too: an away stretch ends there.
@@ -1854,6 +1889,7 @@ impl Worker {
             away: self.away.is_some(),
             suspended: self.suspended.is_some() || self.shutting_down.is_some(),
             tracking: self.blocks.is_open(),
+            consent: self.cfg.consent.clone(),
         }
     }
 
@@ -1879,6 +1915,7 @@ impl Worker {
             task_note: self.task_note.clone().unwrap_or_default(),
             server_reachable: self.reachable,
             clock_skew_minutes: self.clock.skew_minutes(),
+            consent: self.cfg.consent.clone(),
         }
     }
 
@@ -1914,6 +1951,7 @@ impl Worker {
                 s.task_note = v.task_note;
                 s.server_reachable = v.server_reachable;
                 s.clock_skew_minutes = v.clock_skew_minutes;
+                s.consent = v.consent;
             });
             self.published = Some(view);
             (self.repaint)();

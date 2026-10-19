@@ -19,7 +19,7 @@ impl TrackerApp {
         }
         self.general_settings(ui);
         self.goal_settings(ui);
-        policy_card(ui, snapshot);
+        self.consent_and_policy_card(ui, snapshot);
         self.device_card(ui);
         self.account_card(ui, snapshot);
         self.support_card(ui);
@@ -307,10 +307,221 @@ impl TrackerApp {
             }
         });
     }
+
+    /// Privacy and local consent settings: explicit granular consent choices
+    /// and effective capability status matrix (workspace policy ∩ local consent).
+    fn consent_and_policy_card(&mut self, ui: &mut egui::Ui, snapshot: &SharedState) {
+        let project = snapshot
+            .current_project()
+            .map(|p| p.title.clone())
+            .unwrap_or_else(|| "your project".to_owned());
+
+        section(ui, "Privacy & Permissions", Some(&project), |ui| {
+            // Keep VM synchronized if snapshot changed externally
+            if self.consent_vm.current != snapshot.consent {
+                self.consent_vm = crate::ui::consent::ConsentViewModel::new(snapshot.consent.clone());
+            }
+
+            // Consent status pill
+            let (status_tone, status_text) = match &snapshot.consent {
+                crate::config::LocalConsent::Granted(_) => (Tone::Success, "Consented on this computer"),
+                crate::config::LocalConsent::Revoked => (Tone::Warning, "Declined / Revoked"),
+                crate::config::LocalConsent::Absent => (Tone::Warning, "Consent required before tracking"),
+            };
+
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Local consent:").font(theme::semibold(13.0)).color(theme::INK));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    widgets::status_pill(ui, status_tone, status_text);
+                });
+            });
+
+            ui.add_space(2.0);
+            widgets::muted(
+                ui,
+                "Explicit local consent is required. Tracking only captures capabilities granted below AND permitted by your workspace policy.",
+            );
+            divider(ui);
+
+            // Granular controls
+            let mut input_counts = self.consent_vm.draft.keyboard || self.consent_vm.draft.mouse;
+            if setting_row(
+                ui,
+                "Input activity (counts only)",
+                "Count keyboard key presses and mouse clicks/moves — never raw keystrokes or text typed",
+                &mut input_counts,
+            ) {
+                self.consent_vm.toggle_input_counts(input_counts);
+            }
+            divider(ui);
+
+            let mut active_win = self.consent_vm.draft.active_window;
+            if setting_row(
+                ui,
+                "Active window & application",
+                "Record the foreground window title and active application name during tracked time",
+                &mut active_win,
+            ) {
+                self.consent_vm.toggle_active_window(active_win);
+            }
+            divider(ui);
+
+            let mut screenshot = self.consent_vm.draft.screenshot;
+            if setting_row(
+                ui,
+                "Screenshots",
+                "Capture periodic screenshots of the active display during tracked blocks",
+                &mut screenshot,
+            ) {
+                self.consent_vm.toggle_screenshot(screenshot);
+            }
+            divider(ui);
+
+            let mut blur = self.consent_vm.draft.blur_screenshots;
+            if setting_row(
+                ui,
+                "Blur screenshots locally",
+                "Blur captured screenshots on this computer before uploading to protect sensitive text",
+                &mut blur,
+            ) {
+                self.consent_vm.toggle_blur_screenshots(blur);
+            }
+            divider(ui);
+
+            let mut webcam = self.consent_vm.draft.webcam;
+            if setting_row(
+                ui,
+                "Webcam photos",
+                "Capture periodic webcam photos during tracked blocks (if enabled by project)",
+                &mut webcam,
+            ) {
+                self.consent_vm.toggle_webcam(webcam);
+            }
+            divider(ui);
+
+            // Buttons: Save & Revoke
+            ui.horizontal(|ui| {
+                if widgets::button(ui, ButtonKind::Primary, Some(Icon::Check), "Save permissions", None, true).clicked() {
+                    let consent = self.consent_vm.grant();
+                    self.send(Command::UpdateConsent { consent });
+                }
+
+                if widgets::button(ui, ButtonKind::Secondary, None, "Revoke all consent", None, true).clicked() {
+                    let consent = self.consent_vm.revoke();
+                    self.send(Command::UpdateConsent { consent });
+                }
+            });
+
+            ui.add_space(6.0);
+            divider(ui);
+
+            // Effective capability status table
+            ui.label(
+                egui::RichText::new("Effective Recording Matrix")
+                    .font(theme::semibold(13.0))
+                    .color(theme::INK_SOFT),
+            );
+            ui.add_space(2.0);
+
+            let c = snapshot.capture;
+            let user_granted = match &snapshot.consent {
+                crate::config::LocalConsent::Granted(p) => p.clone(),
+                crate::config::LocalConsent::Absent | crate::config::LocalConsent::Revoked => {
+                    crate::config::CapturePermissions::all_disabled()
+                }
+            };
+
+            let capabilities = [
+                (
+                    Icon::Keyboard,
+                    "Keyboard counts",
+                    "Keys pressed as counts — never typed text",
+                    user_granted.keyboard,
+                    c.keyboard,
+                ),
+                (
+                    Icon::Mouse,
+                    "Mouse activity",
+                    "Clicks and movement counts",
+                    user_granted.mouse,
+                    c.mouse,
+                ),
+                (
+                    Icon::Window,
+                    "Active window",
+                    "Foreground app and window title",
+                    user_granted.active_window,
+                    c.active_window,
+                ),
+                (
+                    Icon::Camera,
+                    "Screenshots",
+                    "Occasional screen capture",
+                    user_granted.screenshot,
+                    c.screenshot,
+                ),
+                (
+                    Icon::Webcam,
+                    "Webcam",
+                    "Occasional webcam capture",
+                    user_granted.webcam,
+                    c.webcam,
+                ),
+            ];
+
+            for (i, (icon, title, detail, user_ok, project_ok)) in capabilities.into_iter().enumerate() {
+                if i > 0 {
+                    divider(ui);
+                }
+                let status = crate::ui::consent::ConsentViewModel::capability_status(user_ok, project_ok);
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    widgets::icon(
+                        ui,
+                        icon,
+                        18.0,
+                        if status == crate::ui::consent::CapabilityStatus::Active { theme::INK_SOFT } else { theme::FAINT },
+                    );
+                    let pill_w = 120.0;
+                    ui.allocate_ui_with_layout(
+                        egui::Vec2::new((ui.available_width() - pill_w).max(0.0), 0.0),
+                        Layout::top_down(Align::Min),
+                        |ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            ui.label(
+                                egui::RichText::new(title)
+                                    .font(theme::semibold(13.0))
+                                    .color(if status == crate::ui::consent::CapabilityStatus::Active { theme::INK } else { theme::MUTED_FG }),
+                            );
+                            ui.add(egui::Label::new(egui::RichText::new(detail).font(theme::regular(11.5)).color(theme::MUTED_FG)).wrap());
+                        },
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                        widgets::status_pill(ui, status.tone(), status.label());
+                    });
+                });
+            }
+
+            ui.add_space(4.0);
+            theme::inset(10).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                widgets::muted(
+                    ui,
+                    &format!(
+                        "A block is saved every {} minutes; time with the screen locked or computer asleep is never recorded. \
+                         Never collected: the keys you press or what you type, the clipboard, your microphone, or your personal files.",
+                        snapshot.interval_minutes
+                    ),
+                );
+            });
+        });
+    }
 }
 
 /// One line of what a project records: what it is, and whether it is on.
+#[cfg(test)]
 struct PolicyRow {
+    #[allow(dead_code)]
     icon: Icon,
     title: &'static str,
     on: bool,
@@ -319,6 +530,7 @@ struct PolicyRow {
 
 /// What the current project records, in the words of what is collected —
 /// the admin's policy, read-only here.
+#[cfg(test)]
 fn policy_rows(snapshot: &SharedState) -> Vec<PolicyRow> {
     let c = snapshot.capture;
     let screenshot = if c.blur_screenshots {
@@ -368,57 +580,6 @@ fn policy_rows(snapshot: &SharedState) -> Vec<PolicyRow> {
         },
         idle,
     ]
-}
-
-/// What the current project records — the admin's policy, read-only here.
-fn policy_card(ui: &mut egui::Ui, snapshot: &SharedState) {
-    let project = snapshot
-        .current_project()
-        .map(|p| p.title.clone())
-        .unwrap_or_else(|| "your project".to_owned());
-    section(ui, "What is recorded", Some(&project), |ui| {
-        for (i, row) in policy_rows(snapshot).into_iter().enumerate() {
-            if i > 0 {
-                divider(ui);
-            }
-            // Top-aligned: the icon and the pill stay level with the title
-            // however far the detail wraps.
-            ui.horizontal_top(|ui| {
-                ui.spacing_mut().item_spacing.x = 10.0;
-                widgets::icon(ui, row.icon, 18.0, if row.on { theme::INK_SOFT } else { theme::FAINT });
-                let pill_w = 56.0;
-                ui.allocate_ui_with_layout(
-                    egui::Vec2::new((ui.available_width() - pill_w).max(0.0), 0.0),
-                    Layout::top_down(Align::Min),
-                    |ui| {
-                        ui.spacing_mut().item_spacing.y = 0.0;
-                        ui.label(egui::RichText::new(row.title).font(theme::semibold(13.0)).color(if row.on { theme::INK } else { theme::MUTED_FG }));
-                        ui.add(egui::Label::new(egui::RichText::new(&row.detail).font(theme::regular(11.5)).color(theme::MUTED_FG)).wrap());
-                    },
-                );
-                ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-                    if row.on {
-                        widgets::status_pill(ui, Tone::Success, "On");
-                    } else {
-                        widgets::status_pill(ui, Tone::Neutral, "Off");
-                    }
-                });
-            });
-        }
-        ui.add_space(2.0);
-        theme::inset(10).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            widgets::muted(
-                ui,
-                &format!(
-                    "Set by your workspace admin for each project. A block is saved every {} minutes; time with the \
-                     screen locked or the computer asleep is never recorded. Never collected: the keys you press or \
-                     what you type, the clipboard, your microphone or your files.",
-                    snapshot.interval_minutes
-                ),
-            );
-        });
-    });
 }
 
 /// A label with its icon on the left and a value on the right.

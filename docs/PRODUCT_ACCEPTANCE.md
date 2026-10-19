@@ -121,9 +121,9 @@ Every backlog item and verification check in this specification is categorized u
 - **REQ-PRV-03: Per-User Local Opt-In & Policy Intersection**
   - *Requirement:* Server policy intersection alone (`ProjectPolicy ∩ LocalConsent`) does NOT constitute local user consent. Captures and sensing occur only if:
     $$\text{Effective} = \text{ProjectPolicy} \cap \text{LocalConsent}$$
-    Configuration defaults (`CapturePermissions`) do NOT constitute explicit consent. Production runtime defaults to `LocalConsent::Absent` and fails closed (all sensors disabled) until an explicit interactive consent UI slice is completed.
-  - *Code:* `clients/windows/src/config.rs`, `clients/windows/src/worker/session.rs`, `docs/CONSENT_CAPABILITY_AUDIT.md`.
-  - *Evidence Level:* **[Worker-Reported (Fail-Closed Backend/Session Integration)]** (Session tests and worker test verify fail-closed behavior on `Absent`/`Revoked`; interactive consent UI slice remains a backlog gap).
+    Configuration defaults (`CapturePermissions`) do NOT constitute explicit consent. Production runtime defaults to `LocalConsent::Absent` and fails closed (all sensors disabled) until an explicit affirmative local choice is made. Revoking consent visibly terminates blocks and detaches sensors before acknowledge.
+  - *Code:* `clients/windows/src/config.rs`, `clients/windows/src/worker/session.rs`, `clients/windows/src/worker.rs`.
+  - *Evidence Level:* **[Worker-Reported (Synthetic Integration)]** (`cargo test --bin dosi-tracker consent` 21 passed; 11-scenario worker consent suite passes, exit 0).
 - **REQ-PRV-04: Monotonic Counts Only — No Raw Keystrokes**
   - *Requirement:* Keyboard and mouse inputs are tallied as monotonic integer increments. Keycodes, text characters, clipboard contents, and inter-keystroke timing are discarded.
   - *Code:* `clients/windows/src/tracking/input.rs` (`InputFilter::apply`).
@@ -133,9 +133,9 @@ Every backlog item and verification check in this specification is categorized u
   - *Code:* `docs/CONSENT_CAPABILITY_AUDIT.md` §4, `backend/.../Activity.cs`.
   - *Evidence Level:* **[Not Implemented / Deferred to Reviewed Backend Phase]**.
 - **REQ-PRV-06: Explicit Local Interactive Consent UI & Capability Opt-In**
-  - *Requirement:* Dedicated desktop prompt explaining exactly what is collected (and what is never collected: raw text, passwords) with granular toggles. Fail-closed: missing consent disables the respective sensor.
-  - *Code:* `clients/windows/src/ui/mod.rs`.
-  - *Evidence Level:* **[Not Implemented / Backlog Gap]**.
+  - *Requirement:* Dedicated desktop prompt on Timer view and management section in Settings explaining exactly what is collected (and what is never collected: raw keystrokes, typed text, clipboard, microphone, personal files) with granular toggles (input counts, active window, screenshots + blur, webcam). All default OFF upon fresh install/revocation. Fail-closed persistence in `consent.json`. Capability matrix shows effective status (`Active`, `DeniedByUser`, `DisabledByProject`, `Disabled`).
+  - *Code:* `clients/windows/src/ui/consent.rs`, `clients/windows/src/ui/timer.rs`, `clients/windows/src/ui/settings.rs`.
+  - *Evidence Level:* **[Worker-Reported (View Model & Controller)]** (`ui::consent::tests` 6 passed, exit 0; `worker::tests::consent_*` 11 passed, exit 0); native interactive display session rendering is reported as **[Unverified / Not run in automation]**.
 - **REQ-PRV-07: Idle & Away Recovery Semantics & Privacy Tradeoff**
   - *Requirement:* Transitioning to `Away` state stops input hooks and foreground window samplers to preserve privacy. User return is detected via Windows system idle timer (`GetLastInputInfo`) without installing hooks.
   - *Tradeoff:* The system-level idle clock does not distinguish between physical typing and software jigglers while away; this tradeoff avoids persistent background input surveillance.
@@ -199,10 +199,10 @@ Every backlog item and verification check in this specification is categorized u
 | **REQ-TRK-02**| Windows | `uploader.rs`, `storage.rs`| `cargo test --bin dosi-tracker worker` | **[Worker-Reported]** | Interactive offline network simulation |
 | **REQ-TRK-04**| Backend | `PresenceAppService.cs` | `dotnet test --filter EfCorePresenceAppServiceTests` | **[Worker-Reported]** | WebSocket / SignalR push live presence |
 | **REQ-PRV-02**| Windows | `lifecycle.rs`, `input.rs`, `usage.rs`, `worker.rs` | `cargo test --bin dosi-tracker worker::tests::sensor_lifecycle` | **[Worker-Reported (Synthetic Driver Verified)]** (6 passed) | Native OS interactive Win32 desktop unverified |
-| **REQ-PRV-03**| Windows | `session.rs` | Policy intersection logic | **[Not Implemented]** | Local consent UI missing; defaults cannot substitute |
+| **REQ-PRV-03**| Windows | `config.rs`, `session.rs`, `worker.rs` | `cargo test --bin dosi-tracker consent` | **[Worker-Reported (Synthetic Integration)]** (21 passed) | Native Win32 desktop display unverified |
 | **REQ-PRV-04**| Windows | `input.rs` | `cargo test --bin dosi-tracker tracking::input::tests::inactive_counter_drops_input_events_and_keeps_logs_empty` | **[Verified by PM @ 18db4d5]** (1 passed, exit 0) | Real hook hardware injection ignored in test |
 | **REQ-PRV-05**| Cross | `Activity.cs`, `types.ts` | Schema Migration + `npm test` | **[Not Implemented]** | Deferred to reviewed backend migration phase |
-| **REQ-PRV-06**| Windows UI | `clients/windows/src/ui` | Interactive consent modal | **[Not Implemented]** | User prompt before first tracking session |
+| **REQ-PRV-06**| Windows UI | `consent.rs`, `timer.rs`, `settings.rs` | `cargo test --bin dosi-tracker ui::consent::tests` | **[Worker-Reported (View Model & Controller)]** (6 passed) | Interactive GUI verification not run in automation |
 | **REQ-PRV-07**| Windows | `worker.rs`, `input.rs` | `cargo test --bin dosi-tracker worker::tests::sensor_lifecycle_stops_on_away_and_resumes_on_return` | **[Worker-Reported]** (1 passed, exit 0) | Idle clock doesn't distinguish typing vs jiggler |
 | **REQ-CLI-01**| Windows | `clients/windows/src` | `cargo test --bin dosi-tracker` (focused) | **[Worker-Reported]** | Authenticode code signing & NSIS packaging |
 | **REQ-CLI-02**| macOS | `clients/macos/Sources` | `swift test` (macOS host) | **[Blocked]** | Requires macOS hardware & Apple Notarization |

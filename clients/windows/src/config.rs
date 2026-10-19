@@ -42,7 +42,7 @@ pub struct AppConfig {
 ///
 /// Until a reviewed consent UI slice is completed, production runtime defaults
 /// to `LocalConsent::Absent`, causing all sensor collection to fail closed.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LocalConsent {
     /// No affirmative consent has been granted by the local user yet.
     Absent,
@@ -59,7 +59,46 @@ impl Default for LocalConsent {
 }
 
 impl LocalConsent {
-    #[allow(dead_code)]
+    pub const FILE_NAME: &str = "consent.json";
+
+    pub fn data_path() -> Option<PathBuf> {
+        crate::shell::data_dir().map(|d| d.join(Self::FILE_NAME))
+    }
+
+    pub fn load() -> Self {
+        Self::data_path().map(|p| Self::load_from(&p)).unwrap_or(LocalConsent::Absent)
+    }
+
+    pub fn load_from(path: &Path) -> Self {
+        if !path.is_file() {
+            return LocalConsent::Absent;
+        }
+        match std::fs::read(path) {
+            Ok(bytes) => serde_json::from_slice::<LocalConsent>(&bytes).unwrap_or_else(|e| {
+                tracing::warn!(?e, path = %path.display(), "corrupted or invalid consent file; failing closed to Absent");
+                LocalConsent::Absent
+            }),
+            Err(e) => {
+                tracing::warn!(?e, path = %path.display(), "could not read consent file; failing closed to Absent");
+                LocalConsent::Absent
+            }
+        }
+    }
+
+    pub fn save(&self) -> anyhow::Result<()> {
+        let path = Self::data_path().ok_or_else(|| anyhow::anyhow!("could not resolve user data directory"))?;
+        self.save_to(&path)
+    }
+
+    pub fn save_to(&self, path: &Path) -> anyhow::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let data = serde_json::to_vec_pretty(self)?;
+        std::fs::write(path, data)?;
+        Ok(())
+    }
+
     pub fn is_granted(&self) -> bool {
         matches!(self, LocalConsent::Granted(_))
     }
@@ -90,7 +129,7 @@ impl LocalConsent {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CapturePermissions {
     pub screenshot: bool,
@@ -103,6 +142,21 @@ pub struct CapturePermissions {
     /// project's policy OR this, so a local config can add blur but never
     /// remove it.
     pub blur_screenshots: bool,
+}
+
+impl CapturePermissions {
+    /// Default-off configuration for initial explicit consent presentation.
+    pub fn all_disabled() -> Self {
+        Self {
+            screenshot: false,
+            webcam: false,
+            keyboard: false,
+            mouse: false,
+            active_window: false,
+            running_programs: false,
+            blur_screenshots: true,
+        }
+    }
 }
 
 impl Default for CapturePermissions {
@@ -212,8 +266,12 @@ impl AppConfig {
         }
         let builder =
             builder.add_source(config::Environment::with_prefix("DOSI").separator("__"));
-
-        Ok(Self::from_config(builder.build()?))
+        let mut app_config = Self::from_config(builder.build()?);
+        let persisted_consent = LocalConsent::load();
+        if persisted_consent != LocalConsent::Absent {
+            app_config.consent = persisted_consent;
+        }
+        Ok(app_config)
     }
 
     /// Deserialize over the defaults. A value of the wrong type is reported

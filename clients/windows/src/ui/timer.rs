@@ -79,6 +79,15 @@ impl TaskField {
 impl TrackerApp {
     pub(super) fn timer_view(&mut self, ui: &mut egui::Ui, snapshot: &SharedState, now: DateTime<Utc>, wide: bool) {
         self.alerts(ui, snapshot);
+        if !snapshot.consent.is_granted() {
+            let mut action = None;
+            super::consent::render_consent_card(ui, &mut self.consent_vm, |consent| {
+                action = Some(consent);
+            });
+            if let Some(consent) = action {
+                self.send(Command::UpdateConsent { consent });
+            }
+        }
         let choosing = snapshot.status == TrackerStatus::ChooseProject;
         if wide {
             two_columns(ui, |column, ui| {
@@ -308,6 +317,13 @@ impl TrackerApp {
                     "Pick the project you are working on to start tracking.".to_owned(),
                 ),
                 TrackerStatus::SignInExpired => ("Sign-in expired", theme::DANGER_ON_TINT, "--:--".to_owned(), theme::FAINT, "Enter your password to continue.".to_owned()),
+                TrackerStatus::ConsentRequired => (
+                    "Consent required",
+                    theme::WARNING_ON_TINT,
+                    "--:--".to_owned(),
+                    theme::FAINT,
+                    "Explicit local consent is required before tracking can start. Choose your permissions above.".to_owned(),
+                ),
             };
 
             ui.vertical_centered(|ui| {
@@ -625,7 +641,7 @@ impl TrackerApp {
 fn shows_task_field(status: TrackerStatus) -> bool {
     !matches!(
         status,
-        TrackerStatus::SignedOut | TrackerStatus::SignInExpired | TrackerStatus::Stopped | TrackerStatus::ChooseProject
+        TrackerStatus::SignedOut | TrackerStatus::SignInExpired | TrackerStatus::Stopped | TrackerStatus::ChooseProject | TrackerStatus::ConsentRequired
     )
 }
 
@@ -802,7 +818,7 @@ mod tests {
         for status in [TrackerStatus::Tracking, TrackerStatus::Paused, TrackerStatus::Away, TrackerStatus::Offline, TrackerStatus::Locked] {
             assert!(shows_task_field(status), "{status:?}");
         }
-        for status in [TrackerStatus::SignedOut, TrackerStatus::SignInExpired, TrackerStatus::Stopped, TrackerStatus::ChooseProject] {
+        for status in [TrackerStatus::SignedOut, TrackerStatus::SignInExpired, TrackerStatus::Stopped, TrackerStatus::ChooseProject, TrackerStatus::ConsentRequired] {
             assert!(!shows_task_field(status), "{status:?}");
         }
     }

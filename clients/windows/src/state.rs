@@ -42,6 +42,8 @@ pub enum TrackerStatus {
     /// account deactivated). Tracking stopped; the queue is kept and uploads
     /// once the password is entered again (workspace and email prefilled).
     SignInExpired,
+    /// Affirmative local consent has not been granted, or was revoked.
+    ConsentRequired,
 }
 
 impl TrackerStatus {
@@ -57,6 +59,7 @@ impl TrackerStatus {
             TrackerStatus::Locked => "Locked",
             TrackerStatus::ChooseProject => "Choose a project",
             TrackerStatus::SignInExpired => "Sign-in expired",
+            TrackerStatus::ConsentRequired => "Consent required",
         }
     }
 }
@@ -359,6 +362,8 @@ pub struct SharedState {
     pub workspace_lost: Option<String>,
     /// Things to tell the user once, oldest first (at most [`MAX_NOTICES`]).
     pub notices: Vec<Notice>,
+    /// Current affirmative local user consent state.
+    pub consent: crate::config::LocalConsent,
 }
 
 impl Default for SharedState {
@@ -405,6 +410,7 @@ impl Default for SharedState {
             workspace_note: None,
             workspace_lost: None,
             notices: Vec::new(),
+            consent: crate::config::LocalConsent::Absent,
         }
     }
 }
@@ -499,6 +505,8 @@ pub enum Command {
     /// Quit: save the block in progress (ended by `quit`), tell the server,
     /// upload what fits in the grace period, and stop.
     Shutdown { at: DateTime<Utc> },
+    /// Update affirmative local user consent (grant, decline, revoke, modify).
+    UpdateConsent { consent: crate::config::LocalConsent },
 }
 
 /// Requests from outside the window (a second launch, the installer, the

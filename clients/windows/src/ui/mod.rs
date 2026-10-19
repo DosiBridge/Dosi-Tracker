@@ -11,6 +11,7 @@
 //! once, and the tray went stale and "Quit" stopped working whenever the
 //! window was minimized.
 
+pub mod consent;
 pub mod format;
 mod activity;
 mod alerts;
@@ -117,6 +118,9 @@ pub struct TrackerApp {
     /// The project chooser's filter.
     project_filter: String,
 
+    // Consent
+    pub consent_vm: consent::ConsentViewModel,
+
     // Settings
     autostart_enabled: bool,
     settings_error: Option<String>,
@@ -197,6 +201,7 @@ impl TrackerApp {
         let (view, input_down_preview) = (View::Timer, false);
 
         let login = login::LoginForm::new(&links.api_base_url);
+        let initial_consent = state.snapshot().consent;
         Self {
             state,
             commands,
@@ -211,6 +216,7 @@ impl TrackerApp {
             login,
             task: timer::TaskField::default(),
             project_filter: String::new(),
+            consent_vm: consent::ConsentViewModel::new(initial_consent),
             autostart_enabled: autostart::is_enabled(),
             settings_error: None,
             confirm_sign_out: false,
@@ -643,6 +649,7 @@ fn status_visual(status: TrackerStatus, pending: Option<PendingAction>) -> (Tone
         TrackerStatus::Away | TrackerStatus::Locked => (Tone::Warning, status.label()),
         TrackerStatus::ChooseProject => (Tone::Info, status.label()),
         TrackerStatus::SignInExpired => (Tone::Danger, status.label()),
+        TrackerStatus::ConsentRequired => (Tone::Warning, status.label()),
     }
 }
 
