@@ -148,19 +148,59 @@ The claim that the consent prerequisite was complete was rejected. Four concrete
 
 ---
 
-### D. Worker-Reported Test Execution (Current Working Tree)
+### D. PM Source-Confirmed Review at HEAD `cf4910d` & Targeted Defect Identification
+
+**Supervisory Determination:** PM SOURCE-CONFIRMED CORRECTION — SAME UNACCEPTED WINDOWS CONSENT PHASE.
+At clean HEAD `cf4910d`, the PM independently inspected the diff and worker consent regressions:
+- *Positive Findings:* Dedicated default-deny `ConsentedPermissions`, injected `ConsentStore` boundary, and surfaced persistence failures were recognized as source improvements.
+- *Privacy Defect Identified:* `Worker::update_consent` matched every `LocalConsent::Granted(_)` as an expanding grant and invoked `consent_store.save` synchronously *before* narrowing/stopping existing sensors. A user disabling keyboard/window/screenshot while retaining another capability still sent `Granted(new narrower choices)`. Previously authorized native drivers remained active under the OLD policy throughout blocked/slow filesystem I/O.
+- *Directive:* Enforce withdrawn permissions BEFORE persistence can block; establish fail-closed effective state on failed save with honest restart warnings; add deterministic synthetic regressions using an injected blocking store and barriers; keep all native/runtime/signing gaps open; mark evidence as worker-reported.
+
+---
+
+### E. Implementation of Bounded Correction: Monotonic Narrowing Before Persistence
+
+1. **Monotonic Per-Capability Narrowing (`ConsentedPermissions::intersect`, `LocalConsent::narrow_to`)**:
+   - `ConsentedPermissions::intersect(&self, other: &Self) -> Self`: Computes the strict intersection of permissions. A capability is true ONLY IF it was true in both grants. Defense-in-depth: `blur_screenshots` is kept true if either requires it.
+   - `LocalConsent::narrow_to(&self, target: &Self) -> Self`: Calculates the monotonic staged consent prior to storage:
+     - `(Granted(old), Granted(new)) => Granted(old.intersect(new))`
+     - `(Absent, _) => Absent`
+     - Otherwise `Revoked`.
+   - Any capability withdrawn in the user's request is revoked immediately in memory. No unpersisted capability expansion is granted before persistence succeeds.
+2. **Immediate Sensor Withdrawal & Capture Quiescence**:
+   - `Blocks::narrow_block_permissions`: Immediately updates permissions on both the pending stretch policy and the current open block, guaranteeing that `capture_due` cannot schedule screenshots for withdrawn capabilities during in-flight blocks.
+   - Active screen buffer quiescence: `self.screens.clear()` drops pending screenshots immediately if screenshot permission is withdrawn.
+   - Sensor drivers immediately updated via `apply_sensor_policy` *before* `consent_store.save(&consent)` is called.
+3. **Fail-Closed Effective State & Durability Warnings on Save Failure**:
+   - If disk persistence fails:
+     - All sensors are stopped immediately (`machine.apply_sensor_policy(false, None)`).
+     - State marked unsynced (`consent_unsynced = true`), blocking tracking resumption (`!consent_unsynced` in `should_track()`).
+     - Displayed consent in `self.cfg.consent` set to fail-closed state (`Absent` if previously Absent, otherwise `Revoked`), ensuring the UI does not falsely display accepted withdrawal or full success.
+     - Actionable alert surfaced: `"Failed to persist consent changes to disk: {e}. Tracking stopped (fail-closed) to prevent non-durable sensor operation. Changes/revocation are non-durable across app restart: prior on-disk consent remains and will reload on restart until disk save succeeds."`
+4. **Deterministic Blocking Store & Barrier Regressions**:
+   - `MemoryConsentStore` augmented with `set_save_hook` to allow synchronous assertions and multi-threaded barrier synchronization while `save()` is blocked in flight.
+   - 4 new synthetic regression tests added (`worker::tests::consent_16` through `consent_19`):
+     - `consent_16`: Proves withdrawn sensors (keyboard, active_window, screenshot, webcam) are stopped *while save is blocked*, retained mouse remains active, and save completes with narrower policy.
+     - `consent_17`: Mixed narrowing + expansion request proves withdrawn keyboard stops before save, newly requested webcam is NOT active during blocked save, and webcam activates only after persistence succeeds.
+     - `consent_18`: Save failure proves fail-closed halt of all sensors, `consent_unsynced: true`, fail-closed `Revoked` displayed consent, restart durability warning, and resume rejection.
+     - `consent_19`: Multi-threaded `Arc<Barrier>` test proves the worker thread has stopped withdrawn sensors while literally suspended inside `consent_store.save()`.
+
+---
+
+### F. Worker-Reported Test Execution (Current Working Tree)
 
 All tests executed in `clients/windows` with `RUST_BACKTRACE=1`. Synthetic QA only; no real Win32 input hooks, foreground window enumeration, desktop collection, screen capture, or webcam capture were invoked during execution.
 
 | Target Suite | Exact Command Line | Tests Passed | Ignored | Time | Exit Code | Evidence Level |
 |---|---|:---:|:---:|:---:|:---:|:---:|
-| **Compilation Gate** | `cargo check --bin dosi-tracker` | N/A | 0 errors, 0 warnings | 1.61s | **0** | **[Worker-Reported]** |
-| **Config & Atomic Persistence** | `cargo test --bin dosi-tracker config::tests` | 14 | 0 | 0.03s | **0** | **[Worker-Reported]** |
-| **All Consent Tests (UI+Worker)** | `cargo test --bin dosi-tracker consent` | 28 | 0 | 0.02s | **0** | **[Worker-Reported]** |
+| **Compilation Gate** | `cargo check --bin dosi-tracker` | N/A | 0 errors, 0 warnings | 0.47s | **0** | **[Worker-Reported]** |
+| **Config & Atomic Persistence** | `cargo test --bin dosi-tracker config::tests` | 15 | 0 | 0.01s | **0** | **[Worker-Reported]** |
+| **All Consent Tests (UI+Worker)** | `cargo test --bin dosi-tracker consent` | 33 | 0 | 0.12s | **0** | **[Worker-Reported]** |
 | **Tracking Lifecycle Suite** | `cargo test --bin dosi-tracker tracking::lifecycle::tests` | 11 | 0 | 0.10s | **0** | **[Worker-Reported]** |
 | **Worker Session Suite** | `cargo test --bin dosi-tracker worker::session::tests` | 10 | 0 | 0.00s | **0** | **[Worker-Reported]** |
+| **Worker Blocks Suite** | `cargo test --bin dosi-tracker worker::blocks::tests` | 18 | 0 | 0.00s | **0** | **[Worker-Reported]** |
 
-#### Detailed 15-Scenario Consent Lifecycle Test Matrix (`worker::tests::consent_*`)
+#### Detailed 19-Scenario Consent Lifecycle Test Matrix (`worker::tests::consent_*`)
 1. `consent_1_fresh_config_absent`: Fresh config with `LocalConsent::Absent` yields `TrackerStatus::ConsentRequired`, 0 sensor starts, 0 running drivers.
 2. `consent_2_legacy_config_absent`: Deserializing legacy empty JSON defaults to `LocalConsent::Absent`; missing `consent.json` fails closed to `Absent`.
 3. `consent_3_explicit_granular_grant`: Granting keyboard-only attaches input hooks for keyboard without mouse or active window samplers.
@@ -176,6 +216,10 @@ All tests executed in `clients/windows` with `RUST_BACKTRACE=1`. Synthetic QA on
 13. `consent_13_revoke_persistence_failure_stops_sensors_and_reports_non_durable`: Fault injection on revoke immediately stops sensors in memory, reports non-durable persistence error honestly, and blocks resume.
 14. `consent_14_fake_worker_isolation_proves_no_disk_access`: Proves all test harnesses use `MemoryConsentStore`, verifying save count increments in memory without touching filesystem.
 15. `consent_15_partial_grant_omitted_capabilities_strictly_default_deny`: Deserializing partial grant `{"Granted": {"mouse": true}}` enables mouse only while keyboard, active window, and screenshot remain strictly denied.
+16. `consent_16_narrowing_stops_withdrawn_sensors_before_blocked_save_completes`: Injected save hook proves withdrawn sensors stop *before* save blocks, retained mouse continues, and save finishes cleanly.
+17. `consent_17_mixed_narrowing_and_expansion_request_under_blocked_store`: Proves withdrawn permissions halt immediately while unpersisted expansions remain disabled until persistence succeeds.
+18. `consent_18_blocked_save_failure_fails_closed_and_prevents_resume`: Injected write failure proves fail-closed transition (all sensors stopped), `consent_unsynced: true`, honest restart warning, and resume prevention.
+19. `consent_19_multithreaded_barrier_proves_withdrawn_sensors_stopped_while_store_blocked`: Cross-thread barrier synchronization proves sensors are halted while the worker thread is suspended in `consent_store.save`.
 
 ---
 
@@ -183,8 +227,8 @@ All tests executed in `clients/windows` with `RUST_BACKTRACE=1`. Synthetic QA on
 
 | Evidence Dimension | Windows (Rust) | macOS (Swift) | Linux (Target) |
 |---|---|---|---|
-| **1. Implemented Source** | ⚠️ Corrective source present (`clients/windows`: egui UI, Win32 hooks, xcap, DPAPI, SQLite queue, `ConsentedPermissions`, `ConsentStore`, `atomic_write_file`); native interactive hooks, packaging, and signing open | ⚠️ Source present (`clients/macos`: SwiftUI, ScreenCaptureKit, Keychain, SQLite queue); source presence is NOT proof of complete implementation; TCC consent, runtime execution, packaging, and notarization open | ❌ **Unresolved Gap** (`clients/linux` crate not yet created) |
-| **2. Synthetic / Mock Unit Tests** | ⚠️ **Worker-Reported Only** (28 consent tests, 11 lifecycle tests, 10 session tests, 14 config tests passing locally; awaiting PM independent review) | ⚠️ Unverified locally (Swift test files present in source; not executed locally) | ❌ 0 tests (No crate) |
+| **1. Implemented Source** | ⚠️ Corrective source present (`clients/windows`: egui UI, Win32 hooks, xcap, DPAPI, SQLite queue, `ConsentedPermissions`, `ConsentStore`, `atomic_write_file`, monotonic narrowing); native interactive hooks, packaging, and signing open | ⚠️ Source present (`clients/macos`: SwiftUI, ScreenCaptureKit, Keychain, SQLite queue); source presence is NOT proof of complete implementation; TCC consent, runtime execution, packaging, and notarization open | ❌ **Unresolved Gap** (`clients/linux` crate not yet created) |
+| **2. Synthetic / Mock Unit Tests** | ⚠️ **Worker-Reported Only** (33 consent tests, 11 lifecycle tests, 10 session tests, 15 config tests, 18 block tests passing locally; awaiting PM independent review) | ⚠️ Unverified locally (Swift test files present in source; not executed locally) | ❌ 0 tests (No crate) |
 | **3. Toolchain / Compile / Build** | ✅ Verified locally (Rustc / Cargo 1.97.1 on Windows 11 host) | ❌ Unverified locally (Host lacks macOS toolchain / Xcode) | ❌ Unverified locally (Host lacks Linux build container / environment) |
 | **4. Native Interactive Runtime** | ⚠️ **Unverified** (Unit tests run synthetically via `FakeSensorDriver`, `MemoryConsentStore`, `ConsentViewModel`; interactive Win32 desktop hooks unverified in QA) | ⚠️ **Outstanding** (Requires physical macOS execution environment) | ❌ **Outstanding** (Requires Linux X11/Wayland execution environment) |
 | **5. Packaging / Install / Uninstall** | ⚠️ Partial (NSIS `.nsi` script present; silent install/uninstall unverified in CI) | ⚠️ Partial (`build-app.sh` creates bundle; DMG packaging unverified) | ❌ **Unresolved Gap** (No `.deb`, AppImage, or Flatpak manifest) |
@@ -195,10 +239,11 @@ All tests executed in `clients/windows` with `RUST_BACKTRACE=1`. Synthetic QA on
 ## 5. Next Steps
 
 1. **Awaiting PM Independent Review**:
-   - PM independently executes selected synthetic tests to verify the corrective implementation slice (`config::tests`, `consent` tests, `tracking::lifecycle::tests`, `worker::session::tests`).
+   - PM independently executes selected synthetic tests to verify the monotonic narrowing and fault-boundary implementation slice (`cargo test --bin dosi-tracker consent`, `config::tests`, etc.).
 2. **Subsequent Phasing (Strictly Awaiting PM Authorization)**:
    - Backend schema nullability migration (`Activity.cs` metric nullability) and cross-workspace tenant isolation tests remain deferred until PM authorization.
    - Do NOT proceed to metric migrations or mark this phase passed until PM independently accepts.
+
 
 
 

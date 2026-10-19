@@ -250,6 +250,16 @@ impl Blocks {
         }
     }
 
+    /// Immediately narrows permissions on both the pending stretch policy and the current open block,
+    /// ensuring that any withdrawn capabilities (e.g. screenshots) cannot be scheduled or captured
+    /// during the current block.
+    pub fn narrow_block_permissions(&mut self, perms: &crate::config::CapturePermissions) {
+        if let Some(stretch) = self.stretch.as_mut() {
+            stretch.policy.perms = *perms;
+            stretch.block.policy.perms = *perms;
+        }
+    }
+
     /// The open block whose screenshot moment has come, if it is due one.
     pub fn capture_due(&self, now: DateTime<Utc>) -> Option<BlockId> {
         let block = &self.stretch.as_ref()?.block;

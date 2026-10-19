@@ -201,6 +201,8 @@ struct FakeMachine {
     usage_stops: std::sync::atomic::AtomicUsize,
     last_keyboard: std::sync::atomic::AtomicBool,
     last_mouse: std::sync::atomic::AtomicBool,
+    last_screenshot: std::sync::atomic::AtomicBool,
+    last_webcam: std::sync::atomic::AtomicBool,
     last_perms: Mutex<Option<CapturePermissions>>,
 }
 
@@ -228,6 +230,8 @@ impl FakeMachine {
             usage_stops: std::sync::atomic::AtomicUsize::new(0),
             last_keyboard: std::sync::atomic::AtomicBool::new(false),
             last_mouse: std::sync::atomic::AtomicBool::new(false),
+            last_screenshot: std::sync::atomic::AtomicBool::new(false),
+            last_webcam: std::sync::atomic::AtomicBool::new(false),
             last_perms: Mutex::new(None),
         })
     }
@@ -280,6 +284,14 @@ impl FakeMachine {
 
     fn usage_stops(&self) -> usize {
         self.usage_stops.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn is_screenshot_allowed(&self) -> bool {
+        self.last_screenshot.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn is_webcam_allowed(&self) -> bool {
+        self.last_webcam.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -366,9 +378,13 @@ impl Machine for FakeMachine {
         let keyboard = active && perms.is_some_and(|p| p.keyboard);
         let mouse = active && perms.is_some_and(|p| p.mouse);
         let active_window = active && perms.is_some_and(|p| p.active_window);
+        let screenshot = active && perms.is_some_and(|p| p.screenshot);
+        let webcam = active && perms.is_some_and(|p| p.webcam);
 
         self.last_keyboard.store(keyboard, std::sync::atomic::Ordering::SeqCst);
         self.last_mouse.store(mouse, std::sync::atomic::Ordering::SeqCst);
+        self.last_screenshot.store(screenshot, std::sync::atomic::Ordering::SeqCst);
+        self.last_webcam.store(webcam, std::sync::atomic::Ordering::SeqCst);
 
         if keyboard || mouse {
             if !self.input_running.swap(true, std::sync::atomic::Ordering::SeqCst) {
@@ -394,6 +410,15 @@ fn project(id: &str, idle_minutes: u32) -> Project {
     serde_json::from_value(serde_json::json!({
         "id": id, "title": format!("Project {id}"), "intervalMinutes": 10,
         "allowScreenshot": true, "allowWebcam": false, "allowKeyboard": true, "allowMouse": true,
+        "allowActiveWindow": true, "allowRunningPrograms": true, "idleThresholdMinutes": idle_minutes
+    }))
+    .unwrap()
+}
+
+fn project_allowing_all(id: &str, idle_minutes: u32) -> Project {
+    serde_json::from_value(serde_json::json!({
+        "id": id, "title": format!("Project {id}"), "intervalMinutes": 10,
+        "allowScreenshot": true, "allowWebcam": true, "allowKeyboard": true, "allowMouse": true,
         "allowActiveWindow": true, "allowRunningPrograms": true, "idleThresholdMinutes": idle_minutes
     }))
     .unwrap()
@@ -456,6 +481,7 @@ fn harness_with_consent(start: DateTime<Utc>, saved: Option<Credentials>, consen
     let consent_store = Arc::new(MemoryConsentStore::new(consent));
     let mut cfg = AppConfig::default();
     cfg.consent = consent;
+    cfg.capture.webcam = true;
     let mut worker = Worker::new(
         state.clone(),
         cfg,
@@ -2141,4 +2167,251 @@ fn consent_15_partial_grant_omitted_capabilities_strictly_default_deny() {
     assert!(!h.machine.last_keyboard.load(std::sync::atomic::Ordering::SeqCst), "keyboard omitted -> denied");
     assert!(!h.machine.is_usage_running(), "active window omitted -> denied");
     assert_eq!(h.machine.usage_starts(), 0);
+}
+
+#[test]
+fn consent_16_narrowing_stops_withdrawn_sensors_before_blocked_save_completes() {
+    let broad = ConsentedPermissions {
+        screenshot: true,
+        webcam: true,
+        keyboard: true,
+        mouse: true,
+        active_window: true,
+        running_programs: true,
+        blur_screenshots: true,
+    };
+    let mut h = harness_with_consent(
+        at("10:00:00"),
+        Some(saved(vec![project_allowing_all("p1", 5)], Some("p1"))),
+        LocalConsent::Granted(broad),
+    );
+
+    // Initial state: broad tracking active
+    assert_eq!(h.status(), TrackerStatus::Tracking);
+    assert!(h.machine.is_tracking_active());
+    assert!(h.machine.last_keyboard.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(h.machine.last_mouse.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(h.machine.is_usage_running());
+    assert!(h.machine.is_screenshot_allowed());
+    assert!(h.machine.is_webcam_allowed());
+
+    // Setup injected blocking hook: inspect machine state WHILE save is in flight!
+    let machine = h.machine.clone();
+    let hook_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook_called_clone = hook_called.clone();
+    h.consent_store.set_save_hook(move |_target| {
+        hook_called_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Invariant: Withdrawn permissions (keyboard, window, screen, webcam) MUST be stopped BEFORE save blocks!
+        assert!(!machine.last_keyboard.load(std::sync::atomic::Ordering::SeqCst), "keyboard MUST stop before save blocks");
+        assert!(!machine.is_usage_running(), "usage sampler MUST stop before save blocks");
+        assert!(!machine.is_screenshot_allowed(), "screenshot MUST be disallowed before save blocks");
+        assert!(!machine.is_webcam_allowed(), "webcam MUST be disallowed before save blocks");
+
+        // Retained permission (mouse) remains active without drop
+        assert!(machine.last_mouse.load(std::sync::atomic::Ordering::SeqCst), "mouse remains active");
+        assert!(machine.is_input_running(), "input running for mouse");
+        assert_eq!(machine.captures(), 0, "no screen captures occurred");
+        Ok(())
+    });
+
+    let narrower = ConsentedPermissions {
+        screenshot: false,
+        webcam: false,
+        keyboard: false,
+        mouse: true,
+        active_window: false,
+        running_programs: false,
+        blur_screenshots: true,
+    };
+    h.command(at("10:01:00"), Command::UpdateConsent { consent: LocalConsent::Granted(narrower) });
+
+    // Ensure hook executed synchronously during save
+    assert!(hook_called.load(std::sync::atomic::Ordering::SeqCst), "hook must have executed during save");
+    assert_eq!(h.consent_store.save_count(), 1);
+
+    // After save completed: state matches narrower grant
+    assert_eq!(h.status(), TrackerStatus::Tracking);
+    assert!(h.machine.last_mouse.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(!h.machine.last_keyboard.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(!h.machine.is_usage_running());
+    assert!(!h.machine.is_screenshot_allowed());
+    assert!(!h.machine.is_webcam_allowed());
+}
+
+#[test]
+fn consent_17_mixed_narrowing_and_expansion_request_under_blocked_store() {
+    // Start with mouse + keyboard, but NO webcam
+    let initial = ConsentedPermissions {
+        screenshot: false,
+        webcam: false,
+        keyboard: true,
+        mouse: true,
+        active_window: false,
+        running_programs: false,
+        blur_screenshots: true,
+    };
+    let mut h = harness_with_consent(
+        at("10:00:00"),
+        Some(saved(vec![project_allowing_all("p1", 5)], Some("p1"))),
+        LocalConsent::Granted(initial),
+    );
+    assert_eq!(h.status(), TrackerStatus::Tracking);
+    assert!(h.machine.last_keyboard.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(!h.machine.is_webcam_allowed());
+
+    // Request mixed change: withdraw keyboard, expand webcam
+    let machine = h.machine.clone();
+    let hook_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook_called_clone = hook_called.clone();
+    h.consent_store.set_save_hook(move |_target| {
+        hook_called_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Withdrawn keyboard MUST be stopped
+        assert!(!machine.last_keyboard.load(std::sync::atomic::Ordering::SeqCst), "withdrawn keyboard stopped before save");
+        // Newly requested webcam MUST NOT be active before storage confirms
+        assert!(!machine.is_webcam_allowed(), "unpersisted expansion must NOT be active while save is blocked");
+        // Retained mouse is active
+        assert!(machine.last_mouse.load(std::sync::atomic::Ordering::SeqCst), "retained mouse active");
+        Ok(())
+    });
+
+    let mixed = ConsentedPermissions {
+        screenshot: false,
+        webcam: true,
+        keyboard: false,
+        mouse: true,
+        active_window: false,
+        running_programs: false,
+        blur_screenshots: true,
+    };
+    h.command(at("10:01:00"), Command::UpdateConsent { consent: LocalConsent::Granted(mixed) });
+
+    assert!(hook_called.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(h.status(), TrackerStatus::Tracking);
+    // After persistence succeeded: webcam is now safely active!
+    assert!(h.machine.is_webcam_allowed(), "webcam activated after successful persistence");
+    assert!(!h.machine.last_keyboard.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(h.machine.last_mouse.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[test]
+fn consent_18_blocked_save_failure_fails_closed_and_prevents_resume() {
+    let broad = ConsentedPermissions {
+        screenshot: true,
+        webcam: true,
+        keyboard: true,
+        mouse: true,
+        active_window: true,
+        running_programs: true,
+        blur_screenshots: true,
+    };
+    let mut h = harness_with_consent(
+        at("10:00:00"),
+        Some(saved(vec![project_allowing_all("p1", 5)], Some("p1"))),
+        LocalConsent::Granted(broad),
+    );
+    assert_eq!(h.status(), TrackerStatus::Tracking);
+
+    // Save hook returns error to simulate write failure
+    let machine = h.machine.clone();
+    h.consent_store.set_save_hook(move |_target| {
+        // Assert withdrawn permissions stopped before the write error
+        assert!(!machine.last_keyboard.load(std::sync::atomic::Ordering::SeqCst));
+        anyhow::bail!("simulated disk I/O timeout during consent save")
+    });
+
+    let narrower = ConsentedPermissions {
+        screenshot: false,
+        webcam: false,
+        keyboard: false,
+        mouse: true,
+        active_window: false,
+        running_programs: false,
+        blur_screenshots: true,
+    };
+    h.command(at("10:01:00"), Command::UpdateConsent { consent: LocalConsent::Granted(narrower) });
+
+    // Invariant: Save failure must establish fail-closed state!
+    assert_eq!(h.status(), TrackerStatus::ConsentRequired);
+    assert!(!h.machine.is_tracking_active(), "all sensors stopped on write failure");
+    assert!(!h.machine.is_input_running());
+    assert!(!h.machine.is_usage_running());
+    assert!(!h.machine.is_screenshot_allowed());
+    assert!(!h.machine.is_webcam_allowed());
+
+    let snapshot = h.state.snapshot();
+    assert!(snapshot.consent_unsynced, "must report unsynced");
+    assert_eq!(snapshot.consent, LocalConsent::Revoked, "fail-closed state does not falsely claim success");
+    let err = snapshot.consent_error.as_ref().unwrap();
+    assert!(err.contains("non-durable across app restart"), "honestly reports non-durable restart limit");
+
+    // Resume attempt must be strictly blocked
+    h.command(at("10:02:00"), Command::Resume { at: at("10:02:00") });
+    assert_eq!(h.status(), TrackerStatus::ConsentRequired);
+    assert!(!h.machine.is_tracking_active(), "resume blocked while unsynced");
+}
+
+#[test]
+fn consent_19_multithreaded_barrier_proves_withdrawn_sensors_stopped_while_store_blocked() {
+    let broad = ConsentedPermissions {
+        screenshot: true,
+        webcam: true,
+        keyboard: true,
+        mouse: true,
+        active_window: true,
+        running_programs: true,
+        blur_screenshots: true,
+    };
+    let mut h = harness_with_consent(
+        at("10:00:00"),
+        Some(saved(vec![project_allowing_all("p1", 5)], Some("p1"))),
+        LocalConsent::Granted(broad),
+    );
+    assert_eq!(h.status(), TrackerStatus::Tracking);
+
+    let enter_barrier = Arc::new(std::sync::Barrier::new(2));
+    let exit_barrier = Arc::new(std::sync::Barrier::new(2));
+
+    let enter_clone = enter_barrier.clone();
+    let exit_clone = exit_barrier.clone();
+    h.consent_store.set_save_hook(move |_target| {
+        enter_clone.wait(); // Signals test thread that save is currently blocked
+        exit_clone.wait();  // Waits for test thread to complete its assertions
+        Ok(())
+    });
+
+    let machine = h.machine.clone();
+    let narrower = ConsentedPermissions {
+        screenshot: false,
+        webcam: false,
+        keyboard: false,
+        mouse: true,
+        active_window: false,
+        running_programs: false,
+        blur_screenshots: true,
+    };
+
+    // Run command on worker in a separate thread
+    let worker_thread = std::thread::spawn(move || {
+        h.command(at("10:01:00"), Command::UpdateConsent { consent: LocalConsent::Granted(narrower) });
+        h
+    });
+
+    // Test coordinator thread: wait until store is BLOCKED in save()
+    enter_barrier.wait();
+
+    // At this EXACT moment, worker thread is literally blocked inside consent_store.save!
+    // Assert withdrawn sensors are ALREADY stopped:
+    assert!(!machine.last_keyboard.load(std::sync::atomic::Ordering::SeqCst), "keyboard stopped while store blocked");
+    assert!(!machine.is_usage_running(), "usage stopped while store blocked");
+    assert!(!machine.is_screenshot_allowed(), "screenshot disallowed while store blocked");
+    assert!(!machine.is_webcam_allowed(), "webcam disallowed while store blocked");
+    assert!(machine.last_mouse.load(std::sync::atomic::Ordering::SeqCst), "retained mouse still running");
+    assert_eq!(machine.captures(), 0, "no screen captures scheduled/taken");
+
+    // Release worker thread to finish save
+    exit_barrier.wait();
+
+    let h = worker_thread.join().expect("worker thread must finish cleanly");
+    assert_eq!(h.status(), TrackerStatus::Tracking);
+    assert_eq!(h.consent_store.save_count(), 1);
 }

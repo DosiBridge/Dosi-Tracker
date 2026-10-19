@@ -1281,69 +1281,51 @@ impl Worker {
     fn update_consent(&mut self, consent: crate::config::LocalConsent) {
         tracing::info!(?consent, "local consent update requested by user");
         let now = self.now();
+        let prior_consent = self.cfg.consent;
 
-        match &consent {
-            crate::config::LocalConsent::Granted(_) => {
-                // Defense-in-depth: Granting requires safe persistence before activation.
-                match self.consent_store.save(&consent) {
-                    Ok(()) => {
-                        self.cfg.consent = consent;
-                        self.consent_error = None;
-                        self.consent_unsynced = false;
-                        tracing::info!("consent successfully granted and persisted to disk");
+        // Step 1: Enforce withdrawn permissions BEFORE persistence can block.
+        // Monotonic per-capability narrowing:
+        // - Any capability withdrawn in `consent` becomes false immediately.
+        // - No capability newly expanded in `consent` is granted yet.
+        // - If `consent` is Revoked/Absent, all permissions are withdrawn immediately.
+        let staged_consent = self.cfg.consent.narrow_to(&consent);
+        self.cfg.consent = staged_consent;
 
-                        if let Some(current_session) = self.session.as_ref() {
-                            let project_id = current_session.project_id().to_owned();
-                            if let Some(project) = self.projects.iter().flatten().find(|p| p.id == project_id).cloned() {
-                                let refreshed = session_for(&project, &self.cfg);
-                                self.blocks.update_policy(refreshed.policy.clone());
-                                self.session = Some(refreshed);
-                            }
-                        } else {
-                            self.choose_session(now);
-                        }
-
-                        if self.should_track() {
-                            self.reconcile(now, EndReason::Interval);
-                            if let Some(session) = self.session.as_ref() {
-                                self.machine.apply_sensor_policy(true, Some(&session.policy.perms));
-                            }
-                        } else {
-                            self.machine.apply_sensor_policy(false, None);
-                        }
-                    }
-                    Err(e) => {
-                        let err_msg = format!("Failed to persist granted consent to disk: {e}. Sensors will not start.");
-                        tracing::error!(%err_msg);
-                        self.consent_error = Some(err_msg);
-                        self.consent_unsynced = true;
-                        // Fail closed: do NOT accept grant, sensors MUST remain stopped
-                        self.reconcile(now, EndReason::Pause);
-                        self.machine.apply_sensor_policy(false, None);
-                    }
-                }
+        // Apply narrowed consent to session policy and active blocks
+        if let Some(current_session) = self.session.as_ref() {
+            let project_id = current_session.project_id().to_owned();
+            if let Some(project) = self.projects.iter().flatten().find(|p| p.id == project_id).cloned() {
+                let refreshed = session_for(&project, &self.cfg);
+                self.blocks.narrow_block_permissions(&refreshed.policy.perms);
+                self.session = Some(refreshed);
             }
-            crate::config::LocalConsent::Revoked | crate::config::LocalConsent::Absent => {
-                // Immediate fail-safe revocation: stop sensors right now in-memory regardless of disk result.
-                self.cfg.consent = consent.clone();
-                self.reconcile(now, EndReason::Pause);
-                self.machine.apply_sensor_policy(false, None);
+        }
 
-                match self.consent_store.save(&consent) {
-                    Ok(()) => {
-                        self.consent_error = None;
-                        self.consent_unsynced = false;
-                        tracing::info!("consent revocation successfully persisted to disk");
-                    }
-                    Err(e) => {
-                        let err_msg = format!(
-                            "Consent revoked in-memory and sensors stopped, but disk persistence failed ({e}). Revocation is non-durable across app restart until disk write succeeds."
-                        );
-                        tracing::error!(%err_msg);
-                        self.consent_error = Some(err_msg);
-                        self.consent_unsynced = true;
-                    }
-                }
+        // Quiesce active capture path: clear any pending screenshots if screenshot permission was withdrawn
+        let screenshot_permitted = self.session.as_ref().map_or(false, |s| s.policy.perms.screenshot);
+        if !screenshot_permitted {
+            self.screens.clear();
+        }
+
+        // Apply narrowed policy to native sensor drivers immediately
+        if self.should_track() {
+            self.reconcile(now, EndReason::Interval);
+            if let Some(session) = self.session.as_ref() {
+                self.machine.apply_sensor_policy(true, Some(&session.policy.perms));
+            }
+        } else {
+            self.reconcile(now, EndReason::Pause);
+            self.machine.apply_sensor_policy(false, None);
+        }
+
+        // Step 2: Now invoke persistence (which may block on slow I/O or fail)
+        match self.consent_store.save(&consent) {
+            Ok(()) => {
+                // Safely persisted! Now apply the full target consent (including any persisted expansions)
+                self.cfg.consent = consent;
+                self.consent_error = None;
+                self.consent_unsynced = false;
+                tracing::info!("consent successfully persisted to disk");
 
                 if let Some(current_session) = self.session.as_ref() {
                     let project_id = current_session.project_id().to_owned();
@@ -1352,7 +1334,51 @@ impl Worker {
                         self.blocks.update_policy(refreshed.policy.clone());
                         self.session = Some(refreshed);
                     }
+                } else {
+                    self.choose_session(now);
                 }
+
+                if self.should_track() {
+                    self.reconcile(now, EndReason::Interval);
+                    if let Some(session) = self.session.as_ref() {
+                        self.machine.apply_sensor_policy(true, Some(&session.policy.perms));
+                    }
+                } else {
+                    self.reconcile(now, EndReason::Pause);
+                    self.machine.apply_sensor_policy(false, None);
+                }
+            }
+            Err(e) => {
+                // Persistence failed!
+                // Establish fail-closed effective state:
+                // - Stop all sensors immediately
+                // - Halt tracking
+                // - Mark consent_unsynced = true to prevent resume
+                // - Set displayed consent to fail-closed state (Absent if previously Absent, otherwise Revoked)
+                // - Clear actionable error with restart durability warning
+                let err_msg = format!(
+                    "Failed to persist consent changes to disk: {e}. Tracking stopped (fail-closed) to prevent non-durable sensor operation. Changes/revocation are non-durable across app restart: prior on-disk consent remains and will reload on restart until disk save succeeds."
+                );
+                tracing::error!(%err_msg);
+                self.consent_error = Some(err_msg);
+                self.consent_unsynced = true;
+
+                self.cfg.consent = match prior_consent {
+                    crate::config::LocalConsent::Absent => crate::config::LocalConsent::Absent,
+                    _ => crate::config::LocalConsent::Revoked,
+                };
+                if let Some(current_session) = self.session.as_ref() {
+                    let project_id = current_session.project_id().to_owned();
+                    if let Some(project) = self.projects.iter().flatten().find(|p| p.id == project_id).cloned() {
+                        let refreshed = session_for(&project, &self.cfg);
+                        self.blocks.update_policy(refreshed.policy.clone());
+                        self.session = Some(refreshed);
+                    }
+                }
+
+                self.reconcile(now, EndReason::Pause);
+                self.machine.apply_sensor_policy(false, None);
+                self.screens.clear();
             }
         }
 

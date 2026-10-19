@@ -95,6 +95,21 @@ impl ConsentedPermissions {
     pub fn all_disabled() -> Self {
         Self::default()
     }
+
+    /// Calculates the strict intersection of two permission grants.
+    /// A capability is only true if it is true in BOTH self and other.
+    /// For blur_screenshots, true (blurred) is preserved as defense-in-depth if either requests it.
+    pub fn intersect(&self, other: &Self) -> Self {
+        Self {
+            screenshot: self.screenshot && other.screenshot,
+            webcam: self.webcam && other.webcam,
+            keyboard: self.keyboard && other.keyboard,
+            mouse: self.mouse && other.mouse,
+            active_window: self.active_window && other.active_window,
+            running_programs: self.running_programs && other.running_programs,
+            blur_screenshots: self.blur_screenshots || other.blur_screenshots,
+        }
+    }
 }
 
 impl From<CapturePermissions> for ConsentedPermissions {
@@ -127,6 +142,22 @@ impl From<ConsentedPermissions> for CapturePermissions {
 
 impl LocalConsent {
     pub const FILE_NAME: &str = "consent.json";
+
+    /// Computes the monotonic narrowed consent between the current state and target.
+    /// - If both are Granted, returns Granted(old.intersect(new)).
+    ///   Any withdrawn permission is immediately false; no expansion is granted yet.
+    /// - If self was Absent, returns Absent (fails closed, ungranted).
+    /// - If target is Revoked or Absent, returns Revoked (all permissions withdrawn).
+    /// - If self was Revoked, returns Revoked (no permissions were active).
+    pub fn narrow_to(&self, target: &Self) -> Self {
+        match (self, target) {
+            (LocalConsent::Granted(old), LocalConsent::Granted(new)) => {
+                LocalConsent::Granted(old.intersect(new))
+            }
+            (LocalConsent::Absent, _) => LocalConsent::Absent,
+            _ => LocalConsent::Revoked,
+        }
+    }
 
     pub fn data_path() -> Option<PathBuf> {
         crate::shell::data_dir().map(|d| d.join(Self::FILE_NAME))
@@ -271,15 +302,32 @@ impl ConsentStore for FileConsentStore {
     }
 }
 
+pub type SaveHook = Box<dyn Fn(&LocalConsent) -> anyhow::Result<()> + Send + Sync>;
+
 /// In-memory fake consent store with fault injection for deterministic testing.
 #[allow(dead_code)]
-#[derive(Debug, Default)]
 pub struct MemoryConsentStore {
     consent: std::sync::Mutex<LocalConsent>,
     fail_saves: std::sync::atomic::AtomicBool,
     fail_loads: std::sync::atomic::AtomicBool,
     save_count: std::sync::atomic::AtomicUsize,
     load_count: std::sync::atomic::AtomicUsize,
+    save_hook: std::sync::Mutex<Option<SaveHook>>,
+}
+
+impl Default for MemoryConsentStore {
+    fn default() -> Self {
+        Self::new(LocalConsent::Absent)
+    }
+}
+
+impl std::fmt::Debug for MemoryConsentStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryConsentStore")
+            .field("save_count", &self.save_count())
+            .field("load_count", &self.load_count())
+            .finish()
+    }
 }
 
 #[allow(dead_code)]
@@ -291,7 +339,19 @@ impl MemoryConsentStore {
             fail_loads: std::sync::atomic::AtomicBool::new(false),
             save_count: std::sync::atomic::AtomicUsize::new(0),
             load_count: std::sync::atomic::AtomicUsize::new(0),
+            save_hook: std::sync::Mutex::new(None),
         }
+    }
+
+    pub fn set_save_hook<F>(&self, hook: F)
+    where
+        F: Fn(&LocalConsent) -> anyhow::Result<()> + Send + Sync + 'static,
+    {
+        *self.save_hook.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    pub fn clear_save_hook(&self) {
+        *self.save_hook.lock().unwrap() = None;
     }
 
     pub fn set_fail_saves(&self, fail: bool) {
@@ -322,6 +382,9 @@ impl ConsentStore for MemoryConsentStore {
 
     fn save(&self, consent: &LocalConsent) -> anyhow::Result<()> {
         self.save_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(ref hook) = *self.save_hook.lock().unwrap() {
+            hook(consent)?;
+        }
         if self.fail_saves.load(std::sync::atomic::Ordering::SeqCst) {
             anyhow::bail!("simulated consent disk persistence failure (fault injection)");
         }
@@ -760,6 +823,74 @@ mod tests {
         assert_eq!(store.save_count(), 2);
         // Original grant in store is preserved
         assert_eq!(store.load(), grant);
+    }
+
+    #[test]
+    fn consent_monotonic_narrowing_and_hook_execution() {
+        let broad = ConsentedPermissions {
+            screenshot: true,
+            webcam: true,
+            keyboard: true,
+            mouse: true,
+            active_window: true,
+            running_programs: true,
+            blur_screenshots: true,
+        };
+        let narrow = ConsentedPermissions {
+            screenshot: false,
+            webcam: false,
+            keyboard: false,
+            mouse: true,
+            active_window: false,
+            running_programs: false,
+            blur_screenshots: false,
+        };
+
+        // Intersect proves strict default-deny narrowing
+        let inter = broad.intersect(&narrow);
+        assert!(inter.mouse);
+        assert!(!inter.keyboard);
+        assert!(!inter.active_window);
+        assert!(!inter.screenshot);
+        assert!(!inter.webcam);
+        assert!(inter.blur_screenshots, "blur preserved as defense-in-depth");
+
+        // Mixed request: old had mouse+keyboard, new wants mouse+webcam
+        let old_grant = LocalConsent::Granted(ConsentedPermissions {
+            mouse: true,
+            keyboard: true,
+            ..ConsentedPermissions::default()
+        });
+        let new_grant = LocalConsent::Granted(ConsentedPermissions {
+            mouse: true,
+            webcam: true,
+            ..ConsentedPermissions::default()
+        });
+        let staged = old_grant.narrow_to(&new_grant);
+        match staged {
+            LocalConsent::Granted(p) => {
+                assert!(p.mouse, "retained capability remains");
+                assert!(!p.keyboard, "withdrawn capability is false");
+                assert!(!p.webcam, "unpersisted expansion capability is NOT granted yet");
+            }
+            _ => panic!("expected Granted"),
+        }
+
+        // Narrowing to Revoked yields Revoked
+        assert_eq!(old_grant.narrow_to(&LocalConsent::Revoked), LocalConsent::Revoked);
+        assert_eq!(LocalConsent::Absent.narrow_to(&new_grant), LocalConsent::Absent);
+
+        // Store save_hook execution
+        let store = MemoryConsentStore::new(LocalConsent::Absent);
+        let hook_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_ran_clone = hook_ran.clone();
+        store.set_save_hook(move |consent| {
+            assert_eq!(*consent, old_grant);
+            hook_ran_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+        store.save(&old_grant).expect("save should succeed");
+        assert!(hook_ran.load(std::sync::atomic::Ordering::SeqCst));
     }
 }
 
