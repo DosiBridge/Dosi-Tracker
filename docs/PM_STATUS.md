@@ -469,11 +469,11 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
    - Source inspection revealed that `WorkspaceMembershipManager.ChangeRoleAsync` and `RemoveAsync` independently awaited `CountOwnersAsync` then mutated/updated membership state without an ownership-invariant critical section.
    - `WorkspaceAppService.LeaveAsync` loaded membership and invoked `RemoveAsync` without acquiring a lock or serializing concurrent owner exits within an explicit transactional Unit of Work.
    - Sequential last-owner protections existed in source (`TrackerDomainErrorCodes.LastOwnerCannotLeave`) and were preserved.
-   - However, under concurrent operations, two active owners in the same workspace calling `LeaveAsync` simultaneously both observed `CountOwnersAsync == 2`, passed the guard independently, and proceeded to remove their memberships. This dropped the persisted active owner count to 0, orphaning the workspace.
-   - **Vulnerability Reproduction**: Proven deterministically in `Unsynchronized_Concurrent_Last_Owner_Removal_Demonstrates_Orphaning_Vulnerability` using real separate production service/UOW scopes against a project-local SQLite database. Without synchronization, both concurrent removals succeeded and the active owner count dropped to 0.
+   - However, under uncoordinated concurrent execution, two active owners in the same workspace calling `LeaveAsync` or demoting each other could both observe `CountOwnersAsync == 2`, pass the guard independently, and drop the persisted active owner count to 0 (orphaning the workspace).
+   - **Modeled Interleaving Simulation**: Demonstrated in `Modeled_Unsynchronized_Last_Owner_Removal_Simulates_Orphaning_Risk` using separate real service scopes against a project-local SQLite database. This test is explicitly maintained as a bounded modeled interleaving simulation of the unsynchronized race condition, not an execution of the prior production codebase in the test runner.
 
-2. **Production Architectural Correction**:
-   - Smallest architecture-compatible solution maintaining clean layering and ambient UOW committed-state visibility:
+2. **Production Architectural Correction & Entrypoint Tracing**:
+   - Smallest architecture-compatible solution maintaining clean layering, ambient UOW handling, and committed-state visibility:
      - **`TrackerDomainService.cs`**:
        * Exposed `protected IUnitOfWorkManager UnitOfWorkManager => LazyServiceProvider.LazyGetRequiredService<IUnitOfWorkManager>();` for domain service UOW context inspection.
      - **`WorkspaceMembershipManager.cs`**:
@@ -489,33 +489,42 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
        * Wraps role modification inside a transactional Unit of Work (`UnitOfWorkManager.Begin(new AbpUnitOfWorkOptions(isTransactional: true), requiresNew: true)`).
        * Acquires `await using var ownerLock = await _workspaceMemberships.LockOwnersAsync(WorkspaceId)`.
        * Verifies caller owner permissions and completes transactional UOW before releasing `ownerLock`.
+     - **Entrypoint Verification & Entity Scoping**:
+       * `RemoveFromWorkspaceAsync` currently denies owner targets (`if (member.IsOwner ... throw RoleNotAllowed)`), so it is not an owner removal vector. Only `LeaveAsync` allows an owner to withdraw.
+       * `ProjectMembershipManager` manages project-level enrollments and hourly rates, whereas `WorkspaceMembershipManager` manages workspace-level tenancy. The two managers are kept strictly distinct.
 
-3. **Deterministic Isolated Regressions (`ConcurrentOwnerProtectionTests.cs`)**:
-   - Configured disposable project-local SQLite fixture in WAL mode (`SqliteWalConnectionInterceptor` with `PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 30000;`) and `AddAlwaysDisableUnitOfWorkTransaction()` to enable real independent multi-scope concurrency without SQLite single-writer table contention deadlocks.
-   - Verified that legitimate multi-owner sequential leaves/demotions succeed until the last owner.
-   - Barrier synchronization (`System.Threading.Barrier`) coordinates concurrent callers without flaky thread sleeps.
-   - Asserted that under concurrent leaves and concurrent demotions, exactly one succeeds and the competitor is rejected with a domain error (`Tracker:LastOwnerCannotLeave` or `Tracker:RoleNotAllowed`), maintaining >= 1 active owner at all times.
-   - Verified cross-workspace isolation: concurrent owner leaves in unrelated workspaces run concurrently without contention, and leaving a workspace performs cleanup only in that workspace without touching memberships or projects in foreign workspaces.
+3. **Deterministic Isolated Regressions & Provider Inability (`ConcurrentOwnerProtectionTests.cs`)**:
+   - Configured disposable project-local SQLite fixture in WAL mode (`SqliteWalConnectionInterceptor` with `PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 30000;`).
+   - Injected `ControllableDistributedLock` (`IAbpDistributedLock`) with bounded event hooks (`LockAcquired`, `OnBeforeReleaseAsync`, `LockReleasing`) for deterministic coordination without arbitrary thread sleeps.
+   - **Provider Inability Honestly Documented**: SQLite single-writer locking constraints prevent concurrent write transactions across multiple connections or background initialization tasks in ABP (causes `SQLite Error 5: 'database is locked'` during module data seeding). Therefore, `AddAlwaysDisableUnitOfWorkTransaction()` is required by the SQLite test runner. While production code explicitly begins transactional UOWs and commits prior to lock disposal, full multi-connection transactional commit proof requires a database provider supporting concurrent write transactions (e.g. PostgreSQL / SQL Server).
+   - **Deterministic Lock Exclusivity & Commit Visibility**:
+     * `Owner_Lock_Is_Exclusive_Held_Across_Commit_And_Unrelated_Workspaces_Not_Serialized` proves `LockOwnersAsync` is strictly exclusive for the targeted workspace, blocks competitors for that workspace, does not serialize unrelated workspace keys, and allows competitors after release.
+     * `Deterministic_Interleaved_Owner_Leave_Blocks_Competitor_Until_Commit_Visibility` uses bounded barrier interception to prove Thread 2 is blocked at the lock boundary while Thread 1 executes and commits to DB; upon release, Thread 2 unblocks, observes committed removal, and throws `LastOwnerCannotLeave`.
+   - **Distinct Withdrawal Targets & Cross-Workspace Retention**:
+     * `Two_Owners_Concurrently_Leaving_Preserves_At_Least_One_Active_Owner_And_Retains_Same_User_Unrelated_Workspace_Data`: Two owners in WS1 leave concurrently at a barrier; winner leaves, loser gets `LastOwnerCannotLeave`, WS1 active owners = 1; User 1's seeded membership and project membership in unrelated WS2 remain strictly intact and active (proves no unintended cross-workspace cleanup for the leaving user).
+     * `Concurrent_Mixed_Owner_Leave_And_Demotion_With_Distinct_Targets_Preserves_At_Least_One_Active_Owner`: Exercises two distinct withdrawal targets (Owner B leaves, Owner B demotes Owner A); under protection, exactly one succeeds, loser gets domain error (`RoleNotAllowed` or `LastOwnerCannotLeave`), and active owners NEVER drops below 1.
 
 ### B. Execution Evidence & Provenance Boundaries
 
 | Dimension | Exact Target / Command | Tests Passed | Failed | Duration | Exit Code | Provenance |
 |---|---|:---:|:---:|:---:|:---:|---|
-| **Concurrent Last-Owner Regressions** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~ConcurrentOwnerProtectionTests"` | 6 | 0 | 8.2s | **0** | **[Worker-Reported (Concurrent SQLite WAL)]** |
-| **Hosted ASP.NET Core MVC TestServer** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~EfCoreWorkspaceHttpAuthorizationTests"` | 9 | 0 | 16.8s | **0** | **[Worker-Reported (Hosted MVC TestServer & Shared SQLite)]** |
+| **Concurrent Last-Owner Regressions** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~ConcurrentOwnerProtectionTests"` | 8 | 0 | 8.98s | **0** | **[Worker-Reported (Concurrent SQLite WAL)]** |
+| **Hosted ASP.NET Core MVC TestServer** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~EfCoreWorkspaceHttpAuthorizationTests"` | 9 | 0 | 15.6s | **0** | **[Worker-Reported (Hosted MVC TestServer & Shared SQLite)]** |
 | **Recipient Decline Regressions** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~InvitationDeclineTests"` | 10 | 0 | 9s | **0** | **[Worker-Reported (SQLite In-Memory)]** |
 | **Host Route Reflection** | `dotnet test test/Dosi.Tracker.HttpApi.Host.Tests/Dosi.Tracker.HttpApi.Host.Tests.csproj --filter "FullyQualifiedName~ContractRoutesTests"` | 40 | 0 | 101ms | **0** | **[Worker-Reported (Unit Reflection Only)]** |
 | **Frontend Contract Route Vitest** | `npx vitest run src/lib/api-contract.test.ts` | 30 | 0 | 1.22s | **0** | **[Verified by PM @ 3bebd70]** |
 | **Historical PM Blocked Scripts** | `qa_workspace_phase.ps1` | null | null | null | null | **[Explicitly Not Run / No Repackaging]** |
 | **Real Browser Session Acceptance** | Multi-tenant browser session & cookie verification | null | null | null | null | **[Pending Acceptance Requirement]** |
 
-#### Test Cases Covered in `ConcurrentOwnerProtectionTests` (6 total):
-1. `Unsynchronized_Concurrent_Last_Owner_Removal_Demonstrates_Orphaning_Vulnerability`: Reproduces race condition when two owners concurrently execute `RemoveAsync` without locking; both pass count > 1 check, removing both and leaving 0 active owners in database (orphaning proof).
-2. `Multi_Owner_Sequential_Leaves_Allow_Demotions_Until_Last_Owner`: Proves re-entrant locking and sequential leave operations: 3 owners sequentially leave down to 1 owner; last owner attempting to leave is rejected with `Tracker:LastOwnerCannotLeave`.
-3. `Two_Owners_Concurrently_Leaving_Preserves_At_Least_One_Active_Owner_And_Rejects_Losing_Owner`: Two owners in Workspace 1 call `LeaveAsync` concurrently at a barrier. Winner leaves (status Removed, project memberships pruned); loser is rejected with `Tracker:LastOwnerCannotLeave` (remains active Owner, project memberships intact); persisted active owner count = 1. Foreign Workspace 2 remains completely intact with 0 unintended cleanup.
-4. `Two_Owners_Concurrently_Demoting_Each_Other_Preserves_At_Least_One_Active_Owner`: Two owners call `UpdateWorkspaceRoleAsync` concurrently attempting to demote each other. Exactly one succeeds; loser is rejected with domain error (`Tracker:RoleNotAllowed` or `Tracker:LastOwnerCannotLeave`); persisted active owner count = 1.
-5. `Concurrent_Mixed_Owner_Leave_And_Demotion_Preserves_At_Least_One_Active_Owner`: Concurrent execution of Owner A leaving and Owner B demoting Owner A. In both execution interleavings, at least one active owner remains in the database.
-6. `Concurrent_Owner_Leaves_In_Different_Workspaces_Execute_Concurrently_Without_Contention`: Proves fine-grained per-workspace locking: concurrent leaves in Workspace 1 and Workspace 2 execute simultaneously without contention or cross-workspace blocking.
+#### Test Cases Covered in `ConcurrentOwnerProtectionTests` (8 total):
+1. `Modeled_Unsynchronized_Last_Owner_Removal_Simulates_Orphaning_Risk`: Bounded simulation demonstrating how two uncoordinated readers both observing count == 2 bypass sequential checks and drop active owners to 0 (orphaning risk simulation, not production execution claim).
+2. `Owner_Lock_Is_Exclusive_Held_Across_Commit_And_Unrelated_Workspaces_Not_Serialized`: Proves lock exclusivity, competitor blocking on same key, immediate acquisition on unrelated workspace key, and post-release competitor acquisition.
+3. `Deterministic_Interleaved_Owner_Leave_Blocks_Competitor_Until_Commit_Visibility`: Proves with deterministic barrier interception that competitor is held blocked at lock boundary until commit finishes; upon release, competitor observes committed state and throws `LastOwnerCannotLeave`.
+4. `Two_Owners_Concurrently_Leaving_Preserves_At_Least_One_Active_Owner_And_Retains_Same_User_Unrelated_Workspace_Data`: Barrier-synchronized concurrent leaves in WS1; exactly 1 succeeds, loser gets `LastOwnerCannotLeave`, WS1 active owners = 1; User 1's seeded membership and project membership in unrelated WS2 remain strictly intact and active.
+5. `Two_Owners_Concurrently_Demoting_Each_Other_Preserves_At_Least_One_Active_Owner`: Mutual concurrent demotion; winner succeeds, loser gets domain error (`RoleNotAllowed` or `LastOwnerCannotLeave`), persisted active owners = 1.
+6. `Concurrent_Mixed_Owner_Leave_And_Demotion_With_Distinct_Targets_Preserves_At_Least_One_Active_Owner`: Two distinct withdrawal targets (Owner B leaves, Owner B demotes Owner A); exactly one succeeds, loser gets domain error, and active owners NEVER drops below 1.
+7. `Concurrent_Owner_Leaves_In_Different_Workspaces_Execute_Concurrently_Without_Contention`: Proves fine-grained per-workspace locking: concurrent leaves in Workspace 1 and Workspace 2 execute simultaneously without contention or cross-workspace blocking.
+8. `Multi_Owner_Sequential_Leaves_Allow_Demotions_Until_Last_Owner`: Proves legitimate multi-owner sequential leaves/demotions succeed until the last owner is rejected with `LastOwnerCannotLeave`.
 
 ---
 
@@ -524,8 +533,8 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
 1. **Privacy Acceptance Pending**:
    - The privacy source audit (commit `14bbe66`) remains **Pending PM Independent Review**. This status is preserved and not bypassed.
 2. **Workspace Authorization, Isolation & Concurrency Phase Status**:
-   - Recipient decline lifecycle (`REQ-WS-07`, commit `27f7aa1`), genuine hosted ASP.NET Core `TestServer` MVC aggregate authorization harness (`REQ-ISO-05`, commit `96e3246`), and concurrent last-owner protection (`REQ-WS-06`) are implemented with isolated test coverage (25 SQLite tests total: 10 decline + 9 TestServer MVC auth + 6 concurrent owner protection).
-   - Real browser cookie/session testing (`__Host-Dosi-Workspace`), Next.js server actions, OpenIddict token issuer, multi-node distributed lock infrastructure (Redis), and PM independent execution of `qa_workspace_phase.ps1` remain pending.
+   - Recipient decline lifecycle (`REQ-WS-07`, commit `27f7aa1`), genuine hosted ASP.NET Core `TestServer` MVC aggregate authorization harness (`REQ-ISO-05`, commit `96e3246`), and concurrent last-owner protection (`REQ-WS-06`) are implemented with isolated test coverage (27 SQLite tests total: 10 decline + 9 TestServer MVC auth + 8 concurrent owner protection).
+   - Real browser cookie/session testing (`__Host-Dosi-Workspace`), Next.js server actions, OpenIddict token issuer, multi-node distributed lock infrastructure (Redis), and PM independent execution of `qa_workspace_phase.ps1` remain pending. All reported outcomes are worker-executed, not independent PM QA.
 3. **Overall Product Incomplete**:
    - Overall product remains incomplete across:
      - Backend metric nullability schema migrations (`Activity.cs` truthful nulls vs 0)
@@ -534,7 +543,7 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
      - Production packaging, Authenticode/Apple Developer ID code signing, and installer pipelines
      - Real monitoring, production databases, and hosted operational deployment
 4. **Awaiting PM Guidance**:
-   - Bounded task complete. Stop and hand off for PM review with exact diff and test evidence. PM will inspect this result and designate the next safe, bounded engineering phase.
+   - Bounded correction complete. Stop and hand off for PM review with exact diff and test evidence. PM will inspect this result and designate the next safe, bounded engineering phase.
 
 
 

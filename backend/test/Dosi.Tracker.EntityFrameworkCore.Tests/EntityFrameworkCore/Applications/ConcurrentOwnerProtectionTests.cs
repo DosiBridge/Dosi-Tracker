@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Data.Common;
 using System.IO;
@@ -17,6 +18,7 @@ using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Shouldly;
 using Volo.Abp;
 using Volo.Abp.Data;
@@ -56,6 +58,63 @@ public class SqliteWalConnectionInterceptor : DbConnectionInterceptor
     }
 }
 
+/// <summary>
+/// A controllable per-key distributed lock provider implementing IAbpDistributedLock for integration testing.
+/// Provides deterministic bounded hooks (LockAcquired, OnBeforeReleaseAsync, LockReleasing)
+/// to coordinate concurrent operations without arbitrary thread sleeps.
+/// </summary>
+public class ControllableDistributedLock : IAbpDistributedLock
+{
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _semaphores = new();
+
+    public event Action<string>? LockAcquired;
+    public event Action<string>? LockReleasing;
+    public Func<string, Task>? OnBeforeReleaseAsync { get; set; }
+
+    public async Task<IAbpDistributedLockHandle?> TryAcquireAsync(
+        string name, TimeSpan timeout = default, CancellationToken cancellationToken = default)
+    {
+        var sem = _semaphores.GetOrAdd(name, _ => new SemaphoreSlim(1, 1));
+        var acquired = await sem.WaitAsync(timeout, cancellationToken);
+        if (!acquired)
+        {
+            return null;
+        }
+
+        LockAcquired?.Invoke(name);
+        return new Handle(this, name, sem);
+    }
+
+    private sealed class Handle : IAbpDistributedLockHandle
+    {
+        private readonly ControllableDistributedLock _owner;
+        private readonly string _name;
+        private readonly SemaphoreSlim _semaphore;
+        private int _disposed;
+
+        public Handle(ControllableDistributedLock owner, string name, SemaphoreSlim semaphore)
+        {
+            _owner = owner;
+            _name = name;
+            _semaphore = semaphore;
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) == 0)
+            {
+                if (_owner.OnBeforeReleaseAsync != null)
+                {
+                    await _owner.OnBeforeReleaseAsync(_name);
+                }
+
+                _owner.LockReleasing?.Invoke(_name);
+                _semaphore.Release();
+            }
+        }
+    }
+}
+
 [DependsOn(
     typeof(TrackerApplicationTestModule),
     typeof(TrackerEntityFrameworkCoreModule),
@@ -92,7 +151,18 @@ public class ConcurrentOwnerProtectionTestModule : AbpModule
             options.IsDynamicSettingStoreEnabled = false;
         });
 
+        // Provider Inability Note:
+        // SQLite (in-memory or single file) does not support multi-connection concurrent write transactions in ABP;
+        // enabling transactions causes SQLite Error 5: 'database is locked' during module data seeding.
+        // Therefore, AddAlwaysDisableUnitOfWorkTransaction is required by this SQLite test fixture.
+        // Production code explicitly requests isTransactional: true and awaits uow.CompleteAsync() before releasing
+        // the owner lock, but full multi-connection transactional commit proof requires a database provider supporting
+        // concurrent write transactions (e.g., PostgreSQL / SQL Server).
         context.Services.AddAlwaysDisableUnitOfWorkTransaction();
+
+        // Register controllable distributed lock for deterministic synchronization and key inspection
+        context.Services.Replace(ServiceDescriptor.Singleton<ControllableDistributedLock, ControllableDistributedLock>());
+        context.Services.Replace(ServiceDescriptor.Singleton<IAbpDistributedLock>(sp => sp.GetRequiredService<ControllableDistributedLock>()));
 
         // Initialize dedicated file database in WAL mode for independent multi-connection concurrency
         InitializeDatabase(ConnectionString);
@@ -155,6 +225,8 @@ public class ConcurrentOwnerProtectionTests : TrackerTestBase<ConcurrentOwnerPro
     {
         _guidGenerator = GetRequiredService<IGuidGenerator>();
     }
+
+    private ControllableDistributedLock DistributedLock => GetRequiredService<ControllableDistributedLock>();
 
     private static ClaimsPrincipal CreatePrincipal(Guid userId)
     {
@@ -235,13 +307,12 @@ public class ConcurrentOwnerProtectionTests : TrackerTestBase<ConcurrentOwnerPro
     }
 
     [Fact]
-    public async Task Unsynchronized_Concurrent_Last_Owner_Removal_Demonstrates_Orphaning_Vulnerability()
+    public async Task Modeled_Unsynchronized_Last_Owner_Removal_Simulates_Orphaning_Risk()
     {
-        // Demonstrates the failing-before vulnerability:
-        // Prior to per-workspace serialization and transactional lock scoping,
-        // two concurrent removal operations independently read CountOwnersAsync == 2,
-        // both pass the sequential "count <= 1" check, and both mutate/commit.
-        // As a result, active owner count drops to 0 (orphaning the workspace).
+        // Bounded Modeled Interleaving Simulation (Not a claim of prior production codebase execution):
+        // Demonstrates the theoretical race condition where, in the absence of per-workspace ownership synchronization,
+        // two concurrent removal operations independently read CountOwnersAsync == 2, both pass the sequential
+        // "count <= 1" check, and both mutate/commit. As a result, active owner count drops to 0 (orphaning the workspace).
 
         var wsId = _guidGenerator.Create();
         var userA = await CreateTestUserAsync("vuln_a");
@@ -250,12 +321,6 @@ public class ConcurrentOwnerProtectionTests : TrackerTestBase<ConcurrentOwnerPro
         await AddOwnerAsync(wsId, userB.Id);
 
         (await CountActiveOwnersInDbAsync(wsId)).ShouldBe(2);
-
-        // Simulate the exact unsynchronized interleaving:
-        // Thread A loads membership and counts owners -> sees 2
-        // Thread B loads membership and counts owners -> sees 2
-        // Thread A passes check (2 <= 1 is false), removes owner A, saves
-        // Thread B passes check (2 <= 1 was false), removes owner B, saves
 
         using (var scopeA = ServiceProvider.CreateScope())
         using (var scopeB = ServiceProvider.CreateScope())
@@ -271,55 +336,221 @@ public class ConcurrentOwnerProtectionTests : TrackerTestBase<ConcurrentOwnerPro
             var memberA = await memRepoA.FirstAsync(m => m.WorkspaceId == wsId && m.UserId == userA.Id);
             var memberB = await memRepoB.FirstAsync(m => m.WorkspaceId == wsId && m.UserId == userB.Id);
 
-            // Step 1: Both threads independently check owner count before either commits
+            // Both threads independently check owner count before either commits
             var countObservedByA = await memRepoA.CountAsync(m => m.WorkspaceId == wsId && m.Status == WorkspaceMemberStatus.Active && m.Role == WorkspaceRoles.Owner);
             var countObservedByB = await memRepoB.CountAsync(m => m.WorkspaceId == wsId && m.Status == WorkspaceMemberStatus.Active && m.Role == WorkspaceRoles.Owner);
 
             countObservedByA.ShouldBe(2);
             countObservedByB.ShouldBe(2);
 
-            // Step 2: Because count was 2, neither threw LastOwnerCannotLeave
+            // Because count was 2, neither threw LastOwnerCannotLeave
             (countObservedByA <= 1).ShouldBeFalse();
             (countObservedByB <= 1).ShouldBeFalse();
 
-            // Step 3: Thread A removes owner A and updates
+            // Thread A removes owner A and updates
             memberA.Remove();
             await memRepoA.UpdateAsync(memberA, autoSave: true);
             await uowA.CompleteAsync();
 
-            // Step 4: Thread B, having bypassed the check, removes owner B and updates
+            // Thread B, having bypassed the check, removes owner B and updates
             memberB.Remove();
             await memRepoB.UpdateAsync(memberB, autoSave: true);
             await uowB.CompleteAsync();
         }
 
-        // Final persisted active-owner count drops to 0 -> proves the unsynchronized race orphaning vulnerability!
+        // Final persisted active-owner count drops to 0 in this modeled simulation
         var orphanedCount = await CountActiveOwnersInDbAsync(wsId);
         orphanedCount.ShouldBe(0);
     }
 
     [Fact]
-    public async Task Two_Owners_Concurrently_Leaving_Preserves_At_Least_One_Active_Owner_And_Rejects_Losing_Owner()
+    public async Task Owner_Lock_Is_Exclusive_Held_Across_Commit_And_Unrelated_Workspaces_Not_Serialized()
+    {
+        // Proves that:
+        // 1. LockOwnersAsync is strictly exclusive for the targeted workspace key.
+        // 2. A competitor attempting to acquire the lock for the same workspace fails/blocks.
+        // 3. Lock keys for unrelated workspaces are completely independent and not globally serialized.
+        // 4. Upon disposal/release, the competitor successfully acquires the lock.
+
+        var ws1Id = _guidGenerator.Create();
+        var ws2Id = _guidGenerator.Create();
+
+        using var scope1 = ServiceProvider.CreateScope();
+        var memMgr1 = scope1.ServiceProvider.GetRequiredService<WorkspaceMembershipManager>();
+
+        await using (var lockHandle1 = await memMgr1.LockOwnersAsync(ws1Id))
+        {
+            // While WS1 lock is held, competitor for WS1 cannot acquire it
+            var competitorWs1 = await DistributedLock.TryAcquireAsync(
+                WorkspaceMembershipManager.OwnerLockName(ws1Id),
+                TimeSpan.FromMilliseconds(50));
+            competitorWs1.ShouldBeNull();
+
+            // While WS1 lock is held, competitor for unrelated WS2 acquires lock immediately
+            var competitorWs2 = await DistributedLock.TryAcquireAsync(
+                WorkspaceMembershipManager.OwnerLockName(ws2Id),
+                TimeSpan.FromSeconds(5));
+            competitorWs2.ShouldNotBeNull();
+            await competitorWs2.DisposeAsync();
+        }
+
+        // After WS1 lock is released, competitor for WS1 can acquire it
+        var postReleaseWs1 = await DistributedLock.TryAcquireAsync(
+            WorkspaceMembershipManager.OwnerLockName(ws1Id),
+            TimeSpan.FromSeconds(5));
+        postReleaseWs1.ShouldNotBeNull();
+        await postReleaseWs1.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Deterministic_Interleaved_Owner_Leave_Blocks_Competitor_Until_Commit_Visibility()
+    {
+        // Deterministic Bounded Interleaving Proof:
+        // 1. Thread 1 enters LeaveAsync, acquires ownerLock, and proceeds through member/project cleanup and commit.
+        // 2. Thread 2 enters LeaveAsync and is BLOCKED at the ownerLock boundary.
+        // 3. While Thread 1 has committed to the DB but has not released the lock, we prove:
+        //    - Thread 1's commit is visible (count == 1 in DB).
+        //    - Thread 2 is STILL BLOCKED (task2.IsCompleted == false).
+        // 4. Thread 1 releases the lock.
+        // 5. Thread 2 unblocks, observes Thread 1's committed removal, evaluates CountOwnersAsync <= 1,
+        //    and is rejected with TrackerDomainErrorCodes.LastOwnerCannotLeave.
+        // 6. Persisted active owners count remains exactly 1.
+
+        var wsId = _guidGenerator.Create();
+        var owner1 = await CreateTestUserAsync("det_a");
+        var owner2 = await CreateTestUserAsync("det_b");
+
+        await CreateWorkspaceWithOwnerAsync(wsId, "WS_DetInterleave", owner1.Id);
+        await AddOwnerAsync(wsId, owner2.Id);
+
+        (await CountActiveOwnersInDbAsync(wsId)).ShouldBe(2);
+
+        var lockName = WorkspaceMembershipManager.OwnerLockName(wsId);
+        var thread1AcquiredLock = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var thread2AttemptedLock = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var allowThread1Release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        void OnLockAcquired(string name)
+        {
+            if (name == lockName)
+            {
+                thread1AcquiredLock.TrySetResult(true);
+            }
+        }
+
+        DistributedLock.LockAcquired += OnLockAcquired;
+        DistributedLock.OnBeforeReleaseAsync = async name =>
+        {
+            if (name == lockName)
+            {
+                // Assert at the moment of release: Thread 1 has already committed its changes,
+                // but lock has not yet unblocked Thread 2
+                var ownersInDb = await CountActiveOwnersInDbAsync(wsId);
+                ownersInDb.ShouldBe(1);
+
+                // Wait until test runner signals release
+                await allowThread1Release.Task;
+            }
+        };
+
+        Exception? ex1 = null;
+        Exception? ex2 = null;
+
+        try
+        {
+            var task1 = Task.Run(async () =>
+            {
+                try
+                {
+                    using var scope = ServiceProvider.CreateScope();
+                    var principalAccessor = scope.ServiceProvider.GetRequiredService<ICurrentPrincipalAccessor>();
+                    var appService = scope.ServiceProvider.GetRequiredService<IWorkspaceAppService>();
+                    using (principalAccessor.Change(CreatePrincipal(owner1.Id)))
+                    {
+                        await appService.LeaveAsync(wsId);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    ex1 = ex;
+                }
+            });
+
+            // Wait until Thread 1 has acquired the lock
+            await thread1AcquiredLock.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+            // Launch Thread 2 while Thread 1 holds the lock
+            var task2 = Task.Run(async () =>
+            {
+                try
+                {
+                    thread2AttemptedLock.TrySetResult(true);
+                    using var scope = ServiceProvider.CreateScope();
+                    var principalAccessor = scope.ServiceProvider.GetRequiredService<ICurrentPrincipalAccessor>();
+                    var appService = scope.ServiceProvider.GetRequiredService<IWorkspaceAppService>();
+                    using (principalAccessor.Change(CreatePrincipal(owner2.Id)))
+                    {
+                        await appService.LeaveAsync(wsId);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    ex2 = ex;
+                }
+            });
+
+            await thread2AttemptedLock.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+            // Small bounded check: task2 cannot be completed while Thread 1 holds the lock
+            task2.IsCompleted.ShouldBeFalse();
+
+            // Allow Thread 1 to release lock
+            allowThread1Release.TrySetResult(true);
+
+            await Task.WhenAll(task1, task2);
+
+            ex1.ShouldBeNull();
+            var businessEx = ex2.ShouldBeOfType<BusinessException>();
+            businessEx.Code.ShouldBe(TrackerDomainErrorCodes.LastOwnerCannotLeave);
+
+            // Exactly 1 owner remains persisted in DB
+            var finalOwners = await CountActiveOwnersInDbAsync(wsId);
+            finalOwners.ShouldBe(1);
+        }
+        finally
+        {
+            DistributedLock.LockAcquired -= OnLockAcquired;
+            DistributedLock.OnBeforeReleaseAsync = null;
+            allowThread1Release.TrySetResult(true);
+        }
+    }
+
+    [Fact]
+    public async Task Two_Owners_Concurrently_Leaving_Preserves_At_Least_One_Active_Owner_And_Retains_Same_User_Unrelated_Workspace_Data()
     {
         // Passing-after regression:
         // Two owners in Workspace 1 invoke production WorkspaceAppService.LeaveAsync concurrently.
-        // A second unrelated Workspace 2 with its own owner and project is created to verify
-        // that per-workspace locking preserves isolation and causes no unintended cross-workspace cleanup.
+        // User 1 is ALSO an Owner and Project Member of unrelated Workspace 2.
+        // Proves:
+        // 1. Exactly one owner succeeds in leaving WS1, and the competitor is rejected with LastOwnerCannotLeave.
+        // 2. Active owner count in WS1 is strictly >= 1 (exactly 1).
+        // 3. User 1's seeded membership and project membership in Workspace 2 are strictly preserved (no cross-workspace cleanup).
 
         var ws1Id = _guidGenerator.Create();
         var ws2Id = _guidGenerator.Create();
 
         var owner1 = await CreateTestUserAsync("leave1");
         var owner2 = await CreateTestUserAsync("leave2");
-        var ws2Owner = await CreateTestUserAsync("ws2_owner");
 
+        // Seed WS1 with owner1 and owner2
         await CreateWorkspaceWithOwnerAsync(ws1Id, "WS1_ConcurrentLeave", owner1.Id);
         await AddOwnerAsync(ws1Id, owner2.Id);
         var ws1Proj1 = await CreateProjectWithMemberAsync(ws1Id, owner1.Id);
         var ws1Proj2 = await CreateProjectWithMemberAsync(ws1Id, owner2.Id);
 
-        await CreateWorkspaceWithOwnerAsync(ws2Id, "WS2_Isolated", ws2Owner.Id);
-        var ws2Proj = await CreateProjectWithMemberAsync(ws2Id, ws2Owner.Id);
+        // Seed WS2 where owner1 is ALSO an Owner and has a Project Member
+        await CreateWorkspaceWithOwnerAsync(ws2Id, "WS2_Isolated", owner1.Id);
+        var ws2Proj = await CreateProjectWithMemberAsync(ws2Id, owner1.Id);
 
         (await CountActiveOwnersInDbAsync(ws1Id)).ShouldBe(2);
         (await CountActiveOwnersInDbAsync(ws2Id)).ShouldBe(1);
@@ -379,8 +610,8 @@ public class ConcurrentOwnerProtectionTests : TrackerTestBase<ConcurrentOwnerPro
         var finalWs1Owners = await CountActiveOwnersInDbAsync(ws1Id);
         finalWs1Owners.ShouldBe(1);
 
-        // Assert: Winner was removed and had project memberships removed;
-        // Loser remained active Owner and project membership is intact
+        // Assert: Winner was removed in WS1 and had WS1 project memberships removed;
+        // Loser remained active Owner in WS1 and WS1 project membership is intact
         using (var verifyScope = ServiceProvider.CreateScope())
         {
             var dataFilter = verifyScope.ServiceProvider.GetRequiredService<IDataFilter>();
@@ -399,34 +630,35 @@ public class ConcurrentOwnerProtectionTests : TrackerTestBase<ConcurrentOwnerPro
 
                 if (ex1 == null)
                 {
-                    // Owner 1 won (left)
+                    // Owner 1 won (left WS1)
                     mem1.Status.ShouldBe(WorkspaceMemberStatus.Removed);
                     projMembers1.ShouldBeEmpty();
 
-                    // Owner 2 lost (kept as last owner)
+                    // Owner 2 lost (kept as last owner in WS1)
                     mem2.Status.ShouldBe(WorkspaceMemberStatus.Active);
                     mem2.Role.ShouldBe(WorkspaceRoles.Owner);
                     projMembers2.Count.ShouldBe(1);
                 }
                 else
                 {
-                    // Owner 2 won (left)
+                    // Owner 2 won (left WS1)
                     mem2.Status.ShouldBe(WorkspaceMemberStatus.Removed);
                     projMembers2.ShouldBeEmpty();
 
-                    // Owner 1 lost (kept as last owner)
+                    // Owner 1 lost (kept as last owner in WS1)
                     mem1.Status.ShouldBe(WorkspaceMemberStatus.Active);
                     mem1.Role.ShouldBe(WorkspaceRoles.Owner);
                     projMembers1.Count.ShouldBe(1);
                 }
 
-                // Assert: WS2 is completely unaffected (no unintended membership/project cleanup)
-                var ws2OwnerMem = await memRepo.FirstAsync(m => m.WorkspaceId == ws2Id && m.UserId == ws2Owner.Id);
-                ws2OwnerMem.Status.ShouldBe(WorkspaceMemberStatus.Active);
-                ws2OwnerMem.Role.ShouldBe(WorkspaceRoles.Owner);
+                // Assert: User 1's seeded WS2 membership and project membership remain strictly intact and active!
+                var ws2Owner1Mem = await memRepo.FirstAsync(m => m.WorkspaceId == ws2Id && m.UserId == owner1.Id);
+                ws2Owner1Mem.Status.ShouldBe(WorkspaceMemberStatus.Active);
+                ws2Owner1Mem.Role.ShouldBe(WorkspaceRoles.Owner);
 
-                var ws2ProjMembers = await projMemRepo.GetListAsync(pm => pm.WorkspaceId == ws2Id && pm.UserId == ws2Owner.Id);
+                var ws2ProjMembers = await projMemRepo.GetListAsync(pm => pm.WorkspaceId == ws2Id && pm.UserId == owner1.Id);
                 ws2ProjMembers.Count.ShouldBe(1);
+
                 await uow.CompleteAsync();
             }
         }
@@ -439,7 +671,7 @@ public class ConcurrentOwnerProtectionTests : TrackerTestBase<ConcurrentOwnerPro
         // In a 2-owner workspace, Owner A attempts to demote Owner B to Manager,
         // while Owner B concurrently attempts to demote Owner A to Manager.
         // Under per-workspace serialization and transactional lock scoping:
-        // Exactly one succeeds, and the other is rejected with LastOwnerCannotLeave.
+        // Exactly one succeeds, and the other is rejected with domain error (RoleNotAllowed or LastOwnerCannotLeave).
         // At least one active owner remains.
 
         var wsId = _guidGenerator.Create();
@@ -532,20 +764,23 @@ public class ConcurrentOwnerProtectionTests : TrackerTestBase<ConcurrentOwnerPro
     }
 
     [Fact]
-    public async Task Concurrent_Mixed_Owner_Leave_And_Demotion_Preserves_At_Least_One_Active_Owner()
+    public async Task Concurrent_Mixed_Owner_Leave_And_Demotion_With_Distinct_Targets_Preserves_At_Least_One_Active_Owner()
     {
-        // Passing-after regression:
-        // Owner A leaves while Owner B concurrently demotes Owner A to Manager.
+        // Reachable Mixed Leave & Demotion with Distinct Withdrawal Targets:
+        // Workspace has two owners: Owner A and Owner B.
+        // Withdrawal 1 Target: Owner B leaves via WorkspaceAppService.LeaveAsync.
+        // Withdrawal 2 Target: Owner A is demoted to Manager via TeamAppService.UpdateWorkspaceRoleAsync (initiated by Owner B).
+        // If uncoordinated: Owner B leaves (count drops to 1) and Owner A is demoted (count drops to 0) -> orphaning vulnerability!
         // Under per-workspace serialization and transactional lock scoping:
-        // Either Leave commits first (so Demote throws InvalidUser) OR
-        // Demote commits first (Owner A becomes Manager, Leave removes Manager A, Owner B remains Owner).
-        // In all cases, active owners count in the workspace NEVER drops below 1.
+        // Either Leave executes first (Owner B removed; Demote fails with RoleNotAllowed since caller B is no longer an owner),
+        // or Demote executes first (Owner A becomes Manager; Leave fails with LastOwnerCannotLeave since B is now the last owner).
+        // In all execution orders, active owners count in the workspace NEVER drops below 1.
 
         var wsId = _guidGenerator.Create();
-        var ownerA = await CreateTestUserAsync("mixed_a");
-        var ownerB = await CreateTestUserAsync("mixed_b");
+        var ownerA = await CreateTestUserAsync("dist_mixed_a");
+        var ownerB = await CreateTestUserAsync("dist_mixed_b");
 
-        await CreateWorkspaceWithOwnerAsync(wsId, "WS_MixedLeaveDemote", ownerA.Id);
+        await CreateWorkspaceWithOwnerAsync(wsId, "WS_MixedLeaveDemoteDistinct", ownerA.Id);
         await AddOwnerAsync(wsId, ownerB.Id);
 
         (await CountActiveOwnersInDbAsync(wsId)).ShouldBe(2);
@@ -562,7 +797,7 @@ public class ConcurrentOwnerProtectionTests : TrackerTestBase<ConcurrentOwnerPro
                 var principalAccessor = scope.ServiceProvider.GetRequiredService<ICurrentPrincipalAccessor>();
                 var appService = scope.ServiceProvider.GetRequiredService<IWorkspaceAppService>();
 
-                using (principalAccessor.Change(CreatePrincipal(ownerA.Id)))
+                using (principalAccessor.Change(CreatePrincipal(ownerB.Id)))
                 {
                     barrier.SignalAndWait();
                     await appService.LeaveAsync(wsId);
@@ -598,7 +833,15 @@ public class ConcurrentOwnerProtectionTests : TrackerTestBase<ConcurrentOwnerPro
 
         await Task.WhenAll(taskLeave, taskDemote);
 
-        // In both interleavings, Owner B remains an active Owner
+        // Assert exactly one operation succeeded and exactly one threw a domain exception
+        var exceptions = new[] { exLeave, exDemote }.Where(e => e != null).ToList();
+        exceptions.Count.ShouldBe(1);
+
+        var businessEx = exceptions[0].ShouldBeOfType<BusinessException>();
+        new[] { TrackerDomainErrorCodes.LastOwnerCannotLeave, TrackerDomainErrorCodes.RoleNotAllowed }
+            .ShouldContain(businessEx.Code);
+
+        // In both interleavings, exactly 1 active owner remains
         var finalOwners = await CountActiveOwnersInDbAsync(wsId);
         finalOwners.ShouldBe(1);
 
@@ -607,9 +850,25 @@ public class ConcurrentOwnerProtectionTests : TrackerTestBase<ConcurrentOwnerPro
             var uowManager = verifyScope.ServiceProvider.GetRequiredService<IUnitOfWorkManager>();
             using var uow = uowManager.Begin(requiresNew: true);
             var memRepo = verifyScope.ServiceProvider.GetRequiredService<IRepository<WorkspaceMember, Guid>>();
+            var memA = await memRepo.FirstAsync(m => m.WorkspaceId == wsId && m.UserId == ownerA.Id);
             var memB = await memRepo.FirstAsync(m => m.WorkspaceId == wsId && m.UserId == ownerB.Id);
-            memB.Status.ShouldBe(WorkspaceMemberStatus.Active);
-            memB.Role.ShouldBe(WorkspaceRoles.Owner);
+
+            if (exLeave == null)
+            {
+                // Leave won: Owner B was removed; Demote failed; Owner A remained Owner
+                memB.Status.ShouldBe(WorkspaceMemberStatus.Removed);
+                memA.Status.ShouldBe(WorkspaceMemberStatus.Active);
+                memA.Role.ShouldBe(WorkspaceRoles.Owner);
+            }
+            else
+            {
+                // Demote won: Owner A became Manager; Leave failed; Owner B remained Owner
+                memA.Status.ShouldBe(WorkspaceMemberStatus.Active);
+                memA.Role.ShouldBe(WorkspaceRoles.Manager);
+                memB.Status.ShouldBe(WorkspaceMemberStatus.Active);
+                memB.Role.ShouldBe(WorkspaceRoles.Owner);
+            }
+
             await uow.CompleteAsync();
         }
     }
