@@ -358,40 +358,44 @@ Following PM inspection of source at clean `2a83bc1`, documentation for `REQ-WS-
    - Added `Task DeclineInvitationAsync(string token);`.
 2. **Domain & Application Service Implementation (`WorkspaceAppService.cs`)**:
    - Annotated with `[Authorize]` and `[WorkspaceNotRequired]` so callers do not need an active workspace header or prior membership.
-   - Evaluates authenticated caller identity: `var userId = CurrentUser.Id ?? throw new AbpAuthorizationException();`.
-   - Resolves user's verified identity email via `_userManager.GetByIdAsync(userId.Value)`.
-   - Retrieves usable invitation via `GetUsableInvitationAsync(token)`: verifies token exists, is pending, and has not expired.
-   - Strictly enforces recipient identity: `if (!invitation.IsFor(user.Email)) throw new BusinessException(TrackerDomainErrorCodes.InvalidInvitationToken);`.
-   - Uses domain case-insensitive email match (`invitation.IsFor`), avoiding client-supplied email parameters or spoofing.
-   - Invalidation mechanism: executes schema-free pending row deletion via `_invitationRepository.DeleteAsync(invitation)`. Follows the existing admin delete pattern without requiring database migrations or schema alterations.
-   - Security & Concurrency Trace: Never logs or returns raw tokens in error messages. Decline executes under the unit of work transaction. If concurrent accept/register operations attempt to use the same token, the deleted row causes immediate `EntityNotFoundException` on token lookup, preventing duplicate joins. Decline modifies no existing memberships or acceptances and leaves other-workspace invitations intact.
+   - **Evaluation Order**:
+     1. Retrieves usable invitation first: `var invitation = await GetUsableInvitationAsync(token);`. This throws `BusinessException(TrackerDomainErrorCodes.InvitationNotFound)` if token is null, empty, or does not exist, and throws `BusinessException(TrackerDomainErrorCodes.InvitationExpired)` if expired or already accepted.
+     2. Evaluates authenticated caller identity second: `var userId = CurrentUser.Id ?? throw new AbpAuthorizationException();`.
+     3. Resolves user identity: `var user = await _userManager.GetByIdAsync(userId);`. This reads `user.Email` from identity storage. (Note: reading `user.Email` is an identity email check, not verification that `EmailConfirmed` is true).
+     4. Enforces recipient identity match: `if (!invitation.IsFor(user.Email)) throw new BusinessException(TrackerDomainErrorCodes.InvitationEmailMismatch);`. Uses domain case-insensitive email match (`invitation.IsFor`), avoiding client-supplied email parameters or spoofing.
+     5. Invalidation mechanism: executes schema-free pending row deletion via `_invitationRepository.DeleteAsync(invitation)`. Follows the existing admin delete pattern without requiring database migrations or schema alterations.
+   - **Security, Transaction & Concurrency Trace**:
+     - Never logs or returns raw tokens in error messages.
+     - Decline modifies no existing memberships or acceptances and leaves other-workspace invitations intact.
+     - **Concurrency Status — Unverified**: Existing tests are sequential, in-process SQLite in-memory tests where `TrackerEntityFrameworkCoreTestModule` explicitly enables `AddAlwaysDisableUnitOfWorkTransaction`. In production, both `AcceptInvitationAsync` and `RegisterAsync` resolve the invitation via `GetUsableInvitationAsync` *before* initiating their own explicit transactions. Therefore, deleting a row under a unit of work cannot be claimed to automatically prove multi-threaded race safety against concurrent accept/register-vs-decline. Concurrency behavior under concurrent execution remains **unverified** without concrete multi-threaded regression evidence; no race exploits or concurrency solutions are claimed.
 3. **HTTP API Controller (`WorkspacesController.cs`)**:
    - Added endpoint `[HttpPost("{token}/decline")]` on `InvitationsController` (inheriting `TrackerController`, decorated with `[Authorize]` and `[WorkspaceNotRequired]`).
 4. **Frontend API Contract (`frontend/src/lib/api-contract.ts`)**:
    - Exported `declineInvitationRoute: (token: string) => `/api/app/invitations/${encodeURIComponent(token)}/decline``.
-   - Added test coverage in `frontend/src/lib/api-contract.test.ts`.
+   - Added test coverage in `frontend/src/lib/api-contract.test.ts` (30 passed, Verified by PM @ `3bebd70`).
 
 ### C. Execution Evidence & Provenance Boundaries
 
 | Dimension | Exact Target / Command | Tests Passed | Failed | Duration | Exit Code | Provenance |
 |---|---|:---:|:---:|:---:|:---:|---|
-| **Isolated EF Core Regressions** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~InvitationDeclineTests"` | 9 | 0 | 8s | **0** | **[Worker-Reported (SQLite In-Memory)]** |
-| **Host Route Reflection** | `dotnet test test/Dosi.Tracker.HttpApi.Host.Tests/Dosi.Tracker.HttpApi.Host.Tests.csproj --filter "FullyQualifiedName~ContractRoutesTests"` | 40 | 0 | 107ms | **0** | **[Worker-Reported (Unit Reflection)]** |
-| **Frontend Contract Route Vitest** | `npx vitest run src/lib/api-contract.test.ts` | 30 | 0 | 1.22s | **0** | **[Worker-Reported (Vitest)]** |
+| **Isolated EF Core Regressions** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~InvitationDeclineTests"` | 10 | 0 | 9s | **0** | **[Worker-Reported (SQLite In-Memory)]** |
+| **Host Route Reflection** | `dotnet test test/Dosi.Tracker.HttpApi.Host.Tests/Dosi.Tracker.HttpApi.Host.Tests.csproj --filter "FullyQualifiedName~ContractRoutesTests"` | 40 | 0 | 101ms | **0** | **[Worker-Reported (Unit Reflection Only — Not Authenticated HTTP)]** |
+| **Frontend Contract Route Vitest** | `npx vitest run src/lib/api-contract.test.ts` | 30 | 0 | 1.22s | **0** | **[Verified by PM @ 3bebd70]** |
 | **Frontend TypeScript Gate** | `npm run typecheck` | 0 errors | 0 | 3.5s | **0** | **[Worker-Reported (TypeScript)]** |
 | **Historical PM Blocked Scripts** | `qa_workspace_phase.ps1` | null | null | null | null | **[Explicitly Not Run / No Repackaging]** |
 | **Real Authenticated HTTP/Browser Journey** | End-to-end browser session decline journey | null | null | null | null | **[Pending Acceptance Requirement]** |
 
-#### Test Cases Covered in `EfCoreInvitationDeclineTests`:
-1. `Decline_Pending_Invitation_By_Intended_Recipient_Succeeds_And_Removes_Invitation`: Intended recipient declines -> invitation removed, not joined to workspace.
-2. `Decline_By_Unauthenticated_Caller_Throws_AbpAuthorizationException`: Anonymous caller denied before state check.
-3. `Decline_By_Wrong_Email_Caller_Throws_BusinessException`: Authenticated caller with different email denied with `InvalidInvitationToken`; token remains usable for real recipient.
-4. `Decline_By_Caller_With_Workspace_Membership_Throws_If_Not_Target_Email`: Mere workspace membership does not grant privilege to decline another recipient's invitation.
-5. `Accept_After_Decline_Throws_EntityNotFoundException`: Declined token is permanently unusable for account acceptance.
-6. `Register_With_Invitation_After_Decline_Throws_EntityNotFoundException`: Declined token is permanently unusable for registration.
-7. `Decline_One_Invitation_Leaves_Other_Workspace_Invitation_Intact`: Multi-workspace isolation preserved; declining workspace A invitation does not affect workspace B invitation.
-8. `Decline_Already_Accepted_Invitation_Throws_EntityNotFoundException_And_Leaves_Membership_Intact`: Existing accepted membership is completely immutable to decline calls.
-9. `Expired_Invitation_Cannot_Be_Declined_Throws_BusinessException`: Expired invitation triggers `InvitationExpired`.
+#### Test Cases Covered in `EfCoreInvitationDeclineTests` (10 total):
+1. `Recipient_Can_Decline_Pending_Invitation_Without_Joining_Workspace`: Intended recipient declines -> invitation deleted from DB, `GetInvitationAsync` throws `TrackerDomainErrorCodes.InvitationNotFound`, user does not join workspace.
+2. `Wrong_Email_Authenticated_Caller_Cannot_Decline_Another_Recipients_Invitation`: Authenticated stranger without target workspace membership is rejected with `TrackerDomainErrorCodes.InvitationEmailMismatch`; token remains intact and usable.
+3. `Decline_By_Caller_With_Workspace_Membership_Throws_If_Not_Target_Email`: Authenticated caller who holds an actual active persisted membership (`WorkspaceRoles.Manager`) in the target workspace (and member of another workspace) attempting to decline another recipient's invitation is rejected with `TrackerDomainErrorCodes.InvitationEmailMismatch`; token remains usable and can be accepted by the intended recipient; caller's existing membership in target and other workspaces remains intact.
+4. `Unauthenticated_Caller_Cannot_Decline_Invitation`: Unauthenticated caller throws `AbpAuthorizationException`; token remains intact.
+5. `Declined_Token_Cannot_Be_Accepted_By_Existing_Account`: Attempting to accept a declined token throws `TrackerDomainErrorCodes.InvitationNotFound`.
+6. `Declined_Token_Cannot_Be_Used_For_New_Registration`: Attempting to register with a declined token throws `TrackerDomainErrorCodes.InvitationNotFound`.
+7. `Declining_One_Workspace_Invitation_Does_Not_Affect_Other_Workspace_Invitations`: In a multi-workspace scenario, declining one invitation throws `TrackerDomainErrorCodes.InvitationNotFound` for that token, while another workspace invitation for the same or other user remains valid and acceptable.
+8. `Already_Accepted_Invitation_Cannot_Be_Declined_And_Existing_Membership_Preserved`: Attempting to decline an already accepted invitation throws `TrackerDomainErrorCodes.InvitationExpired`; existing accepted membership remains active and intact.
+9. `Expired_Invitation_Cannot_Be_Declined`: Expired invitation throws `TrackerDomainErrorCodes.InvitationExpired`.
+10. `Nonexistent_Or_Malformed_Token_Cannot_Be_Declined`: Unknown or whitespace token throws `TrackerDomainErrorCodes.InvitationNotFound`.
 
 ---
 
@@ -400,8 +404,8 @@ Following PM inspection of source at clean `2a83bc1`, documentation for `REQ-WS-
 1. **Privacy Acceptance Pending**:
    - The privacy source audit (commit `14bbe66`) remains **Pending PM Independent Review**. This status is preserved and not bypassed.
 2. **Workspace Authorization & Isolation Phase Status**:
-   - In-process boundary integration tests (`2a83bc1`) and recipient decline lifecycle (`REQ-WS-07`) are implemented with isolated in-memory test coverage.
-   - Aggregate authenticated HTTP/browser acceptance and PM independent execution of `qa_workspace_phase.ps1` remain pending.
+   - In-process boundary integration tests (`2a83bc1`) and recipient decline lifecycle (`REQ-WS-07`) are implemented with isolated in-memory test coverage (10 SQLite tests).
+   - Aggregate authenticated HTTP/browser acceptance, multi-threaded concurrency verification, and PM independent execution of `qa_workspace_phase.ps1` remain pending.
 3. **Overall Product Incomplete**:
    - Overall product remains incomplete across:
      - Backend metric nullability schema migrations (`Activity.cs` truthful nulls vs 0)

@@ -126,6 +126,79 @@ public abstract class InvitationDeclineTests<TStartupModule> : TrackerApplicatio
     }
 
     [Fact]
+    public async Task Decline_By_Caller_With_Workspace_Membership_Throws_If_Not_Target_Email()
+    {
+        var wsTarget = await ServiceProvider.CreateWorkspaceAsync("Decline-WS-MemberTarget");
+        var wsOther = await ServiceProvider.CreateWorkspaceAsync("Decline-WS-MemberOther");
+
+        // 1. Target workspace has a pending invitation for the intended recipient
+        var token = await InviteAsync(wsTarget, "target-invitee@decline.test");
+        var targetInviteeId = await CreateUserAsync("target-invitee@decline.test");
+
+        // 2. Caller has an actual active membership in wsTarget (Manager) and in wsOther (Member)
+        var memberId = await CreateUserAsync("existing-member@decline.test");
+        await ServiceProvider.AddWorkspaceMemberAsync(memberId, WorkspaceRoles.Manager, wsTarget);
+        await ServiceProvider.AddWorkspaceMemberAsync(memberId, WorkspaceRoles.Member, wsOther);
+
+        // Verify initial membership state
+        var initialTargetMember = await ServiceProvider.FindWorkspaceMemberAsync(memberId, wsTarget);
+        initialTargetMember.ShouldNotBeNull();
+        initialTargetMember.IsActive.ShouldBeTrue();
+        initialTargetMember.Role.ShouldBe(WorkspaceRoles.Manager);
+
+        var initialOtherMember = await ServiceProvider.FindWorkspaceMemberAsync(memberId, wsOther);
+        initialOtherMember.ShouldNotBeNull();
+        initialOtherMember.IsActive.ShouldBeTrue();
+
+        // 3. Caller acts with active target-workspace ambient context/role and attempts to decline another recipient's invitation
+        using (ActAs(memberId))
+        using (_currentWorkspace.Change(wsTarget, WorkspaceRoles.Manager))
+        {
+            var ex = await Should.ThrowAsync<BusinessException>(() => _workspaceAppService.DeclineInvitationAsync(token));
+            ex.Code.ShouldBe(TrackerDomainErrorCodes.InvitationEmailMismatch);
+        }
+
+        // Also verify when ambient context is unset (endpoint is WorkspaceNotRequired)
+        using (ActAs(memberId))
+        using (_currentWorkspace.Change(null))
+        {
+            var ex = await Should.ThrowAsync<BusinessException>(() => _workspaceAppService.DeclineInvitationAsync(token));
+            ex.Code.ShouldBe(TrackerDomainErrorCodes.InvitationEmailMismatch);
+        }
+
+        // 4. Token remains untouched and completely usable by the real intended recipient
+        using (_currentWorkspace.Change(null))
+        {
+            var info = await _workspaceAppService.GetInvitationAsync(token);
+            info.ShouldNotBeNull();
+            info.Email.ShouldBe("target-invitee@decline.test");
+            info.Expired.ShouldBeFalse();
+        }
+
+        using (ActAs(targetInviteeId))
+        using (_currentWorkspace.Change(null))
+        {
+            var acceptResult = await _workspaceAppService.AcceptInvitationAsync(token);
+            acceptResult.WorkspaceId.ShouldBe(wsTarget);
+        }
+
+        var targetMember = await ServiceProvider.FindWorkspaceMemberAsync(targetInviteeId, wsTarget);
+        targetMember.ShouldNotBeNull();
+        targetMember.IsActive.ShouldBeTrue();
+
+        // 5. Caller's existing membership in wsTarget remains completely intact and active
+        var postTargetMember = await ServiceProvider.FindWorkspaceMemberAsync(memberId, wsTarget);
+        postTargetMember.ShouldNotBeNull();
+        postTargetMember.IsActive.ShouldBeTrue();
+        postTargetMember.Role.ShouldBe(WorkspaceRoles.Manager);
+
+        // 6. Other-workspace membership remains intact
+        var postOtherMember = await ServiceProvider.FindWorkspaceMemberAsync(memberId, wsOther);
+        postOtherMember.ShouldNotBeNull();
+        postOtherMember.IsActive.ShouldBeTrue();
+    }
+
+    [Fact]
     public async Task Unauthenticated_Caller_Cannot_Decline_Invitation()
     {
         var ws = await ServiceProvider.CreateWorkspaceAsync("Decline-WS-3");
