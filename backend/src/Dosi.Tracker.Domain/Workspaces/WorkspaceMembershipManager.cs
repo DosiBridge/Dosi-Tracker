@@ -1,7 +1,10 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using Volo.Abp;
+using Volo.Abp.DistributedLocking;
 using Volo.Abp.Domain.Repositories;
 
 namespace Dosi.Tracker.Workspaces;
@@ -10,11 +13,85 @@ namespace Dosi.Tracker.Workspaces;
 /// person's account (global) is never touched.</summary>
 public class WorkspaceMembershipManager : TrackerDomainService
 {
-    private readonly IRepository<WorkspaceMember, Guid> _memberRepository;
+    /// <summary>Timeout for acquiring the lock serializing workspace ownership transitions.</summary>
+    public static readonly TimeSpan OwnerLockTimeout = TimeSpan.FromSeconds(30);
 
-    public WorkspaceMembershipManager(IRepository<WorkspaceMember, Guid> memberRepository)
+    /// <summary>Name of the distributed lock that serializes owner removals and demotions of a workspace.</summary>
+    public static string OwnerLockName(Guid workspaceId) => $"Tracker:WorkspaceOwners:{workspaceId:N}";
+
+    private readonly IRepository<WorkspaceMember, Guid> _memberRepository;
+    private readonly IAbpDistributedLock _distributedLock;
+    private static string OwnerLockItemKey(Guid workspaceId) => $"Tracker:WorkspaceOwnersLock:{workspaceId:N}";
+
+    public WorkspaceMembershipManager(
+        IRepository<WorkspaceMember, Guid> memberRepository,
+        IAbpDistributedLock distributedLock)
     {
         _memberRepository = memberRepository;
+        _distributedLock = distributedLock;
+    }
+
+    /// <summary>
+    /// Serializes owner transitions (removals and demotions) for a specific workspace.
+    /// Re-entrant within the ambient unit of work so that callers wrapping a unit of work
+    /// (such as LeaveAsync or UpdateWorkspaceRoleAsync) can hold the lock until commit,
+    /// while domain methods (RemoveAsync, ChangeRoleAsync) also safely ensure the lock is held.
+    /// </summary>
+    public virtual async Task<IAsyncDisposable> LockOwnersAsync(Guid workspaceId)
+    {
+        var currentUow = UnitOfWorkManager?.Current;
+        var itemKey = OwnerLockItemKey(workspaceId);
+
+        if (currentUow != null && currentUow.Items.ContainsKey(itemKey))
+        {
+            return new ReentrantLockHandle(() => ValueTask.CompletedTask);
+        }
+
+        var handle = await _distributedLock.TryAcquireAsync(OwnerLockName(workspaceId), OwnerLockTimeout);
+        if (handle == null)
+        {
+            throw new AbpException(
+                "Another change of this workspace's ownership is still being processed; try again in a moment.");
+        }
+
+        if (currentUow != null)
+        {
+            currentUow.Items[itemKey] = handle;
+        }
+
+        return new ReentrantLockHandle(async () =>
+        {
+            try
+            {
+                await handle.DisposeAsync();
+            }
+            finally
+            {
+                if (currentUow != null)
+                {
+                    currentUow.Items.Remove(itemKey);
+                }
+            }
+        });
+    }
+
+    private sealed class ReentrantLockHandle : IAsyncDisposable
+    {
+        private readonly Func<ValueTask> _onDispose;
+        private int _disposed;
+
+        public ReentrantLockHandle(Func<ValueTask> onDispose)
+        {
+            _onDispose = onDispose;
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) == 0)
+            {
+                await _onDispose();
+            }
+        }
     }
 
     public virtual Task<WorkspaceMember?> FindAsync(Guid workspaceId, Guid userId)
@@ -69,9 +146,19 @@ public class WorkspaceMembershipManager : TrackerDomainService
             return;
         }
 
-        if (member.Role == WorkspaceRoles.Owner && await CountOwnersAsync(member.WorkspaceId) <= 1)
+        var isOwnerDemotion = member.Role == WorkspaceRoles.Owner && role != WorkspaceRoles.Owner;
+        if (isOwnerDemotion)
         {
-            throw new BusinessException(TrackerDomainErrorCodes.LastOwnerCannotLeave);
+            await using var ownerLock = await LockOwnersAsync(member.WorkspaceId);
+
+            if (await CountOwnersAsync(member.WorkspaceId) <= 1)
+            {
+                throw new BusinessException(TrackerDomainErrorCodes.LastOwnerCannotLeave);
+            }
+
+            member.SetRole(role);
+            await _memberRepository.UpdateAsync(member, autoSave: true);
+            return;
         }
 
         member.SetRole(role);
@@ -81,9 +168,18 @@ public class WorkspaceMembershipManager : TrackerDomainService
     /// <summary>Ends the membership. The last owner cannot be removed.</summary>
     public virtual async Task RemoveAsync(WorkspaceMember member)
     {
-        if (member.IsOwner && await CountOwnersAsync(member.WorkspaceId) <= 1)
+        if (member.IsOwner)
         {
-            throw new BusinessException(TrackerDomainErrorCodes.LastOwnerCannotLeave);
+            await using var ownerLock = await LockOwnersAsync(member.WorkspaceId);
+
+            if (await CountOwnersAsync(member.WorkspaceId) <= 1)
+            {
+                throw new BusinessException(TrackerDomainErrorCodes.LastOwnerCannotLeave);
+            }
+
+            member.Remove();
+            await _memberRepository.UpdateAsync(member, autoSave: true);
+            return;
         }
 
         member.Remove();

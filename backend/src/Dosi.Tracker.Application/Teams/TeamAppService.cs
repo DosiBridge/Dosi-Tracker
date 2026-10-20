@@ -409,12 +409,17 @@ public class TeamAppService : TrackerAppService, ITeamAppService
             throw new BusinessException(TrackerDomainErrorCodes.CannotModifySelf);
         }
 
+        using var uow = UnitOfWorkManager.Begin(new Volo.Abp.Uow.AbpUnitOfWorkOptions(isTransactional: true), requiresNew: true);
+        await using var ownerLock = await _workspaceMemberships.LockOwnersAsync(WorkspaceId);
+
         var member = await _workspaceMemberships.FindActiveAsync(WorkspaceId, userId)
                      ?? throw new BusinessException(TrackerDomainErrorCodes.InvalidUser).WithData("userId", userId);
         await _workspaceMemberships.ChangeRoleAsync(member, newRole);
 
         var user = await _userRepository.GetAsync(userId);
         var memberships = await _memberRepository.GetListAsync(m => m.UserId == userId);
+        await uow.CompleteAsync();
+
         return ToTeamMemberDto(member, user, memberships);
     }
 

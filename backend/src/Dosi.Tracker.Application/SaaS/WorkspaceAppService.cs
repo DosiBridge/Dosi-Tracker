@@ -217,6 +217,10 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
     public async Task LeaveAsync(Guid id)
     {
         var userId = CurrentUser.GetId();
+
+        using var uow = UnitOfWorkManager.Begin(new Volo.Abp.Uow.AbpUnitOfWorkOptions(isTransactional: true), requiresNew: true);
+        await using var ownerLock = await _memberships.LockOwnersAsync(id);
+
         var member = await _memberships.FindActiveAsync(id, userId)
                      ?? throw new BusinessException(TrackerDomainErrorCodes.NotWorkspaceMember);
 
@@ -225,6 +229,8 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
             await _memberships.RemoveAsync(member);
             await _projectMemberships.RemoveAllOfUserAsync(userId);
         }
+
+        await uow.CompleteAsync();
     }
 
     [AllowAnonymous]

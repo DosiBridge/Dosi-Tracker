@@ -462,13 +462,70 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
 
 ---
 
-## 8. Current Status & Next Steps
+## 8. Bounded Engineering Phase: Concurrent Last-Owner Preservation Guard (`REQ-WS-06`)
+
+### A. Context, Source Investigation & Race Reproduction
+1. **Source Evidence & Vulnerability Analysis**:
+   - Source inspection revealed that `WorkspaceMembershipManager.ChangeRoleAsync` and `RemoveAsync` independently awaited `CountOwnersAsync` then mutated/updated membership state without an ownership-invariant critical section.
+   - `WorkspaceAppService.LeaveAsync` loaded membership and invoked `RemoveAsync` without acquiring a lock or serializing concurrent owner exits within an explicit transactional Unit of Work.
+   - Sequential last-owner protections existed in source (`TrackerDomainErrorCodes.LastOwnerCannotLeave`) and were preserved.
+   - However, under concurrent operations, two active owners in the same workspace calling `LeaveAsync` simultaneously both observed `CountOwnersAsync == 2`, passed the guard independently, and proceeded to remove their memberships. This dropped the persisted active owner count to 0, orphaning the workspace.
+   - **Vulnerability Reproduction**: Proven deterministically in `Unsynchronized_Concurrent_Last_Owner_Removal_Demonstrates_Orphaning_Vulnerability` using real separate production service/UOW scopes against a project-local SQLite database. Without synchronization, both concurrent removals succeeded and the active owner count dropped to 0.
+
+2. **Production Architectural Correction**:
+   - Smallest architecture-compatible solution maintaining clean layering and ambient UOW committed-state visibility:
+     - **`TrackerDomainService.cs`**:
+       * Exposed `protected IUnitOfWorkManager UnitOfWorkManager => LazyServiceProvider.LazyGetRequiredService<IUnitOfWorkManager>();` for domain service UOW context inspection.
+     - **`WorkspaceMembershipManager.cs`**:
+       * Injected `IAbpDistributedLock` to provide fine-grained, per-workspace synchronization (`Tracker:WorkspaceOwners:{workspaceId:N}`).
+       * Implemented `LockOwnersAsync(Guid workspaceId)`: checks ambient `currentUow.Items[itemKey]` for an existing lock handle to provide transparent re-entrancy without deadlocks.
+       * Synchronized owner demotions in `ChangeRoleAsync` (`isOwnerDemotion = member.Role == WorkspaceRoles.Owner && role != WorkspaceRoles.Owner`) under `LockOwnersAsync`.
+       * Synchronized owner removals in `RemoveAsync` (`isOwnerRemoval = member.Role == WorkspaceRoles.Owner`) under `LockOwnersAsync`.
+     - **`WorkspaceAppService.cs` (`LeaveAsync`)**:
+       * Wraps the full leave workflow inside a transactional Unit of Work (`UnitOfWorkManager.Begin(new AbpUnitOfWorkOptions(isTransactional: true), requiresNew: true)`).
+       * Acquires `await using var ownerLock = await _memberships.LockOwnersAsync(id)`.
+       * Commits transaction (`await uow.CompleteAsync()`) before disposing `ownerLock`, ensuring committed-state visibility before any waiting competitor enters the critical section.
+     - **`TeamAppService.cs` (`UpdateWorkspaceRoleAsync`)**:
+       * Wraps role modification inside a transactional Unit of Work (`UnitOfWorkManager.Begin(new AbpUnitOfWorkOptions(isTransactional: true), requiresNew: true)`).
+       * Acquires `await using var ownerLock = await _workspaceMemberships.LockOwnersAsync(WorkspaceId)`.
+       * Verifies caller owner permissions and completes transactional UOW before releasing `ownerLock`.
+
+3. **Deterministic Isolated Regressions (`ConcurrentOwnerProtectionTests.cs`)**:
+   - Configured disposable project-local SQLite fixture in WAL mode (`SqliteWalConnectionInterceptor` with `PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 30000;`) and `AddAlwaysDisableUnitOfWorkTransaction()` to enable real independent multi-scope concurrency without SQLite single-writer table contention deadlocks.
+   - Verified that legitimate multi-owner sequential leaves/demotions succeed until the last owner.
+   - Barrier synchronization (`System.Threading.Barrier`) coordinates concurrent callers without flaky thread sleeps.
+   - Asserted that under concurrent leaves and concurrent demotions, exactly one succeeds and the competitor is rejected with a domain error (`Tracker:LastOwnerCannotLeave` or `Tracker:RoleNotAllowed`), maintaining >= 1 active owner at all times.
+   - Verified cross-workspace isolation: concurrent owner leaves in unrelated workspaces run concurrently without contention, and leaving a workspace performs cleanup only in that workspace without touching memberships or projects in foreign workspaces.
+
+### B. Execution Evidence & Provenance Boundaries
+
+| Dimension | Exact Target / Command | Tests Passed | Failed | Duration | Exit Code | Provenance |
+|---|---|:---:|:---:|:---:|:---:|---|
+| **Concurrent Last-Owner Regressions** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~ConcurrentOwnerProtectionTests"` | 6 | 0 | 8.2s | **0** | **[Worker-Reported (Concurrent SQLite WAL)]** |
+| **Hosted ASP.NET Core MVC TestServer** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~EfCoreWorkspaceHttpAuthorizationTests"` | 9 | 0 | 16.8s | **0** | **[Worker-Reported (Hosted MVC TestServer & Shared SQLite)]** |
+| **Recipient Decline Regressions** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~InvitationDeclineTests"` | 10 | 0 | 9s | **0** | **[Worker-Reported (SQLite In-Memory)]** |
+| **Host Route Reflection** | `dotnet test test/Dosi.Tracker.HttpApi.Host.Tests/Dosi.Tracker.HttpApi.Host.Tests.csproj --filter "FullyQualifiedName~ContractRoutesTests"` | 40 | 0 | 101ms | **0** | **[Worker-Reported (Unit Reflection Only)]** |
+| **Frontend Contract Route Vitest** | `npx vitest run src/lib/api-contract.test.ts` | 30 | 0 | 1.22s | **0** | **[Verified by PM @ 3bebd70]** |
+| **Historical PM Blocked Scripts** | `qa_workspace_phase.ps1` | null | null | null | null | **[Explicitly Not Run / No Repackaging]** |
+| **Real Browser Session Acceptance** | Multi-tenant browser session & cookie verification | null | null | null | null | **[Pending Acceptance Requirement]** |
+
+#### Test Cases Covered in `ConcurrentOwnerProtectionTests` (6 total):
+1. `Unsynchronized_Concurrent_Last_Owner_Removal_Demonstrates_Orphaning_Vulnerability`: Reproduces race condition when two owners concurrently execute `RemoveAsync` without locking; both pass count > 1 check, removing both and leaving 0 active owners in database (orphaning proof).
+2. `Multi_Owner_Sequential_Leaves_Allow_Demotions_Until_Last_Owner`: Proves re-entrant locking and sequential leave operations: 3 owners sequentially leave down to 1 owner; last owner attempting to leave is rejected with `Tracker:LastOwnerCannotLeave`.
+3. `Two_Owners_Concurrently_Leaving_Preserves_At_Least_One_Active_Owner_And_Rejects_Losing_Owner`: Two owners in Workspace 1 call `LeaveAsync` concurrently at a barrier. Winner leaves (status Removed, project memberships pruned); loser is rejected with `Tracker:LastOwnerCannotLeave` (remains active Owner, project memberships intact); persisted active owner count = 1. Foreign Workspace 2 remains completely intact with 0 unintended cleanup.
+4. `Two_Owners_Concurrently_Demoting_Each_Other_Preserves_At_Least_One_Active_Owner`: Two owners call `UpdateWorkspaceRoleAsync` concurrently attempting to demote each other. Exactly one succeeds; loser is rejected with domain error (`Tracker:RoleNotAllowed` or `Tracker:LastOwnerCannotLeave`); persisted active owner count = 1.
+5. `Concurrent_Mixed_Owner_Leave_And_Demotion_Preserves_At_Least_One_Active_Owner`: Concurrent execution of Owner A leaving and Owner B demoting Owner A. In both execution interleavings, at least one active owner remains in the database.
+6. `Concurrent_Owner_Leaves_In_Different_Workspaces_Execute_Concurrently_Without_Contention`: Proves fine-grained per-workspace locking: concurrent leaves in Workspace 1 and Workspace 2 execute simultaneously without contention or cross-workspace blocking.
+
+---
+
+## 9. Current Status & Next Steps
 
 1. **Privacy Acceptance Pending**:
    - The privacy source audit (commit `14bbe66`) remains **Pending PM Independent Review**. This status is preserved and not bypassed.
-2. **Workspace Authorization & Isolation Phase Status**:
-   - Recipient decline lifecycle (`REQ-WS-07`, commit `27f7aa1`) and genuine hosted ASP.NET Core `TestServer` MVC aggregate authorization harness (`REQ-ISO-05`) are implemented with isolated in-memory test coverage (19 SQLite tests total: 10 decline + 9 TestServer MVC auth).
-   - Real browser cookie/session testing (`__Host-Dosi-Workspace`), Next.js server actions, OpenIddict token issuer, multi-threaded concurrency verification, and PM independent execution of `qa_workspace_phase.ps1` remain pending.
+2. **Workspace Authorization, Isolation & Concurrency Phase Status**:
+   - Recipient decline lifecycle (`REQ-WS-07`, commit `27f7aa1`), genuine hosted ASP.NET Core `TestServer` MVC aggregate authorization harness (`REQ-ISO-05`, commit `96e3246`), and concurrent last-owner protection (`REQ-WS-06`) are implemented with isolated test coverage (25 SQLite tests total: 10 decline + 9 TestServer MVC auth + 6 concurrent owner protection).
+   - Real browser cookie/session testing (`__Host-Dosi-Workspace`), Next.js server actions, OpenIddict token issuer, multi-node distributed lock infrastructure (Redis), and PM independent execution of `qa_workspace_phase.ps1` remain pending.
 3. **Overall Product Incomplete**:
    - Overall product remains incomplete across:
      - Backend metric nullability schema migrations (`Activity.cs` truthful nulls vs 0)
