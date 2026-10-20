@@ -732,10 +732,15 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
    - Date validation: `To >= From` and date span `<= 366` days (`Tracker:ReportRangeInvalid`).
    - Server-enforced output ceiling: `MaxAllowedResultCount = 10000`.
    - Candidate overflow protection: if the candidate count exceeds the requested or system maximum, the endpoint explicitly rejects the request with HTTP 400 `Tracker:ExportExceedsLimit` rather than returning a deceptively complete-looking partial/truncated export.
+   - **Cardinality Hardening at Materialization Boundary**:
+     * Prior flaw: Preliminary `CountAsync(query)` verified `totalCount <= limit`, but the query was then materialized without a server-side `Take` bound and without post-materialization cardinality validation. Concurrent ingestion between count and fetch could yield rows exceeding `limit` and stale response metadata (`X-Total-Count < X-Exported-Count`).
+     * Hardened correction: Applied deterministic server-side `Take(limit + 1)` bound on production query (`query.OrderByDescending(...).ThenByDescending(...).Take(limit + 1)`).
+     * Post-materialization validation: If `activities.Count > limit`, immediately rejects with `BusinessException(TrackerDomainErrorCodes.ExportExceedsLimit)` (HTTP 400 `BadRequest`). No partial CSV or header stream is emitted.
+     * Snapshot-derived counts: `TotalCount = activities.Count` and `ExportedCount = activities.Count` derived honestly from the bounded materialized snapshot, guaranteeing coherence across `X-Total-Count`, `X-Exported-Count`, and actual CSV data lines.
 
 6. **Isolated Regression Evidence**:
    - Hosted ASP.NET Core `TestServer` regression suite with isolated SQLite database: `backend/test/Dosi.Tracker.EntityFrameworkCore.Tests/EntityFrameworkCore/Applications/Activities/WorkspaceActivityExportHttpTests.cs`.
-   - 7 test scenarios (7 passed, exit 0, repeated twice):
+   - 10 test scenarios (10 passed, exit 0, repeated twice):
      1. `Authorized_Workspace_Owner_Exports_Csv_With_Headers_And_Data`: Verifies 200 OK, `text/csv; charset=utf-8`, `attachment; filename=...`, `X-Total-Count`, `X-Exported-Count`, stable column contract, and exact data fields.
      2. `A_Only_Caller_Denied_B_With_Seeded_Foreign_Sentinel`: Verifies 403 Forbidden on spoofed header; Workspace B sentinel remains untouched.
      3. `Same_User_A_And_B_Switching_Respects_Workspace_Specific_Roles_And_Data`: Verifies same user with Owner role in A sees all activities and with Member role in B sees only own activity.
@@ -743,6 +748,9 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
      5. `Missing_Or_Empty_Workspace_Header_Is_Rejected_With_400_WorkspaceRequired`: Verifies 400 BadRequest with code `Tracker:WorkspaceRequired` on missing or `Guid.Empty` header.
      6. `Malformed_Or_Out_Of_Bounds_Dates_And_Oversize_Workload_Are_Rejected`: Verifies 400 BadRequest for reversed dates, excessive span (> 366 days), oversize MaxResultCount (> 10000), and candidate overflow past limit (`Tracker:ExportExceedsLimit`).
      7. `Csv_Escapes_Special_Characters_And_Neutralizes_Formula_Injection_While_Keeping_Unavailable_Values_Blank`: Verifies quotes doubling, newline handling, formula prefixing (`=`, `+`, `@`, `\t`), and blank unavailable metrics.
+     8. `Old_Implementation_Without_Bounded_Take_Violates_Requested_Limit_And_Metadata_When_Row_Added_After_Count`: Proves the former defect under retained old-code query (preliminary count passes at limit 2; concurrent insert adds row 3; unconstrained materialization yields 3 rows; CSV emits 3 data rows violating requested limit; stale `TotalCount` 2 < `ExportedCount` 3). Workspace B sentinel preserved.
+     9. `Production_Export_Rejects_Limit_Plus_One_Candidate_Overflow_At_Materialization_Boundary_Without_Partial_Csv`: Injected `BarrierInterceptor` executes mid-operation row insertion immediately after preliminary `CountAsync`. Proves both direct production `ActivityAppService.ExportCsvAsync` and hosted `TestServer` HTTP endpoint reject limit + 1 candidate overflow with HTTP 400 `Tracker:ExportExceedsLimit` without partial CSV. Workspace B sentinel preserved.
+     10. `Production_Export_Exact_Limit_Succeeds_With_Coherent_Snapshot_Derived_Counts_And_Exact_Csv_Rows`: Verifies requested exact limit (2 activities seeded, limit = 2) returns HTTP 200 OK, matching `X-Total-Count: 2`, `X-Exported-Count: 2`, and exact CSV row count (1 header + 2 data rows).
 
 7. **Operational Limitations & Remaining Gaps**:
    - **Async Bulk/Capture Export Gap**: Asynchronous background jobs, multi-file capture packaging, and zip archiving are deferred; this slice delivers synchronous workspace-scoped activity/time CSV export.
@@ -757,17 +765,17 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
 1. **Privacy Acceptance Pending**:
    - The privacy source audit (commit `14bbe66`) remains **Pending PM Independent Review**. This status is preserved and not bypassed.
 2. **Workspace Lifecycle, Authorization, Retention & Export Status**:
-   - Reversible owner-controlled workspace archival (`REQ-WS-08`), concurrent last-owner protection (`REQ-WS-06`), recipient decline lifecycle (`REQ-WS-07`), hosted ASP.NET Core `TestServer` MVC aggregate authorization harness (`REQ-ISO-05`), workspace-isolated capture retention lifecycle safe first slice (`REQ-DAT-01`), and authenticated workspace-scoped activity CSV export (`REQ-DAT-02`) are implemented and verified via isolated regressions (74 SQLite tests total: 7 activity export + 20 capture retention + 9 archival lifecycle + 10 archival migration/upgrade + 9 concurrent owner protection + 9 hosted MVC auth + 10 decline).
+   - Reversible owner-controlled workspace archival (`REQ-WS-08`), concurrent last-owner protection (`REQ-WS-06`), recipient decline lifecycle (`REQ-WS-07`), hosted ASP.NET Core `TestServer` MVC aggregate authorization harness (`REQ-ISO-05`), workspace-isolated capture retention lifecycle safe first slice (`REQ-DAT-01`), and authenticated workspace-scoped activity CSV export (`REQ-DAT-02`) with materialization cardinality hardening are implemented and verified via isolated regressions (77 SQLite tests total: 10 activity export + 20 capture retention + 9 archival lifecycle + 10 archival migration/upgrade + 9 concurrent owner protection + 9 hosted MVC auth + 10 decline).
    - Real browser cookie/session testing (`__Host-Dosi-Workspace`), Next.js server actions, OpenIddict token issuer, provider-backed multi-connection transactional commit proof (PostgreSQL/SQL Server), multi-node distributed lock infrastructure (Redis), and PM independent execution remain pending. All reported outcomes are worker-executed, not independent PM QA.
 3. **Execution Limits & Evidence Boundaries**:
-   - TestServer regressions prove conventional MVC routing, aggregate permission checks, fail-closed workspace scoping, CSV formula neutralization, and server limits on in-memory SQLite, but do NOT replace execution on a real PostgreSQL cluster; no live user/production database was modified.
+   - TestServer regressions prove conventional MVC routing, aggregate permission checks, fail-closed workspace scoping, CSV formula neutralization, Take(limit + 1) hard bounded fetch, post-materialization cardinality rejection, and server limits on in-memory SQLite, but do NOT replace execution on a real PostgreSQL cluster; no live user/production database was modified.
    - Retention defaults remain disabled (`IsEnabled = false`); no cleanup was executed against user DB or real object storage.
 4. **Remaining Backlog Gaps**:
    - Asynchronous export background worker, screenshot zip archive, signed download URLs, disaster recovery / automated backup procedures, frontend UI export actions, 1-year activity summary pruning, and permanent deletion remain deferred acceptance gaps.
 5. **Overall Product Incomplete**:
    - Full product remains incomplete across backend metric nullability schema migrations (`Activity.cs` truthful nulls vs 0), desktop offline ingestion queue hardening, platform-native interactive client runtimes, code signing, and hosted operational deployment.
 6. **Awaiting PM Guidance**:
-   - Single bounded REQ-DAT-02 authenticated activity CSV export full-product slice complete. Stop and hand off for PM review with exact diff and test evidence.
+   - Bounded REQ-DAT-02 materialization cardinality correction complete. Stop and hand off for PM review with exact diff and test evidence.
 
 
 

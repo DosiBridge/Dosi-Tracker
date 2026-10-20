@@ -923,17 +923,28 @@ public class ActivityAppService : TrackerAppService, IActivityAppService
                 .WithData("limit", limit);
         }
 
-        // 7. Load activities ordered deterministically
+        // 7. Load activities ordered deterministically with hard-bounded Take(limit + 1)
         var activities = await AsyncExecuter.ToListAsync(
-            query.OrderByDescending(a => a.StartedAt).ThenByDescending(a => a.Id)
+            query.OrderByDescending(a => a.StartedAt).ThenByDescending(a => a.Id).Take(limit + 1)
         );
 
-        // 8. Load project titles
+        // 8. Strict post-materialization cardinality enforcement (reject candidate overflow past limit)
+        if (activities.Count > limit)
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.ExportExceedsLimit)
+                .WithData("totalCount", activities.Count)
+                .WithData("limit", limit);
+        }
+
+        // 9. Derive honest count from materialized bounded snapshot
+        totalCount = activities.Count;
+
+        // 10. Load project titles
         var projectIds = activities.Select(a => a.ProjectId).Distinct().ToList();
         var projects = (await _projectRepository.GetListAsync(p => projectIds.Contains(p.Id)))
             .ToDictionary(p => p.Id, p => p.Title);
 
-        // 9. Format CSV
+        // 11. Format CSV
         var csvBytes = CsvExportHelper.BuildActivitiesCsv(activities, projects);
         var fileName = $"activities-{currentWorkspaceId:N}-{DateTime.UtcNow:yyyyMMddHHmmss}.csv";
 

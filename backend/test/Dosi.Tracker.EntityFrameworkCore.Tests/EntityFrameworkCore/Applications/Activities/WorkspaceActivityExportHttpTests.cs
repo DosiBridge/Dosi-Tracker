@@ -5,6 +5,7 @@ using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
+using System.Security.Claims;
 using System.Text;
 using System.Threading.Tasks;
 using Dosi.Tracker.Activities;
@@ -15,9 +16,12 @@ using Dosi.Tracker.Workspaces;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Shouldly;
+using Volo.Abp;
 using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Guids;
 using Volo.Abp.Identity;
+using Volo.Abp.Linq;
+using Volo.Abp.Security.Claims;
 using Volo.Abp.Uow;
 using Xunit;
 
@@ -43,6 +47,9 @@ public class WorkspaceActivityExportHttpTests : WorkspaceHttpTestBase<TrackerHtt
     private readonly IdentityUserManager _userManager;
     private readonly IGuidGenerator _guidGenerator;
     private readonly ICurrentWorkspace _currentWorkspace;
+    private readonly IActivityAppService _activityAppService;
+    private readonly IAsyncQueryableExecuter _asyncExecuter;
+    private readonly ICurrentPrincipalAccessor _currentPrincipalAccessor;
 
     public WorkspaceActivityExportHttpTests()
     {
@@ -53,6 +60,15 @@ public class WorkspaceActivityExportHttpTests : WorkspaceHttpTestBase<TrackerHtt
         _userManager = GetRequiredService<IdentityUserManager>();
         _guidGenerator = GetRequiredService<IGuidGenerator>();
         _currentWorkspace = GetRequiredService<ICurrentWorkspace>();
+        _activityAppService = GetRequiredService<IActivityAppService>();
+        _asyncExecuter = GetRequiredService<IAsyncQueryableExecuter>();
+        _currentPrincipalAccessor = GetRequiredService<ICurrentPrincipalAccessor>();
+    }
+
+    protected override void AfterAddApplication(IServiceCollection services)
+    {
+        base.AfterAddApplication(services);
+        RegisterBarrierProxy(services);
     }
 
     protected override void ConfigureTestServerServices(IServiceCollection services)
@@ -67,6 +83,58 @@ public class WorkspaceActivityExportHttpTests : WorkspaceHttpTestBase<TrackerHtt
             });
         });
         services.AddAlwaysDisableUnitOfWorkTransaction();
+        RegisterBarrierProxy(services);
+    }
+
+    private static void RegisterBarrierProxy(IServiceCollection services)
+    {
+        var existingExecuterDescriptor = services.FirstOrDefault(d => d.ServiceType == typeof(IAsyncQueryableExecuter));
+        if (existingExecuterDescriptor != null)
+        {
+            services.Remove(existingExecuterDescriptor);
+            services.AddTransient<IAsyncQueryableExecuter>(sp =>
+            {
+                IAsyncQueryableExecuter inner;
+                if (existingExecuterDescriptor.ImplementationInstance != null)
+                {
+                    inner = (IAsyncQueryableExecuter)existingExecuterDescriptor.ImplementationInstance;
+                }
+                else if (existingExecuterDescriptor.ImplementationFactory != null)
+                {
+                    inner = (IAsyncQueryableExecuter)existingExecuterDescriptor.ImplementationFactory(sp);
+                }
+                else
+                {
+                    inner = (IAsyncQueryableExecuter)ActivatorUtilities.CreateInstance(sp, existingExecuterDescriptor.ImplementationType!);
+                }
+                var generator = new Castle.DynamicProxy.ProxyGenerator();
+                return generator.CreateInterfaceProxyWithTarget<IAsyncQueryableExecuter>(inner, new BarrierInterceptor());
+            });
+        }
+    }
+
+    public class BarrierInterceptor : Castle.DynamicProxy.IInterceptor
+    {
+        public static Func<Task>? AfterCountHook { get; set; }
+
+        public void Intercept(Castle.DynamicProxy.IInvocation invocation)
+        {
+            invocation.Proceed();
+
+            if (invocation.Method.Name == nameof(IAsyncQueryableExecuter.CountAsync) && AfterCountHook != null && invocation.ReturnValue is Task<int> task)
+            {
+                var hook = AfterCountHook;
+                AfterCountHook = null;
+                invocation.ReturnValue = RunAfterCountAsync(task, hook);
+            }
+        }
+
+        private static async Task<int> RunAfterCountAsync(Task<int> originalTask, Func<Task> hook)
+        {
+            var count = await originalTask;
+            await hook();
+            return count;
+        }
     }
 
     private new static HttpRequestMessage CreateRequest(
@@ -482,5 +550,291 @@ public class WorkspaceActivityExportHttpTests : WorkspaceHttpTestBase<TrackerHtt
         var lines = csv.Split('\n').Select(l => l.TrimEnd('\r')).ToList();
         var emptyMetricRow = lines.FirstOrDefault(l => l.Contains(",,"));
         emptyMetricRow.ShouldNotBeNull();
+    }
+
+    [Fact]
+    public async Task Old_Implementation_Without_Bounded_Take_Violates_Requested_Limit_And_Metadata_When_Row_Added_After_Count()
+    {
+        var (wsA, wsB, projA, projB) = await SeedFixturesAsync();
+
+        // 1. Seed exactly 2 activities in Workspace A for UserA (requested limit = 2)
+        var t0 = new DateTime(2026, 8, 1, 10, 0, 0, DateTimeKind.Utc);
+        Guid sentinelBId = Guid.Empty;
+        await WithUnitOfWorkAsync(async () =>
+        {
+            using (_currentWorkspace.Change(wsA, WorkspaceRoles.Owner))
+            {
+                var a1 = new Activity(_guidGenerator.Create(), wsA, UserA, projA, _guidGenerator.Create(), t0, t0.AddMinutes(10))
+                {
+                    Description = "Activity 1"
+                };
+                var a2 = new Activity(_guidGenerator.Create(), wsA, UserA, projA, _guidGenerator.Create(), t0.AddMinutes(15), t0.AddMinutes(25))
+                {
+                    Description = "Activity 2"
+                };
+                await _activityRepository.InsertAsync(a1, autoSave: true);
+                await _activityRepository.InsertAsync(a2, autoSave: true);
+            }
+
+            // Seed Workspace B sentinel to ensure isolation remains intact
+            using (_currentWorkspace.Change(wsB, WorkspaceRoles.Owner))
+            {
+                var sentinelB = new Activity(_guidGenerator.Create(), wsB, UserB, projB, _guidGenerator.Create(), t0, t0.AddMinutes(10))
+                {
+                    Description = "Sentinel B"
+                };
+                await _activityRepository.InsertAsync(sentinelB, autoSave: true);
+                sentinelBId = sentinelB.Id;
+            }
+        });
+
+        const int requestedLimit = 2;
+
+        // 2. Execute the former uncorrected query flow:
+        // Preliminary CountAsync passes because totalCount (2) <= limit (2)
+        int preliminaryCount = await WithUnitOfWorkAsync(async () =>
+        {
+            using (_currentWorkspace.Change(wsA, WorkspaceRoles.Owner))
+            {
+                var query = (await _activityRepository.GetQueryableAsync())
+                    .Where(a => a.WorkspaceId == wsA && a.UserId == UserA);
+                return await _asyncExecuter.CountAsync(query);
+            }
+        });
+        preliminaryCount.ShouldBe(2);
+        (preliminaryCount <= requestedLimit).ShouldBeTrue();
+
+        // 3. Concurrent mid-operation insertion adds row 3 before materialization
+        await WithUnitOfWorkAsync(async () =>
+        {
+            using (_currentWorkspace.Change(wsA, WorkspaceRoles.Owner))
+            {
+                var a3 = new Activity(_guidGenerator.Create(), wsA, UserA, projA, _guidGenerator.Create(), t0.AddMinutes(30), t0.AddMinutes(40))
+                {
+                    Description = "Activity 3 - inserted after count"
+                };
+                await _activityRepository.InsertAsync(a3, autoSave: true);
+            }
+        });
+
+        // 4. Old materialization query: had NO Take(limit + 1) and NO post-materialization cardinality validation
+        List<Activity> oldMaterializedActivities = await WithUnitOfWorkAsync(async () =>
+        {
+            using (_currentWorkspace.Change(wsA, WorkspaceRoles.Owner))
+            {
+                var query = (await _activityRepository.GetQueryableAsync())
+                    .Where(a => a.WorkspaceId == wsA && a.UserId == UserA);
+                return await _asyncExecuter.ToListAsync(
+                    query.OrderByDescending(a => a.StartedAt).ThenByDescending(a => a.Id)
+                );
+            }
+        });
+
+        // DEMONSTRATION OF DEFECT IN FORMER CODE:
+        // Violation 1: Materialized count exceeds requested limit
+        oldMaterializedActivities.Count.ShouldBe(3);
+        (oldMaterializedActivities.Count > requestedLimit).ShouldBeTrue();
+
+        // Violation 2: Format CSV outputs 3 data lines, violating requested limit of 2
+        Dictionary<Guid, string> projects = await WithUnitOfWorkAsync(async () =>
+        {
+            using (_currentWorkspace.Change(wsA, WorkspaceRoles.Owner))
+            {
+                return (await _projectRepository.GetListAsync(p => p.WorkspaceId == wsA))
+                    .ToDictionary(p => p.Id, p => p.Title);
+            }
+        });
+        var oldCsvBytes = CsvExportHelper.BuildActivitiesCsv(oldMaterializedActivities, projects);
+        var oldCsvLines = Encoding.UTF8.GetString(oldCsvBytes).Split('\n').Where(l => !string.IsNullOrWhiteSpace(l)).ToList();
+        oldCsvLines.Count.ShouldBe(4); // 1 header + 3 data lines (violating limit of 2!)
+
+        // Violation 3: Metadata incoherence - preliminary totalCount is stale (2) while ExportedCount is 3
+        var oldResult = new ActivityExportResultDto
+        {
+            Bytes = oldCsvBytes,
+            ContentType = "text/csv; charset=utf-8",
+            FileName = "old.csv",
+            TotalCount = preliminaryCount, // stale 2
+            ExportedCount = oldMaterializedActivities.Count // 3
+        };
+        oldResult.TotalCount.ShouldBe(2);
+        oldResult.ExportedCount.ShouldBe(3);
+        (oldResult.TotalCount < oldResult.ExportedCount).ShouldBeTrue(); // Incoherent stale metadata!
+
+        // Verify Workspace B sentinel was not touched
+        await WithUnitOfWorkAsync(async () =>
+        {
+            using (_currentWorkspace.Change(wsB, WorkspaceRoles.Owner))
+            {
+                var sentinel = await _activityRepository.FindAsync(sentinelBId);
+                sentinel.ShouldNotBeNull();
+                sentinel.Description.ShouldBe("Sentinel B");
+            }
+        });
+    }
+
+    [Fact]
+    public async Task Production_Export_Rejects_Limit_Plus_One_Candidate_Overflow_At_Materialization_Boundary_Without_Partial_Csv()
+    {
+        BarrierInterceptor.AfterCountHook = null;
+        try
+        {
+            var (wsA, wsB, projA, projB) = await SeedFixturesAsync();
+
+            var t0 = new DateTime(2026, 8, 2, 10, 0, 0, DateTimeKind.Utc);
+            Guid sentinelBId = Guid.Empty;
+            await WithUnitOfWorkAsync(async () =>
+            {
+                using (_currentWorkspace.Change(wsA, WorkspaceRoles.Owner))
+                {
+                    var a1 = new Activity(_guidGenerator.Create(), wsA, UserA, projA, _guidGenerator.Create(), t0, t0.AddMinutes(10))
+                    {
+                        Description = "Act 1"
+                    };
+                    var a2 = new Activity(_guidGenerator.Create(), wsA, UserA, projA, _guidGenerator.Create(), t0.AddMinutes(15), t0.AddMinutes(25))
+                    {
+                        Description = "Act 2"
+                    };
+                    await _activityRepository.InsertAsync(a1, autoSave: true);
+                    await _activityRepository.InsertAsync(a2, autoSave: true);
+                }
+
+                // Seed Workspace B sentinel to ensure isolation remains intact
+                using (_currentWorkspace.Change(wsB, WorkspaceRoles.Owner))
+                {
+                    var sentinelB = new Activity(_guidGenerator.Create(), wsB, UserB, projB, _guidGenerator.Create(), t0, t0.AddMinutes(10))
+                    {
+                        Description = "Sentinel B in wsB"
+                    };
+                    await _activityRepository.InsertAsync(sentinelB, autoSave: true);
+                    sentinelBId = sentinelB.Id;
+                }
+            });
+
+            // 1. Direct production service invocation:
+            // Set barrier hook to insert row 3 right after CountAsync finishes (preliminary count = 2 <= limit 2)
+            BarrierInterceptor.AfterCountHook = async () =>
+            {
+                await WithUnitOfWorkAsync(async () =>
+                {
+                    using (_currentWorkspace.Change(wsA, WorkspaceRoles.Owner))
+                    {
+                        var a3 = new Activity(_guidGenerator.Create(), wsA, UserA, projA, _guidGenerator.Create(), t0.AddMinutes(30), t0.AddMinutes(40))
+                        {
+                            Description = "Act 3 - inserted after count"
+                        };
+                        await _activityRepository.InsertAsync(a3, autoSave: true);
+                    }
+                });
+            };
+
+            await WithUnitOfWorkAsync(async () =>
+            {
+                using (_currentPrincipalAccessor.Change(new ClaimsPrincipal(new ClaimsIdentity(new[]
+                {
+                    new Claim(AbpClaimTypes.UserId, UserA.ToString())
+                }))))
+                using (_currentWorkspace.Change(wsA, WorkspaceRoles.Owner))
+                {
+                    var ex = await Should.ThrowAsync<BusinessException>(async () =>
+                    {
+                        await _activityAppService.ExportCsvAsync(new ExportActivitiesInput { MaxResultCount = 2 });
+                    });
+                    ex.Code.ShouldBe(TrackerDomainErrorCodes.ExportExceedsLimit);
+                }
+            });
+
+            // 2. Real hosted HTTP TestServer endpoint:
+            // wsA now has 3 rows (a1, a2, a3). Request limit = 3.
+            // Preliminary CountAsync passes (3 <= 3).
+            // Barrier hook inserts row 4 right after CountAsync finishes.
+            // Production materialization Take(3 + 1) catches 4 rows (> limit 3) and rejects with 400.
+            BarrierInterceptor.AfterCountHook = async () =>
+            {
+                await WithUnitOfWorkAsync(async () =>
+                {
+                    using (_currentWorkspace.Change(wsA, WorkspaceRoles.Owner))
+                    {
+                        var a4 = new Activity(_guidGenerator.Create(), wsA, UserA, projA, _guidGenerator.Create(), t0.AddMinutes(45), t0.AddMinutes(55))
+                        {
+                            Description = "Act 4 - inserted after count during HTTP"
+                        };
+                        await _activityRepository.InsertAsync(a4, autoSave: true);
+                    }
+                });
+            };
+
+            var client = CreateHttpClient();
+            var req = CreateRequest(HttpMethod.Get, "/api/app/activity/export?maxResultCount=3", userId: UserA, workspaceId: wsA);
+            var resp = await client.SendAsync(req);
+
+            // Corrected implementation rejects with 400 BadRequest
+            resp.StatusCode.ShouldBe(HttpStatusCode.BadRequest);
+            var body = await resp.Content.ReadAsStringAsync();
+            body.ShouldContain("Tracker:ExportExceedsLimit");
+
+            // Proof of no partial CSV emission: body is an error response, not a CSV document
+            body.ShouldNotContain("ActivityId,UserId,ProjectId,ProjectTitle");
+
+            // Verify Workspace B sentinel was not touched
+            await WithUnitOfWorkAsync(async () =>
+            {
+                using (_currentWorkspace.Change(wsB, WorkspaceRoles.Owner))
+                {
+                    var sentinel = await _activityRepository.FindAsync(sentinelBId);
+                    sentinel.ShouldNotBeNull();
+                    sentinel.Description.ShouldBe("Sentinel B in wsB");
+                }
+            });
+        }
+        finally
+        {
+            BarrierInterceptor.AfterCountHook = null;
+        }
+    }
+
+    [Fact]
+    public async Task Production_Export_Exact_Limit_Succeeds_With_Coherent_Snapshot_Derived_Counts_And_Exact_Csv_Rows()
+    {
+        BarrierInterceptor.AfterCountHook = null;
+        var (wsA, wsB, projA, projB) = await SeedFixturesAsync();
+
+        var t0 = new DateTime(2026, 8, 3, 10, 0, 0, DateTimeKind.Utc);
+        await WithUnitOfWorkAsync(async () =>
+        {
+            using (_currentWorkspace.Change(wsA, WorkspaceRoles.Owner))
+            {
+                var a1 = new Activity(_guidGenerator.Create(), wsA, UserA, projA, _guidGenerator.Create(), t0, t0.AddMinutes(10))
+                {
+                    Description = "Exact Item 1"
+                };
+                var a2 = new Activity(_guidGenerator.Create(), wsA, UserA, projA, _guidGenerator.Create(), t0.AddMinutes(15), t0.AddMinutes(25))
+                {
+                    Description = "Exact Item 2"
+                };
+                await _activityRepository.InsertAsync(a1, autoSave: true);
+                await _activityRepository.InsertAsync(a2, autoSave: true);
+            }
+        });
+
+        var client = CreateHttpClient();
+        var req = CreateRequest(HttpMethod.Get, "/api/app/activity/export?maxResultCount=2", userId: UserA, workspaceId: wsA);
+        var resp = await client.SendAsync(req);
+
+        resp.StatusCode.ShouldBe(HttpStatusCode.OK);
+        resp.Content.Headers.ContentType?.ToString().ShouldBe("text/csv; charset=utf-8");
+
+        // Derived snapshot counts must be exactly 2 and perfectly coherent
+        resp.Headers.GetValues("X-Total-Count").First().ShouldBe("2");
+        resp.Headers.GetValues("X-Exported-Count").First().ShouldBe("2");
+
+        var csv = await resp.Content.ReadAsStringAsync();
+        var lines = csv.Split('\n').Where(l => !string.IsNullOrWhiteSpace(l)).ToList();
+
+        // 1 header row + exactly 2 data rows = 3 rows total
+        lines.Count.ShouldBe(3);
+        lines[0].ShouldStartWith("ActivityId,UserId,ProjectId,ProjectTitle");
+        lines[1].ShouldContain("Exact Item");
+        lines[2].ShouldContain("Exact Item");
     }
 }
