@@ -5,11 +5,13 @@ using System.Linq;
 using System.Security.Cryptography.X509Certificates;
 using System.Threading.Tasks;
 using Dosi.Tracker.Billing;
+using Dosi.Tracker.Activities.Retention;
 using Dosi.Tracker.Compatibility;
 using Dosi.Tracker.SaaS;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Volo.Abp.BackgroundWorkers;
+using Microsoft.Extensions.Options;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Cors;
@@ -249,6 +251,8 @@ public class TrackerHttpApiHostModule : AbpModule
                 serviceProvider.GetRequiredService<Volo.Abp.Security.Encryption.IStringEncryptionService>(),
                 forcePathStyle.Value));
         }
+
+        Configure<CaptureRetentionOptions>(configuration.GetSection("CaptureRetention"));
     }
 
     /// <summary>ABP's S3 client factory, with path-style addressing as configured by <c>S3:ForcePathStyle</c>.</summary>
@@ -533,5 +537,11 @@ public class TrackerHttpApiHostModule : AbpModule
 
         await context.AddBackgroundWorkerAsync<TrialExpiryWorker>();
         await context.AddBackgroundWorkerAsync<InvoiceGenerationWorker>();
+
+        var retentionOptions = context.ServiceProvider.GetRequiredService<IOptions<CaptureRetentionOptions>>().Value;
+        if (retentionOptions.IsEnabled)
+        {
+            await context.AddBackgroundWorkerAsync<CaptureRetentionWorker>();
+        }
     }
 }

@@ -573,8 +573,9 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
 
 | Dimension | Exact Target / Command | Tests Passed | Failed | Duration | Exit Code | Provenance |
 |---|---|:---:|:---:|:---:|:---:|---|
-| **Workspace Archival Lifecycle Regressions** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~WorkspaceArchivalLifecycleTests"` | 9 | 0 | 14.7s | **0** | **[Worker-Reported (Hosted MVC TestServer & SQLite WAL)]** |
-| **Workspace Archival Migration & Upgrade Regressions** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~WorkspaceArchivalMigrationTests"` | 10 | 0 | 7.8s | **0** | **[Worker-Reported (Direct Snapshot/TargetModel, Npgsql DDL, Operation-Level & Tracked Migrator Upgrade)]** |
+| **Workspace Archival Lifecycle Regressions** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~WorkspaceArchivalLifecycleTests"` | 9 | 0 | 13.0s | **0** | **[Worker-Reported (Hosted MVC TestServer & SQLite WAL)]** |
+| **Workspace Archival Migration & Upgrade Regressions** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~WorkspaceArchivalMigrationTests"` | 10 | 0 | 7.0s | **0** | **[Worker-Reported (Direct Snapshot/TargetModel, Npgsql DDL, Operation-Level & Tracked Migrator Upgrade)]** |
+| **Workspace Capture Retention Regressions (REQ-DAT-01)** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~WorkspaceCaptureRetentionTests"` | 13 | 0 | 9.0s | **0** | **[Worker-Reported (Isolated SQLite & Scripted In-Memory Blob Provider)]** |
 | **Concurrent Last-Owner Regressions** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~ConcurrentOwnerProtectionTests"` | 9 | 0 | 9.23s | **0** | **[Worker-Reported (Concurrent SQLite WAL)]** |
 | **Hosted ASP.NET Core MVC TestServer** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~EfCoreWorkspaceHttpAuthorizationTests"` | 9 | 0 | 15.6s | **0** | **[Worker-Reported (Hosted MVC TestServer & Shared SQLite)]** |
 | **Host Route & Resolution Regressions** | `dotnet test test/Dosi.Tracker.HttpApi.Host.Tests/Dosi.Tracker.HttpApi.Host.Tests.csproj` | 125 | 0 | 1.15s | **0** | **[Worker-Reported (Host Test Suite)]** |
@@ -618,6 +619,54 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
    - `Disposable_OperationLevel_Baseline_Upgrade_Preserves_Workspace_Memberships_Projects_And_Subscriptions`: Tests reflected `Up` operations against hand-built baseline SQLite schema (`AppWorkspaces`, `AppWorkspaceMembers`, `AppProjects`, `AppSubscriptions` matching `Initial`), seeds sentinels, applies DDL, verifies all sentinels survive intact, verifies active default, verifies EF Core archival mutation, and asserts SQLite's provider boundary on DropColumn (`NotSupportedException` without rebuild).
    - `Tracked_Baseline_To_Current_Migrator_Upgrade_Preserves_Existing_Data_With_Active_Defaults`: Executes real tracked EF Core `IMigrator` service on disposable SQLite connection: migrates to `20261007185459_Initial`, verifies baseline schema without archival fields, seeds sentinels, migrates to `20261020200944_AddWorkspaceArchivalFields`, verifies `__EFMigrationsHistory`, verifies all 4 entity sentinels survive intact, and executes EF Core archival mutation and persistence.
 
+### D. Workspace-Isolated Capture Retention Lifecycle (`REQ-DAT-01`, Safe First Slice)
+
+1. **Source Evidence & Production Architecture**:
+   - Implemented `ICaptureRetentionService` and `CaptureRetentionService` in `Dosi.Tracker.Activities.Retention`.
+   - Smallest maintainable production domain service enforcing explicit workspace-scoped age-based cleanup for `SCREEN`, `THUMB`, and `WEBCAM` captures (`Screenshot` entity in `AppScreenshots` + `IBlobContainer` objects).
+   - Activity time summaries (`Activity` entity in `AppActivities`), productivity metrics, mouse/keyboard counts, active window lists, timeline buckets, memberships, projects, invitations, and billing subscriptions remain 100% untouched.
+   - Provided `CaptureRetentionPolicy`: enforces non-empty `WorkspaceId`, validated positive retention (`RetentionPeriod > TimeSpan.Zero`), bounded batch size (1..1000), optional capture kinds filter, explicit `AllowArchivedWorkspace` toggle (default `false`), and optional deterministic `Cutoff` override.
+   - Enforces defense-in-depth: explicit `WorkspaceId` predicates on both candidate selection (`Where(s => s.WorkspaceId == policy.WorkspaceId && s.CapturedAt < cutoff)`) and database mutation (`Where(s => toDeleteIds.Contains(s.Id) && s.WorkspaceId == policy.WorkspaceId)`).
+   - Scoped data filtering (`using (_dataFilter.Disable<IWorkspaceScoped>())`) within explicit UOW boundaries, preventing cross-tenant filter leakage across runs.
+   - Canonical blob key validation (`IsCanonicalStorageUrl`): strictly validates `activities/{activityId}/{kind}{ext}` convention. Rejects arbitrary caller-supplied keys, external URLs (`https://...`), and path traversal attempts (`..` or `\`), incrementing `CorruptKeyCount` and bypassing blob deletion.
+
+2. **Non-Atomic Distributed Boundary & Failure Ordering**:
+   - Order of operations: Blob deletion is executed first per candidate, followed by database row deletion in a transactional Unit of Work.
+   - Blob deletion failures (e.g., S3 503 / timeout) preserve the database pointer: the row is omitted from `toDeleteFromDb`, incrementing `FailedBlobCount` and allowing safe retry.
+   - Missing blobs (already deleted from storage or 404 from provider) increment `MissingBlobCount` and allow safe deletion of dangling database records.
+   - DB transaction failure after blob deletion converges honestly on retry: the next execution finds the missing blob (`existed == false`), treats it as `MissingBlobCount`, and commits the DB deletion without orphan rows or blocking exceptions.
+   - Ordering explicitly does NOT claim atomic transactions across remote blob storage and SQL database.
+
+3. **Disabled-by-Default Configuration & Worker Adapter**:
+   - `CaptureRetentionWorker`: Periodic background worker adapter inheriting `AsyncPeriodicBackgroundWorkerBase`.
+   - `Timer.RunOnStart = false`: Worker never runs on application or test startup.
+   - `CaptureRetentionOptions`: Defaults `IsEnabled = false`.
+   - `CaptureRetentionWorker.SweepAsync`: Checks `if (!_options.Value.IsEnabled) return new CaptureRetentionSweepResult { Skipped = true, SkipReason = "Disabled by configuration" };`.
+   - `TrackerHttpApiHostModule.cs`: Only adds `CaptureRetentionWorker` to background workers if `retentionOptions.IsEnabled == true`.
+   - No public unauthenticated HTTP endpoint is exposed.
+   - Automatic execution against the host machine's configured database or real blob storage is strictly prevented.
+
+4. **Concrete Isolated Regression Suite (`WorkspaceCaptureRetentionTests.cs`, 13 tests passed, exit 0)**:
+   - `Expired_Captures_Are_Deleted_From_Database_And_Blob_Container`: A-expired captures (both screen and thumb) deleted from SQLite and fake blob provider; asserts both DB row deletion and blob key removal.
+   - `Unrelated_Workspace_Expired_Captures_Are_Preserved_Untouched`: B-expired sentinel in unrelated workspace is untouched in SQLite and fake blob provider when running retention on Workspace A.
+   - `Fresh_And_Exact_Cutoff_Captures_Are_Preserved_Untouched`: A-fresh (newer than cutoff) and exact-cutoff (capturedAt == cutoff) are preserved in DB and blob provider; only strictly expired (< cutoff) deleted.
+   - `Activity_Time_Summaries_And_Blocks_Remain_Completely_Untouched`: Parent `Activity` record with time summaries, input counts (mouse/keyboard), and JSON payloads remains 100% intact after child screenshot cleanup.
+   - `Archived_Workspace_Policy_Explicit_Default_Skips_Unless_Explicitly_Allowed`: Verifies archived workspace is skipped (`Skipped = true`, `SkipReason = "Workspace is archived"`) when `AllowArchivedWorkspace = false`, and cleans expired captures when `AllowArchivedWorkspace = true`.
+   - `Zero_Empty_Or_Negative_Policy_Throws_Before_Any_Side_Effects`: Verifies `Guid.Empty`, `TimeSpan.Zero`, negative duration, zero/negative batch size, > 1000 batch size, and null policy throw before any database or storage operations.
+   - `Bounded_Batching_And_HasMore_Convergence_On_Repeat_Execution`: Verifies bounded batch pagination (batchSize = 2 over 5 candidates) and `HasMore` convergence across successive idempotent passes.
+   - `Missing_Blobs_In_Storage_Safely_Clean_Up_Dangling_Database_Rows`: Dangling DB rows pointing to missing blobs in storage are safely cleaned up (`MissingBlobCount = 1`, `DeletedCount = 1`).
+   - `Blob_Deletion_Failure_Preserves_Database_Pointer_For_Retry`: Injected S3 503 failure during blob deletion preserves DB pointer (`FailedBlobCount = 1`, `DeletedCount = 0`); retry after recovery succeeds (`DeletedCount = 1`).
+   - `Database_Failure_After_Blob_Deletion_Converges_Honestly_On_Retry`: Simulates recovery from crash between blob deletion and DB commit; retry converges honestly (`MissingBlobCount = 1`, `DeletedCount = 1`).
+   - `Corrupt_Or_Non_Canonical_Storage_Urls_Are_Rejected_Without_Deleting_Arbitrary_Blobs`: Non-canonical, traversal, and external URLs are rejected without deleting caller-supplied blobs (`CorruptKeyCount = 3`, `DeletedCount = 0`).
+   - `Worker_Default_Disabled_Performs_Zero_Work_And_Produces_No_Side_Effects`: Default worker with `IsEnabled = false` skips immediately (`Skipped = true`, `WorkspacesSwept = 0`, `TotalDeleted = 0`), producing 0 side effects.
+   - `Worker_Enabled_Sweeps_Active_Workspaces_And_Skips_Archived`: Worker with `IsEnabled = true` sweeps active workspaces and skips archived workspaces.
+
+5. **Operational Limitations & Remaining Gaps**:
+   - **A disabled implementation is not deployed/enforced retention**: The worker is disabled by default and has not been executed on live environments.
+   - **Activity Retention Gap**: 1-year activity summary pruning (e.g. deleting old `Activity` records) is deferred; only captures are pruned in this slice.
+   - **Owner Settings UI Gap**: Per-workspace retention period configuration UI for workspace owners in Next.js frontend is not yet implemented.
+   - **Live Storage / DB Approval Gap**: Production execution against live PostgreSQL databases and real AWS S3 / Cloudflare R2 object storage remains pending independent PM operational approval.
+
 ---
 
 ## 10. Current Status & Next Steps
@@ -625,18 +674,19 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
 1. **Privacy Acceptance Pending**:
    - The privacy source audit (commit `14bbe66`) remains **Pending PM Independent Review**. This status is preserved and not bypassed.
 2. **Workspace Lifecycle, Authorization & Concurrency Status**:
-   - Reversible owner-controlled workspace archival (`REQ-WS-08`), concurrent last-owner protection (`REQ-WS-06`), recipient decline lifecycle (`REQ-WS-07`), and hosted ASP.NET Core `TestServer` MVC aggregate authorization harness (`REQ-ISO-05`) are fully implemented and verified via isolated regressions (47 SQLite tests total: 9 archival lifecycle + 10 archival migration/upgrade + 9 concurrent owner protection + 9 hosted MVC auth + 10 decline).
+   - Reversible owner-controlled workspace archival (`REQ-WS-08`), concurrent last-owner protection (`REQ-WS-06`), recipient decline lifecycle (`REQ-WS-07`), hosted ASP.NET Core `TestServer` MVC aggregate authorization harness (`REQ-ISO-05`), and workspace-isolated capture retention lifecycle safe first slice (`REQ-DAT-01`) are implemented and verified via isolated regressions (60 SQLite tests total: 13 capture retention + 9 archival lifecycle + 10 archival migration/upgrade + 9 concurrent owner protection + 9 hosted MVC auth + 10 decline).
    - Real browser cookie/session testing (`__Host-Dosi-Workspace`), Next.js server actions, OpenIddict token issuer, provider-backed multi-connection transactional commit proof (PostgreSQL/SQL Server), multi-node distributed lock infrastructure (Redis), and PM independent execution of `qa_workspace_phase.ps1` remain pending. All reported outcomes are worker-executed, not independent PM QA.
 3. **Execution Limits & Evidence Boundaries**:
    - Disposable SQLite baseline-to-current upgrades (both operation-level and tracked migrator) prove migration logic, history discovery, and baseline row preservation with default states on SQLite, but do NOT replace execution on a real PostgreSQL cluster; no live user/production database was modified.
    - The archival lifecycle fixture disables Unit of Work transactions due to SQLite locking constraints (`AddAlwaysDisableUnitOfWorkTransaction()`).
    - Registration rejection in tests is verified via direct service invocation (`RegisterWithInvitationAsync`), not hosted anonymous HTTP.
+   - Capture retention tests use disposable SQLite in-memory and synthetic in-memory `ScriptedBlobProvider` without real images, AWS S3, or Cloudflare R2 connections.
 4. **Remaining Lifecycle Gaps**:
-   - Destructive permanent deletion, retention grace-period enforcement, automated billing subscription cancellation/downgrades, and frontend UI workspace archive/restore management actions remain deferred acceptance gaps.
+   - Destructive permanent deletion, retention grace-period enforcement, automated billing subscription cancellation/downgrades, 1-year activity summary pruning, and frontend UI workspace archive/restore/retention management actions remain deferred acceptance gaps.
 5. **Overall Product Incomplete**:
    - Full product remains incomplete across backend metric nullability schema migrations (`Activity.cs` truthful nulls vs 0), desktop offline ingestion queue hardening, platform-native interactive client runtimes, code signing, and hosted operational deployment.
 6. **Awaiting PM Guidance**:
-   - Single bounded evidence correction complete. Stop and hand off for PM review with exact diff and test evidence.
+   - Single bounded REQ-DAT-01 capture retention first slice complete. Stop and hand off for PM review with exact diff and test evidence.
 
 
 

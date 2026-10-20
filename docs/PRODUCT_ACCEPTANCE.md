@@ -176,9 +176,9 @@ Every backlog item and verification check in this specification is categorized u
 
 ## 8. Priority 7: Data Retention & Compliance Operations
 - **REQ-DAT-01: Activity & Screenshot Retention Cleanup Worker**
-  - *Requirement:* Background worker enforcing workspace retention policies (e.g. 30/90 days for screenshots, 1 year for activity summaries). Prunes both blob storage objects and database records.
-  - *Code:* `backend/.../BlobStoring`, `backend/.../ActivityAppService.cs`.
-  - *Evidence Level:* **[Not Implemented / Backlog Gap]** (Settings exist in host config; periodic pruning background worker not implemented).
+  - *Requirement:* Explicit workspace-scoped age-based capture retention lifecycle service and background worker. Prunes both blob storage objects and database records for screenshots/thumbnails/webcam captures while strictly preserving activity time summaries, blocks, and unrelated workspaces.
+  - *Code:* `backend/src/Dosi.Tracker.Domain/Activities/Retention/CaptureRetentionService.cs`, `CaptureRetentionPolicy.cs`, `CaptureRetentionOptions.cs`, `CaptureRetentionWorker.cs`, `TrackerHttpApiHostModule.cs`.
+  - *Evidence Level:* **[Worker-Reported (Isolated SQLite & Scripted Blob Provider)]** (13 passed, exit 0). Safe first slice implemented with disabled-by-default configuration (`IsEnabled = false`), bounded batching, deterministic cutoff, canonical blob key validation, retriable storage failure handling, and idempotent DB retry convergence. Activity/time summary pruning, per-workspace owner settings UI, and production operational rollout remain deferred.
 - **REQ-DAT-02: Data Export, Extraction & Disaster Recovery**
   - *Requirement:* Workspace Owners can request full data export (CSV/JSON activity summaries + zip archive of screenshots) for compliance/GDPR. Export jobs execute asynchronously with signed download URLs. Automated database backup and restore procedures documented.
   - *Evidence Level:* **[Not Implemented / Backlog Gap]**.
@@ -213,5 +213,5 @@ Every backlog item and verification check in this specification is categorized u
 | **REQ-CLI-03**| Linux | `clients/linux` (greenfield) | Crate build + tests | **[Not Implemented]** | Greenfield implementation |
 | **REQ-OPS-01**| Frontend | Full frontend suite | `npm run typecheck` | **[Verified by PM @ 18db4d5]** (exit 0) | Full CI pipeline setup |
 | **REQ-OPS-02**| Frontend | `analytics-charts.tsx` | `npm run test:a11y` | **[Worker-Reported (Historical)]** (53 passed) | Manual screen reader / zoom audit |
-| **REQ-DAT-01**| Backend | Background worker | Retention pruning test suite | **[Not Implemented]** | Periodic pruning job not implemented |
+| **REQ-DAT-01**| Backend | `CaptureRetentionService.cs`, `CaptureRetentionWorker.cs`, `CaptureRetentionPolicy.cs` | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~WorkspaceCaptureRetentionTests"` (13 passed, exit 0) | **[Worker-Reported (Isolated SQLite & Scripted In-Memory Blob Provider)]** | First slice: explicit workspace age capture cleanup (SCREEN/THUMB/WEBCAM), bounded batches, deterministic cutoff, canonical key check, retriable storage failure handling, crash convergence, disabled-by-default registration (`IsEnabled = false`). Remaining gaps: Activity time summary retention (1yr), per-workspace owner settings UI, operational rollout/approval |
 | **REQ-DAT-02**| Backend | Export service | Asynchronous export & backup suite | **[Not Implemented]** | Async bulk zip & signed URL generator |

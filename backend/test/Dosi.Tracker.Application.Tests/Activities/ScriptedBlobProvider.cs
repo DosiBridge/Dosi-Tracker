@@ -22,6 +22,11 @@ public sealed class ScriptedBlobProvider : BlobProviderBase
     /// <summary>Called with the 1-based number of the save and the blob name, before the blob is stored.</summary>
     public Func<int, string, Task>? BeforeSave { get; set; }
 
+    private int _deleteCount;
+
+    /// <summary>Called with the 1-based number of the delete and the blob name, before the blob is removed.</summary>
+    public Func<int, string, Task>? BeforeDelete { get; set; }
+
     public override async Task SaveAsync(BlobProviderSaveArgs args)
     {
         var saveNumber = Interlocked.Increment(ref _saveCount);
@@ -38,8 +43,16 @@ public sealed class ScriptedBlobProvider : BlobProviderBase
         Blobs[args.BlobName] = await args.BlobStream.GetAllBytesAsync(args.CancellationToken);
     }
 
-    public override Task<bool> DeleteAsync(BlobProviderDeleteArgs args) =>
-        Task.FromResult(Blobs.TryRemove(args.BlobName, out _));
+    public override async Task<bool> DeleteAsync(BlobProviderDeleteArgs args)
+    {
+        var deleteNumber = Interlocked.Increment(ref _deleteCount);
+        if (BeforeDelete != null)
+        {
+            await BeforeDelete(deleteNumber, args.BlobName);
+        }
+
+        return Blobs.TryRemove(args.BlobName, out _);
+    }
 
     public override Task<bool> ExistsAsync(BlobProviderExistsArgs args) =>
         Task.FromResult(Blobs.ContainsKey(args.BlobName));
