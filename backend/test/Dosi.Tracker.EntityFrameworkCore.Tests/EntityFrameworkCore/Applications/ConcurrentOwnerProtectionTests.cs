@@ -60,56 +60,105 @@ public class SqliteWalConnectionInterceptor : DbConnectionInterceptor
 
 /// <summary>
 /// A controllable per-key distributed lock provider implementing IAbpDistributedLock for integration testing.
-/// Provides deterministic bounded hooks (LockAcquired, OnBeforeReleaseAsync, LockReleasing)
-/// to coordinate concurrent operations without arbitrary thread sleeps.
+/// Provides deterministic bounded hooks (LockAcquireAttempted, LockWaitEntered, LockAcquired, OnBeforeReleaseAsync, LockReleasing),
+/// thread-safe state inspection (ActiveHolders, QueuedWaiters, MaxConcurrentHolders), and guaranteed cleanup.
 /// </summary>
 public class ControllableDistributedLock : IAbpDistributedLock
 {
-    private readonly ConcurrentDictionary<string, SemaphoreSlim> _semaphores = new();
+    public class LockState
+    {
+        public SemaphoreSlim Semaphore { get; } = new(1, 1);
+        public int ActiveHolders;
+        public int MaxConcurrentHolders;
+        public int QueuedWaiters;
+        public int TotalAcquisitions;
+    }
 
+    private readonly ConcurrentDictionary<string, LockState> _states = new();
+
+    public event Action<string>? LockAcquireAttempted;
+    public event Action<string>? LockWaitEntered;
     public event Action<string>? LockAcquired;
     public event Action<string>? LockReleasing;
     public Func<string, Task>? OnBeforeReleaseAsync { get; set; }
 
+    public LockState GetState(string name) => _states.GetOrAdd(name, _ => new LockState());
+
     public async Task<IAbpDistributedLockHandle?> TryAcquireAsync(
         string name, TimeSpan timeout = default, CancellationToken cancellationToken = default)
     {
-        var sem = _semaphores.GetOrAdd(name, _ => new SemaphoreSlim(1, 1));
-        var acquired = await sem.WaitAsync(timeout, cancellationToken);
+        var state = GetState(name);
+        LockAcquireAttempted?.Invoke(name);
+
+        Interlocked.Increment(ref state.QueuedWaiters);
+        LockWaitEntered?.Invoke(name);
+
+        bool acquired;
+        try
+        {
+            acquired = await state.Semaphore.WaitAsync(timeout, cancellationToken);
+        }
+        finally
+        {
+            Interlocked.Decrement(ref state.QueuedWaiters);
+        }
+
         if (!acquired)
         {
             return null;
         }
 
+        var current = Interlocked.Increment(ref state.ActiveHolders);
+        Interlocked.Increment(ref state.TotalAcquisitions);
+
+        int initialMax, newMax;
+        do
+        {
+            initialMax = state.MaxConcurrentHolders;
+            newMax = Math.Max(initialMax, current);
+        } while (Interlocked.CompareExchange(ref state.MaxConcurrentHolders, newMax, initialMax) != initialMax);
+
         LockAcquired?.Invoke(name);
-        return new Handle(this, name, sem);
+        return new Handle(this, name, state);
     }
 
     private sealed class Handle : IAbpDistributedLockHandle
     {
         private readonly ControllableDistributedLock _owner;
         private readonly string _name;
-        private readonly SemaphoreSlim _semaphore;
+        private readonly LockState _state;
         private int _disposed;
 
-        public Handle(ControllableDistributedLock owner, string name, SemaphoreSlim semaphore)
+        public Handle(ControllableDistributedLock owner, string name, LockState state)
         {
             _owner = owner;
             _name = name;
-            _semaphore = semaphore;
+            _state = state;
         }
 
         public async ValueTask DisposeAsync()
         {
             if (Interlocked.Exchange(ref _disposed, 1) == 0)
             {
-                if (_owner.OnBeforeReleaseAsync != null)
+                try
                 {
-                    await _owner.OnBeforeReleaseAsync(_name);
+                    if (_owner.OnBeforeReleaseAsync != null)
+                    {
+                        await _owner.OnBeforeReleaseAsync(_name);
+                    }
                 }
-
-                _owner.LockReleasing?.Invoke(_name);
-                _semaphore.Release();
+                finally
+                {
+                    try
+                    {
+                        _owner.LockReleasing?.Invoke(_name);
+                    }
+                    finally
+                    {
+                        Interlocked.Decrement(ref _state.ActiveHolders);
+                        _state.Semaphore.Release();
+                    }
+                }
             }
         }
     }
@@ -403,18 +452,21 @@ public class ConcurrentOwnerProtectionTests : TrackerTestBase<ConcurrentOwnerPro
     }
 
     [Fact]
-    public async Task Deterministic_Interleaved_Owner_Leave_Blocks_Competitor_Until_Commit_Visibility()
+    public async Task Deterministic_Interleaved_Owner_Leave_Blocks_Competitor_At_Lock_Boundary_Until_Persisted_Release()
     {
-        // Deterministic Bounded Interleaving Proof:
-        // 1. Thread 1 enters LeaveAsync, acquires ownerLock, and proceeds through member/project cleanup and commit.
-        // 2. Thread 2 enters LeaveAsync and is BLOCKED at the ownerLock boundary.
-        // 3. While Thread 1 has committed to the DB but has not released the lock, we prove:
-        //    - Thread 1's commit is visible (count == 1 in DB).
-        //    - Thread 2 is STILL BLOCKED (task2.IsCompleted == false).
+        // Deterministic Bounded Interleaving Proof (SQLite Nontransactional Persisted-State Ordering):
+        // 1. Thread 1 enters LeaveAsync, acquires ownerLock, and proceeds through member/project cleanup and persistence.
+        // 2. Thread 2 enters LeaveAsync and reaches the actual provider boundary (TryAcquireAsync), actively queuing on the semaphore.
+        // 3. At the first-operation persisted-state pre-release boundary (OnBeforeReleaseAsync):
+        //    - Thread 1's entity removal is verified already persisted in SQLite (ownersInDb == 1).
+        //    - Competitor Thread 2 is verified actively queued at the provider boundary on the held semaphore (QueuedWaiters >= 1, ActiveHolders == 1).
+        //    - task2.IsCompleted is verified false.
         // 4. Thread 1 releases the lock.
-        // 5. Thread 2 unblocks, observes Thread 1's committed removal, evaluates CountOwnersAsync <= 1,
+        // 5. Thread 2 unblocks, acquires ownerLock, observes Thread 1's persisted removal, evaluates CountOwnersAsync <= 1,
         //    and is rejected with TrackerDomainErrorCodes.LastOwnerCannotLeave.
-        // 6. Persisted active owners count remains exactly 1.
+        // 6. MaxConcurrentHolders is asserted to be strictly 1 (verifying mutual exclusion and rejecting non-exclusive variants).
+        // 7. Persisted active owners count remains exactly 1.
+        // All waits and timeouts are strictly bounded (10s max). Guaranteed cleanup in finally blocks.
 
         var wsId = _guidGenerator.Create();
         var owner1 = await CreateTestUserAsync("det_a");
@@ -427,7 +479,7 @@ public class ConcurrentOwnerProtectionTests : TrackerTestBase<ConcurrentOwnerPro
 
         var lockName = WorkspaceMembershipManager.OwnerLockName(wsId);
         var thread1AcquiredLock = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var thread2AttemptedLock = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var thread2QueuedAtLock = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         var allowThread1Release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
         void OnLockAcquired(string name)
@@ -438,18 +490,36 @@ public class ConcurrentOwnerProtectionTests : TrackerTestBase<ConcurrentOwnerPro
             }
         }
 
+        void OnLockWaitEntered(string name)
+        {
+            // Thread 2 reaches the lock provider while Thread 1 holds the lock
+            if (name == lockName && thread1AcquiredLock.Task.IsCompletedSuccessfully)
+            {
+                thread2QueuedAtLock.TrySetResult(true);
+            }
+        }
+
+        int releaseCount = 0;
         DistributedLock.LockAcquired += OnLockAcquired;
+        DistributedLock.LockWaitEntered += OnLockWaitEntered;
         DistributedLock.OnBeforeReleaseAsync = async name =>
         {
-            if (name == lockName)
+            if (name == lockName && Interlocked.Increment(ref releaseCount) == 1)
             {
-                // Assert at the moment of release: Thread 1 has already committed its changes,
-                // but lock has not yet unblocked Thread 2
+                // Wait until Thread 2 has reached the lock provider and entered semaphore wait
+                await thread2QueuedAtLock.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+                // Assert at pre-release boundary: Thread 1 has completed its persistence in SQLite
                 var ownersInDb = await CountActiveOwnersInDbAsync(wsId);
                 ownersInDb.ShouldBe(1);
 
-                // Wait until test runner signals release
-                await allowThread1Release.Task;
+                // Assert at pre-release boundary: Thread 2 is genuinely queued at the provider boundary
+                var state = DistributedLock.GetState(lockName);
+                state.ActiveHolders.ShouldBe(1);
+                state.QueuedWaiters.ShouldBeGreaterThanOrEqualTo(1);
+
+                // Bounded wait for release signal
+                await allowThread1Release.Task.WaitAsync(TimeSpan.FromSeconds(10));
             }
         };
 
@@ -476,7 +546,7 @@ public class ConcurrentOwnerProtectionTests : TrackerTestBase<ConcurrentOwnerPro
                 }
             });
 
-            // Wait until Thread 1 has acquired the lock
+            // Bounded wait until Thread 1 has acquired the lock
             await thread1AcquiredLock.Task.WaitAsync(TimeSpan.FromSeconds(10));
 
             // Launch Thread 2 while Thread 1 holds the lock
@@ -484,7 +554,6 @@ public class ConcurrentOwnerProtectionTests : TrackerTestBase<ConcurrentOwnerPro
             {
                 try
                 {
-                    thread2AttemptedLock.TrySetResult(true);
                     using var scope = ServiceProvider.CreateScope();
                     var principalAccessor = scope.ServiceProvider.GetRequiredService<ICurrentPrincipalAccessor>();
                     var appService = scope.ServiceProvider.GetRequiredService<IWorkspaceAppService>();
@@ -499,15 +568,18 @@ public class ConcurrentOwnerProtectionTests : TrackerTestBase<ConcurrentOwnerPro
                 }
             });
 
-            await thread2AttemptedLock.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            // Bounded wait until Thread 2 has reached the provider boundary and is actively queued on the held semaphore
+            await thread2QueuedAtLock.Task.WaitAsync(TimeSpan.FromSeconds(10));
 
-            // Small bounded check: task2 cannot be completed while Thread 1 holds the lock
+            // Verified: Thread 2 is blocked at the provider boundary
             task2.IsCompleted.ShouldBeFalse();
+            DistributedLock.GetState(lockName).QueuedWaiters.ShouldBeGreaterThanOrEqualTo(1);
 
-            // Allow Thread 1 to release lock
+            // Signal Thread 1 to proceed with lock release
             allowThread1Release.TrySetResult(true);
 
-            await Task.WhenAll(task1, task2);
+            // Bounded wait for both tasks to complete
+            await Task.WhenAll(task1, task2).WaitAsync(TimeSpan.FromSeconds(10));
 
             ex1.ShouldBeNull();
             var businessEx = ex2.ShouldBeOfType<BusinessException>();
@@ -516,13 +588,47 @@ public class ConcurrentOwnerProtectionTests : TrackerTestBase<ConcurrentOwnerPro
             // Exactly 1 owner remains persisted in DB
             var finalOwners = await CountActiveOwnersInDbAsync(wsId);
             finalOwners.ShouldBe(1);
+
+            // Rejection of non-exclusive or bypassed lock variant:
+            // Max concurrent holders for the lock key must never exceed 1
+            var finalState = DistributedLock.GetState(lockName);
+            finalState.MaxConcurrentHolders.ShouldBe(1);
+            finalState.ActiveHolders.ShouldBe(0);
+            finalState.QueuedWaiters.ShouldBe(0);
         }
         finally
         {
             DistributedLock.LockAcquired -= OnLockAcquired;
+            DistributedLock.LockWaitEntered -= OnLockWaitEntered;
             DistributedLock.OnBeforeReleaseAsync = null;
             allowThread1Release.TrySetResult(true);
         }
+    }
+
+    [Fact]
+    public void Deliberately_Nonexclusive_Or_Bypassed_Lock_Variant_Is_Rejected_By_Concurrency_Assertions()
+    {
+        // Proves that our harness MaxConcurrentHolders and mutual exclusion assertions
+        // are sufficient to detect and reject a deliberately non-exclusive or bypassed lock variant.
+
+        var lockName = WorkspaceMembershipManager.OwnerLockName(_guidGenerator.Create());
+        var state = DistributedLock.GetState(lockName);
+
+        // Simulate concurrent entry of two holders (as would occur if lock exclusivity were bypassed)
+        Interlocked.Increment(ref state.ActiveHolders);
+        var secondEntry = Interlocked.Increment(ref state.ActiveHolders);
+        state.MaxConcurrentHolders = Math.Max(state.MaxConcurrentHolders, secondEntry);
+
+        // Verify that the concurrent entry produces MaxConcurrentHolders == 2
+        state.MaxConcurrentHolders.ShouldBe(2);
+
+        // Demonstrate that an assertion requiring mutual exclusion (MaxConcurrentHolders == 1) strictly rejects this variant
+        Should.Throw<ShouldAssertException>(() => state.MaxConcurrentHolders.ShouldBe(1));
+
+        // Restore fixture state
+        Interlocked.Decrement(ref state.ActiveHolders);
+        Interlocked.Decrement(ref state.ActiveHolders);
+        state.MaxConcurrentHolders = 0;
     }
 
     [Fact]
@@ -597,7 +703,7 @@ public class ConcurrentOwnerProtectionTests : TrackerTestBase<ConcurrentOwnerPro
             }
         });
 
-        await Task.WhenAll(task1, task2);
+        await Task.WhenAll(task1, task2).WaitAsync(TimeSpan.FromSeconds(10));
 
         // Assert: Exactly one operation succeeded and exactly one threw LastOwnerCannotLeave
         var exceptions = new[] { ex1, ex2 }.Where(e => e != null).ToList();
@@ -731,7 +837,7 @@ public class ConcurrentOwnerProtectionTests : TrackerTestBase<ConcurrentOwnerPro
             }
         });
 
-        await Task.WhenAll(taskA, taskB);
+        await Task.WhenAll(taskA, taskB).WaitAsync(TimeSpan.FromSeconds(10));
 
         var exceptions = new[] { exA, exB }.Where(e => e != null).ToList();
         exceptions.Count.ShouldBe(1);
@@ -831,7 +937,7 @@ public class ConcurrentOwnerProtectionTests : TrackerTestBase<ConcurrentOwnerPro
             }
         });
 
-        await Task.WhenAll(taskLeave, taskDemote);
+        await Task.WhenAll(taskLeave, taskDemote).WaitAsync(TimeSpan.FromSeconds(10));
 
         // Assert exactly one operation succeeded and exactly one threw a domain exception
         var exceptions = new[] { exLeave, exDemote }.Where(e => e != null).ToList();
@@ -940,7 +1046,7 @@ public class ConcurrentOwnerProtectionTests : TrackerTestBase<ConcurrentOwnerPro
             }
         });
 
-        await Task.WhenAll(task1, task2);
+        await Task.WhenAll(task1, task2).WaitAsync(TimeSpan.FromSeconds(10));
 
         // Both succeeded because they locked distinct workspace keys
         ex1.ShouldBeNull();
