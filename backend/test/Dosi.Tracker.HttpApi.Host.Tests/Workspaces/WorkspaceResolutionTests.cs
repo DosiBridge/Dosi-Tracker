@@ -129,6 +129,16 @@ public class WorkspaceResolutionTests
     }
 
     [Fact]
+    public async Task An_Empty_Guid_Header_Should_Be_Refused_With_400()
+    {
+        var context = Request(Guid.Empty.ToString(), Member);
+
+        (await RunAsync(context)).NextCalled.ShouldBeFalse();
+        context.Response.StatusCode.ShouldBe(StatusCodes.Status400BadRequest);
+        (await ErrorCodeAsync(context)).ShouldBe(TrackerDomainErrorCodes.WorkspaceRequired);
+    }
+
+    [Fact]
     public async Task Without_A_Header_Or_A_User_The_Request_Should_Have_No_Workspace()
     {
         (await RunAsync(Request(null, Member))).ShouldBe((true, (Guid?)null, (string?)null));

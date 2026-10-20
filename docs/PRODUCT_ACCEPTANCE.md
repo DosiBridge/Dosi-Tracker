@@ -67,13 +67,13 @@ Every backlog item and verification check in this specification is categorized u
 
 ## 3. Priority 2: Tenant & Workspace Isolation
 - **REQ-ISO-01: Backend Entity Query Scoping**
-  - *Requirement:* Every tenant-scoped entity implements `IWorkspaceScoped`. ABP global query filters automatically restrict reads/writes to `CurrentWorkspace.Id`.
-  - *Code:* `backend/.../DosiTrackerDbContext.cs`, `backend/.../CurrentWorkspace.cs`.
-  - *Evidence Level:* **[Worker-Reported]** (`WorkspacePersistenceTests.cs`, `ActivityPersistenceTests.cs`).
+  - *Requirement:* Every tenant-scoped entity implements `IWorkspaceScoped`. ABP global query filters automatically restrict reads/writes to `CurrentWorkspace.Id`. Empty GUID workspace header (`00000000-0000-0000-0000-000000000000`) is refused with `400 Bad Request (Tracker:WorkspaceRequired)` before DB lookups.
+  - *Code:* `backend/.../TrackerDbContext.cs`, `backend/.../CurrentWorkspace.cs`, `backend/.../WorkspaceResolution.cs`.
+  - *Evidence Level:* **[Worker-Reported]** (`WorkspacePersistenceTests.cs`, `ActivityPersistenceTests.cs`, `WorkspaceResolutionTests.An_Empty_Guid_Header_Should_Be_Refused_With_400`: 117 passed, exit 0).
 - **REQ-ISO-02: Cross-Tenant Injection Guard**
   - *Requirement:* Ingestion and mutation endpoints verify that referenced projects, members, and resources belong to the caller's active workspace.
   - *Code:* `backend/.../ActivityAppService.cs` line 118, `backend/.../ProjectAppService.cs`.
-  - *Evidence Level:* **[Worker-Reported]** (`ProjectsAndTeamSteps.cs`, `MemberScopingTests.cs`).
+  - *Evidence Level:* **[Worker-Reported]** (`ProjectsAndTeamSteps.cs`, `MemberScopingTests.cs`, `EfCoreCrossWorkspaceIsolationTests.Caller_In_Workspace_A_Cannot_Upload_Activity_To_Project_In_Workspace_B`).
 - **REQ-ISO-03: Pay-Rate & Sensitive Metric Masking**
   - *Requirement:* Hourly pay rates and sensitive team finances are masked from non-owner/non-manager members.
   - *Code:* `backend/.../TeamAppService.cs`, `backend/.../ProjectMembershipManager.cs`.
@@ -83,9 +83,9 @@ Every backlog item and verification check in this specification is categorized u
   - *Code:* `frontend/src/hooks/useApi.ts`, `frontend/src/lib/tenant-data.ts`, `clients/windows/src/worker.rs`.
   - *Evidence Level:* **[Verified by PM @ 18db4d5]** (Frontend `tenant-switching.test.tsx` 8 passed).
 - **REQ-ISO-05: Authenticated HTTP/Browser Negative Tenant Isolation**
-  - *Requirement:* Authenticated API requests and Next.js server actions must strictly enforce tenant boundaries against malicious parameter tampering (e.g., User from Workspace A attempting `GET /api/app/activity?workspaceId=WorkspaceB` or spoofing `X-Workspace-Id` header). Must return `403 Forbidden` and prevent data leakage.
-  - *Code:* `backend/.../CurrentWorkspace.cs`, `frontend/src/middleware.ts`.
-  - *Evidence Level:* **[Source-Only / Backlog Gap]** (Entity query filters exist in EF Core; comprehensive negative HTTP test suite open).
+  - *Requirement:* Authenticated API requests and server context must strictly enforce tenant boundaries against malicious parameter tampering (e.g., User from Workspace A attempting to read, mutate, delete, or list Workspace B resources or spoofing `X-Workspace-Id` header). Dual-membership context switching must preserve legitimate permissions per workspace and forbid cross-workspace leakage.
+  - *Code:* `backend/.../CurrentWorkspace.cs`, `backend/.../WorkspaceResolution.cs`, `backend/.../CrossWorkspaceIsolationTests.cs`.
+  - *Evidence Level:* **[Worker-Reported]** (`EfCoreCrossWorkspaceIsolationTests`: 10 passed, 0 failed, exit 0, covering negative project read/update/delete/list, activity upload injection, screenshot access, team roster query/mutation, presence heartbeat clamping, dual-membership context switching, and role lookup isolation; `WorkspaceResolutionTests`: 117 passed, exit 0).
 
 ---
 

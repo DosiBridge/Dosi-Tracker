@@ -37,7 +37,7 @@ public class WorkspaceResolutionMiddleware
             return;
         }
 
-        if (!Guid.TryParse(header.Trim(), out var workspaceId))
+        if (!Guid.TryParse(header.Trim(), out var workspaceId) || workspaceId == Guid.Empty)
         {
             await WriteErrorAsync(context, StatusCodes.Status400BadRequest, TrackerDomainErrorCodes.WorkspaceRequired,
                 $"The {WorkspaceConsts.HeaderName} header is not a valid workspace id.");

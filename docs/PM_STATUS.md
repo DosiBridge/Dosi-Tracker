@@ -296,13 +296,50 @@ All tests executed in `clients/windows` with `RUST_BACKTRACE=1`. Synthetic QA on
 
 ---
 
-## 5. Next Steps
+## 5. Bounded Engineering Phase: Multi-Workspace Server-Side Authorization & Data Isolation
 
-1. **Awaiting PM Independent Review**:
-   - PM independently executes selected synthetic tests to verify the monotonic narrowing and fault-boundary implementation slice (`cargo test --bin dosi-tracker consent`, `config::tests`, etc.).
-2. **Subsequent Phasing (Strictly Awaiting PM Authorization)**:
-   - Backend schema nullability migration (`Activity.cs` metric nullability) and cross-workspace tenant isolation tests remain deferred until PM authorization.
-   - Do NOT proceed to metric migrations or mark this phase passed until PM independently accepts.
+### A. Context & Concrete Source Gap
+Under the renewed product mission, an end-to-end trace from authenticated identity -> workspace resolution header -> repository scope was audited:
+1. **Source-Proven Resolution Defect (`WorkspaceResolution.cs`)**:
+   - `WorkspaceResolutionMiddleware` previously parsed `X-Workspace-Id` with `Guid.TryParse(rawHeader, out var workspaceId)`. When a caller provided `Guid.Empty` (`00000000-0000-0000-0000-000000000000`), `TryParse` succeeded.
+   - As a result, `CurrentWorkspace.Id` was bound to `Guid.Empty`.
+   - In `TrackerDbContext.cs` (`ApplyAbpConceptsForAddedEntity`), a check `scoped.WorkspaceId == Guid.Empty` checked `CurrentWorkspaceId ?? throw ...`, which with `Guid.Empty` resulted in records retaining `Guid.Empty`.
+   - **Fix Implemented**: Updated `WorkspaceResolutionMiddleware` to require `Guid.TryParse(...) && workspaceId != Guid.Empty`, rejecting empty GUID headers immediately with `400 Bad Request` and error code `Tracker:WorkspaceRequired`.
+2. **Comprehensive Negative Cross-Workspace Isolation Test Suite (`CrossWorkspaceIsolationTests.cs`)**:
+   - Implemented abstract in-process test fixture `CrossWorkspaceIsolationTests<TStartupModule>` and concrete EF Core SQLite in-memory binding `EfCoreCrossWorkspaceIsolationTests` covering 10 distinct negative isolation and role-switching dimensions:
+     - `Caller_In_Workspace_A_Cannot_Get_Project_Owned_By_Workspace_B`: Throws `EntityNotFoundException`.
+     - `Caller_In_Workspace_A_Cannot_Update_Project_Owned_By_Workspace_B`: Throws `EntityNotFoundException`.
+     - `Caller_In_Workspace_A_Cannot_Delete_Project_Owned_By_Workspace_B`: Deletion across tenant is a no-op; foreign project remains intact in Workspace B.
+     - `Caller_In_Workspace_A_Project_List_Does_Not_Leak_Workspace_B_Projects`: Workspace B projects excluded from Workspace A list.
+     - `Caller_In_Workspace_A_Cannot_Upload_Activity_To_Project_In_Workspace_B`: Throws `BusinessException(TrackerDomainErrorCodes.NotProjectMember)`.
+     - `Caller_In_Workspace_A_Cannot_Access_Screenshot_Content_Owned_By_Workspace_B`: Throws `EntityNotFoundException`.
+     - `Caller_In_Workspace_A_Cannot_See_Or_Remove_Workspace_B_Team_Members`: Roster query excludes foreign members; cross-workspace removal fails with `TrackerDomainErrorCodes.InvalidUser`.
+     - `Caller_In_Workspace_A_Heartbeat_Does_Not_Attach_To_Workspace_B_Project`: Ingests heartbeat in Workspace A, but ProjectId is clamped to null.
+     - `Dual_Member_Role_And_Data_Context_Switching`: Verifies a user holding Owner in WS-A and Member in WS-B is granted project creation in WS-A, but denied project creation with `AbpAuthorizationException` in WS-B, with zero project list leakage across context switch.
+     - `WorkspaceRoleLookup_Trace_Direct_Repository_Check`: Direct unit test of `WorkspaceRoleLookup.FindRoleAsync` proving role lookup matches active membership, returns null for non-member, and returns null for `Guid.Empty`.
+
+### B. Execution Evidence & Test Counts
+
+| Test Suite | Exact Command Line | Tests Passed | Failed | Duration | Exit Code | Provenance |
+|---|---|:---:|:---:|:---:|:---:|---|
+| **Host Resolution Unit Tests** | `dotnet test test/Dosi.Tracker.HttpApi.Host.Tests/Dosi.Tracker.HttpApi.Host.Tests.csproj` | 117 | 0 | 0.76s | **0** | **[Worker-Reported]** |
+| **EF Core Cross-Workspace Isolation** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~CrossWorkspaceIsolationTests"` | 10 | 0 | 9.0s | **0** | **[Worker-Reported]** |
+
+---
+
+## 6. Current Status & Next Steps
+
+1. **Privacy Acceptance Pending**:
+   - The privacy source audit (commit `14bbe66`) remains **Pending PM Independent Review**. This status is preserved and not bypassed.
+2. **Overall Product Incomplete**:
+   - While multi-workspace negative tenant isolation and header resolution are now verified with automated regression tests, the overall product remains incomplete across:
+     - Backend metric nullability schema migrations (`Activity.cs` truthful nulls)
+     - Desktop offline ingestion queue hardening & data retention policies
+     - Platform-native interactive client runtimes (macOS Swift, Linux client)
+     - Production packaging, Authenticode/Apple Developer ID code signing, and installer pipelines
+     - Real monitoring, production databases, and hosted operational deployment
+3. **Awaiting PM Guidance**:
+   - Stop and hand off for PM review. PM will inspect this result and designate the next safe, bounded engineering phase.
 
 
 
