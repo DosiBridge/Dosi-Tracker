@@ -7,6 +7,7 @@ using Shouldly;
 using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Identity;
 using Volo.Abp.Modularity;
+using Dosi.Tracker.Workspaces;
 using Xunit;
 
 namespace Dosi.Tracker.Presence;
@@ -32,6 +33,11 @@ public abstract class PresenceMemberTests<TStartupModule> : TrackerApplicationTe
         {
             var user = new IdentityUser(id, userName, $"{userName}@acme.test");
             (await GetRequiredService<IdentityUserManager>().CreateAsync(user)).Succeeded.ShouldBeTrue();
+            var members = GetRequiredService<IRepository<WorkspaceMember, Guid>>();
+            if (await members.FirstOrDefaultAsync(m => m.WorkspaceId == TrackerTestConsts.WorkspaceId && m.UserId == id) == null)
+            {
+                await members.InsertAsync(new WorkspaceMember(Guid.NewGuid(), TrackerTestConsts.WorkspaceId, id, WorkspaceRoles.Member, DateTime.UtcNow));
+            }
         });
     }
 

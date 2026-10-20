@@ -760,23 +760,76 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
 
 ---
 
-## 11. Current Status & Next Steps
+## 11. Bounded Phase: Live Team Presence Active Workspace Member Lifecycle Enforcement (REQ-TRK-04 / REQ-ISO)
+
+### A. Defect Trace & Boundary Analysis
+1. **Source Evidence & Lifecycle Gap**:
+   - `PresenceAppService.GetTeamAsync` retrieved all scoped `AgentPresence` rows for the current workspace and filtered them strictly against `IdentityUser.IsActive` (global account activity), despite the code comment stating `"Only devices of current members: a deleted or deactivated account is no longer part of the team"`.
+   - `WorkspaceMembershipManager.RemoveAsync` sets `member.Status = WorkspaceMemberStatus.Removed` (`IsActive = false`) and persists the inactive membership without deleting presence records.
+   - Self-service member exit (`WorkspaceAppService.LeaveAsync`) delegates to `_memberships.RemoveAsync` and similarly persists `WorkspaceMemberStatus.Removed`.
+   - When a user was removed from or left Workspace A while remaining active globally (e.g. holding active membership in Workspace B), their recent `AgentPresence` in Workspace A continued to be returned in Workspace A's live team presence view.
+   - Presence freshness (`AgentPresence.LastSeenAt`), global account status (`IdentityUser.IsActive`), and workspace membership status (`WorkspaceMember.Status == WorkspaceMemberStatus.Active`) are distinct predicates that were conflated.
+
+2. **Reproduction in Isolated Hosted TestServer Regression**:
+   - Prior to fix, regression test `Departed_Member_Removed_From_Workspace_A_Is_Excluded_From_A_Team_Presence_While_Retaining_B_Presence` was executed against the uncorrected production code.
+   - Test demonstrated the actual failure:
+     ```
+     Shouldly.ShouldAssertException : userIdsInA should not contain 5a701e62-0953-4dd3-910b-dc6cc93ccb03
+     but was actually [5a701e62-0953-4dd3-910b-dc6cc93ccb02, 5a701e62-0953-4dd3-910b-dc6cc93ccb03]
+     ```
+   - Proved departed user presence remained visible to Workspace A callers after removal via the production domain path.
+
+3. **Minimal Server-Side Query Boundary Correction**:
+   - File: `backend/src/Dosi.Tracker.Application/Presence/PresenceAppService.cs`.
+   - Injected `IRepository<WorkspaceMember, Guid> _memberRepository`.
+   - Enforced active workspace membership at the database query boundary in `GetTeamAsync`:
+     ```csharp
+     var currentWorkspaceId = CurrentWorkspace.GetId();
+     var memberQuery = await _memberRepository.GetQueryableAsync();
+     var activeMemberUserIds = memberQuery
+         .Where(m => m.WorkspaceId == currentWorkspaceId && m.Status == WorkspaceMemberStatus.Active)
+         .Select(m => m.UserId);
+
+     var query = (await _presenceRepository.GetQueryableAsync())
+         .Where(p => activeMemberUserIds.Contains(p.UserId));
+     ```
+   - Preserves historical activities, captures, and `AgentPresence` records (non-destructive query-level scoping; no destructive history cleanup).
+   - Preserves member-only-own-device visibility (`!Activities.ViewAll`) and manager/owner `ViewAll` permissions.
+   - Preserves legitimate multi-workspace (A+B) roles, switching, and foreign workspace protection.
+
+4. **Concrete Regression Suite**:
+   - File: `backend/test/Dosi.Tracker.EntityFrameworkCore.Tests/EntityFrameworkCore/Applications/Presence/WorkspaceTeamPresenceHttpTests.cs`.
+   - 6 concrete test scenarios (6 passed, exit 0):
+     1. `Departed_Member_Removed_From_Workspace_A_Is_Excluded_From_A_Team_Presence_While_Retaining_B_Presence`: Seeds active global user in A and B; removes from A via `_membershipManager.RemoveAsync`; verifies user excluded from A team presence, retained in B, and historical presence in A preserved.
+     2. `Departed_Member_Via_Self_Service_Leave_Is_Excluded_From_Team_Presence`: User leaves A via `_workspaceAppService.LeaveAsync`; verifies user excluded from A team presence, retained in B, and presence record in A preserved.
+     3. `Inactive_Membership_And_Non_Members_Are_Excluded_While_Current_Active_Members_Are_Retained`: Seeds inactive member (`Status = Removed`) and non-member (no record in A); verifies only current active member is retained; historical presence preserved.
+     4. `Regular_Member_Without_ViewAll_Only_Sees_Own_Device_In_Live_Presence`: Regular member sees only own device; owner sees all active member devices.
+     5. `Foreign_Workspace_Caller_Attempting_Presence_Access_Is_Denied_With_403_NotWorkspaceMember`: Caller belonging to A only attempts to query B presence; rejected with HTTP 403 `NotWorkspaceMember`; B presence untouched.
+     6. `Same_User_With_Different_Roles_In_Workspaces_A_And_B_Switches_Legitimately`: DualUser is Owner in A and Member in B; verifies switching context in same hosted client correctly displays all devices in A and only own device in B.
+
+5. **Regression Suites Verification**:
+   - `WorkspaceTeamPresenceHttpTests`: 6 passed, exit 0
+   - `EfCorePresenceAppServiceTests` & `EfCorePresenceMemberTests`: 24 passed, exit 0
+   - `WorkspaceActivityExportHttpTests`: 10 passed, exit 0
+   - `WorkspaceCaptureRetentionTests`: 20 passed, exit 0
+   - `Dosi.Tracker.Application.Tests`: 166 passed, exit 0
+   - `Dosi.Tracker.Domain.Tests`: 60 passed, exit 0
+
+---
+
+## 12. Current Status & Next Steps
 
 1. **Privacy Acceptance Pending**:
    - The privacy source audit (commit `14bbe66`) remains **Pending PM Independent Review**. This status is preserved and not bypassed.
-2. **Workspace Lifecycle, Authorization, Retention & Export Status**:
-   - Reversible owner-controlled workspace archival (`REQ-WS-08`), concurrent last-owner protection (`REQ-WS-06`), recipient decline lifecycle (`REQ-WS-07`), hosted ASP.NET Core `TestServer` MVC aggregate authorization harness (`REQ-ISO-05`), workspace-isolated capture retention lifecycle safe first slice (`REQ-DAT-01`), and authenticated workspace-scoped activity CSV export (`REQ-DAT-02`) with materialization cardinality hardening are implemented and verified via isolated regressions (77 SQLite tests total: 10 activity export + 20 capture retention + 9 archival lifecycle + 10 archival migration/upgrade + 9 concurrent owner protection + 9 hosted MVC auth + 10 decline).
+2. **Workspace Lifecycle, Authorization, Retention, Export & Presence Status**:
+   - Reversible owner-controlled workspace archival (`REQ-WS-08`), concurrent last-owner protection (`REQ-WS-06`), recipient decline lifecycle (`REQ-WS-07`), hosted ASP.NET Core `TestServer` MVC aggregate authorization harness (`REQ-ISO-05`), workspace-isolated capture retention lifecycle safe first slice (`REQ-DAT-01`), authenticated workspace-scoped activity CSV export (`REQ-DAT-02`) with materialization cardinality hardening, and live team presence active membership scoping (`REQ-TRK-04`) are implemented and verified via isolated regressions (83 SQLite integration tests total: 6 team presence + 10 activity export + 20 capture retention + 9 archival lifecycle + 10 archival migration/upgrade + 9 concurrent owner protection + 9 hosted MVC auth + 10 decline).
    - Real browser cookie/session testing (`__Host-Dosi-Workspace`), Next.js server actions, OpenIddict token issuer, provider-backed multi-connection transactional commit proof (PostgreSQL/SQL Server), multi-node distributed lock infrastructure (Redis), and PM independent execution remain pending. All reported outcomes are worker-executed, not independent PM QA.
 3. **Execution Limits & Evidence Boundaries**:
-   - TestServer regressions prove conventional MVC routing, aggregate permission checks, fail-closed workspace scoping, CSV formula neutralization, Take(limit + 1) hard bounded fetch, post-materialization cardinality rejection, and server limits on in-memory SQLite, but do NOT replace execution on a real PostgreSQL cluster; no live user/production database was modified.
+   - TestServer regressions prove conventional MVC routing, aggregate permission checks, fail-closed workspace scoping, CSV formula neutralization, Take(limit + 1) hard bounded fetch, post-materialization cardinality rejection, active member presence query scoping, and server limits on in-memory SQLite, but do NOT replace execution on a real PostgreSQL cluster; no live user/production database was modified.
    - Retention defaults remain disabled (`IsEnabled = false`); no cleanup was executed against user DB or real object storage.
 4. **Remaining Backlog Gaps**:
-   - Asynchronous export background worker, screenshot zip archive, signed download URLs, disaster recovery / automated backup procedures, frontend UI export actions, 1-year activity summary pruning, and permanent deletion remain deferred acceptance gaps.
+   - WebSocket / SignalR push live presence notification, asynchronous export background worker, screenshot zip archive, signed download URLs, disaster recovery / automated backup procedures, frontend UI export actions, 1-year activity summary pruning, and permanent deletion remain deferred acceptance gaps.
 5. **Overall Product Incomplete**:
    - Full product remains incomplete across backend metric nullability schema migrations (`Activity.cs` truthful nulls vs 0), desktop offline ingestion queue hardening, platform-native interactive client runtimes, code signing, and hosted operational deployment.
 6. **Awaiting PM Guidance**:
-   - Bounded REQ-DAT-02 materialization cardinality correction complete. Stop and hand off for PM review with exact diff and test evidence.
-
-
-
-
+   - Bounded live team presence active workspace membership enforcement slice complete. Stop and hand off for PM review with exact diff and test evidence.

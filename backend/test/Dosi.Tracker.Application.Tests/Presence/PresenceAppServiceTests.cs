@@ -47,6 +47,17 @@ public abstract class PresenceAppServiceTests<TStartupModule> : TrackerApplicati
         {
             var user = new IdentityUser(id, userName, $"{userName}@acme.test") { Name = name, Surname = surname };
             (await GetRequiredService<IdentityUserManager>().CreateAsync(user)).Succeeded.ShouldBeTrue();
+            var wsId = tenantId ?? TrackerTestConsts.WorkspaceId;
+            var workspaces = GetRequiredService<IRepository<Workspace, Guid>>();
+            if (await workspaces.FirstOrDefaultAsync(w => w.Id == wsId) == null)
+            {
+                await workspaces.InsertAsync(new Workspace(wsId, "Workspace " + wsId), autoSave: true);
+            }
+            var members = GetRequiredService<IRepository<WorkspaceMember, Guid>>();
+            if (await members.FirstOrDefaultAsync(m => m.WorkspaceId == wsId && m.UserId == id) == null)
+            {
+                await members.InsertAsync(new WorkspaceMember(_guidGenerator.Create(), wsId, id, WorkspaceRoles.Member, DateTime.UtcNow));
+            }
             return user;
         });
     }

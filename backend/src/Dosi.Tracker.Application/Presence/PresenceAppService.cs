@@ -31,15 +31,18 @@ public class PresenceAppService : TrackerAppService, IPresenceAppService
     private readonly IRepository<AgentPresence, Guid> _presenceRepository;
     private readonly IRepository<Project, Guid> _projectRepository;
     private readonly IIdentityUserRepository _userRepository;
+    private readonly IRepository<WorkspaceMember, Guid> _memberRepository;
 
     public PresenceAppService(
         IRepository<AgentPresence, Guid> presenceRepository,
         IRepository<Project, Guid> projectRepository,
-        IIdentityUserRepository userRepository)
+        IIdentityUserRepository userRepository,
+        IRepository<WorkspaceMember, Guid> memberRepository)
     {
         _presenceRepository = presenceRepository;
         _projectRepository = projectRepository;
         _userRepository = userRepository;
+        _memberRepository = memberRepository;
     }
 
     /// <summary>Records the caller's agent state on one device. Not written to the audit log: every running agent
@@ -80,7 +83,15 @@ public class PresenceAppService : TrackerAppService, IPresenceAppService
 
     public async Task<ListResultDto<PresenceDto>> GetTeamAsync()
     {
-        var query = await _presenceRepository.GetQueryableAsync();
+        var currentWorkspaceId = CurrentWorkspace.GetId();
+        var memberQuery = await _memberRepository.GetQueryableAsync();
+        var activeMemberUserIds = memberQuery
+            .Where(m => m.WorkspaceId == currentWorkspaceId && m.Status == WorkspaceMemberStatus.Active)
+            .Select(m => m.UserId);
+
+        var query = (await _presenceRepository.GetQueryableAsync())
+            .Where(p => activeMemberUserIds.Contains(p.UserId));
+
         if (!await AuthorizationService.IsGrantedAsync(TrackerPermissions.Activities.ViewAll))
         {
             // Members only ever see their own devices.
