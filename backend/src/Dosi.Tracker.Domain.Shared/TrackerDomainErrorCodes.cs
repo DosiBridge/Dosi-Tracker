@@ -10,6 +10,7 @@ public static class TrackerDomainErrorCodes
     public const string ActivityTooOld = "Tracker:ActivityTooOld";
     public const string ActivityOverlaps = "Tracker:ActivityOverlaps";
     public const string ProjectArchived = "Tracker:ProjectArchived";
+    public const string WorkspaceArchived = "Tracker:WorkspaceArchived";
     public const string NotProjectMember = "Tracker:NotProjectMember";
     public const string DuplicateProjectMember = "Tracker:DuplicateProjectMember";
     public const string InvalidCaptureData = "Tracker:InvalidCaptureData";

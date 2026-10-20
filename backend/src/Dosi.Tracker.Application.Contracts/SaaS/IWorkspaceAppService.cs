@@ -38,6 +38,12 @@ public interface IWorkspaceAppService : IApplicationService
     /// <summary><c>POST /api/app/workspaces/{id}/leave</c>. The last owner cannot leave.</summary>
     Task LeaveAsync(Guid id);
 
+    /// <summary><c>POST /api/app/workspaces/{id}/archive</c>: Active owner of target workspace only. Idempotent.</summary>
+    Task<WorkspaceDto> ArchiveAsync(Guid id);
+
+    /// <summary><c>POST /api/app/workspaces/{id}/restore</c>: Active owner of target workspace only. Idempotent.</summary>
+    Task<WorkspaceDto> RestoreAsync(Guid id);
+
     /// <summary><c>GET /api/app/invitations/{token}</c> (anonymous).</summary>
     Task<InvitationInfoDto> GetInvitationAsync(string token);
 

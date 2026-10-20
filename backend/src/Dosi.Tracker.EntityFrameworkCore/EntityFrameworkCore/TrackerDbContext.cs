@@ -100,8 +100,10 @@ public class TrackerDbContext :
             b.ConfigureByConvention();
             b.Property(x => x.Name).IsRequired().HasMaxLength(WorkspaceConsts.MaxNameLength);
             b.Property(x => x.NormalizedName).IsRequired().HasMaxLength(WorkspaceConsts.MaxNameLength);
+            b.Property(x => x.IsArchived).HasDefaultValue(false);
             // The backstop for concurrent creations of the same name (Tracker:DuplicateWorkspaceName).
             b.HasIndex(x => x.NormalizedName).IsUnique();
+            b.HasIndex(x => x.IsArchived);
         });
 
         builder.Entity<WorkspaceMember>(b =>

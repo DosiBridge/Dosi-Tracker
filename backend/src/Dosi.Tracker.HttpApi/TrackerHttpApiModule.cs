@@ -1,4 +1,4 @@
-﻿using System.Net;
+using System.Net;
 using Localization.Resources.AbpUi;
 using Dosi.Tracker.Localization;
 using Volo.Abp.Account;
@@ -73,6 +73,7 @@ public class TrackerHttpApiModule : AbpModule
             options.Map(TrackerDomainErrorCodes.CannotModifySelf, HttpStatusCode.Forbidden);
             options.Map(TrackerDomainErrorCodes.RoleNotAllowed, HttpStatusCode.Forbidden);
             options.Map(TrackerDomainErrorCodes.WorkspaceRequired, HttpStatusCode.BadRequest);
+            options.Map(TrackerDomainErrorCodes.WorkspaceArchived, HttpStatusCode.Forbidden);
             options.Map(TrackerDomainErrorCodes.NotWorkspaceMember, HttpStatusCode.Forbidden);
             options.Map(TrackerDomainErrorCodes.EmailAlreadyRegistered, HttpStatusCode.Conflict);
             options.Map(TrackerDomainErrorCodes.DuplicateWorkspaceName, HttpStatusCode.Conflict);

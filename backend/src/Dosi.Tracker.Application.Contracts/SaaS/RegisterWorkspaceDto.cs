@@ -73,6 +73,17 @@ public class MyWorkspaceDto
 
     public string? PlanName { get; set; }
     public bool IsOwner { get; set; }
+    public bool IsArchived { get; set; }
+    public DateTime? ArchivedTime { get; set; }
+}
+
+public class WorkspaceDto
+{
+    public Guid Id { get; set; }
+    public string Name { get; set; } = string.Empty;
+    public bool IsArchived { get; set; }
+    public DateTime? ArchivedTime { get; set; }
+    public Guid? ArchivedBy { get; set; }
 }
 
 public class CreateWorkspaceDto

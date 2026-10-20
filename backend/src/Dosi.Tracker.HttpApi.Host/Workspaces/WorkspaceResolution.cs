@@ -60,6 +60,23 @@ public class WorkspaceResolutionMiddleware
             return;
         }
 
+        var isArchived = await lookup.IsArchivedAsync(workspaceId);
+        if (isArchived)
+        {
+            var endpoint = context.GetEndpoint();
+            var action = endpoint?.Metadata.GetMetadata<ControllerActionDescriptor>();
+            var isNotRequired = action != null &&
+                (action.ControllerTypeInfo.IsDefined(typeof(WorkspaceNotRequiredAttribute), inherit: true) ||
+                 action.MethodInfo.IsDefined(typeof(WorkspaceNotRequiredAttribute), inherit: true));
+
+            if (!isNotRequired)
+            {
+                await WriteErrorAsync(context, StatusCodes.Status403Forbidden, TrackerDomainErrorCodes.WorkspaceArchived,
+                    "This workspace is archived.");
+                return;
+            }
+        }
+
         using (context.RequestServices.GetRequiredService<ICurrentWorkspace>().Change(workspaceId, role))
         {
             await _next(context);
@@ -77,7 +94,8 @@ public class WorkspaceResolutionMiddleware
 }
 
 /// <summary>Answers 400 <c>Tracker:WorkspaceRequired</c> when a tracker endpoint that works inside a workspace is
-/// called without one. Endpoints (or their classes) marked <see cref="WorkspaceNotRequiredAttribute"/> are exempt, and
+/// called without one, or 403 <c>Tracker:WorkspaceArchived</c> when the target workspace is archived.
+/// Endpoints (or their classes) marked <see cref="WorkspaceNotRequiredAttribute"/> are exempt, and
 /// so is everything outside the tracker's own assemblies (ABP's account, identity and configuration endpoints).</summary>
 public class WorkspaceRequiredFilter : IAsyncActionFilter
 {
@@ -90,10 +108,19 @@ public class WorkspaceRequiredFilter : IAsyncActionFilter
 
     public async Task OnActionExecutionAsync(ActionExecutingContext context, ActionExecutionDelegate next)
     {
-        if (RequiresWorkspace(context.ActionDescriptor as ControllerActionDescriptor) &&
-            context.HttpContext.RequestServices.GetRequiredService<ICurrentWorkspace>().Id == null)
+        if (RequiresWorkspace(context.ActionDescriptor as ControllerActionDescriptor))
         {
-            throw new BusinessException(TrackerDomainErrorCodes.WorkspaceRequired);
+            var currentWorkspace = context.HttpContext.RequestServices.GetRequiredService<ICurrentWorkspace>();
+            if (currentWorkspace.Id == null)
+            {
+                throw new BusinessException(TrackerDomainErrorCodes.WorkspaceRequired);
+            }
+
+            var lookup = context.HttpContext.RequestServices.GetRequiredService<WorkspaceRoleLookup>();
+            if (await lookup.IsArchivedAsync(currentWorkspace.Id.Value))
+            {
+                throw new BusinessException(TrackerDomainErrorCodes.WorkspaceArchived);
+            }
         }
 
         await next();

@@ -530,22 +530,81 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
 
 ---
 
-## 9. Current Status & Next Steps
+## 9. Bounded Engineering Phase: Reversible Owner-Controlled Workspace Archival & Restoration (`REQ-WS-08`)
+
+### A. Context, Architecture & Invariant Enforcement
+1. **Source Evidence & Lifecycle Gap**:
+   - Source inspection of `Workspace.cs` confirmed it was an `AuditedAggregateRoot<Guid>` with only `Name` and `NormalizedName`. No archive state, timestamps, or archival operators existed.
+   - `IWorkspaceAppService` and `WorkspacesController` exposed `CreateAsync`, `GetMineAsync`, and `LeaveAsync`, but no `ArchiveAsync` or `RestoreAsync` routes existed.
+   - In accordance with `REQ-WS-08`, reversible archival and restoration are implemented now, while destructive permanent deletion, retention grace-period policies, and subscription billing cancellations are explicitly deferred.
+
+2. **Domain Model & State Preservation**:
+   - **`Workspace.cs`**:
+     * Added properties `public bool IsArchived { get; private set; }`, `public DateTime? ArchivedTime { get; private set; }`, and `public Guid? ArchivedBy { get; private set; }`.
+     * Added idempotent domain methods `Archive(Guid operatorUserId, DateTime archivedTime)` and `Restore()`.
+     * Invariant: Archival does NOT delete or alter child entities, memberships, projects, invitations, or subscriptions. All data remains completely intact.
+   - **`WorkspaceManager.cs`**:
+     * Added `ArchiveAsync(Guid workspaceId, Guid operatorUserId)` and `RestoreAsync(Guid workspaceId, Guid operatorUserId)`.
+     * Strictly verifies that the operator is an active `Owner` in the target workspace via `_memberships.FindActiveAsync(workspaceId, operatorUserId)`. Outsiders, Managers, Members, and inactive/removed former owners are denied with `AbpAuthorizationException` (403 Forbidden).
+     * Added `IsArchivedAsync(Guid workspaceId)` domain query.
+
+3. **Gating Active Workspace Resolution & Ingestion**:
+   - **`WorkspaceResolutionMiddleware` (`backend/src/Dosi.Tracker.HttpApi.Host/Workspaces/WorkspaceResolution.cs`)**:
+     * If an incoming request targets an archived workspace (`await workspaceRoleLookup.IsArchivedAsync(workspaceId.Value)`), the middleware inspects the endpoint metadata. If the endpoint is not decorated with `[WorkspaceNotRequired]`, it immediately writes a `403 Forbidden` response with `{ "error": { "code": "Tracker:WorkspaceArchived", "message": "This workspace is archived. Contact a workspace owner to restore it." } }` and short-circuits the pipeline before downstream controllers or actions execute.
+   - **`WorkspaceRequiredFilter`**:
+     * Gated so that any endpoint requiring an active workspace throws `BusinessException(TrackerDomainErrorCodes.WorkspaceArchived)` if the resolved workspace is archived.
+   - **`WorkspaceRolePermissionValueProvider.cs`**:
+     * `WorkspaceRoleLookup` checks `_workspaceRepository.FindAsync(workspaceId)` to truthfully answer `IsArchivedAsync(workspaceId)`.
+
+4. **Service Contracts & Endpoint Routing**:
+   - **`IWorkspaceAppService.cs` & `WorkspaceAppService.cs`**:
+     * Declared and implemented `ArchiveAsync(Guid id)` and `RestoreAsync(Guid id)`, decorated with `[WorkspaceNotRequired]` and `[RemoteService(IsEnabled = false)]`.
+     * `GetMineAsync()` projects `IsArchived` and `ArchivedTime` into `MyWorkspaceDto`.
+     * `AcceptAsync` and `RegisterWithInvitationAsync`: Gated to reject invitation acceptance or new anonymous registration into an archived workspace before any account creation, membership join, or seat count mutation occurs, throwing `BusinessException(TrackerDomainErrorCodes.WorkspaceArchived)`.
+   - **`WorkspacesController.cs`**:
+     * Added protected routes `POST /api/app/workspaces/{id}/archive` and `POST /api/app/workspaces/{id}/restore`, calling `_workspaceAppService.ArchiveAsync(id)` and `RestoreAsync(id)`.
+
+5. **Test Harness & Isolated Regression Suite (`WorkspaceArchivalLifecycleTests.cs`)**:
+   - Extracted `WorkspaceHttpTestBase<TStartupModule>` from `WorkspaceHttpAuthorizationTests` to allow clean reuse of the hosted ASP.NET Core `TestServer` MVC pipeline without inheriting duplicate `REQ-ISO-05` test cases.
+   - Project-local disposable SQLite fixture with WAL mode, genuine production routing, real `WorkspacesController`, real `WorkspaceManager`, real `WorkspaceResolutionMiddleware`, and production `WorkspaceAppService`.
+   - Seeded two separate workspaces (`ARCHIVE-WS-A`, `ARCHIVE-WS-B`) with distinct user roles (`OwnerA`, `ManagerA`, `MemberA`, `InactiveOwnerA`, `UserB`, `DualUser`, `InviteeUser`).
+
+### B. Execution Evidence & Provenance Boundaries
+
+| Dimension | Exact Target / Command | Tests Passed | Failed | Duration | Exit Code | Provenance |
+|---|---|:---:|:---:|:---:|:---:|---|
+| **Workspace Archival Lifecycle Regressions** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~WorkspaceArchivalLifecycleTests"` | 9 | 0 | 17.5s | **0** | **[Worker-Reported (Hosted MVC TestServer & SQLite WAL)]** |
+| **Concurrent Last-Owner Regressions** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~ConcurrentOwnerProtectionTests"` | 9 | 0 | 9.23s | **0** | **[Worker-Reported (Concurrent SQLite WAL)]** |
+| **Hosted ASP.NET Core MVC TestServer** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~EfCoreWorkspaceHttpAuthorizationTests"` | 9 | 0 | 15.6s | **0** | **[Worker-Reported (Hosted MVC TestServer & Shared SQLite)]** |
+| **Host Route & Resolution Regressions** | `dotnet test test/Dosi.Tracker.HttpApi.Host.Tests/Dosi.Tracker.HttpApi.Host.Tests.csproj` | 125 | 0 | 1.15s | **0** | **[Worker-Reported (Host Test Suite)]** |
+| **Historical PM Blocked Scripts** | `qa_workspace_phase.ps1` | null | null | null | null | **[Explicitly Not Run / No Repackaging]** |
+
+#### Test Cases Covered in `WorkspaceArchivalLifecycleTests` (9 total):
+1. `Owner_Can_Archive_Workspace_Successfully_And_Listing_Visibly_Reflects_Archived_State`: Proves an active Owner can archive target workspace via `POST /api/app/workspaces/{id}/archive`, DB persists `IsArchived = true`, `ArchivedBy = OwnerA`, and `ArchivedTime`, and listing via `GET /api/app/workspaces/mine` visibly reports `isArchived: true`.
+2. `Outsider_Manager_Member_And_Inactive_Former_Owner_Are_Denied_Archive_With_Unchanged_State`: Proves Outsider (UserB), Manager (ManagerA), Member (MemberA), and Inactive former owner (InactiveOwnerA) are all denied with 403 Forbidden; DB state remains `IsArchived = false`.
+3. `Archived_Workspace_Normal_Requests_Are_Denied_With_403_WorkspaceArchived`: Proves both Owner and Manager sending normal requests (GET / POST to `/api/app/project` with `X-Workspace-Id: wsA`) are intercepted by `WorkspaceResolutionMiddleware` and denied with 403 Forbidden (`Tracker:WorkspaceArchived`); DB writes rejected (0 projects inserted).
+4. `Archiving_Workspace_A_Preserves_Legitimate_Access_To_Unrelated_Workspace_B`: Proves that archiving Workspace A leaves unrelated Workspace B completely unaffected; dual-member can read and create projects in Workspace B with 200 OK.
+5. `Owner_Can_Restore_Archived_Workspace_Reenabling_Normal_Access`: Proves an active Owner can restore an archived workspace via `POST /api/app/workspaces/{id}/restore`, restoring `IsArchived = false`, and normal active workspace requests immediately succeed again (200 OK).
+6. `Outsider_Manager_Member_And_Inactive_Former_Owner_Are_Denied_Restore`: Proves Outsider, Manager, Member, and Inactive former owner are denied restore with 403 Forbidden; workspace remains archived in DB.
+7. `Archive_And_Restore_Are_Idempotent_Preserving_Audit_State`: Proves repeat archive calls return 200 OK without mutating original `ArchivedTime` or `ArchivedBy`, and repeat restore calls return 200 OK idempotently.
+8. `Archival_Preserves_All_Data_Memberships_Subscriptions_And_Sentinels_Without_Deletion_Or_Cancellation`: Directly verifies that members, projects, and active billing subscriptions are NOT deleted, modified, or cancelled during archival; upon restore, all sentinel data is accessible via HTTP.
+9. `Invitation_Acceptance_And_Registration_Into_Archived_Workspace_Are_Rejected_Before_Mutation`: Proves both existing user invitation acceptance (`POST /api/app/invitations/{token}/accept`) and new anonymous user registration (`_workspaceAppService.RegisterAsync`) are rejected with `Tracker:WorkspaceArchived` before any user account, membership, or database mutation occurs.
+
+---
+
+## 10. Current Status & Next Steps
 
 1. **Privacy Acceptance Pending**:
    - The privacy source audit (commit `14bbe66`) remains **Pending PM Independent Review**. This status is preserved and not bypassed.
-2. **Workspace Authorization, Isolation & Concurrency Phase Status**:
-   - Recipient decline lifecycle (`REQ-WS-07`, commit `27f7aa1`), genuine hosted ASP.NET Core `TestServer` MVC aggregate authorization harness (`REQ-ISO-05`, commit `96e3246`), and concurrent last-owner protection (`REQ-WS-06`) are implemented with isolated test coverage (28 SQLite tests total: 10 decline + 9 TestServer MVC auth + 9 concurrent owner protection).
+2. **Workspace Lifecycle, Authorization & Concurrency Status**:
+   - Reversible owner-controlled workspace archival (`REQ-WS-08`), concurrent last-owner protection (`REQ-WS-06`), recipient decline lifecycle (`REQ-WS-07`), and hosted ASP.NET Core `TestServer` MVC aggregate authorization harness (`REQ-ISO-05`) are fully implemented and verified via isolated regressions (37 SQLite tests total: 9 archival lifecycle + 9 concurrent owner protection + 9 hosted MVC auth + 10 decline).
    - Real browser cookie/session testing (`__Host-Dosi-Workspace`), Next.js server actions, OpenIddict token issuer, provider-backed multi-connection transactional commit proof (PostgreSQL/SQL Server), multi-node distributed lock infrastructure (Redis), and PM independent execution of `qa_workspace_phase.ps1` remain pending. All reported outcomes are worker-executed, not independent PM QA.
-3. **Overall Product Incomplete**:
-   - Overall product remains incomplete across:
-     - Backend metric nullability schema migrations (`Activity.cs` truthful nulls vs 0)
-     - Desktop offline ingestion queue hardening & data retention policies
-     - Platform-native interactive client runtimes (macOS Swift, Linux client)
-     - Production packaging, Authenticode/Apple Developer ID code signing, and installer pipelines
-     - Real monitoring, production databases, and hosted operational deployment
-4. **Awaiting PM Guidance**:
-   - Bounded correction complete. Stop and hand off for PM review with exact diff and test evidence. PM will inspect this result and designate the next safe, bounded engineering phase.
+3. **Remaining Lifecycle Gaps**:
+   - Destructive permanent deletion, retention grace-period enforcement, automated billing subscription cancellation/downgrades, and frontend UI workspace archive/restore management actions remain deferred acceptance gaps.
+4. **Overall Product Incomplete**:
+   - Full product remains incomplete across backend metric nullability schema migrations (`Activity.cs` truthful nulls vs 0), desktop offline ingestion queue hardening, platform-native interactive client runtimes, code signing, and hosted operational deployment.
+5. **Awaiting PM Guidance**:
+   - Bounded task complete. Stop and hand off for PM review with exact diff and test evidence.
 
 
 

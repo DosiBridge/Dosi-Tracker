@@ -11,14 +11,18 @@ using Volo.Abp.Users;
 
 namespace Dosi.Tracker.Workspaces;
 
-/// <summary>Finds a user's active role in a workspace.</summary>
+/// <summary>Finds a user's active role in a workspace, and checks whether the workspace is archived.</summary>
 public class WorkspaceRoleLookup : ITransientDependency
 {
     private readonly IRepository<WorkspaceMember, Guid> _memberRepository;
+    private readonly IRepository<Workspace, Guid>? _workspaceRepository;
 
-    public WorkspaceRoleLookup(IRepository<WorkspaceMember, Guid> memberRepository)
+    public WorkspaceRoleLookup(
+        IRepository<WorkspaceMember, Guid> memberRepository,
+        IRepository<Workspace, Guid>? workspaceRepository = null)
     {
         _memberRepository = memberRepository;
+        _workspaceRepository = workspaceRepository;
     }
 
     [UnitOfWork]
@@ -27,6 +31,18 @@ public class WorkspaceRoleLookup : ITransientDependency
         var member = await _memberRepository.FirstOrDefaultAsync(m =>
             m.WorkspaceId == workspaceId && m.UserId == userId && m.Status == WorkspaceMemberStatus.Active);
         return member?.Role;
+    }
+
+    [UnitOfWork]
+    public virtual async Task<bool> IsArchivedAsync(Guid workspaceId)
+    {
+        if (_workspaceRepository == null)
+        {
+            return false;
+        }
+
+        var workspace = await _workspaceRepository.FindAsync(workspaceId);
+        return workspace?.IsArchived == true;
     }
 }
 

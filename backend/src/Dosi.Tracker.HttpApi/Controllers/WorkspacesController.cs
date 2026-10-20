@@ -38,6 +38,18 @@ public class WorkspacesController : TrackerController
     {
         return _workspaceAppService.LeaveAsync(id);
     }
+
+    [HttpPost("{id}/archive")]
+    public Task<WorkspaceDto> ArchiveAsync(Guid id)
+    {
+        return _workspaceAppService.ArchiveAsync(id);
+    }
+
+    [HttpPost("{id}/restore")]
+    public Task<WorkspaceDto> RestoreAsync(Guid id)
+    {
+        return _workspaceAppService.RestoreAsync(id);
+    }
 }
 
 /// <summary>Workspace invitations, addressed by their token.</summary>

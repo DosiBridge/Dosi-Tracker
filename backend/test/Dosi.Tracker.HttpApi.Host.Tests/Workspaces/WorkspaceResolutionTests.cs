@@ -169,6 +169,8 @@ public class WorkspaceResolutionTests
     [InlineData(typeof(WorkspaceAppService), nameof(WorkspaceAppService.GetAvailablePlansAsync), false)]
     [InlineData(typeof(WorkspaceAppService), nameof(WorkspaceAppService.GetMyPreferencesAsync), false)]
     [InlineData(typeof(WorkspacesController), nameof(WorkspacesController.GetMineAsync), false)]
+    [InlineData(typeof(WorkspacesController), nameof(WorkspacesController.ArchiveAsync), false)]
+    [InlineData(typeof(WorkspacesController), nameof(WorkspacesController.RestoreAsync), false)]
     [InlineData(typeof(InvitationsController), nameof(InvitationsController.AcceptAsync), false)]
     [InlineData(typeof(Dosi.Tracker.Platform.PlatformAppService), nameof(Dosi.Tracker.Platform.PlatformAppService.GetOverviewAsync), false)]
     [InlineData(typeof(Volo.Abp.Account.ProfileController), nameof(Volo.Abp.Account.ProfileController.GetAsync), false)]

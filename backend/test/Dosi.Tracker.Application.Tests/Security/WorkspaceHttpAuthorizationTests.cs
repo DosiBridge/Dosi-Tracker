@@ -49,20 +49,18 @@ namespace Dosi.Tracker.Security;
 /// and real production ProjectAppService / EF Core query filter paths.
 /// Uses a test-only authentication handler for synthetic identities without copied policies or fake endpoints.
 /// </summary>
-public abstract class WorkspaceHttpAuthorizationTests<TStartupModule> : TrackerApplicationTestBase<TStartupModule>
+/// <summary>
+/// Base harness for hosted HTTP aggregate integration tests using TestServer and TestAuthHandler.
+/// </summary>
+public abstract class WorkspaceHttpTestBase<TStartupModule> : TrackerApplicationTestBase<TStartupModule>
     where TStartupModule : IAbpModule
 {
-    private static readonly Guid UserA = Guid.Parse("3f701e62-0953-4dd3-910b-dc6cc93ccb01");
-    private static readonly Guid UserB = Guid.Parse("3f701e62-0953-4dd3-910b-dc6cc93ccb02");
-    private static readonly Guid DualUser = Guid.Parse("3f701e62-0953-4dd3-910b-dc6cc93ccb03");
-    private static readonly Guid InactiveUser = Guid.Parse("3f701e62-0953-4dd3-910b-dc6cc93ccb04");
-
-    private static readonly JsonSerializerOptions CamelCaseJsonOptions = new()
+    protected static readonly JsonSerializerOptions CamelCaseJsonOptions = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase
     };
 
-    private static Guid ReadGuidProperty(JsonElement element, string propName)
+    protected static Guid ReadGuidProperty(JsonElement element, string propName)
     {
         if (element.TryGetProperty(propName.ToLowerInvariant(), out var p) ||
             element.TryGetProperty(char.ToUpperInvariant(propName[0]) + propName[1..], out p))
@@ -72,7 +70,7 @@ public abstract class WorkspaceHttpAuthorizationTests<TStartupModule> : TrackerA
         throw new KeyNotFoundException($"Property '{propName}' not found in JSON payload");
     }
 
-    private static string ReadStringProperty(JsonElement element, string propName)
+    protected static string ReadStringProperty(JsonElement element, string propName)
     {
         if (element.TryGetProperty(propName.ToLowerInvariant(), out var p) ||
             element.TryGetProperty(char.ToUpperInvariant(propName[0]) + propName[1..], out p))
@@ -80,21 +78,6 @@ public abstract class WorkspaceHttpAuthorizationTests<TStartupModule> : TrackerA
             return p.GetString()!;
         }
         throw new KeyNotFoundException($"Property '{propName}' not found in JSON payload");
-    }
-
-    private readonly IRepository<Project, Guid> _projectRepository;
-    private readonly IRepository<WorkspaceMember, Guid> _memberRepository;
-    private readonly IdentityUserManager _userManager;
-    private readonly IGuidGenerator _guidGenerator;
-    private readonly ICurrentWorkspace _currentWorkspace;
-
-    protected WorkspaceHttpAuthorizationTests()
-    {
-        _projectRepository = GetRequiredService<IRepository<Project, Guid>>();
-        _memberRepository = GetRequiredService<IRepository<WorkspaceMember, Guid>>();
-        _userManager = GetRequiredService<IdentityUserManager>();
-        _guidGenerator = GetRequiredService<IGuidGenerator>();
-        _currentWorkspace = GetRequiredService<ICurrentWorkspace>();
     }
 
     protected override void AfterAddApplication(IServiceCollection services)
@@ -206,7 +189,7 @@ public abstract class WorkspaceHttpAuthorizationTests<TStartupModule> : TrackerA
 
     protected virtual void ConfigureTestServerServices(IServiceCollection services) { }
 
-    private HttpClient CreateHttpClient()
+    protected HttpClient CreateHttpClient()
     {
         var config = ServiceProvider.GetRequiredService<Microsoft.Extensions.Configuration.IConfiguration>();
 
@@ -266,6 +249,66 @@ public abstract class WorkspaceHttpAuthorizationTests<TStartupModule> : TrackerA
         return host.GetTestServer().CreateClient();
     }
 
+    protected static HttpRequestMessage CreateRequest(
+        HttpMethod method,
+        string url,
+        Guid? userId,
+        Guid? workspaceId,
+        object? jsonBody = null)
+    {
+        var request = new HttpRequestMessage(method, url);
+        if (userId.HasValue)
+        {
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", userId.Value.ToString());
+        }
+
+        if (workspaceId.HasValue)
+        {
+            request.Headers.Add(WorkspaceConsts.HeaderName, workspaceId.Value.ToString());
+        }
+
+        if (jsonBody != null)
+        {
+            var json = JsonSerializer.Serialize(jsonBody);
+            request.Content = new StringContent(json, Encoding.UTF8, "application/json");
+        }
+
+        return request;
+    }
+}
+
+/// <summary>
+/// REQ-ISO-05: Authenticated HTTP aggregate authorization and workspace isolation integration harness.
+/// Sends real in-process HTTP requests through production workspace resolution, SQLite membership lookup,
+/// actual ABP aggregate permission checking (WorkspaceRolePermissionValueProvider + IPermissionChecker),
+/// and real production ProjectAppService / EF Core query filter paths.
+/// Uses a test-only authentication handler for synthetic identities without copied policies or fake endpoints.
+/// </summary>
+public abstract class WorkspaceHttpAuthorizationTests<TStartupModule> : WorkspaceHttpTestBase<TStartupModule>
+    where TStartupModule : IAbpModule
+{
+    private static readonly Guid UserA = Guid.Parse("3f701e62-0953-4dd3-910b-dc6cc93ccb01");
+    private static readonly Guid UserB = Guid.Parse("3f701e62-0953-4dd3-910b-dc6cc93ccb02");
+    private static readonly Guid DualUser = Guid.Parse("3f701e62-0953-4dd3-910b-dc6cc93ccb03");
+    private static readonly Guid InactiveUser = Guid.Parse("3f701e62-0953-4dd3-910b-dc6cc93ccb04");
+
+    private readonly IRepository<Project, Guid> _projectRepository;
+    private readonly IRepository<WorkspaceMember, Guid> _memberRepository;
+    private readonly IdentityUserManager _userManager;
+    private readonly IGuidGenerator _guidGenerator;
+    private readonly ICurrentWorkspace _currentWorkspace;
+
+    protected WorkspaceHttpAuthorizationTests()
+    {
+        _projectRepository = GetRequiredService<IRepository<Project, Guid>>();
+        _memberRepository = GetRequiredService<IRepository<WorkspaceMember, Guid>>();
+        _userManager = GetRequiredService<IdentityUserManager>();
+        _guidGenerator = GetRequiredService<IGuidGenerator>();
+        _currentWorkspace = GetRequiredService<ICurrentWorkspace>();
+    }
+
+
+
     private async Task<(Guid WorkspaceA, Guid WorkspaceB)> SeedUsersAndWorkspacesAsync()
     {
         if (await _userManager.FindByIdAsync(UserA.ToString()) == null)
@@ -309,32 +352,7 @@ public abstract class WorkspaceHttpAuthorizationTests<TStartupModule> : TrackerA
         return (wsA, wsB);
     }
 
-    private static HttpRequestMessage CreateRequest(
-        HttpMethod method,
-        string url,
-        Guid? userId,
-        Guid? workspaceId,
-        object? jsonBody = null)
-    {
-        var request = new HttpRequestMessage(method, url);
-        if (userId.HasValue)
-        {
-            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", userId.Value.ToString());
-        }
 
-        if (workspaceId.HasValue)
-        {
-            request.Headers.Add(WorkspaceConsts.HeaderName, workspaceId.Value.ToString());
-        }
-
-        if (jsonBody != null)
-        {
-            var json = JsonSerializer.Serialize(jsonBody);
-            request.Content = new StringContent(json, Encoding.UTF8, "application/json");
-        }
-
-        return request;
-    }
 
     [Fact]
     public async Task Unauthenticated_Request_To_Protected_Project_Endpoint_Is_Rejected_With_401()

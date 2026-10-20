@@ -141,6 +141,11 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
             throw new BusinessException(TrackerDomainErrorCodes.InvitationEmailMismatch);
         }
 
+        if (await _workspaceManager.IsArchivedAsync(invitation.WorkspaceId))
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.WorkspaceArchived);
+        }
+
         using (CurrentWorkspace.Change(invitation.WorkspaceId))
         {
             await using var seatLock = await _seatCounter.LockAsync();
@@ -171,7 +176,7 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
             from m in members
             join w in workspaces on m.WorkspaceId equals w.Id
             where m.UserId == userId && m.Status == WorkspaceMemberStatus.Active
-            select new { w.Id, w.Name, m.Role });
+            select new { w.Id, w.Name, m.Role, w.IsArchived, w.ArchivedTime });
 
         var ids = rows.Select(r => r.Id).ToList();
         Dictionary<Guid, Guid> planIds;
@@ -191,6 +196,8 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
                 Name = r.Name,
                 Role = r.Role,
                 IsOwner = r.Role == WorkspaceRoles.Owner,
+                IsArchived = r.IsArchived,
+                ArchivedTime = r.ArchivedTime,
                 PlanName = planIds.TryGetValue(r.Id, out var planId) ? plans.GetValueOrDefault(planId) : null
             })
             .OrderBy(w => w.Name, StringComparer.OrdinalIgnoreCase)
@@ -231,6 +238,40 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
         }
 
         await uow.CompleteAsync();
+    }
+
+    [WorkspaceNotRequired]
+    [RemoteService(IsEnabled = false)]
+    public async Task<WorkspaceDto> ArchiveAsync(Guid id)
+    {
+        var userId = CurrentUser.GetId();
+        var workspace = await _workspaceManager.ArchiveAsync(id, userId);
+
+        return new WorkspaceDto
+        {
+            Id = workspace.Id,
+            Name = workspace.Name,
+            IsArchived = workspace.IsArchived,
+            ArchivedTime = workspace.ArchivedTime,
+            ArchivedBy = workspace.ArchivedBy
+        };
+    }
+
+    [WorkspaceNotRequired]
+    [RemoteService(IsEnabled = false)]
+    public async Task<WorkspaceDto> RestoreAsync(Guid id)
+    {
+        var userId = CurrentUser.GetId();
+        var workspace = await _workspaceManager.RestoreAsync(id, userId);
+
+        return new WorkspaceDto
+        {
+            Id = workspace.Id,
+            Name = workspace.Name,
+            IsArchived = workspace.IsArchived,
+            ArchivedTime = workspace.ArchivedTime,
+            ArchivedBy = workspace.ArchivedBy
+        };
     }
 
     [AllowAnonymous]
@@ -293,6 +334,11 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
     private async Task<Workspace> AcceptAsync(WorkspaceInvitation invitation, Guid userId)
     {
         var workspace = await _workspaceRepository.GetAsync(invitation.WorkspaceId);
+        if (workspace.IsArchived)
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.WorkspaceArchived);
+        }
+
         var existing = await _memberships.FindActiveAsync(workspace.Id, userId);
         var projectId = invitation.ProjectId;
         if (projectId.HasValue)

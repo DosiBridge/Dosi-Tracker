@@ -39,6 +39,7 @@
     "Tracker:CannotModifySelf": "You cannot make this change to your own account or membership.",
     "Tracker:RoleNotAllowed": "Only the workspace owner can grant this role, change hourly rates or manage an owner's account.",
     "Tracker:WorkspaceRequired": "Choose a workspace: send its id in the X-Workspace-Id header.",
+    "Tracker:WorkspaceArchived": "This workspace is archived. Contact a workspace owner to restore it.",
     "Tracker:NotWorkspaceMember": "You are not a member of this workspace.",
     "Tracker:EmailAlreadyRegistered": "An account with this email already exists. Sign in and create the workspace from inside the app.",
     "Tracker:DuplicateWorkspaceName": "A workspace with this name already exists.",

@@ -2,6 +2,7 @@ using System;
 using System.Threading.Tasks;
 using Dosi.Tracker.SaaS;
 using Volo.Abp;
+using Volo.Abp.Authorization;
 using Volo.Abp.DistributedLocking;
 using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Uow;
@@ -92,5 +93,58 @@ public class WorkspaceManager : TrackerDomainService
     public static BusinessException DuplicateName(string name)
     {
         return new BusinessException(TrackerDomainErrorCodes.DuplicateWorkspaceName).WithData("name", name.Trim());
+    }
+
+    /// <summary>
+    /// Archives the workspace. Reversible and idempotent.
+    /// Strictly requires the operator to be an active owner of the target workspace.
+    /// </summary>
+    public virtual async Task<Workspace> ArchiveAsync(Guid workspaceId, Guid operatorUserId)
+    {
+        var workspace = await _workspaceRepository.GetAsync(workspaceId);
+        var member = await _memberships.FindActiveAsync(workspaceId, operatorUserId);
+        if (member == null || !member.IsOwner)
+        {
+            throw new AbpAuthorizationException("Only an active owner of the workspace can archive it.");
+        }
+
+        if (!workspace.IsArchived)
+        {
+            workspace.Archive(operatorUserId, Clock.Now);
+            await _workspaceRepository.UpdateAsync(workspace, autoSave: true);
+        }
+
+        return workspace;
+    }
+
+    /// <summary>
+    /// Restores an archived workspace to active. Reversible and idempotent.
+    /// Strictly requires the operator to be an active owner of the target workspace.
+    /// </summary>
+    public virtual async Task<Workspace> RestoreAsync(Guid workspaceId, Guid operatorUserId)
+    {
+        var workspace = await _workspaceRepository.GetAsync(workspaceId);
+        var member = await _memberships.FindActiveAsync(workspaceId, operatorUserId);
+        if (member == null || !member.IsOwner)
+        {
+            throw new AbpAuthorizationException("Only an active owner of the workspace can restore it.");
+        }
+
+        if (workspace.IsArchived)
+        {
+            workspace.Restore();
+            await _workspaceRepository.UpdateAsync(workspace, autoSave: true);
+        }
+
+        return workspace;
+    }
+
+    /// <summary>
+    /// Checks whether the specified workspace is archived.
+    /// </summary>
+    public virtual async Task<bool> IsArchivedAsync(Guid workspaceId)
+    {
+        var workspace = await _workspaceRepository.FindAsync(workspaceId);
+        return workspace?.IsArchived ?? false;
     }
 }
