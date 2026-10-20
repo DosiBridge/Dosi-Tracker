@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
@@ -11,6 +12,7 @@ using Volo.Abp.DistributedLocking;
 using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Linq;
 using Volo.Abp.Threading;
+using Volo.Abp.Timing;
 using Volo.Abp.Uow;
 using Dosi.Tracker.Workspaces;
 
@@ -22,6 +24,8 @@ namespace Dosi.Tracker.Activities.Retention;
 /// Never runs automatically on application startup (Timer.RunOnStart = false).
 /// Executes sweeps across active workspaces under a distributed lock, delegating actual
 /// workspace-isolated cleanup to ICaptureRetentionService.
+/// Maintains workspace-scoped continuation cursors across sweeps to ensure forward progress
+/// past preserved poison/failing rows, with bounded pages per sweep and deterministic wrap-around.
 /// </summary>
 public class CaptureRetentionWorker : AsyncPeriodicBackgroundWorkerBase
 {
@@ -29,6 +33,19 @@ public class CaptureRetentionWorker : AsyncPeriodicBackgroundWorkerBase
 
     private readonly IOptions<CaptureRetentionOptions> _options;
     private readonly ILogger<CaptureRetentionWorker> _logger;
+    private readonly ConcurrentDictionary<Guid, CaptureRetentionCursor> _workspaceCursors = new();
+
+    /// <summary>
+    /// Gets the current continuation cursor for the specified workspace, if any.
+    /// </summary>
+    public CaptureRetentionCursor? GetWorkspaceCursor(Guid workspaceId) =>
+        _workspaceCursors.TryGetValue(workspaceId, out var cursor) ? cursor : null;
+
+    /// <summary>
+    /// Explicitly resets or clears the continuation cursor for the specified workspace.
+    /// </summary>
+    public void ResetWorkspaceCursor(Guid workspaceId) =>
+        _workspaceCursors.TryRemove(workspaceId, out _);
 
     public CaptureRetentionWorker(
         AbpAsyncTimer timer,
@@ -94,26 +111,62 @@ public class CaptureRetentionWorker : AsyncPeriodicBackgroundWorkerBase
             await readUow.CompleteAsync();
         }
 
+        var clock = serviceProvider.GetRequiredService<IClock>();
         var sweepResult = new CaptureRetentionSweepResult();
         var retentionPeriod = TimeSpan.FromDays(Math.Max(1, _options.Value.DefaultRetentionDays));
         var batchSize = Math.Clamp(_options.Value.BatchSize, 1, CaptureRetentionPolicy.MaxBatchSize);
+        var maxPages = Math.Max(1, _options.Value.MaxPagesPerWorkspace);
 
         foreach (var workspaceId in workspaceIds)
         {
             try
             {
-                var policy = new CaptureRetentionPolicy(
-                    workspaceId: workspaceId,
-                    retentionPeriod: retentionPeriod,
-                    batchSize: batchSize,
-                    kinds: null,
-                    allowArchivedWorkspace: false);
+                // Freeze deterministic cutoff timestamp for this workspace sweep so pagination does not drift across pages
+                var cutoff = clock.Now - retentionPeriod;
+                _workspaceCursors.TryGetValue(workspaceId, out var cursor);
+                var pagesProcessed = 0;
 
-                var runResult = await retentionService.CleanExpiredCapturesAsync(policy);
+                while (pagesProcessed < maxPages)
+                {
+                    pagesProcessed++;
+                    sweepResult.TotalBatchesProcessed++;
+
+                    var policy = new CaptureRetentionPolicy(
+                        workspaceId: workspaceId,
+                        retentionPeriod: retentionPeriod,
+                        batchSize: batchSize,
+                        kinds: null,
+                        allowArchivedWorkspace: false,
+                        cutoff: cutoff,
+                        cursor: cursor);
+
+                    var runResult = await retentionService.CleanExpiredCapturesAsync(policy);
+
+                    if (runResult.Skipped)
+                    {
+                        break;
+                    }
+
+                    sweepResult.TotalDeleted += runResult.DeletedCount;
+                    sweepResult.TotalFailedBlobs += runResult.FailedBlobCount;
+                    sweepResult.TotalMissingBlobs += runResult.MissingBlobCount;
+                    sweepResult.TotalCorruptKeys += runResult.CorruptKeyCount;
+
+                    if (runResult.HasMore && runResult.NextCursor != null)
+                    {
+                        cursor = runResult.NextCursor;
+                        _workspaceCursors[workspaceId] = cursor;
+                    }
+                    else
+                    {
+                        // Reached end of candidate stream: wrap around to beginning for next sweep
+                        _workspaceCursors.TryRemove(workspaceId, out _);
+                        cursor = null;
+                        break;
+                    }
+                }
+
                 sweepResult.WorkspacesSwept++;
-                sweepResult.TotalDeleted += runResult.DeletedCount;
-                sweepResult.TotalFailedBlobs += runResult.FailedBlobCount;
-                sweepResult.TotalMissingBlobs += runResult.MissingBlobCount;
             }
             catch (Exception ex)
             {

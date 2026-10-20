@@ -25,4 +25,11 @@ public class CaptureRetentionOptions
     /// Maximum number of items processed per batch in automated sweeps.
     /// </summary>
     public int BatchSize { get; set; } = CaptureRetentionPolicy.DefaultBatchSize;
+
+    /// <summary>
+    /// Maximum number of batches (pages) to process per workspace within a single periodic sweep.
+    /// Bounds the execution time and provider operations per sweep while guaranteeing bounded forward progress.
+    /// Defaults to 5.
+    /// </summary>
+    public int MaxPagesPerWorkspace { get; set; } = 5;
 }

@@ -11,5 +11,7 @@ public class CaptureRetentionSweepResult
     public int TotalDeleted { get; set; }
     public int TotalFailedBlobs { get; set; }
     public int TotalMissingBlobs { get; set; }
+    public int TotalCorruptKeys { get; set; }
+    public int TotalBatchesProcessed { get; set; }
     public int Errors { get; set; }
 }

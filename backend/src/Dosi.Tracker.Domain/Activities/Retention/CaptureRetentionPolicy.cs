@@ -46,13 +46,20 @@ public class CaptureRetentionPolicy
     /// </summary>
     public DateTime? Cutoff { get; }
 
+    /// <summary>
+    /// Optional keyset pagination cursor for continuation past previously processed candidates.
+    /// If null, query starts from the earliest expired candidate in (CapturedAt, Id) order.
+    /// </summary>
+    public CaptureRetentionCursor? Cursor { get; }
+
     public CaptureRetentionPolicy(
         Guid workspaceId,
         TimeSpan retentionPeriod,
         int batchSize = DefaultBatchSize,
         IReadOnlyList<string>? kinds = null,
         bool allowArchivedWorkspace = false,
-        DateTime? cutoff = null)
+        DateTime? cutoff = null,
+        CaptureRetentionCursor? cursor = null)
     {
         WorkspaceId = workspaceId;
         RetentionPeriod = retentionPeriod;
@@ -60,6 +67,7 @@ public class CaptureRetentionPolicy
         Kinds = kinds;
         AllowArchivedWorkspace = allowArchivedWorkspace;
         Cutoff = cutoff;
+        Cursor = cursor;
     }
 
     /// <summary>

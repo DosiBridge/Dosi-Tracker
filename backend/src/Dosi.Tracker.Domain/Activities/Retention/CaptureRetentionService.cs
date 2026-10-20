@@ -117,6 +117,14 @@ public class CaptureRetentionService : ICaptureRetentionService, ITransientDepen
                 query = query.Where(s => policy.Kinds.Contains(s.Kind));
             }
 
+            if (policy.Cursor != null)
+            {
+                var cursorCapturedAt = policy.Cursor.CapturedAt;
+                var cursorId = policy.Cursor.ScreenshotId;
+                query = query.Where(s => s.CapturedAt > cursorCapturedAt ||
+                    (s.CapturedAt == cursorCapturedAt && s.Id.CompareTo(cursorId) > 0));
+            }
+
             query = query
                 .OrderBy(s => s.CapturedAt)
                 .ThenBy(s => s.Id)
@@ -156,6 +164,8 @@ public class CaptureRetentionService : ICaptureRetentionService, ITransientDepen
                 MissingBlobCount = 0,
                 CorruptKeyCount = 0,
                 HasMore = false,
+                NextCursor = null,
+                LastProcessedCursor = null,
                 Skipped = false
             };
         }
@@ -246,6 +256,10 @@ public class CaptureRetentionService : ICaptureRetentionService, ITransientDepen
             await uow.CompleteAsync(cancellationToken);
         }
 
+        var lastCandidate = batch.Count > 0 ? batch[^1] : null;
+        var lastCursor = lastCandidate != null ? new CaptureRetentionCursor(lastCandidate.CapturedAt, lastCandidate.Id) : null;
+        var nextCursor = hasMore && lastCursor != null ? lastCursor : null;
+
         return new CaptureRetentionResult
         {
             WorkspaceId = policy.WorkspaceId,
@@ -256,6 +270,8 @@ public class CaptureRetentionService : ICaptureRetentionService, ITransientDepen
             MissingBlobCount = missingBlobCount,
             CorruptKeyCount = corruptKeyCount,
             HasMore = hasMore,
+            NextCursor = nextCursor,
+            LastProcessedCursor = lastCursor,
             Skipped = false
         };
     }

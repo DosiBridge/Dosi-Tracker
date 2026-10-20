@@ -15,6 +15,8 @@ public class CaptureRetentionResult
     public int MissingBlobCount { get; init; }
     public int CorruptKeyCount { get; init; }
     public bool HasMore { get; init; }
+    public CaptureRetentionCursor? NextCursor { get; init; }
+    public CaptureRetentionCursor? LastProcessedCursor { get; init; }
     public bool Skipped { get; init; }
     public string? SkipReason { get; init; }
 }

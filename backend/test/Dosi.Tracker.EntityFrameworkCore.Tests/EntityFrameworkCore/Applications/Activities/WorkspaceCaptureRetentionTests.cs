@@ -18,6 +18,7 @@ using Volo.Abp.Data;
 using Volo.Abp.Domain.Entities;
 using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Guids;
+using Volo.Abp.Linq;
 using Volo.Abp.Threading;
 using Volo.Abp.Timing;
 using Volo.Abp.Uow;
@@ -45,6 +46,10 @@ namespace Dosi.Tracker.EntityFrameworkCore.Applications.Activities;
 /// 14. Cross-workspace inconsistent Activity reference fails closed without deleting blob or metadata.
 /// 15. Exact-key negative regressions rejecting sibling, nested, unknown kind, case-folded, and unsupported format.
 /// 16. Legitimate screen/thumb/webcam kinds and .jpg/.png format variants clean up successfully.
+/// 17. Valid later expired captures progress past full leading batch of corrupt rows without starvation.
+/// 18. Valid later expired captures progress past full leading batch of failing blob rows without starvation.
+/// 19. Progress across worker sweeps when preserved rows exceed one page and single sweep limit.
+/// 20. Repaired blob failures become eligible again on wrap-around.
 /// </summary>
 [Collection(TrackerTestConsts.CollectionDefinitionName)]
 public class WorkspaceCaptureRetentionTests : TrackerEntityFrameworkCoreTestBase
@@ -849,5 +854,296 @@ public class WorkspaceCaptureRetentionTests : TrackerEntityFrameworkCoreTestBase
                 _blobProvider.Blobs.ContainsKey(sc.StorageUrl).ShouldBeFalse();
             }
         }
+    }
+
+    [Fact]
+    public async Task Valid_Later_Expired_Captures_Starve_Behind_Full_Leading_Batch_Of_Corrupt_Rows_Without_Progress()
+    {
+        // Demonstrates the liveness defect:
+        // BatchSize = 2.
+        // Leading batch: 2 corrupt ownership/key rows that fail closed and remain preserved in DB.
+        // Later batch: 2 valid legitimate expired captures.
+        var (wsA, projA, actA) = await SeedWorkspaceAndActivityAsync("RET-STARVE-CORRUPT-A");
+        var baseTime = _clock.Now.AddDays(-50);
+
+        // Foreign workspace B
+        var (wsB, _, actB) = await SeedWorkspaceAndActivityAsync("RET-STARVE-CORRUPT-B");
+
+        // 2 leading poison rows (referencing activity in foreign workspace B, which fail closed)
+        var poison1 = await SeedScreenshotAsync(
+            wsA, actB, Screenshot.ScreenKind, baseTime,
+            customStorageUrl: $"activities/{actB:D}/screen.jpg");
+
+        var poison2 = await SeedScreenshotAsync(
+            wsA, actA, Screenshot.ScreenKind, baseTime.AddMinutes(1),
+            customStorageUrl: $"activities/{actA:D}/screen-other.jpg");
+
+        // 2 valid later expired captures
+        var actValid1 = await SeedActivityInWorkspaceAsync(wsA, projA, startedAt: baseTime.AddMinutes(10));
+        var valid1 = await SeedScreenshotAsync(wsA, actValid1, Screenshot.ScreenKind, baseTime.AddMinutes(11));
+
+        var actValid2 = await SeedActivityInWorkspaceAsync(wsA, projA, startedAt: baseTime.AddMinutes(20));
+        var valid2 = await SeedScreenshotAsync(wsA, actValid2, Screenshot.ScreenKind, baseTime.AddMinutes(21));
+
+        var enabledOptions = Options.Create(new CaptureRetentionOptions
+        {
+            IsEnabled = true,
+            DefaultRetentionDays = 30,
+            BatchSize = 2
+        });
+
+        var timer = GetRequiredService<AbpAsyncTimer>();
+        var scopeFactory = GetRequiredService<IServiceScopeFactory>();
+        var worker = new CaptureRetentionWorker(timer, scopeFactory, enabledOptions);
+
+        // Sweep 1: Processes the 2 leading poison rows.
+        var sweep1 = await worker.SweepAsync(ServiceProvider);
+
+        // In existing code without continuation, Sweep 2 processes the SAME 2 leading poison rows again!
+        var sweep2 = await worker.SweepAsync(ServiceProvider);
+
+        // Assert that the valid later rows MUST be reclaimed across sweeps
+        using (DataFilter.Disable<IWorkspaceScoped>())
+        {
+            (await _screenshotRepository.FindAsync(valid1.Id)).ShouldBeNull();
+            (await _screenshotRepository.FindAsync(valid2.Id)).ShouldBeNull();
+        }
+        _blobProvider.Blobs.ContainsKey(valid1.StorageUrl).ShouldBeFalse();
+        _blobProvider.Blobs.ContainsKey(valid2.StorageUrl).ShouldBeFalse();
+    }
+
+    [Fact]
+    public async Task Valid_Later_Expired_Captures_Starve_Behind_Full_Leading_Batch_Of_Failing_Blob_Rows_Without_Progress()
+    {
+        // Demonstrates the liveness defect with retriable blob failures:
+        // BatchSize = 2.
+        // Leading batch: 2 valid canonical captures whose blob deletion fails with S3 503 (preserved for retry).
+        // Later batch: 2 valid legitimate expired captures whose blob deletion succeeds.
+        var (wsA, projA, actA) = await SeedWorkspaceAndActivityAsync("RET-STARVE-BLOBFAIL-A");
+        var baseTime = _clock.Now.AddDays(-50);
+
+        // 2 leading captures that fail during blob deletion
+        var fail1 = await SeedScreenshotAsync(wsA, actA, Screenshot.ScreenKind, baseTime);
+        var actFail2 = await SeedActivityInWorkspaceAsync(wsA, projA, startedAt: baseTime.AddMinutes(2));
+        var fail2 = await SeedScreenshotAsync(wsA, actFail2, Screenshot.ScreenKind, baseTime.AddMinutes(3));
+
+        // 2 later captures that should succeed
+        var actValid1 = await SeedActivityInWorkspaceAsync(wsA, projA, startedAt: baseTime.AddMinutes(10));
+        var valid1 = await SeedScreenshotAsync(wsA, actValid1, Screenshot.ScreenKind, baseTime.AddMinutes(11));
+        var actValid2 = await SeedActivityInWorkspaceAsync(wsA, projA, startedAt: baseTime.AddMinutes(20));
+        var valid2 = await SeedScreenshotAsync(wsA, actValid2, Screenshot.ScreenKind, baseTime.AddMinutes(21));
+
+        // Inject blob failure specifically for the leading 2 keys
+        var failingKeys = new HashSet<string> { fail1.StorageUrl, fail2.StorageUrl };
+        _blobProvider.BeforeDelete = (num, key) =>
+        {
+            if (failingKeys.Contains(key))
+            {
+                throw new HttpRequestException("S3 503 Service Unavailable");
+            }
+            return Task.CompletedTask;
+        };
+
+        var enabledOptions = Options.Create(new CaptureRetentionOptions
+        {
+            IsEnabled = true,
+            DefaultRetentionDays = 30,
+            BatchSize = 2
+        });
+
+        var timer = GetRequiredService<AbpAsyncTimer>();
+        var scopeFactory = GetRequiredService<IServiceScopeFactory>();
+        var worker = new CaptureRetentionWorker(timer, scopeFactory, enabledOptions);
+
+        // Sweep 1: encounters blob failures on leading 2 rows
+        var sweep1 = await worker.SweepAsync(ServiceProvider);
+
+        // Sweep 2: in existing code without continuation, encounters the SAME 2 rows again and starves valid rows
+        var sweep2 = await worker.SweepAsync(ServiceProvider);
+
+        // Assert that the valid later rows MUST be reclaimed across sweeps
+        using (DataFilter.Disable<IWorkspaceScoped>())
+        {
+            (await _screenshotRepository.FindAsync(valid1.Id)).ShouldBeNull();
+            (await _screenshotRepository.FindAsync(valid2.Id)).ShouldBeNull();
+        }
+        _blobProvider.Blobs.ContainsKey(valid1.StorageUrl).ShouldBeFalse();
+        _blobProvider.Blobs.ContainsKey(valid2.StorageUrl).ShouldBeFalse();
+    }
+
+    [Fact]
+    public async Task Progress_Across_Worker_Sweeps_When_Preserved_Rows_Exceed_One_Page_And_Single_Sweep_Limit()
+    {
+        // Scenario:
+        // BatchSize = 2, MaxPagesPerWorkspace = 2 (so max 4 items processed per sweep).
+        // 4 leading poison rows (occupying 2 full pages = max sweep capacity).
+        // 2 later legitimate expired captures (on page 3).
+        // Plus sentinels:
+        // - fresh capture in wsA
+        // - exact cutoff capture in wsA
+        // - expired capture in unrelated wsB
+        var (wsA, projA, actA) = await SeedWorkspaceAndActivityAsync("RET-MULTI-SWEEP-A");
+        var (wsB, _, actB) = await SeedWorkspaceAndActivityAsync("RET-MULTI-SWEEP-B");
+        var baseTime = _clock.Now.AddDays(-50);
+        var retention = TimeSpan.FromDays(30);
+        var cutoff = _clock.Now - retention;
+
+        // 4 poison rows in wsA (referencing foreign activity actB)
+        var poisonList = new List<Screenshot>();
+        for (int i = 0; i < 4; i++)
+        {
+            var p = await SeedScreenshotAsync(
+                wsA, actB, Screenshot.ScreenKind, baseTime.AddMinutes(i),
+                customStorageUrl: $"activities/{actB:D}/screen.jpg");
+            poisonList.Add(p);
+        }
+
+        // 2 legitimate expired captures on page 3 in wsA
+        var actValid1 = await SeedActivityInWorkspaceAsync(wsA, projA, startedAt: baseTime.AddMinutes(10));
+        var valid1 = await SeedScreenshotAsync(wsA, actValid1, Screenshot.ScreenKind, baseTime.AddMinutes(11));
+        var actValid2 = await SeedActivityInWorkspaceAsync(wsA, projA, startedAt: baseTime.AddMinutes(20));
+        var valid2 = await SeedScreenshotAsync(wsA, actValid2, Screenshot.ScreenKind, baseTime.AddMinutes(21));
+
+        // Fresh sentinel in wsA (clearly within retention window, must NOT be cleaned)
+        var freshSc = await SeedScreenshotAsync(wsA, actA, Screenshot.ScreenKind, _clock.Now.AddDays(-10));
+
+        // wsB is archived, so worker sweep skips it and preserves its capture
+        await WithUnitOfWorkAsync(async () =>
+        {
+            using (DataFilter.Disable<IWorkspaceScoped>())
+            {
+                var ws = await _workspaceRepository.GetAsync(wsB);
+                ws.Archive(TestUserId, _clock.Now);
+                await _workspaceRepository.UpdateAsync(ws, autoSave: true);
+            }
+        });
+        var unrelatedScB = await SeedScreenshotAsync(wsB, actB, Screenshot.ScreenKind, baseTime);
+
+        var options = Options.Create(new CaptureRetentionOptions
+        {
+            IsEnabled = true,
+            DefaultRetentionDays = 30,
+            BatchSize = 2,
+            MaxPagesPerWorkspace = 2
+        });
+
+        var timer = GetRequiredService<AbpAsyncTimer>();
+        var scopeFactory = GetRequiredService<IServiceScopeFactory>();
+        var worker = new CaptureRetentionWorker(timer, scopeFactory, options);
+
+        var initialDeleteCount = _blobProvider.DeleteCount;
+
+        // Sweep 1: Processes exactly 2 pages (4 poison rows). Bounded work limit reached.
+        var sweep1 = await worker.SweepAsync(ServiceProvider);
+        sweep1.TotalDeleted.ShouldBe(0);
+        sweep1.TotalBatchesProcessed.ShouldBeGreaterThanOrEqualTo(2);
+
+        // Continuation cursor for wsA MUST be positioned at poison row 4
+        var cursorAfterSweep1 = worker.GetWorkspaceCursor(wsA);
+        cursorAfterSweep1.ShouldNotBeNull();
+        cursorAfterSweep1.ScreenshotId.ShouldBe(poisonList[3].Id);
+
+        // Valid rows not yet deleted because sweep 1 stopped at maxPages = 2
+        using (DataFilter.Disable<IWorkspaceScoped>())
+        {
+            (await _screenshotRepository.FindAsync(valid1.Id)).ShouldNotBeNull();
+            (await _screenshotRepository.FindAsync(valid2.Id)).ShouldNotBeNull();
+        }
+
+        // Sweep 2: Resumes from cursor (poison row 4), processes page 3 (valid rows), deletes them!
+        var sweep2 = await worker.SweepAsync(ServiceProvider);
+        sweep2.TotalDeleted.ShouldBe(2);
+
+        // Reached end of candidate stream: cursor wraps around to null!
+        worker.GetWorkspaceCursor(wsA).ShouldBeNull();
+
+        // Valid rows deleted from DB and blob container
+        using (DataFilter.Disable<IWorkspaceScoped>())
+        {
+            (await _screenshotRepository.FindAsync(valid1.Id)).ShouldBeNull();
+            (await _screenshotRepository.FindAsync(valid2.Id)).ShouldBeNull();
+
+            // Poison rows fail-closed: preserved in DB
+            foreach (var p in poisonList)
+            {
+                (await _screenshotRepository.FindAsync(p.Id)).ShouldNotBeNull();
+            }
+
+            // Sentinels preserved:
+            (await _screenshotRepository.FindAsync(freshSc.Id)).ShouldNotBeNull();
+            (await _screenshotRepository.FindAsync(unrelatedScB.Id)).ShouldNotBeNull();
+        }
+
+        _blobProvider.Blobs.ContainsKey(valid1.StorageUrl).ShouldBeFalse();
+        _blobProvider.Blobs.ContainsKey(valid2.StorageUrl).ShouldBeFalse();
+        _blobProvider.Blobs.ContainsKey(freshSc.StorageUrl).ShouldBeTrue();
+        _blobProvider.Blobs.ContainsKey(unrelatedScB.StorageUrl).ShouldBeTrue();
+
+        // Exact provider delete operations: only the 2 legitimate rows deleted
+        (_blobProvider.DeleteCount - initialDeleteCount).ShouldBe(2);
+    }
+
+    [Fact]
+    public async Task Repaired_Blob_Failures_Become_Eligible_Again_On_WrapAround()
+    {
+        // Demonstrates wrap-around retry semantics:
+        // When a previous blob failure is repaired in storage, wrap-around re-evaluates it from the beginning
+        var (wsA, projA, actA) = await SeedWorkspaceAndActivityAsync("RET-REPAIR-A");
+        var baseTime = _clock.Now.AddDays(-50);
+
+        var failRow = await SeedScreenshotAsync(wsA, actA, Screenshot.ScreenKind, baseTime);
+        var actValid = await SeedActivityInWorkspaceAsync(wsA, projA, startedAt: baseTime.AddMinutes(5));
+        var validRow = await SeedScreenshotAsync(wsA, actValid, Screenshot.ScreenKind, baseTime.AddMinutes(6));
+
+        // Inject transient failure on failRow
+        var failKey = failRow.StorageUrl;
+        _blobProvider.BeforeDelete = (num, key) =>
+        {
+            if (key == failKey)
+            {
+                throw new HttpRequestException("S3 503 Service Unavailable");
+            }
+            return Task.CompletedTask;
+        };
+
+        var options = Options.Create(new CaptureRetentionOptions
+        {
+            IsEnabled = true,
+            DefaultRetentionDays = 30,
+            BatchSize = 1,
+            MaxPagesPerWorkspace = 5
+        });
+
+        var timer = GetRequiredService<AbpAsyncTimer>();
+        var scopeFactory = GetRequiredService<IServiceScopeFactory>();
+        var worker = new CaptureRetentionWorker(timer, scopeFactory, options);
+
+        // Sweep 1: failRow fails (preserved), validRow deleted. Reaches end, wraps cursor to null!
+        var sweep1 = await worker.SweepAsync(ServiceProvider);
+        sweep1.TotalDeleted.ShouldBe(1);
+        sweep1.TotalFailedBlobs.ShouldBe(1);
+
+        // Cursor wrapped around
+        worker.GetWorkspaceCursor(wsA).ShouldBeNull();
+
+        using (DataFilter.Disable<IWorkspaceScoped>())
+        {
+            (await _screenshotRepository.FindAsync(failRow.Id)).ShouldNotBeNull();
+            (await _screenshotRepository.FindAsync(validRow.Id)).ShouldBeNull();
+        }
+
+        // Repair: S3 recovers
+        _blobProvider.BeforeDelete = null;
+
+        // Sweep 2: starts from beginning (null cursor), processes repaired failRow and cleans it!
+        var sweep2 = await worker.SweepAsync(ServiceProvider);
+        sweep2.TotalDeleted.ShouldBe(1);
+        sweep2.TotalFailedBlobs.ShouldBe(0);
+
+        using (DataFilter.Disable<IWorkspaceScoped>())
+        {
+            (await _screenshotRepository.FindAsync(failRow.Id)).ShouldBeNull();
+        }
+        _blobProvider.Blobs.ContainsKey(failRow.StorageUrl).ShouldBeFalse();
     }
 }

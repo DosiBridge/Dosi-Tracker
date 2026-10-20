@@ -652,7 +652,26 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
    - No public unauthenticated HTTP endpoint is exposed.
    - Automatic execution against the host machine's configured database or real blob storage is strictly prevented.
 
-4. **Concrete Isolated Regression Suite (`WorkspaceCaptureRetentionTests.cs`, 16 tests passed, exit 0)**:
+4. **Operational Defect: Retention Liveness Starvation Behind Preserved Bad Rows**:
+   - *Source-Confirmed Operational Defect:* `CaptureRetentionService` previously ordered expired rows by `CapturedAt, Id` and took `Take(BatchSize + 1)`, processing only the first `BatchSize`.
+   - Bad/corrupt rows (e.g. malformed storage URLs or referencing foreign activities) and transient blob deletion failures (e.g. S3 503) fail closed and deliberately remain persisted in the database.
+   - Without continuation cursor state, `CaptureRetentionWorker.SweepAsync` called the service once per active workspace per sweep, ignoring `HasMore`.
+   - Consequently, when a full batch of preserved poison or failing rows existed at the head of the expired stream, every sweep repeatedly examined only that leading batch and made zero progress, permanently starving later legitimate expired captures from being reclaimed.
+
+5. **Bounded Progress Strategy: Deterministic Keyset Cursor & Bounded Sweeps**:
+   - *Domain Keyset Cursor (`CaptureRetentionCursor`):* Represents deterministic pagination position `(DateTime CapturedAt, Guid ScreenshotId)`.
+   - *Policy & Result Contract:* `CaptureRetentionPolicy` carries `CaptureRetentionCursor? Cursor`. `CaptureRetentionResult` returns `CaptureRetentionCursor? NextCursor` (null when candidate stream ends, signaling wrap-around) and `LastProcessedCursor`.
+   - *Keyset Predicate in Service:* `s.CapturedAt > cursorCapturedAt || (s.CapturedAt == cursorCapturedAt && s.Id.CompareTo(cursorId) > 0)`. EF Core SQLite and PostgreSQL translate `s.Id.CompareTo(cursorId) > 0` cleanly into SQL without client evaluation.
+   - *Bounded Worker Orchestration (`CaptureRetentionWorker`):*
+     * Freezes `cutoff = clock.Now - retentionPeriod` per workspace per sweep, preventing clock drift across multi-page sweeps.
+     * Maintains in-memory workspace-scoped cursors (`ConcurrentDictionary<Guid, CaptureRetentionCursor> _workspaceCursors`).
+     * Sweeps up to `MaxPagesPerWorkspace` (configurable in `CaptureRetentionOptions`, default 5) per workspace per sweep.
+     * Updates cursor on `hasMore`; when `hasMore == false`, resets cursor to null (deterministic wrap-around).
+     * Wrap-around ensures transient blob failures that have been repaired in storage become eligible for reclamation on subsequent sweeps.
+     * Preserved bad/corrupt rows are NOT deleted or bypassed in ownership validation (fail-closed preservation strictly maintained).
+     * Strictly avoids unbounded materialization, recursive `HasMore` loops, mutable global tenant DB state, or destructive quarantine.
+
+6. **Concrete Isolated Regression Suite (`WorkspaceCaptureRetentionTests.cs`, 20 tests passed, exit 0)**:
    - `Expired_Captures_Are_Deleted_From_Database_And_Blob_Container`: A-expired captures (both screen and thumb) deleted from SQLite and fake blob provider; asserts both DB row deletion and blob key removal.
    - `Unrelated_Workspace_Expired_Captures_Are_Preserved_Untouched`: B-expired sentinel in unrelated workspace is untouched in SQLite and fake blob provider when running retention on Workspace A.
    - `Fresh_And_Exact_Cutoff_Captures_Are_Preserved_Untouched`: A-fresh (newer than cutoff) and exact-cutoff (capturedAt == cutoff) are preserved in DB and blob provider; only strictly expired (< cutoff) deleted.
@@ -669,8 +688,12 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
    - `Cross_Workspace_Inconsistent_Activity_Reference_Fails_Closed_Without_Deleting_Blob_Or_Metadata`: Proves candidate screenshot with `WorkspaceId = wsA` referencing genuine `ActivityId = actB` (in `wsB`) and `actB`'s canonical blob key fails closed: zero provider deletes, Workspace B blob/DB row/Activity untouched, and corrupt metadata row preserved without deletion.
    - `Exact_Key_Negative_Regressions_Reject_Sibling_Nested_UnknownKind_CaseFolded_And_UnsupportedFormat`: Unit-level and DB/storage execution verifying sibling suffixes (`screen-other.jpg`, `screen_0.jpg`), nested directory segments (`screen/nested.jpg`), unknown kinds (`audio.jpg`), case folding (`Activities/`, `SCREEN.jpg`, `screen.JPG`), and unsupported formats (`screen.bmp`, `screen.webp`) are rejected with 0 provider deletes, preserving rows and blobs.
    - `Legitimate_Capture_Kinds_And_Format_Variants_Clean_Up_Successfully`: Verifies all 6 legitimate writer-compatible combinations (`screen`/`thumb`/`webcam` × `.jpg`/`.png`) across distinct synthetic activities clean up cleanly with exact provider delete count delta = 6.
+   - `Valid_Later_Expired_Captures_Starve_Behind_Full_Leading_Batch_Of_Corrupt_Rows_Without_Progress`: Isolated regression demonstrating starvation defect on production path (fails before fix with exit code 1 in task-3936; passes after fix with exit 0). Verifies later valid expired captures are reclaimed past leading preserved foreign rows, and corrupt rows remain preserved.
+   - `Valid_Later_Expired_Captures_Starve_Behind_Full_Leading_Batch_Of_Failing_Blob_Rows_Without_Progress`: Isolated regression demonstrating starvation defect behind leading batch of retriable blob delete failures (fails before fix with exit code 1; passes after fix with exit 0).
+   - `Progress_Across_Worker_Sweeps_When_Preserved_Rows_Exceed_One_Page_And_Single_Sweep_Limit`: Proves multi-sweep worker progress when preserved poison rows (4 rows) exceed a single sweep's bounded limit (`MaxPagesPerWorkspace = 2`, `BatchSize = 2`). Demonstrates cursor advancement at sweep 1 boundary, subsequent sweep 2 resumption past cursor, deletion of valid rows, and wrap-around cursor reset.
+   - `Repaired_Blob_Failures_Become_Eligible_Again_On_WrapAround`: Proves deterministic wrap-around semantics: when a previously failing blob is repaired in storage, worker wrap-around re-evaluates and reclaims the row.
 
-5. **Operational Limitations & Remaining Gaps**:
+7. **Operational Limitations & Remaining Gaps**:
    - **A disabled implementation is not deployed/enforced retention**: The worker is disabled by default and has not been executed on live environments.
    - **Activity Retention Gap**: 1-year activity summary pruning (e.g. deleting old `Activity` records) is deferred; only captures are pruned in this slice.
    - **Owner Settings UI Gap**: Per-workspace retention period configuration UI for workspace owners in Next.js frontend is not yet implemented.
@@ -683,7 +706,7 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
 1. **Privacy Acceptance Pending**:
    - The privacy source audit (commit `14bbe66`) remains **Pending PM Independent Review**. This status is preserved and not bypassed.
 2. **Workspace Lifecycle, Authorization & Concurrency Status**:
-   - Reversible owner-controlled workspace archival (`REQ-WS-08`), concurrent last-owner protection (`REQ-WS-06`), recipient decline lifecycle (`REQ-WS-07`), hosted ASP.NET Core `TestServer` MVC aggregate authorization harness (`REQ-ISO-05`), and workspace-isolated capture retention lifecycle safe first slice (`REQ-DAT-01`) are implemented and verified via isolated regressions (63 SQLite tests total: 16 capture retention + 9 archival lifecycle + 10 archival migration/upgrade + 9 concurrent owner protection + 9 hosted MVC auth + 10 decline).
+   - Reversible owner-controlled workspace archival (`REQ-WS-08`), concurrent last-owner protection (`REQ-WS-06`), recipient decline lifecycle (`REQ-WS-07`), hosted ASP.NET Core `TestServer` MVC aggregate authorization harness (`REQ-ISO-05`), and workspace-isolated capture retention lifecycle safe first slice (`REQ-DAT-01`) are implemented and verified via isolated regressions (67 SQLite tests total: 20 capture retention + 9 archival lifecycle + 10 archival migration/upgrade + 9 concurrent owner protection + 9 hosted MVC auth + 10 decline).
    - Real browser cookie/session testing (`__Host-Dosi-Workspace`), Next.js server actions, OpenIddict token issuer, provider-backed multi-connection transactional commit proof (PostgreSQL/SQL Server), multi-node distributed lock infrastructure (Redis), and PM independent execution of `qa_workspace_phase.ps1` remain pending. All reported outcomes are worker-executed, not independent PM QA.
 3. **Execution Limits & Evidence Boundaries**:
    - Disposable SQLite baseline-to-current upgrades (both operation-level and tracked migrator) prove migration logic, history discovery, and baseline row preservation with default states on SQLite, but do NOT replace execution on a real PostgreSQL cluster; no live user/production database was modified.
