@@ -639,22 +639,37 @@ impl Tracker {
     /// [`Tracker::capture_screen`] (if any).
     ///
     /// Admission / Revocation Synchronization Contract:
-    /// - Each capability acquisition (`window_now`, `running_programs`, `webcam_jpg_base64`)
-    ///   performs its own linearized logical admission check and captures a capability generation token
-    ///   under a brief read lock immediately before calling the provider.
-    /// - NO single upfront authorization snapshot is reused across sequential steps.
-    /// - Read locks are NEVER held across provider calls, preventing authorization lock contention.
-    /// - If a capability is revoked while an earlier step was executing, subsequent steps are
-    ///   REJECTED AT ADMISSION (zero provider calls).
-    /// - If an admitted provider call completes after revocation (or revocation + regrant) took place
-    ///   while in-flight, the post-admission generation check detects the ABA transition and discards the result.
-    ///   Discarding the result prevents admission into activity blocks; it does not cancel in-flight OS work.
-    /// - `running_programs` is queried whenever authorized by current policy and historical block,
-    ///   independent of the active_window usage driver state (avoiding inappropriate driver dependency).
-    /// - Historical accumulator data (`slices`, `key_presses`, `clicks`, `active_seconds`)
-    ///   recorded while consent was active is preserved in the emitted block without acquiring new data.
-    /// - Screenshot handoff is validated conservatively: both current effective authorization AND historical
-    ///   block permissions must allow screenshots, and blur is enforced if either required it.
+    /// - Upfront Generation Era Token Capture: Generation era tokens are captured upfront
+    ///   under a brief read lock for all capabilities (`window_token`, `progs_token`, `screen_token`,
+    ///   `webcam_token`) at method entry.
+    /// - Sequential Provider Execution with Fresh Boolean Checks: Immediately before calling each
+    ///   provider (`current_window`, `running_programs`, `capture_webcam`), a fresh boolean admission
+    ///   check is evaluated under a brief read lock (`auth.active && auth.perms.<cap> && perms.<cap>`).
+    ///   If unauthorized, the provider call is skipped entirely (zero provider calls).
+    /// - Read locks are NEVER held across provider calls, avoiding authorization lock contention
+    ///   with `apply_sensor_policy`.
+    /// - Conservative Rejection after Generation Changes: If a capability undergoes an authorization
+    ///   transition (revocation, re-grant, or blur tightening) after snapshot start, a later provider
+    ///   may execute under current boolean permissions if re-granted, but the resulting acquisition
+    ///   will be conservatively rejected at final publication reconciliation because the current
+    ///   generation token will no longer match the upfront era token.
+    /// - Final Post-Provider Reconciliation: Once all sequential provider calls finish, a single
+    ///   post-execution validation under lock validates all acquired results against current authorization,
+    ///   the upfront era tokens, and (for screen) the handed-off screen provenance generation token.
+    ///   - Discarding invalidated results prevents unconsented data from entering activity blocks
+    ///     or persistent storage; it is post-execution validation, not hardware cancellation or
+    ///     atomic physical provider entry with revocation.
+    ///   - `self.usage.record(ended_at, ...)` is deferred to this final reconciliation and invoked
+    ///     if and only if `window_valid` passes, guaranteeing that invalidated window samples
+    ///     never contaminate historical usage.
+    /// - Process Decoupling: `running_programs` is queried based strictly on active running_programs
+    ///   authorization and historical block permission, independent of the active_window usage driver.
+    /// - Historical Accumulator Preservation: Historical accumulator data (`slices`, `key_presses`,
+    ///   `clicks`, `active_seconds`) recorded while consent was active is preserved in the emitted block
+    ///   without acquiring new data.
+    /// - Screenshot Provenance Handoff: Handed-off screenshots must have been captured under an authorized
+    ///   generation matching the current publication era, and conservative blur is enforced if either
+    ///   the caller or current policy requires blur.
     pub fn snapshot(&self, block: &BlockSpec<'_>, screen: Option<ProvenanceScreenCapture>) -> Activity {
         let perms = block.perms;
         let (started_at, ended_at) = (block.started_at, block.ended_at);
@@ -2110,6 +2125,7 @@ mod tests {
     fn tracker_consent_screenshot_rejected_after_later_webcam_aba_revocation() {
         let (tracker, _driver, acq) = Tracker::new_fake_with_acquisition();
         let tracker = Arc::new(tracker);
+        acq.set_canned_webcam(Some("/9j/valid_webcam_during_blocked_screen_aba".into()));
 
         let mut perms = CapturePermissions::all_disabled();
         perms.screenshot = true;
@@ -2119,7 +2135,7 @@ mod tests {
         let prov_cap = tracker.capture_screen(false);
         assert!(prov_cap.is_some());
 
-        // Block inside webcam acquisition (running after screenshot verification)
+        // Block inside webcam acquisition (running after screenshot handoff)
         let (webcam_entered_tx, webcam_entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let release_rx = Arc::new(Mutex::new(release_rx));
@@ -2140,14 +2156,39 @@ mod tests {
 
         webcam_entered_rx.recv_timeout(std::time::Duration::from_secs(5)).expect("timeout waiting for webcam entry");
 
-        // ABA transition on screenshot while webcam is blocked
-        tracker.apply_sensor_policy(false, None);
+        // Isolated ABA transition: withdraw ONLY screenshot while keeping active=true and webcam=true
+        let mut perms_webcam_only = perms;
+        perms_webcam_only.screenshot = false;
+        tracker.apply_sensor_policy(true, Some(&perms_webcam_only));
+        assert!(tracker.is_tracking_active());
+
+        // Regrant screenshot BEFORE releasing webcam
         tracker.apply_sensor_policy(true, Some(&perms));
+        assert!(tracker.is_tracking_active());
 
         release_tx.send(()).unwrap();
         let activity = handle.join().expect("thread panicked");
 
+        // Old screenshot from invalidated interval must be rejected
         assert!(activity.screenshot_png_base64.is_none(), "screenshot associated with revoked/ABA interval must be rejected at publication");
+        // Continuously authorized webcam result must be present!
+        assert!(activity.webcam_jpg_base64.is_some(), "continuously authorized webcam capture must be kept");
+        assert_eq!(activity.webcam_jpg_base64.as_deref(), Some("/9j/valid_webcam_during_blocked_screen_aba"));
+
+        // Assert exact provider call counts
+        assert_eq!(acq.screen_calls(), 1, "exactly 1 screen call from earlier capture_screen");
+        assert_eq!(acq.webcam_calls(), 1, "exactly 1 webcam call during snapshot");
+
+        // Assert fresh screenshot under current generation succeeds
+        acq.set_on_capture_webcam(|| {});
+        let fresh_prov_cap = tracker.capture_screen(false);
+        assert!(fresh_prov_cap.is_some(), "fresh capture_screen under current generation succeeds");
+        let fresh_spec = block(&perms, Some(EndReason::Interval));
+        let fresh_activity = tracker.snapshot(&fresh_spec, fresh_prov_cap);
+        assert!(fresh_activity.screenshot_png_base64.is_some(), "fresh screenshot under current generation accepted");
+        assert!(fresh_activity.webcam_jpg_base64.is_some(), "fresh webcam accepted");
+        assert_eq!(acq.screen_calls(), 2);
+        assert_eq!(acq.webcam_calls(), 2);
     }
 
     #[test]
