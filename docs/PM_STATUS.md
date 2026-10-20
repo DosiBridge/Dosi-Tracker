@@ -399,13 +399,47 @@ Following PM inspection of source at clean `2a83bc1`, documentation for `REQ-WS-
 
 ---
 
-## 7. Current Status & Next Steps
+---
+
+## 7. Bounded Engineering Phase: Authenticated HTTP Aggregate Authorization & Isolation Harness (`REQ-ISO-05`)
+
+### A. Context & Architectural Boundary
+Existing tests directly called `WorkspaceRolePermissionValueProvider.CheckAsync` or used route reflection. To verify aggregate authorization without permissive test doubles or fake downstream endpoints, an in-process HTTP integration harness was implemented:
+1. **Real In-Process HTTP Pipeline (`WorkspaceHttpAuthorizationTests.cs`)**:
+   - Dispatches real `HttpRequestMessage` instances through ASP.NET Core middleware (`UseRouting`, `UseAuthentication`, `UseWorkspaceResolution`, `UseAuthorization`) to real production `ProjectAppService` mapped endpoints.
+   - Restores actual ABP aggregate authorization in DI: `AbpAuthorizationService` + `PermissionChecker` + `WorkspaceRolePermissionValueProvider` (undoing `TrackerTestBaseModule`'s `AddAlwaysAllowAuthorization`).
+   - Uses synthetic authentication handler (`TestAuthHandler`) for test identity bearer tokens without modifying production token issuance or copying role policies.
+   - Enforces SQLite in-memory `:memory:` persistence, verifying exact entity state and zero-mutation guarantees upon authorization denials.
+2. **Boundary & Provenance Distinctions**:
+   - Synthetic authentication verifies ASP.NET Core + ABP aggregate authorization mechanics in-process; it is **NOT** a substitute for real browser cookie/session testing (`__Host-Dosi-Workspace`), Next.js server actions, or hosted OpenIddict token validation.
+   - Test-only harness configuration is used; no production behavior was broken or bypassed.
+
+### B. Execution Evidence & Provenance Boundaries
+
+| Dimension | Exact Target / Command | Tests Passed | Failed | Duration | Exit Code | Provenance |
+|---|---|:---:|:---:|:---:|:---:|---|
+| **Authenticated HTTP Harness** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~WorkspaceHttpAuthorizationTests"` | 7 | 0 | 10s | **0** | **[Worker-Reported (SQLite In-Memory In-Process HTTP)]** |
+| **Historical PM Blocked Scripts** | `qa_workspace_phase.ps1` | null | null | null | null | **[Explicitly Not Run / No Repackaging]** |
+| **Real Browser Session Acceptance** | Multi-tenant browser session & cookie verification | null | null | null | null | **[Pending Acceptance Requirement]** |
+
+#### Test Cases Covered in `EfCoreWorkspaceHttpAuthorizationTests` (7 total):
+1. `Unauthenticated_Request_To_Protected_Project_Endpoint_Is_Rejected_With_401`: Anonymous request to protected project endpoint is challenged by ASP.NET Core authorization middleware -> 401 Unauthorized (`Volo.Abp.Authorization:010001`).
+2. `Missing_Or_Empty_Workspace_Header_Is_Rejected_With_400_WorkspaceRequired`: Authenticated request with `Guid.Empty` workspace header is rejected by `WorkspaceResolutionMiddleware` -> 400 Bad Request (`Tracker:WorkspaceRequired`).
+3. `Workspace_A_Only_Caller_Spoofing_Workspace_B_Header_Is_Rejected_With_403_NotWorkspaceMember`: Authenticated caller possessing membership only in Workspace A attempting to access Workspace B via header spoofing is rejected with 403 Forbidden (`Tracker:NotWorkspaceMember`). Data read returns no data; POST mutation is rejected and leaves Workspace B database state strictly unchanged (0 projects inserted).
+4. `Member_Role_Caller_Is_Denied_Manager_Operation_By_Actual_Aggregate_Authorization`: Authenticated caller holding `Member` role in Workspace B attempts POST `/api/app/project`. Admitted into Workspace B context by middleware, but denied by actual ABP aggregate authorization (`AbpAuthorizationService` + `PermissionChecker` + `WorkspaceRolePermissionValueProvider`) -> 403 Forbidden (`Volo.Abp.Authorization:010001`). Verified SQLite DB state remains completely unchanged (0 projects inserted).
+5. `Dual_Member_Sees_Only_Selected_Workspace_Data_And_Persisted_Roles_Govern_Operations`: Caller holding distinct roles (`Manager` in A, `Member` in B) creates Project-A1 under Workspace A (permitted as Manager), queries `/api/app/project` under A -> sees only Project-A1 (never B). Under Workspace B header, queries `/api/app/project` -> sees only Project-B1 (never A). Attempting to create project under Workspace B is rejected with 403 Forbidden by role governance.
+6. `Inactive_Or_Removed_Workspace_Member_Is_Denied_With_403_NotWorkspaceMember`: Authenticated caller whose membership in target workspace is marked inactive/removed (`IsActive == false`) is rejected by `WorkspaceResolutionMiddleware` -> 403 Forbidden (`Tracker:NotWorkspaceMember`).
+7. `Legitimate_Permitted_Path_Creates_Project_In_Workspace_And_Persists_To_Database`: Authenticated caller with Manager role in target workspace creates project -> 201 Created. Directly verified in SQLite database: project record persisted with matching `WorkspaceId == wsA`, Title, and Color. Cross-workspace query isolation verified: project is invisible under foreign workspace context.
+
+---
+
+## 8. Current Status & Next Steps
 
 1. **Privacy Acceptance Pending**:
    - The privacy source audit (commit `14bbe66`) remains **Pending PM Independent Review**. This status is preserved and not bypassed.
 2. **Workspace Authorization & Isolation Phase Status**:
-   - In-process boundary integration tests (`2a83bc1`) and recipient decline lifecycle (`REQ-WS-07`) are implemented with isolated in-memory test coverage (10 SQLite tests).
-   - Aggregate authenticated HTTP/browser acceptance, multi-threaded concurrency verification, and PM independent execution of `qa_workspace_phase.ps1` remain pending.
+   - In-process boundary integration tests (`2a83bc1`), recipient decline lifecycle (`REQ-WS-07`, commit `27f7aa1`), and authenticated HTTP aggregate authorization harness (`REQ-ISO-05`) are implemented with isolated in-memory test coverage (17 SQLite tests total: 10 decline + 7 HTTP auth).
+   - Real browser cookie/session testing (`__Host-Dosi-Workspace`), multi-threaded concurrency verification, and PM independent execution of `qa_workspace_phase.ps1` remain pending.
 3. **Overall Product Incomplete**:
    - Overall product remains incomplete across:
      - Backend metric nullability schema migrations (`Activity.cs` truthful nulls vs 0)
