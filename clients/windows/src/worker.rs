@@ -43,9 +43,8 @@ use crate::state::{
     TrackerStatus, UploadState, WorkspaceChoice, RECENT_BLOCKS,
 };
 use crate::storage::{self, QueueLimits, Storage};
-use crate::tracking::screenshot::ScreenCapture;
 use crate::tracking::system::DeviceInfo;
-use crate::tracking::{BlockSpec, Tracker, MIN_BLOCK};
+use crate::tracking::{BlockSpec, ProvenanceScreenCapture, Tracker, MIN_BLOCK};
 
 use blocks::{BlockId, Blocks, FinishedBlock, Stretch};
 use control::{ControlEvent, ControlLink, ControlRequest};
@@ -189,9 +188,10 @@ pub trait Machine: Send + Sync {
     fn last_input(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>>;
     /// The user's first input after `since`, up to `now` (coming back).
     fn first_input_after(&self, since: DateTime<Utc>, now: DateTime<Utc>) -> Option<DateTime<Utc>>;
-    fn capture_screen(&self, blur: bool) -> Option<ScreenCapture>;
+    fn capture_screen(&self, blur: bool) -> Option<crate::tracking::ProvenanceScreenCapture>;
     /// Build the block's upload payload.
-    fn snapshot(&self, block: &BlockSpec<'_>, screen: Option<ScreenCapture>) -> Activity;
+    fn snapshot(&self, block: &BlockSpec<'_>, screen: Option<crate::tracking::ProvenanceScreenCapture>) -> Activity;
+
     /// The time away kept as work (CONTRACT §4).
     fn kept_idle_blocks(
         &self,
@@ -246,13 +246,14 @@ impl Machine for Tracker {
         }
     }
 
-    fn capture_screen(&self, blur: bool) -> Option<ScreenCapture> {
+    fn capture_screen(&self, blur: bool) -> Option<crate::tracking::ProvenanceScreenCapture> {
         Tracker::capture_screen(self, blur)
     }
 
-    fn snapshot(&self, block: &BlockSpec<'_>, screen: Option<ScreenCapture>) -> Activity {
+    fn snapshot(&self, block: &BlockSpec<'_>, screen: Option<crate::tracking::ProvenanceScreenCapture>) -> Activity {
         Tracker::snapshot(self, block, screen)
     }
+
 
     fn kept_idle_blocks(
         &self,
@@ -607,7 +608,7 @@ struct Worker {
 
     blocks: Blocks,
     /// Screenshots taken for blocks not finished yet.
-    screens: Vec<(BlockId, ScreenCapture)>,
+    screens: Vec<(BlockId, ProvenanceScreenCapture)>,
     sleep: SleepDetector,
     /// Tell the user when tracking starts by itself after an autostart.
     announce_autostart: bool,
@@ -930,7 +931,7 @@ impl Worker {
             let late = now - block.ended_at > LATE;
             let taken = self
                 .take_screen(block.id)
-                .filter(|capture| capture.captured_at <= block.ended_at + CAPTURE_SLACK);
+                .filter(|capture| capture.capture.captured_at <= block.ended_at + CAPTURE_SLACK);
             // Ended before its screenshot moment: taken at the end instead —
             // unless the machine is locked, asleep, idle or shutting down,
             // or screenshot permission has been withdrawn.
@@ -1021,7 +1022,7 @@ impl Worker {
         true
     }
 
-    fn take_screen(&mut self, id: BlockId) -> Option<ScreenCapture> {
+    fn take_screen(&mut self, id: BlockId) -> Option<ProvenanceScreenCapture> {
         let index = self.screens.iter().position(|(block, _)| *block == id)?;
         Some(self.screens.swap_remove(index).1)
     }

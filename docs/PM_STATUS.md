@@ -73,8 +73,9 @@ This correction introduces an injectable sensor driver foundation without archit
 | `clients/windows/src/tracking/lifecycle.rs` | Implemented platform-neutral `InputLifecycleController` and `UsageLifecycleController` with explicit queue-ready handshake, serial transitions under lock, bounded shutdown retry, truthful running state, and `Drop` cleanup; updated `NativeSensorDriver` to consume lifecycle controllers; expanded tests with 7 new synthetic lifecycle edge tests (11 total). |
 | `clients/windows/src/tracking/mod.rs` | Updated `Tracker::with_driver_and_device` and `Tracker::new_fake` to use `DeviceInfo::fixture()`; updated `apply_sensor_policy` to use `set_policy`; closed `Tracker::snapshot` bypass so `active_window::current` and `running_programs` are queried only when permitted and sampler is active. |
 | `clients/windows/src/worker/session.rs` | Evaluates effective permissions via `cfg.consent.effective_permissions`; added 3 consent tests. |
-| `clients/windows/src/worker/tests.rs` | Injected affirmative consent in `harness_at`; added task barrier in quit regression test proving sensor stop before upload wait; added `worker_fails_closed_when_consent_is_absent`; aligned `FakeMachine::is_tracking_active` with `Tracker::is_tracking_active`. |
-| `docs/PRODUCT_ACCEPTANCE.md` | Reconciled evidence levels to distinguish PM-verified tests from worker-reported tests; clarified that accumulator tests do not prove absence of raw keystrokes across the pipeline; noted fail-closed consent integration. |
+| `clients/windows/src/worker/tests.rs` | Injected affirmative consent in `harness_at`; added task barrier in quit regression test proving sensor stop before upload wait; added `worker_fails_closed_when_consent_is_absent`; aligned `FakeMachine::is_tracking_active` with `Tracker::is_tracking_active`; updated `FakeMachine` to use `ProvenanceScreenCapture`. |
+| `clients/windows/src/worker.rs` | Updated `Machine` trait and `Worker` struct to store and hand off `ProvenanceScreenCapture`, validating screenshot provenance generation against the snapshot publication era. |
+| `docs/PRODUCT_ACCEPTANCE.md` | Reconciled evidence levels to distinguish PM-verified tests from worker-reported tests; clarified that accumulator tests do not prove absence of raw keystrokes across the pipeline; noted fail-closed consent integration; updated consent and isolated regression test counts. |
 | `docs/PM_STATUS.md` | Recorded PM baselines at `18db4d5` and `8c1b201`, documented Step 1C hardening results and test provenance. |
 
 ---
@@ -202,15 +203,27 @@ At clean HEAD `cf4910d`, the PM independently inspected the diff and worker cons
    - Defect 1 resolved: `Tracker::snapshot` previously cloned authorization once at method entry and reused it across sequential provider calls. If an earlier call (`current_window`) was delayed while revocation occurred, a subsequent fresh `capture_webcam` was admitted under stale permissions. Additionally, `current_app` previously held its read guard across provider execution, risking blocking `apply_sensor_policy`.
    - Architectural resolution:
      - Every capability entry point (`capture_screen`, `snapshot`'s `window_now`, `running_programs`, `webcam_jpg_base64`, and `current_app`) performs an atomic pre-admission check under a brief read lock immediately before delegating to the provider. No single upfront snapshot is reused across steps.
-     - Read locks are NEVER held across provider calls. `apply_sensor_policy` completes unconditionally and instantaneously under write lock, advancing the authorization epoch and halting OS hook/sampler threads without being blocked.
-     - Native hardware limitation documented honestly: Synchronous OS APIs (Windows MediaFoundation, GDI/xcap, EnumWindows) cannot be cancelled mid-flight without unsafe thread aborts. However, subsequent admissions are immediately blocked (zero provider calls), and any admitted in-flight capture that finishes post-revocation is verified on exit and discarded immediately.
+     - Read locks are NEVER held across provider calls. `apply_sensor_policy` avoids authorization lock contention. IMPORTANT: `apply_sensor_policy` does NOT complete instantaneously; it synchronously posts quit messages and joins native sensor driver threads (`driver.stop_input`, `driver.stop_usage`).
+     - Native hardware limitation documented honestly: Synchronous OS APIs (Windows MediaFoundation, GDI/xcap, EnumWindows) cannot be cancelled mid-flight without unsafe thread aborts. Subsequent admissions are immediately blocked (zero provider calls), and any admitted in-flight capture that finishes post-revocation is verified on exit and discarded immediately.
    - Defect 2 resolved: `snapshot` previously checked `driver.is_usage_running()` for `running_programs`, but `apply_sensor_policy` only starts that driver for `active_window`. Process enumeration was silently skipped under a valid `running_programs=true, active_window=false` grant. Decoupled `running_programs` from the active-window driver, querying the process list based strictly on active authorization without starting disallowed foreground samplers.
-   - Added 5 new deterministic concurrency and positive process regressions (12 total isolated regressions):
-     - `tracker_consent_snapshot_interleaving_revocation_prevents_new_webcam_admission`: Proves snapshot blocked in window query during revocation drops window result and admits zero new webcam calls.
-     - `tracker_consent_process_only_positive_regression`: Proves active process-only grant queries running programs (1 call, fixture present) while usage/input drivers remain strictly stopped and zero window/camera/screen calls occur.
-     - `tracker_consent_capture_screen_race_and_revocation_prevents_subsequent_admission`: Proves in-flight screen capture during revocation is discarded on return, and subsequent call is rejected at admission.
-     - `tracker_consent_pause_and_partial_narrowing_during_snapshot`: Proves partial narrowing during multi-step snapshot admits retained capability while rejecting withdrawn webcam.
-     - `tracker_consent_no_deadlock_between_slow_provider_and_sensor_policy`: Proves `apply_sensor_policy` completes immediately without deadlocking or waiting for in-flight provider calls.
+7. **Bounded Generation-Aware Admission and Result Validation (ABA Immunity)**:
+   - Defect resolved: `TrackerAuth.epoch` was incremented on policy changes but never read by result validation checks; post-admission checks evaluated only current booleans (`auth.active && auth.perms.<cap>`). An acquisition blocked inside a provider could have consent revoked and then re-granted (ABA transition), incorrectly accepting old captures from an invalidated consent interval.
+   - Architectural resolution:
+     - Defined `CapabilityGenerations` with per-capability generation tokens: `screen`, `webcam`, `window`, and `processes`.
+     - `TrackerAuth::update(&mut self, active: bool, perms: Option<&CapturePermissions>)` advances capability generations on actual transitions: revocation (active/permitted to inactive/denied), granting (unauthorized to authorized), or tightening (blur required).
+     - Semantic generation policy preserves generations on routine unchanged policy publication (`Worker::publish` ticks), ensuring legitimate in-flight sampling is not falsely invalidated.
+     - Admission tokens captured under brief read lock at admission; post-admission validation checks `auth.generations.<cap> == token`, guaranteeing that results from invalidated intervals are discarded even if consent was re-granted prior to provider completion.
+     - Clarified admission contract: a short read-lock check followed by an unlocked provider invocation linearizes logical admission, but does not provide atomic physical provider entry with revocation. Discarding the result prevents invalidated data from entering blocks or storage; it is post-admission validation, not hardware cancellation or sensor stop.
+     - Snapshot handoff applies conservative blur across BOTH current authorization and block policy: `!(auth.perms.blur_screenshots || perms.blur_screenshots)`.
+   - Added 9 new deterministic regressions exercising production Tracker with fake drivers/acquisition (21 total isolated regressions):
+     - `tracker_consent_capture_screen_revocation_regrant_aba_rejects_old_capture_and_fresh_succeeds`: Proves blocked screen capture during revoke/regrant is rejected upon provider release, and fresh post-regrant capture succeeds.
+     - `tracker_consent_webcam_revocation_regrant_aba_rejects_old_capture_and_fresh_succeeds`: Proves blocked webcam capture during revoke/regrant is rejected upon provider release, and fresh post-regrant capture succeeds.
+     - `tracker_consent_current_app_and_snapshot_window_revocation_regrant_aba_rejected`: Proves blocked current_app and snapshot window queries during revoke/regrant are rejected upon provider release, and fresh call succeeds.
+     - `tracker_consent_running_programs_revocation_regrant_aba_rejected`: Proves blocked running_programs query during revoke/regrant is rejected upon provider release, and fresh query succeeds.
+     - `tracker_consent_unchanged_policy_republish_does_not_invalidate_in_flight_acquisition`: Proves routine unchanged policy republish does not invalidate legitimate in-flight acquisitions.
+     - `tracker_consent_final_publication_rejects_earlier_results_after_later_provider_aba`: Multi-sensor later-webcam barrier regression: gathers earlier window, process, and screen data; blocks webcam; executes ABA revoke/regrant transition before provider release; proves invalidated NEW values (window, processes, screen, webcam) are excluded at final activity assembly and `usage.record` is skipped (zero usage contamination); preserves genuinely authorized historical accumulators (keyboard hits, mouse clicks, historical window slices); and verifies fresh post-regrant acquisitions.
+     - `tracker_consent_screenshot_rejected_after_later_webcam_aba_revocation`: Proves screen capture with old generation is rejected if ABA transition occurs while webcam is blocked.
+     - `tracker_consent_screenshot_blur_tightening_during_blocked_webcam`: Proves unblurred screen capture is dropped if blur requirement is tightened while webcam is blocked.
 
 ---
 
@@ -220,14 +233,15 @@ All tests executed in `clients/windows` with `RUST_BACKTRACE=1`. Synthetic QA on
 
 | Target Suite | Exact Command Line | Tests Passed | Ignored | Time | Exit Code | Evidence Level |
 |---|---|:---:|:---:|:---:|:---:|:---:|
-| **Compilation Gate** | `cargo check --bin dosi-tracker --tests` | N/A | 0 errors, 0 warnings | 2.22s | **0** | **[Worker-Reported]** |
-| **Config & Atomic Persistence** | `cargo test --bin dosi-tracker config::tests` | 15 | 0 | 0.03s | **0** | **[Worker-Reported]** |
-| **All Consent Tests (UI+Worker+Tracker)** | `cargo test --bin dosi-tracker consent` | 48 | 0 | 0.03s | **0** | **[Worker-Reported]** |
-| **Tracking Subsystem & Boundary** | `cargo test --bin dosi-tracker tracking::tests` | 23 | 0 | 0.01s | **0** | **[Worker-Reported]** |
+| **Compilation Gate** | `cargo check --bin dosi-tracker --tests` | N/A | 0 errors, 0 warnings | 3.66s | **0** | **[Worker-Reported]** |
+| **Config & Atomic Persistence** | `cargo test --bin dosi-tracker config::tests` | 15 | 0 | 0.07s | **0** | **[Worker-Reported]** |
+| **All Consent Tests (UI+Worker+Tracker)** | `cargo test --bin dosi-tracker consent` | 57 | 0 | 0.05s | **0** | **[Worker-Reported]** |
+| **Tracker Consent Isolated Regressions** | `cargo test --bin dosi-tracker tracker_consent` | 21 | 0 | 0.02s | **0** | **[Worker-Reported]** |
+| **Tracking Subsystem & Boundary** | `cargo test --bin dosi-tracker tracking::tests` | 32 | 0 | 0.02s | **0** | **[Worker-Reported]** |
 | **Tracking Lifecycle Suite** | `cargo test --bin dosi-tracker tracking::lifecycle::tests` | 11 | 0 | 0.10s | **0** | **[Worker-Reported]** |
 | **Worker Session Suite** | `cargo test --bin dosi-tracker worker::session::tests` | 10 | 0 | 0.00s | **0** | **[Worker-Reported]** |
 | **Worker Blocks Suite** | `cargo test --bin dosi-tracker worker::blocks::tests` | 19 | 0 | 0.00s | **0** | **[Worker-Reported]** |
-| **Full Worker Test Suite** | `cargo test --bin dosi-tracker worker::tests` | 84 | 2 (e2e backend) | 2.06s | **0** | **[Worker-Reported]** |
+| **Full Worker Test Suite** | `cargo test --bin dosi-tracker worker::tests` | 84 | 2 (e2e backend) | 2.05s | **0** | **[Worker-Reported]** |
 
 #### Detailed 22-Scenario Consent Lifecycle Test Matrix (`worker::tests::consent_*`)
 1. `consent_1_fresh_config_absent`: Fresh config with `LocalConsent::Absent` yields `TrackerStatus::ConsentRequired`, 0 sensor starts, 0 running drivers.

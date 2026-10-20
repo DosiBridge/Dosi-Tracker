@@ -5,6 +5,7 @@ use chrono::FixedOffset;
 use super::control::Farewell;
 use super::*;
 use crate::config::{ConsentedPermissions, LocalConsent, MemoryConsentStore};
+use crate::tracking::screenshot::ScreenCapture;
 use crate::tracking::{build_activity, Measurements, Zone};
 
 fn utc(s: &str) -> DateTime<Utc> {
@@ -341,7 +342,7 @@ impl Machine for FakeMachine {
         self.inputs.lock().unwrap().iter().copied().filter(|t| *t > since && *t <= now).min()
     }
 
-    fn capture_screen(&self, blur: bool) -> Option<ScreenCapture> {
+    fn capture_screen(&self, blur: bool) -> Option<crate::tracking::ProvenanceScreenCapture> {
         let last_perms = self.last_perms.lock().unwrap().clone();
         let (authorized, effective_blur) = if self.is_tracking_active() {
             let perms = last_perms.unwrap_or_else(CapturePermissions::all_disabled);
@@ -353,15 +354,18 @@ impl Machine for FakeMachine {
             return None;
         }
         *self.captures.lock().unwrap() += 1;
-        Some(ScreenCapture {
-            jpeg_base64: "/9j/screen".into(),
-            thumb_jpg_base64: Some("/9j/dGh1bWI=".into()),
-            captured_at: self.now(),
-            blurred: effective_blur,
+        Some(crate::tracking::ProvenanceScreenCapture {
+            capture: ScreenCapture {
+                jpeg_base64: "/9j/screen".into(),
+                thumb_jpg_base64: Some("/9j/dGh1bWI=".into()),
+                captured_at: self.now(),
+                blurred: effective_blur,
+            },
+            generation: 1,
         })
     }
 
-    fn snapshot(&self, block: &BlockSpec<'_>, screen: Option<ScreenCapture>) -> Activity {
+    fn snapshot(&self, block: &BlockSpec<'_>, screen: Option<crate::tracking::ProvenanceScreenCapture>) -> Activity {
         self.snapshot_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if let Some(hook) = self.on_snapshot.lock().unwrap().as_ref() {
             hook();
@@ -396,7 +400,7 @@ impl Machine for FakeMachine {
             Vec::new()
         };
         let screen = if current_perms.screenshot {
-            screen.filter(|c| c.blurred || !current_perms.blur_screenshots)
+            screen.map(|sc| sc.capture).filter(|c| c.blurred || !current_perms.blur_screenshots)
         } else {
             None
         };
