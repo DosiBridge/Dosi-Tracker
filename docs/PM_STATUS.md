@@ -573,7 +573,8 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
 
 | Dimension | Exact Target / Command | Tests Passed | Failed | Duration | Exit Code | Provenance |
 |---|---|:---:|:---:|:---:|:---:|---|
-| **Workspace Archival Lifecycle Regressions** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~WorkspaceArchivalLifecycleTests"` | 9 | 0 | 17.5s | **0** | **[Worker-Reported (Hosted MVC TestServer & SQLite WAL)]** |
+| **Workspace Archival Lifecycle Regressions** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~WorkspaceArchivalLifecycleTests"` | 9 | 0 | 16.0s | **0** | **[Worker-Reported (Hosted MVC TestServer & SQLite WAL)]** |
+| **Workspace Archival Migration & Upgrade Regressions** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~WorkspaceArchivalMigrationTests"` | 7 | 0 | 7.7s | **0** | **[Worker-Reported (Migration Metadata, Npgsql DDL & Disposable SQLite Upgrade)]** |
 | **Concurrent Last-Owner Regressions** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~ConcurrentOwnerProtectionTests"` | 9 | 0 | 9.23s | **0** | **[Worker-Reported (Concurrent SQLite WAL)]** |
 | **Hosted ASP.NET Core MVC TestServer** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~EfCoreWorkspaceHttpAuthorizationTests"` | 9 | 0 | 15.6s | **0** | **[Worker-Reported (Hosted MVC TestServer & Shared SQLite)]** |
 | **Host Route & Resolution Regressions** | `dotnet test test/Dosi.Tracker.HttpApi.Host.Tests/Dosi.Tracker.HttpApi.Host.Tests.csproj` | 125 | 0 | 1.15s | **0** | **[Worker-Reported (Host Test Suite)]** |
@@ -590,6 +591,30 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
 8. `Archival_Preserves_All_Data_Memberships_Subscriptions_And_Sentinels_Without_Deletion_Or_Cancellation`: Directly verifies that members, projects, and active billing subscriptions are NOT deleted, modified, or cancelled during archival; upon restore, all sentinel data is accessible via HTTP.
 9. `Invitation_Acceptance_And_Registration_Into_Archived_Workspace_Are_Rejected_Before_Mutation`: Proves both existing user invitation acceptance (`POST /api/app/invitations/{token}/accept`) and new anonymous user registration (`_workspaceAppService.RegisterAsync`) are rejected with `Tracker:WorkspaceArchived` before any user account, membership, or database mutation occurs.
 
+### C. Reversible Archival Schema Upgrade Path (`20261020200944_AddWorkspaceArchivalFields`)
+1. **Source Evidence & Production Gap**:
+   - `Workspace.cs` mapped `IsArchived`, `ArchivedTime`, and `ArchivedBy`, and `TrackerDbContext.cs` configured index `IX_AppWorkspaces_IsArchived`.
+   - However, tracked EF Core migrations contained only `20261007185459_Initial.cs`, and `TrackerDbContextModelSnapshot.cs` lacked these three columns and index on `AppWorkspaces`.
+   - Because `EntityFrameworkCoreTrackerDbSchemaMigrator` uses `Database.MigrateAsync`, existing migrated databases would not receive the new columns without an additive migration.
+2. **Additive Migration & Model Snapshot Implementation**:
+   - Generated additive migration `20261020200944_AddWorkspaceArchivalFields.cs` with matching designer `20261020200944_AddWorkspaceArchivalFields.Designer.cs`.
+   - `Up`: Adds nullable `ArchivedBy` (uuid), nullable `ArchivedTime` (timestamp without time zone), non-null `IsArchived` (boolean, default `false`), and index `IX_AppWorkspaces_IsArchived`. Existing rows automatically receive active status (`IsArchived = false`).
+   - `Down`: Drops index and drops the three columns reversibly.
+   - Updated `TrackerDbContextModelSnapshot.cs` strictly for the `Workspace` entity block; verified zero unintended diff across other entities.
+   - Verified zero pending model drift via `dotnet ef migrations has-pending-model-changes` (exit code 0).
+3. **Rollback Data Consequences (Honest Disclosure)**:
+   - Rolling back via `Down()` executes `ALTER TABLE "AppWorkspaces" DROP COLUMN` for `IsArchived`, `ArchivedTime`, `ArchivedBy` and drops index `IX_AppWorkspaces_IsArchived`.
+   - Any workspaces that were archived will lose their archival status and audit record, reverting to unarchived upon schema rollback. All underlying workspace rows, memberships, projects, and subscriptions remain intact and are not deleted.
+   - Migration files are prepared for code review only; never apply migration or rollback directly to user/production database.
+4. **Isolated Migration Regression Suite (`WorkspaceArchivalMigrationTests.cs`, 7 tests passed)**:
+   - `Migration_Metadata_And_Attributes_Are_Correctly_Configured`: Verifies `MigrationAttribute` ID and `DbContextAttribute(typeof(TrackerDbContext))`.
+   - `Up_Operations_Add_Expected_Columns_And_Index_With_Safe_Defaults`: Verifies 4 operations (3 AddColumn, 1 CreateIndex), types, names, default `false`, and nullable audit columns.
+   - `Down_Operations_Reversibly_Drop_Archival_Columns_And_Index`: Verifies 4 operations (1 DropIndex, 3 DropColumn).
+   - `ModelSnapshot_Contains_Workspace_Archival_Properties_And_Index`: Verifies compiled snapshot metadata.
+   - `Generated_PostgreSql_Up_Ddl_Contains_Non_Destructive_Alter_Table_And_Index`: Verifies PostgreSQL DDL generated by `NpgsqlMigrationsSqlGenerator` contains non-destructive `ALTER TABLE "AppWorkspaces" ADD "IsArchived" boolean NOT NULL DEFAULT FALSE;`, `ArchivedTime timestamp without time zone`, `ArchivedBy uuid`, and `CREATE INDEX "IX_AppWorkspaces_IsArchived"`.
+   - `Generated_PostgreSql_Down_Ddl_Reversibly_Drops_Columns_And_Index`: Verifies PostgreSQL Down DDL drops index and drops columns.
+   - `Disposable_Baseline_To_Current_Upgrade_Preserves_Existing_Data_With_Active_Defaults`: Creates a disposable SQLite schema representing unmigrated baseline model, inserts active seeded workspaces with projects, memberships, subscriptions, applies `Up` migration operations, queries existing workspaces via EF Core, confirms existing workspaces have `IsArchived == false` and nullable audit fields null, proves active operations still work, archives workspace via EF Core, verifies index and persistence, and asserts SQLite's expected provider boundary on DropColumn (`NotSupportedException` without rebuild).
+
 ---
 
 ## 10. Current Status & Next Steps
@@ -597,13 +622,17 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
 1. **Privacy Acceptance Pending**:
    - The privacy source audit (commit `14bbe66`) remains **Pending PM Independent Review**. This status is preserved and not bypassed.
 2. **Workspace Lifecycle, Authorization & Concurrency Status**:
-   - Reversible owner-controlled workspace archival (`REQ-WS-08`), concurrent last-owner protection (`REQ-WS-06`), recipient decline lifecycle (`REQ-WS-07`), and hosted ASP.NET Core `TestServer` MVC aggregate authorization harness (`REQ-ISO-05`) are fully implemented and verified via isolated regressions (37 SQLite tests total: 9 archival lifecycle + 9 concurrent owner protection + 9 hosted MVC auth + 10 decline).
+   - Reversible owner-controlled workspace archival (`REQ-WS-08`), concurrent last-owner protection (`REQ-WS-06`), recipient decline lifecycle (`REQ-WS-07`), and hosted ASP.NET Core `TestServer` MVC aggregate authorization harness (`REQ-ISO-05`) are fully implemented and verified via isolated regressions (44 SQLite tests total: 9 archival lifecycle + 7 archival migration/upgrade + 9 concurrent owner protection + 9 hosted MVC auth + 10 decline).
    - Real browser cookie/session testing (`__Host-Dosi-Workspace`), Next.js server actions, OpenIddict token issuer, provider-backed multi-connection transactional commit proof (PostgreSQL/SQL Server), multi-node distributed lock infrastructure (Redis), and PM independent execution of `qa_workspace_phase.ps1` remain pending. All reported outcomes are worker-executed, not independent PM QA.
-3. **Remaining Lifecycle Gaps**:
+3. **Execution Limits & Evidence Boundaries**:
+   - Disposable SQLite baseline-to-current upgrade fixture proves migration logic and baseline row preservation with default states, but does NOT replace execution on a real PostgreSQL cluster; no live user/production database was modified.
+   - The archival lifecycle fixture disables Unit of Work transactions due to SQLite locking constraints (`AddAlwaysDisableUnitOfWorkTransaction()`).
+   - Registration rejection in tests is verified via direct service invocation (`RegisterWithInvitationAsync`), not hosted anonymous HTTP.
+4. **Remaining Lifecycle Gaps**:
    - Destructive permanent deletion, retention grace-period enforcement, automated billing subscription cancellation/downgrades, and frontend UI workspace archive/restore management actions remain deferred acceptance gaps.
-4. **Overall Product Incomplete**:
+5. **Overall Product Incomplete**:
    - Full product remains incomplete across backend metric nullability schema migrations (`Activity.cs` truthful nulls vs 0), desktop offline ingestion queue hardening, platform-native interactive client runtimes, code signing, and hosted operational deployment.
-5. **Awaiting PM Guidance**:
+6. **Awaiting PM Guidance**:
    - Bounded task complete. Stop and hand off for PM review with exact diff and test evidence.
 
 

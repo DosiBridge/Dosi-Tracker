@@ -707,6 +707,12 @@ namespace Dosi.Tracker.Migrations
                     b.Property<Guid>("Id")
                         .HasColumnType("uuid");
 
+                    b.Property<Guid?>("ArchivedBy")
+                        .HasColumnType("uuid");
+
+                    b.Property<DateTime?>("ArchivedTime")
+                        .HasColumnType("timestamp without time zone");
+
                     b.Property<string>("ConcurrencyStamp")
                         .IsConcurrencyToken()
                         .IsRequired()
@@ -727,6 +733,11 @@ namespace Dosi.Tracker.Migrations
                         .HasColumnType("text")
                         .HasColumnName("ExtraProperties");
 
+                    b.Property<bool>("IsArchived")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("boolean")
+                        .HasDefaultValue(false);
+
                     b.Property<DateTime?>("LastModificationTime")
                         .HasColumnType("timestamp without time zone")
                         .HasColumnName("LastModificationTime");
@@ -746,6 +757,8 @@ namespace Dosi.Tracker.Migrations
                         .HasColumnType("character varying(64)");
 
                     b.HasKey("Id");
+
+                    b.HasIndex("IsArchived");
 
                     b.HasIndex("NormalizedName")
                         .IsUnique();
