@@ -27,51 +27,12 @@ using Xunit;
 namespace Dosi.Tracker.Security;
 
 /// <summary>
-/// Mirrors ABP's test authorization service while honoring the caller's active role in the current workspace.
-/// </summary>
-public class WorkspaceRoleAwareAuthorizationService : IAbpAuthorizationService
-{
-    private readonly ICurrentPrincipalAccessor _currentPrincipalAccessor;
-    private readonly ICurrentWorkspace _currentWorkspace;
-
-    public WorkspaceRoleAwareAuthorizationService(
-        IServiceProvider serviceProvider,
-        ICurrentPrincipalAccessor currentPrincipalAccessor,
-        ICurrentWorkspace currentWorkspace)
-    {
-        ServiceProvider = serviceProvider;
-        _currentPrincipalAccessor = currentPrincipalAccessor;
-        _currentWorkspace = currentWorkspace;
-    }
-
-    public IServiceProvider ServiceProvider { get; }
-    public ClaimsPrincipal CurrentPrincipal => _currentPrincipalAccessor.Principal;
-
-    public Task<AuthorizationResult> AuthorizeAsync(
-        ClaimsPrincipal user, object? resource, IEnumerable<IAuthorizationRequirement> requirements)
-    {
-        return Task.FromResult(AuthorizationResult.Success());
-    }
-
-    public Task<AuthorizationResult> AuthorizeAsync(ClaimsPrincipal user, object? resource, string policyName)
-    {
-        var role = _currentWorkspace.Role;
-        if (string.IsNullOrEmpty(role))
-        {
-            return Task.FromResult(AuthorizationResult.Success());
-        }
-
-        var granted = WorkspaceRoles.PermissionsOf(role);
-        return Task.FromResult(granted.Contains(policyName)
-            ? AuthorizationResult.Success()
-            : AuthorizationResult.Failed());
-    }
-}
-
-/// <summary>
-/// REQ-ISO-01 & REQ-ISO-05: Multi-workspace server-side authorization and data isolation.
-/// Proves that an authenticated caller in Workspace A cannot access, mutate, or leak resources
-/// owned by Workspace B, and verifies dual-membership role/context switching.
+/// REQ-ISO-01: EF Core Entity Query Scoping & Repository Data Isolation.
+/// Verifies that EF Core's IWorkspaceScoped global query filters and repository queries
+/// restrict entity retrieval, modification, deletion, and cross-entity references strictly
+/// to the active workspace ambiently set on ICurrentWorkspace.
+/// NOTE: This suite tests data/query isolation under ambient context; HTTP header-to-role
+/// admission and production permission checks are exercised in WorkspaceResolutionIntegrationTests.
 /// </summary>
 public abstract class CrossWorkspaceIsolationTests<TStartupModule> : TrackerApplicationTestBase<TStartupModule>
     where TStartupModule : IAbpModule
@@ -112,12 +73,6 @@ public abstract class CrossWorkspaceIsolationTests<TStartupModule> : TrackerAppl
         _guidGenerator = GetRequiredService<IGuidGenerator>();
         _principalAccessor = GetRequiredService<ICurrentPrincipalAccessor>();
         _userManager = GetRequiredService<IdentityUserManager>();
-    }
-
-    protected override void AfterAddApplication(IServiceCollection services)
-    {
-        services.Replace(ServiceDescriptor.Singleton<IAuthorizationService, WorkspaceRoleAwareAuthorizationService>());
-        services.Replace(ServiceDescriptor.Singleton<IAbpAuthorizationService, WorkspaceRoleAwareAuthorizationService>());
     }
 
     private IDisposable ActAs(Guid userId)
@@ -309,47 +264,29 @@ public abstract class CrossWorkspaceIsolationTests<TStartupModule> : TrackerAppl
     }
 
     [Fact]
-    public async Task Dual_Member_Role_And_Data_Context_Switching()
+    public async Task Dual_Member_Data_Context_Switching_Excludes_Foreign_Workspace_Data()
     {
         var (wsA, wsB, projA, projB, _, _) = await SeedTwoWorkspacesAsync();
 
-        // DualUser is Owner in Workspace A, but plain Member in Workspace B
         await ServiceProvider.AddWorkspaceMemberAsync(DualUser, WorkspaceRoles.Owner, wsA);
         await ServiceProvider.AddWorkspaceMemberAsync(DualUser, WorkspaceRoles.Member, wsB);
 
         using (ActAs(DualUser))
         {
-            // Under Workspace A context: User has Owner privileges
+            // Under Workspace A context: Project A visible, Project B invisible
             using (_currentWorkspace.Change(wsA, WorkspaceRoles.Owner))
             {
-                var created = await _projectAppService.CreateAsync(new CreateUpdateProjectDto
-                {
-                    Title = "DualUser Owned Project in A",
-                    Color = "#006bff",
-                    IntervalMinutes = 10
-                });
-                created.ShouldNotBeNull();
-                created.Title.ShouldBe("DualUser Owned Project in A");
-
                 var listA = await _projectAppService.GetListAsync(new PagedAndSortedResultRequestDto());
                 listA.Items.Any(p => p.Id == projA).ShouldBeTrue();
-                listA.Items.Any(p => p.Id == projB).ShouldBeFalse();
+                listA.Items.Any(p => p.Id == projB).ShouldBeFalse("Workspace B project must never leak into Workspace A context");
             }
 
-            // Switch context to Workspace B: User has only Member privileges
+            // Switch context to Workspace B: Project B visible, Project A invisible
             using (_currentWorkspace.Change(wsB, WorkspaceRoles.Member))
             {
-                // Creating a project requires Projects.Create permission (held by Manager/Owner, NOT by Member)
-                await Should.ThrowAsync<AbpAuthorizationException>(() => _projectAppService.CreateAsync(new CreateUpdateProjectDto
-                {
-                    Title = "Unauthorized Project in B",
-                    Color = "#006bff",
-                    IntervalMinutes = 10
-                }));
-
-                // Project A must NOT be visible under Workspace B context
                 var listB = await _projectAppService.GetListAsync(new PagedAndSortedResultRequestDto());
-                listB.Items.Any(p => p.Id == projA).ShouldBeFalse();
+                listB.Items.Any(p => p.Id == projA).ShouldBeFalse("Workspace A project must never leak into Workspace B context");
+                listB.Items.Any(p => p.Id == projB).ShouldBeTrue();
             }
         }
     }

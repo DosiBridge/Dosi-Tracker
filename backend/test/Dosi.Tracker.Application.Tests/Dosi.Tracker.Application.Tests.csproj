@@ -9,6 +9,14 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="..\..\src\Dosi.Tracker.HttpApi.Host\Workspaces\WorkspaceResolution.cs" Link="Workspaces\Host\WorkspaceResolution.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\..\src\Dosi.Tracker.Application\Dosi.Tracker.Application.csproj" />
     <ProjectReference Include="..\Dosi.Tracker.Domain.Tests\Dosi.Tracker.Domain.Tests.csproj" />
   </ItemGroup>

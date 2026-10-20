@@ -9,6 +9,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\..\src\Dosi.Tracker.EntityFrameworkCore\Dosi.Tracker.EntityFrameworkCore.csproj" />
     <ProjectReference Include="..\Dosi.Tracker.Application.Tests\Dosi.Tracker.Application.Tests.csproj" />
   </ItemGroup>

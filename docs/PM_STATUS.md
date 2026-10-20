@@ -298,32 +298,44 @@ All tests executed in `clients/windows` with `RUST_BACKTRACE=1`. Synthetic QA on
 
 ## 5. Bounded Engineering Phase: Multi-Workspace Server-Side Authorization & Data Isolation
 
-### A. Context & Concrete Source Gap
+### A. Context & Concrete Source Hardening
 Under the renewed product mission, an end-to-end trace from authenticated identity -> workspace resolution header -> repository scope was audited:
-1. **Source-Proven Resolution Defect (`WorkspaceResolution.cs`)**:
+1. **Header Validation Hardening (`WorkspaceResolution.cs`)**:
    - `WorkspaceResolutionMiddleware` previously parsed `X-Workspace-Id` with `Guid.TryParse(rawHeader, out var workspaceId)`. When a caller provided `Guid.Empty` (`00000000-0000-0000-0000-000000000000`), `TryParse` succeeded.
-   - As a result, `CurrentWorkspace.Id` was bound to `Guid.Empty`.
-   - In `TrackerDbContext.cs` (`ApplyAbpConceptsForAddedEntity`), a check `scoped.WorkspaceId == Guid.Empty` checked `CurrentWorkspaceId ?? throw ...`, which with `Guid.Empty` resulted in records retaining `Guid.Empty`.
-   - **Fix Implemented**: Updated `WorkspaceResolutionMiddleware` to require `Guid.TryParse(...) && workspaceId != Guid.Empty`, rejecting empty GUID headers immediately with `400 Bad Request` and error code `Tracker:WorkspaceRequired`.
-2. **Comprehensive Negative Cross-Workspace Isolation Test Suite (`CrossWorkspaceIsolationTests.cs`)**:
-   - Implemented abstract in-process test fixture `CrossWorkspaceIsolationTests<TStartupModule>` and concrete EF Core SQLite in-memory binding `EfCoreCrossWorkspaceIsolationTests` covering 10 distinct negative isolation and role-switching dimensions:
+   - An authenticated caller was subsequently checked against `WorkspaceRoleLookup.FindRoleAsync(Guid.Empty, userId)`. Because no membership record has `WorkspaceId == Guid.Empty`, lookup returned `null`, writing `403 Forbidden` (`Tracker:NotWorkspaceMember`). It did **NOT** reach `CurrentWorkspace.Change(workspaceId, role)` or bind `CurrentWorkspace.Id` to `Guid.Empty`.
+   - **Hardening Implemented**: Updated `WorkspaceResolutionMiddleware` to require `Guid.TryParse(...) && workspaceId != Guid.Empty`, rejecting empty GUID headers immediately with `400 Bad Request` and error code `Tracker:WorkspaceRequired`. This is input validation hardening preventing an unnecessary database round-trip for a known invalid workspace ID, not a cross-tenant exploit.
+2. **EF Core Repository & Query Filter Data Isolation Suite (`CrossWorkspaceIsolationTests.cs`)**:
+   - **Scope**: Evaluates EF Core `IWorkspaceScoped` global query filters, repository queries, and cross-entity references under ambient `ICurrentWorkspace.Change` context (`REQ-ISO-01`).
+   - The test double `WorkspaceRoleAwareAuthorizationService` was removed so that replacement test policies are not substituted for production authorization enforcement.
+   - Tests:
      - `Caller_In_Workspace_A_Cannot_Get_Project_Owned_By_Workspace_B`: Throws `EntityNotFoundException`.
      - `Caller_In_Workspace_A_Cannot_Update_Project_Owned_By_Workspace_B`: Throws `EntityNotFoundException`.
-     - `Caller_In_Workspace_A_Cannot_Delete_Project_Owned_By_Workspace_B`: Deletion across tenant is a no-op; foreign project remains intact in Workspace B.
+     - `Caller_In_Workspace_A_Cannot_Delete_Project_Owned_By_Workspace_B`: Foreign delete is a no-op; project remains intact in Workspace B.
      - `Caller_In_Workspace_A_Project_List_Does_Not_Leak_Workspace_B_Projects`: Workspace B projects excluded from Workspace A list.
      - `Caller_In_Workspace_A_Cannot_Upload_Activity_To_Project_In_Workspace_B`: Throws `BusinessException(TrackerDomainErrorCodes.NotProjectMember)`.
      - `Caller_In_Workspace_A_Cannot_Access_Screenshot_Content_Owned_By_Workspace_B`: Throws `EntityNotFoundException`.
-     - `Caller_In_Workspace_A_Cannot_See_Or_Remove_Workspace_B_Team_Members`: Roster query excludes foreign members; cross-workspace removal fails with `TrackerDomainErrorCodes.InvalidUser`.
-     - `Caller_In_Workspace_A_Heartbeat_Does_Not_Attach_To_Workspace_B_Project`: Ingests heartbeat in Workspace A, but ProjectId is clamped to null.
-     - `Dual_Member_Role_And_Data_Context_Switching`: Verifies a user holding Owner in WS-A and Member in WS-B is granted project creation in WS-A, but denied project creation with `AbpAuthorizationException` in WS-B, with zero project list leakage across context switch.
-     - `WorkspaceRoleLookup_Trace_Direct_Repository_Check`: Direct unit test of `WorkspaceRoleLookup.FindRoleAsync` proving role lookup matches active membership, returns null for non-member, and returns null for `Guid.Empty`.
+     - `Caller_In_Workspace_A_Cannot_See_Or_Remove_Workspace_B_Team_Members`: Foreign members excluded from roster; removal fails with `TrackerDomainErrorCodes.InvalidUser`.
+     - `Caller_In_Workspace_A_Heartbeat_Does_Not_Attach_To_Workspace_B_Project`: Presence recorded in Workspace A, but ProjectId clamped to null.
+     - `Dual_Member_Data_Context_Switching_Excludes_Foreign_Workspace_Data`: Verifies data context isolation across switches (under WS-A, only Project A is listed; under WS-B, only Project B is listed).
+     - `WorkspaceRoleLookup_Trace_Direct_Repository_Check`: Direct repository check proving role lookup matches active membership, returns null for non-member, and returns null for `Guid.Empty`.
+3. **Focused Production-Boundary Integration Harness (`WorkspaceResolutionIntegrationTests.cs`)**:
+   - **Scope**: In-process integration harness composing actual `WorkspaceResolutionMiddleware` + real `WorkspaceRoleLookup` (querying SQLite `:memory:` membership) + actual production `WorkspaceRolePermissionValueProvider` (registered in ABP `TrackerDomainModule`).
+   - Uses synthetic claims (`ClaimsPrincipal` with `AbpClaimTypes.UserId`) and SQLite `:memory:` without test doubles or replacement authorization services.
+   - Tests:
+     - `A_Only_Caller_Spoofing_Workspace_B_Is_Rejected_With_403_Before_Downstream`: Rejects cross-workspace spoofing with `403 Forbidden` (`Tracker:NotWorkspaceMember`) and halts pipeline before downstream execution.
+     - `Legitimate_Dual_Member_Owner_In_A_Vs_Member_In_B_Uses_Real_Production_Permissions`: Resolves real role from SQLite membership; verifies real `WorkspaceRolePermissionValueProvider` grants Owner permissions (`Projects.Create`, `Billing.Default`, `Projects.Delete`) under Workspace A, and denies them under Workspace B.
+     - `Missing_Or_Unknown_Workspace_Membership_Is_Denied_With_403_Before_Downstream`: Denies unknown workspace IDs with 403 before downstream.
+     - `Empty_Guid_Workspace_Header_Is_Refused_With_400_Validation_Before_Downstream`: Refuses empty GUID with 400 before downstream.
+     - `Anonymous_Caller_With_Workspace_Header_Leaves_Workspace_Unset`: Leaves workspace unset when unauthenticated.
 
-### B. Execution Evidence & Test Counts
+### B. Execution Evidence & Provenance Boundaries
 
-| Test Suite | Exact Command Line | Tests Passed | Failed | Duration | Exit Code | Provenance |
+| Dimension | Exact Target / Command | Tests Passed | Failed | Duration | Exit Code | Provenance |
 |---|---|:---:|:---:|:---:|:---:|---|
-| **Host Resolution Unit Tests** | `dotnet test test/Dosi.Tracker.HttpApi.Host.Tests/Dosi.Tracker.HttpApi.Host.Tests.csproj` | 117 | 0 | 0.76s | **0** | **[Worker-Reported]** |
-| **EF Core Cross-Workspace Isolation** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~CrossWorkspaceIsolationTests"` | 10 | 0 | 9.0s | **0** | **[Worker-Reported]** |
+| **Compilation Gate** | `dotnet build backend/test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj` | N/A | 0 errors, 27 warnings | 10.53s | **0** | **[Worker-Reported (Build)]** |
+| **Host Unit Regressions** | `dotnet test test/Dosi.Tracker.HttpApi.Host.Tests/Dosi.Tracker.HttpApi.Host.Tests.csproj` | 117 | 0 | 0.76s | **0** | **[Worker-Reported @ 39dc149]** |
+| **Independent PM Execution (`qa_workspace_phase.ps1`)** | Filtered `WorkspaceResolutionTests` & `EfCoreCrossWorkspaceIsolationTests` | null | null | null | null | **[Approval-Pending / Explicitly Not Run]** |
+| **New Integration Harness Execution** | `EfCoreWorkspaceResolutionIntegrationTests` & updated `EfCoreCrossWorkspaceIsolationTests` | null | null | null | null | **[Approval-Pending / Explicitly Not Run]** |
 
 ---
 
@@ -331,15 +343,17 @@ Under the renewed product mission, an end-to-end trace from authenticated identi
 
 1. **Privacy Acceptance Pending**:
    - The privacy source audit (commit `14bbe66`) remains **Pending PM Independent Review**. This status is preserved and not bypassed.
-2. **Overall Product Incomplete**:
-   - While multi-workspace negative tenant isolation and header resolution are now verified with automated regression tests, the overall product remains incomplete across:
-     - Backend metric nullability schema migrations (`Activity.cs` truthful nulls)
+2. **Acceptance Gap Maintained (`REQ-ISO-05`)**:
+   - While the in-process integration harness composition (`WorkspaceResolutionIntegrationTests`) verifies server-side middleware admission, SQLite membership lookup, and production permission evaluation, end-to-end authenticated HTTP browser session testing (Next.js server actions, session cookies, and client browser requests) remains an open acceptance requirement.
+3. **Overall Product Incomplete**:
+   - The overall product remains incomplete across:
+     - Backend metric nullability schema migrations (`Activity.cs` truthful nulls vs 0)
      - Desktop offline ingestion queue hardening & data retention policies
      - Platform-native interactive client runtimes (macOS Swift, Linux client)
      - Production packaging, Authenticode/Apple Developer ID code signing, and installer pipelines
      - Real monitoring, production databases, and hosted operational deployment
-3. **Awaiting PM Guidance**:
-   - Stop and hand off for PM review. PM will inspect this result and designate the next safe, bounded engineering phase.
+4. **Awaiting PM Guidance**:
+   - Stop and hand off for PM review with exact diff and test admission boundaries. PM will inspect this result and designate the next safe, bounded engineering phase.
 
 
 
