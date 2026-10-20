@@ -701,24 +701,73 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
 
 ---
 
-## 10. Current Status & Next Steps
+## 10. REQ-DAT-02: Authenticated Workspace-Scoped Activity CSV Export (Bounded Full-Product Slice)
+
+1. **Architecture & Conventions**:
+   - Implemented via conventional hosted HTTP endpoint: `GET /api/app/activity/export` (`ActivityExportController.cs`), backed by `IActivityAppService.ExportCsvAsync` in `ActivityAppService.cs` and RFC 4180 serialization in `CsvExportHelper.cs`.
+   - Contracts: `ExportActivitiesInput.cs` (query parameters: `From`, `To`, `ProjectId`, `UserId`, `MaxResultCount`) and `ActivityExportResultDto.cs` (binary payload, UTF-8 content type `text/csv; charset=utf-8`, attachment filename, `TotalCount`, `ExportedCount`).
+   - Domain Shared: `ExportExceedsLimit = "Tracker:ExportExceedsLimit"` in `TrackerDomainErrorCodes.cs`, localized in `en.json`, and mapped to HTTP 400 `BadRequest` in `TrackerHttpApiModule.cs`.
+
+2. **Server-Enforced Authorization & Scoping**:
+   - Enforced by `ICurrentWorkspace.GetId()`: fail-closed if missing (400 `Tracker:WorkspaceRequired`).
+   - Enforced by `ICurrentUser.GetId()`.
+   - Role-based visibility via production `WorkspaceRolePermissionValueProvider`:
+     * Regular members can export only their own activities.
+     * Owners and Managers holding `Tracker.Activities.ViewAll` can view all workspace activities or filter by `UserId`.
+     * If a regular member supplies `UserId != currentUserId`, request is rejected with 403 Forbidden.
+     * If a caller supplies `ProjectId` belonging to another workspace, query filter restricts project lookup and returns 404 NotFound.
+     * Spoofed foreign workspace header (`X-Workspace-Id`) rejected with 403 `Tracker:NotWorkspaceMember`.
+     * Same-user A+B switching respects workspace-specific roles and visibility (verified via `DualUser` with Owner role in Workspace A and Member role in Workspace B).
+
+3. **Column Contract & Truthful Metrics**:
+   - Minimal stable column schema: `ActivityId,UserId,ProjectId,ProjectTitle,StartedAtUtc,EndedAtUtc,DurationMinutes,DurationSeconds,Description,Productivity,IdleSeconds,MouseClicks,KeyboardHits`.
+   - Omits sensitive captures/blob URLs, raw window titles, hourly pay rates, and extraneous PII fields.
+   - Unavailable values remain blank (`""`), never inventing measured zeros (`0`) for missing metrics.
+
+4. **CSV Escaping & Formula Injection Neutralization**:
+   - RFC 4180 compliant: fields containing commas, double quotes, or newlines are wrapped in double quotes; double quotes are escaped by doubling (`""`).
+   - Spreadsheet formula injection defense: fields starting with `=, +, -, @, \t, \r, |` (including leading whitespace/control variants) are prefixed with a single quote (`'`).
+
+5. **Server-Enforced Date Bounds & Workload Limits**:
+   - Date validation: `To >= From` and date span `<= 366` days (`Tracker:ReportRangeInvalid`).
+   - Server-enforced output ceiling: `MaxAllowedResultCount = 10000`.
+   - Candidate overflow protection: if the candidate count exceeds the requested or system maximum, the endpoint explicitly rejects the request with HTTP 400 `Tracker:ExportExceedsLimit` rather than returning a deceptively complete-looking partial/truncated export.
+
+6. **Isolated Regression Evidence**:
+   - Hosted ASP.NET Core `TestServer` regression suite with isolated SQLite database: `backend/test/Dosi.Tracker.EntityFrameworkCore.Tests/EntityFrameworkCore/Applications/Activities/WorkspaceActivityExportHttpTests.cs`.
+   - 7 test scenarios (7 passed, exit 0, repeated twice):
+     1. `Authorized_Workspace_Owner_Exports_Csv_With_Headers_And_Data`: Verifies 200 OK, `text/csv; charset=utf-8`, `attachment; filename=...`, `X-Total-Count`, `X-Exported-Count`, stable column contract, and exact data fields.
+     2. `A_Only_Caller_Denied_B_With_Seeded_Foreign_Sentinel`: Verifies 403 Forbidden on spoofed header; Workspace B sentinel remains untouched.
+     3. `Same_User_A_And_B_Switching_Respects_Workspace_Specific_Roles_And_Data`: Verifies same user with Owner role in A sees all activities and with Member role in B sees only own activity.
+     4. `Regular_Member_Attempting_Other_User_Or_Foreign_Project_Filter_Is_Rejected`: Verifies 403 Forbidden when member filters by other user, and 404 NotFound when member filters by foreign workspace project.
+     5. `Missing_Or_Empty_Workspace_Header_Is_Rejected_With_400_WorkspaceRequired`: Verifies 400 BadRequest with code `Tracker:WorkspaceRequired` on missing or `Guid.Empty` header.
+     6. `Malformed_Or_Out_Of_Bounds_Dates_And_Oversize_Workload_Are_Rejected`: Verifies 400 BadRequest for reversed dates, excessive span (> 366 days), oversize MaxResultCount (> 10000), and candidate overflow past limit (`Tracker:ExportExceedsLimit`).
+     7. `Csv_Escapes_Special_Characters_And_Neutralizes_Formula_Injection_While_Keeping_Unavailable_Values_Blank`: Verifies quotes doubling, newline handling, formula prefixing (`=`, `+`, `@`, `\t`), and blank unavailable metrics.
+
+7. **Operational Limitations & Remaining Gaps**:
+   - **Async Bulk/Capture Export Gap**: Asynchronous background jobs, multi-file capture packaging, and zip archiving are deferred; this slice delivers synchronous workspace-scoped activity/time CSV export.
+   - **Signed Public URLs Gap**: Temporary signed URLs (e.g. S3 presigned URLs) are not generated; CSV is streamed directly over authenticated session.
+   - **Disaster Recovery Gap**: Automated database dump/restore and disaster recovery runbooks remain deferred.
+   - **Frontend UI Gap**: Next.js export buttons and modal dialogs are deferred.
+
+---
+
+## 11. Current Status & Next Steps
 
 1. **Privacy Acceptance Pending**:
    - The privacy source audit (commit `14bbe66`) remains **Pending PM Independent Review**. This status is preserved and not bypassed.
-2. **Workspace Lifecycle, Authorization & Concurrency Status**:
-   - Reversible owner-controlled workspace archival (`REQ-WS-08`), concurrent last-owner protection (`REQ-WS-06`), recipient decline lifecycle (`REQ-WS-07`), hosted ASP.NET Core `TestServer` MVC aggregate authorization harness (`REQ-ISO-05`), and workspace-isolated capture retention lifecycle safe first slice (`REQ-DAT-01`) are implemented and verified via isolated regressions (67 SQLite tests total: 20 capture retention + 9 archival lifecycle + 10 archival migration/upgrade + 9 concurrent owner protection + 9 hosted MVC auth + 10 decline).
-   - Real browser cookie/session testing (`__Host-Dosi-Workspace`), Next.js server actions, OpenIddict token issuer, provider-backed multi-connection transactional commit proof (PostgreSQL/SQL Server), multi-node distributed lock infrastructure (Redis), and PM independent execution of `qa_workspace_phase.ps1` remain pending. All reported outcomes are worker-executed, not independent PM QA.
+2. **Workspace Lifecycle, Authorization, Retention & Export Status**:
+   - Reversible owner-controlled workspace archival (`REQ-WS-08`), concurrent last-owner protection (`REQ-WS-06`), recipient decline lifecycle (`REQ-WS-07`), hosted ASP.NET Core `TestServer` MVC aggregate authorization harness (`REQ-ISO-05`), workspace-isolated capture retention lifecycle safe first slice (`REQ-DAT-01`), and authenticated workspace-scoped activity CSV export (`REQ-DAT-02`) are implemented and verified via isolated regressions (74 SQLite tests total: 7 activity export + 20 capture retention + 9 archival lifecycle + 10 archival migration/upgrade + 9 concurrent owner protection + 9 hosted MVC auth + 10 decline).
+   - Real browser cookie/session testing (`__Host-Dosi-Workspace`), Next.js server actions, OpenIddict token issuer, provider-backed multi-connection transactional commit proof (PostgreSQL/SQL Server), multi-node distributed lock infrastructure (Redis), and PM independent execution remain pending. All reported outcomes are worker-executed, not independent PM QA.
 3. **Execution Limits & Evidence Boundaries**:
-   - Disposable SQLite baseline-to-current upgrades (both operation-level and tracked migrator) prove migration logic, history discovery, and baseline row preservation with default states on SQLite, but do NOT replace execution on a real PostgreSQL cluster; no live user/production database was modified.
-   - The archival lifecycle fixture disables Unit of Work transactions due to SQLite locking constraints (`AddAlwaysDisableUnitOfWorkTransaction()`).
-   - Registration rejection in tests is verified via direct service invocation (`RegisterWithInvitationAsync`), not hosted anonymous HTTP.
-   - Capture retention tests use disposable SQLite in-memory and synthetic in-memory `ScriptedBlobProvider` without real images, AWS S3, or Cloudflare R2 connections.
-4. **Remaining Lifecycle Gaps**:
-   - Destructive permanent deletion, retention grace-period enforcement, automated billing subscription cancellation/downgrades, 1-year activity summary pruning, and frontend UI workspace archive/restore/retention management actions remain deferred acceptance gaps.
+   - TestServer regressions prove conventional MVC routing, aggregate permission checks, fail-closed workspace scoping, CSV formula neutralization, and server limits on in-memory SQLite, but do NOT replace execution on a real PostgreSQL cluster; no live user/production database was modified.
+   - Retention defaults remain disabled (`IsEnabled = false`); no cleanup was executed against user DB or real object storage.
+4. **Remaining Backlog Gaps**:
+   - Asynchronous export background worker, screenshot zip archive, signed download URLs, disaster recovery / automated backup procedures, frontend UI export actions, 1-year activity summary pruning, and permanent deletion remain deferred acceptance gaps.
 5. **Overall Product Incomplete**:
    - Full product remains incomplete across backend metric nullability schema migrations (`Activity.cs` truthful nulls vs 0), desktop offline ingestion queue hardening, platform-native interactive client runtimes, code signing, and hosted operational deployment.
 6. **Awaiting PM Guidance**:
-   - Single bounded REQ-DAT-01 capture retention first slice complete. Stop and hand off for PM review with exact diff and test evidence.
+   - Single bounded REQ-DAT-02 authenticated activity CSV export full-product slice complete. Stop and hand off for PM review with exact diff and test evidence.
 
 
 

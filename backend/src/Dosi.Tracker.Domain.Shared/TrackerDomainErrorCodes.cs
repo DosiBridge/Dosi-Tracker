@@ -39,4 +39,5 @@ public static class TrackerDomainErrorCodes
     public const string InvitationExpired = "Tracker:InvitationExpired";
     public const string InvitationEmailMismatch = "Tracker:InvitationEmailMismatch";
     public const string AlreadyWorkspaceMember = "Tracker:AlreadyWorkspaceMember";
+    public const string ExportExceedsLimit = "Tracker:ExportExceedsLimit";
 }

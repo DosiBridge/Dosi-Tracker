@@ -19,6 +19,14 @@ namespace Dosi.Tracker.EntityFrameworkCore.Applications;
 )]
 public class TrackerHttpApiServerTestModule : AbpModule
 {
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        PreConfigure<IMvcBuilder>(mvcBuilder =>
+        {
+            mvcBuilder.AddApplicationPartIfNotExists(typeof(TrackerHttpApiModule).Assembly);
+        });
+    }
+
     public override void ConfigureServices(ServiceConfigurationContext context)
     {
         Configure<AbpAspNetCoreMvcOptions>(options =>

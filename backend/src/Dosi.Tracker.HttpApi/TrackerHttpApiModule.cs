@@ -82,6 +82,7 @@ public class TrackerHttpApiModule : AbpModule
             options.Map(TrackerDomainErrorCodes.InvitationExpired, HttpStatusCode.Gone);
             options.Map(TrackerDomainErrorCodes.InvitationEmailMismatch, HttpStatusCode.Forbidden);
             options.Map(TrackerDomainErrorCodes.AlreadyWorkspaceMember, HttpStatusCode.Conflict);
+            options.Map(TrackerDomainErrorCodes.ExportExceedsLimit, HttpStatusCode.BadRequest);
         });
     }
 }

@@ -47,6 +47,7 @@
     "Tracker:InvitationNotFound": "This invitation does not exist.",
     "Tracker:InvitationExpired": "This invitation has expired or was already used.",
     "Tracker:InvitationEmailMismatch": "This invitation was sent to a different email address.",
-    "Tracker:AlreadyWorkspaceMember": "This person is already a member of the workspace."
+    "Tracker:AlreadyWorkspaceMember": "This person is already a member of the workspace.",
+    "Tracker:ExportExceedsLimit": "The requested export exceeds the maximum limit of {limit} records (found {totalCount}). Please narrow your date range or filters."
   }
 }

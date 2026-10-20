@@ -835,4 +835,115 @@ public class ActivityAppService : TrackerAppService, IActivityAppService
             .OrderBy(c => c.Kind, StringComparer.Ordinal)
             .ThenBy(c => c.Id)
             .ToList();
+
+    [RemoteService(IsEnabled = false)]
+    public async Task<ActivityExportResultDto> ExportCsvAsync(ExportActivitiesInput input)
+    {
+        var currentWorkspaceId = CurrentWorkspace.GetId();
+        var callerId = CurrentUser.GetId();
+
+        // 1. Validate date bounds if provided
+        if (input.From.HasValue && input.To.HasValue)
+        {
+            var fromUtc = AgentContextNormalizer.AsUtc(input.From.Value);
+            var toUtc = AgentContextNormalizer.AsUtc(input.To.Value);
+            if (toUtc <= fromUtc || toUtc - fromUtc > TimeSpan.FromDays(ExportActivitiesInput.MaxRangeDays))
+            {
+                throw new BusinessException(TrackerDomainErrorCodes.ReportRangeInvalid)
+                    .WithData("maxDays", ExportActivitiesInput.MaxRangeDays);
+            }
+        }
+
+        // 2. Validate maximum workload limit
+        if (input.MaxResultCount.HasValue && (input.MaxResultCount.Value <= 0 || input.MaxResultCount.Value > ExportActivitiesInput.MaxAllowedResultCount))
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.ExportExceedsLimit)
+                .WithData("limit", ExportActivitiesInput.MaxAllowedResultCount);
+        }
+        var limit = input.MaxResultCount ?? ExportActivitiesInput.DefaultMaxResultCount;
+
+        // 3. Authorization and User filtering
+        var canViewAll = await AuthorizationService.IsGrantedAsync(TrackerPermissions.Activities.ViewAll);
+        if (!canViewAll)
+        {
+            if (input.UserId.HasValue && input.UserId.Value != callerId)
+            {
+                throw new AbpAuthorizationException("Regular members cannot export other members' activities.");
+            }
+        }
+
+        // 4. Project validation within current workspace
+        if (input.ProjectId.HasValue)
+        {
+            var project = await _projectRepository.FindAsync(input.ProjectId.Value);
+            if (project == null || project.WorkspaceId != currentWorkspaceId)
+            {
+                throw new EntityNotFoundException(typeof(Project), input.ProjectId.Value);
+            }
+        }
+
+        // 5. Build Scoped Query
+        var query = await _activityRepository.GetQueryableAsync();
+
+        if (canViewAll)
+        {
+            if (input.UserId.HasValue)
+            {
+                query = query.Where(a => a.UserId == input.UserId.Value);
+            }
+        }
+        else
+        {
+            query = query.Where(a => a.UserId == callerId);
+        }
+
+        if (input.ProjectId.HasValue)
+        {
+            query = query.Where(a => a.ProjectId == input.ProjectId.Value);
+        }
+
+        if (input.From.HasValue)
+        {
+            var fromUtc = AgentContextNormalizer.AsUtc(input.From.Value);
+            query = query.Where(a => a.StartedAt >= fromUtc);
+        }
+
+        if (input.To.HasValue)
+        {
+            var toUtc = AgentContextNormalizer.AsUtc(input.To.Value);
+            query = query.Where(a => a.StartedAt < toUtc);
+        }
+
+        // 6. Strict server-enforced workload limit (reject oversize/truncation)
+        var totalCount = await AsyncExecuter.CountAsync(query);
+        if (totalCount > limit)
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.ExportExceedsLimit)
+                .WithData("totalCount", totalCount)
+                .WithData("limit", limit);
+        }
+
+        // 7. Load activities ordered deterministically
+        var activities = await AsyncExecuter.ToListAsync(
+            query.OrderByDescending(a => a.StartedAt).ThenByDescending(a => a.Id)
+        );
+
+        // 8. Load project titles
+        var projectIds = activities.Select(a => a.ProjectId).Distinct().ToList();
+        var projects = (await _projectRepository.GetListAsync(p => projectIds.Contains(p.Id)))
+            .ToDictionary(p => p.Id, p => p.Title);
+
+        // 9. Format CSV
+        var csvBytes = CsvExportHelper.BuildActivitiesCsv(activities, projects);
+        var fileName = $"activities-{currentWorkspaceId:N}-{DateTime.UtcNow:yyyyMMddHHmmss}.csv";
+
+        return new ActivityExportResultDto
+        {
+            Bytes = csvBytes,
+            ContentType = "text/csv; charset=utf-8",
+            FileName = fileName,
+            TotalCount = totalCount,
+            ExportedCount = activities.Count
+        };
+    }
 }

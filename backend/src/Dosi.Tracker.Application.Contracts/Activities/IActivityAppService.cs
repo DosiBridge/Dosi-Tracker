@@ -19,4 +19,9 @@ public interface IActivityAppService : IApplicationService
     /// <summary>Changes the task note of a block (<c>PUT /api/app/activity/{id}/note</c>): allowed for the block's
     /// owner within 30 days of its start, and for callers with the Tracker.Team.Manage permission.</summary>
     Task<ActivityDto> UpdateNoteAsync(Guid id, UpdateActivityNoteDto input);
+
+    /// <summary>
+    /// Exports workspace activities to CSV within authorized scope and server-enforced bounds.
+    /// </summary>
+    Task<ActivityExportResultDto> ExportCsvAsync(ExportActivitiesInput input);
 }
