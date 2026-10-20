@@ -42,6 +42,9 @@ namespace Dosi.Tracker.EntityFrameworkCore.Applications.Activities;
 /// 11. Canonical blob key validation rejecting arbitrary/caller-supplied paths.
 /// 12. Default-disabled worker no side effects.
 /// 13. Enabled worker sweeping active workspaces and skipping archived.
+/// 14. Cross-workspace inconsistent Activity reference fails closed without deleting blob or metadata.
+/// 15. Exact-key negative regressions rejecting sibling, nested, unknown kind, case-folded, and unsupported format.
+/// 16. Legitimate screen/thumb/webcam kinds and .jpg/.png format variants clean up successfully.
 /// </summary>
 [Collection(TrackerTestConsts.CollectionDefinitionName)]
 public class WorkspaceCaptureRetentionTests : TrackerEntityFrameworkCoreTestBase
@@ -114,16 +117,51 @@ public class WorkspaceCaptureRetentionTests : TrackerEntityFrameworkCoreTestBase
         return (wsId, projId, actId);
     }
 
+    private async Task<Guid> SeedActivityInWorkspaceAsync(Guid workspaceId, Guid projectId, DateTime? startedAt = null)
+    {
+        var actId = _guidGenerator.Create();
+        var start = startedAt ?? _clock.Now.AddDays(-50);
+
+        await WithUnitOfWorkAsync(async () =>
+        {
+            using (DataFilter.Disable<IWorkspaceScoped>())
+            {
+                var activity = new Activity(
+                    id: actId,
+                    workspaceId: workspaceId,
+                    userId: TestUserId,
+                    projectId: projectId,
+                    clientActivityId: _guidGenerator.Create(),
+                    startedAt: start,
+                    endedAt: start.AddMinutes(10))
+                {
+                    Productivity = 88,
+                    MouseClicks = 250,
+                    KeyboardHits = 600,
+                    ActiveWindowsJson = "[\"Code.exe\"]",
+                    RunningProgramsJson = "[\"devenv.exe\"]",
+                    TimelineJson = "[{\"m\":0,\"k\":60}]"
+                };
+
+                await _activityRepository.InsertAsync(activity, autoSave: true);
+            }
+        });
+
+        return actId;
+    }
+
     private async Task<Screenshot> SeedScreenshotAsync(
         Guid workspaceId,
         Guid activityId,
         string kind,
         DateTime capturedAt,
         string? customStorageUrl = null,
-        byte[]? syntheticBytes = null)
+        byte[]? syntheticBytes = null,
+        string contentType = "image/jpeg")
     {
         var id = _guidGenerator.Create();
-        var storageUrl = customStorageUrl ?? $"activities/{activityId}/{kind}.jpg";
+        var ext = contentType == "image/png" ? ".png" : ".jpg";
+        var storageUrl = customStorageUrl ?? $"activities/{activityId:D}/{kind}{ext}";
         var screenshot = new Screenshot(
             id: id,
             workspaceId: workspaceId,
@@ -131,7 +169,7 @@ public class WorkspaceCaptureRetentionTests : TrackerEntityFrameworkCoreTestBase
             storageUrl: storageUrl,
             capturedAt: capturedAt,
             sizeBytes: syntheticBytes?.Length ?? 1024,
-            contentType: "image/jpeg",
+            contentType: contentType,
             kind: kind);
 
         await WithUnitOfWorkAsync(async () =>
@@ -362,16 +400,19 @@ public class WorkspaceCaptureRetentionTests : TrackerEntityFrameworkCoreTestBase
     [Fact]
     public async Task Bounded_Batching_And_HasMore_Convergence_On_Repeat_Execution()
     {
-        // Arrange: 5 expired screenshots in Workspace A with batch size = 2
-        var (wsA, _, actA) = await SeedWorkspaceAndActivityAsync("RET-BATCH-A");
+        // Arrange: 5 expired screenshots across distinct synthetic activities in Workspace A with batch size = 2
+        var (wsA, projA, actA) = await SeedWorkspaceAndActivityAsync("RET-BATCH-A");
         var baseTime = _clock.Now.AddDays(-50);
 
-        var list = new List<Screenshot>();
-        for (int i = 0; i < 5; i++)
+        var list = new List<Screenshot>
         {
-            var sc = await SeedScreenshotAsync(
-                wsA, actA, Screenshot.ScreenKind, baseTime.AddMinutes(i),
-                customStorageUrl: $"activities/{actA}/screen_{i}.jpg");
+            await SeedScreenshotAsync(wsA, actA, Screenshot.ScreenKind, baseTime)
+        };
+
+        for (int i = 1; i < 5; i++)
+        {
+            var nextActId = await SeedActivityInWorkspaceAsync(wsA, projA, startedAt: baseTime.AddMinutes(i * 15));
+            var sc = await SeedScreenshotAsync(wsA, nextActId, Screenshot.ScreenKind, baseTime.AddMinutes(i * 15 + 1));
             list.Add(sc);
         }
 
@@ -476,11 +517,15 @@ public class WorkspaceCaptureRetentionTests : TrackerEntityFrameworkCoreTestBase
         _blobProvider.Blobs.ContainsKey(sc.StorageUrl).ShouldBeFalse();
     }
 
+    /// <summary>
+    /// Note: Manual removal of a fake blob in this test is modeled missing-blob recovery,
+    /// NOT an injected real DB commit failure.
+    /// Scenario: Blob was deleted in a previous execution before a crash prevented DB commit.
+    /// On retry, the blob is already missing, so the service safely cleans the DB row.
+    /// </summary>
     [Fact]
     public async Task Database_Failure_After_Blob_Deletion_Converges_Honestly_On_Retry()
     {
-        // Scenario: Blob was deleted in a previous execution before a crash prevented DB commit.
-        // On retry, the blob is already missing, so the service safely cleans the DB row.
         var (wsA, _, actA) = await SeedWorkspaceAndActivityAsync("RET-CRASH-A");
         var sc = await SeedScreenshotAsync(wsA, actA, Screenshot.ScreenKind, _clock.Now.AddDays(-40));
 
@@ -518,6 +563,7 @@ public class WorkspaceCaptureRetentionTests : TrackerEntityFrameworkCoreTestBase
         var sc2 = await SeedScreenshotAsync(wsA, actA, Screenshot.ScreenKind, expiredTime, customStorageUrl: mismatchedKindUrl);
         var sc3 = await SeedScreenshotAsync(wsA, actA, Screenshot.ScreenKind, expiredTime, customStorageUrl: externalUrl);
 
+        var initialDeleteCount = _blobProvider.DeleteCount;
         var policy = new CaptureRetentionPolicy(wsA, TimeSpan.FromDays(30));
 
         // Act
@@ -526,6 +572,7 @@ public class WorkspaceCaptureRetentionTests : TrackerEntityFrameworkCoreTestBase
         // Assert: rejected by canonical validator; 0 deletions, blobs untouched
         result.CorruptKeyCount.ShouldBe(3);
         result.DeletedCount.ShouldBe(0);
+        (_blobProvider.DeleteCount - initialDeleteCount).ShouldBe(0);
 
         _blobProvider.Blobs.ContainsKey(traversalUrl).ShouldBeTrue();
         _blobProvider.Blobs.ContainsKey(mismatchedKindUrl).ShouldBeTrue();
@@ -613,5 +660,194 @@ public class WorkspaceCaptureRetentionTests : TrackerEntityFrameworkCoreTestBase
             (await _screenshotRepository.FindAsync(scB.Id)).ShouldNotBeNull();
         }
         _blobProvider.Blobs.ContainsKey(scB.StorageUrl).ShouldBeTrue();
+    }
+
+    [Fact]
+    public async Task Cross_Workspace_Inconsistent_Activity_Reference_Fails_Closed_Without_Deleting_Blob_Or_Metadata()
+    {
+        // Arrange:
+        // Genuine Workspace B with its own activity, capture, and blob.
+        var (wsB, _, actB) = await SeedWorkspaceAndActivityAsync("RET-INCONSISTENT-B");
+        var expiredTime = _clock.Now.AddDays(-40);
+        var scB = await SeedScreenshotAsync(wsB, actB, Screenshot.ScreenKind, expiredTime);
+
+        // Genuine Workspace A with its own activity.
+        var (wsA, _, actA) = await SeedWorkspaceAndActivityAsync("RET-INCONSISTENT-A");
+
+        // Corrupt row in Workspace A: Screenshot.WorkspaceId = wsA, but references actB and actB's canonical blob key!
+        // Note: EF Core schema allows this because FK_AppScreenshots_AppActivities_ActivityId only enforces that
+        // actB exists in AppActivities, with no composite constraint on (WorkspaceId, ActivityId).
+        var corruptUrl = $"activities/{actB:D}/screen.jpg";
+        var corruptScreenshot = await SeedScreenshotAsync(
+            wsA, actB, Screenshot.ScreenKind, expiredTime, customStorageUrl: corruptUrl);
+
+        var initialDeleteCount = _blobProvider.DeleteCount;
+        var policyA = new CaptureRetentionPolicy(wsA, TimeSpan.FromDays(30));
+
+        // Act: Run retention for Workspace A
+        var result = await _retentionService.CleanExpiredCapturesAsync(policyA);
+
+        // Assert:
+        // 1. Service fails closed: identifies corrupt ownership, rejects mutation
+        result.CorruptKeyCount.ShouldBe(1);
+        result.DeletedCount.ShouldBe(0);
+
+        // 2. Zero blob provider delete invocations occurred
+        (_blobProvider.DeleteCount - initialDeleteCount).ShouldBe(0);
+
+        // 3. Workspace B's blob remains intact in storage
+        _blobProvider.Blobs.ContainsKey(scB.StorageUrl).ShouldBeTrue();
+
+        // 4. Workspace B's DB row and Activity remain intact
+        using (DataFilter.Disable<IWorkspaceScoped>())
+        {
+            var bInDb = await _screenshotRepository.FindAsync(scB.Id);
+            bInDb.ShouldNotBeNull();
+            bInDb.WorkspaceId.ShouldBe(wsB);
+            bInDb.ActivityId.ShouldBe(actB);
+
+            var actBInDb = await _activityRepository.FindAsync(actB);
+            actBInDb.ShouldNotBeNull();
+            actBInDb.WorkspaceId.ShouldBe(wsB);
+
+            // 5. Corrupt Workspace A metadata row is NOT deleted (fail closed without deleting metadata)
+            var corruptInDb = await _screenshotRepository.FindAsync(corruptScreenshot.Id);
+            corruptInDb.ShouldNotBeNull();
+            corruptInDb.WorkspaceId.ShouldBe(wsA);
+        }
+    }
+
+    [Fact]
+    public async Task Exact_Key_Negative_Regressions_Reject_Sibling_Nested_UnknownKind_CaseFolded_And_UnsupportedFormat()
+    {
+        var (wsA, _, actA) = await SeedWorkspaceAndActivityAsync("RET-EXACT-KEYS-A");
+        var expiredTime = _clock.Now.AddDays(-40);
+
+        // Unit-level checks on CaptureRetentionService.IsCanonicalStorageUrl
+        // 1. Sibling suffix (e.g. screen-other.jpg, screen_0.jpg)
+        CaptureRetentionService.IsCanonicalStorageUrl($"activities/{actA:D}/screen-other.jpg", actA, Screenshot.ScreenKind).ShouldBeFalse();
+        CaptureRetentionService.IsCanonicalStorageUrl($"activities/{actA:D}/screen_0.jpg", actA, Screenshot.ScreenKind).ShouldBeFalse();
+
+        // 2. Nested directory segments
+        CaptureRetentionService.IsCanonicalStorageUrl($"activities/{actA:D}/screen/nested.jpg", actA, Screenshot.ScreenKind).ShouldBeFalse();
+        CaptureRetentionService.IsCanonicalStorageUrl($"activities/{actA:D}/nested/screen.jpg", actA, Screenshot.ScreenKind).ShouldBeFalse();
+
+        // 3. Unknown capture kind
+        CaptureRetentionService.IsCanonicalStorageUrl($"activities/{actA:D}/audio.jpg", actA, "audio").ShouldBeFalse();
+        CaptureRetentionService.IsCanonicalStorageUrl($"activities/{actA:D}/video.mp4", actA, "video").ShouldBeFalse();
+
+        // 4. Case folded prefix or kind or extension
+        CaptureRetentionService.IsCanonicalStorageUrl($"Activities/{actA:D}/screen.jpg", actA, Screenshot.ScreenKind).ShouldBeFalse();
+        CaptureRetentionService.IsCanonicalStorageUrl($"ACTIVITIES/{actA:D}/screen.jpg", actA, Screenshot.ScreenKind).ShouldBeFalse();
+        CaptureRetentionService.IsCanonicalStorageUrl($"activities/{actA:D}/SCREEN.jpg", actA, Screenshot.ScreenKind).ShouldBeFalse();
+        CaptureRetentionService.IsCanonicalStorageUrl($"activities/{actA:D}/screen.JPG", actA, Screenshot.ScreenKind).ShouldBeFalse();
+        CaptureRetentionService.IsCanonicalStorageUrl($"activities/{actA:D}/screen.PNG", actA, Screenshot.ScreenKind).ShouldBeFalse();
+
+        // 5. Unsupported format
+        CaptureRetentionService.IsCanonicalStorageUrl($"activities/{actA:D}/screen.bmp", actA, Screenshot.ScreenKind).ShouldBeFalse();
+        CaptureRetentionService.IsCanonicalStorageUrl($"activities/{actA:D}/screen.webp", actA, Screenshot.ScreenKind).ShouldBeFalse();
+        CaptureRetentionService.IsCanonicalStorageUrl($"activities/{actA:D}/screen.gif", actA, Screenshot.ScreenKind).ShouldBeFalse();
+
+        // Service-level execution: seed these non-canonical rows into DB and assert persisted rows and provider operations
+        var badUrls = new[]
+        {
+            $"activities/{actA:D}/screen-other.jpg",
+            $"activities/{actA:D}/screen/nested.jpg",
+            $"activities/{actA:D}/audio.jpg",
+            $"Activities/{actA:D}/screen.jpg",
+            $"activities/{actA:D}/screen.webp"
+        };
+
+        var badScreenshots = new List<Screenshot>();
+        foreach (var url in badUrls)
+        {
+            var kind = url.Contains("audio") ? "audio" : Screenshot.ScreenKind;
+            badScreenshots.Add(await SeedScreenshotAsync(wsA, actA, kind, expiredTime, customStorageUrl: url));
+        }
+
+        var initialDeleteCount = _blobProvider.DeleteCount;
+        var policy = new CaptureRetentionPolicy(wsA, TimeSpan.FromDays(30));
+
+        // Act
+        var result = await _retentionService.CleanExpiredCapturesAsync(policy);
+
+        // Assert: all rejected, 0 deleted
+        result.CorruptKeyCount.ShouldBe(badUrls.Length);
+        result.DeletedCount.ShouldBe(0);
+        (_blobProvider.DeleteCount - initialDeleteCount).ShouldBe(0);
+
+        // Blobs and DB rows remain completely untouched
+        using (DataFilter.Disable<IWorkspaceScoped>())
+        {
+            foreach (var sc in badScreenshots)
+            {
+                (await _screenshotRepository.FindAsync(sc.Id)).ShouldNotBeNull();
+                _blobProvider.Blobs.ContainsKey(sc.StorageUrl).ShouldBeTrue();
+            }
+        }
+    }
+
+    [Fact]
+    public async Task Legitimate_Capture_Kinds_And_Format_Variants_Clean_Up_Successfully()
+    {
+        // Tests all legitimate combinations supported by the writer:
+        // Kinds: "screen", "thumb", "webcam"
+        // Extensions: ".jpg" (image/jpeg), ".png" (image/png)
+        var (wsA, projA, actA) = await SeedWorkspaceAndActivityAsync("RET-LEGIT-A");
+        var expiredTime = _clock.Now.AddDays(-40);
+
+        var variants = new (string Kind, string ContentType, string Ext)[]
+        {
+            (Screenshot.ScreenKind, "image/jpeg", ".jpg"),
+            (Screenshot.ScreenKind, "image/png", ".png"),
+            (Screenshot.ThumbKind, "image/jpeg", ".jpg"),
+            (Screenshot.ThumbKind, "image/png", ".png"),
+            (Screenshot.WebcamKind, "image/jpeg", ".jpg"),
+            (Screenshot.WebcamKind, "image/png", ".png")
+        };
+
+        var seededScreenshots = new List<Screenshot>();
+        for (int i = 0; i < variants.Length; i++)
+        {
+            var variant = variants[i];
+            // Each combination on a distinct synthetic activity
+            var actId = i == 0 ? actA : await SeedActivityInWorkspaceAsync(wsA, projA, startedAt: expiredTime.AddHours(-i));
+            var canonicalUrl = $"activities/{actId:D}/{variant.Kind}{variant.Ext}";
+
+            // Verify helper boolean first
+            CaptureRetentionService.IsCanonicalStorageUrl(canonicalUrl, actId, variant.Kind).ShouldBeTrue();
+
+            var sc = await SeedScreenshotAsync(
+                wsA, actId, variant.Kind, expiredTime.AddMinutes(-i),
+                customStorageUrl: canonicalUrl,
+                contentType: variant.ContentType);
+            seededScreenshots.Add(sc);
+        }
+
+        var initialDeleteCount = _blobProvider.DeleteCount;
+        var policy = new CaptureRetentionPolicy(wsA, TimeSpan.FromDays(30));
+
+        // Act
+        var result = await _retentionService.CleanExpiredCapturesAsync(policy);
+
+        // Assert: all 6 cleaned cleanly
+        result.CandidateCount.ShouldBe(variants.Length);
+        result.DeletedCount.ShouldBe(variants.Length);
+        result.CorruptKeyCount.ShouldBe(0);
+        result.FailedBlobCount.ShouldBe(0);
+        result.MissingBlobCount.ShouldBe(0);
+
+        // Provider delete count increased by exactly 6
+        (_blobProvider.DeleteCount - initialDeleteCount).ShouldBe(variants.Length);
+
+        // Database and storage assertions
+        using (DataFilter.Disable<IWorkspaceScoped>())
+        {
+            foreach (var sc in seededScreenshots)
+            {
+                (await _screenshotRepository.FindAsync(sc.Id)).ShouldBeNull();
+                _blobProvider.Blobs.ContainsKey(sc.StorageUrl).ShouldBeFalse();
+            }
+        }
     }
 }

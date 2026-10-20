@@ -30,6 +30,7 @@ namespace Dosi.Tracker.Activities.Retention;
 public class CaptureRetentionService : ICaptureRetentionService, ITransientDependency
 {
     private readonly IRepository<Screenshot, Guid> _screenshotRepository;
+    private readonly IRepository<Activity, Guid> _activityRepository;
     private readonly IRepository<Workspace, Guid> _workspaceRepository;
     private readonly IBlobContainer _blobContainer;
     private readonly IUnitOfWorkManager _unitOfWorkManager;
@@ -40,6 +41,7 @@ public class CaptureRetentionService : ICaptureRetentionService, ITransientDepen
 
     public CaptureRetentionService(
         IRepository<Screenshot, Guid> screenshotRepository,
+        IRepository<Activity, Guid> activityRepository,
         IRepository<Workspace, Guid> workspaceRepository,
         IBlobContainer blobContainer,
         IUnitOfWorkManager unitOfWorkManager,
@@ -49,6 +51,7 @@ public class CaptureRetentionService : ICaptureRetentionService, ITransientDepen
         ILogger<CaptureRetentionService> logger)
     {
         _screenshotRepository = screenshotRepository;
+        _activityRepository = activityRepository;
         _workspaceRepository = workspaceRepository;
         _blobContainer = blobContainer;
         _unitOfWorkManager = unitOfWorkManager;
@@ -74,6 +77,7 @@ public class CaptureRetentionService : ICaptureRetentionService, ITransientDepen
 
         // Read phase: verify workspace and query candidates under a single read Unit of Work
         List<Screenshot> candidateList;
+        Dictionary<Guid, Activity> activitiesById;
         using (var readUow = _unitOfWorkManager.Begin(requiresNew: true))
         using (_dataFilter.Disable<IWorkspaceScoped>())
         {
@@ -119,6 +123,21 @@ public class CaptureRetentionService : ICaptureRetentionService, ITransientDepen
                 .Take(policy.BatchSize + 1);
 
             candidateList = await _asyncExecuter.ToListAsync(query, cancellationToken);
+
+            var batchActivityIds = candidateList.Take(policy.BatchSize).Select(s => s.ActivityId).Distinct().ToList();
+            if (batchActivityIds.Count > 0)
+            {
+                // Verify that referenced activities exist and belong to the explicit policy workspace
+                var activities = await _activityRepository.GetListAsync(
+                    a => batchActivityIds.Contains(a.Id) && a.WorkspaceId == policy.WorkspaceId,
+                    cancellationToken: cancellationToken);
+                activitiesById = activities.ToDictionary(a => a.Id);
+            }
+            else
+            {
+                activitiesById = new Dictionary<Guid, Activity>();
+            }
+
             await readUow.CompleteAsync(cancellationToken);
         }
 
@@ -150,7 +169,19 @@ public class CaptureRetentionService : ICaptureRetentionService, ITransientDepen
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            // Enforce canonical blob ownership / key convention
+            // 1. Prove referenced Activity belongs to the explicit policy workspace (fail closed on inconsistent/missing ownership)
+            if (!activitiesById.TryGetValue(screenshot.ActivityId, out var activity) ||
+                activity.WorkspaceId != policy.WorkspaceId ||
+                screenshot.WorkspaceId != policy.WorkspaceId)
+            {
+                _logger.LogWarning(
+                    "Screenshot {ScreenshotId} in workspace {WorkspaceId} references Activity {ActivityId} with inconsistent or missing workspace ownership. Failing closed without deleting blob or metadata.",
+                    screenshot.Id, screenshot.WorkspaceId, screenshot.ActivityId);
+                corruptKeyCount++;
+                continue;
+            }
+
+            // 2. Enforce canonical blob ownership / key convention
             if (!IsCanonicalStorageUrl(screenshot.StorageUrl, screenshot.ActivityId, screenshot.Kind))
             {
                 _logger.LogWarning(
@@ -229,9 +260,27 @@ public class CaptureRetentionService : ICaptureRetentionService, ITransientDepen
         };
     }
 
+    private static readonly HashSet<string> KnownCaptureKinds = new(StringComparer.Ordinal)
+    {
+        Screenshot.ScreenKind,
+        Screenshot.ThumbKind,
+        Screenshot.WebcamKind
+    };
+
+    private static readonly HashSet<string> SupportedExtensions = new(StringComparer.Ordinal)
+    {
+        ".jpg",
+        ".png"
+    };
+
     /// <summary>
     /// Canonical blob key convention: activities/{activityId}/{kind}{extension}
-    /// Rejects arbitrary URLs, filesystem paths, path traversal, or mismatched activity/kind bindings.
+    /// Enforces exact writer-compatible format:
+    /// 1. activityId must be a valid non-empty Guid.
+    /// 2. kind must be a known capture kind ("screen", "thumb", "webcam").
+    /// 3. storageUrl must strictly equal $"activities/{activityId:D}/{kind}{extension}"
+    ///    where extension is strictly ".jpg" or ".png".
+    /// 4. Case-sensitive (Ordinal), rejecting path traversal, nested directory segments, sibling suffixes, or case folding.
     /// </summary>
     public static bool IsCanonicalStorageUrl(string? storageUrl, Guid activityId, string? kind)
     {
@@ -240,25 +289,39 @@ public class CaptureRetentionService : ICaptureRetentionService, ITransientDepen
             return false;
         }
 
-        var expectedPrefix = $"activities/{activityId}/";
-        if (!storageUrl.StartsWith(expectedPrefix, StringComparison.OrdinalIgnoreCase))
+        if (!KnownCaptureKinds.Contains(kind))
         {
             return false;
         }
 
-        // Prohibit path traversal or directory manipulation
-        if (storageUrl.Contains("..") || storageUrl.Contains('\\'))
+        var expectedPrefix = $"activities/{activityId:D}/";
+        if (!storageUrl.StartsWith(expectedPrefix, StringComparison.Ordinal))
         {
             return false;
         }
 
         var fileName = storageUrl.Substring(expectedPrefix.Length);
-        if (!fileName.StartsWith(kind, StringComparison.OrdinalIgnoreCase))
+
+        // Reject nested directory separators or path traversal
+        if (fileName.Contains('/') || fileName.Contains('\\') || fileName.Contains(".."))
         {
             return false;
         }
 
-        return true;
+        // Filename must start with kind using exact ordinal comparison
+        if (!fileName.StartsWith(kind, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var extension = fileName.Substring(kind.Length);
+        if (!SupportedExtensions.Contains(extension))
+        {
+            return false;
+        }
+
+        var canonicalKey = $"{expectedPrefix}{kind}{extension}";
+        return string.Equals(storageUrl, canonicalKey, StringComparison.Ordinal);
     }
 
     private static bool IsBlobNotFoundException(Exception ex)

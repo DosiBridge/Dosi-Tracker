@@ -24,6 +24,9 @@ public sealed class ScriptedBlobProvider : BlobProviderBase
 
     private int _deleteCount;
 
+    /// <summary>Number of times DeleteAsync was invoked on this provider.</summary>
+    public int DeleteCount => Volatile.Read(ref _deleteCount);
+
     /// <summary>Called with the 1-based number of the delete and the blob name, before the blob is removed.</summary>
     public Func<int, string, Task>? BeforeDelete { get; set; }
 
