@@ -43,4 +43,7 @@ public interface IWorkspaceAppService : IApplicationService
 
     /// <summary><c>POST /api/app/invitations/{token}/accept</c>: the caller's email must be the invited one.</summary>
     Task<AcceptInvitationResultDto> AcceptInvitationAsync(string token);
+
+    /// <summary><c>POST /api/app/invitations/{token}/decline</c>: the authenticated caller's email must match the invited one.</summary>
+    Task DeclineInvitationAsync(string token);
 }

@@ -55,9 +55,12 @@ Every backlog item and verification check in this specification is categorized u
   - *Code:* `backend/.../WorkspaceAppService.cs` (`LeaveAsync`), `backend/.../TeamAppService.cs` (`UpdateWorkspaceRoleAsync`, `RemoveFromWorkspaceAsync`).
   - *Evidence Level:* **[Worker-Reported]** (EF Core `EfCoreWorkspaceAppServiceTests`, `TeamOwnerRulesTests`).
 - **REQ-WS-07: Workspace Invitation Expiry, Revocation & Decline**
-  - *Requirement:* Invitations must enforce cryptographic token expiry (e.g., 7 days). Inviters and admins can explicitly revoke pending invitations. Recipients can decline invitations without joining.
-  - *Code:* `backend/.../WorkspaceAppService.cs`, `backend/.../TeamAppService.cs`.
-  - *Evidence Level:* **[Not Implemented / Backlog Gap]** (Accept flow present; decline, revocation, and TTL expiry endpoints open).
+  - *Requirement:* Invitations must enforce cryptographic token expiry (e.g., 7 days). Inviters and admins can explicitly revoke pending invitations. Authenticated recipients can decline invitations without joining or requiring prior membership.
+  - *Code:*
+    - Expiry & TTL: `backend/.../WorkspaceInvitation.cs` (`ExpiresAt`, `IsUsable(Clock.Now)`), `TeamAppService.cs` (`Clock.Now.AddDays(...)`) — pre-existing in baseline source.
+    - Admin Revocation: `backend/.../TeamAppService.cs` (`ITeamAppService.DeleteInvitationAsync`, scoped lookup by invitation ID + `CurrentWorkspace.Id`) — pre-existing in baseline source.
+    - Recipient Decline: `backend/.../WorkspaceAppService.cs` (`DeclineInvitationAsync`), `backend/.../Controllers/WorkspacesController.cs` (`POST /api/app/invitations/{token}/decline`) — authenticated recipient verified via identity email `invitation.IsFor(user.Email)` with schema-free pending row invalidation.
+  - *Evidence Level:* **[Worker-Reported (Component / EF Core In-Memory)]** (`EfCoreInvitationDeclineTests` 9 passed, `ContractRoutesTests` 40 passed, `api-contract.test.ts` 30 passed). Real end-to-end authenticated HTTP/browser acceptance remains open.
 - **REQ-WS-08: Safe Workspace Archive, Deletion & Settings Governance**
   - *Requirement:* Workspace Owners can archive or safely schedule deletion with confirmation and a retention grace period. Deletion must be blocked if active billing subscriptions or un-archived member data exist. Workspace settings changes must be audited.
   - *Code:* `backend/.../WorkspaceAppService.cs`.
@@ -190,7 +193,7 @@ Every backlog item and verification check in this specification is categorized u
 | **REQ-WS-04** | Frontend | `session-provider.tsx` | `npx vitest run src/test/integration/tenant-switching.test.tsx` | **[Verified by PM @ 18db4d5]** (8 passed) | Browser navigation URL sync |
 | **REQ-WS-05** | Backend | `TeamAppService.cs` | `dotnet test --filter TeamMembershipLifecycleTests` | **[Worker-Reported]** | Real SMTP invitation email delivery |
 | **REQ-WS-06** | Backend | `WorkspaceAppService.cs` | `dotnet test --filter EfCoreWorkspaceAppServiceTests` | **[Worker-Reported]** | Frontend leave-workspace confirmation modal |
-| **REQ-WS-07** | Backend | `WorkspaceAppService.cs` | Endpoints for decline, revoke, TTL | **[Not Implemented]** | Token expiry & decline endpoints |
+| **REQ-WS-07** | Backend / API | `WorkspaceAppService.cs`, `WorkspacesController.cs`, `TeamAppService.cs` | `dotnet test --filter InvitationDeclineTests` (9 passed), `ContractRoutesTests` (40 passed), `api-contract.test.ts` (30 passed) | **[Worker-Reported (Component)]** | Expiry & admin revoke pre-exist in source; decline implemented & verified in-memory; authenticated HTTP/browser acceptance open |
 | **REQ-WS-08** | Backend | `WorkspaceAppService.cs` | Soft-delete & archive workflows | **[Not Implemented]** | Grace period & active billing checks |
 | **REQ-ISO-01**| Backend | `DosiTrackerDbContext.cs`| `dotnet test --filter WorkspacePersistenceTests` | **[Worker-Reported]** | Multi-node tenant cache invalidation |
 | **REQ-ISO-04**| Frontend | `tenant-switching.test.tsx`| `npx vitest run src/test/integration/tenant-switching.test.tsx` | **[Verified by PM @ 18db4d5]** (8 passed) | Browser multi-tab synchronization |

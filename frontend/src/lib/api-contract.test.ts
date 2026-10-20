@@ -32,6 +32,7 @@ import {
   leaveWorkspaceRoute,
   invitationRoute,
   acceptInvitationRoute,
+  declineInvitationRoute,
   collectPages,
   endReasonLabel,
   isPresenceOnline,
@@ -117,6 +118,7 @@ describe("routes", () => {
     expect(revokeInvitationRoute("i1")).toBe("/api/app/team/i1/invitation");
     expect(leaveWorkspaceRoute("w1")).toBe("/api/app/workspaces/w1/leave");
     expect(acceptInvitationRoute("a b")).toBe("/api/app/invitations/a%20b/accept");
+    expect(declineInvitationRoute("a b")).toBe("/api/app/invitations/a%20b/decline");
     expect(removeFromWorkspaceRoute("u1")).toBe("/api/app/team/from-workspace?userId=u1");
     expect(changeWorkspacePlanRoute("t&1", "p=2")).toBe("/api/app/platform/change-workspace-plan?workspaceId=t%261&planId=p%3D2");
     expect(activateSubscriptionRoute("t1")).toBe("/api/app/platform/activate-subscription?workspaceId=t1");

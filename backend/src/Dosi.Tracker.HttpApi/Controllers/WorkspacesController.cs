@@ -65,4 +65,11 @@ public class InvitationsController : TrackerController
     {
         return _workspaceAppService.AcceptInvitationAsync(token);
     }
+
+    [HttpPost("{token}/decline")]
+    [Authorize]
+    public Task DeclineAsync(string token)
+    {
+        return _workspaceAppService.DeclineInvitationAsync(token);
+    }
 }

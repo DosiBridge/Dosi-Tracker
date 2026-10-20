@@ -65,6 +65,7 @@ public class ContractRoutesTests
     [InlineData(nameof(WorkspaceAppService.LeaveAsync))]
     [InlineData(nameof(WorkspaceAppService.GetInvitationAsync))]
     [InlineData(nameof(WorkspaceAppService.AcceptInvitationAsync))]
+    [InlineData(nameof(WorkspaceAppService.DeclineInvitationAsync))]
     public void Workspace_And_Invitation_Endpoints_Should_Be_Served_By_Controllers_Only(string methodName)
     {
         typeof(WorkspaceAppService).GetMethod(methodName)!
@@ -77,6 +78,7 @@ public class ContractRoutesTests
     [InlineData(typeof(Dosi.Tracker.Controllers.WorkspacesController), "LeaveAsync", "POST", "{id}/leave")]
     [InlineData(typeof(Dosi.Tracker.Controllers.InvitationsController), "GetAsync", "GET", "{token}")]
     [InlineData(typeof(Dosi.Tracker.Controllers.InvitationsController), "AcceptAsync", "POST", "{token}/accept")]
+    [InlineData(typeof(Dosi.Tracker.Controllers.InvitationsController), "DeclineAsync", "POST", "{token}/decline")]
     public void Workspace_And_Invitation_Controllers_Should_Have_The_Contract_Routes(Type controller, string methodName, string verb, string template)
     {
         var prefix = controller == typeof(Dosi.Tracker.Controllers.WorkspacesController) ? "api/app/workspaces" : "api/app/invitations";

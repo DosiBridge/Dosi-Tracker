@@ -268,6 +268,21 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
         }
     }
 
+    [WorkspaceNotRequired]
+    [RemoteService(IsEnabled = false)]
+    public async Task DeclineInvitationAsync(string token)
+    {
+        var invitation = await GetUsableInvitationAsync(token);
+        var userId = CurrentUser.Id ?? throw new AbpAuthorizationException();
+        var user = await _userManager.GetByIdAsync(userId);
+        if (!invitation.IsFor(user.Email))
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.InvitationEmailMismatch);
+        }
+
+        await _invitationRepository.DeleteAsync(invitation);
+    }
+
     /// <summary>Joins the invitation's workspace (the current one) and uses the invitation up.</summary>
     private async Task<Workspace> AcceptAsync(WorkspaceInvitation invitation, Guid userId)
     {

@@ -1078,6 +1078,10 @@ export function acceptInvitationRoute(token: string): string {
   return `${invitationRoute(token)}/accept`;
 }
 
+export function declineInvitationRoute(token: string): string {
+  return `${invitationRoute(token)}/decline`;
+}
+
 /** GET /api/app/team/invitations item. */
 export interface WorkspaceInvitationDto {
   id: string;
