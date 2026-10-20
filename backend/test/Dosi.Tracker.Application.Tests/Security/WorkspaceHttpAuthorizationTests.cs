@@ -23,6 +23,7 @@ using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Options;
+using Microsoft.Extensions.Hosting;
 using Shouldly;
 using Volo.Abp;
 using Volo.Abp.Application.Dtos;
@@ -33,6 +34,10 @@ using Volo.Abp.Guids;
 using Volo.Abp.Identity;
 using Volo.Abp.Modularity;
 using Volo.Abp.Security.Claims;
+using Volo.Abp.AspNetCore.Mvc;
+using Volo.Abp.Autofac;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.TestHost;
 using Xunit;
 
 namespace Dosi.Tracker.Security;
@@ -199,180 +204,66 @@ public abstract class WorkspaceHttpAuthorizationTests<TStartupModule> : TrackerA
         }
     }
 
-    private sealed class InProcessHttpHandler : HttpMessageHandler
-    {
-        private readonly RequestDelegate _pipeline;
-        private readonly IServiceProvider _serviceProvider;
-
-        public InProcessHttpHandler(RequestDelegate pipeline, IServiceProvider serviceProvider)
-        {
-            _pipeline = pipeline;
-            _serviceProvider = serviceProvider;
-        }
-
-        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
-        {
-            using var scope = _serviceProvider.CreateScope();
-            var context = new DefaultHttpContext
-            {
-                RequestServices = scope.ServiceProvider
-            };
-
-            context.Request.Method = request.Method.Method;
-            context.Request.Path = request.RequestUri != null ? request.RequestUri.AbsolutePath : "/";
-            if (request.RequestUri?.Query != null)
-            {
-                context.Request.QueryString = new QueryString(request.RequestUri.Query);
-            }
-
-            foreach (var header in request.Headers)
-            {
-                context.Request.Headers[header.Key] = header.Value.ToArray();
-            }
-
-            if (request.Content != null)
-            {
-                foreach (var header in request.Content.Headers)
-                {
-                    context.Request.Headers[header.Key] = header.Value.ToArray();
-                }
-
-                var ms = new MemoryStream();
-                await request.Content.CopyToAsync(ms, cancellationToken);
-                ms.Position = 0;
-                context.Request.Body = ms;
-                context.Request.ContentLength = ms.Length;
-            }
-
-            var responseStream = new MemoryStream();
-            context.Response.Body = responseStream;
-
-            await _pipeline(context);
-
-            var response = new HttpResponseMessage((HttpStatusCode)context.Response.StatusCode);
-            responseStream.Position = 0;
-            response.Content = new ByteArrayContent(responseStream.ToArray());
-
-            foreach (var header in context.Response.Headers)
-            {
-                if (!response.Headers.TryAddWithoutValidation(header.Key, (IEnumerable<string>)header.Value))
-                {
-                    response.Content.Headers.TryAddWithoutValidation(header.Key, (IEnumerable<string>)header.Value);
-                }
-            }
-
-            return response;
-        }
-    }
+    protected virtual void ConfigureTestServerServices(IServiceCollection services) { }
 
     private HttpClient CreateHttpClient()
     {
-        var appBuilder = new ApplicationBuilder(ServiceProvider);
+        var config = ServiceProvider.GetRequiredService<Microsoft.Extensions.Configuration.IConfiguration>();
 
-        // Top-level error format middleware for exceptions bubbling from downstream application services
-        appBuilder.Use(async (context, next) =>
-        {
-            try
-            {
-                await next();
-            }
-            catch (AbpAuthorizationException ex)
-            {
-                context.Response.StatusCode = StatusCodes.Status403Forbidden;
-                context.Response.ContentType = "application/json";
-                context.Response.Headers["_AbpErrorFormat"] = "true";
-                await context.Response.WriteAsync(JsonSerializer.Serialize(new
+        var host = new Microsoft.Extensions.Hosting.HostBuilder()
+            .UseAutofac()
+            .ConfigureWebHost(web => web
+                .UseTestServer()
+                .ConfigureServices(services =>
                 {
-                    error = new
+                    services.ReplaceConfiguration(config);
+                    services.AddLogging();
+                    services.AddRouting();
+                    services.AddAuthentication(options =>
                     {
-                        code = "Volo.Abp.Authorization:010001",
-                        message = ex.Message
-                    }
-                }));
-            }
-            catch (BusinessException ex)
-            {
-                context.Response.StatusCode = ex.Code == TrackerDomainErrorCodes.WorkspaceRequired
-                    ? StatusCodes.Status400BadRequest
-                    : StatusCodes.Status403Forbidden;
-                context.Response.ContentType = "application/json";
-                context.Response.Headers["_AbpErrorFormat"] = "true";
-                await context.Response.WriteAsync(JsonSerializer.Serialize(new
+                        options.DefaultAuthenticateScheme = TestAuthHandler.SchemeName;
+                        options.DefaultChallengeScheme = TestAuthHandler.SchemeName;
+                    })
+                    .AddScheme<AuthenticationSchemeOptions, TestAuthHandler>(TestAuthHandler.SchemeName, _ => { });
+
+                    services.Configure<Volo.Abp.BackgroundWorkers.AbpBackgroundWorkerOptions>(options => options.IsEnabled = false);
+
+                    services.AddApplication<TStartupModule>();
+                    ConfigureTestServerServices(services);
+
+                    services.Replace(ServiceDescriptor.Singleton<ICurrentWorkspace, CurrentWorkspace>());
+                    services.Replace(ServiceDescriptor.Transient<IAuthorizationService, AbpAuthorizationService>());
+                    services.Replace(ServiceDescriptor.Transient<IAbpAuthorizationService, AbpAuthorizationService>());
+                    services.Replace(ServiceDescriptor.Transient<IPermissionChecker, PermissionChecker>());
+                })
+                .Configure(app =>
                 {
-                    error = new
+                    app.InitializeApplication();
+                    app.UseRouting();
+                    app.UseAuthentication();
+
+                    app.Use(async (context, next) =>
                     {
-                        code = ex.Code,
-                        message = ex.Message
-                    }
-                }));
-            }
-        });
+                        var principalAccessor = context.RequestServices.GetRequiredService<ICurrentPrincipalAccessor>();
+                        using (principalAccessor.Change(context.User))
+                        {
+                            await next();
+                        }
+                    });
 
-        appBuilder.UseRouting();
-        appBuilder.UseAuthentication();
+                    app.UseUnitOfWork();
+                    app.UseWorkspaceResolution();
+                    app.UseAuthorization();
 
-        // Sync ABP ICurrentPrincipalAccessor with authenticated HttpContext.User
-        appBuilder.Use(async (context, next) =>
-        {
-            var principalAccessor = context.RequestServices.GetRequiredService<ICurrentPrincipalAccessor>();
-            using (principalAccessor.Change(context.User))
-            {
-                await next();
-            }
-        });
+                    app.UseEndpoints(endpoints =>
+                    {
+                        endpoints.MapControllers();
+                    });
+                }))
+            .Build();
 
-        // Production Workspace Resolution Middleware
-        appBuilder.UseWorkspaceResolution();
-
-        // ASP.NET Core Authorization Middleware
-        appBuilder.UseAuthorization();
-
-        // Endpoints routing to real production ProjectAppService
-        appBuilder.UseEndpoints(endpoints =>
-        {
-            endpoints.MapGet("/api/app/project", async (HttpContext ctx) =>
-            {
-                var service = ctx.RequestServices.GetRequiredService<IProjectAppService>();
-                var list = await service.GetListAsync(new PagedAndSortedResultRequestDto());
-                ctx.Response.StatusCode = StatusCodes.Status200OK;
-                ctx.Response.ContentType = "application/json";
-                await ctx.Response.WriteAsync(JsonSerializer.Serialize(list, CamelCaseJsonOptions));
-            }).RequireAuthorization();
-
-            endpoints.MapPost("/api/app/project", async (HttpContext ctx) =>
-            {
-                var service = ctx.RequestServices.GetRequiredService<IProjectAppService>();
-                using var reader = new StreamReader(ctx.Request.Body);
-                var body = await reader.ReadToEndAsync();
-                var dto = JsonSerializer.Deserialize<CreateUpdateProjectDto>(body, new JsonSerializerOptions
-                {
-                    PropertyNameCaseInsensitive = true
-                });
-                if (dto == null)
-                {
-                    ctx.Response.StatusCode = StatusCodes.Status400BadRequest;
-                    return;
-                }
-
-                var created = await service.CreateAsync(dto);
-                ctx.Response.StatusCode = StatusCodes.Status201Created;
-                ctx.Response.ContentType = "application/json";
-                await ctx.Response.WriteAsync(JsonSerializer.Serialize(created, CamelCaseJsonOptions));
-            }).RequireAuthorization();
-
-            endpoints.MapDelete("/api/app/project/{id:guid}", async (HttpContext ctx, Guid id) =>
-            {
-                var service = ctx.RequestServices.GetRequiredService<IProjectAppService>();
-                await service.DeleteAsync(id);
-                ctx.Response.StatusCode = StatusCodes.Status204NoContent;
-            }).RequireAuthorization();
-        });
-
-        var pipeline = appBuilder.Build();
-        return new HttpClient(new InProcessHttpHandler(pipeline, ServiceProvider))
-        {
-            BaseAddress = new Uri("http://localhost")
-        };
+        host.Start();
+        return host.GetTestServer().CreateClient();
     }
 
     private async Task<(Guid WorkspaceA, Guid WorkspaceB)> SeedUsersAndWorkspacesAsync()
@@ -458,12 +349,31 @@ public abstract class WorkspaceHttpAuthorizationTests<TStartupModule> : TrackerA
     }
 
     [Fact]
-    public async Task Missing_Or_Empty_Workspace_Header_Is_Rejected_With_400_WorkspaceRequired()
+    public async Task Missing_Workspace_Header_Is_Rejected_With_400_WorkspaceRequired_By_Action_Filter()
     {
         await SeedUsersAndWorkspacesAsync();
         var client = CreateHttpClient();
 
-        // Guid.Empty rejected with 400 Tracker:WorkspaceRequired by WorkspaceResolutionMiddleware
+        // Production missing header behavior: passes WorkspaceResolutionMiddleware,
+        // intercepted by production WorkspaceRequiredFilter on conventional controller,
+        // which throws BusinessException(Tracker:WorkspaceRequired) -> ABP maps to 400 BadRequest
+        var missingHeaderReq = new HttpRequestMessage(HttpMethod.Get, "/api/app/project");
+        missingHeaderReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", UserA.ToString());
+
+        var missingResponse = await client.SendAsync(missingHeaderReq);
+        missingResponse.StatusCode.ShouldBe(HttpStatusCode.BadRequest);
+
+        var missingBody = await missingResponse.Content.ReadAsStringAsync();
+        missingBody.ShouldContain(TrackerDomainErrorCodes.WorkspaceRequired);
+    }
+
+    [Fact]
+    public async Task Empty_Workspace_Header_Guid_Empty_Is_Rejected_With_400_WorkspaceRequired_By_Resolution_Middleware()
+    {
+        await SeedUsersAndWorkspacesAsync();
+        var client = CreateHttpClient();
+
+        // Guid.Empty rejected with 400 Tracker:WorkspaceRequired directly by WorkspaceResolutionMiddleware
         var emptyHeaderReq = new HttpRequestMessage(HttpMethod.Get, "/api/app/project");
         emptyHeaderReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", UserA.ToString());
         emptyHeaderReq.Headers.Add(WorkspaceConsts.HeaderName, Guid.Empty.ToString());
@@ -480,6 +390,18 @@ public abstract class WorkspaceHttpAuthorizationTests<TStartupModule> : TrackerA
     {
         var (wsA, wsB) = await SeedUsersAndWorkspacesAsync();
         var client = CreateHttpClient();
+
+        // Seed target workspace B sentinel to ensure non-vacuous inspection
+        Guid sentinelBId = Guid.Empty;
+        await WithUnitOfWorkAsync(async () =>
+        {
+            using (_currentWorkspace.Change(wsB, WorkspaceRoles.Owner))
+            {
+                var sentinel = new Project(_guidGenerator.Create(), wsB, "Sentinel-B-Project", color: "#990000");
+                await _projectRepository.InsertAsync(sentinel, autoSave: true);
+                sentinelBId = sentinel.Id;
+            }
+        });
 
         // 1. UserA attempts GET on Workspace B
         var getReq = CreateRequest(HttpMethod.Get, "/api/app/project", userId: UserA, workspaceId: wsB);
@@ -502,11 +424,89 @@ public abstract class WorkspaceHttpAuthorizationTests<TStartupModule> : TrackerA
         var postBody = await postResponse.Content.ReadAsStringAsync();
         postBody.ShouldContain(TrackerDomainErrorCodes.NotWorkspaceMember);
 
-        // 3. Verify SQLite DB state: 0 projects created in Workspace B
+        // 3. Non-vacuous SQLite DB state inspection under explicit Workspace B context:
+        // Confirms that target workspace B was not empty, pre-seeded sentinel remains intact,
+        // and spoofed POST mutation did not insert any additional entity.
         await WithUnitOfWorkAsync(async () =>
         {
-            var wsBProjects = await _projectRepository.GetListAsync(p => p.WorkspaceId == wsB);
-            wsBProjects.ShouldBeEmpty("Spoofed POST mutation must not insert any project into target workspace");
+            using (_currentWorkspace.Change(wsB, WorkspaceRoles.Owner))
+            {
+                var wsBProjects = await _projectRepository.GetListAsync(p => p.WorkspaceId == wsB);
+                wsBProjects.Count.ShouldBe(1, "Target workspace B must retain only its pre-seeded sentinel");
+                wsBProjects.ShouldContain(p => p.Id == sentinelBId && p.Title == "Sentinel-B-Project");
+                wsBProjects.ShouldNotContain(p => p.Title == "Spoofed Project in B");
+            }
+        });
+    }
+
+    [Fact]
+    public async Task Cross_Workspace_Resource_Id_Read_And_Mutation_While_Selecting_Workspace_A_Are_Rejected_And_Target_Unchanged()
+    {
+        var (wsA, wsB) = await SeedUsersAndWorkspacesAsync();
+        var client = CreateHttpClient();
+
+        Guid sentinelAId = Guid.Empty;
+        Guid sentinelBId = Guid.Empty;
+
+        // Seed distinct sentinels under Workspace A and Workspace B
+        await WithUnitOfWorkAsync(async () =>
+        {
+            using (_currentWorkspace.Change(wsA, WorkspaceRoles.Owner))
+            {
+                var pA = new Project(_guidGenerator.Create(), wsA, "Sentinel-A-Project", color: "#111111");
+                await _projectRepository.InsertAsync(pA, autoSave: true);
+                sentinelAId = pA.Id;
+            }
+
+            using (_currentWorkspace.Change(wsB, WorkspaceRoles.Owner))
+            {
+                var pB = new Project(_guidGenerator.Create(), wsB, "Sentinel-B-Project", color: "#222222");
+                await _projectRepository.InsertAsync(pB, autoSave: true);
+                sentinelBId = pB.Id;
+            }
+        });
+
+        // 1. Cross-workspace resource-ID read: UserA selects Workspace A, requests Workspace B sentinel ID
+        var crossGetReq = CreateRequest(HttpMethod.Get, $"/api/app/project/{sentinelBId}", userId: UserA, workspaceId: wsA);
+        var crossGetResp = await client.SendAsync(crossGetReq);
+        crossGetResp.StatusCode.ShouldBe(HttpStatusCode.NotFound);
+
+        // 2. Cross-workspace resource-ID update: UserA selects Workspace A, attempts PUT mutation on Workspace B sentinel ID
+        var crossPutReq = CreateRequest(HttpMethod.Put, $"/api/app/project/{sentinelBId}", userId: UserA, workspaceId: wsA, new
+        {
+            Title = "Tampered-By-A",
+            Color = "#999999"
+        });
+        var crossPutResp = await client.SendAsync(crossPutReq);
+        crossPutResp.StatusCode.ShouldBe(HttpStatusCode.NotFound);
+
+        // 3. Cross-workspace resource-ID delete: UserA selects Workspace A, attempts DELETE on Workspace B sentinel ID.
+        // UserA has role Manager in Workspace A; Manager does not have Projects.Delete permission in production,
+        // so request is denied with 403 Forbidden per production contract.
+        var crossDelReq = CreateRequest(HttpMethod.Delete, $"/api/app/project/{sentinelBId}", userId: UserA, workspaceId: wsA);
+        var crossDelResp = await client.SendAsync(crossDelReq);
+        crossDelResp.StatusCode.ShouldBe(HttpStatusCode.Forbidden);
+
+        // 4. Verify persisted state:
+        // Workspace A state and counts unchanged
+        await WithUnitOfWorkAsync(async () =>
+        {
+            using (_currentWorkspace.Change(wsA, WorkspaceRoles.Owner))
+            {
+                var wsAProjects = await _projectRepository.GetListAsync(p => p.WorkspaceId == wsA);
+                wsAProjects.Count.ShouldBe(1);
+                wsAProjects.ShouldContain(p => p.Id == sentinelAId && p.Title == "Sentinel-A-Project");
+            }
+
+            // Target Workspace B state and counts unchanged, sentinel entity content unaltered
+            using (_currentWorkspace.Change(wsB, WorkspaceRoles.Owner))
+            {
+                var wsBProjects = await _projectRepository.GetListAsync(p => p.WorkspaceId == wsB);
+                wsBProjects.Count.ShouldBe(1);
+                var bEntity = wsBProjects.Single(p => p.Id == sentinelBId);
+                bEntity.Title.ShouldBe("Sentinel-B-Project");
+                bEntity.Color.ShouldBe("#222222");
+            }
         });
     }
 
@@ -526,7 +526,7 @@ public abstract class WorkspaceHttpAuthorizationTests<TStartupModule> : TrackerA
 
         postResponse.StatusCode.ShouldBe(HttpStatusCode.Forbidden);
         var postBody = await postResponse.Content.ReadAsStringAsync();
-        postBody.ShouldContain("Volo.Abp.Authorization:010001");
+        postBody.ShouldContain("Volo.Abp.Authorization:010002");
 
         // Verify SQLite DB state: project was NOT created in Workspace B
         await WithUnitOfWorkAsync(async () =>
@@ -552,7 +552,7 @@ public abstract class WorkspaceHttpAuthorizationTests<TStartupModule> : TrackerA
             Color = "#112233"
         });
         var createRespA = await client.SendAsync(createReqA);
-        createRespA.StatusCode.ShouldBe(HttpStatusCode.Created);
+        createRespA.StatusCode.ShouldBe(HttpStatusCode.OK);
 
         // 2. UserB creates "Project-B1" under Workspace B (where UserB is Owner -> permitted)
         var createReqB = CreateRequest(HttpMethod.Post, "/api/app/project", userId: UserB, workspaceId: wsB, new
@@ -561,7 +561,7 @@ public abstract class WorkspaceHttpAuthorizationTests<TStartupModule> : TrackerA
             Color = "#445566"
         });
         var createRespB = await client.SendAsync(createReqB);
-        createRespB.StatusCode.ShouldBe(HttpStatusCode.Created);
+        createRespB.StatusCode.ShouldBe(HttpStatusCode.OK);
 
         // 3. DualUser queries under Workspace A -> sees ONLY Project-A1
         var listReqA = CreateRequest(HttpMethod.Get, "/api/app/project", userId: DualUser, workspaceId: wsA);
@@ -629,7 +629,7 @@ public abstract class WorkspaceHttpAuthorizationTests<TStartupModule> : TrackerA
             Color = "#22C55E"
         });
         var createResp = await client.SendAsync(createReq);
-        createResp.StatusCode.ShouldBe(HttpStatusCode.Created);
+        createResp.StatusCode.ShouldBe(HttpStatusCode.OK);
 
         var respBody = await createResp.Content.ReadAsStringAsync();
         using var doc = JsonDocument.Parse(respBody);

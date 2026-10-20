@@ -401,35 +401,64 @@ Following PM inspection of source at clean `2a83bc1`, documentation for `REQ-WS-
 
 ---
 
-## 7. Bounded Engineering Phase: Authenticated HTTP Aggregate Authorization & Isolation Harness (`REQ-ISO-05`)
+---
 
-### A. Context & Architectural Boundary
-Existing tests directly called `WorkspaceRolePermissionValueProvider.CheckAsync` or used route reflection. To verify aggregate authorization without permissive test doubles or fake downstream endpoints, an in-process HTTP integration harness was implemented:
-1. **Real In-Process HTTP Pipeline (`WorkspaceHttpAuthorizationTests.cs`)**:
-   - Dispatches real `HttpRequestMessage` instances through ASP.NET Core middleware (`UseRouting`, `UseAuthentication`, `UseWorkspaceResolution`, `UseAuthorization`) to real production `ProjectAppService` mapped endpoints.
+## 7. Bounded Engineering Phase: Hosted ASP.NET Core TestServer MVC Aggregate Authorization & Isolation Harness (`REQ-ISO-05`)
+
+### A. Context & Architectural Boundary Correction
+An earlier worker iteration relied on `InProcessHttpHandler` copying requests to `DefaultHttpContext` and mapping handwritten `MapGet`/`MapPost`/`MapDelete` delegates directly to `IProjectAppService`, manually emulating JSON and status/exception serialization without constructing an actual `TestServer`. This boundary gap could not prove conventional MVC controller discovery, model/query binding, or production ASP.NET Core exception-to-status mapping.
+
+This harness correction replaces that manual mapping with a genuinely hosted in-process ASP.NET Core `TestServer` (`Microsoft.AspNetCore.TestHost`):
+1. **Genuine Hosted ASP.NET Core MVC Pipeline (`WorkspaceHttpAuthorizationTests.cs`)**:
+   - Hosted via `HostBuilder.UseAutofac().ConfigureWebHost(web => web.UseTestServer()...)`.
+   - Dispatches real `HttpRequestMessage` instances through `TestServer.CreateClient()` across the full production ASP.NET Core pipeline: `UseRouting`, `UseAuthentication`, `UseUnitOfWork`, `UseWorkspaceResolution`, `UseAuthorization`, and `endpoints.MapControllers()`.
+   - Real conventional MVC controller discovery: registers `options.ConventionalControllers.Create(typeof(TrackerApplicationModule).Assembly)` in `TrackerHttpApiServerTestModule`, matching production routing (`/api/app/project`, `/api/app/project/{id}`) rather than invented controller classes.
+   - Real production action filter: registers `WorkspaceRequiredFilter` in `MvcOptions.Filters` to enforce header presence on conventional controller actions.
    - Restores actual ABP aggregate authorization in DI: `AbpAuthorizationService` + `PermissionChecker` + `WorkspaceRolePermissionValueProvider` (undoing `TrackerTestBaseModule`'s `AddAlwaysAllowAuthorization`).
-   - Uses synthetic authentication handler (`TestAuthHandler`) for test identity bearer tokens without modifying production token issuance or copying role policies.
-   - Enforces SQLite in-memory `:memory:` persistence, verifying exact entity state and zero-mutation guarantees upon authorization denials.
-2. **Boundary & Provenance Distinctions**:
-   - Synthetic authentication verifies ASP.NET Core + ABP aggregate authorization mechanics in-process; it is **NOT** a substitute for real browser cookie/session testing (`__Host-Dosi-Workspace`), Next.js server actions, or hosted OpenIddict token validation.
-   - Test-only harness configuration is used; no production behavior was broken or bypassed.
+   - Uses synthetic authentication handler (`TestAuthHandler`) to establish caller claims (`AbpClaimTypes.UserId`, `ClaimTypes.NameIdentifier`) without copying role policies or tampering with production token issuance.
+   - Enforces SQLite in-memory `:memory:` persistence sharing the active connection across test fixture and `TestServer`, verifying exact entity state and zero-mutation guarantees upon authorization denials.
+
+2. **Honest Diagnostic & Harness Setup Findings (Not Production Vulnerabilities)**:
+   - *DI / Autofac Property Injection*: Initial `TestServer` construction using standard `AutofacServiceProviderFactory` threw `NullReferenceException` on `BasicRepositoryBase.CurrentTenant` because `LazyServiceProvider` was not property-injected. Resolved by configuring `HostBuilder.UseAutofac()` (which registers ABP's `AbpAutofacServiceProviderFactory` with property injection and interception) without duplicate `options.UseAutofac()` calls in `AddApplication`.
+   - *SQLite In-Memory Database Sharing*: `TrackerEntityFrameworkCoreTestModule` creates a new `:memory:` SQLite connection on initialization. Reordering `ConfigureTestServerServices` after `AddApplication` ensures the test fixture's pre-opened, table-seeded SQLite connection is applied to the `TestServer`'s `DbContextOptions`, ensuring both client dispatch and fixture assertions query the identical SQLite database.
+   - *Missing Header vs Guid.Empty Separation*:
+     - `Guid.Empty` header: rejected directly by `WorkspaceResolutionMiddleware` with `400 BadRequest` (`Tracker:WorkspaceRequired`).
+     - Missing header: passes `WorkspaceResolutionMiddleware`, then intercepted by `WorkspaceRequiredFilter` on conventional controllers which throws `BusinessException(TrackerDomainErrorCodes.WorkspaceRequired)` -> ABP maps to `400 BadRequest`. In the test harness, replacing `ICurrentWorkspace` with production `CurrentWorkspace` (`DefaultId => null`, rather than `TestCurrentWorkspace`'s hardcoded test fallback) allows `WorkspaceRequiredFilter` to truthfully evaluate `CurrentWorkspace.Id == null`.
+   - *Conventional Controller Response Contract*: ABP's conventional controller for `CrudAppService.CreateAsync` returns the created DTO with HTTP `200 OK` (standard ASP.NET Core action return), not `201 Created`. Test assertions honestly reflect production HTTP status contracts.
+   - *ABP Policy Error Code*: When an authenticated caller lacks policy permission (e.g. `Projects.Create`), ABP's aggregate authorization handler produces `Volo.Abp.Authorization:010002` ("Authorization failed! Given policy has not granted"), distinct from `010001` (unauthenticated).
+   - *Non-Vacuous State Inspection*: The spoofing test pre-seeds a distinct sentinel project in target Workspace B. Persisted database state is inspected under explicit Workspace B context (`_currentWorkspace.Change(wsB, ...)`), proving the sentinel exists before and after denial (not merely an empty query result).
+   - *Cross-Workspace Resource Read & Mutation*: Distinct sentinels A and B seeded. Caller selecting Workspace A (where caller is Manager):
+     - GET `/api/app/project/{sentinelBId}` -> `404 NotFound` (`EntityNotFoundException`).
+     - PUT `/api/app/project/{sentinelBId}` -> `404 NotFound` (`EntityNotFoundException`).
+     - DELETE `/api/app/project/{sentinelBId}` -> `403 Forbidden` (`Projects.Delete` is withheld from Manager role per production contract).
+     - Persisted target B and A entities and counts/content verified strictly unchanged.
+
+3. **Boundary & Provenance Distinctions**:
+   - **Component Composition vs Hosted MVC HTTP**: Distinguishes direct unit service invocations from genuine ASP.NET Core `TestServer` HTTP dispatch through conventional controller routing, model binding, middleware, and action filters.
+   - **Worker Outcomes vs Independent QA Review**: All test executions below are worker tool outcomes. PM has **NOT** independently executed backend test commands.
+   - **Open Acceptance Requirements**: Real browser session cookies (`__Host-Dosi-Workspace`), Next.js server actions, hosted OpenIddict token issuing/validation, native platform runtimes, and multi-threaded race conditions remain **Unverified / Pending Acceptance**.
 
 ### B. Execution Evidence & Provenance Boundaries
 
 | Dimension | Exact Target / Command | Tests Passed | Failed | Duration | Exit Code | Provenance |
 |---|---|:---:|:---:|:---:|:---:|---|
-| **Authenticated HTTP Harness** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~WorkspaceHttpAuthorizationTests"` | 7 | 0 | 10s | **0** | **[Worker-Reported (SQLite In-Memory In-Process HTTP)]** |
+| **Hosted ASP.NET Core MVC TestServer** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~EfCoreWorkspaceHttpAuthorizationTests"` | 9 | 0 | 16.8s | **0** | **[Worker-Reported (Hosted MVC TestServer & Shared SQLite)]** |
+| **Recipient Decline Regressions** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~InvitationDeclineTests"` | 10 | 0 | 9s | **0** | **[Worker-Reported (SQLite In-Memory)]** |
+| **Host Route Reflection** | `dotnet test test/Dosi.Tracker.HttpApi.Host.Tests/Dosi.Tracker.HttpApi.Host.Tests.csproj --filter "FullyQualifiedName~ContractRoutesTests"` | 40 | 0 | 101ms | **0** | **[Worker-Reported (Unit Reflection Only)]** |
+| **Frontend Contract Route Vitest** | `npx vitest run src/lib/api-contract.test.ts` | 30 | 0 | 1.22s | **0** | **[Verified by PM @ 3bebd70]** |
 | **Historical PM Blocked Scripts** | `qa_workspace_phase.ps1` | null | null | null | null | **[Explicitly Not Run / No Repackaging]** |
 | **Real Browser Session Acceptance** | Multi-tenant browser session & cookie verification | null | null | null | null | **[Pending Acceptance Requirement]** |
 
-#### Test Cases Covered in `EfCoreWorkspaceHttpAuthorizationTests` (7 total):
-1. `Unauthenticated_Request_To_Protected_Project_Endpoint_Is_Rejected_With_401`: Anonymous request to protected project endpoint is challenged by ASP.NET Core authorization middleware -> 401 Unauthorized (`Volo.Abp.Authorization:010001`).
-2. `Missing_Or_Empty_Workspace_Header_Is_Rejected_With_400_WorkspaceRequired`: Authenticated request with `Guid.Empty` workspace header is rejected by `WorkspaceResolutionMiddleware` -> 400 Bad Request (`Tracker:WorkspaceRequired`).
-3. `Workspace_A_Only_Caller_Spoofing_Workspace_B_Header_Is_Rejected_With_403_NotWorkspaceMember`: Authenticated caller possessing membership only in Workspace A attempting to access Workspace B via header spoofing is rejected with 403 Forbidden (`Tracker:NotWorkspaceMember`). Data read returns no data; POST mutation is rejected and leaves Workspace B database state strictly unchanged (0 projects inserted).
-4. `Member_Role_Caller_Is_Denied_Manager_Operation_By_Actual_Aggregate_Authorization`: Authenticated caller holding `Member` role in Workspace B attempts POST `/api/app/project`. Admitted into Workspace B context by middleware, but denied by actual ABP aggregate authorization (`AbpAuthorizationService` + `PermissionChecker` + `WorkspaceRolePermissionValueProvider`) -> 403 Forbidden (`Volo.Abp.Authorization:010001`). Verified SQLite DB state remains completely unchanged (0 projects inserted).
-5. `Dual_Member_Sees_Only_Selected_Workspace_Data_And_Persisted_Roles_Govern_Operations`: Caller holding distinct roles (`Manager` in A, `Member` in B) creates Project-A1 under Workspace A (permitted as Manager), queries `/api/app/project` under A -> sees only Project-A1 (never B). Under Workspace B header, queries `/api/app/project` -> sees only Project-B1 (never A). Attempting to create project under Workspace B is rejected with 403 Forbidden by role governance.
-6. `Inactive_Or_Removed_Workspace_Member_Is_Denied_With_403_NotWorkspaceMember`: Authenticated caller whose membership in target workspace is marked inactive/removed (`IsActive == false`) is rejected by `WorkspaceResolutionMiddleware` -> 403 Forbidden (`Tracker:NotWorkspaceMember`).
-7. `Legitimate_Permitted_Path_Creates_Project_In_Workspace_And_Persists_To_Database`: Authenticated caller with Manager role in target workspace creates project -> 201 Created. Directly verified in SQLite database: project record persisted with matching `WorkspaceId == wsA`, Title, and Color. Cross-workspace query isolation verified: project is invisible under foreign workspace context.
+#### Test Cases Covered in `EfCoreWorkspaceHttpAuthorizationTests` (9 total):
+1. `Unauthenticated_Request_To_Protected_Project_Endpoint_Is_Rejected_With_401`: Anonymous request to protected project endpoint is challenged by ASP.NET Core authentication middleware -> 401 Unauthorized (`Volo.Abp.Authorization:010001`).
+2. `Empty_Workspace_Header_Guid_Empty_Is_Rejected_With_400_WorkspaceRequired_By_Resolution_Middleware`: Authenticated request with `Guid.Empty` workspace header is rejected by `WorkspaceResolutionMiddleware` -> 400 Bad Request (`Tracker:WorkspaceRequired`).
+3. `Missing_Workspace_Header_Is_Rejected_With_400_WorkspaceRequired_By_Action_Filter`: Authenticated request with missing `X-Workspace-Id` header passes resolution middleware, then intercepted by `WorkspaceRequiredFilter` on conventional MVC controller -> 400 Bad Request (`Tracker:WorkspaceRequired`).
+4. `Workspace_A_Only_Caller_Spoofing_Workspace_B_Header_Is_Rejected_With_403_NotWorkspaceMember`: Authenticated caller possessing membership only in Workspace A attempting to access Workspace B via header spoofing is rejected with 403 Forbidden (`Tracker:NotWorkspaceMember`). Non-vacuous SQLite DB inspection under explicit Workspace B context confirms pre-seeded B sentinel exists and remains completely unchanged (count remains 1, no mutation inserted).
+5. `Cross_Workspace_Resource_Id_Read_And_Mutation_While_Selecting_Workspace_A_Are_Rejected_And_Target_Unchanged`: Seeded distinct sentinels A and B. Caller selecting Workspace A attempts cross-workspace operations on Workspace B sentinel ID: GET -> 404 NotFound, PUT -> 404 NotFound, DELETE -> 403 Forbidden (denied per production contract for Manager). Persisted database inspection verifies Workspace A and Workspace B counts and sentinel contents remain strictly unaltered.
+6. `Member_Role_Caller_Is_Denied_Manager_Operation_By_Actual_Aggregate_Authorization`: Authenticated caller holding `Member` role in Workspace B attempts POST `/api/app/project`. Admitted into Workspace B context by middleware, but denied by actual ABP aggregate authorization (`AbpAuthorizationService` + `PermissionChecker` + `WorkspaceRolePermissionValueProvider`) -> 403 Forbidden (`Volo.Abp.Authorization:010002`). Verified SQLite DB state remains completely unchanged (0 projects inserted).
+7. `Dual_Member_Sees_Only_Selected_Workspace_Data_And_Persisted_Roles_Govern_Operations`: Caller holding distinct roles (`Manager` in A, `Member` in B) creates Project-A1 under Workspace A (permitted as Manager -> 200 OK), queries `/api/app/project` under A -> sees only Project-A1 (never B). Under Workspace B header, queries `/api/app/project` -> sees only Project-B1 (never A). Attempting to create project under Workspace B is rejected with 403 Forbidden by role governance.
+8. `Inactive_Or_Removed_Workspace_Member_Is_Denied_With_403_NotWorkspaceMember`: Authenticated caller whose membership in target workspace is marked inactive/removed (`IsActive == false`) is rejected by `WorkspaceResolutionMiddleware` -> 403 Forbidden (`Tracker:NotWorkspaceMember`).
+9. `Legitimate_Permitted_Path_Creates_Project_In_Workspace_And_Persists_To_Database`: Authenticated caller with Manager role in target workspace creates project -> 200 OK. Directly verified in SQLite database: project record persisted with matching `WorkspaceId == wsA`, Title, and Color. Cross-workspace query isolation verified: project is invisible under foreign workspace context.
 
 ---
 
@@ -438,8 +467,8 @@ Existing tests directly called `WorkspaceRolePermissionValueProvider.CheckAsync`
 1. **Privacy Acceptance Pending**:
    - The privacy source audit (commit `14bbe66`) remains **Pending PM Independent Review**. This status is preserved and not bypassed.
 2. **Workspace Authorization & Isolation Phase Status**:
-   - In-process boundary integration tests (`2a83bc1`), recipient decline lifecycle (`REQ-WS-07`, commit `27f7aa1`), and authenticated HTTP aggregate authorization harness (`REQ-ISO-05`) are implemented with isolated in-memory test coverage (17 SQLite tests total: 10 decline + 7 HTTP auth).
-   - Real browser cookie/session testing (`__Host-Dosi-Workspace`), multi-threaded concurrency verification, and PM independent execution of `qa_workspace_phase.ps1` remain pending.
+   - Recipient decline lifecycle (`REQ-WS-07`, commit `27f7aa1`) and genuine hosted ASP.NET Core `TestServer` MVC aggregate authorization harness (`REQ-ISO-05`) are implemented with isolated in-memory test coverage (19 SQLite tests total: 10 decline + 9 TestServer MVC auth).
+   - Real browser cookie/session testing (`__Host-Dosi-Workspace`), Next.js server actions, OpenIddict token issuer, multi-threaded concurrency verification, and PM independent execution of `qa_workspace_phase.ps1` remain pending.
 3. **Overall Product Incomplete**:
    - Overall product remains incomplete across:
      - Backend metric nullability schema migrations (`Activity.cs` truthful nulls vs 0)
