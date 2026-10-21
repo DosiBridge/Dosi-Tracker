@@ -151,9 +151,10 @@ public class WorkspaceTeamRosterHttpTests : WorkspaceHttpTestBase<TrackerHttpApi
             await _memberRepository.InsertAsync(mInactive, autoSave: true);
 
             // Workspace B memberships:
-            // ColleagueB is Owner, DualUser is regular Member (unprivileged in B, no Team.Manage)
+            // ColleagueB is Owner, DualUser is regular Member (unprivileged in B, no Team.Manage), OwnerA is Member in B
             await _memberRepository.InsertAsync(new WorkspaceMember(_guidGenerator.Create(), wsB, ColleagueB, WorkspaceRoles.Owner, DateTime.UtcNow), autoSave: true);
             await _memberRepository.InsertAsync(new WorkspaceMember(_guidGenerator.Create(), wsB, DualUser, WorkspaceRoles.Member, DateTime.UtcNow), autoSave: true);
+            await _memberRepository.InsertAsync(new WorkspaceMember(_guidGenerator.Create(), wsB, OwnerA, WorkspaceRoles.Member, DateTime.UtcNow), autoSave: true);
         });
 
         Guid projA1 = Guid.Empty;
@@ -576,4 +577,464 @@ public class WorkspaceTeamRosterHttpTests : WorkspaceHttpTestBase<TrackerHttpApi
             }
         });
     }
+
+    [Fact]
+    public async Task Authorized_Owner_Can_Update_Project_Member_Rate_And_Role_With_Persistence()
+    {
+        var (wsA, wsB, projA1, projA2, projB1, projB2) = await SeedFixturesAsync();
+        var client = CreateHttpClient();
+
+        // Positive mutation control: OwnerA in wsA updates ColleagueA's role to Manager and hourly rate to 68.50m
+        var updateDto = new UpdateProjectMemberDto
+        {
+            Role = ProjectMemberRoles.Manager,
+            HourlyRate = 68.50m
+        };
+
+        var req = CreateRequest(
+            HttpMethod.Put,
+            $"/api/app/team/member?projectId={projA1}&userId={ColleagueA}",
+            userId: OwnerA,
+            workspaceId: wsA,
+            jsonBody: updateDto);
+
+        var resp = await client.SendAsync(req);
+        resp.StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        var json = await resp.Content.ReadAsStringAsync();
+        var result = JsonSerializer.Deserialize<ProjectMemberDto>(json, CamelCaseJsonOptions);
+        result.ShouldNotBeNull();
+        result.ProjectId.ShouldBe(projA1);
+        result.UserId.ShouldBe(ColleagueA);
+        result.Role.ShouldBe(ProjectMemberRoles.Manager);
+        result.HourlyRate.ShouldBe(68.50m);
+        result.UserName.ShouldBe("colleague_a_roster");
+        result.Email.ShouldBe("colleague_a_roster@acme.test");
+
+        // Verify state persisted accurately in SQLite database
+        await WithUnitOfWorkAsync(async () =>
+        {
+            using (_currentWorkspace.Change(wsA, WorkspaceRoles.Owner))
+            {
+                var target = await _projectMemberRepository.FirstOrDefaultAsync(
+                    m => m.ProjectId == projA1 && m.UserId == ColleagueA);
+                target.ShouldNotBeNull();
+                target.Role.ShouldBe(ProjectMemberRoles.Manager);
+                target.HourlyRate.ShouldBe(68.50m);
+
+                // Unrelated Workspace A rows remain intact
+                var ownerInA1 = await _projectMemberRepository.FirstOrDefaultAsync(
+                    m => m.ProjectId == projA1 && m.UserId == OwnerA);
+                ownerInA1.ShouldNotBeNull();
+                ownerInA1.HourlyRate.ShouldBe(RateOwnerA);
+                ownerInA1.Role.ShouldBe(ProjectMemberRoles.Admin);
+
+                var dualInA1 = await _projectMemberRepository.FirstOrDefaultAsync(
+                    m => m.ProjectId == projA1 && m.UserId == DualUser);
+                dualInA1.ShouldNotBeNull();
+                dualInA1.HourlyRate.ShouldBe(RateDualUserA);
+                dualInA1.Role.ShouldBe(ProjectMemberRoles.Manager);
+
+                var ownerInA2 = await _projectMemberRepository.FirstOrDefaultAsync(
+                    m => m.ProjectId == projA2 && m.UserId == OwnerA);
+                ownerInA2.ShouldNotBeNull();
+                ownerInA2.HourlyRate.ShouldBe(RateOwnerA);
+            }
+
+            // Target Workspace B rows remain completely unaffected
+            using (_currentWorkspace.Change(wsB, WorkspaceRoles.Owner))
+            {
+                var colleagueB1 = await _projectMemberRepository.FirstOrDefaultAsync(
+                    m => m.ProjectId == projB1 && m.UserId == ColleagueB);
+                colleagueB1.ShouldNotBeNull();
+                colleagueB1.HourlyRate.ShouldBe(RateColleagueB);
+                colleagueB1.Role.ShouldBe(ProjectMemberRoles.Admin);
+
+                var dualB1 = await _projectMemberRepository.FirstOrDefaultAsync(
+                    m => m.ProjectId == projB1 && m.UserId == DualUser);
+                dualB1.ShouldNotBeNull();
+                dualB1.HourlyRate.ShouldBe(RateDualUserB);
+                dualB1.Role.ShouldBe(ProjectMemberRoles.Worker);
+
+                var colleagueB2 = await _projectMemberRepository.FirstOrDefaultAsync(
+                    m => m.ProjectId == projB2 && m.UserId == ColleagueB);
+                colleagueB2.ShouldNotBeNull();
+                colleagueB2.HourlyRate.ShouldBe(RateColleagueB);
+            }
+        });
+    }
+
+    [Fact]
+    public async Task Lower_Role_Cannot_Change_Rates_Or_Elevate_Role()
+    {
+        var (wsA, wsB, projA1, _, projB1, _) = await SeedFixturesAsync();
+        var client = CreateHttpClient();
+
+        // 1. DualUser is Manager in Workspace A (has Team.Manage aggregate permission)
+        // Attempting to change ColleagueA's rate is rejected by domain rule with 403 RoleNotAllowed
+        var reqRateChange = CreateRequest(
+            HttpMethod.Put,
+            $"/api/app/team/member?projectId={projA1}&userId={ColleagueA}",
+            userId: DualUser,
+            workspaceId: wsA,
+            jsonBody: new UpdateProjectMemberDto { Role = ProjectMemberRoles.Worker, HourlyRate = 99.00m });
+        var respRateChange = await client.SendAsync(reqRateChange);
+        respRateChange.StatusCode.ShouldBe(HttpStatusCode.Forbidden);
+        var bodyRateChange = await respRateChange.Content.ReadAsStringAsync();
+        bodyRateChange.ShouldContain(TrackerDomainErrorCodes.RoleNotAllowed);
+
+        // Attempting to elevate ColleagueA to Manager role without owner rights is rejected with 403 RoleNotAllowed
+        var reqElevateManager = CreateRequest(
+            HttpMethod.Put,
+            $"/api/app/team/member?projectId={projA1}&userId={ColleagueA}",
+            userId: DualUser,
+            workspaceId: wsA,
+            jsonBody: new UpdateProjectMemberDto { Role = ProjectMemberRoles.Manager, HourlyRate = RateColleagueA });
+        var respElevateManager = await client.SendAsync(reqElevateManager);
+        respElevateManager.StatusCode.ShouldBe(HttpStatusCode.Forbidden);
+        var bodyElevateManager = await respElevateManager.Content.ReadAsStringAsync();
+        bodyElevateManager.ShouldContain(TrackerDomainErrorCodes.RoleNotAllowed);
+
+        // Attempting to elevate ColleagueA to Admin role is rejected with 403 RoleNotAllowed
+        var reqElevateAdmin = CreateRequest(
+            HttpMethod.Put,
+            $"/api/app/team/member?projectId={projA1}&userId={ColleagueA}",
+            userId: DualUser,
+            workspaceId: wsA,
+            jsonBody: new UpdateProjectMemberDto { Role = ProjectMemberRoles.Admin, HourlyRate = RateColleagueA });
+        var respElevateAdmin = await client.SendAsync(reqElevateAdmin);
+        respElevateAdmin.StatusCode.ShouldBe(HttpStatusCode.Forbidden);
+        var bodyElevateAdmin = await respElevateAdmin.Content.ReadAsStringAsync();
+        bodyElevateAdmin.ShouldContain(TrackerDomainErrorCodes.RoleNotAllowed);
+
+        // 2. ColleagueA is regular Member in Workspace A (lacks Team.Manage)
+        // Blocked at aggregate MVC authorization layer with 403 (policy not granted)
+        var reqMemberInA = CreateRequest(
+            HttpMethod.Put,
+            $"/api/app/team/member?projectId={projA1}&userId={DualUser}",
+            userId: ColleagueA,
+            workspaceId: wsA,
+            jsonBody: new UpdateProjectMemberDto { Role = ProjectMemberRoles.Worker, HourlyRate = 20.00m });
+        var respMemberInA = await client.SendAsync(reqMemberInA);
+        respMemberInA.StatusCode.ShouldBe(HttpStatusCode.Forbidden);
+        var bodyMemberInA = await respMemberInA.Content.ReadAsStringAsync();
+        bodyMemberInA.ShouldContain("010002");
+
+        // 3. DualUser is regular Member in Workspace B (lacks Team.Manage in B)
+        // Blocked at aggregate MVC authorization layer with 403 (policy not granted)
+        var reqMemberInB = CreateRequest(
+            HttpMethod.Put,
+            $"/api/app/team/member?projectId={projB1}&userId={ColleagueB}",
+            userId: DualUser,
+            workspaceId: wsB,
+            jsonBody: new UpdateProjectMemberDto { Role = ProjectMemberRoles.Worker, HourlyRate = 10.00m });
+        var respMemberInB = await client.SendAsync(reqMemberInB);
+        respMemberInB.StatusCode.ShouldBe(HttpStatusCode.Forbidden);
+        var bodyMemberInB = await respMemberInB.Content.ReadAsStringAsync();
+        bodyMemberInB.ShouldContain("010002");
+
+        // Verify sentinels row-for-row in both workspaces remain untouched
+        await WithUnitOfWorkAsync(async () =>
+        {
+            using (_currentWorkspace.Change(wsA, WorkspaceRoles.Owner))
+            {
+                var memberColleagueA = await _projectMemberRepository.FirstOrDefaultAsync(
+                    m => m.ProjectId == projA1 && m.UserId == ColleagueA);
+                memberColleagueA.ShouldNotBeNull();
+                memberColleagueA.HourlyRate.ShouldBe(RateColleagueA);
+                memberColleagueA.Role.ShouldBe(ProjectMemberRoles.Worker);
+            }
+
+            using (_currentWorkspace.Change(wsB, WorkspaceRoles.Owner))
+            {
+                var memberColleagueB = await _projectMemberRepository.FirstOrDefaultAsync(
+                    m => m.ProjectId == projB1 && m.UserId == ColleagueB);
+                memberColleagueB.ShouldNotBeNull();
+                memberColleagueB.HourlyRate.ShouldBe(RateColleagueB);
+                memberColleagueB.Role.ShouldBe(ProjectMemberRoles.Admin);
+            }
+        });
+    }
+
+    [Fact]
+    public async Task Same_Account_Switching_Never_Carries_Workspace_A_Owner_Rights_To_Workspace_B()
+    {
+        var (wsA, wsB, projA1, _, projB1, _) = await SeedFixturesAsync();
+        var client = CreateHttpClient();
+
+        // 1. OwnerA is Owner in Workspace A -> legitimate mutation succeeds
+        var reqA1 = CreateRequest(
+            HttpMethod.Put,
+            $"/api/app/team/member?projectId={projA1}&userId={ColleagueA}",
+            userId: OwnerA,
+            workspaceId: wsA,
+            jsonBody: new UpdateProjectMemberDto { Role = ProjectMemberRoles.Manager, HourlyRate = 62.00m });
+        var respA1 = await client.SendAsync(reqA1);
+        respA1.StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        // 2. OwnerA switches to Workspace B (where they hold only Member role, unprivileged)
+        // Owner rights from Workspace A MUST NOT leak or grant Team.Manage in Workspace B
+        var reqB = CreateRequest(
+            HttpMethod.Put,
+            $"/api/app/team/member?projectId={projB1}&userId={DualUser}",
+            userId: OwnerA,
+            workspaceId: wsB,
+            jsonBody: new UpdateProjectMemberDto { Role = ProjectMemberRoles.Manager, HourlyRate = 99.00m });
+        var respB = await client.SendAsync(reqB);
+        respB.StatusCode.ShouldBe(HttpStatusCode.Forbidden);
+        var bodyB = await respB.Content.ReadAsStringAsync();
+        bodyB.ShouldContain("010002");
+
+        // 3. DualUser switches from privileged Manager in A to unprivileged Member in B
+        var reqDualInB = CreateRequest(
+            HttpMethod.Put,
+            $"/api/app/team/member?projectId={projB1}&userId={ColleagueB}",
+            userId: DualUser,
+            workspaceId: wsB,
+            jsonBody: new UpdateProjectMemberDto { Role = ProjectMemberRoles.Worker, HourlyRate = 12.00m });
+        var respDualInB = await client.SendAsync(reqDualInB);
+        respDualInB.StatusCode.ShouldBe(HttpStatusCode.Forbidden);
+        var bodyDualInB = await respDualInB.Content.ReadAsStringAsync();
+        bodyDualInB.ShouldContain("010002");
+
+        // 4. OwnerA switches back to Workspace A -> still authorized Owner
+        var reqA2 = CreateRequest(
+            HttpMethod.Put,
+            $"/api/app/team/member?projectId={projA1}&userId={ColleagueA}",
+            userId: OwnerA,
+            workspaceId: wsA,
+            jsonBody: new UpdateProjectMemberDto { Role = ProjectMemberRoles.Worker, HourlyRate = 59.00m });
+        var respA2 = await client.SendAsync(reqA2);
+        respA2.StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        // Verify Workspace B database sentinels remained 100% unmutated throughout
+        await WithUnitOfWorkAsync(async () =>
+        {
+            using (_currentWorkspace.Change(wsB, WorkspaceRoles.Owner))
+            {
+                var dualInB = await _projectMemberRepository.FirstOrDefaultAsync(
+                    m => m.ProjectId == projB1 && m.UserId == DualUser);
+                dualInB.ShouldNotBeNull();
+                dualInB.HourlyRate.ShouldBe(RateDualUserB);
+                dualInB.Role.ShouldBe(ProjectMemberRoles.Worker);
+
+                var colleagueInB = await _projectMemberRepository.FirstOrDefaultAsync(
+                    m => m.ProjectId == projB1 && m.UserId == ColleagueB);
+                colleagueInB.ShouldNotBeNull();
+                colleagueInB.HourlyRate.ShouldBe(RateColleagueB);
+                colleagueInB.Role.ShouldBe(ProjectMemberRoles.Admin);
+            }
+
+            using (_currentWorkspace.Change(wsA, WorkspaceRoles.Owner))
+            {
+                var colleagueInA = await _projectMemberRepository.FirstOrDefaultAsync(
+                    m => m.ProjectId == projA1 && m.UserId == ColleagueA);
+                colleagueInA.ShouldNotBeNull();
+                colleagueInA.HourlyRate.ShouldBe(59.00m);
+                colleagueInA.Role.ShouldBe(ProjectMemberRoles.Worker);
+            }
+        });
+    }
+
+    [Fact]
+    public async Task Cannot_Modify_Own_Role_Or_Rate_Even_As_Privileged_Owner_Or_Manager()
+    {
+        var (wsA, _, projA1, _, _, _) = await SeedFixturesAsync();
+        var client = CreateHttpClient();
+
+        // 1. OwnerA (Workspace Owner) attempting to modify self rate
+        var reqOwnerSelf = CreateRequest(
+            HttpMethod.Put,
+            $"/api/app/team/member?projectId={projA1}&userId={OwnerA}",
+            userId: OwnerA,
+            workspaceId: wsA,
+            jsonBody: new UpdateProjectMemberDto { Role = ProjectMemberRoles.Admin, HourlyRate = 250.00m });
+        var respOwnerSelf = await client.SendAsync(reqOwnerSelf);
+        respOwnerSelf.StatusCode.ShouldBe(HttpStatusCode.Forbidden);
+        var bodyOwnerSelf = await respOwnerSelf.Content.ReadAsStringAsync();
+        bodyOwnerSelf.ShouldContain(TrackerDomainErrorCodes.CannotModifySelf);
+
+        // 2. DualUser (Workspace Manager) attempting to modify self role
+        var reqManagerSelf = CreateRequest(
+            HttpMethod.Put,
+            $"/api/app/team/member?projectId={projA1}&userId={DualUser}",
+            userId: DualUser,
+            workspaceId: wsA,
+            jsonBody: new UpdateProjectMemberDto { Role = ProjectMemberRoles.Worker, HourlyRate = RateDualUserA });
+        var respManagerSelf = await client.SendAsync(reqManagerSelf);
+        respManagerSelf.StatusCode.ShouldBe(HttpStatusCode.Forbidden);
+        var bodyManagerSelf = await respManagerSelf.Content.ReadAsStringAsync();
+        bodyManagerSelf.ShouldContain(TrackerDomainErrorCodes.CannotModifySelf);
+
+        // Verify database sentinels remain unchanged
+        await WithUnitOfWorkAsync(async () =>
+        {
+            using (_currentWorkspace.Change(wsA, WorkspaceRoles.Owner))
+            {
+                var owner = await _projectMemberRepository.FirstOrDefaultAsync(
+                    m => m.ProjectId == projA1 && m.UserId == OwnerA);
+                owner.ShouldNotBeNull();
+                owner.HourlyRate.ShouldBe(RateOwnerA);
+                owner.Role.ShouldBe(ProjectMemberRoles.Admin);
+
+                var dual = await _projectMemberRepository.FirstOrDefaultAsync(
+                    m => m.ProjectId == projA1 && m.UserId == DualUser);
+                dual.ShouldNotBeNull();
+                dual.HourlyRate.ShouldBe(RateDualUserA);
+                dual.Role.ShouldBe(ProjectMemberRoles.Manager);
+            }
+        });
+    }
+
+    [Fact]
+    public async Task Manager_Cannot_Modify_Workspace_Owner_Project_Membership()
+    {
+        var (wsA, _, projA1, _, _, _) = await SeedFixturesAsync();
+        var client = CreateHttpClient();
+
+        // DualUser is Manager in Workspace A. OwnerA is Workspace Owner.
+        // Manager attempting to modify Owner's project membership role is rejected with 403 RoleNotAllowed
+        var req = CreateRequest(
+            HttpMethod.Put,
+            $"/api/app/team/member?projectId={projA1}&userId={OwnerA}",
+            userId: DualUser,
+            workspaceId: wsA,
+            jsonBody: new UpdateProjectMemberDto { Role = ProjectMemberRoles.Worker, HourlyRate = RateOwnerA });
+        var resp = await client.SendAsync(req);
+        resp.StatusCode.ShouldBe(HttpStatusCode.Forbidden);
+
+        var body = await resp.Content.ReadAsStringAsync();
+        body.ShouldContain(TrackerDomainErrorCodes.RoleNotAllowed);
+
+        // Verify OwnerA row in projA1 is completely unchanged
+        await WithUnitOfWorkAsync(async () =>
+        {
+            using (_currentWorkspace.Change(wsA, WorkspaceRoles.Owner))
+            {
+                var owner = await _projectMemberRepository.FirstOrDefaultAsync(
+                    m => m.ProjectId == projA1 && m.UserId == OwnerA);
+                owner.ShouldNotBeNull();
+                owner.HourlyRate.ShouldBe(RateOwnerA);
+                owner.Role.ShouldBe(ProjectMemberRoles.Admin);
+            }
+        });
+    }
+
+    [Fact]
+    public async Task Foreign_Workspace_Caller_Spoofing_Target_Header_Cannot_Mutate_Roster()
+    {
+        var (_, wsB, _, _, projB1, _) = await SeedFixturesAsync();
+        var client = CreateHttpClient();
+
+        // ForeignUserA belongs strictly to Workspace A, not Workspace B
+        // Attempts to mutate DualUser in projB1 by spoofing X-Workspace-Id: wsB
+        var req = CreateRequest(
+            HttpMethod.Put,
+            $"/api/app/team/member?projectId={projB1}&userId={DualUser}",
+            userId: ForeignUserA,
+            workspaceId: wsB,
+            jsonBody: new UpdateProjectMemberDto { Role = ProjectMemberRoles.Manager, HourlyRate = 88.00m });
+        var resp = await client.SendAsync(req);
+        resp.StatusCode.ShouldBe(HttpStatusCode.Forbidden);
+
+        var body = await resp.Content.ReadAsStringAsync();
+        body.ShouldContain(TrackerDomainErrorCodes.NotWorkspaceMember);
+
+        // Target workspace B rows remain strictly preserved
+        await WithUnitOfWorkAsync(async () =>
+        {
+            using (_currentWorkspace.Change(wsB, WorkspaceRoles.Owner))
+            {
+                var dualB = await _projectMemberRepository.FirstOrDefaultAsync(
+                    m => m.ProjectId == projB1 && m.UserId == DualUser);
+                dualB.ShouldNotBeNull();
+                dualB.HourlyRate.ShouldBe(RateDualUserB);
+                dualB.Role.ShouldBe(ProjectMemberRoles.Worker);
+            }
+        });
+    }
+
+    [Fact]
+    public async Task Workspace_A_Authorized_Header_With_Real_Foreign_Project_And_User_Returns_404_And_Preserves_Foreign_State()
+    {
+        var (wsA, wsB, _, _, projB1, _) = await SeedFixturesAsync();
+        var client = CreateHttpClient();
+
+        // OwnerA is fully authorized in Workspace A. Passes X-Workspace-Id: wsA but targets real Workspace B project & user
+        // Ambient query filter restricts FirstOrDefaultAsync to Workspace A, resulting in member == null -> EntityNotFoundException -> 404
+        var req = CreateRequest(
+            HttpMethod.Put,
+            $"/api/app/team/member?projectId={projB1}&userId={DualUser}",
+            userId: OwnerA,
+            workspaceId: wsA,
+            jsonBody: new UpdateProjectMemberDto { Role = ProjectMemberRoles.Manager, HourlyRate = 99.00m });
+        var resp = await client.SendAsync(req);
+        resp.StatusCode.ShouldBe(HttpStatusCode.NotFound);
+
+        // Workspace B sentinels must remain 100% intact
+        await WithUnitOfWorkAsync(async () =>
+        {
+            using (_currentWorkspace.Change(wsB, WorkspaceRoles.Owner))
+            {
+                var dualB = await _projectMemberRepository.FirstOrDefaultAsync(
+                    m => m.ProjectId == projB1 && m.UserId == DualUser);
+                dualB.ShouldNotBeNull();
+                dualB.HourlyRate.ShouldBe(RateDualUserB);
+                dualB.Role.ShouldBe(ProjectMemberRoles.Worker);
+            }
+        });
+    }
+
+    [Fact]
+    public async Task Missing_Or_Empty_Workspace_Header_On_Update_Is_Rejected()
+    {
+        var (wsA, _, projA1, _, _, _) = await SeedFixturesAsync();
+        var client = CreateHttpClient();
+
+        var updateDto = new UpdateProjectMemberDto { Role = ProjectMemberRoles.Manager, HourlyRate = 60.00m };
+
+        // 1. Missing workspace header
+        // Since UpdateMemberAsync requires [Authorize(TrackerPermissions.Team.Manage)], which is resolved
+        // per-workspace, absence of workspace header leaves user unprivileged in aggregate auth -> 403 Forbidden
+        var reqMissing = CreateRequest(
+            HttpMethod.Put,
+            $"/api/app/team/member?projectId={projA1}&userId={ColleagueA}",
+            userId: OwnerA,
+            workspaceId: null,
+            jsonBody: updateDto);
+        var respMissing = await client.SendAsync(reqMissing);
+        respMissing.StatusCode.ShouldBe(HttpStatusCode.Forbidden);
+        var bodyMissing = await respMissing.Content.ReadAsStringAsync();
+        bodyMissing.ShouldContain("010002");
+
+        // 2. Guid.Empty workspace header
+        // Intercepted by production WorkspaceResolutionMiddleware -> 400 BadRequest with WorkspaceRequired
+        var reqEmpty = new HttpRequestMessage(
+            HttpMethod.Put,
+            $"/api/app/team/member?projectId={projA1}&userId={ColleagueA}");
+        reqEmpty.Headers.Authorization = new AuthenticationHeaderValue("Bearer", OwnerA.ToString());
+        reqEmpty.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+        reqEmpty.Headers.Add(WorkspaceConsts.HeaderName, Guid.Empty.ToString());
+        var jsonContent = JsonSerializer.Serialize(updateDto);
+        reqEmpty.Content = new StringContent(jsonContent, System.Text.Encoding.UTF8, "application/json");
+
+        var respEmpty = await client.SendAsync(reqEmpty);
+        respEmpty.StatusCode.ShouldBe(HttpStatusCode.BadRequest);
+        var bodyEmpty = await respEmpty.Content.ReadAsStringAsync();
+        bodyEmpty.ShouldContain(TrackerDomainErrorCodes.WorkspaceRequired);
+
+        // Verify Workspace A sentinels remain unmutated
+        await WithUnitOfWorkAsync(async () =>
+        {
+            using (_currentWorkspace.Change(wsA, WorkspaceRoles.Owner))
+            {
+                var member = await _projectMemberRepository.FirstOrDefaultAsync(
+                    m => m.ProjectId == projA1 && m.UserId == ColleagueA);
+                member.ShouldNotBeNull();
+                member.HourlyRate.ShouldBe(RateColleagueA);
+                member.Role.ShouldBe(ProjectMemberRoles.Worker);
+            }
+        });
+    }
 }
+
