@@ -89,6 +89,7 @@ public class ProjectTaskAppService : TrackerAppService, IProjectTaskAppService
         var items = await AsyncExecuter.ToListAsync(
             query.OrderBy(t => t.IsCompleted)
                  .ThenByDescending(t => t.CreationTime)
+                 .ThenBy(t => t.Id)
                  .Skip(skipCount)
                  .Take(pageSize));
 

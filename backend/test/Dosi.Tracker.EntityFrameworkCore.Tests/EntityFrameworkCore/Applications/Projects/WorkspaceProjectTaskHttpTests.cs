@@ -684,4 +684,184 @@ public class WorkspaceProjectTaskHttpTests : WorkspaceHttpTestBase<TrackerHttpAp
         var respLong = await client.SendAsync(reqLong);
         respLong.StatusCode.ShouldBe(HttpStatusCode.BadRequest);
     }
+
+    [Fact]
+    public async Task Pagination_Is_Bounded_And_Clamped_To_Max_Page_Size_With_Filter_And_Isolation()
+    {
+        var (wsA, wsB, projA1, projA2, _, projB1, taskB1Id) = await SeedFixturesAsync();
+        var client = CreateHttpClient();
+
+        var activeTasks = new List<ProjectTask>();
+        var completedTasks = new List<ProjectTask>();
+        Guid sentA2Id = Guid.Empty;
+
+        // Seed >100 nonempty tasks in authorized A project (65 active + 40 completed = 105 total),
+        // plus sentinel in unauthorized A2 project and sentinel in foreign B project.
+        await WithUnitOfWorkAsync(async () =>
+        {
+            using (_currentWorkspace.Change(wsA, WorkspaceRoles.Owner))
+            {
+                for (int i = 1; i <= 65; i++)
+                {
+                    var t = new ProjectTask(
+                        _guidGenerator.Create(),
+                        wsA,
+                        projA1,
+                        $"Active Task {i:D3}",
+                        $"Active description {i:D3}");
+                    await _taskRepository.InsertAsync(t, autoSave: false);
+                    activeTasks.Add(t);
+                }
+
+                for (int i = 1; i <= 40; i++)
+                {
+                    var t = new ProjectTask(
+                        _guidGenerator.Create(),
+                        wsA,
+                        projA1,
+                        $"Completed Task {i:D3}",
+                        $"Completed description {i:D3}");
+                    t.Complete(DateTime.UtcNow.AddMinutes(-i));
+                    await _taskRepository.InsertAsync(t, autoSave: false);
+                    completedTasks.Add(t);
+                }
+
+                var sentA2 = new ProjectTask(
+                    _guidGenerator.Create(),
+                    wsA,
+                    projA2,
+                    "Project A2 Sentinel Task",
+                    "A2 sentinel description");
+                await _taskRepository.InsertAsync(sentA2, autoSave: true);
+                sentA2Id = sentA2.Id;
+            }
+        });
+
+        var allA1Ids = activeTasks.Concat(completedTasks).Select(t => t.Id).ToHashSet();
+        var activeA1Ids = activeTasks.Select(t => t.Id).ToHashSet();
+        var completedA1Ids = completedTasks.Select(t => t.Id).ToHashSet();
+
+        allA1Ids.Count.ShouldBe(105);
+        activeA1Ids.Count.ShouldBe(65);
+        completedA1Ids.Count.ShouldBe(40);
+
+        // 1. Accepted oversize page request within inherited DTO validation ceiling (MaxResultCount = 250, inherited ceiling 1000)
+        // Service clamps MaxResultCount to ProjectTaskConsts.MaxPageSize = 100
+        var clampReq = CreateRequest(HttpMethod.Get, $"/api/app/project-task?projectId={projA1}&maxResultCount=250", userId: OwnerA, workspaceId: wsA);
+        var clampResp = await client.SendAsync(clampReq);
+        clampResp.StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        var clampDto = JsonSerializer.Deserialize<PagedResultDto<ProjectTaskDto>>(await clampResp.Content.ReadAsStringAsync(), CamelCaseJsonOptions);
+        clampDto.ShouldNotBeNull();
+        clampDto.TotalCount.ShouldBe(105);
+        clampDto.Items.Count.ShouldBe(100);
+        clampDto.Items.All(t => t.ProjectId == projA1).ShouldBeTrue();
+        clampDto.Items.ShouldNotContain(t => t.Id == sentA2Id);
+        clampDto.Items.ShouldNotContain(t => t.Id == taskB1Id);
+
+        // 2. Meaningful successive pages / SkipCount without duplication or silent foreign inclusion
+        // Page 1: skipCount = 0, maxResultCount = 50
+        var p1Req = CreateRequest(HttpMethod.Get, $"/api/app/project-task?projectId={projA1}&skipCount=0&maxResultCount=50", userId: OwnerA, workspaceId: wsA);
+        var p1Resp = await client.SendAsync(p1Req);
+        p1Resp.StatusCode.ShouldBe(HttpStatusCode.OK);
+        var p1Dto = JsonSerializer.Deserialize<PagedResultDto<ProjectTaskDto>>(await p1Resp.Content.ReadAsStringAsync(), CamelCaseJsonOptions);
+        p1Dto.ShouldNotBeNull();
+        p1Dto.TotalCount.ShouldBe(105);
+        p1Dto.Items.Count.ShouldBe(50);
+        var p1Ids = p1Dto.Items.Select(x => x.Id).ToList();
+
+        // Page 2: skipCount = 50, maxResultCount = 50
+        var p2Req = CreateRequest(HttpMethod.Get, $"/api/app/project-task?projectId={projA1}&skipCount=50&maxResultCount=50", userId: OwnerA, workspaceId: wsA);
+        var p2Resp = await client.SendAsync(p2Req);
+        p2Resp.StatusCode.ShouldBe(HttpStatusCode.OK);
+        var p2Dto = JsonSerializer.Deserialize<PagedResultDto<ProjectTaskDto>>(await p2Resp.Content.ReadAsStringAsync(), CamelCaseJsonOptions);
+        p2Dto.ShouldNotBeNull();
+        p2Dto.TotalCount.ShouldBe(105);
+        p2Dto.Items.Count.ShouldBe(50);
+        var p2Ids = p2Dto.Items.Select(x => x.Id).ToList();
+
+        // Page 3: skipCount = 100, maxResultCount = 50
+        var p3Req = CreateRequest(HttpMethod.Get, $"/api/app/project-task?projectId={projA1}&skipCount=100&maxResultCount=50", userId: OwnerA, workspaceId: wsA);
+        var p3Resp = await client.SendAsync(p3Req);
+        p3Resp.StatusCode.ShouldBe(HttpStatusCode.OK);
+        var p3Dto = JsonSerializer.Deserialize<PagedResultDto<ProjectTaskDto>>(await p3Resp.Content.ReadAsStringAsync(), CamelCaseJsonOptions);
+        p3Dto.ShouldNotBeNull();
+        p3Dto.TotalCount.ShouldBe(105);
+        p3Dto.Items.Count.ShouldBe(5);
+        var p3Ids = p3Dto.Items.Select(x => x.Id).ToList();
+
+        // Zero duplicate items across page boundaries
+        p1Ids.Intersect(p2Ids).ShouldBeEmpty();
+        p2Ids.Intersect(p3Ids).ShouldBeEmpty();
+        p1Ids.Intersect(p3Ids).ShouldBeEmpty();
+
+        // Full union matches all 105 seeded tasks with zero foreign inclusion
+        var combinedIds = p1Ids.Concat(p2Ids).Concat(p3Ids).ToHashSet();
+        combinedIds.Count.ShouldBe(105);
+        combinedIds.SetEquals(allA1Ids).ShouldBeTrue();
+        combinedIds.ShouldNotContain(sentA2Id);
+        combinedIds.ShouldNotContain(taskB1Id);
+
+        // 3. IsCompleted filter with coherent snapshot counts
+        // 3a. isCompleted = false
+        var activeReq = CreateRequest(HttpMethod.Get, $"/api/app/project-task?projectId={projA1}&isCompleted=false&maxResultCount=100", userId: OwnerA, workspaceId: wsA);
+        var activeResp = await client.SendAsync(activeReq);
+        activeResp.StatusCode.ShouldBe(HttpStatusCode.OK);
+        var activeDto = JsonSerializer.Deserialize<PagedResultDto<ProjectTaskDto>>(await activeResp.Content.ReadAsStringAsync(), CamelCaseJsonOptions);
+        activeDto.ShouldNotBeNull();
+        activeDto.TotalCount.ShouldBe(65);
+        activeDto.Items.Count.ShouldBe(65);
+        activeDto.Items.All(t => !t.IsCompleted && t.CompletedAt == null).ShouldBeTrue();
+        activeDto.Items.Select(t => t.Id).ToHashSet().SetEquals(activeA1Ids).ShouldBeTrue();
+        activeDto.Items.First().Title.ShouldStartWith("Active Task");
+        activeDto.Items.Last().Title.ShouldStartWith("Active Task");
+
+        // 3b. isCompleted = true
+        var completedReq = CreateRequest(HttpMethod.Get, $"/api/app/project-task?projectId={projA1}&isCompleted=true&maxResultCount=100", userId: OwnerA, workspaceId: wsA);
+        var completedResp = await client.SendAsync(completedReq);
+        completedResp.StatusCode.ShouldBe(HttpStatusCode.OK);
+        var completedDto = JsonSerializer.Deserialize<PagedResultDto<ProjectTaskDto>>(await completedResp.Content.ReadAsStringAsync(), CamelCaseJsonOptions);
+        completedDto.ShouldNotBeNull();
+        completedDto.TotalCount.ShouldBe(40);
+        completedDto.Items.Count.ShouldBe(40);
+        completedDto.Items.All(t => t.IsCompleted && t.CompletedAt != null).ShouldBeTrue();
+        completedDto.Items.Select(t => t.Id).ToHashSet().SetEquals(completedA1Ids).ShouldBeTrue();
+        completedDto.Items.First().Title.ShouldStartWith("Completed Task");
+        completedDto.Items.Last().Title.ShouldStartWith("Completed Task");
+
+        // 4. Foreign & Unenrolled Query Denial
+        // 4a. Query with real foreign project ID (projB1) under Workspace A header returns 404
+        var foreignProjReq = CreateRequest(HttpMethod.Get, $"/api/app/project-task?projectId={projB1}", userId: OwnerA, workspaceId: wsA);
+        var foreignProjResp = await client.SendAsync(foreignProjReq);
+        foreignProjResp.StatusCode.ShouldBe(HttpStatusCode.NotFound);
+
+        // 4b. ColleagueA (active workspace member, but unenrolled in private projA2) querying projA2 returns 404
+        var unenrolledReq = CreateRequest(HttpMethod.Get, $"/api/app/project-task?projectId={projA2}", userId: ColleagueA, workspaceId: wsA);
+        var unenrolledResp = await client.SendAsync(unenrolledReq);
+        unenrolledResp.StatusCode.ShouldBe(HttpStatusCode.NotFound);
+
+        // 5. Preserved target sentinels in database directly
+        await WithUnitOfWorkAsync(async () =>
+        {
+            using (_currentWorkspace.Change(wsA, WorkspaceRoles.Owner))
+            {
+                var countA1 = await _taskRepository.CountAsync(t => t.ProjectId == projA1);
+                countA1.ShouldBe(105);
+
+                var taskA2 = await _taskRepository.GetAsync(sentA2Id);
+                taskA2.Title.ShouldBe("Project A2 Sentinel Task");
+                taskA2.IsCompleted.ShouldBeFalse();
+                taskA2.ProjectId.ShouldBe(projA2);
+            }
+
+            using (_currentWorkspace.Change(wsB, WorkspaceRoles.Owner))
+            {
+                var taskB = await _taskRepository.GetAsync(taskB1Id);
+                taskB.Title.ShouldBe("Project B Seeded Task");
+                taskB.IsCompleted.ShouldBeFalse();
+                taskB.ProjectId.ShouldBe(projB1);
+            }
+        });
+    }
 }
+
