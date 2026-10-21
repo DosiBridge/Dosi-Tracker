@@ -6,6 +6,7 @@ using System.Threading.Tasks;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using Dosi.Tracker.Devices;
 using Dosi.Tracker.Identity;
 using Dosi.Tracker.Permissions;
 using Dosi.Tracker.Projects;
@@ -64,6 +65,7 @@ public class ActivityAppService : TrackerAppService, IActivityAppService
     private readonly IRepository<Screenshot, Guid> _screenshotRepository;
     private readonly IRepository<ProjectMember, Guid> _memberRepository;
     private readonly IRepository<Project, Guid> _projectRepository;
+    private readonly IRepository<DeviceRevocation, Guid> _revocationRepository;
     private readonly IBlobContainer _blobContainer;
     private readonly ISubscriptionAccessChecker _subscriptionAccessChecker;
     private readonly IAbpDistributedLock _distributedLock;
@@ -74,6 +76,7 @@ public class ActivityAppService : TrackerAppService, IActivityAppService
         IRepository<Screenshot, Guid> screenshotRepository,
         IRepository<ProjectMember, Guid> memberRepository,
         IRepository<Project, Guid> projectRepository,
+        IRepository<DeviceRevocation, Guid> revocationRepository,
         IBlobContainer blobContainer,
         ISubscriptionAccessChecker subscriptionAccessChecker,
         IAbpDistributedLock distributedLock,
@@ -83,6 +86,7 @@ public class ActivityAppService : TrackerAppService, IActivityAppService
         _screenshotRepository = screenshotRepository;
         _memberRepository = memberRepository;
         _projectRepository = projectRepository;
+        _revocationRepository = revocationRepository;
         _blobContainer = blobContainer;
         _subscriptionAccessChecker = subscriptionAccessChecker;
         _distributedLock = distributedLock;
@@ -120,6 +124,21 @@ public class ActivityAppService : TrackerAppService, IActivityAppService
         if (stored != null)
         {
             return await MapToDtoWithCapturesAsync(stored);
+        }
+
+        // Deny subsequent activity ingestion for a revoked logical device id before persistence or blob side effects.
+        if (input.DeviceId.HasValue && input.DeviceId.Value != Guid.Empty)
+        {
+            var isRevoked = await _revocationRepository.AnyAsync(r =>
+                r.WorkspaceId == CurrentWorkspace.GetId() &&
+                r.UserId == userId &&
+                r.DeviceId == input.DeviceId.Value);
+
+            if (isRevoked)
+            {
+                throw new BusinessException(TrackerDomainErrorCodes.DeviceRevoked)
+                    .WithData("deviceId", input.DeviceId.Value);
+            }
         }
 
         var project = await GetUploadProjectAsync(userId, input.ProjectId);

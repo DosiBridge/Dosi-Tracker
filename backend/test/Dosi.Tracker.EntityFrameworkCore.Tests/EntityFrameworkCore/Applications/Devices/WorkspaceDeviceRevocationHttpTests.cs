@@ -1,0 +1,636 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Text.Json;
+using System.Threading.Tasks;
+using Dosi.Tracker.Activities;
+using Dosi.Tracker.Devices;
+using Dosi.Tracker.EntityFrameworkCore;
+using Dosi.Tracker.Presence;
+using Dosi.Tracker.Projects;
+using Dosi.Tracker.Security;
+using Dosi.Tracker.Workspaces;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
+using Shouldly;
+using Volo.Abp.Domain.Repositories;
+using Volo.Abp.Guids;
+using Volo.Abp.Identity;
+using Volo.Abp.Security.Claims;
+using Volo.Abp.Uow;
+using Xunit;
+
+namespace Dosi.Tracker.EntityFrameworkCore.Applications.Devices;
+
+/// <summary>
+/// Regressions for workspace-scoped self-service device revocation:
+/// 1. Own device revoke and repeated revoke (idempotent 200 OK).
+/// 2. Post-revoke heartbeat denied (403 Tracker:DeviceRevoked) with persisted sentinels.
+/// 3. Post-revoke activity ingest denied (403 Tracker:DeviceRevoked) with zero blob/screenshot side-effects.
+/// 4. Idempotent replay of previously stored block for revoked device succeeds.
+/// 5. Historical records retained and current live presence projection excluded.
+/// 6. Legitimate different device for caller in A continues to work.
+/// 7. Same user/device ID in Workspace B unaffected (strictly workspace-scoped).
+/// 8. Another member's device in A and foreign workspace targets denied without tombstones.
+/// 9. Stale presence cleanup cannot remove persistent revocation record.
+/// 10. Malformed/unobserved device targets rejected (400 Tracker:DeviceNotObserved) without creating tombstones.
+/// 11. Status inspection and bounded listing contracts work as expected.
+/// 12. Legacy missing-DeviceId activity behavior preserved.
+/// </summary>
+public class WorkspaceDeviceRevocationHttpTests : WorkspaceHttpTestBase<TrackerHttpApiServerTestModule>
+{
+    private static readonly Guid UserA = Guid.Parse("6a701e62-0953-4dd3-910b-dc6cc93ccb01");
+    private static readonly Guid ColleagueA = Guid.Parse("6a701e62-0953-4dd3-910b-dc6cc93ccb02");
+    private static readonly Guid ForeignUser = Guid.Parse("6a701e62-0953-4dd3-910b-dc6cc93ccb03");
+
+    private readonly IRepository<Workspace, Guid> _workspaceRepository;
+    private readonly IRepository<WorkspaceMember, Guid> _memberRepository;
+    private readonly IRepository<Project, Guid> _projectRepository;
+    private readonly IRepository<ProjectMember, Guid> _projectMemberRepository;
+    private readonly IRepository<AgentPresence, Guid> _presenceRepository;
+    private readonly IRepository<Activity, Guid> _activityRepository;
+    private readonly IRepository<Screenshot, Guid> _screenshotRepository;
+    private readonly IRepository<DeviceRevocation, Guid> _revocationRepository;
+    private readonly IdentityUserManager _userManager;
+    private readonly IGuidGenerator _guidGenerator;
+    private readonly ICurrentWorkspace _currentWorkspace;
+
+    public WorkspaceDeviceRevocationHttpTests()
+    {
+        _workspaceRepository = GetRequiredService<IRepository<Workspace, Guid>>();
+        _memberRepository = GetRequiredService<IRepository<WorkspaceMember, Guid>>();
+        _projectRepository = GetRequiredService<IRepository<Project, Guid>>();
+        _projectMemberRepository = GetRequiredService<IRepository<ProjectMember, Guid>>();
+        _presenceRepository = GetRequiredService<IRepository<AgentPresence, Guid>>();
+        _activityRepository = GetRequiredService<IRepository<Activity, Guid>>();
+        _screenshotRepository = GetRequiredService<IRepository<Screenshot, Guid>>();
+        _revocationRepository = GetRequiredService<IRepository<DeviceRevocation, Guid>>();
+        _userManager = GetRequiredService<IdentityUserManager>();
+        _guidGenerator = GetRequiredService<IGuidGenerator>();
+        _currentWorkspace = GetRequiredService<ICurrentWorkspace>();
+    }
+
+    protected override void ConfigureTestServerServices(IServiceCollection services)
+    {
+        var db = ServiceProvider.GetRequiredService<TrackerDbContext>();
+        var conn = db.Database.GetDbConnection();
+        services.Configure<Volo.Abp.EntityFrameworkCore.AbpDbContextOptions>(options =>
+        {
+            options.Configure(ctx =>
+            {
+                ctx.DbContextOptions.UseSqlite(conn);
+            });
+        });
+        services.AddAlwaysDisableUnitOfWorkTransaction();
+    }
+
+    private new static HttpRequestMessage CreateRequest(
+        HttpMethod method,
+        string url,
+        Guid? userId,
+        Guid? workspaceId,
+        object? jsonBody = null)
+    {
+        return WorkspaceHttpTestBase<TrackerHttpApiServerTestModule>.CreateRequest(method, url, userId, workspaceId, jsonBody);
+    }
+
+    private async Task<(Guid WorkspaceA, Guid WorkspaceB, Guid ProjectA, Guid ProjectB)> SeedFixturesAsync()
+    {
+        var wsA = _guidGenerator.Create();
+        var wsB = _guidGenerator.Create();
+        var projA = _guidGenerator.Create();
+        var projB = _guidGenerator.Create();
+
+        await WithUnitOfWorkAsync(async () =>
+        {
+            if (await _userManager.FindByIdAsync(UserA.ToString()) == null)
+            {
+                await _userManager.CreateAsync(new IdentityUser(UserA, "userA_dev", "userA_dev@test.com"));
+            }
+            if (await _userManager.FindByIdAsync(ColleagueA.ToString()) == null)
+            {
+                await _userManager.CreateAsync(new IdentityUser(ColleagueA, "colleagueA_dev", "colleagueA_dev@test.com"));
+            }
+            if (await _userManager.FindByIdAsync(ForeignUser.ToString()) == null)
+            {
+                await _userManager.CreateAsync(new IdentityUser(ForeignUser, "foreign_dev", "foreign_dev@test.com"));
+            }
+
+            await _workspaceRepository.InsertAsync(new Workspace(wsA, "Workspace Alpha"), autoSave: true);
+            await _workspaceRepository.InsertAsync(new Workspace(wsB, "Workspace Beta"), autoSave: true);
+
+            var now = DateTime.UtcNow;
+            // Workspace A: UserA (Owner), ColleagueA (Member)
+            await _memberRepository.InsertAsync(new WorkspaceMember(_guidGenerator.Create(), wsA, UserA, WorkspaceRoles.Owner, now), autoSave: true);
+            await _memberRepository.InsertAsync(new WorkspaceMember(_guidGenerator.Create(), wsA, ColleagueA, WorkspaceRoles.Member, now), autoSave: true);
+
+            // Workspace B: UserA (Member), ForeignUser (Owner)
+            await _memberRepository.InsertAsync(new WorkspaceMember(_guidGenerator.Create(), wsB, UserA, WorkspaceRoles.Member, now), autoSave: true);
+            await _memberRepository.InsertAsync(new WorkspaceMember(_guidGenerator.Create(), wsB, ForeignUser, WorkspaceRoles.Owner, now), autoSave: true);
+
+            using (_currentWorkspace.Change(wsA, WorkspaceRoles.Owner))
+            {
+                await _projectRepository.InsertAsync(new Project(projA, wsA, "Project Alpha"), autoSave: true);
+                await _projectMemberRepository.InsertAsync(new ProjectMember(_guidGenerator.Create(), wsA, projA, UserA, "Developer"), autoSave: true);
+                await _projectMemberRepository.InsertAsync(new ProjectMember(_guidGenerator.Create(), wsA, projA, ColleagueA, "Developer"), autoSave: true);
+            }
+
+            using (_currentWorkspace.Change(wsB, WorkspaceRoles.Owner))
+            {
+                await _projectRepository.InsertAsync(new Project(projB, wsB, "Project Beta"), autoSave: true);
+                await _projectMemberRepository.InsertAsync(new ProjectMember(_guidGenerator.Create(), wsB, projB, UserA, "Developer"), autoSave: true);
+            }
+        });
+
+        return (wsA, wsB, projA, projB);
+    }
+
+    [Fact]
+    public async Task Own_Device_Revocation_And_Repeated_Revoke_Are_Idempotent_And_Persisted()
+    {
+        var (wsA, _, _, _) = await SeedFixturesAsync();
+        var client = CreateHttpClient();
+        var deviceId = _guidGenerator.Create();
+
+        // 1. Establish observed device for UserA in wsA via heartbeat
+        var heartbeatReq = CreateRequest(HttpMethod.Post, "/api/app/presence/heartbeat", UserA, wsA, new
+        {
+            deviceId = deviceId,
+            status = "tracking",
+            deviceName = "MY-LAPTOP"
+        });
+        var heartbeatResp = await client.SendAsync(heartbeatReq);
+        heartbeatResp.StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        // 2. Revoke own device
+        var revokeReq = CreateRequest(HttpMethod.Post, "/api/app/device/revoke", UserA, wsA, new
+        {
+            deviceId = deviceId,
+            reason = "Stolen laptop"
+        });
+        var revokeResp = await client.SendAsync(revokeReq);
+        revokeResp.StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        var revokeJson = await revokeResp.Content.ReadAsStringAsync();
+        using (var doc = JsonDocument.Parse(revokeJson))
+        {
+            doc.RootElement.GetProperty("deviceId").GetString().ShouldBe(deviceId.ToString());
+            doc.RootElement.GetProperty("reason").GetString().ShouldBe("Stolen laptop");
+            doc.RootElement.GetProperty("workspaceId").GetString().ShouldBe(wsA.ToString());
+            doc.RootElement.GetProperty("userId").GetString().ShouldBe(UserA.ToString());
+        }
+
+        // Verify persisted in AppDeviceRevocations
+        await WithUnitOfWorkAsync(async () =>
+        {
+            using (_currentWorkspace.Change(wsA))
+            {
+                var count = await _revocationRepository.CountAsync(r => r.WorkspaceId == wsA && r.UserId == UserA && r.DeviceId == deviceId);
+                count.ShouldBe(1);
+            }
+        });
+
+        // 3. Repeated revoke is idempotent (200 OK without creating duplicate rows)
+        var repeatReq = CreateRequest(HttpMethod.Post, "/api/app/device/revoke", UserA, wsA, new
+        {
+            deviceId = deviceId,
+            reason = "Another reason attempt"
+        });
+        var repeatResp = await client.SendAsync(repeatReq);
+        repeatResp.StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        await WithUnitOfWorkAsync(async () =>
+        {
+            using (_currentWorkspace.Change(wsA))
+            {
+                var count = await _revocationRepository.CountAsync(r => r.WorkspaceId == wsA && r.UserId == UserA && r.DeviceId == deviceId);
+                count.ShouldBe(1);
+            }
+        });
+    }
+
+    [Fact]
+    public async Task Post_Revoke_Heartbeat_And_Activity_Ingestion_Are_Denied_With_Zero_Blob_Effects()
+    {
+        var (wsA, _, projA, _) = await SeedFixturesAsync();
+        var client = CreateHttpClient();
+        var deviceId = _guidGenerator.Create();
+
+        // 1. Observe device via initial heartbeat
+        var initHeartbeat = CreateRequest(HttpMethod.Post, "/api/app/presence/heartbeat", UserA, wsA, new
+        {
+            deviceId = deviceId,
+            status = "tracking"
+        });
+        (await client.SendAsync(initHeartbeat)).StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        // Count initial screenshots and activities
+        long initialScreenshots = 0;
+        long initialActivities = 0;
+        await WithUnitOfWorkAsync(async () =>
+        {
+            using (_currentWorkspace.Change(wsA))
+            {
+                initialScreenshots = await _screenshotRepository.GetCountAsync();
+                initialActivities = await _activityRepository.GetCountAsync();
+            }
+        });
+
+        // 2. Revoke the device
+        var revokeReq = CreateRequest(HttpMethod.Post, "/api/app/device/revoke", UserA, wsA, new
+        {
+            deviceId = deviceId,
+            reason = "Compromised machine"
+        });
+        (await client.SendAsync(revokeReq)).StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        // 3. Subsequent heartbeat from revoked device is DENIED (403 Forbidden with Tracker:DeviceRevoked)
+        var deniedHeartbeat = CreateRequest(HttpMethod.Post, "/api/app/presence/heartbeat", UserA, wsA, new
+        {
+            deviceId = deviceId,
+            status = "tracking"
+        });
+        var hbResp = await client.SendAsync(deniedHeartbeat);
+        hbResp.StatusCode.ShouldBe(HttpStatusCode.Forbidden);
+        var hbBody = await hbResp.Content.ReadAsStringAsync();
+        hbBody.ShouldContain("Tracker:DeviceRevoked");
+
+        // 4. Subsequent activity ingestion from revoked device is DENIED (403 Forbidden with Tracker:DeviceRevoked)
+        var blockTime = DateTime.UtcNow.AddMinutes(-10);
+        var jpeg = Convert.ToBase64String(new byte[] { 0xFF, 0xD8, 0xFF, 0xE0, 0x01, 0x02, 0xFF, 0xD9 });
+        var activityClientGuid = _guidGenerator.Create();
+        var deniedActivityReq = CreateRequest(HttpMethod.Post, "/api/app/activity", UserA, wsA, new
+        {
+            projectId = projA,
+            clientActivityId = activityClientGuid,
+            startedAt = blockTime,
+            endedAt = blockTime.AddMinutes(10),
+            productivity = 80,
+            deviceId = deviceId,
+            screenshotPngBase64 = jpeg,
+            screenshotThumbJpgBase64 = jpeg
+        });
+
+        var actResp = await client.SendAsync(deniedActivityReq);
+        actResp.StatusCode.ShouldBe(HttpStatusCode.Forbidden);
+        var actBody = await actResp.Content.ReadAsStringAsync();
+        actBody.ShouldContain("Tracker:DeviceRevoked");
+
+        // 5. Zero persistence / blob side effects: activity count and screenshot count remain unchanged!
+        await WithUnitOfWorkAsync(async () =>
+        {
+            using (_currentWorkspace.Change(wsA))
+            {
+                var finalScreenshots = await _screenshotRepository.GetCountAsync();
+                var finalActivities = await _activityRepository.GetCountAsync();
+                finalScreenshots.ShouldBe(initialScreenshots);
+                finalActivities.ShouldBe(initialActivities);
+            }
+        });
+    }
+
+    [Fact]
+    public async Task Idempotent_Replay_Of_Pre_Revocation_Block_Succeeds_While_New_Block_Is_Denied()
+    {
+        var (wsA, _, projA, _) = await SeedFixturesAsync();
+        var client = CreateHttpClient();
+        var deviceId = _guidGenerator.Create();
+        var preRevocationClientActId = _guidGenerator.Create();
+        var blockTime = DateTime.UtcNow.AddMinutes(-30);
+
+        // 1. Upload valid block prior to revocation
+        var preUploadReq = CreateRequest(HttpMethod.Post, "/api/app/activity", UserA, wsA, new
+        {
+            projectId = projA,
+            clientActivityId = preRevocationClientActId,
+            startedAt = blockTime,
+            endedAt = blockTime.AddMinutes(10),
+            productivity = 75,
+            deviceId = deviceId
+        });
+        var preResp = await client.SendAsync(preUploadReq);
+        preResp.StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        // 2. Revoke the device
+        var revokeReq = CreateRequest(HttpMethod.Post, "/api/app/device/revoke", UserA, wsA, new
+        {
+            deviceId = deviceId,
+            reason = "Device decommissioned"
+        });
+        (await client.SendAsync(revokeReq)).StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        // 3. Idempotent replay of previously stored block SUCCEEDS (200 OK)
+        var replayReq = CreateRequest(HttpMethod.Post, "/api/app/activity", UserA, wsA, new
+        {
+            projectId = projA,
+            clientActivityId = preRevocationClientActId,
+            startedAt = blockTime,
+            endedAt = blockTime.AddMinutes(10),
+            productivity = 75,
+            deviceId = deviceId
+        });
+        var replayResp = await client.SendAsync(replayReq);
+        replayResp.StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        // 4. A NEW block from the same revoked device is DENIED (403 Forbidden)
+        var newActId = _guidGenerator.Create();
+        var newBlockReq = CreateRequest(HttpMethod.Post, "/api/app/activity", UserA, wsA, new
+        {
+            projectId = projA,
+            clientActivityId = newActId,
+            startedAt = blockTime.AddMinutes(10),
+            endedAt = blockTime.AddMinutes(20),
+            productivity = 75,
+            deviceId = deviceId
+        });
+        var newResp = await client.SendAsync(newBlockReq);
+        newResp.StatusCode.ShouldBe(HttpStatusCode.Forbidden);
+        var newBody = await newResp.Content.ReadAsStringAsync();
+        newBody.ShouldContain("Tracker:DeviceRevoked");
+    }
+
+    [Fact]
+    public async Task Live_Presence_Excludes_Revoked_Device_While_Retaining_Historical_Records()
+    {
+        var (wsA, _, projA, _) = await SeedFixturesAsync();
+        var client = CreateHttpClient();
+        var revokedDeviceId = _guidGenerator.Create();
+        var colleagueDeviceId = _guidGenerator.Create();
+        var now = DateTime.UtcNow;
+
+        // 1. Seed presence for UserA (revokedDeviceId) and ColleagueA (colleagueDeviceId)
+        await WithUnitOfWorkAsync(async () =>
+        {
+            using (_currentWorkspace.Change(wsA, WorkspaceRoles.Owner))
+            {
+                var pUserA = new AgentPresence(_guidGenerator.Create(), wsA, UserA, revokedDeviceId, "tracking", now)
+                {
+                    DeviceName = "USER-A-DEV",
+                    ProjectId = projA
+                };
+                var pColleague = new AgentPresence(_guidGenerator.Create(), wsA, ColleagueA, colleagueDeviceId, "tracking", now)
+                {
+                    DeviceName = "COLLEAGUE-DEV",
+                    ProjectId = projA
+                };
+                await _presenceRepository.InsertAsync(pUserA, autoSave: true);
+                await _presenceRepository.InsertAsync(pColleague, autoSave: true);
+            }
+        });
+
+        // 2. Revoke UserA's device
+        var revokeReq = CreateRequest(HttpMethod.Post, "/api/app/device/revoke", UserA, wsA, new
+        {
+            deviceId = revokedDeviceId,
+            reason = "Revoking old laptop"
+        });
+        (await client.SendAsync(revokeReq)).StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        // 3. Query live team presence as ColleagueA
+        var teamReq = CreateRequest(HttpMethod.Get, "/api/app/presence/team", ColleagueA, wsA);
+        var teamResp = await client.SendAsync(teamReq);
+        teamResp.StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        var teamJson = await teamResp.Content.ReadAsStringAsync();
+        using (var doc = JsonDocument.Parse(teamJson))
+        {
+            var items = doc.RootElement.GetProperty("items").EnumerateArray().ToList();
+            var returnedDevices = items.Select(i => Guid.Parse(i.GetProperty("deviceId").GetString()!)).ToList();
+
+            // Revoked device MUST be excluded from live presence!
+            returnedDevices.ShouldNotContain(revokedDeviceId);
+            // Colleague device MUST be present
+            returnedDevices.ShouldContain(colleagueDeviceId);
+        }
+
+        // 4. Verify historical presence row still exists in DB (not destroyed)
+        await WithUnitOfWorkAsync(async () =>
+        {
+            using (_currentWorkspace.Change(wsA))
+            {
+                var presenceInDb = await _presenceRepository.FirstOrDefaultAsync(p => p.WorkspaceId == wsA && p.UserId == UserA && p.DeviceId == revokedDeviceId);
+                presenceInDb.ShouldNotBeNull();
+            }
+        });
+    }
+
+    [Fact]
+    public async Task Different_Device_In_A_Works_And_Same_Device_In_B_Is_Unaffected()
+    {
+        var (wsA, wsB, projA, projB) = await SeedFixturesAsync();
+        var client = CreateHttpClient();
+        var revokedDeviceId = _guidGenerator.Create();
+        var secondDeviceId = _guidGenerator.Create();
+
+        // 1. Establish observed revokedDeviceId in wsA and wsB
+        var hbA1 = CreateRequest(HttpMethod.Post, "/api/app/presence/heartbeat", UserA, wsA, new { deviceId = revokedDeviceId, status = "tracking" });
+        (await client.SendAsync(hbA1)).StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        var hbB1 = CreateRequest(HttpMethod.Post, "/api/app/presence/heartbeat", UserA, wsB, new { deviceId = revokedDeviceId, status = "tracking" });
+        (await client.SendAsync(hbB1)).StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        // 2. Revoke revokedDeviceId strictly in Workspace A
+        var revokeReq = CreateRequest(HttpMethod.Post, "/api/app/device/revoke", UserA, wsA, new { deviceId = revokedDeviceId, reason = "Scoped revoke" });
+        (await client.SendAsync(revokeReq)).StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        // 3. UserA's DIFFERENT device (secondDeviceId) in Workspace A works normally!
+        var hbA2 = CreateRequest(HttpMethod.Post, "/api/app/presence/heartbeat", UserA, wsA, new { deviceId = secondDeviceId, status = "tracking" });
+        (await client.SendAsync(hbA2)).StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        var actA2 = CreateRequest(HttpMethod.Post, "/api/app/activity", UserA, wsA, new
+        {
+            projectId = projA,
+            clientActivityId = _guidGenerator.Create(),
+            startedAt = DateTime.UtcNow.AddMinutes(-5),
+            endedAt = DateTime.UtcNow,
+            deviceId = secondDeviceId
+        });
+        (await client.SendAsync(actA2)).StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        // 4. UserA's SAME device (revokedDeviceId) in Workspace B is completely UNAFFECTED!
+        var hbB2 = CreateRequest(HttpMethod.Post, "/api/app/presence/heartbeat", UserA, wsB, new { deviceId = revokedDeviceId, status = "tracking" });
+        (await client.SendAsync(hbB2)).StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        var actB2 = CreateRequest(HttpMethod.Post, "/api/app/activity", UserA, wsB, new
+        {
+            projectId = projB,
+            clientActivityId = _guidGenerator.Create(),
+            startedAt = DateTime.UtcNow.AddMinutes(-5),
+            endedAt = DateTime.UtcNow,
+            deviceId = revokedDeviceId
+        });
+        (await client.SendAsync(actB2)).StatusCode.ShouldBe(HttpStatusCode.OK);
+    }
+
+    [Fact]
+    public async Task Denies_Revoking_Another_Members_Device_Or_In_Foreign_Workspace_Without_Tombstones()
+    {
+        var (wsA, wsB, _, _) = await SeedFixturesAsync();
+        var client = CreateHttpClient();
+        var colleagueDeviceId = _guidGenerator.Create();
+
+        // 1. Observe colleague's device in wsA
+        var hbColleague = CreateRequest(HttpMethod.Post, "/api/app/presence/heartbeat", ColleagueA, wsA, new { deviceId = colleagueDeviceId, status = "tracking" });
+        (await client.SendAsync(hbColleague)).StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        // 2. UserA attempts to revoke ColleagueA's device in wsA -> 400 Tracker:DeviceNotObserved (UserA never observed it as own)
+        var revokeOtherReq = CreateRequest(HttpMethod.Post, "/api/app/device/revoke", UserA, wsA, new { deviceId = colleagueDeviceId });
+        var revokeOtherResp = await client.SendAsync(revokeOtherReq);
+        revokeOtherResp.StatusCode.ShouldBe(HttpStatusCode.BadRequest);
+        var errBody = await revokeOtherResp.Content.ReadAsStringAsync();
+        errBody.ShouldContain("Tracker:DeviceNotObserved");
+
+        // Verify no revocation record created
+        await WithUnitOfWorkAsync(async () =>
+        {
+            using (_currentWorkspace.Change(wsA))
+            {
+                var exists = await _revocationRepository.AnyAsync(r => r.DeviceId == colleagueDeviceId);
+                exists.ShouldBeFalse();
+            }
+        });
+
+        // ColleagueA's device continues to function normally
+        var hbColleague2 = CreateRequest(HttpMethod.Post, "/api/app/presence/heartbeat", ColleagueA, wsA, new { deviceId = colleagueDeviceId, status = "tracking" });
+        (await client.SendAsync(hbColleague2)).StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        // 3. ForeignUser (only in wsB) attempts to revoke in wsA -> 403 Tracker:NotWorkspaceMember
+        var foreignReq = CreateRequest(HttpMethod.Post, "/api/app/device/revoke", ForeignUser, wsA, new { deviceId = _guidGenerator.Create() });
+        var foreignResp = await client.SendAsync(foreignReq);
+        foreignResp.StatusCode.ShouldBe(HttpStatusCode.Forbidden);
+    }
+
+    [Fact]
+    public async Task Presence_Pruning_Does_Not_Erase_Revocation_And_Unobserved_Target_Creates_No_Record()
+    {
+        var (wsA, _, _, _) = await SeedFixturesAsync();
+        var client = CreateHttpClient();
+        var deviceId = _guidGenerator.Create();
+
+        // 1. Observe device, then revoke
+        var hb = CreateRequest(HttpMethod.Post, "/api/app/presence/heartbeat", UserA, wsA, new { deviceId = deviceId, status = "tracking" });
+        (await client.SendAsync(hb)).StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        var revokeReq = CreateRequest(HttpMethod.Post, "/api/app/device/revoke", UserA, wsA, new { deviceId = deviceId });
+        (await client.SendAsync(revokeReq)).StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        // 2. Simulate complete presence cleanup (e.g. stale row deletion)
+        await WithUnitOfWorkAsync(async () =>
+        {
+            using (_currentWorkspace.Change(wsA, WorkspaceRoles.Owner))
+            {
+                var presences = await _presenceRepository.GetListAsync(p => p.WorkspaceId == wsA && p.UserId == UserA && p.DeviceId == deviceId);
+                foreach (var p in presences)
+                {
+                    await _presenceRepository.DeleteAsync(p, autoSave: true);
+                }
+            }
+        });
+
+        // Verify presence rows are gone, but DeviceRevocation remains
+        await WithUnitOfWorkAsync(async () =>
+        {
+            using (_currentWorkspace.Change(wsA))
+            {
+                var presenceCount = await _presenceRepository.CountAsync(p => p.WorkspaceId == wsA && p.UserId == UserA && p.DeviceId == deviceId);
+                presenceCount.ShouldBe(0);
+
+                var revCount = await _revocationRepository.CountAsync(r => r.WorkspaceId == wsA && r.UserId == UserA && r.DeviceId == deviceId);
+                revCount.ShouldBe(1);
+            }
+        });
+
+        // 3. Post-pruning heartbeat is STILL denied (403 Forbidden)
+        var postPruneHb = CreateRequest(HttpMethod.Post, "/api/app/presence/heartbeat", UserA, wsA, new { deviceId = deviceId, status = "tracking" });
+        (await client.SendAsync(postPruneHb)).StatusCode.ShouldBe(HttpStatusCode.Forbidden);
+
+        // 4. Calling revoke with empty or unobserved GUID creates NO record
+        var emptyReq = CreateRequest(HttpMethod.Post, "/api/app/device/revoke", UserA, wsA, new { deviceId = Guid.Empty });
+        (await client.SendAsync(emptyReq)).StatusCode.ShouldBe(HttpStatusCode.BadRequest);
+
+        var unobservedId = _guidGenerator.Create();
+        var unobsReq = CreateRequest(HttpMethod.Post, "/api/app/device/revoke", UserA, wsA, new { deviceId = unobservedId });
+        (await client.SendAsync(unobsReq)).StatusCode.ShouldBe(HttpStatusCode.BadRequest);
+
+        await WithUnitOfWorkAsync(async () =>
+        {
+            using (_currentWorkspace.Change(wsA))
+            {
+                var count = await _revocationRepository.CountAsync(r => r.DeviceId == unobservedId || r.DeviceId == Guid.Empty);
+                count.ShouldBe(0);
+            }
+        });
+    }
+
+    [Fact]
+    public async Task Status_Inspection_And_Bounded_Listing_Contracts()
+    {
+        var (wsA, _, _, _) = await SeedFixturesAsync();
+        var client = CreateHttpClient();
+        var deviceId = _guidGenerator.Create();
+        var activeDeviceId = _guidGenerator.Create();
+
+        // 1. Observe both devices
+        (await client.SendAsync(CreateRequest(HttpMethod.Post, "/api/app/presence/heartbeat", UserA, wsA, new { deviceId = deviceId, status = "tracking" }))).StatusCode.ShouldBe(HttpStatusCode.OK);
+        (await client.SendAsync(CreateRequest(HttpMethod.Post, "/api/app/presence/heartbeat", UserA, wsA, new { deviceId = activeDeviceId, status = "tracking" }))).StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        // 2. Check initial status before revoke
+        var statusReq1 = CreateRequest(HttpMethod.Get, $"/api/app/device/{deviceId}/status", UserA, wsA);
+        var statusResp1 = await client.SendAsync(statusReq1);
+        statusResp1.StatusCode.ShouldBe(HttpStatusCode.OK);
+        using (var doc = JsonDocument.Parse(await statusResp1.Content.ReadAsStringAsync()))
+        {
+            doc.RootElement.GetProperty("deviceId").GetString().ShouldBe(deviceId.ToString());
+            doc.RootElement.GetProperty("isRevoked").GetBoolean().ShouldBeFalse();
+        }
+
+        // 3. Revoke deviceId
+        (await client.SendAsync(CreateRequest(HttpMethod.Post, "/api/app/device/revoke", UserA, wsA, new { deviceId = deviceId, reason = "Decommissioned" }))).StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        // 4. Inspect status after revoke
+        var statusReq2 = CreateRequest(HttpMethod.Get, $"/api/app/device/{deviceId}/status", UserA, wsA);
+        var statusResp2 = await client.SendAsync(statusReq2);
+        statusResp2.StatusCode.ShouldBe(HttpStatusCode.OK);
+        using (var doc = JsonDocument.Parse(await statusResp2.Content.ReadAsStringAsync()))
+        {
+            doc.RootElement.GetProperty("deviceId").GetString().ShouldBe(deviceId.ToString());
+            doc.RootElement.GetProperty("isRevoked").GetBoolean().ShouldBeTrue();
+            doc.RootElement.GetProperty("reason").GetString().ShouldBe("Decommissioned");
+            doc.RootElement.TryGetProperty("revokedAt", out var revAt).ShouldBeTrue();
+            revAt.GetString().ShouldNotBeNull();
+        }
+
+        // 5. Get listing of my revocations
+        var listReq = CreateRequest(HttpMethod.Get, "/api/app/device/my-revocations", UserA, wsA);
+        var listResp = await client.SendAsync(listReq);
+        listResp.StatusCode.ShouldBe(HttpStatusCode.OK);
+        using (var doc = JsonDocument.Parse(await listResp.Content.ReadAsStringAsync()))
+        {
+            var items = doc.RootElement.GetProperty("items").EnumerateArray().ToList();
+            items.Count.ShouldBe(1);
+            items[0].GetProperty("deviceId").GetString().ShouldBe(deviceId.ToString());
+            items[0].GetProperty("reason").GetString().ShouldBe("Decommissioned");
+        }
+    }
+
+    [Fact]
+    public async Task Legacy_Missing_DeviceId_Activity_Behavior_Is_Preserved()
+    {
+        var (wsA, _, projA, _) = await SeedFixturesAsync();
+        var client = CreateHttpClient();
+
+        // Activity without deviceId (legacy client) succeeds
+        var legacyActReq = CreateRequest(HttpMethod.Post, "/api/app/activity", UserA, wsA, new
+        {
+            projectId = projA,
+            clientActivityId = _guidGenerator.Create(),
+            startedAt = DateTime.UtcNow.AddMinutes(-10),
+            endedAt = DateTime.UtcNow,
+            productivity = 50
+        });
+        var actResp = await client.SendAsync(legacyActReq);
+        actResp.StatusCode.ShouldBe(HttpStatusCode.OK);
+    }
+}

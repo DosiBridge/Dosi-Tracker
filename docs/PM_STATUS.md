@@ -817,19 +817,79 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
 
 ---
 
-## 12. Current Status & Next Steps
+## 13. Phase 3 Step 6: Workspace-Scoped Self-Service Device Revocation (REQ-DEV-01)
+
+### A. Context & Architectural Discovery
+1. **Background**: Prior to this slice, `Activity.DeviceId` was normalized client metadata, and `PresenceAppService.HeartbeatAsync` auto-created and pruned per-(workspace, user, device) rows without a persistent revocation model. `ActivityAppService.CreateAsync` accepted caller-supplied `DeviceId` without checking durable revocation.
+2. **Missing Product Capability**: Workspace members needed self-service capability to revoke their own observed logical devices in their authorized workspace, denying subsequent heartbeats and activity uploads prior to persistence or blob storage side-effects, excluding them from live team presence projection, while maintaining workspace isolation and idempotency.
+
+### B. Implementation Details
+1. **Domain & Data Model**:
+   - `DeviceRevocation` entity (`backend/src/Dosi.Tracker.Domain/Devices/DeviceRevocation.cs`): implements `IWorkspaceScoped`, `CreationAuditedEntity<Guid>`. Table `AppDeviceRevocations` with composite unique index `IX_AppDeviceRevocations_WorkspaceId_UserId_DeviceId`.
+   - `DeviceRevocationManager` domain service: validates device observation in presence or activity records for `(WorkspaceId, UserId)`, enforces idempotent repeated revocation, and handles revocation creation.
+   - Domain errors in `TrackerDomainErrorCodes.cs`: `DeviceRevoked` (403), `DeviceNotObserved` (400), `DeviceNotFound` (404).
+   - Domain constants in `DeviceConsts.cs`: `MaxReasonLength = 256`, `MaxRevocationsListing = 100`.
+2. **Application & HTTP API**:
+   - `DeviceAppService` & `DeviceController`: authenticated routes `POST /api/app/device/revoke`, `GET /api/app/device/my-revocations`, `GET /api/app/device/{deviceId}/status`.
+   - `PresenceAppService`:
+     - Injected `IRepository<DeviceRevocation, Guid> _revocationRepository`.
+     - `HeartbeatAsync` rejects heartbeats for revoked device with 403 `Tracker:DeviceRevoked`.
+     - `GetTeamAsync` filters out live presence for devices matching active revocations in the current workspace, without deleting historical presence records from database.
+   - `ActivityAppService`:
+     - Injected `IRepository<DeviceRevocation, Guid> _revocationRepository`.
+     - `CreateAsync`: preserves honest idempotent replay of pre-revocation stored blocks via `FindOwnBlockAsync`; for new blocks with revoked `DeviceId`, throws 403 `Tracker:DeviceRevoked` prior to validation, project checks, or screenshot/blob storage side-effects.
+3. **Database Migration**:
+   - Additive migration `20261021060000_AddDeviceRevocations.cs` + Designer + `TrackerDbContextModelSnapshot.cs`.
+   - Default-compatible with existing rows; tested with tracked `IMigrator` baseline-to-current upgrade regression on disposable in-memory SQLite fixture.
+
+### C. Concrete Test Execution & Verified Evidence
+1. **Device Revocation Migration Tests** (`backend/test/Dosi.Tracker.EntityFrameworkCore.Tests/EntityFrameworkCore/Migrations/DeviceRevocationMigrationTests.cs`):
+   - Command: `dotnet test backend/test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~DeviceRevocationMigrationTests"`
+   - Result: **7 passed, 0 failed, exit 0**.
+   - Verified: migration metadata, Up/Down DDL operations, runtime model properties, direct snapshot synchronization, PostgreSQL DDL generation, and disposable SQLite baseline-to-current upgrade preserving existing data.
+2. **Hosted HTTP Integration Suite** (`backend/test/Dosi.Tracker.EntityFrameworkCore.Tests/EntityFrameworkCore/Applications/Devices/WorkspaceDeviceRevocationHttpTests.cs`):
+   - Command: `dotnet test backend/test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~WorkspaceDeviceRevocationHttpTests"`
+   - Result: **9 passed, 0 failed, exit 0**.
+   - Verified scenarios:
+     1. `Own_Device_Revocation_And_Repeated_Revoke_Are_Idempotent_And_Persisted`: Own device revoked successfully (200 OK); repeated revocation returns existing record idempotently without duplicate insertion.
+     2. `Post_Revoke_Heartbeat_And_Activity_Ingestion_Are_Denied_With_Zero_Blob_Effects`: Subsequent heartbeat returns 403 `Tracker:DeviceRevoked`; subsequent activity upload returns 403 `Tracker:DeviceRevoked` with zero screenshots and zero activity DB/blob side-effects.
+     3. `Idempotent_Replay_Of_Pre_Revocation_Block_Succeeds_While_New_Block_Is_Denied`: Replay of pre-revocation block succeeds (200 OK); new block from revoked device is denied (403).
+     4. `Live_Presence_Excludes_Revoked_Device_While_Retaining_Historical_Records`: Live presence query excludes revoked device; historical DB presence rows preserved.
+     5. `Different_Device_In_A_Works_And_Same_Device_In_B_Is_Unaffected`: Another device for caller in A works normally; same device in Workspace B works normally (strictly workspace-scoped).
+     6. `Denies_Revoking_Another_Members_Device_Or_In_Foreign_Workspace_Without_Tombstones`: Attempt to revoke another member's device in A rejected with 400 `Tracker:DeviceNotObserved`; foreign workspace caller rejected with 403 `Tracker:NotWorkspaceMember`; no tombstones created.
+     7. `Presence_Pruning_Does_Not_Erase_Revocation_And_Unobserved_Target_Creates_No_Record`: Stale presence pruning cannot remove revocation; unobserved/empty target rejected (400) without creating records.
+     8. `Status_Inspection_And_Bounded_Listing_Contracts`: Status inspection returns accurate boolean state, timestamp, and reason; bounded listing returns current user's revocations.
+     9. `Legacy_Missing_DeviceId_Activity_Behavior_Is_Preserved`: Legacy activity upload without `DeviceId` succeeds normally.
+3. **Regression Suites Verification**:
+   - `WorkspaceTeamPresenceHttpTests`: 6 passed, exit 0
+   - `WorkspaceActivityExportHttpTests`: 10 passed, exit 0
+   - `WorkspaceCaptureRetentionTests`: 20 passed, exit 0
+   - `ContractRoutesTests`: 44 passed, exit 0
+   - `Dosi.Tracker.Application.Tests`: 166 passed, exit 0
+   - `Dosi.Tracker.Domain.Tests`: 60 passed, exit 0
+
+### D. Explicit Deferred Limitations
+1. **Device ID Binding**: `DeviceId` is a logical, client-reported UUID. It is NOT a hardware-bound cryptographic credential or TPM/Secure Enclave attestation.
+2. **Session & Token Scoping**: Revoking a logical device ID does NOT revoke OAuth refresh tokens, invalidate JWT bearer tokens, or execute global account logout. New-ID rotation, token revocation, enrollment credentials, and native desktop agent handling remain explicitly deferred.
+3. **Storage & Audit Preservation**: Historical activity blocks, screenshots, memberships, and presence rows are retained and never deleted upon device revocation.
+4. **Environment**: All executions performed on project-local disposable in-memory SQLite fixtures; production PostgreSQL cluster execution, native OS runtimes, and PM independent acceptance remain pending.
+
+---
+
+## 14. Current Status & Next Steps
 
 1. **Privacy Acceptance Pending**:
    - The privacy source audit (commit `14bbe66`) remains **Pending PM Independent Review**. This status is preserved and not bypassed.
-2. **Workspace Lifecycle, Authorization, Retention, Export & Presence Status**:
-   - Reversible owner-controlled workspace archival (`REQ-WS-08`), concurrent last-owner protection (`REQ-WS-06`), recipient decline lifecycle (`REQ-WS-07`), hosted ASP.NET Core `TestServer` MVC aggregate authorization harness (`REQ-ISO-05`), workspace-isolated capture retention lifecycle safe first slice (`REQ-DAT-01`), authenticated workspace-scoped activity CSV export (`REQ-DAT-02`) with materialization cardinality hardening, and live team presence active membership scoping (`REQ-TRK-04`) are implemented and verified via isolated regressions (83 SQLite integration tests total: 6 team presence + 10 activity export + 20 capture retention + 9 archival lifecycle + 10 archival migration/upgrade + 9 concurrent owner protection + 9 hosted MVC auth + 10 decline).
+2. **Workspace Lifecycle, Authorization, Retention, Export, Presence & Device Status**:
+   - Workspace-scoped self-service device revocation (`REQ-DEV-01`), live team presence active membership scoping (`REQ-TRK-04`), authenticated workspace-scoped activity CSV export (`REQ-DAT-02`), workspace-isolated capture retention lifecycle safe first slice (`REQ-DAT-01`), reversible owner-controlled workspace archival (`REQ-WS-08`), concurrent last-owner protection (`REQ-WS-06`), recipient decline lifecycle (`REQ-WS-07`), and hosted ASP.NET Core `TestServer` MVC aggregate authorization harness (`REQ-ISO-05`) are implemented and verified via isolated regressions (99 SQLite integration tests total: 9 device revocation + 7 device migration + 6 team presence + 10 activity export + 20 capture retention + 9 archival lifecycle + 10 archival migration/upgrade + 9 concurrent owner protection + 9 hosted MVC auth + 10 decline).
    - Real browser cookie/session testing (`__Host-Dosi-Workspace`), Next.js server actions, OpenIddict token issuer, provider-backed multi-connection transactional commit proof (PostgreSQL/SQL Server), multi-node distributed lock infrastructure (Redis), and PM independent execution remain pending. All reported outcomes are worker-executed, not independent PM QA.
 3. **Execution Limits & Evidence Boundaries**:
-   - TestServer regressions prove conventional MVC routing, aggregate permission checks, fail-closed workspace scoping, CSV formula neutralization, Take(limit + 1) hard bounded fetch, post-materialization cardinality rejection, active member presence query scoping, and server limits on in-memory SQLite, but do NOT replace execution on a real PostgreSQL cluster; no live user/production database was modified.
+   - TestServer regressions prove conventional MVC routing, aggregate permission checks, fail-closed workspace scoping, CSV formula neutralization, Take(limit + 1) hard bounded fetch, active member presence query scoping, device revocation gating before blob side-effects, and server limits on in-memory SQLite, but do NOT replace execution on a real PostgreSQL cluster; no live user/production database was modified.
    - Retention defaults remain disabled (`IsEnabled = false`); no cleanup was executed against user DB or real object storage.
 4. **Remaining Backlog Gaps**:
-   - WebSocket / SignalR push live presence notification, asynchronous export background worker, screenshot zip archive, signed download URLs, disaster recovery / automated backup procedures, frontend UI export actions, 1-year activity summary pruning, and permanent deletion remain deferred acceptance gaps.
+   - Cryptographic client machine enrollment / attestation, token/session revocation, native desktop agent revocation prompt/unenrollment UI, WebSocket / SignalR push live presence notification, asynchronous export background worker, screenshot zip archive, signed download URLs, disaster recovery / automated backup procedures, frontend UI export actions, 1-year activity summary pruning, and permanent deletion remain deferred acceptance gaps.
 5. **Overall Product Incomplete**:
    - Full product remains incomplete across backend metric nullability schema migrations (`Activity.cs` truthful nulls vs 0), desktop offline ingestion queue hardening, platform-native interactive client runtimes, code signing, and hosted operational deployment.
 6. **Awaiting PM Guidance**:
-   - Bounded live team presence active workspace membership enforcement slice complete. Stop and hand off for PM review with exact diff and test evidence.
+   - Bounded workspace-scoped self-service device revocation slice complete. Stop and hand off for PM review with exact diff and test evidence.
+

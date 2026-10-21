@@ -40,4 +40,7 @@ public static class TrackerDomainErrorCodes
     public const string InvitationEmailMismatch = "Tracker:InvitationEmailMismatch";
     public const string AlreadyWorkspaceMember = "Tracker:AlreadyWorkspaceMember";
     public const string ExportExceedsLimit = "Tracker:ExportExceedsLimit";
+    public const string DeviceRevoked = "Tracker:DeviceRevoked";
+    public const string DeviceNotObserved = "Tracker:DeviceNotObserved";
+    public const string DeviceNotFound = "Tracker:DeviceNotFound";
 }

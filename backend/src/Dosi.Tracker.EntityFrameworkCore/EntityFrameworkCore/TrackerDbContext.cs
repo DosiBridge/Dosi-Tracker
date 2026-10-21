@@ -21,6 +21,7 @@ using Microsoft.EntityFrameworkCore.Metadata.Builders;
 using Volo.Abp;
 using Dosi.Tracker.Projects;
 using Dosi.Tracker.Activities;
+using Dosi.Tracker.Devices;
 using Dosi.Tracker.Presence;
 
 namespace Dosi.Tracker.EntityFrameworkCore;
@@ -38,6 +39,7 @@ public class TrackerDbContext :
     public DbSet<Activity> Activities { get; set; }
     public DbSet<Screenshot> Screenshots { get; set; }
     public DbSet<AgentPresence> AgentPresences { get; set; }
+    public DbSet<DeviceRevocation> DeviceRevocations { get; set; }
 
     // New Domains
     public DbSet<Dosi.Tracker.SaaS.Plan> Plans { get; set; }
@@ -202,6 +204,14 @@ public class TrackerDbContext :
             b.Property(x => x.CurrentApp).HasMaxLength(AgentPresenceConsts.MaxCurrentAppLength);
             b.Property(x => x.TimeZone).HasMaxLength(ActivityConsts.MaxTimeZoneLength);
             // One row per agent install.
+            b.HasIndex(x => new { x.WorkspaceId, x.UserId, x.DeviceId }).IsUnique();
+        });
+
+        builder.Entity<DeviceRevocation>(b =>
+        {
+            b.ToTable(TrackerConsts.DbTablePrefix + "DeviceRevocations", TrackerConsts.DbSchema);
+            b.ConfigureByConvention();
+            b.Property(x => x.Reason).HasMaxLength(DeviceConsts.MaxReasonLength);
             b.HasIndex(x => new { x.WorkspaceId, x.UserId, x.DeviceId }).IsUnique();
         });
 

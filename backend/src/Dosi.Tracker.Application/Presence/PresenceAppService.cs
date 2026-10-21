@@ -3,9 +3,11 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 using Dosi.Tracker.Activities;
+using Dosi.Tracker.Devices;
 using Dosi.Tracker.Permissions;
 using Dosi.Tracker.Projects;
 using Microsoft.AspNetCore.Authorization;
+using Volo.Abp;
 using Volo.Abp.Application.Dtos;
 using Volo.Abp.Application.Services;
 using Volo.Abp.Auditing;
@@ -32,17 +34,20 @@ public class PresenceAppService : TrackerAppService, IPresenceAppService
     private readonly IRepository<Project, Guid> _projectRepository;
     private readonly IIdentityUserRepository _userRepository;
     private readonly IRepository<WorkspaceMember, Guid> _memberRepository;
+    private readonly IRepository<DeviceRevocation, Guid> _revocationRepository;
 
     public PresenceAppService(
         IRepository<AgentPresence, Guid> presenceRepository,
         IRepository<Project, Guid> projectRepository,
         IIdentityUserRepository userRepository,
-        IRepository<WorkspaceMember, Guid> memberRepository)
+        IRepository<WorkspaceMember, Guid> memberRepository,
+        IRepository<DeviceRevocation, Guid> revocationRepository)
     {
         _presenceRepository = presenceRepository;
         _projectRepository = projectRepository;
         _userRepository = userRepository;
         _memberRepository = memberRepository;
+        _revocationRepository = revocationRepository;
     }
 
     /// <summary>Records the caller's agent state on one device. Not written to the audit log: every running agent
@@ -51,6 +56,19 @@ public class PresenceAppService : TrackerAppService, IPresenceAppService
     public async Task<HeartbeatResultDto> HeartbeatAsync(HeartbeatDto input)
     {
         var userId = CurrentUser.GetId();
+        var currentWorkspaceId = CurrentWorkspace.GetId();
+
+        var isRevoked = await _revocationRepository.AnyAsync(r =>
+            r.WorkspaceId == currentWorkspaceId &&
+            r.UserId == userId &&
+            r.DeviceId == input.DeviceId);
+
+        if (isRevoked)
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.DeviceRevoked)
+                .WithData("deviceId", input.DeviceId);
+        }
+
         var now = AgentContextNormalizer.AsUtc(Clock.Now);
         // Validation has already refused an unknown status (400).
         var status = HeartbeatDto.FindStatus(input.Status) ?? throw new ArgumentException("Unknown status.", nameof(input));
@@ -89,8 +107,12 @@ public class PresenceAppService : TrackerAppService, IPresenceAppService
             .Where(m => m.WorkspaceId == currentWorkspaceId && m.Status == WorkspaceMemberStatus.Active)
             .Select(m => m.UserId);
 
+        var revokedDeviceQuery = (await _revocationRepository.GetQueryableAsync())
+            .Where(r => r.WorkspaceId == currentWorkspaceId);
+
         var query = (await _presenceRepository.GetQueryableAsync())
-            .Where(p => activeMemberUserIds.Contains(p.UserId));
+            .Where(p => activeMemberUserIds.Contains(p.UserId))
+            .Where(p => !revokedDeviceQuery.Any(r => r.UserId == p.UserId && r.DeviceId == p.DeviceId));
 
         if (!await AuthorizationService.IsGrantedAsync(TrackerPermissions.Activities.ViewAll))
         {
