@@ -23,6 +23,14 @@ public class ActivityRetentionPolicy
     public TimeSpan RetentionPeriod { get; }
 
     /// <summary>
+    /// Explicit offline ingestion horizon / admissible upload window (e.g. from ActivityIngestOptions.MaxBlockAge).
+    /// Replay safety guard: an activity can only be deleted if its StartedAt is strictly older than (IngestionCutoff ?? (Now - IngestionHorizon)).
+    /// Activities within the upload window must be preserved to guarantee idempotency and prevent recreating deleted blocks.
+    /// Must be greater than TimeSpan.Zero unless IngestionCutoff is explicitly provided.
+    /// </summary>
+    public TimeSpan IngestionHorizon { get; }
+
+    /// <summary>
     /// Maximum number of records to process in a single bounded batch (1..1000).
     /// </summary>
     public int BatchSize { get; }
@@ -46,25 +54,35 @@ public class ActivityRetentionPolicy
     /// </summary>
     public ActivityRetentionCursor? Cursor { get; }
 
+    /// <summary>
+    /// Optional deterministic cutoff timestamp for the ingestion horizon.
+    /// Exact-boundary preservation: activities with StartedAt >= IngestionCutoff survive; only StartedAt &lt; IngestionCutoff are eligible.
+    /// </summary>
+    public DateTime? IngestionCutoff { get; }
+
     public ActivityRetentionPolicy(
         Guid workspaceId,
         TimeSpan retentionPeriod,
+        TimeSpan ingestionHorizon,
         int batchSize = DefaultBatchSize,
         bool allowArchivedWorkspace = false,
         DateTime? cutoff = null,
-        ActivityRetentionCursor? cursor = null)
+        ActivityRetentionCursor? cursor = null,
+        DateTime? ingestionCutoff = null)
     {
         WorkspaceId = workspaceId;
         RetentionPeriod = retentionPeriod;
+        IngestionHorizon = ingestionHorizon;
         BatchSize = batchSize;
         AllowArchivedWorkspace = allowArchivedWorkspace;
         Cutoff = cutoff;
         Cursor = cursor;
+        IngestionCutoff = ingestionCutoff;
     }
 
     /// <summary>
     /// Validates policy parameters before any database operations.
-    /// Refuses empty workspace, zero/negative retention period, or invalid batch sizes.
+    /// Refuses empty workspace, zero/negative retention period, unknown/invalid ingestion horizon, or invalid batch sizes.
     /// </summary>
     public void Validate()
     {
@@ -76,6 +94,13 @@ public class ActivityRetentionPolicy
         if (RetentionPeriod <= TimeSpan.Zero)
         {
             throw new ArgumentOutOfRangeException(nameof(RetentionPeriod), "Retention period must be greater than zero.");
+        }
+
+        if (!IngestionCutoff.HasValue && IngestionHorizon <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(IngestionHorizon),
+                "Ingestion horizon must be greater than zero to protect replay idempotency.");
         }
 
         if (BatchSize <= 0 || BatchSize > MaxBatchSize)

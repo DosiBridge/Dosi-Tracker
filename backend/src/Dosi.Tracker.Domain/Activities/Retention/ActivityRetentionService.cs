@@ -70,6 +70,14 @@ public class ActivityRetentionService : IActivityRetentionService, ITransientDep
         policy.Validate();
 
         var cutoff = policy.Cutoff ?? (_clock.Now - policy.RetentionPeriod);
+        var ingestionCutoff = policy.IngestionCutoff ?? (_clock.Now - policy.IngestionHorizon);
+
+        if (ingestionCutoff > _clock.Now)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(policy.IngestionCutoff),
+                "Ingestion cutoff cannot be in the future.");
+        }
 
         List<Activity> candidateList;
         HashSet<Guid> referencedActivityIds;
@@ -95,9 +103,11 @@ public class ActivityRetentionService : IActivityRetentionService, ITransientDep
                 {
                     WorkspaceId = policy.WorkspaceId,
                     Cutoff = cutoff,
+                    IngestionCutoff = ingestionCutoff,
                     CandidateCount = 0,
                     DeletedCount = 0,
                     PreservedReferencedCount = 0,
+                    PreservedReplaySafetyCount = 0,
                     HasMore = false,
                     Skipped = true,
                     SkipReason = "Workspace is archived"
@@ -154,9 +164,11 @@ public class ActivityRetentionService : IActivityRetentionService, ITransientDep
             {
                 WorkspaceId = policy.WorkspaceId,
                 Cutoff = cutoff,
+                IngestionCutoff = ingestionCutoff,
                 CandidateCount = 0,
                 DeletedCount = 0,
                 PreservedReferencedCount = 0,
+                PreservedReplaySafetyCount = 0,
                 HasMore = false,
                 NextCursor = null,
                 LastProcessedCursor = null,
@@ -166,12 +178,13 @@ public class ActivityRetentionService : IActivityRetentionService, ITransientDep
 
         var toDeleteFromDb = new List<Activity>(batch.Count);
         var preservedReferencedCount = 0;
+        var preservedReplaySafetyCount = 0;
 
         foreach (var activity in batch)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            // Guard: preserve any Activity still referenced by capture metadata (even foreign/corrupt references).
+            // Guard 1: preserve any Activity still referenced by capture metadata (even foreign/corrupt references).
             // Do not cascade delete metadata or orphan blobs; do not call blob provider.
             if (referencedActivityIds.Contains(activity.Id))
             {
@@ -179,6 +192,19 @@ public class ActivityRetentionService : IActivityRetentionService, ITransientDep
                     "Activity {ActivityId} in workspace {WorkspaceId} is still referenced by capture metadata. Preserving activity row.",
                     activity.Id, activity.WorkspaceId);
                 preservedReferencedCount++;
+                continue;
+            }
+
+            // Guard 2: Ingestion horizon / Replay safety guard (exact-boundary preservation).
+            // Activities with StartedAt >= ingestionCutoff are still inside the admissible offline upload window.
+            // Deleting them destroys the stored idempotency record and allows replaying clients to recreate
+            // deleted blocks with the same scoped client id. Preserving them guarantees replay/tombstone safety.
+            if (activity.StartedAt >= ingestionCutoff)
+            {
+                _logger.LogInformation(
+                    "Activity {ActivityId} in workspace {WorkspaceId} started at {StartedAt} which is within ingestion cutoff {IngestionCutoff}. Preserving activity row to protect replay safety.",
+                    activity.Id, activity.WorkspaceId, activity.StartedAt, ingestionCutoff);
+                preservedReplaySafetyCount++;
                 continue;
             }
 
@@ -224,9 +250,11 @@ public class ActivityRetentionService : IActivityRetentionService, ITransientDep
         {
             WorkspaceId = policy.WorkspaceId,
             Cutoff = cutoff,
+            IngestionCutoff = ingestionCutoff,
             CandidateCount = batch.Count,
             DeletedCount = deletedCount,
             PreservedReferencedCount = preservedReferencedCount,
+            PreservedReplaySafetyCount = preservedReplaySafetyCount,
             HasMore = hasMore,
             NextCursor = nextCursor,
             LastProcessedCursor = lastCursor,

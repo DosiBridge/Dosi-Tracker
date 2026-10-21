@@ -764,20 +764,32 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
    - `ActivityRetentionPolicy`: Specification record requiring:
      * `WorkspaceId != Guid.Empty` (target workspace must be explicitly specified; rejects empty GUID).
      * `RetentionPeriod > TimeSpan.Zero` (positive bounded age required; zero or negative durations rejected).
+     * `IngestionHorizon`: Explicit positive `TimeSpan` (e.g. matching configured `ActivityIngestOptions.MaxBlockAge`, default 45 days) representing the offline upload acceptance window during which client retries may arrive. Does NOT assume a hardcoded 45-day default.
+     * Optional frozen `IngestionCutoff` (`DateTime?`, defaults to `clock.Now - IngestionHorizon` at execution start).
      * `BatchSize` bounded in `[1, 1000]` (default 100).
      * `AllowArchivedWorkspace` boolean (defaults to `false` to preserve archived workspaces by default).
      * Optional frozen `Cutoff` (defaults to `clock.Now - RetentionPeriod` at execution start).
      * Optional keyset `Cursor` for forward continuation.
-     * Throws `ArgumentException` / `ArgumentOutOfRangeException` on invalid policy prior to any query or database effect.
-   - `ActivityRetentionResult`: Metrics record reporting `CandidateCount`, `DeletedCount`, `PreservedReferencedCount`, `HasMore`, `NextCursor`, `LastProcessedCursor`, `Skipped`, and `SkipReason`.
+     * Throws `ArgumentException` / `ArgumentOutOfRangeException` on invalid policy prior to any query or database effect (fails closed if `!IngestionCutoff.HasValue && IngestionHorizon <= TimeSpan.Zero`).
+   - `ActivityRetentionResult`: Metrics record reporting `CandidateCount`, `DeletedCount`, `PreservedReferencedCount`, `PreservedReplaySafetyCount`, `IngestionCutoff`, `HasMore`, `NextCursor`, `LastProcessedCursor`, `Skipped`, and `SkipReason`.
    - `IActivityRetentionService`: Interface defining `CleanExpiredActivitiesAsync(policy, cancellationToken)`.
 2. **Production Domain Service (`ActivityRetentionService.cs`)**:
-   - **Validation & Fail-Closed Guards**: Invokes `policy.Validate()`. Queries `_workspaceRepository.FindAsync(policy.WorkspaceId)`; returns `Skipped = true, SkipReason = "Workspace not found"` if missing, or `SkipReason = "Workspace is archived"` if archived and `!policy.AllowArchivedWorkspace`.
+   - **Validation & Fail-Closed Guards**: Invokes `policy.Validate()`. Queries `_workspaceRepository.FindAsync(policy.WorkspaceId)`; returns `Skipped = true, SkipReason = "Workspace not found"` if missing, or `SkipReason = "Workspace is archived"` if archived and `!policy.AllowArchivedWorkspace`. Rejects in-future cutoffs (`ingestionCutoff > _clock.Now`) with `ArgumentOutOfRangeException`.
    - **Deterministic Cutoff & Keyset Pagination**:
      * Strict cutoff rule: candidates strictly satisfy `s.StartedAt < cutoff`. Records with `StartedAt >= cutoff` (fresh or exact-cutoff boundary) are completely preserved.
      * Ordered by `s.StartedAt` ascending, then `s.Id` ascending.
      * Keyset predicate: `s.StartedAt > cursorStartedAt || (s.StartedAt == cursorStartedAt && s.Id.CompareTo(cursorId) > 0)` translated natively by EF Core.
      * Fetches `Take(policy.BatchSize + 1)` to evaluate `HasMore` deterministically.
+   - **Replay Safety Horizon Guard (REQ-DAT-01 Safety Correction)**:
+     * In the offline ingestion flow (`ActivityAppService.CreateAsync`), client block uploads are accepted if `_clock.Now - StartedAt <= _ingestOptions.MaxBlockAge` (default 45 days). The persisted `Activity.ClientActivityId` along with the unique DB index `(WorkspaceId, UserId, ClientActivityId)` and `FindOwnBlockAsync` constitute the stored idempotency backstop.
+     * If activity retention deletes an activity whose `StartedAt` still falls within this acceptance window, the idempotency record is lost. A network-delayed or offline client retry with the same `ClientActivityId` is admitted by `ValidateBlockAsync` and creates a duplicate block with a brand new `ActivityId` (and can re-upload captures).
+     * Failing-before reproduction in `WorkspaceActivityRetentionTests.cs` (`Production_Ingestion_Retention_Retry_Preserves_Idempotency_And_Rejects_Recreation`) executed this exact production sequence: before the fix, the test failed with exit code 1 (`ShouldAssertException: retryBlock.Id should be 3a246e8a-e539-deb5-b5bc-f3f52f742c0f but was 3a246e8a-e60b-7f69-9dc8-ceb7d6f2bf04`), proving recreation of a deleted accepted block.
+     * Corrected domain service computes `ingestionCutoff = policy.IngestionCutoff ?? (_clock.Now - policy.IngestionHorizon)`.
+     * In the candidate loop, Guard 2 enforces:
+       `if (activity.StartedAt >= ingestionCutoff) { result.PreservedReplaySafetyCount++; continue; }`
+     * Conservative preservation: Activities whose deletion would destroy replay safety within the ingestion horizon are preserved without requiring schema migrations or tombstone tables.
+     * Keyset cursor advances past preserved replay-safety rows using `batch[^1]` without starvation or infinite loops.
+     * Only activities strictly older than both cutoffs (`StartedAt < cutoff && StartedAt < ingestionCutoff`) are deleted. Once an activity is older than the horizon, `ValidateBlockAsync` permanently rejects any retry with `Tracker:ActivityTooOld` (422), guaranteeing safe deletion without risk of duplicate recreation.
    - **Capture Dependency & Cascade Defense**:
      * EF Core entity configuration defines `Screenshot.ActivityId` as a required foreign key to `Activity`. Deleting an activity with screenshots would cascade delete capture metadata while leaving unreferenced orphan blobs in object storage.
      * Cross-tenant inspection: `ActivityRetentionService` temporarily disables workspace data filters (`_dataFilter.Disable<IWorkspaceScoped>()`) to query `_screenshotRepository` for candidate IDs across the entire database.
@@ -785,8 +797,8 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
      * Zero blob provider interactions: The service never calls blob storage, never reads, writes, or deletes blobs, eliminating any risk of blob corruption or orphaned storage.
    - **Dual Workspace Predicates**:
      * Explicit `s.WorkspaceId == policy.WorkspaceId` predicate is enforced at BOTH selection query and batch mutation loop, ensuring defense-in-depth against ambient filter leakage.
-   - **Forward Progress Past Preserved Dependencies**:
-     * If all candidates on a page are preserved (e.g. all referenced by captures), advancing the keyset cursor to the last candidate evaluated (`batch[^1]`) ensures subsequent iterations query `WHERE (StartedAt, Id) > cursor`, making bounded forward progress past preserved rows and avoiding infinite starvation loops.
+   - **Forward Progress Past Preserved Dependencies & Replay Rows**:
+     * If all candidates on a page are preserved (e.g. all referenced by captures or protected by replay safety), advancing the keyset cursor to the last candidate evaluated (`batch[^1]`) ensures subsequent iterations query `WHERE (StartedAt, Id) > cursor`, making bounded forward progress past preserved rows and avoiding infinite starvation loops.
    - **Transactional Unit of Work**:
      * Deletions execute within a transactional unit of work (`_unitOfWorkManager.Begin(requiresNew: true)`), deleting eligible unreferenced activities via `_activityRepository.DeleteManyAsync`.
    - **Sentinel Preservation**:
@@ -794,7 +806,7 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
 
 ### C. Isolated SQLite Regression Evidence (`WorkspaceActivityRetentionTests.cs`)
 - Command: `dotnet test backend/test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~WorkspaceActivityRetentionTests"`
-- Outcome: **11 passed, 0 failed, exit 0**.
+- Outcome: **14 passed, 0 failed, exit 0**.
 - Scenarios Verified:
   1. `Expired_Unreferenced_Activities_Are_Deleted_While_Referenced_And_Fresh_Survive`: Expired unreferenced activities are deleted; referenced activities and fresh activities survive.
   2. `Cross_Workspace_Isolation_Unrelated_Workspace_Expired_Activities_Survive`: Unrelated workspace's expired activities survive untouched when executing retention on Workspace A.
@@ -807,6 +819,9 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
   9. `Archived_Workspace_Is_Skipped_By_Default_And_Processed_When_Explicitly_Allowed`: Archived workspace returns `Skipped = true` by default; when `AllowArchivedWorkspace = true`, processes expired activities.
   10. `Concrete_Project_Membership_Subscription_And_Revocation_Sentinels_Survive`: Preseeded project, workspace member, subscription, and device revocation sentinels survive retention completely untouched.
   11. `Cancellation_Token_Stops_Execution_Before_Database_Mutations`: Pre-cancelled token halts execution before candidate evaluation; zero deletions occur.
+  12. `Replay_Safety_Preserves_Activities_Within_Ingestion_Horizon_And_Exact_Cutoff`: Exact boundary protection: activities with `StartedAt >= ingestionCutoff` survive (`PreservedReplaySafetyCount == 2`); strictly older (`StartedAt < cutoff && StartedAt < ingestionCutoff`) are deleted.
+  13. `Bounded_Batching_And_Keyset_Progress_Past_Leading_Preserved_Replay_Safety_Rows`: 3-page keyset cursor pagination with leading preserved replay-safety rows on page 1; proves keyset advances past preserved rows and deletes unreferenced expired rows on subsequent pages.
+  14. `Production_Ingestion_Retention_Retry_Preserves_Idempotency_And_Rejects_Recreation`: Full production path regression: accepts client block, executes retention with conservative replay safety horizon, retries with identical `ClientActivityId`; asserts `retryBlock.Id == initialBlock.Id`, capture count is 1, and zero duplicate blocks are created.
 
 ---
 
@@ -1050,7 +1065,7 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
 1. **Privacy Acceptance Pending**:
    - The privacy source audit (commit `14bbe66`) remains **Pending PM Independent Review**. This status is preserved and not bypassed.
 2. **Workspace Lifecycle, Authorization, Retention, Export, Presence, Device & Screenshot Delivery Status**:
-   - Explicit-policy workspace activity summary age-retention service (`REQ-DAT-01`), owner-managed workspace capture retention policy lifecycle (`REQ-DAT-01`), non-storable cache policy for private capture delivery (`REQ-ISO-05`), private-capture-delivery acceptance harness (`REQ-ISO-05`), workspace-scoped self-service device revocation (`REQ-DEV-01`), live team presence active membership scoping (`REQ-TRK-04`), authenticated workspace-scoped activity CSV export (`REQ-DAT-02`), workspace-isolated capture retention lifecycle safe first slice (`REQ-DAT-01`), reversible owner-controlled workspace archival (`REQ-WS-08`), concurrent last-owner protection (`REQ-WS-06`), recipient decline lifecycle (`REQ-WS-07`), and hosted ASP.NET Core `TestServer` MVC aggregate authorization harness (`REQ-ISO-05`) are implemented and verified via isolated regressions (135 SQLite integration tests total: 11 activity retention + 14 capture retention policy HTTP + 11 screenshot content delivery + 9 device revocation + 7 device migration + 6 team presence + 10 activity export + 20 capture retention + 9 archival lifecycle + 10 archival migration/upgrade + 9 concurrent owner protection + 9 hosted MVC auth + 10 decline).
+   - Explicit-policy workspace activity summary age-retention service (`REQ-DAT-01`), owner-managed workspace capture retention policy lifecycle (`REQ-DAT-01`), non-storable cache policy for private capture delivery (`REQ-ISO-05`), private-capture-delivery acceptance harness (`REQ-ISO-05`), workspace-scoped self-service device revocation (`REQ-DEV-01`), live team presence active membership scoping (`REQ-TRK-04`), authenticated workspace-scoped activity CSV export (`REQ-DAT-02`), workspace-isolated capture retention lifecycle safe first slice (`REQ-DAT-01`), reversible owner-controlled workspace archival (`REQ-WS-08`), concurrent last-owner protection (`REQ-WS-06`), recipient decline lifecycle (`REQ-WS-07`), and hosted ASP.NET Core `TestServer` MVC aggregate authorization harness (`REQ-ISO-05`) are implemented and verified via isolated regressions (138 SQLite integration tests total: 14 activity retention + 14 capture retention policy HTTP + 11 screenshot content delivery + 9 device revocation + 7 device migration + 6 team presence + 10 activity export + 20 capture retention + 9 archival lifecycle + 10 archival migration/upgrade + 9 concurrent owner protection + 9 hosted MVC auth + 10 decline).
    - Real browser cookie/session testing (`__Host-Dosi-Workspace`), Next.js server actions, OpenIddict token issuer, provider-backed multi-connection transactional commit proof (PostgreSQL/SQL Server), multi-node distributed lock infrastructure (Redis), and PM independent execution remain pending. All reported outcomes are worker-executed, not independent PM QA.
 3. **Execution Limits & Evidence Boundaries**:
    - TestServer regressions prove conventional MVC routing, aggregate permission checks, fail-closed workspace scoping, binary capture streaming, non-storable capture delivery caching, CSV formula neutralization, Take(limit + 1) hard bounded fetch, active member presence query scoping, device revocation gating before blob side-effects, and server limits on in-memory SQLite, but do NOT replace execution on a real PostgreSQL cluster; no live user/production database was modified.
@@ -1060,5 +1075,5 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
 5. **Overall Product Incomplete**:
    - Full product remains incomplete across backend metric nullability schema migrations (`Activity.cs` truthful nulls vs 0), desktop offline ingestion queue hardening, platform-native interactive client runtimes, code signing, and hosted operational deployment.
 6. **Awaiting PM Guidance**:
-   - Explicit-policy workspace activity summary age-retention service (`REQ-DAT-01`) complete. Stop and hand off for PM review with exact diff and test evidence.
+   - Explicit-policy workspace activity summary age-retention service with replay-safety horizon guard (`REQ-DAT-01`) complete. Stop and hand off for PM review with exact diff and test evidence.
 

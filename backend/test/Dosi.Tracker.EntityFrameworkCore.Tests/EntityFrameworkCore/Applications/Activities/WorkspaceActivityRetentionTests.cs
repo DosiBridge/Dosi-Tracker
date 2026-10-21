@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Security.Claims;
 using System.Threading;
 using System.Threading.Tasks;
 using Dosi.Tracker.Activities;
@@ -11,12 +12,14 @@ using Dosi.Tracker.SaaS;
 using Dosi.Tracker.Workspaces;
 using Microsoft.Extensions.DependencyInjection;
 using Shouldly;
+using Volo.Abp;
 using Volo.Abp.BlobStoring;
 using Volo.Abp.Data;
 using Volo.Abp.Domain.Entities;
 using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Guids;
 using Volo.Abp.Identity;
+using Volo.Abp.Security.Claims;
 using Volo.Abp.Timing;
 using Volo.Abp.Uow;
 using Xunit;
@@ -47,14 +50,18 @@ public class WorkspaceActivityRetentionTests : TrackerEntityFrameworkCoreTestBas
 
     private readonly ScriptedBlobProvider _blobProvider = new();
     private readonly IActivityRetentionService _retentionService;
+    private readonly IActivityAppService _activityAppService;
     private readonly IRepository<Activity, Guid> _activityRepository;
     private readonly IRepository<Screenshot, Guid> _screenshotRepository;
     private readonly IRepository<Workspace, Guid> _workspaceRepository;
     private readonly IRepository<Project, Guid> _projectRepository;
     private readonly IRepository<WorkspaceMember, Guid> _memberRepository;
+    private readonly IRepository<ProjectMember, Guid> _projectMemberRepository;
     private readonly IRepository<Plan, Guid> _planRepository;
     private readonly IRepository<Subscription, Guid> _subscriptionRepository;
     private readonly IdentityUserManager _userManager;
+    private readonly ICurrentWorkspace _currentWorkspace;
+    private readonly ICurrentPrincipalAccessor _principalAccessor;
     private readonly IGuidGenerator _guidGenerator;
     private readonly IClock _clock;
     private IDataFilter DataFilter => GetRequiredService<IDataFilter>();
@@ -62,16 +69,35 @@ public class WorkspaceActivityRetentionTests : TrackerEntityFrameworkCoreTestBas
     public WorkspaceActivityRetentionTests()
     {
         _retentionService = GetRequiredService<IActivityRetentionService>();
+        _activityAppService = GetRequiredService<IActivityAppService>();
         _activityRepository = GetRequiredService<IRepository<Activity, Guid>>();
         _screenshotRepository = GetRequiredService<IRepository<Screenshot, Guid>>();
         _workspaceRepository = GetRequiredService<IRepository<Workspace, Guid>>();
         _projectRepository = GetRequiredService<IRepository<Project, Guid>>();
         _memberRepository = GetRequiredService<IRepository<WorkspaceMember, Guid>>();
+        _projectMemberRepository = GetRequiredService<IRepository<ProjectMember, Guid>>();
         _planRepository = GetRequiredService<IRepository<Plan, Guid>>();
         _subscriptionRepository = GetRequiredService<IRepository<Subscription, Guid>>();
         _userManager = GetRequiredService<IdentityUserManager>();
+        _currentWorkspace = GetRequiredService<ICurrentWorkspace>();
+        _principalAccessor = GetRequiredService<ICurrentPrincipalAccessor>();
         _guidGenerator = GetRequiredService<IGuidGenerator>();
         _clock = GetRequiredService<IClock>();
+    }
+
+    private IDisposable SetCurrentUser(Guid userId, string? email = null)
+    {
+        var claims = new List<Claim>
+        {
+            new(AbpClaimTypes.UserId, userId.ToString()),
+            new(ClaimTypes.NameIdentifier, userId.ToString())
+        };
+        if (email != null)
+        {
+            claims.Add(new Claim(AbpClaimTypes.Email, email));
+        }
+
+        return _principalAccessor.Change(new ClaimsPrincipal(new ClaimsIdentity(claims, "TestAuth")));
     }
 
     protected override void AfterAddApplication(IServiceCollection services)
@@ -192,15 +218,16 @@ public class WorkspaceActivityRetentionTests : TrackerEntityFrameworkCoreTestBas
         var (wsA, wsB, projA, projB) = await SeedFixtureAsync();
         var cutoff = _clock.Now.AddDays(-30);
 
-        // Seed expired activity in Workspace A (40 days old, no screenshots)
-        var actA = await SeedActivityAsync(wsA, projA, TestUserId, _clock.Now.AddDays(-40));
+        // Seed expired activity in Workspace A (60 days old, older than both 30-day retention and 45-day ingestion horizon)
+        var actA = await SeedActivityAsync(wsA, projA, TestUserId, _clock.Now.AddDays(-60));
 
-        // Seed expired activity in Workspace B (40 days old, same age, no screenshots)
-        var actB = await SeedActivityAsync(wsB, projB, UserB, _clock.Now.AddDays(-40));
+        // Seed expired activity in Workspace B (60 days old, same age, no screenshots)
+        var actB = await SeedActivityAsync(wsB, projB, UserB, _clock.Now.AddDays(-60));
 
         var policyA = new ActivityRetentionPolicy(
             workspaceId: wsA,
             retentionPeriod: TimeSpan.FromDays(30),
+            ingestionHorizon: TimeSpan.FromDays(45),
             batchSize: 100,
             cutoff: cutoff);
 
@@ -212,6 +239,7 @@ public class WorkspaceActivityRetentionTests : TrackerEntityFrameworkCoreTestBas
         result.CandidateCount.ShouldBe(1);
         result.DeletedCount.ShouldBe(1);
         result.PreservedReferencedCount.ShouldBe(0);
+        result.PreservedReplaySafetyCount.ShouldBe(0);
         result.HasMore.ShouldBeFalse();
         result.Skipped.ShouldBeFalse();
 
@@ -247,6 +275,7 @@ public class WorkspaceActivityRetentionTests : TrackerEntityFrameworkCoreTestBas
         var policy = new ActivityRetentionPolicy(
             workspaceId: wsA,
             retentionPeriod: TimeSpan.FromDays(30),
+            ingestionHorizon: TimeSpan.FromDays(45),
             cutoff: cutoff);
 
         // Act
@@ -256,6 +285,7 @@ public class WorkspaceActivityRetentionTests : TrackerEntityFrameworkCoreTestBas
         result.CandidateCount.ShouldBe(0);
         result.DeletedCount.ShouldBe(0);
         result.PreservedReferencedCount.ShouldBe(0);
+        result.PreservedReplaySafetyCount.ShouldBe(0);
 
         using (DataFilter.Disable<IWorkspaceScoped>())
         {
@@ -265,20 +295,67 @@ public class WorkspaceActivityRetentionTests : TrackerEntityFrameworkCoreTestBas
     }
 
     [Fact]
+    public async Task Replay_Safety_Preserves_Activities_Within_Ingestion_Horizon_And_Exact_Cutoff()
+    {
+        var (wsA, _, projA, _) = await SeedFixtureAsync();
+        var now = _clock.Now;
+        var cutoff = now.AddDays(-30);
+        var ingestionHorizon = TimeSpan.FromDays(45);
+        var ingestionCutoff = now.AddDays(-45);
+
+        // Act 1: Fresh activity (10 days old, not a candidate: StartedAt >= cutoff)
+        var actFresh = await SeedActivityAsync(wsA, projA, TestUserId, now.AddDays(-10));
+
+        // Act 2: Older than retention cutoff, but within ingestion horizon (40 days old: preserved for replay safety!)
+        var actWithinHorizon = await SeedActivityAsync(wsA, projA, TestUserId, now.AddDays(-40));
+
+        // Act 3: Exact ingestion cutoff boundary (StartedAt == ingestionCutoff: preserved for replay safety!)
+        var actExactHorizon = await SeedActivityAsync(wsA, projA, TestUserId, ingestionCutoff);
+
+        // Act 4: Strictly older than ingestion cutoff (50 days old: safely eligible for deletion!)
+        var actSafelyExpired = await SeedActivityAsync(wsA, projA, TestUserId, now.AddDays(-50));
+
+        var policy = new ActivityRetentionPolicy(
+            workspaceId: wsA,
+            retentionPeriod: TimeSpan.FromDays(30),
+            ingestionHorizon: ingestionHorizon,
+            cutoff: cutoff,
+            ingestionCutoff: ingestionCutoff);
+
+        // Act
+        var result = await _retentionService.CleanExpiredActivitiesAsync(policy);
+
+        // Assert: 3 candidates evaluated (< 30d cutoff); 2 preserved for replay safety; 1 safely deleted
+        result.CandidateCount.ShouldBe(3);
+        result.DeletedCount.ShouldBe(1);
+        result.PreservedReplaySafetyCount.ShouldBe(2);
+        result.PreservedReferencedCount.ShouldBe(0);
+
+        using (DataFilter.Disable<IWorkspaceScoped>())
+        {
+            (await _activityRepository.FindAsync(actFresh.Id)).ShouldNotBeNull();
+            (await _activityRepository.FindAsync(actWithinHorizon.Id)).ShouldNotBeNull();
+            (await _activityRepository.FindAsync(actExactHorizon.Id)).ShouldNotBeNull();
+            (await _activityRepository.FindAsync(actSafelyExpired.Id)).ShouldBeNull();
+        }
+    }
+
+    [Fact]
     public async Task Referenced_Activity_With_Screenshots_Is_Preserved_Along_With_Metadata_And_Blob_Bytes()
     {
         var (wsA, _, projA, _) = await SeedFixtureAsync();
         var cutoff = _clock.Now.AddDays(-30);
 
-        // Seed expired activity in Workspace A (45 days old)
-        var actReferenced = await SeedActivityAsync(wsA, projA, TestUserId, _clock.Now.AddDays(-45));
+        // Seed expired activity in Workspace A (60 days old, safely past ingestion horizon)
+        var actReferenced = await SeedActivityAsync(wsA, projA, TestUserId, _clock.Now.AddDays(-60));
 
         // Seed screenshot referencing this activity with fake blob bytes
-        var sc = await SeedScreenshotAsync(wsA, actReferenced.Id, _clock.Now.AddDays(-45));
+        var sc = await SeedScreenshotAsync(wsA, actReferenced.Id, _clock.Now.AddDays(-60));
 
         var policy = new ActivityRetentionPolicy(
             workspaceId: wsA,
             retentionPeriod: TimeSpan.FromDays(30),
+            ingestionHorizon: TimeSpan.FromDays(45),
             cutoff: cutoff);
 
         // Act
@@ -288,6 +365,7 @@ public class WorkspaceActivityRetentionTests : TrackerEntityFrameworkCoreTestBas
         result.CandidateCount.ShouldBe(1);
         result.DeletedCount.ShouldBe(0);
         result.PreservedReferencedCount.ShouldBe(1);
+        result.PreservedReplaySafetyCount.ShouldBe(0);
         result.HasMore.ShouldBeFalse();
 
         // Database row survives intact
@@ -314,15 +392,16 @@ public class WorkspaceActivityRetentionTests : TrackerEntityFrameworkCoreTestBas
         var (wsA, wsB, projA, _) = await SeedFixtureAsync();
         var cutoff = _clock.Now.AddDays(-30);
 
-        // Seed expired activity in Workspace A (45 days old)
-        var actForeignRef = await SeedActivityAsync(wsA, projA, TestUserId, _clock.Now.AddDays(-45));
+        // Seed expired activity in Workspace A (60 days old)
+        var actForeignRef = await SeedActivityAsync(wsA, projA, TestUserId, _clock.Now.AddDays(-60));
 
         // Seed screenshot pointing to actForeignRef, but with WorkspaceId = wsB (foreign/corrupt capture reference)
-        var corruptSc = await SeedScreenshotAsync(wsB, actForeignRef.Id, _clock.Now.AddDays(-45));
+        var corruptSc = await SeedScreenshotAsync(wsB, actForeignRef.Id, _clock.Now.AddDays(-60));
 
         var policy = new ActivityRetentionPolicy(
             workspaceId: wsA,
             retentionPeriod: TimeSpan.FromDays(30),
+            ingestionHorizon: TimeSpan.FromDays(45),
             cutoff: cutoff);
 
         // Act
@@ -332,6 +411,7 @@ public class WorkspaceActivityRetentionTests : TrackerEntityFrameworkCoreTestBas
         result.CandidateCount.ShouldBe(1);
         result.DeletedCount.ShouldBe(0);
         result.PreservedReferencedCount.ShouldBe(1);
+        result.PreservedReplaySafetyCount.ShouldBe(0);
 
         using (DataFilter.Disable<IWorkspaceScoped>())
         {
@@ -346,27 +426,45 @@ public class WorkspaceActivityRetentionTests : TrackerEntityFrameworkCoreTestBas
     public async Task Invalid_Or_Empty_Policy_Is_Rejected_Before_Any_Writes()
     {
         var (wsA, _, projA, _) = await SeedFixtureAsync();
-        var act = await SeedActivityAsync(wsA, projA, TestUserId, _clock.Now.AddDays(-45));
+        var act = await SeedActivityAsync(wsA, projA, TestUserId, _clock.Now.AddDays(-60));
 
         // 1. Empty workspace ID rejected
         Should.Throw<ArgumentException>(() =>
-            new ActivityRetentionPolicy(Guid.Empty, TimeSpan.FromDays(30)).Validate());
+            new ActivityRetentionPolicy(Guid.Empty, TimeSpan.FromDays(30), TimeSpan.FromDays(45)).Validate());
 
         // 2. Zero retention period rejected
         Should.Throw<ArgumentOutOfRangeException>(() =>
-            new ActivityRetentionPolicy(wsA, TimeSpan.Zero).Validate());
+            new ActivityRetentionPolicy(wsA, TimeSpan.Zero, TimeSpan.FromDays(45)).Validate());
 
         // 3. Negative retention period rejected
         Should.Throw<ArgumentOutOfRangeException>(() =>
-            new ActivityRetentionPolicy(wsA, TimeSpan.FromDays(-10)).Validate());
+            new ActivityRetentionPolicy(wsA, TimeSpan.FromDays(-10), TimeSpan.FromDays(45)).Validate());
 
-        // 4. Batch size 0 rejected
+        // 4. Zero ingestion horizon rejected
         Should.Throw<ArgumentOutOfRangeException>(() =>
-            new ActivityRetentionPolicy(wsA, TimeSpan.FromDays(30), batchSize: 0).Validate());
+            new ActivityRetentionPolicy(wsA, TimeSpan.FromDays(30), TimeSpan.Zero).Validate());
 
-        // 5. Batch size > 1000 rejected
+        // 5. Negative ingestion horizon rejected
         Should.Throw<ArgumentOutOfRangeException>(() =>
-            new ActivityRetentionPolicy(wsA, TimeSpan.FromDays(30), batchSize: 1001).Validate());
+            new ActivityRetentionPolicy(wsA, TimeSpan.FromDays(30), TimeSpan.FromDays(-5)).Validate());
+
+        // 6. Batch size 0 rejected
+        Should.Throw<ArgumentOutOfRangeException>(() =>
+            new ActivityRetentionPolicy(wsA, TimeSpan.FromDays(30), TimeSpan.FromDays(45), batchSize: 0).Validate());
+
+        // 7. Batch size > 1000 rejected
+        Should.Throw<ArgumentOutOfRangeException>(() =>
+            new ActivityRetentionPolicy(wsA, TimeSpan.FromDays(30), TimeSpan.FromDays(45), batchSize: 1001).Validate());
+
+        // 8. Future ingestion cutoff rejected by service
+        var futurePolicy = new ActivityRetentionPolicy(
+            workspaceId: wsA,
+            retentionPeriod: TimeSpan.FromDays(30),
+            ingestionHorizon: TimeSpan.FromDays(45),
+            ingestionCutoff: _clock.Now.AddDays(5));
+
+        await Should.ThrowAsync<ArgumentOutOfRangeException>(async () =>
+            await _retentionService.CleanExpiredActivitiesAsync(futurePolicy));
 
         // Verify zero database modifications occurred
         using (DataFilter.Disable<IWorkspaceScoped>())
@@ -382,27 +480,28 @@ public class WorkspaceActivityRetentionTests : TrackerEntityFrameworkCoreTestBas
         var cutoff = _clock.Now.AddDays(-30);
 
         // Seed 5 expired activities in chronological order:
-        // Act 1: 50 days old, has screenshot (preserved)
-        var act1 = await SeedActivityAsync(wsA, projA, TestUserId, _clock.Now.AddDays(-50));
-        var sc1 = await SeedScreenshotAsync(wsA, act1.Id, _clock.Now.AddDays(-50));
+        // Act 1: 60 days old, has screenshot (preserved for capture reference)
+        var act1 = await SeedActivityAsync(wsA, projA, TestUserId, _clock.Now.AddDays(-60));
+        var sc1 = await SeedScreenshotAsync(wsA, act1.Id, _clock.Now.AddDays(-60));
 
-        // Act 2: 48 days old, has screenshot (preserved)
-        var act2 = await SeedActivityAsync(wsA, projA, TestUserId, _clock.Now.AddDays(-48));
-        var sc2 = await SeedScreenshotAsync(wsA, act2.Id, _clock.Now.AddDays(-48));
+        // Act 2: 58 days old, has screenshot (preserved for capture reference)
+        var act2 = await SeedActivityAsync(wsA, projA, TestUserId, _clock.Now.AddDays(-58));
+        var sc2 = await SeedScreenshotAsync(wsA, act2.Id, _clock.Now.AddDays(-58));
 
-        // Act 3: 46 days old, no screenshot (eligible)
-        var act3 = await SeedActivityAsync(wsA, projA, TestUserId, _clock.Now.AddDays(-46));
+        // Act 3: 56 days old, no screenshot (eligible)
+        var act3 = await SeedActivityAsync(wsA, projA, TestUserId, _clock.Now.AddDays(-56));
 
-        // Act 4: 44 days old, no screenshot (eligible)
-        var act4 = await SeedActivityAsync(wsA, projA, TestUserId, _clock.Now.AddDays(-44));
+        // Act 4: 54 days old, no screenshot (eligible)
+        var act4 = await SeedActivityAsync(wsA, projA, TestUserId, _clock.Now.AddDays(-54));
 
-        // Act 5: 42 days old, no screenshot (eligible)
-        var act5 = await SeedActivityAsync(wsA, projA, TestUserId, _clock.Now.AddDays(-42));
+        // Act 5: 52 days old, no screenshot (eligible)
+        var act5 = await SeedActivityAsync(wsA, projA, TestUserId, _clock.Now.AddDays(-52));
 
         // Page 1: batch size 2
         var policyPage1 = new ActivityRetentionPolicy(
             workspaceId: wsA,
             retentionPeriod: TimeSpan.FromDays(30),
+            ingestionHorizon: TimeSpan.FromDays(45),
             batchSize: 2,
             cutoff: cutoff);
 
@@ -418,6 +517,7 @@ public class WorkspaceActivityRetentionTests : TrackerEntityFrameworkCoreTestBas
         var policyPage2 = new ActivityRetentionPolicy(
             workspaceId: wsA,
             retentionPeriod: TimeSpan.FromDays(30),
+            ingestionHorizon: TimeSpan.FromDays(45),
             batchSize: 2,
             cutoff: cutoff,
             cursor: result1.NextCursor);
@@ -434,6 +534,7 @@ public class WorkspaceActivityRetentionTests : TrackerEntityFrameworkCoreTestBas
         var policyPage3 = new ActivityRetentionPolicy(
             workspaceId: wsA,
             retentionPeriod: TimeSpan.FromDays(30),
+            ingestionHorizon: TimeSpan.FromDays(45),
             batchSize: 2,
             cutoff: cutoff,
             cursor: result2.NextCursor);
@@ -465,16 +566,74 @@ public class WorkspaceActivityRetentionTests : TrackerEntityFrameworkCoreTestBas
     }
 
     [Fact]
+    public async Task Bounded_Batching_And_Keyset_Progress_Past_Leading_Preserved_Replay_Safety_Rows()
+    {
+        var (wsA, _, projA, _) = await SeedFixtureAsync();
+        var cutoff = _clock.Now.AddDays(-30);
+        var ingestionHorizon = TimeSpan.FromDays(45);
+
+        // Act 1: 40 days old, within upload window (preserved for replay safety)
+        var act1 = await SeedActivityAsync(wsA, projA, TestUserId, _clock.Now.AddDays(-40));
+
+        // Act 2: 38 days old, within upload window (preserved for replay safety)
+        var act2 = await SeedActivityAsync(wsA, projA, TestUserId, _clock.Now.AddDays(-38));
+
+        // Act 3: 36 days old, within upload window (preserved for replay safety)
+        var act3 = await SeedActivityAsync(wsA, projA, TestUserId, _clock.Now.AddDays(-36));
+
+        // Page 1: batch size 2 (both rows are within upload window)
+        var policyPage1 = new ActivityRetentionPolicy(
+            workspaceId: wsA,
+            retentionPeriod: TimeSpan.FromDays(30),
+            ingestionHorizon: ingestionHorizon,
+            batchSize: 2,
+            cutoff: cutoff);
+
+        var result1 = await _retentionService.CleanExpiredActivitiesAsync(policyPage1);
+        result1.CandidateCount.ShouldBe(2);
+        result1.DeletedCount.ShouldBe(0);
+        result1.PreservedReplaySafetyCount.ShouldBe(2);
+        result1.HasMore.ShouldBeTrue();
+        result1.NextCursor.ShouldNotBeNull();
+        result1.NextCursor.ActivityId.ShouldBe(act2.Id);
+
+        // Page 2: continuing from NextCursor of Page 1 past preserved replay rows
+        var policyPage2 = new ActivityRetentionPolicy(
+            workspaceId: wsA,
+            retentionPeriod: TimeSpan.FromDays(30),
+            ingestionHorizon: ingestionHorizon,
+            batchSize: 2,
+            cutoff: cutoff,
+            cursor: result1.NextCursor);
+
+        var result2 = await _retentionService.CleanExpiredActivitiesAsync(policyPage2);
+        result2.CandidateCount.ShouldBe(1);
+        result2.DeletedCount.ShouldBe(0);
+        result2.PreservedReplaySafetyCount.ShouldBe(1);
+        result2.HasMore.ShouldBeFalse();
+        result2.NextCursor.ShouldBeNull();
+
+        // All 3 rows survive to protect replay safety
+        using (DataFilter.Disable<IWorkspaceScoped>())
+        {
+            (await _activityRepository.FindAsync(act1.Id)).ShouldNotBeNull();
+            (await _activityRepository.FindAsync(act2.Id)).ShouldNotBeNull();
+            (await _activityRepository.FindAsync(act3.Id)).ShouldNotBeNull();
+        }
+    }
+
+    [Fact]
     public async Task Repeat_Cleanup_Is_Idempotent_With_Zero_Candidates()
     {
         var (wsA, _, projA, _) = await SeedFixtureAsync();
         var cutoff = _clock.Now.AddDays(-30);
 
-        var act = await SeedActivityAsync(wsA, projA, TestUserId, _clock.Now.AddDays(-40));
+        var act = await SeedActivityAsync(wsA, projA, TestUserId, _clock.Now.AddDays(-60));
 
         var policy = new ActivityRetentionPolicy(
             workspaceId: wsA,
             retentionPeriod: TimeSpan.FromDays(30),
+            ingestionHorizon: TimeSpan.FromDays(45),
             cutoff: cutoff);
 
         // First run cleans the eligible row
@@ -503,13 +662,14 @@ public class WorkspaceActivityRetentionTests : TrackerEntityFrameworkCoreTestBas
             await _workspaceRepository.UpdateAsync(ws, autoSave: true);
         });
 
-        // Seed expired activity in the archived workspace
-        var actArchived = await SeedActivityAsync(wsArchived, projA, TestUserId, _clock.Now.AddDays(-40));
+        // Seed expired activity in the archived workspace (60 days old)
+        var actArchived = await SeedActivityAsync(wsArchived, projA, TestUserId, _clock.Now.AddDays(-60));
 
         // 1. Default policy (AllowArchivedWorkspace = false): skips archived workspace
         var skipPolicy = new ActivityRetentionPolicy(
             workspaceId: wsArchived,
             retentionPeriod: TimeSpan.FromDays(30),
+            ingestionHorizon: TimeSpan.FromDays(45),
             allowArchivedWorkspace: false);
 
         var skipResult = await _retentionService.CleanExpiredActivitiesAsync(skipPolicy);
@@ -526,6 +686,7 @@ public class WorkspaceActivityRetentionTests : TrackerEntityFrameworkCoreTestBas
         var allowPolicy = new ActivityRetentionPolicy(
             workspaceId: wsArchived,
             retentionPeriod: TimeSpan.FromDays(30),
+            ingestionHorizon: TimeSpan.FromDays(45),
             allowArchivedWorkspace: true);
 
         var allowResult = await _retentionService.CleanExpiredActivitiesAsync(allowPolicy);
@@ -542,7 +703,7 @@ public class WorkspaceActivityRetentionTests : TrackerEntityFrameworkCoreTestBas
     public async Task Sentinels_For_Project_Membership_Subscription_And_User_Remain_Untouched()
     {
         var (wsA, _, projA, _) = await SeedFixtureAsync();
-        var act = await SeedActivityAsync(wsA, projA, TestUserId, _clock.Now.AddDays(-40));
+        var act = await SeedActivityAsync(wsA, projA, TestUserId, _clock.Now.AddDays(-60));
 
         // Seed Plan and Subscription
         var planId = _guidGenerator.Create();
@@ -562,7 +723,8 @@ public class WorkspaceActivityRetentionTests : TrackerEntityFrameworkCoreTestBas
 
         var policy = new ActivityRetentionPolicy(
             workspaceId: wsA,
-            retentionPeriod: TimeSpan.FromDays(30));
+            retentionPeriod: TimeSpan.FromDays(30),
+            ingestionHorizon: TimeSpan.FromDays(45));
 
         var result = await _retentionService.CleanExpiredActivitiesAsync(policy);
         result.DeletedCount.ShouldBe(1);
@@ -582,11 +744,12 @@ public class WorkspaceActivityRetentionTests : TrackerEntityFrameworkCoreTestBas
     public async Task Cancellation_Token_Halts_Execution_Without_Mutation()
     {
         var (wsA, _, projA, _) = await SeedFixtureAsync();
-        var act = await SeedActivityAsync(wsA, projA, TestUserId, _clock.Now.AddDays(-40));
+        var act = await SeedActivityAsync(wsA, projA, TestUserId, _clock.Now.AddDays(-60));
 
         var policy = new ActivityRetentionPolicy(
             workspaceId: wsA,
-            retentionPeriod: TimeSpan.FromDays(30));
+            retentionPeriod: TimeSpan.FromDays(30),
+            ingestionHorizon: TimeSpan.FromDays(45));
 
         using var cts = new CancellationTokenSource();
         cts.Cancel(); // Pre-canceled token
@@ -607,9 +770,103 @@ public class WorkspaceActivityRetentionTests : TrackerEntityFrameworkCoreTestBas
         var nonExistentWorkspace = Guid.NewGuid();
         var policy = new ActivityRetentionPolicy(
             workspaceId: nonExistentWorkspace,
-            retentionPeriod: TimeSpan.FromDays(30));
+            retentionPeriod: TimeSpan.FromDays(30),
+            ingestionHorizon: TimeSpan.FromDays(45));
 
         await Should.ThrowAsync<EntityNotFoundException>(async () =>
             await _retentionService.CleanExpiredActivitiesAsync(policy));
+    }
+
+    [Fact]
+    public async Task Production_Ingestion_Retention_Retry_Preserves_Idempotency_And_Rejects_Recreation()
+    {
+        var (wsA, _, projA, _) = await SeedFixtureAsync();
+
+        // Seed ProjectMember for TestUserId
+        await WithUnitOfWorkAsync(async () =>
+        {
+            using (DataFilter.Disable<IWorkspaceScoped>())
+            {
+                await _projectMemberRepository.InsertAsync(
+                    new ProjectMember(_guidGenerator.Create(), wsA, projA, TestUserId, "Worker"), autoSave: true);
+            }
+        });
+
+        using (_currentWorkspace.Change(wsA))
+        using (SetCurrentUser(TestUserId, "testuser@dosi.test"))
+        {
+            var now = _clock.Now;
+            var clientActivityId = _guidGenerator.Create();
+            var startedAt = now.AddDays(-40);
+            var endedAt = startedAt.AddMinutes(10);
+
+            var input = new CreateActivityDto
+            {
+                ProjectId = projA,
+                ClientActivityId = clientActivityId,
+                StartedAt = startedAt,
+                EndedAt = endedAt,
+                Productivity = 80,
+                MouseClicks = 100,
+                KeyboardHits = 200,
+                Description = "Replay safety test block"
+            };
+
+            // 1. Ingestion: block is accepted within 45-day window
+            var initialBlock = await _activityAppService.CreateAsync(input);
+            initialBlock.ShouldNotBeNull();
+            initialBlock.ClientActivityId.ShouldBe(clientActivityId);
+            var originalBlockId = initialBlock.Id;
+
+            // 2. Retention: 30-day retention with 45-day ingestion horizon preserves the row to protect replay safety
+            var policy = new ActivityRetentionPolicy(
+                workspaceId: wsA,
+                retentionPeriod: TimeSpan.FromDays(30),
+                ingestionHorizon: TimeSpan.FromDays(45));
+
+            var retentionResult = await _retentionService.CleanExpiredActivitiesAsync(policy);
+            retentionResult.CandidateCount.ShouldBe(1);
+            retentionResult.DeletedCount.ShouldBe(0); // Preserved!
+            retentionResult.PreservedReplaySafetyCount.ShouldBe(1);
+
+            // 3. Identical Retry: Client replays the exact same block
+            var retryBlock = await _activityAppService.CreateAsync(input);
+
+            // Idempotency guarantee: retry returns the exact same accepted block, NOT a new/recreated block!
+            retryBlock.Id.ShouldBe(originalBlockId);
+            retryBlock.ClientActivityId.ShouldBe(clientActivityId);
+
+            // 4. Positive Control: An activity strictly older than the 45-day upload window (e.g. 50 days old)
+            // can be safely deleted, and subsequent retry attempts are rejected with ActivityTooOld (422)
+            var oldClientActivityId = _guidGenerator.Create();
+            var oldStartedAt = now.AddDays(-50);
+            var oldAct = await SeedActivityAsync(wsA, projA, TestUserId, oldStartedAt);
+            oldAct.ClientActivityId = oldClientActivityId;
+
+            var oldRetentionResult = await _retentionService.CleanExpiredActivitiesAsync(policy);
+            oldRetentionResult.DeletedCount.ShouldBe(1); // 50-day-old row is safely deleted!
+
+            using (DataFilter.Disable<IWorkspaceScoped>())
+            {
+                (await _activityRepository.FindAsync(oldAct.Id)).ShouldBeNull();
+            }
+
+            var oldInput = new CreateActivityDto
+            {
+                ProjectId = projA,
+                ClientActivityId = oldClientActivityId,
+                StartedAt = oldStartedAt,
+                EndedAt = oldStartedAt.AddMinutes(10),
+                Productivity = 80,
+                MouseClicks = 50,
+                KeyboardHits = 100,
+                Description = "Old block outside upload window"
+            };
+
+            // Retry for safely deleted block older than upload window is rejected by production validation!
+            var ex = await Should.ThrowAsync<BusinessException>(async () =>
+                await _activityAppService.CreateAsync(oldInput));
+            ex.Code.ShouldBe(TrackerDomainErrorCodes.ActivityTooOld);
+        }
     }
 }
