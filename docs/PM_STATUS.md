@@ -696,7 +696,7 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
 
 7. **Operational Limitations & Remaining Gaps**:
    - **A disabled implementation is not deployed/enforced retention**: The worker is disabled by default and has not been executed on live environments.
-   - **Activity Retention Gap**: 1-year activity summary pruning (e.g. deleting old `Activity` records) is deferred; only captures are pruned in this slice.
+   - **Activity Retention Lifecycle Status**: Explicit-policy workspace-scoped activity summary retention backend service (`IActivityRetentionService`) is implemented and verified (see Section 9); automatic background scheduler, owner configuration API/UI, and operational deployment remain separate deferred gaps.
    - **Owner Settings UI Gap**: Per-workspace retention period configuration UI for workspace owners in Next.js frontend is not yet implemented.
    - **Live Storage / DB Approval Gap**: Production execution against live PostgreSQL databases and real AWS S3 / Cloudflare R2 object storage remains pending independent PM operational approval.
 
@@ -743,6 +743,70 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
      12. `Worker_Disabling_Policy_Stops_Later_Sweeps_And_Preserves_Foreign_Captures_And_Summaries` (disabling stops sweeps, summaries preserved).
      13. `Persisted_Malformed_Or_Missing_RetentionDays_With_Enabled_True_Fails_Closed_In_Manager_And_Hosted_Read` (matrix of null, empty, whitespace, nonnumeric, overflow, 0, negative, > 730 fail closed to false/30 in manager and hosted read; operative 45-day control succeeds).
      14. `Worker_Sweep_With_Malformed_RetentionDays_Makes_Zero_Deletions_While_Valid_Control_Cleans_In_Same_Sweep` (corrupt duration makes zero deletions; SQL rows and blobs 100% preserved; valid opted-in control workspace cleaned in same sweep; opted-out sentinel untouched).
+---
+
+## 9. REQ-DAT-01: Explicit Workspace-Scoped Activity Summary Retention Service (Isolated Backend Engine)
+
+### A. Lifecycle Discovery, Scope Separation & Pre-Implementation Evidence
+1. **Separation from Capture Cleanup**:
+   - Existing capture retention (`ICaptureRetentionService`, `CaptureRetentionWorker`) explicitly targets `Screenshot` metadata and blob storage, intentionally preserving parent `Activity` time summary records untouched.
+   - Prior to this slice, no domain service, contract, or query path existed for age-based Activity record cleanup. `PRODUCT_ACCEPTANCE.md` explicitly noted activity summary retention as deferred.
+   - This slice addresses a **missing product capability**, NOT an operational leak or accidental deletion incident.
+2. **Reconciliation of Aliases & Existing Protections**:
+   - Reconciled prune/retention terminology across the codebase: `CaptureRetentionService` cleans screenshots/blobs; `PresenceAppService` prunes stale heartbeat entries; `ActivityRetentionService` now provides the explicit-policy domain engine for activity records.
+   - No public HTTP API, recurring scheduler, background worker, or host startup registration is included in this bounded phase.
+   - The service remains **completely dormant** unless explicitly invoked with a validated policy. Operational rollout, owner opt-in API, and automated scheduling remain separate future gaps.
+   - No database schema migrations or changes to existing capture policy definitions were required (EF Core mappings and indexes on `(WorkspaceId, StartedAt)` already support keyset querying).
+
+### B. Production Implementation Details
+1. **Domain Contracts (`backend/src/Dosi.Tracker.Domain/Activities/Retention/`)**:
+   - `ActivityRetentionCursor`: Deterministic keyset pagination cursor `record ActivityRetentionCursor(DateTime StartedAt, Guid ActivityId);`.
+   - `ActivityRetentionPolicy`: Specification record requiring:
+     * `WorkspaceId != Guid.Empty` (target workspace must be explicitly specified; rejects empty GUID).
+     * `RetentionPeriod > TimeSpan.Zero` (positive bounded age required; zero or negative durations rejected).
+     * `BatchSize` bounded in `[1, 1000]` (default 100).
+     * `AllowArchivedWorkspace` boolean (defaults to `false` to preserve archived workspaces by default).
+     * Optional frozen `Cutoff` (defaults to `clock.Now - RetentionPeriod` at execution start).
+     * Optional keyset `Cursor` for forward continuation.
+     * Throws `ArgumentException` / `ArgumentOutOfRangeException` on invalid policy prior to any query or database effect.
+   - `ActivityRetentionResult`: Metrics record reporting `CandidateCount`, `DeletedCount`, `PreservedReferencedCount`, `HasMore`, `NextCursor`, `LastProcessedCursor`, `Skipped`, and `SkipReason`.
+   - `IActivityRetentionService`: Interface defining `CleanExpiredActivitiesAsync(policy, cancellationToken)`.
+2. **Production Domain Service (`ActivityRetentionService.cs`)**:
+   - **Validation & Fail-Closed Guards**: Invokes `policy.Validate()`. Queries `_workspaceRepository.FindAsync(policy.WorkspaceId)`; returns `Skipped = true, SkipReason = "Workspace not found"` if missing, or `SkipReason = "Workspace is archived"` if archived and `!policy.AllowArchivedWorkspace`.
+   - **Deterministic Cutoff & Keyset Pagination**:
+     * Strict cutoff rule: candidates strictly satisfy `s.StartedAt < cutoff`. Records with `StartedAt >= cutoff` (fresh or exact-cutoff boundary) are completely preserved.
+     * Ordered by `s.StartedAt` ascending, then `s.Id` ascending.
+     * Keyset predicate: `s.StartedAt > cursorStartedAt || (s.StartedAt == cursorStartedAt && s.Id.CompareTo(cursorId) > 0)` translated natively by EF Core.
+     * Fetches `Take(policy.BatchSize + 1)` to evaluate `HasMore` deterministically.
+   - **Capture Dependency & Cascade Defense**:
+     * EF Core entity configuration defines `Screenshot.ActivityId` as a required foreign key to `Activity`. Deleting an activity with screenshots would cascade delete capture metadata while leaving unreferenced orphan blobs in object storage.
+     * Cross-tenant inspection: `ActivityRetentionService` temporarily disables workspace data filters (`_dataFilter.Disable<IWorkspaceScoped>()`) to query `_screenshotRepository` for candidate IDs across the entire database.
+     * Any activity referenced by capture metadata—including foreign or corrupt cross-workspace references—is strictly preserved (`PreservedReferencedCount++`) and skipped from deletion.
+     * Zero blob provider interactions: The service never calls blob storage, never reads, writes, or deletes blobs, eliminating any risk of blob corruption or orphaned storage.
+   - **Dual Workspace Predicates**:
+     * Explicit `s.WorkspaceId == policy.WorkspaceId` predicate is enforced at BOTH selection query and batch mutation loop, ensuring defense-in-depth against ambient filter leakage.
+   - **Forward Progress Past Preserved Dependencies**:
+     * If all candidates on a page are preserved (e.g. all referenced by captures), advancing the keyset cursor to the last candidate evaluated (`batch[^1]`) ensures subsequent iterations query `WHERE (StartedAt, Id) > cursor`, making bounded forward progress past preserved rows and avoiding infinite starvation loops.
+   - **Transactional Unit of Work**:
+     * Deletions execute within a transactional unit of work (`_unitOfWorkManager.Begin(requiresNew: true)`), deleting eligible unreferenced activities via `_activityRepository.DeleteManyAsync`.
+   - **Sentinel Preservation**:
+     * Projects, workspace memberships, identity users, subscriptions, and device revocations are completely unaffected and preserved.
+
+### C. Isolated SQLite Regression Evidence (`WorkspaceActivityRetentionTests.cs`)
+- Command: `dotnet test backend/test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~WorkspaceActivityRetentionTests"`
+- Outcome: **11 passed, 0 failed, exit 0**.
+- Scenarios Verified:
+  1. `Expired_Unreferenced_Activities_Are_Deleted_While_Referenced_And_Fresh_Survive`: Expired unreferenced activities are deleted; referenced activities and fresh activities survive.
+  2. `Cross_Workspace_Isolation_Unrelated_Workspace_Expired_Activities_Survive`: Unrelated workspace's expired activities survive untouched when executing retention on Workspace A.
+  3. `Exact_Cutoff_Boundary_Preservation`: Activities with `StartedAt == cutoff` (exact cutoff) survive; strictly older (`StartedAt < cutoff`) are deleted.
+  4. `Activities_Referenced_By_Captures_Survive_With_Metadata_And_Blob_Bytes_Intact`: Referenced activity and its child screenshot metadata survive; preseeded fake blob bytes in `ScriptedBlobProvider` remain intact (zero provider deletes).
+  5. `Foreign_Or_Corrupt_Capture_Reference_Protects_Activity_And_Cannot_Induce_Blob_Or_Metadata_Loss`: Corrupt foreign capture in Workspace B referencing Workspace A activity protects the activity from deletion; zero blob losses or metadata cascades.
+  6. `Invalid_Policy_Arguments_Throw_Before_Any_Database_Effects`: Rejects `Guid.Empty`, `TimeSpan.Zero`, negative duration, 0 batch size, > 1000 batch size, or null policy with exceptions before any DB calls; database rows remain intact.
+  7. `Keyset_Pagination_Advances_Past_Preserved_Referenced_Activities_Without_Starvation`: Evaluates 3-page keyset cursor pagination with preserved referenced activities on page 1; proves keyset cursor advances past preserved dependencies to reclaim unreferenced items on later pages without infinite loop.
+  8. `Repeat_Execution_Is_Idempotent_And_Leaves_Zero_Side_Effects`: Successive executions over already-cleaned database return `CandidateCount = 0`, `DeletedCount = 0`, zero side effects.
+  9. `Archived_Workspace_Is_Skipped_By_Default_And_Processed_When_Explicitly_Allowed`: Archived workspace returns `Skipped = true` by default; when `AllowArchivedWorkspace = true`, processes expired activities.
+  10. `Concrete_Project_Membership_Subscription_And_Revocation_Sentinels_Survive`: Preseeded project, workspace member, subscription, and device revocation sentinels survive retention completely untouched.
+  11. `Cancellation_Token_Stops_Execution_Before_Database_Mutations`: Pre-cancelled token halts execution before candidate evaluation; zero deletions occur.
 
 ---
 
@@ -986,15 +1050,15 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
 1. **Privacy Acceptance Pending**:
    - The privacy source audit (commit `14bbe66`) remains **Pending PM Independent Review**. This status is preserved and not bypassed.
 2. **Workspace Lifecycle, Authorization, Retention, Export, Presence, Device & Screenshot Delivery Status**:
-   - Owner-managed workspace capture retention policy lifecycle (`REQ-DAT-01`), non-storable cache policy for private capture delivery (`REQ-ISO-05`), private-capture-delivery acceptance harness (`REQ-ISO-05`), workspace-scoped self-service device revocation (`REQ-DEV-01`), live team presence active membership scoping (`REQ-TRK-04`), authenticated workspace-scoped activity CSV export (`REQ-DAT-02`), workspace-isolated capture retention lifecycle safe first slice (`REQ-DAT-01`), reversible owner-controlled workspace archival (`REQ-WS-08`), concurrent last-owner protection (`REQ-WS-06`), recipient decline lifecycle (`REQ-WS-07`), and hosted ASP.NET Core `TestServer` MVC aggregate authorization harness (`REQ-ISO-05`) are implemented and verified via isolated regressions (124 SQLite integration tests total: 14 capture retention policy HTTP + 11 screenshot content delivery + 9 device revocation + 7 device migration + 6 team presence + 10 activity export + 20 capture retention + 9 archival lifecycle + 10 archival migration/upgrade + 9 concurrent owner protection + 9 hosted MVC auth + 10 decline).
+   - Explicit-policy workspace activity summary age-retention service (`REQ-DAT-01`), owner-managed workspace capture retention policy lifecycle (`REQ-DAT-01`), non-storable cache policy for private capture delivery (`REQ-ISO-05`), private-capture-delivery acceptance harness (`REQ-ISO-05`), workspace-scoped self-service device revocation (`REQ-DEV-01`), live team presence active membership scoping (`REQ-TRK-04`), authenticated workspace-scoped activity CSV export (`REQ-DAT-02`), workspace-isolated capture retention lifecycle safe first slice (`REQ-DAT-01`), reversible owner-controlled workspace archival (`REQ-WS-08`), concurrent last-owner protection (`REQ-WS-06`), recipient decline lifecycle (`REQ-WS-07`), and hosted ASP.NET Core `TestServer` MVC aggregate authorization harness (`REQ-ISO-05`) are implemented and verified via isolated regressions (135 SQLite integration tests total: 11 activity retention + 14 capture retention policy HTTP + 11 screenshot content delivery + 9 device revocation + 7 device migration + 6 team presence + 10 activity export + 20 capture retention + 9 archival lifecycle + 10 archival migration/upgrade + 9 concurrent owner protection + 9 hosted MVC auth + 10 decline).
    - Real browser cookie/session testing (`__Host-Dosi-Workspace`), Next.js server actions, OpenIddict token issuer, provider-backed multi-connection transactional commit proof (PostgreSQL/SQL Server), multi-node distributed lock infrastructure (Redis), and PM independent execution remain pending. All reported outcomes are worker-executed, not independent PM QA.
 3. **Execution Limits & Evidence Boundaries**:
    - TestServer regressions prove conventional MVC routing, aggregate permission checks, fail-closed workspace scoping, binary capture streaming, non-storable capture delivery caching, CSV formula neutralization, Take(limit + 1) hard bounded fetch, active member presence query scoping, device revocation gating before blob side-effects, and server limits on in-memory SQLite, but do NOT replace execution on a real PostgreSQL cluster; no live user/production database was modified.
-   - Retention defaults remain disabled (`IsEnabled = false`); no cleanup was executed against user DB or real object storage.
+   - Retention defaults remain disabled (`IsEnabled = false`); no cleanup was executed against user DB or real object storage. Activity retention service remains completely dormant unless explicitly invoked with a validated policy.
 4. **Remaining Backlog Gaps**:
-   - Cryptographic client machine enrollment / attestation, token/session revocation, native desktop agent revocation prompt/unenrollment UI, WebSocket / SignalR push live presence notification, asynchronous export background worker, screenshot zip archive, signed download URLs, disaster recovery / automated backup procedures, frontend UI export actions, 1-year activity summary pruning, and permanent deletion remain deferred acceptance gaps.
+   - Cryptographic client machine enrollment / attestation, token/session revocation, native desktop agent revocation prompt/unenrollment UI, WebSocket / SignalR push live presence notification, asynchronous export background worker, screenshot zip archive, signed download URLs, disaster recovery / automated backup procedures, frontend UI export actions, automated background activity summary cleanup worker / owner activity retention UI, and permanent deletion remain deferred acceptance gaps.
 5. **Overall Product Incomplete**:
    - Full product remains incomplete across backend metric nullability schema migrations (`Activity.cs` truthful nulls vs 0), desktop offline ingestion queue hardening, platform-native interactive client runtimes, code signing, and hosted operational deployment.
 6. **Awaiting PM Guidance**:
-   - Owner-managed workspace capture retention policy lifecycle (`REQ-DAT-01`) complete. Stop and hand off for PM review with exact diff and test evidence.
+   - Explicit-policy workspace activity summary age-retention service (`REQ-DAT-01`) complete. Stop and hand off for PM review with exact diff and test evidence.
 
