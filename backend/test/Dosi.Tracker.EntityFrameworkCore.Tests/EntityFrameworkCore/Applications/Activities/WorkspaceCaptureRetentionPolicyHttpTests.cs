@@ -24,6 +24,7 @@ using Volo.Abp.Data;
 using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Guids;
 using Volo.Abp.Identity;
+using Volo.Abp.SettingManagement;
 using Volo.Abp.Threading;
 using Volo.Abp.Timing;
 using Volo.Abp.Uow;
@@ -56,6 +57,7 @@ public class WorkspaceCaptureRetentionPolicyHttpTests : WorkspaceHttpTestBase<Tr
     private readonly IGuidGenerator _guidGenerator;
     private readonly IClock _clock;
     private readonly WorkspaceSettingsManager _settingsManager;
+    private readonly ISettingManager _settingManager;
     private IDataFilter DataFilter => GetRequiredService<IDataFilter>();
 
     public WorkspaceCaptureRetentionPolicyHttpTests()
@@ -69,6 +71,7 @@ public class WorkspaceCaptureRetentionPolicyHttpTests : WorkspaceHttpTestBase<Tr
         _guidGenerator = GetRequiredService<IGuidGenerator>();
         _clock = GetRequiredService<IClock>();
         _settingsManager = GetRequiredService<WorkspaceSettingsManager>();
+        _settingManager = GetRequiredService<ISettingManager>();
     }
 
     protected override void AfterAddApplication(IServiceCollection services)
@@ -644,5 +647,184 @@ public class WorkspaceCaptureRetentionPolicyHttpTests : WorkspaceHttpTestBase<Tr
         }
         _blobProvider.Blobs.ContainsKey(scA.StorageUrl).ShouldBeTrue();
         _blobProvider.Blobs.ContainsKey(scB.StorageUrl).ShouldBeTrue();
+    }
+
+    [Fact]
+    public async Task Persisted_Malformed_Or_Missing_RetentionDays_With_Enabled_True_Fails_Closed_In_Manager_And_Hosted_Read()
+    {
+        var (wsA, _) = await SeedPolicyFixtureAsync();
+        var client = CreateHttpClient();
+
+        var malformedOrMissingCases = new (string? RawDays, string Description)[]
+        {
+            (null, "missing/null days"),
+            ("", "empty string days"),
+            ("   ", "whitespace days"),
+            ("nonnumeric", "non-numeric string days"),
+            ("corrupt_value", "corrupt text days"),
+            ("999999999999999999999999999", "integer overflow days"),
+            ("0", "out of bounds low (0 days)"),
+            ("-10", "out of bounds negative days"),
+            ("731", "out of bounds high (731 days)"),
+            ("10000", "out of bounds high (10000 days)")
+        };
+
+        foreach (var (rawDays, desc) in malformedOrMissingCases)
+        {
+            var wsCase = await ServiceProvider.CreateWorkspaceAsync($"MALFORMED-{Guid.NewGuid():N}");
+            await ServiceProvider.AddWorkspaceMemberAsync(OwnerA, WorkspaceRoles.Owner, wsCase);
+
+            // Persist IsEnabled = true with the malformed/missing rawDays setting on provider "W"
+            await WithUnitOfWorkAsync(async () =>
+            {
+                await _settingManager.SetAsync(
+                    TrackerSettings.Workspace.CaptureRetention.IsEnabled,
+                    "true",
+                    WorkspaceSettingValueProvider.ProviderName,
+                    wsCase.ToString());
+
+                if (rawDays != null)
+                {
+                    await _settingManager.SetAsync(
+                        TrackerSettings.Workspace.CaptureRetention.RetentionDays,
+                        rawDays,
+                        WorkspaceSettingValueProvider.ProviderName,
+                        wsCase.ToString());
+                }
+            });
+
+            // 1. Production manager must fail closed: IsEnabled = false, RetentionDays = 30
+            var policy = await _settingsManager.GetCaptureRetentionPolicyAsync(wsCase);
+            policy.IsEnabled.ShouldBeFalse($"Expected IsEnabled to fail closed (false) for {desc}, but got {policy.IsEnabled}");
+            policy.RetentionDays.ShouldBe(30, $"Expected RetentionDays to fail closed to safe default (30) for {desc}, but got {policy.RetentionDays}");
+
+            // 2. Authenticated hosted GET route must reflect fail-closed disabled policy
+            var reqGet = CreateRequest(HttpMethod.Get, $"/api/app/workspaces/{wsCase}/capture-retention", OwnerA, wsCase);
+            var respGet = await client.SendAsync(reqGet);
+            respGet.StatusCode.ShouldBe(HttpStatusCode.OK);
+
+            var docGet = JsonDocument.Parse(await respGet.Content.ReadAsStringAsync());
+            docGet.RootElement.GetProperty("isEnabled").GetBoolean().ShouldBeFalse($"Hosted GET must report disabled for {desc}");
+            docGet.RootElement.GetProperty("retentionDays").GetInt32().ShouldBe(30);
+        }
+
+        // Control: Explicitly valid bounded policy remains operative
+        var wsValid = await ServiceProvider.CreateWorkspaceAsync("VALID-WS");
+        await ServiceProvider.AddWorkspaceMemberAsync(OwnerA, WorkspaceRoles.Owner, wsValid);
+
+        await WithUnitOfWorkAsync(async () =>
+        {
+            await _settingManager.SetAsync(
+                TrackerSettings.Workspace.CaptureRetention.IsEnabled,
+                "true",
+                WorkspaceSettingValueProvider.ProviderName,
+                wsValid.ToString());
+
+            await _settingManager.SetAsync(
+                TrackerSettings.Workspace.CaptureRetention.RetentionDays,
+                "45",
+                WorkspaceSettingValueProvider.ProviderName,
+                wsValid.ToString());
+        });
+
+        var validPolicy = await _settingsManager.GetCaptureRetentionPolicyAsync(wsValid);
+        validPolicy.IsEnabled.ShouldBeTrue();
+        validPolicy.RetentionDays.ShouldBe(45);
+
+        var reqValid = CreateRequest(HttpMethod.Get, $"/api/app/workspaces/{wsValid}/capture-retention", OwnerA, wsValid);
+        var respValid = await client.SendAsync(reqValid);
+        respValid.StatusCode.ShouldBe(HttpStatusCode.OK);
+        var docValid = JsonDocument.Parse(await respValid.Content.ReadAsStringAsync());
+        docValid.RootElement.GetProperty("isEnabled").GetBoolean().ShouldBeTrue();
+        docValid.RootElement.GetProperty("retentionDays").GetInt32().ShouldBe(45);
+    }
+
+    [Fact]
+    public async Task Worker_Sweep_With_Malformed_RetentionDays_Makes_Zero_Deletions_While_Valid_Control_Cleans_In_Same_Sweep()
+    {
+        var (wsA, wsB) = await SeedPolicyFixtureAsync();
+        var wsC = await ServiceProvider.CreateWorkspaceAsync("POLICY-WS-C");
+
+        // Seed captures older than 30 days in all 3 workspaces:
+        var (_, actA) = await SeedActivityAsync(wsA, _clock.Now.AddDays(-60));
+        var (_, actB) = await SeedActivityAsync(wsB, _clock.Now.AddDays(-60));
+        var (_, actC) = await SeedActivityAsync(wsC, _clock.Now.AddDays(-60));
+
+        var scOldA = await SeedScreenshotAsync(wsA, actA, _clock.Now.AddDays(-45), kind: Screenshot.ScreenKind);
+        var scFreshA = await SeedScreenshotAsync(wsA, actA, _clock.Now.AddDays(-5), kind: Screenshot.WebcamKind);
+
+        var scOldB = await SeedScreenshotAsync(wsB, actB, _clock.Now.AddDays(-45), kind: Screenshot.ScreenKind);
+        var scOldC = await SeedScreenshotAsync(wsC, actC, _clock.Now.AddDays(-45), kind: Screenshot.ScreenKind);
+
+        // Workspace A: Persisted IsEnabled = true, but RetentionDays is corrupt/non-numeric ("corrupted_duration")
+        await WithUnitOfWorkAsync(async () =>
+        {
+            await _settingManager.SetAsync(
+                TrackerSettings.Workspace.CaptureRetention.IsEnabled,
+                "true",
+                WorkspaceSettingValueProvider.ProviderName,
+                wsA.ToString());
+
+            await _settingManager.SetAsync(
+                TrackerSettings.Workspace.CaptureRetention.RetentionDays,
+                "corrupted_duration",
+                WorkspaceSettingValueProvider.ProviderName,
+                wsA.ToString());
+        });
+
+        // Workspace B: Control workspace explicitly opted in with valid 30 days
+        await WithUnitOfWorkAsync(async () =>
+        {
+            await _settingsManager.SetCaptureRetentionPolicyAsync(wsB, isEnabled: true, retentionDays: 30);
+        });
+
+        // Workspace C: Opted-out sentinel (IsEnabled = false)
+        await WithUnitOfWorkAsync(async () =>
+        {
+            await _settingsManager.SetCaptureRetentionPolicyAsync(wsC, isEnabled: false, retentionDays: 30);
+        });
+
+        // Master-enabled worker
+        var enabledOptions = Options.Create(new CaptureRetentionOptions
+        {
+            IsEnabled = true,
+            DefaultRetentionDays = 30,
+            BatchSize = 100
+        });
+        var timer = GetRequiredService<AbpAsyncTimer>();
+        var scopeFactory = GetRequiredService<IServiceScopeFactory>();
+        var worker = new CaptureRetentionWorker(timer, scopeFactory, enabledOptions);
+
+        // Run isolated sweep
+        var result = await worker.SweepAsync(ServiceProvider);
+        result.Skipped.ShouldBeFalse();
+
+        // Workspace A (corrupted days) MUST HAVE ZERO DELETIONS (failed closed):
+        using (DataFilter.Disable<IWorkspaceScoped>())
+        {
+            (await _screenshotRepository.FindAsync(scOldA.Id)).ShouldNotBeNull();
+            (await _screenshotRepository.FindAsync(scFreshA.Id)).ShouldNotBeNull();
+
+            // Activity summary in Workspace A preserved
+            var act = await _activityRepository.FindAsync(actA);
+            act.ShouldNotBeNull();
+            act.Productivity.ShouldBe(90);
+        }
+        _blobProvider.Blobs.ContainsKey(scOldA.StorageUrl).ShouldBeTrue();
+        _blobProvider.Blobs.ContainsKey(scFreshA.StorageUrl).ShouldBeTrue();
+
+        // Workspace B (valid control) MUST BE CLEANED (proves worker ran):
+        using (DataFilter.Disable<IWorkspaceScoped>())
+        {
+            (await _screenshotRepository.FindAsync(scOldB.Id)).ShouldBeNull();
+        }
+        _blobProvider.Blobs.ContainsKey(scOldB.StorageUrl).ShouldBeFalse();
+
+        // Workspace C (opted-out sentinel) MUST BE PRESERVED:
+        using (DataFilter.Disable<IWorkspaceScoped>())
+        {
+            (await _screenshotRepository.FindAsync(scOldC.Id)).ShouldNotBeNull();
+        }
+        _blobProvider.Blobs.ContainsKey(scOldC.StorageUrl).ShouldBeTrue();
     }
 }

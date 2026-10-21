@@ -117,9 +117,11 @@ public class WorkspaceSettingsManager : TrackerDomainService
             return (false, 30);
         }
 
-        // Positive bounded days validation: if unset when enabled or malformed/out-of-bounds, fail closed
-        var days = SettingValueFormat.ReadInt(daysStr, fallback: 30);
-        if (days < 1 || days > 730)
+        // Strict integer parsing and bounded range validation [1, 730].
+        // If days is missing/null, empty/whitespace, non-numeric, integer overflow, or out-of-bounds,
+        // fail closed: do NOT silently substitute a destructive valid duration!
+        if (!int.TryParse(daysStr, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var days) ||
+            days < 1 || days > 730)
         {
             return (false, 30);
         }
