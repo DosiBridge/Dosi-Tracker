@@ -50,6 +50,18 @@ public class WorkspacesController : TrackerController
     {
         return _workspaceAppService.RestoreAsync(id);
     }
+
+    [HttpGet("{id}/capture-retention")]
+    public Task<WorkspaceCaptureRetentionDto> GetCaptureRetentionAsync(Guid id)
+    {
+        return _workspaceAppService.GetCaptureRetentionAsync(id);
+    }
+
+    [HttpPut("{id}/capture-retention")]
+    public Task<WorkspaceCaptureRetentionDto> UpdateCaptureRetentionAsync(Guid id, [FromBody] WorkspaceCaptureRetentionDto input)
+    {
+        return _workspaceAppService.UpdateCaptureRetentionAsync(id, input);
+    }
 }
 
 /// <summary>Workspace invitations, addressed by their token.</summary>

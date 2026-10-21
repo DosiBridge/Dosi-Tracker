@@ -1,4 +1,4 @@
-﻿using Volo.Abp.Settings;
+using Volo.Abp.Settings;
 
 namespace Dosi.Tracker.Settings;
 
@@ -18,6 +18,8 @@ public class TrackerSettingDefinitionProvider : SettingDefinitionProvider
             WorkspaceSetting(TrackerSettings.Workspace.NewProject.AllowRunningPrograms, SettingValueFormat.Write(defaults.AllowRunningPrograms)),
             WorkspaceSetting(TrackerSettings.Workspace.NewProject.BlurScreenshots, SettingValueFormat.Write(defaults.BlurScreenshots)),
             WorkspaceSetting(TrackerSettings.Workspace.NewProject.IdleThresholdMinutes, SettingValueFormat.Write(defaults.IdleThresholdMinutes)),
+            WorkspaceSetting(TrackerSettings.Workspace.CaptureRetention.IsEnabled, SettingValueFormat.Write(false)),
+            WorkspaceSetting(TrackerSettings.Workspace.CaptureRetention.RetentionDays, SettingValueFormat.Write(30)),
             new SettingDefinition(TrackerSettings.User.TimeZone)
                 .WithProviders(DefaultValueSettingValueProvider.ProviderName, UserSettingValueProvider.ProviderName));
     }

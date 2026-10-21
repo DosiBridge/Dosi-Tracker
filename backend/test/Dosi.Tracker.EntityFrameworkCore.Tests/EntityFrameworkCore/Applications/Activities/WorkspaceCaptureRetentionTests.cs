@@ -190,6 +190,15 @@ public class WorkspaceCaptureRetentionTests : TrackerEntityFrameworkCoreTestBase
         return screenshot;
     }
 
+    private async Task OptInWorkspaceRetentionAsync(Guid workspaceId, int retentionDays = 30)
+    {
+        var settingsManager = GetRequiredService<Dosi.Tracker.Settings.WorkspaceSettingsManager>();
+        await WithUnitOfWorkAsync(async () =>
+        {
+            await settingsManager.SetCaptureRetentionPolicyAsync(workspaceId, isEnabled: true, retentionDays);
+        });
+    }
+
     [Fact]
     public async Task Expired_Captures_Are_Deleted_From_Database_And_Blob_Container()
     {
@@ -621,6 +630,9 @@ public class WorkspaceCaptureRetentionTests : TrackerEntityFrameworkCoreTestBase
         var (wsA, _, actA) = await SeedWorkspaceAndActivityAsync("RET-WORKER-ACTIVE-A");
         var (wsB, _, actB) = await SeedWorkspaceAndActivityAsync("RET-WORKER-ARCHIVED-B");
 
+        await OptInWorkspaceRetentionAsync(wsA, 30);
+        await OptInWorkspaceRetentionAsync(wsB, 30);
+
         await WithUnitOfWorkAsync(async () =>
         {
             using (DataFilter.Disable<IWorkspaceScoped>())
@@ -885,6 +897,8 @@ public class WorkspaceCaptureRetentionTests : TrackerEntityFrameworkCoreTestBase
         var actValid2 = await SeedActivityInWorkspaceAsync(wsA, projA, startedAt: baseTime.AddMinutes(20));
         var valid2 = await SeedScreenshotAsync(wsA, actValid2, Screenshot.ScreenKind, baseTime.AddMinutes(21));
 
+        await OptInWorkspaceRetentionAsync(wsA, 30);
+
         var enabledOptions = Options.Create(new CaptureRetentionOptions
         {
             IsEnabled = true,
@@ -950,6 +964,8 @@ public class WorkspaceCaptureRetentionTests : TrackerEntityFrameworkCoreTestBase
             DefaultRetentionDays = 30,
             BatchSize = 2
         });
+
+        await OptInWorkspaceRetentionAsync(wsA, 30);
 
         var timer = GetRequiredService<AbpAsyncTimer>();
         var scopeFactory = GetRequiredService<IServiceScopeFactory>();
@@ -1026,6 +1042,8 @@ public class WorkspaceCaptureRetentionTests : TrackerEntityFrameworkCoreTestBase
             BatchSize = 2,
             MaxPagesPerWorkspace = 2
         });
+
+        await OptInWorkspaceRetentionAsync(wsA, 30);
 
         var timer = GetRequiredService<AbpAsyncTimer>();
         var scopeFactory = GetRequiredService<IServiceScopeFactory>();
@@ -1113,6 +1131,8 @@ public class WorkspaceCaptureRetentionTests : TrackerEntityFrameworkCoreTestBase
             BatchSize = 1,
             MaxPagesPerWorkspace = 5
         });
+
+        await OptInWorkspaceRetentionAsync(wsA, 30);
 
         var timer = GetRequiredService<AbpAsyncTimer>();
         var scopeFactory = GetRequiredService<IServiceScopeFactory>();

@@ -44,6 +44,12 @@ public interface IWorkspaceAppService : IApplicationService
     /// <summary><c>POST /api/app/workspaces/{id}/restore</c>: Active owner of target workspace only. Idempotent.</summary>
     Task<WorkspaceDto> RestoreAsync(Guid id);
 
+    /// <summary><c>GET /api/app/workspaces/{id}/capture-retention</c>: Active member of target workspace only.</summary>
+    Task<WorkspaceCaptureRetentionDto> GetCaptureRetentionAsync(Guid id);
+
+    /// <summary><c>PUT /api/app/workspaces/{id}/capture-retention</c>: Active owner of target workspace only.</summary>
+    Task<WorkspaceCaptureRetentionDto> UpdateCaptureRetentionAsync(Guid id, WorkspaceCaptureRetentionDto input);
+
     /// <summary><c>GET /api/app/invitations/{token}</c> (anonymous).</summary>
     Task<InvitationInfoDto> GetInvitationAsync(string token);
 

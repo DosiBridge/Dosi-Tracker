@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
 using System.Linq;
 using System.Threading.Tasks;
+using Dosi.Tracker.Activities.Retention;
 using Dosi.Tracker.Identity;
 using Dosi.Tracker.Projects;
 using Dosi.Tracker.Settings;
@@ -271,6 +272,60 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
             IsArchived = workspace.IsArchived,
             ArchivedTime = workspace.ArchivedTime,
             ArchivedBy = workspace.ArchivedBy
+        };
+    }
+
+    [WorkspaceNotRequired]
+    [RemoteService(IsEnabled = false)]
+    public async Task<WorkspaceCaptureRetentionDto> GetCaptureRetentionAsync(Guid id)
+    {
+        var userId = CurrentUser.GetId();
+        var member = await _memberships.FindActiveAsync(id, userId);
+        if (member == null)
+        {
+            throw new AbpAuthorizationException("Only an active member of the workspace can view its capture retention policy.");
+        }
+
+        var (isEnabled, days) = await _workspaceSettings.GetCaptureRetentionPolicyAsync(id);
+        return new WorkspaceCaptureRetentionDto
+        {
+            IsEnabled = isEnabled,
+            RetentionDays = days
+        };
+    }
+
+    [WorkspaceNotRequired]
+    [RemoteService(IsEnabled = false)]
+    public async Task<WorkspaceCaptureRetentionDto> UpdateCaptureRetentionAsync(Guid id, WorkspaceCaptureRetentionDto input)
+    {
+        Check.NotNull(input, nameof(input));
+
+        if (input.RetentionDays < WorkspaceCaptureRetentionDto.MinRetentionDays ||
+            input.RetentionDays > WorkspaceCaptureRetentionDto.MaxRetentionDays)
+        {
+            throw new AbpValidationException(new List<ValidationResult>
+            {
+                new($"Retention days must be between {WorkspaceCaptureRetentionDto.MinRetentionDays} and {WorkspaceCaptureRetentionDto.MaxRetentionDays}.",
+                    new[] { nameof(WorkspaceCaptureRetentionDto.RetentionDays) })
+            });
+        }
+
+        var userId = CurrentUser.GetId();
+        var member = await _memberships.FindActiveAsync(id, userId);
+        if (member == null || !member.IsOwner)
+        {
+            throw new AbpAuthorizationException("Only an active owner of the workspace can change its capture retention policy.");
+        }
+
+        await _workspaceSettings.SetCaptureRetentionPolicyAsync(id, input.IsEnabled, input.RetentionDays);
+
+        // Invalidate/reset continuation cursor when retention policy changes
+        CaptureRetentionWorker.ResetCursor(id);
+
+        return new WorkspaceCaptureRetentionDto
+        {
+            IsEnabled = input.IsEnabled,
+            RetentionDays = input.RetentionDays
         };
     }
 

@@ -15,6 +15,7 @@ using Volo.Abp.Threading;
 using Volo.Abp.Timing;
 using Volo.Abp.Uow;
 using Dosi.Tracker.Workspaces;
+using Dosi.Tracker.Settings;
 
 namespace Dosi.Tracker.Activities.Retention;
 
@@ -33,7 +34,8 @@ public class CaptureRetentionWorker : AsyncPeriodicBackgroundWorkerBase
 
     private readonly IOptions<CaptureRetentionOptions> _options;
     private readonly ILogger<CaptureRetentionWorker> _logger;
-    private readonly ConcurrentDictionary<Guid, CaptureRetentionCursor> _workspaceCursors = new();
+    private static readonly ConcurrentDictionary<Guid, CaptureRetentionCursor> _sharedCursors = new();
+    private readonly ConcurrentDictionary<Guid, CaptureRetentionCursor> _workspaceCursors = _sharedCursors;
 
     /// <summary>
     /// Gets the current continuation cursor for the specified workspace, if any.
@@ -46,6 +48,12 @@ public class CaptureRetentionWorker : AsyncPeriodicBackgroundWorkerBase
     /// </summary>
     public void ResetWorkspaceCursor(Guid workspaceId) =>
         _workspaceCursors.TryRemove(workspaceId, out _);
+
+    /// <summary>
+    /// Static helper to reset the continuation cursor for the specified workspace when policy changes.
+    /// </summary>
+    public static void ResetCursor(Guid workspaceId) =>
+        _sharedCursors.TryRemove(workspaceId, out _);
 
     public CaptureRetentionWorker(
         AbpAsyncTimer timer,
@@ -112,8 +120,8 @@ public class CaptureRetentionWorker : AsyncPeriodicBackgroundWorkerBase
         }
 
         var clock = serviceProvider.GetRequiredService<IClock>();
+        var workspaceSettings = serviceProvider.GetRequiredService<WorkspaceSettingsManager>();
         var sweepResult = new CaptureRetentionSweepResult();
-        var retentionPeriod = TimeSpan.FromDays(Math.Max(1, _options.Value.DefaultRetentionDays));
         var batchSize = Math.Clamp(_options.Value.BatchSize, 1, CaptureRetentionPolicy.MaxBatchSize);
         var maxPages = Math.Max(1, _options.Value.MaxPagesPerWorkspace);
 
@@ -121,6 +129,29 @@ public class CaptureRetentionWorker : AsyncPeriodicBackgroundWorkerBase
         {
             try
             {
+                // REQ-DAT-01: Workspace-specific opt-in and retention policy.
+                // Explicit opt-in defaults to FALSE. Unset or malformed policy fails closed (skipped).
+                (bool isEnabled, int retentionDays) wsPolicy;
+                using (var uow = uowManager.Begin(requiresNew: true))
+                {
+                    wsPolicy = await workspaceSettings.GetCaptureRetentionPolicyAsync(workspaceId);
+                    await uow.CompleteAsync();
+                }
+
+                if (!wsPolicy.isEnabled)
+                {
+                    continue; // Skip opted-out or unset workspaces!
+                }
+
+                if (wsPolicy.retentionDays < 1 || wsPolicy.retentionDays > 730)
+                {
+                    _logger.LogWarning("Workspace {WorkspaceId} has invalid retention days {Days}; failing closed.",
+                        workspaceId, wsPolicy.retentionDays);
+                    continue; // Malformed policy fails closed!
+                }
+
+                var retentionPeriod = TimeSpan.FromDays(wsPolicy.retentionDays);
+
                 // Freeze deterministic cutoff timestamp for this workspace sweep so pagination does not drift across pages
                 var cutoff = clock.Now - retentionPeriod;
                 _workspaceCursors.TryGetValue(workspaceId, out var cursor);

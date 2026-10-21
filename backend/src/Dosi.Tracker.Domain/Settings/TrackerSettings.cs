@@ -1,4 +1,4 @@
-﻿namespace Dosi.Tracker.Settings;
+namespace Dosi.Tracker.Settings;
 
 public static class TrackerSettings
 {
@@ -26,6 +26,18 @@ public static class TrackerSettings
             public const string AllowRunningPrograms = NewProjectPrefix + ".AllowRunningPrograms";
             public const string BlurScreenshots = NewProjectPrefix + ".BlurScreenshots";
             public const string IdleThresholdMinutes = NewProjectPrefix + ".IdleThresholdMinutes";
+        }
+
+        /// <summary>Workspace capture retention policy (REQ-DAT-01).</summary>
+        public static class CaptureRetention
+        {
+            private const string RetentionPrefix = WorkspacePrefix + ".CaptureRetention";
+
+            /// <summary>Whether capture retention is explicitly opted-in for the workspace (defaults to false).</summary>
+            public const string IsEnabled = RetentionPrefix + ".IsEnabled";
+
+            /// <summary>Retention duration in days for the workspace (positive integer, 1 to 730).</summary>
+            public const string RetentionDays = RetentionPrefix + ".RetentionDays";
         }
     }
 

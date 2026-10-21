@@ -575,10 +575,11 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
 |---|---|:---:|:---:|:---:|:---:|---|
 | **Workspace Archival Lifecycle Regressions** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~WorkspaceArchivalLifecycleTests"` | 9 | 0 | 13.0s | **0** | **[Worker-Reported (Hosted MVC TestServer & SQLite WAL)]** |
 | **Workspace Archival Migration & Upgrade Regressions** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~WorkspaceArchivalMigrationTests"` | 10 | 0 | 7.0s | **0** | **[Worker-Reported (Direct Snapshot/TargetModel, Npgsql DDL, Operation-Level & Tracked Migrator Upgrade)]** |
-| **Workspace Capture Retention Regressions (REQ-DAT-01)** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~WorkspaceCaptureRetentionTests"` | 16 | 0 | 9.0s | **0** | **[Worker-Reported (Isolated SQLite & Scripted In-Memory Blob Provider)]** |
+| **Workspace Capture Retention Policy HTTP Regressions (REQ-DAT-01)** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~WorkspaceCaptureRetentionPolicyHttpTests"` | 12 | 0 | 14.0s | **0** | **[Worker-Reported (Hosted MVC TestServer, Aggregate Auth & Persisted Settings)]** |
+| **Workspace Capture Retention Worker & Domain Regressions (REQ-DAT-01)** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~WorkspaceCaptureRetentionTests"` | 20 | 0 | 11.0s | **0** | **[Worker-Reported (Isolated SQLite & Scripted In-Memory Blob Provider)]** |
 | **Concurrent Last-Owner Regressions** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~ConcurrentOwnerProtectionTests"` | 9 | 0 | 9.23s | **0** | **[Worker-Reported (Concurrent SQLite WAL)]** |
 | **Hosted ASP.NET Core MVC TestServer** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~EfCoreWorkspaceHttpAuthorizationTests"` | 9 | 0 | 15.6s | **0** | **[Worker-Reported (Hosted MVC TestServer & Shared SQLite)]** |
-| **Host Route & Resolution Regressions** | `dotnet test test/Dosi.Tracker.HttpApi.Host.Tests/Dosi.Tracker.HttpApi.Host.Tests.csproj` | 125 | 0 | 1.15s | **0** | **[Worker-Reported (Host Test Suite)]** |
+| **Host Route & Resolution Regressions** | `dotnet test test/Dosi.Tracker.HttpApi.Host.Tests/Dosi.Tracker.HttpApi.Host.Tests.csproj` | 127 | 0 | 1.15s | **0** | **[Worker-Reported (Host Test Suite)]** |
 | **Historical PM Blocked Scripts** | `qa_workspace_phase.ps1` | null | null | null | null | **[Explicitly Not Run / No Repackaging]** |
 
 #### Test Cases Covered in `WorkspaceArchivalLifecycleTests` (9 total):
@@ -698,6 +699,43 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
    - **Activity Retention Gap**: 1-year activity summary pruning (e.g. deleting old `Activity` records) is deferred; only captures are pruned in this slice.
    - **Owner Settings UI Gap**: Per-workspace retention period configuration UI for workspace owners in Next.js frontend is not yet implemented.
    - **Live Storage / DB Approval Gap**: Production execution against live PostgreSQL databases and real AWS S3 / Cloudflare R2 object storage remains pending independent PM operational approval.
+
+8. **Owner-Managed Workspace Capture Retention Policy Lifecycle & Dedicated Contracts (REQ-DAT-01)**:
+   - **Source Evidence & Dedicated Contracts**: Implemented dedicated capture retention routes `GET /api/app/workspaces/{id}/capture-retention` and `PUT /api/app/workspaces/{id}/capture-retention` in `WorkspacesController.cs`, `WorkspaceAppService.cs`, and `WorkspaceCaptureRetentionDto.cs`. Dedicated route prevents general workspace settings clients from accidentally overriding or resetting destructive capture retention policies.
+   - **Safe Default-Off Policy**: Explicit workspace opt-in defaults to `false` (`IsEnabled = false`). Positive bounded retention days strictly validated in `[1, 730]` (default 30 days; ~2 years maximum). Unset or malformed policy fails closed (`(IsEnabled: false, RetentionDays: 30)`).
+   - **Authorization Matrix & Cross-Workspace Isolation**:
+     * Authenticated active members can read policy (`GetCaptureRetentionAsync`) with 200 OK.
+     * Only active owners (`member.IsOwner == true`) can mutate policy (`UpdateCaptureRetentionAsync`).
+     * Unauthenticated callers rejected with 401 Unauthorized.
+     * Foreign callers (Workspace A member attempting GET or PUT on Workspace B) denied with 403 Forbidden.
+     * Non-owner active members (Member, Manager) denied PUT with 403 Forbidden; database state remains unchanged.
+     * Dual-members (Owner of A, Member of B) can read both and update A, but are rejected with 403 Forbidden when attempting to mutate B; Workspace B sentinels remain untouched.
+     * Inactive or removed members denied with 403 Forbidden.
+     * Invalid inputs (0, negative, > 730) rejected with 400 BadRequest; zero policy changes persist.
+   - **Continuation Cursor Invalidation**: Updating retention policy resets the workspace continuation cursor via `CaptureRetentionWorker.ResetCursor(id)`, ensuring pagination cutoffs do not skip eligible items under the new policy.
+   - **Periodic Background Worker Sweep Enforcement**:
+     * Global master options remain disabled by default (`IsEnabled = false`, `Timer.RunOnStart = false`).
+     * In an isolated fixture with master enabled, `CaptureRetentionWorker.SweepAsync` queries each active workspace's policy:
+       - Master-disabled worker makes 0 cleanup calls even if workspaces are opted in.
+       - Master-enabled worker skips unset or opted-out workspaces (0 deletions; foreign captures untouched).
+       - Explicit opted-in workspace's own validated duration controls candidate selection with boundary sentinels (e.g. 60-day policy purges 70-day captures, preserves 45-day boundary captures, preserves 10-day fresh captures).
+       - Disabling policy stops later sweeps immediately.
+       - Activity and time summary records remain 100% untouched.
+   - **Persistence Architecture**: Uses existing ABP setting management (provider `"W"`, key `workspaceId.ToString()`), persisting settings in `AppSettings` without requiring any entity schema modifications, new tables, or EF Core migrations.
+   - **Honest Boundary Documentation**: Directly-invoked domain service (`ICaptureRetentionService.CleanExpiredCapturesAsync(policy)`) remains distinct from automated periodic worker sweep (`CaptureRetentionWorker.SweepAsync`). Direct service allows explicit programmatic execution with custom policies, while background worker strictly enforces workspace-level opt-in.
+   - **Isolated Hosted HTTP Regression Suite (`WorkspaceCaptureRetentionPolicyHttpTests.cs`, 12 tests passed, exit 0)**:
+     1. `Real_Hosted_Route_Get_Returns_Safe_DefaultOff_Policy_For_Active_Members` (200 OK, default-off).
+     2. `Unauthenticated_Requests_Are_Rejected_With_401` (401 on GET and PUT).
+     3. `Cross_Workspace_Isolation_UserA_Cannot_Read_Or_Write_WorkspaceB` (403 on GET and PUT).
+     4. `Non_Owner_In_WorkspaceA_Cannot_Change_Policy` (403 for member/manager; policy unchanged).
+     5. `Dual_Member_OwnerA_MemberB_Can_Read_Both_And_Mutate_A_But_Cannot_Mutate_B` (mutates A, rejected on B).
+     6. `OwnerA_Can_Update_Policy_And_Subsequent_Read_Persists_While_WorkspaceB_Remains_Unchanged` (persists, B untouched).
+     7. `Inactive_Or_Removed_Member_Is_Rejected_With_403` (403 for removed member).
+     8. `Invalid_Inputs_Cause_Zero_Policy_Changes` (400 for 0, negative, > 730 days).
+     9. `Worker_MasterDisabled_Makes_Zero_Cleanup_Calls_Even_When_Workspace_OptedIn` (0 calls, skipped by config).
+     10. `Worker_MasterEnabled_Skips_Unset_Or_OptedOut_WorkspaceB_And_Cleans_OptedIn_WorkspaceA` (A cleaned, B untouched).
+     11. `Worker_OptedIn_Workspace_Own_Duration_Controls_Selection_With_Boundary_Sentinels` (A's duration controls, boundary sentinel preserved, summaries preserved).
+     12. `Worker_Disabling_Policy_Stops_Later_Sweeps_And_Preserves_Foreign_Captures_And_Summaries` (disabling stops sweeps, summaries preserved).
 
 ---
 
@@ -941,7 +979,7 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
 1. **Privacy Acceptance Pending**:
    - The privacy source audit (commit `14bbe66`) remains **Pending PM Independent Review**. This status is preserved and not bypassed.
 2. **Workspace Lifecycle, Authorization, Retention, Export, Presence, Device & Screenshot Delivery Status**:
-   - Non-storable cache policy for private capture delivery (`REQ-ISO-05`), private-capture-delivery acceptance harness (`REQ-ISO-05`), workspace-scoped self-service device revocation (`REQ-DEV-01`), live team presence active membership scoping (`REQ-TRK-04`), authenticated workspace-scoped activity CSV export (`REQ-DAT-02`), workspace-isolated capture retention lifecycle safe first slice (`REQ-DAT-01`), reversible owner-controlled workspace archival (`REQ-WS-08`), concurrent last-owner protection (`REQ-WS-06`), recipient decline lifecycle (`REQ-WS-07`), and hosted ASP.NET Core `TestServer` MVC aggregate authorization harness (`REQ-ISO-05`) are implemented and verified via isolated regressions (110 SQLite integration tests total: 11 screenshot content delivery + 9 device revocation + 7 device migration + 6 team presence + 10 activity export + 20 capture retention + 9 archival lifecycle + 10 archival migration/upgrade + 9 concurrent owner protection + 9 hosted MVC auth + 10 decline).
+   - Owner-managed workspace capture retention policy lifecycle (`REQ-DAT-01`), non-storable cache policy for private capture delivery (`REQ-ISO-05`), private-capture-delivery acceptance harness (`REQ-ISO-05`), workspace-scoped self-service device revocation (`REQ-DEV-01`), live team presence active membership scoping (`REQ-TRK-04`), authenticated workspace-scoped activity CSV export (`REQ-DAT-02`), workspace-isolated capture retention lifecycle safe first slice (`REQ-DAT-01`), reversible owner-controlled workspace archival (`REQ-WS-08`), concurrent last-owner protection (`REQ-WS-06`), recipient decline lifecycle (`REQ-WS-07`), and hosted ASP.NET Core `TestServer` MVC aggregate authorization harness (`REQ-ISO-05`) are implemented and verified via isolated regressions (122 SQLite integration tests total: 12 capture retention policy HTTP + 11 screenshot content delivery + 9 device revocation + 7 device migration + 6 team presence + 10 activity export + 20 capture retention + 9 archival lifecycle + 10 archival migration/upgrade + 9 concurrent owner protection + 9 hosted MVC auth + 10 decline).
    - Real browser cookie/session testing (`__Host-Dosi-Workspace`), Next.js server actions, OpenIddict token issuer, provider-backed multi-connection transactional commit proof (PostgreSQL/SQL Server), multi-node distributed lock infrastructure (Redis), and PM independent execution remain pending. All reported outcomes are worker-executed, not independent PM QA.
 3. **Execution Limits & Evidence Boundaries**:
    - TestServer regressions prove conventional MVC routing, aggregate permission checks, fail-closed workspace scoping, binary capture streaming, non-storable capture delivery caching, CSV formula neutralization, Take(limit + 1) hard bounded fetch, active member presence query scoping, device revocation gating before blob side-effects, and server limits on in-memory SQLite, but do NOT replace execution on a real PostgreSQL cluster; no live user/production database was modified.
@@ -951,5 +989,5 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
 5. **Overall Product Incomplete**:
    - Full product remains incomplete across backend metric nullability schema migrations (`Activity.cs` truthful nulls vs 0), desktop offline ingestion queue hardening, platform-native interactive client runtimes, code signing, and hosted operational deployment.
 6. **Awaiting PM Guidance**:
-   - Bounded non-storable cache policy security correction for private capture delivery complete. Stop and hand off for PM review with exact diff and test evidence.
+   - Owner-managed workspace capture retention policy lifecycle (`REQ-DAT-01`) complete. Stop and hand off for PM review with exact diff and test evidence.
 

@@ -87,6 +87,67 @@ public class WorkspaceSettingsManager : TrackerDomainService
         return await GetUserTimeZoneAsync() ?? await GetDefaultTimeZoneAsync();
     }
 
+    /// <summary>
+    /// Gets the capture retention policy for the specified workspace (REQ-DAT-01).
+    /// Safe default-off: unset or malformed policy fails closed (IsEnabled = false, RetentionDays = 30).
+    /// </summary>
+    public virtual async Task<(bool IsEnabled, int RetentionDays)> GetCaptureRetentionPolicyAsync(Guid workspaceId)
+    {
+        var isEnabledStr = await _settingManager.GetOrNullAsync(
+            TrackerSettings.Workspace.CaptureRetention.IsEnabled,
+            WorkspaceSettingValueProvider.ProviderName,
+            workspaceId.ToString(),
+            fallback: false);
+
+        var daysStr = await _settingManager.GetOrNullAsync(
+            TrackerSettings.Workspace.CaptureRetention.RetentionDays,
+            WorkspaceSettingValueProvider.ProviderName,
+            workspaceId.ToString(),
+            fallback: false);
+
+        // Safe default-off: unset policy fails closed with IsEnabled = false
+        if (isEnabledStr == null)
+        {
+            return (false, 30);
+        }
+
+        // Malformed boolean fails closed
+        if (!bool.TryParse(isEnabledStr, out var isEnabled))
+        {
+            return (false, 30);
+        }
+
+        // Positive bounded days validation: if unset when enabled or malformed/out-of-bounds, fail closed
+        var days = SettingValueFormat.ReadInt(daysStr, fallback: 30);
+        if (days < 1 || days > 730)
+        {
+            return (false, 30);
+        }
+
+        return (isEnabled, days);
+    }
+
+    /// <summary>
+    /// Sets the capture retention policy for the specified workspace (REQ-DAT-01).
+    /// Validates bounded positive retention days (1 to 730).
+    /// </summary>
+    public virtual async Task SetCaptureRetentionPolicyAsync(Guid workspaceId, bool isEnabled, int retentionDays)
+    {
+        Check.Range(retentionDays, nameof(retentionDays), 1, 730);
+
+        await _settingManager.SetAsync(
+            TrackerSettings.Workspace.CaptureRetention.IsEnabled,
+            SettingValueFormat.Write(isEnabled),
+            WorkspaceSettingValueProvider.ProviderName,
+            workspaceId.ToString());
+
+        await _settingManager.SetAsync(
+            TrackerSettings.Workspace.CaptureRetention.RetentionDays,
+            SettingValueFormat.Write(retentionDays),
+            WorkspaceSettingValueProvider.ProviderName,
+            workspaceId.ToString());
+    }
+
     private Task SetAsync(string name, string? value)
     {
         return _settingManager.SetAsync(name, value, WorkspaceSettingValueProvider.ProviderName, CurrentWorkspace.GetId().ToString());
