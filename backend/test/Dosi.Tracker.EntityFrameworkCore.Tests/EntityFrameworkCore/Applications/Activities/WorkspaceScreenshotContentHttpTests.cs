@@ -127,6 +127,17 @@ public class WorkspaceScreenshotContentHttpTests : WorkspaceHttpTestBase<Tracker
         return request;
     }
 
+    /// <summary>
+    /// Fails closed if CacheControl header is absent, missing no-store, or missing private.
+    /// Used across all capture delivery responses (both allowed 200 binary streams and 401/400/403/404 rejection paths).
+    /// </summary>
+    private static void AssertNonStorablePrivateCachePolicy(HttpResponseMessage response)
+    {
+        response.Headers.CacheControl.ShouldNotBeNull();
+        response.Headers.CacheControl.NoStore.ShouldBeTrue();
+        response.Headers.CacheControl.Private.ShouldBeTrue();
+    }
+
     private sealed record FixtureData(
         Guid WsA,
         Guid WsB,
@@ -278,6 +289,51 @@ public class WorkspaceScreenshotContentHttpTests : WorkspaceHttpTestBase<Tracker
     }
 
     [Fact]
+    public void NonStorablePrivateCachePolicyOracle_RejectsMissingOrCacheableHeaders_AndAcceptsStrictNonStorable()
+    {
+        // 1. Oracle must reject response with no Cache-Control header (null)
+        using var respNoHeader = new HttpResponseMessage(HttpStatusCode.Unauthorized);
+        respNoHeader.Headers.CacheControl.ShouldBeNull();
+        Should.Throw<ShouldAssertException>(() => AssertNonStorablePrivateCachePolicy(respNoHeader));
+
+        // 2. Oracle must reject response with public/cacheable max-age policy
+        using var respPublic = new HttpResponseMessage(HttpStatusCode.OK);
+        respPublic.Headers.CacheControl = new CacheControlHeaderValue
+        {
+            Public = true,
+            MaxAge = TimeSpan.FromHours(1)
+        };
+        Should.Throw<ShouldAssertException>(() => AssertNonStorablePrivateCachePolicy(respPublic));
+
+        // 3. Oracle must reject response missing Private directive
+        using var respNoStoreOnly = new HttpResponseMessage(HttpStatusCode.OK);
+        respNoStoreOnly.Headers.CacheControl = new CacheControlHeaderValue
+        {
+            NoStore = true,
+            Private = false
+        };
+        Should.Throw<ShouldAssertException>(() => AssertNonStorablePrivateCachePolicy(respNoStoreOnly));
+
+        // 4. Oracle must reject response missing NoStore directive
+        using var respPrivateOnly = new HttpResponseMessage(HttpStatusCode.OK);
+        respPrivateOnly.Headers.CacheControl = new CacheControlHeaderValue
+        {
+            NoStore = false,
+            Private = true
+        };
+        Should.Throw<ShouldAssertException>(() => AssertNonStorablePrivateCachePolicy(respPrivateOnly));
+
+        // 5. Oracle must accept compliant no-store, private response
+        using var respCompliant = new HttpResponseMessage(HttpStatusCode.OK);
+        respCompliant.Headers.CacheControl = new CacheControlHeaderValue
+        {
+            NoStore = true,
+            Private = true
+        };
+        AssertNonStorablePrivateCachePolicy(respCompliant);
+    }
+
+    [Fact]
     public async Task GetScreenshotContent_Unauthenticated_Returns401Unauthorized()
     {
         var fix = await SeedFixturesAsync();
@@ -287,7 +343,7 @@ public class WorkspaceScreenshotContentHttpTests : WorkspaceHttpTestBase<Tracker
         var resp = await client.SendAsync(req);
 
         resp.StatusCode.ShouldBe(HttpStatusCode.Unauthorized);
-        resp.Headers.CacheControl?.NoStore.ShouldBeTrue();
+        AssertNonStorablePrivateCachePolicy(resp);
         _blobProvider.GetCount.ShouldBe(0);
         _blobProvider.GetAttempts.ShouldBeEmpty();
     }
@@ -302,7 +358,7 @@ public class WorkspaceScreenshotContentHttpTests : WorkspaceHttpTestBase<Tracker
         var reqMissing = CreateCustomRequest(HttpMethod.Get, $"/api/app/activity/screenshot/{fix.ScA_Dual}/content", DualUser, rawWorkspaceHeader: null);
         var respMissing = await client.SendAsync(reqMissing);
         respMissing.StatusCode.ShouldBe(HttpStatusCode.BadRequest);
-        respMissing.Headers.CacheControl?.NoStore.ShouldBeTrue();
+        AssertNonStorablePrivateCachePolicy(respMissing);
         var bodyMissing = await respMissing.Content.ReadAsStringAsync();
         bodyMissing.ShouldContain("Tracker:WorkspaceRequired");
 
@@ -310,7 +366,7 @@ public class WorkspaceScreenshotContentHttpTests : WorkspaceHttpTestBase<Tracker
         var reqEmpty = CreateCustomRequest(HttpMethod.Get, $"/api/app/activity/screenshot/{fix.ScA_Dual}/content", DualUser, rawWorkspaceHeader: "   ");
         var respEmpty = await client.SendAsync(reqEmpty);
         respEmpty.StatusCode.ShouldBe(HttpStatusCode.BadRequest);
-        respEmpty.Headers.CacheControl?.NoStore.ShouldBeTrue();
+        AssertNonStorablePrivateCachePolicy(respEmpty);
         var bodyEmpty = await respEmpty.Content.ReadAsStringAsync();
         bodyEmpty.ShouldContain("Tracker:WorkspaceRequired");
 
@@ -318,7 +374,7 @@ public class WorkspaceScreenshotContentHttpTests : WorkspaceHttpTestBase<Tracker
         var reqMalformed = CreateCustomRequest(HttpMethod.Get, $"/api/app/activity/screenshot/{fix.ScA_Dual}/content", DualUser, rawWorkspaceHeader: "not-a-guid");
         var respMalformed = await client.SendAsync(reqMalformed);
         respMalformed.StatusCode.ShouldBe(HttpStatusCode.BadRequest);
-        respMalformed.Headers.CacheControl?.NoStore.ShouldBeTrue();
+        AssertNonStorablePrivateCachePolicy(respMalformed);
         var bodyMalformed = await respMalformed.Content.ReadAsStringAsync();
         bodyMalformed.ShouldContain("Tracker:WorkspaceRequired");
 
@@ -326,7 +382,7 @@ public class WorkspaceScreenshotContentHttpTests : WorkspaceHttpTestBase<Tracker
         var reqZero = CreateCustomRequest(HttpMethod.Get, $"/api/app/activity/screenshot/{fix.ScA_Dual}/content", DualUser, rawWorkspaceHeader: Guid.Empty.ToString());
         var respZero = await client.SendAsync(reqZero);
         respZero.StatusCode.ShouldBe(HttpStatusCode.BadRequest);
-        respZero.Headers.CacheControl?.NoStore.ShouldBeTrue();
+        AssertNonStorablePrivateCachePolicy(respZero);
         var bodyZero = await respZero.Content.ReadAsStringAsync();
         bodyZero.ShouldContain("Tracker:WorkspaceRequired");
 
@@ -345,7 +401,7 @@ public class WorkspaceScreenshotContentHttpTests : WorkspaceHttpTestBase<Tracker
         var resp = await client.SendAsync(req);
 
         resp.StatusCode.ShouldBe(HttpStatusCode.Forbidden);
-        resp.Headers.CacheControl?.NoStore.ShouldBeTrue();
+        AssertNonStorablePrivateCachePolicy(resp);
         var body = await resp.Content.ReadAsStringAsync();
         body.ShouldContain("Tracker:NotWorkspaceMember");
 
@@ -365,7 +421,7 @@ public class WorkspaceScreenshotContentHttpTests : WorkspaceHttpTestBase<Tracker
 
         // EF Core global query filter prevents discovering B's screenshot under A -> non-disclosing 404
         resp.StatusCode.ShouldBe(HttpStatusCode.NotFound);
-        resp.Headers.CacheControl?.NoStore.ShouldBeTrue();
+        AssertNonStorablePrivateCachePolicy(resp);
 
         // Body must NOT leak binary image data, storage URL, or foreign activity identifiers
         var body = await resp.Content.ReadAsStringAsync();
@@ -389,7 +445,7 @@ public class WorkspaceScreenshotContentHttpTests : WorkspaceHttpTestBase<Tracker
         var respOther = await client.SendAsync(reqOther);
 
         respOther.StatusCode.ShouldBe(HttpStatusCode.NotFound);
-        respOther.Headers.CacheControl?.NoStore.ShouldBeTrue();
+        AssertNonStorablePrivateCachePolicy(respOther);
         var bodyOther = await respOther.Content.ReadAsStringAsync();
         bodyOther.ShouldNotContain(fix.StorageUrlB_Other);
         _blobProvider.GetAttempts.Contains(fix.StorageUrlB_Other).ShouldBeFalse();
@@ -400,9 +456,7 @@ public class WorkspaceScreenshotContentHttpTests : WorkspaceHttpTestBase<Tracker
         var respOwn = await client.SendAsync(reqOwn);
 
         respOwn.StatusCode.ShouldBe(HttpStatusCode.OK);
-        respOwn.Headers.CacheControl.ShouldNotBeNull();
-        respOwn.Headers.CacheControl.NoStore.ShouldBeTrue();
-        respOwn.Headers.CacheControl.Private.ShouldBeTrue();
+        AssertNonStorablePrivateCachePolicy(respOwn);
         respOwn.Content.Headers.ContentType?.MediaType.ShouldBe("image/png");
 
         var receivedBytes = await respOwn.Content.ReadAsByteArrayAsync();
@@ -429,17 +483,13 @@ public class WorkspaceScreenshotContentHttpTests : WorkspaceHttpTestBase<Tracker
         bytesOwnA.SequenceEqual(fix.BytesA_Dual).ShouldBeTrue();
         respOwnA.Content.Headers.ContentDisposition?.FileName.ShouldBe($"{fix.ActA_Dual}-screen.jpg");
         // Inspect response cache policy: private capture delivery must enforce explicit non-storable caching
-        respOwnA.Headers.CacheControl.ShouldNotBeNull();
-        respOwnA.Headers.CacheControl.NoStore.ShouldBeTrue();
-        respOwnA.Headers.CacheControl.Private.ShouldBeTrue();
+        AssertNonStorablePrivateCachePolicy(respOwnA);
 
         // B. Read colleague's capture in wsA (allowed because Owner has ViewAll in wsA)
         var reqOnlyA = CreateRequest(HttpMethod.Get, $"/api/app/activity/screenshot/{fix.ScA_Only}/content", DualUser, fix.WsA);
         var respOnlyA = await client.SendAsync(reqOnlyA);
         respOnlyA.StatusCode.ShouldBe(HttpStatusCode.OK);
-        respOnlyA.Headers.CacheControl.ShouldNotBeNull();
-        respOnlyA.Headers.CacheControl.NoStore.ShouldBeTrue();
-        respOnlyA.Headers.CacheControl.Private.ShouldBeTrue();
+        AssertNonStorablePrivateCachePolicy(respOnlyA);
         respOnlyA.Content.Headers.ContentType?.MediaType.ShouldBe("image/jpeg");
         var bytesOnlyA = await respOnlyA.Content.ReadAsByteArrayAsync();
         bytesOnlyA.SequenceEqual(fix.BytesA_Only).ShouldBeTrue();
@@ -450,9 +500,7 @@ public class WorkspaceScreenshotContentHttpTests : WorkspaceHttpTestBase<Tracker
         var reqOwnB = CreateRequest(HttpMethod.Get, $"/api/app/activity/screenshot/{fix.ScB_Dual}/content", DualUser, fix.WsB);
         var respOwnB = await client.SendAsync(reqOwnB);
         respOwnB.StatusCode.ShouldBe(HttpStatusCode.OK);
-        respOwnB.Headers.CacheControl.ShouldNotBeNull();
-        respOwnB.Headers.CacheControl.NoStore.ShouldBeTrue();
-        respOwnB.Headers.CacheControl.Private.ShouldBeTrue();
+        AssertNonStorablePrivateCachePolicy(respOwnB);
         respOwnB.Content.Headers.ContentType?.MediaType.ShouldBe("image/png");
         var bytesOwnB = await respOwnB.Content.ReadAsByteArrayAsync();
         bytesOwnB.SequenceEqual(fix.BytesB_Dual).ShouldBeTrue();
@@ -480,7 +528,7 @@ public class WorkspaceScreenshotContentHttpTests : WorkspaceHttpTestBase<Tracker
         var reqInactive = CreateRequest(HttpMethod.Get, $"/api/app/activity/screenshot/{fix.ScA_Only}/content", InactiveUserA, fix.WsA);
         var respInactive = await client.SendAsync(reqInactive);
         respInactive.StatusCode.ShouldBe(HttpStatusCode.Forbidden);
-        respInactive.Headers.CacheControl?.NoStore.ShouldBeTrue();
+        AssertNonStorablePrivateCachePolicy(respInactive);
         var bodyInactive = await respInactive.Content.ReadAsStringAsync();
         bodyInactive.ShouldContain("Tracker:NotWorkspaceMember");
 
@@ -498,7 +546,7 @@ public class WorkspaceScreenshotContentHttpTests : WorkspaceHttpTestBase<Tracker
         var reqRemoved = CreateRequest(HttpMethod.Get, $"/api/app/activity/screenshot/{fix.ScA_Only}/content", UserAOnly, fix.WsA);
         var respRemoved = await client.SendAsync(reqRemoved);
         respRemoved.StatusCode.ShouldBe(HttpStatusCode.Forbidden);
-        respRemoved.Headers.CacheControl?.NoStore.ShouldBeTrue();
+        AssertNonStorablePrivateCachePolicy(respRemoved);
         var bodyRemoved = await respRemoved.Content.ReadAsStringAsync();
         bodyRemoved.ShouldContain("Tracker:NotWorkspaceMember");
 
@@ -518,7 +566,7 @@ public class WorkspaceScreenshotContentHttpTests : WorkspaceHttpTestBase<Tracker
 
         // Must yield mapped 404 Not Found, not successful 200 OK with empty 0 bytes
         resp.StatusCode.ShouldBe(HttpStatusCode.NotFound);
-        resp.Headers.CacheControl?.NoStore.ShouldBeTrue();
+        AssertNonStorablePrivateCachePolicy(resp);
 
         // Provider instrumentation confirms GetOrNullAsync was attempted for that key and returned null
         _blobProvider.GetCount.ShouldBe(1);
@@ -536,7 +584,7 @@ public class WorkspaceScreenshotContentHttpTests : WorkspaceHttpTestBase<Tracker
         var resp = await client.SendAsync(req);
 
         resp.StatusCode.ShouldBe(HttpStatusCode.NotFound);
-        resp.Headers.CacheControl?.NoStore.ShouldBeTrue();
+        AssertNonStorablePrivateCachePolicy(resp);
         _blobProvider.GetCount.ShouldBe(0);
         _blobProvider.GetAttempts.ShouldBeEmpty();
     }
@@ -553,32 +601,39 @@ public class WorkspaceScreenshotContentHttpTests : WorkspaceHttpTestBase<Tracker
 
         // Execute a battery of denied reads across all boundary categories
         // 1. Unauthenticated
-        (await client.SendAsync(CreateRequest(HttpMethod.Get, $"/api/app/activity/screenshot/{fix.ScA_Dual}/content", null, fix.WsA)))
-            .StatusCode.ShouldBe(HttpStatusCode.Unauthorized);
+        var r1 = await client.SendAsync(CreateRequest(HttpMethod.Get, $"/api/app/activity/screenshot/{fix.ScA_Dual}/content", null, fix.WsA));
+        r1.StatusCode.ShouldBe(HttpStatusCode.Unauthorized);
+        AssertNonStorablePrivateCachePolicy(r1);
 
         // 2. Missing workspace header
-        (await client.SendAsync(CreateCustomRequest(HttpMethod.Get, $"/api/app/activity/screenshot/{fix.ScA_Dual}/content", DualUser, null)))
-            .StatusCode.ShouldBe(HttpStatusCode.BadRequest);
+        var r2 = await client.SendAsync(CreateCustomRequest(HttpMethod.Get, $"/api/app/activity/screenshot/{fix.ScA_Dual}/content", DualUser, null));
+        r2.StatusCode.ShouldBe(HttpStatusCode.BadRequest);
+        AssertNonStorablePrivateCachePolicy(r2);
 
         // 3. Spoofed foreign workspace header
-        (await client.SendAsync(CreateRequest(HttpMethod.Get, $"/api/app/activity/screenshot/{fix.ScB_Dual}/content", UserAOnly, fix.WsB)))
-            .StatusCode.ShouldBe(HttpStatusCode.Forbidden);
+        var r3 = await client.SendAsync(CreateRequest(HttpMethod.Get, $"/api/app/activity/screenshot/{fix.ScB_Dual}/content", UserAOnly, fix.WsB));
+        r3.StatusCode.ShouldBe(HttpStatusCode.Forbidden);
+        AssertNonStorablePrivateCachePolicy(r3);
 
         // 4. Cross-workspace ID under wsA
-        (await client.SendAsync(CreateRequest(HttpMethod.Get, $"/api/app/activity/screenshot/{fix.ScB_Dual}/content", DualUser, fix.WsA)))
-            .StatusCode.ShouldBe(HttpStatusCode.NotFound);
+        var r4 = await client.SendAsync(CreateRequest(HttpMethod.Get, $"/api/app/activity/screenshot/{fix.ScB_Dual}/content", DualUser, fix.WsA));
+        r4.StatusCode.ShouldBe(HttpStatusCode.NotFound);
+        AssertNonStorablePrivateCachePolicy(r4);
 
         // 5. Member trying colleague's capture in wsB
-        (await client.SendAsync(CreateRequest(HttpMethod.Get, $"/api/app/activity/screenshot/{fix.ScB_Other}/content", DualUser, fix.WsB)))
-            .StatusCode.ShouldBe(HttpStatusCode.NotFound);
+        var r5 = await client.SendAsync(CreateRequest(HttpMethod.Get, $"/api/app/activity/screenshot/{fix.ScB_Other}/content", DualUser, fix.WsB));
+        r5.StatusCode.ShouldBe(HttpStatusCode.NotFound);
+        AssertNonStorablePrivateCachePolicy(r5);
 
         // 6. Inactive member in wsA
-        (await client.SendAsync(CreateRequest(HttpMethod.Get, $"/api/app/activity/screenshot/{fix.ScA_Only}/content", InactiveUserA, fix.WsA)))
-            .StatusCode.ShouldBe(HttpStatusCode.Forbidden);
+        var r6 = await client.SendAsync(CreateRequest(HttpMethod.Get, $"/api/app/activity/screenshot/{fix.ScA_Only}/content", InactiveUserA, fix.WsA));
+        r6.StatusCode.ShouldBe(HttpStatusCode.Forbidden);
+        AssertNonStorablePrivateCachePolicy(r6);
 
         // 7. Unknown ID
-        (await client.SendAsync(CreateRequest(HttpMethod.Get, $"/api/app/activity/screenshot/{Guid.NewGuid()}/content", DualUser, fix.WsA)))
-            .StatusCode.ShouldBe(HttpStatusCode.NotFound);
+        var r7 = await client.SendAsync(CreateRequest(HttpMethod.Get, $"/api/app/activity/screenshot/{Guid.NewGuid()}/content", DualUser, fix.WsA));
+        r7.StatusCode.ShouldBe(HttpStatusCode.NotFound);
+        AssertNonStorablePrivateCachePolicy(r7);
 
         // Assert provider delete count is strictly 0 and save count is strictly 0
         _blobProvider.DeleteCount.ShouldBe(0);
