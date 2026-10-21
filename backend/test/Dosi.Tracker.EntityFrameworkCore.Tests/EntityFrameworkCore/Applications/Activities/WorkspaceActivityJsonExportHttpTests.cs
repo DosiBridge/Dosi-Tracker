@@ -12,6 +12,7 @@ using System.Threading.Tasks;
 using Dosi.Tracker.Activities;
 using Dosi.Tracker.EntityFrameworkCore;
 using Dosi.Tracker.Projects;
+using Dosi.Tracker.SaaS;
 using Dosi.Tracker.Security;
 using Dosi.Tracker.Workspaces;
 using Microsoft.EntityFrameworkCore;
@@ -42,6 +43,8 @@ public class WorkspaceActivityJsonExportHttpTests : WorkspaceHttpTestBase<Tracke
     private static readonly Guid UserB = Guid.Parse("4a701e62-0953-4dd3-910b-dc6cc93ccb03");
     private static readonly Guid DualUser = Guid.Parse("4a701e62-0953-4dd3-910b-dc6cc93ccb04");
     private static readonly Guid NonMemberUser = Guid.Parse("4a701e62-0953-4dd3-910b-dc6cc93ccb05");
+    private static readonly Guid WithdrawnUser = Guid.Parse("4a701e62-0953-4dd3-910b-dc6cc93ccb06");
+    private static readonly Guid InactiveMemberUser = Guid.Parse("4a701e62-0953-4dd3-910b-dc6cc93ccb07");
 
     private readonly IRepository<Workspace, Guid> _workspaceRepository;
     private readonly IRepository<WorkspaceMember, Guid> _memberRepository;
@@ -53,6 +56,8 @@ public class WorkspaceActivityJsonExportHttpTests : WorkspaceHttpTestBase<Tracke
     private readonly IActivityAppService _activityAppService;
     private readonly IAsyncQueryableExecuter _asyncExecuter;
     private readonly ICurrentPrincipalAccessor _currentPrincipalAccessor;
+    private readonly IWorkspaceAppService _workspaceAppService;
+    private readonly WorkspaceMembershipManager _membershipManager;
 
     public WorkspaceActivityJsonExportHttpTests()
     {
@@ -66,6 +71,23 @@ public class WorkspaceActivityJsonExportHttpTests : WorkspaceHttpTestBase<Tracke
         _activityAppService = GetRequiredService<IActivityAppService>();
         _asyncExecuter = GetRequiredService<IAsyncQueryableExecuter>();
         _currentPrincipalAccessor = GetRequiredService<ICurrentPrincipalAccessor>();
+        _workspaceAppService = GetRequiredService<IWorkspaceAppService>();
+        _membershipManager = GetRequiredService<WorkspaceMembershipManager>();
+    }
+
+    private IDisposable SetCurrentUser(Guid userId, string? email = null)
+    {
+        var claims = new List<Claim>
+        {
+            new(AbpClaimTypes.UserId, userId.ToString()),
+            new(ClaimTypes.NameIdentifier, userId.ToString())
+        };
+        if (email != null)
+        {
+            claims.Add(new Claim(AbpClaimTypes.Email, email));
+        }
+
+        return _currentPrincipalAccessor.Change(new ClaimsPrincipal(new ClaimsIdentity(claims, "TestAuth")));
     }
 
     protected override void AfterAddApplication(IServiceCollection services)
@@ -179,6 +201,14 @@ public class WorkspaceActivityJsonExportHttpTests : WorkspaceHttpTestBase<Tracke
             {
                 await _userManager.CreateAsync(new IdentityUser(NonMemberUser, "nonmember_json_exp", "nonmember_json_exp@acme.test"));
             }
+            if (await _userManager.FindByIdAsync(WithdrawnUser.ToString()) == null)
+            {
+                await _userManager.CreateAsync(new IdentityUser(WithdrawnUser, "withdrawn_json_exp", "withdrawn_json_exp@acme.test"));
+            }
+            if (await _userManager.FindByIdAsync(InactiveMemberUser.ToString()) == null)
+            {
+                await _userManager.CreateAsync(new IdentityUser(InactiveMemberUser, "inactive_member_json_exp", "inactive_member_json_exp@acme.test"));
+            }
 
             await _workspaceRepository.InsertAsync(new Workspace(wsA, "Workspace A"), autoSave: true);
             await _workspaceRepository.InsertAsync(new Workspace(wsB, "Workspace B"), autoSave: true);
@@ -187,10 +217,15 @@ public class WorkspaceActivityJsonExportHttpTests : WorkspaceHttpTestBase<Tracke
             await _memberRepository.InsertAsync(new WorkspaceMember(_guidGenerator.Create(), wsA, UserA, WorkspaceRoles.Owner, DateTime.UtcNow), autoSave: true);
             await _memberRepository.InsertAsync(new WorkspaceMember(_guidGenerator.Create(), wsA, ColleagueA, WorkspaceRoles.Member, DateTime.UtcNow), autoSave: true);
             await _memberRepository.InsertAsync(new WorkspaceMember(_guidGenerator.Create(), wsA, DualUser, WorkspaceRoles.Owner, DateTime.UtcNow), autoSave: true);
+            await _memberRepository.InsertAsync(new WorkspaceMember(_guidGenerator.Create(), wsA, WithdrawnUser, WorkspaceRoles.Member, DateTime.UtcNow), autoSave: true);
+            var mInactive = new WorkspaceMember(_guidGenerator.Create(), wsA, InactiveMemberUser, WorkspaceRoles.Member, DateTime.UtcNow);
+            mInactive.Remove();
+            await _memberRepository.InsertAsync(mInactive, autoSave: true);
 
             // Workspace B members
             await _memberRepository.InsertAsync(new WorkspaceMember(_guidGenerator.Create(), wsB, UserB, WorkspaceRoles.Owner, DateTime.UtcNow), autoSave: true);
             await _memberRepository.InsertAsync(new WorkspaceMember(_guidGenerator.Create(), wsB, DualUser, WorkspaceRoles.Member, DateTime.UtcNow), autoSave: true);
+            await _memberRepository.InsertAsync(new WorkspaceMember(_guidGenerator.Create(), wsB, WithdrawnUser, WorkspaceRoles.Member, DateTime.UtcNow), autoSave: true);
         });
 
         Guid projA = Guid.Empty;
@@ -438,18 +473,262 @@ public class WorkspaceActivityJsonExportHttpTests : WorkspaceHttpTestBase<Tracke
     }
 
     [Fact]
-    public async Task Inactive_Or_Removed_Workspace_Member_Is_Denied_Json_Export()
+    public async Task Never_Member_Caller_Is_Denied_Json_Export_With_403_NotWorkspaceMember()
     {
         var (wsA, _, _, _) = await SeedFixturesAsync();
         var client = CreateHttpClient();
 
-        // NonMemberUser was never added to wsA
+        // NonMemberUser was never added to wsA (zero membership row)
         var req = CreateRequest(HttpMethod.Get, "/api/app/activity/export/json", userId: NonMemberUser, workspaceId: wsA);
         var resp = await client.SendAsync(req);
 
         resp.StatusCode.ShouldBe(HttpStatusCode.Forbidden);
         var body = await resp.Content.ReadAsStringAsync();
         body.ShouldContain(TrackerDomainErrorCodes.NotWorkspaceMember);
+        body.ShouldNotContain("\"activities\":");
+    }
+
+    [Fact]
+    public async Task Withdrawn_Member_After_Leave_Lifecycle_Is_Denied_Json_Export_In_A_While_Preserving_B_Authorization_And_Historical_Sentinels()
+    {
+        var (wsA, wsB, projA, projB) = await SeedFixturesAsync();
+        var client = CreateHttpClient();
+
+        var time = new DateTime(2026, 7, 12, 10, 0, 0, DateTimeKind.Utc);
+        Guid actAId = Guid.Empty;
+        Guid actBId = Guid.Empty;
+
+        // Seed real nonempty activity sentinels in both Workspace A and Workspace B for WithdrawnUser
+        await WithUnitOfWorkAsync(async () =>
+        {
+            using (_currentWorkspace.Change(wsA, WorkspaceRoles.Owner))
+            {
+                var actA = new Activity(
+                    _guidGenerator.Create(), wsA, WithdrawnUser, projA, _guidGenerator.Create(), time, time.AddMinutes(15))
+                {
+                    Productivity = 80,
+                    Description = "Withdrawn User Activity in wsA"
+                };
+                await _activityRepository.InsertAsync(actA, autoSave: true);
+                actAId = actA.Id;
+            }
+
+            using (_currentWorkspace.Change(wsB, WorkspaceRoles.Owner))
+            {
+                var actB = new Activity(
+                    _guidGenerator.Create(), wsB, WithdrawnUser, projB, _guidGenerator.Create(), time.AddMinutes(20), time.AddMinutes(35))
+                {
+                    Productivity = 88,
+                    Description = "Withdrawn User Activity in wsB"
+                };
+                await _activityRepository.InsertAsync(actB, autoSave: true);
+                actBId = actB.Id;
+            }
+        });
+
+        // 1. First prove authorized JSON export for WithdrawnUser in A and B via actual production HTTP path
+        var reqInitialA = CreateRequest(HttpMethod.Get, "/api/app/activity/export/json", userId: WithdrawnUser, workspaceId: wsA);
+        var respInitialA = await client.SendAsync(reqInitialA);
+        respInitialA.StatusCode.ShouldBe(HttpStatusCode.OK);
+        var docInitialA = JsonSerializer.Deserialize<ActivityJsonExportDocumentDto>(
+            await respInitialA.Content.ReadAsStringAsync(), JsonExportHelper.JsonOptions);
+        docInitialA.ShouldNotBeNull();
+        docInitialA.TotalCount.ShouldBe(1);
+        docInitialA.Activities[0].Description.ShouldBe("Withdrawn User Activity in wsA");
+
+        var reqInitialB = CreateRequest(HttpMethod.Get, "/api/app/activity/export/json", userId: WithdrawnUser, workspaceId: wsB);
+        var respInitialB = await client.SendAsync(reqInitialB);
+        respInitialB.StatusCode.ShouldBe(HttpStatusCode.OK);
+        var docInitialB = JsonSerializer.Deserialize<ActivityJsonExportDocumentDto>(
+            await respInitialB.Content.ReadAsStringAsync(), JsonExportHelper.JsonOptions);
+        docInitialB.ShouldNotBeNull();
+        docInitialB.TotalCount.ShouldBe(1);
+        docInitialB.Activities[0].Description.ShouldBe("Withdrawn User Activity in wsB");
+
+        // 2. Withdraw A membership through production self-service leave / removal lifecycle
+        // Note: WithdrawnUser is a non-last-owner target (role is Member, UserA is Owner)
+        var reqLeave = CreateRequest(HttpMethod.Post, $"/api/app/workspaces/{wsA}/leave", userId: WithdrawnUser, workspaceId: null);
+        var respLeave = await client.SendAsync(reqLeave);
+        (respLeave.StatusCode == HttpStatusCode.OK || respLeave.StatusCode == HttpStatusCode.NoContent).ShouldBeTrue();
+
+        // Explicitly verify persisted membership becomes inactive/removed in A, while remaining active in B
+        await WithUnitOfWorkAsync(async () =>
+        {
+            var memberA = await _memberRepository.FirstOrDefaultAsync(m => m.WorkspaceId == wsA && m.UserId == WithdrawnUser);
+            memberA.ShouldNotBeNull();
+            memberA.IsActive.ShouldBeFalse();
+            memberA.Status.ShouldBe(WorkspaceMemberStatus.Removed);
+
+            var memberB = await _memberRepository.FirstOrDefaultAsync(m => m.WorkspaceId == wsB && m.UserId == WithdrawnUser);
+            memberB.ShouldNotBeNull();
+            memberB.IsActive.ShouldBeTrue();
+            memberB.Status.ShouldBe(WorkspaceMemberStatus.Active);
+        });
+
+        // 3. Make NEW request on existing client/identity/header for A: require JSON export denial with 403 NotWorkspaceMember, no summary rows
+        var reqAfterA = CreateRequest(HttpMethod.Get, "/api/app/activity/export/json", userId: WithdrawnUser, workspaceId: wsA);
+        var respAfterA = await client.SendAsync(reqAfterA);
+        respAfterA.StatusCode.ShouldBe(HttpStatusCode.Forbidden);
+        var bodyAfterA = await respAfterA.Content.ReadAsStringAsync();
+        bodyAfterA.ShouldContain(TrackerDomainErrorCodes.NotWorkspaceMember);
+        bodyAfterA.ShouldNotContain("\"activities\":");
+
+        // B export must remain authorized with correct role-limited data
+        var reqAfterB = CreateRequest(HttpMethod.Get, "/api/app/activity/export/json", userId: WithdrawnUser, workspaceId: wsB);
+        var respAfterB = await client.SendAsync(reqAfterB);
+        respAfterB.StatusCode.ShouldBe(HttpStatusCode.OK);
+        var docAfterB = JsonSerializer.Deserialize<ActivityJsonExportDocumentDto>(
+            await respAfterB.Content.ReadAsStringAsync(), JsonExportHelper.JsonOptions);
+        docAfterB.ShouldNotBeNull();
+        docAfterB.TotalCount.ShouldBe(1);
+        docAfterB.Activities[0].Description.ShouldBe("Withdrawn User Activity in wsB");
+
+        // 4. Verify historical A/B activity rows/project/membership sentinels remain intact in explicit target contexts
+        await WithUnitOfWorkAsync(async () =>
+        {
+            using (_currentWorkspace.Change(wsA))
+            {
+                var actA = await _activityRepository.FindAsync(actAId);
+                actA.ShouldNotBeNull();
+                actA.Description.ShouldBe("Withdrawn User Activity in wsA");
+
+                var pA = await _projectRepository.FindAsync(projA);
+                pA.ShouldNotBeNull();
+                pA.Title.ShouldBe("Project Alpha");
+            }
+
+            using (_currentWorkspace.Change(wsB))
+            {
+                var actB = await _activityRepository.FindAsync(actBId);
+                actB.ShouldNotBeNull();
+                actB.Description.ShouldBe("Withdrawn User Activity in wsB");
+
+                var pB = await _projectRepository.FindAsync(projB);
+                pB.ShouldNotBeNull();
+                pB.Title.ShouldBe("Project Beta");
+            }
+        });
+    }
+
+    [Fact]
+    public async Task Owner_Removal_Lifecycle_Denies_Subsequent_Json_Export_While_Preserving_Historical_Activity()
+    {
+        var (wsA, _, projA, _) = await SeedFixturesAsync();
+        var client = CreateHttpClient();
+
+        var time = new DateTime(2026, 7, 13, 11, 0, 0, DateTimeKind.Utc);
+        Guid colActId = Guid.Empty;
+
+        await WithUnitOfWorkAsync(async () =>
+        {
+            using (_currentWorkspace.Change(wsA, WorkspaceRoles.Owner))
+            {
+                var act = new Activity(
+                    _guidGenerator.Create(), wsA, ColleagueA, projA, _guidGenerator.Create(), time, time.AddMinutes(10))
+                {
+                    Description = "Colleague A Activity before removal"
+                };
+                await _activityRepository.InsertAsync(act, autoSave: true);
+                colActId = act.Id;
+            }
+        });
+
+        // 1. Initial positive control: ColleagueA can export own activity
+        var reqInitial = CreateRequest(HttpMethod.Get, "/api/app/activity/export/json", userId: ColleagueA, workspaceId: wsA);
+        var respInitial = await client.SendAsync(reqInitial);
+        respInitial.StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        // 2. Legitimate Owner UserA removes ColleagueA via production removal lifecycle
+        await WithUnitOfWorkAsync(async () =>
+        {
+            using (SetCurrentUser(UserA, "userA_json_exp@acme.test"))
+            using (_currentWorkspace.Change(wsA, WorkspaceRoles.Owner))
+            {
+                var member = await _membershipManager.FindActiveAsync(wsA, ColleagueA);
+                member.ShouldNotBeNull();
+                await _membershipManager.RemoveAsync(member);
+            }
+        });
+
+        // Verify persisted membership is now removed
+        await WithUnitOfWorkAsync(async () =>
+        {
+            var member = await _memberRepository.FirstOrDefaultAsync(m => m.WorkspaceId == wsA && m.UserId == ColleagueA);
+            member.ShouldNotBeNull();
+            member.IsActive.ShouldBeFalse();
+            member.Status.ShouldBe(WorkspaceMemberStatus.Removed);
+        });
+
+        // 3. New request by removed member is denied with 403 NotWorkspaceMember, no summary rows
+        var reqAfter = CreateRequest(HttpMethod.Get, "/api/app/activity/export/json", userId: ColleagueA, workspaceId: wsA);
+        var respAfter = await client.SendAsync(reqAfter);
+        respAfter.StatusCode.ShouldBe(HttpStatusCode.Forbidden);
+        var bodyAfter = await respAfter.Content.ReadAsStringAsync();
+        bodyAfter.ShouldContain(TrackerDomainErrorCodes.NotWorkspaceMember);
+        bodyAfter.ShouldNotContain("\"activities\":");
+
+        // 4. Verify historical activity row remains intact
+        await WithUnitOfWorkAsync(async () =>
+        {
+            using (_currentWorkspace.Change(wsA, WorkspaceRoles.Owner))
+            {
+                var act = await _activityRepository.FindAsync(colActId);
+                act.ShouldNotBeNull();
+                act.Description.ShouldBe("Colleague A Activity before removal");
+            }
+        });
+    }
+
+    [Fact]
+    public async Task Persisted_Removed_Membership_In_Workspace_Is_Denied_Json_Export_With_403_NotWorkspaceMember()
+    {
+        var (wsA, wsB, _, projB) = await SeedFixturesAsync();
+        var client = CreateHttpClient();
+
+        // InactiveMemberUser has a preexisting persisted row in wsA with Status == Removed
+        await WithUnitOfWorkAsync(async () =>
+        {
+            var memberA = await _memberRepository.FirstOrDefaultAsync(m => m.WorkspaceId == wsA && m.UserId == InactiveMemberUser);
+            memberA.ShouldNotBeNull();
+            memberA.IsActive.ShouldBeFalse();
+            memberA.Status.ShouldBe(WorkspaceMemberStatus.Removed);
+        });
+
+        // Seed foreign sentinel in wsB
+        Guid foreignActId = Guid.Empty;
+        await WithUnitOfWorkAsync(async () =>
+        {
+            using (_currentWorkspace.Change(wsB, WorkspaceRoles.Owner))
+            {
+                var actB = new Activity(
+                    _guidGenerator.Create(), wsB, UserB, projB, _guidGenerator.Create(),
+                    DateTime.UtcNow.AddMinutes(-20), DateTime.UtcNow)
+                {
+                    Description = "Sentinel B for Inactive Member Test"
+                };
+                await _activityRepository.InsertAsync(actB, autoSave: true);
+                foreignActId = actB.Id;
+            }
+        });
+
+        var req = CreateRequest(HttpMethod.Get, "/api/app/activity/export/json", userId: InactiveMemberUser, workspaceId: wsA);
+        var resp = await client.SendAsync(req);
+
+        resp.StatusCode.ShouldBe(HttpStatusCode.Forbidden);
+        var body = await resp.Content.ReadAsStringAsync();
+        body.ShouldContain(TrackerDomainErrorCodes.NotWorkspaceMember);
+        body.ShouldNotContain("\"activities\":");
+
+        // Verify foreign sentinel untouched
+        await WithUnitOfWorkAsync(async () =>
+        {
+            using (_currentWorkspace.Change(wsB, WorkspaceRoles.Owner))
+            {
+                var actB = await _activityRepository.FindAsync(foreignActId);
+                actB.ShouldNotBeNull();
+                actB.Description.ShouldBe("Sentinel B for Inactive Member Test");
+            }
+        });
     }
 
     [Fact]
