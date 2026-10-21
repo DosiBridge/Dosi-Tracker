@@ -516,46 +516,6 @@ public class WorkspaceRegistrationLifecycleHttpTests : WorkspaceHttpTestBase<Tra
     }
 
     [Fact]
-    public async Task Direct_Call_To_Register_With_Invite()
-    {
-        await EnsureInitialSeedUsersAsync();
-        var (_, _, businessPlan) = await EnsureDefaultPlansAsync();
-        var db = ServiceProvider.GetRequiredService<TrackerDbContext>();
-
-        var wsB = await ServiceProvider.CreateWorkspaceAsync("Echo Enterprise Direct");
-        var s1 = (await db.Set<Workspace>().AsNoTracking().FirstAsync(w => w.Id == wsB)).ConcurrencyStamp;
-
-        await ServiceProvider.AddWorkspaceMemberAsync(ForeignOwner, WorkspaceRoles.Owner, wsB);
-        var s2 = (await db.Set<Workspace>().AsNoTracking().FirstAsync(w => w.Id == wsB)).ConcurrencyStamp;
-
-        var (tokenA, _) = await SeedInvitationAsync(wsB, "invited.direct@signup-test.com", role: WorkspaceRoles.Member);
-        var s3 = (await db.Set<Workspace>().AsNoTracking().FirstAsync(w => w.Id == wsB)).ConcurrencyStamp;
-
-        var appService = GetRequiredService<IWorkspaceAppService>();
-        try
-        {
-            await appService.RegisterAsync(new RegisterWorkspaceDto
-            {
-                Email = "invited.direct@signup-test.com",
-                Password = "Password123!",
-                FirstName = "Invited",
-                Surname = "Direct",
-                InviteToken = tokenA
-            });
-        }
-        catch (AbpDbConcurrencyException ex)
-        {
-            if (ex.InnerException is DbUpdateConcurrencyException efEx)
-            {
-                var currentInDb = await db.Set<Workspace>().AsNoTracking().FirstOrDefaultAsync(w => w.Id == wsB);
-                var entry = efEx.Entries.First();
-                throw new Exception($"STAMPS: s1={s1}, s2={s2}, s3={s3}, InDb={currentInDb?.ConcurrencyStamp}, OrigEntry={entry.Property("ConcurrencyStamp").OriginalValue}", ex);
-            }
-            throw;
-        }
-    }
-
-    [Fact]
     public async Task Invitation_Signup_Joins_Invited_Workspace_With_Assigned_Role_And_Consumes_Invitation_Without_Extra_Workspace_Or_Subscription()
     {
         await EnsureInitialSeedUsersAsync();
@@ -593,8 +553,7 @@ public class WorkspaceRegistrationLifecycleHttpTests : WorkspaceHttpTestBase<Tra
             InviteToken = tokenA
         };
         var inviteSignupResp = await client.SendAsync(CreateRequest(HttpMethod.Post, "/api/app/workspace/register", userId: null, workspaceId: null, jsonBody: inviteSignupDto));
-        var inviteSignupBody = await inviteSignupResp.Content.ReadAsStringAsync();
-        inviteSignupResp.StatusCode.ShouldBe(HttpStatusCode.OK, customMessage: inviteSignupBody);
+        inviteSignupResp.StatusCode.ShouldBe(HttpStatusCode.OK);
 
         using var resultDoc = JsonDocument.Parse(await inviteSignupResp.Content.ReadAsStringAsync());
         ReadGuidProperty(resultDoc.RootElement, "workspaceId").ShouldBe(wsB);

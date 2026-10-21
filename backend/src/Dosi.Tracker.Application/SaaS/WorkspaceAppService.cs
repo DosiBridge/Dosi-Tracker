@@ -150,7 +150,7 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
         using (CurrentWorkspace.Change(invitation.WorkspaceId))
         {
             await using var seatLock = await _seatCounter.LockAsync();
-            using var uow = UnitOfWorkManager.Begin(requiresNew: true, isTransactional: true);
+            using var uow = UnitOfWorkManager.Begin(isTransactional: true);
 
             var user = await _accounts.CreateAsync(input.Email, input.Password, input.FirstName, input.Surname);
             var workspace = await AcceptAsync(invitation, user.Id);
