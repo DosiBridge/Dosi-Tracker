@@ -884,22 +884,57 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
 5. **Storage & Audit Preservation**: Historical activity blocks, screenshots, memberships, and presence rows are retained and never deleted upon device revocation.
 6. **Execution Environment**: All executions performed on project-local disposable in-memory SQLite fixtures; production PostgreSQL cluster execution, native OS runtimes, and PM independent acceptance remain pending. Initial compile/fixture failures during test harness setup are not production failing-before evidence. No production code churn or invented vulnerabilities.
 
+## 14. Private-Capture-Delivery Acceptance Harness (REQ-ISO-05)
+
+### A. Acceptance Gap & Architectural Background
+1. **Endpoint & Context**:
+   - `ScreenshotContentController` (`GET /api/app/activity/screenshot/{id}/content`) is a conventional authenticated binary file MVC controller returning `File(content.Bytes, content.ContentType, content.FileName)`.
+   - Authorization and scoping are enforced through `WorkspaceRequiredFilter`, `WorkspaceResolutionMiddleware`, and `ActivityAppService.GetScreenshotContentAsync` (which checks `_screenshotRepository.GetAsync`, `EnsureCanReadActivityAsync`, and `_blobContainer.GetAllBytesOrNullAsync`).
+2. **Acceptance Harness Gap**:
+   - Prior coverage was limited to application service unit tests (`CrossWorkspaceIsolationTests`) and host reflection. No concrete hosted ASP.NET Core `TestServer` HTTP pipeline tests existed for this binary capture endpoint.
+   - Production guards were verified to be architecturally sound and enforced; no production vulnerabilities or forced production churn was needed.
+
+### B. Concrete Implementation & Test Suite
+- Test Suite: `backend/test/Dosi.Tracker.EntityFrameworkCore.Tests/EntityFrameworkCore/Applications/Activities/WorkspaceScreenshotContentHttpTests.cs`
+- Fixture Architecture:
+  - Uses `WorkspaceHttpTestBase<TrackerHttpApiServerTestModule>`, in-memory SQLite (`conn`), and singleton `ScriptedBlobProvider` registered across both host and in-process `TestServer`.
+  - Instrumented `ScriptedBlobProvider` with read tracking: `GetCount`, `GetAttempts` queue, and `BeforeGet` hook (separate from `_saveCount` and `_deleteCount`).
+  - Seeded distinguishable synthetic captures and activities in Workspace A and B for a dual-workspace caller (`DualUser`: Owner in A, Member in B), an A-only member (`UserAOnly`), a B activity owner (`UserBOther`), and an inactive/removed member (`InactiveUserA`).
+  - Distinguishable synthetic binary payloads: JPEG magic bytes for A captures (`image/jpeg`, `.jpg`), PNG magic bytes for B captures (`image/png`, `.png`).
+- Executed Test Results: **10 passed, 0 failed, exit 0**:
+  1. `GetScreenshotContent_Unauthenticated_Returns401Unauthorized`: Unauthenticated request rejected with 401 Unauthorized; 0 blob provider reads.
+  2. `GetScreenshotContent_MissingOrInvalidWorkspaceHeader_Returns400BadRequest`: Missing header, whitespace header, malformed GUID, and empty GUID rejected with 400 Bad Request (`Tracker:WorkspaceRequired`); 0 blob provider reads.
+  3. `GetScreenshotContent_AOnlyCaller_SpoofingWorkspaceBHeader_Returns403Forbidden`: Workspace A-only caller attempting to use Workspace B header rejected with 403 Forbidden (`Tracker:NotWorkspaceMember`); 0 blob provider reads.
+  4. `GetScreenshotContent_CrossWorkspaceAccess_UnderWorkspaceA_Returns404NotFound`: Request for Workspace B screenshot under Workspace A header returns non-disclosing 404 Not Found; body does not leak foreign image bytes or storage URLs; 0 blob provider reads for foreign blob.
+  5. `GetScreenshotContent_RegularMemberInWorkspaceB_CannotReadOtherMembersCapture_WhileOwnRemainsAccessible`: Regular member in Workspace B (no `Activities.ViewAll`) receives 404 when requesting colleague's capture; control request for own capture succeeds with 200 OK, detected PNG content type, exact binary stream, and provider instrumentation records exactly 1 get attempt.
+  6. `GetScreenshotContent_LegitimateDualWorkspaceSwitching_RetrievesAuthorizedBytesAndContentType`: Dual member in Workspace A (Owner, has `ViewAll`) reads own and colleague's JPEG captures (200 OK, `image/jpeg`); switches context to Workspace B (Member) and reads own PNG capture (200 OK, `image/png`); binary streams are raw bytes (not base64 JSON); filenames match pattern; FileContentResult verified without custom response caching headers; provider logs all 3 requests in order.
+  7. `GetScreenshotContent_InactiveOrRemovedMembership_Returns403Forbidden`: Inactive member and removed member requests rejected with 403 Forbidden (`Tracker:NotWorkspaceMember`); 0 blob provider reads.
+  8. `GetScreenshotContent_MissingBlobInStorage_Returns404NotFound`: Existing DB screenshot with missing blob in storage returns mapped 404 Not Found (not successful 200 OK with empty image); provider confirms lookup was attempted.
+  9. `GetScreenshotContent_UnknownScreenshotId_Returns404NotFound_WithoutDisclosingContent`: Unknown GUID returns 404 Not Found without disclosing content or unhandled 500 error; 0 blob provider reads.
+  10. `Preserves_All_Blob_Bytes_And_SQL_Sentinels_Across_Denied_Reads`: Battery of denied reads across all boundary types preserves `_blobProvider.Blobs` contents byte-for-byte (`DeleteCount == 0`, `SaveCount == 0`), and explicit SQLite inspection verifies all rows in `AppWorkspaces`, `AppWorkspaceMembers`, `AppActivities`, and `AppScreenshots` across both workspaces remain untouched.
+
+### C. Explicit Deferred Limitations & Evidence Boundaries
+1. **Synthetic-Auth vs Real OpenIddict/Browser Cookies**: TestServer uses synthetic test authentication tokens with real production middleware and permission value providers; browser cookie sessions (`__Host-Dosi-Workspace`), Next.js server actions, and OpenIddict token flows remain deferred.
+2. **Concurrency & Execution Environment**: Sequential in-memory SQLite fixtures verify routing, authorization, and error mapping, but do NOT prove multi-threaded race conditions or PostgreSQL cluster execution.
+3. **No Production Code Churn**: Existing production routing, authorization, and storage guards were verified to be correct without requiring production code edits.
+4. **Historical Approvals**: All reported outcomes are worker-executed; independent PM QA and native desktop client acceptance remain pending.
+
 ---
 
-## 14. Current Status & Next Steps
+## 15. Current Status & Next Steps
 
 1. **Privacy Acceptance Pending**:
    - The privacy source audit (commit `14bbe66`) remains **Pending PM Independent Review**. This status is preserved and not bypassed.
-2. **Workspace Lifecycle, Authorization, Retention, Export, Presence & Device Status**:
-   - Workspace-scoped self-service device revocation (`REQ-DEV-01`), live team presence active membership scoping (`REQ-TRK-04`), authenticated workspace-scoped activity CSV export (`REQ-DAT-02`), workspace-isolated capture retention lifecycle safe first slice (`REQ-DAT-01`), reversible owner-controlled workspace archival (`REQ-WS-08`), concurrent last-owner protection (`REQ-WS-06`), recipient decline lifecycle (`REQ-WS-07`), and hosted ASP.NET Core `TestServer` MVC aggregate authorization harness (`REQ-ISO-05`) are implemented and verified via isolated regressions (99 SQLite integration tests total: 9 device revocation + 7 device migration + 6 team presence + 10 activity export + 20 capture retention + 9 archival lifecycle + 10 archival migration/upgrade + 9 concurrent owner protection + 9 hosted MVC auth + 10 decline).
+2. **Workspace Lifecycle, Authorization, Retention, Export, Presence, Device & Screenshot Delivery Status**:
+   - Private-capture-delivery acceptance harness (`REQ-ISO-05`), workspace-scoped self-service device revocation (`REQ-DEV-01`), live team presence active membership scoping (`REQ-TRK-04`), authenticated workspace-scoped activity CSV export (`REQ-DAT-02`), workspace-isolated capture retention lifecycle safe first slice (`REQ-DAT-01`), reversible owner-controlled workspace archival (`REQ-WS-08`), concurrent last-owner protection (`REQ-WS-06`), recipient decline lifecycle (`REQ-WS-07`), and hosted ASP.NET Core `TestServer` MVC aggregate authorization harness (`REQ-ISO-05`) are implemented and verified via isolated regressions (109 SQLite integration tests total: 10 screenshot content delivery + 9 device revocation + 7 device migration + 6 team presence + 10 activity export + 20 capture retention + 9 archival lifecycle + 10 archival migration/upgrade + 9 concurrent owner protection + 9 hosted MVC auth + 10 decline).
    - Real browser cookie/session testing (`__Host-Dosi-Workspace`), Next.js server actions, OpenIddict token issuer, provider-backed multi-connection transactional commit proof (PostgreSQL/SQL Server), multi-node distributed lock infrastructure (Redis), and PM independent execution remain pending. All reported outcomes are worker-executed, not independent PM QA.
 3. **Execution Limits & Evidence Boundaries**:
-   - TestServer regressions prove conventional MVC routing, aggregate permission checks, fail-closed workspace scoping, CSV formula neutralization, Take(limit + 1) hard bounded fetch, active member presence query scoping, device revocation gating before blob side-effects, and server limits on in-memory SQLite, but do NOT replace execution on a real PostgreSQL cluster; no live user/production database was modified.
+   - TestServer regressions prove conventional MVC routing, aggregate permission checks, fail-closed workspace scoping, binary capture streaming, CSV formula neutralization, Take(limit + 1) hard bounded fetch, active member presence query scoping, device revocation gating before blob side-effects, and server limits on in-memory SQLite, but do NOT replace execution on a real PostgreSQL cluster; no live user/production database was modified.
    - Retention defaults remain disabled (`IsEnabled = false`); no cleanup was executed against user DB or real object storage.
 4. **Remaining Backlog Gaps**:
    - Cryptographic client machine enrollment / attestation, token/session revocation, native desktop agent revocation prompt/unenrollment UI, WebSocket / SignalR push live presence notification, asynchronous export background worker, screenshot zip archive, signed download URLs, disaster recovery / automated backup procedures, frontend UI export actions, 1-year activity summary pruning, and permanent deletion remain deferred acceptance gaps.
 5. **Overall Product Incomplete**:
    - Full product remains incomplete across backend metric nullability schema migrations (`Activity.cs` truthful nulls vs 0), desktop offline ingestion queue hardening, platform-native interactive client runtimes, code signing, and hosted operational deployment.
 6. **Awaiting PM Guidance**:
-   - Bounded workspace-scoped self-service device revocation slice complete. Stop and hand off for PM review with exact diff and test evidence.
+   - Bounded private-capture-delivery HTTP isolation regression slice complete. Stop and hand off for PM review with exact diff and test evidence.
 

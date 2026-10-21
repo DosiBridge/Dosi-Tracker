@@ -57,9 +57,29 @@ public sealed class ScriptedBlobProvider : BlobProviderBase
         return Blobs.TryRemove(args.BlobName, out _);
     }
 
+    private int _getCount;
+
+    /// <summary>Number of times GetOrNullAsync was invoked on this provider.</summary>
+    public int GetCount => Volatile.Read(ref _getCount);
+
+    /// <summary>Chronological log of blob names requested via GetOrNullAsync.</summary>
+    public ConcurrentQueue<string> GetAttempts { get; } = new();
+
+    /// <summary>Called with the 1-based number of the get and the blob name, before the blob is retrieved.</summary>
+    public Func<int, string, Task>? BeforeGet { get; set; }
+
     public override Task<bool> ExistsAsync(BlobProviderExistsArgs args) =>
         Task.FromResult(Blobs.ContainsKey(args.BlobName));
 
-    public override Task<Stream?> GetOrNullAsync(BlobProviderGetArgs args) =>
-        Task.FromResult<Stream?>(Blobs.TryGetValue(args.BlobName, out var bytes) ? new MemoryStream(bytes) : null);
+    public override async Task<Stream?> GetOrNullAsync(BlobProviderGetArgs args)
+    {
+        var getNumber = Interlocked.Increment(ref _getCount);
+        GetAttempts.Enqueue(args.BlobName);
+        if (BeforeGet != null)
+        {
+            await BeforeGet(getNumber, args.BlobName);
+        }
+
+        return Blobs.TryGetValue(args.BlobName, out var bytes) ? new MemoryStream(bytes) : null;
+    }
 }
