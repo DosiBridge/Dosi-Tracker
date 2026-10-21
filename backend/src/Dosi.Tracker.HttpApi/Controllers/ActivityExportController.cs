@@ -6,8 +6,8 @@ using Microsoft.AspNetCore.Mvc;
 namespace Dosi.Tracker.Controllers;
 
 /// <summary>
-/// Authenticated workspace-scoped activity CSV export endpoint (REQ-DAT-02).
-/// Enforces workspace context via WorkspaceRequiredFilter and returns downloadable CSV stream.
+/// Authenticated workspace-scoped activity export endpoints (REQ-DAT-02).
+/// Enforces workspace context via WorkspaceRequiredFilter and returns downloadable CSV or JSON stream.
 /// </summary>
 [Route("api/app/activity")]
 [Authorize]
@@ -26,6 +26,17 @@ public class ActivityExportController : TrackerController
         var result = await _activityAppService.ExportCsvAsync(input);
         Response.Headers["X-Total-Count"] = result.TotalCount.ToString();
         Response.Headers["X-Exported-Count"] = result.ExportedCount.ToString();
+        return File(result.Bytes, result.ContentType, result.FileName);
+    }
+
+    [HttpGet("export/json")]
+    public async Task<IActionResult> ExportJsonAsync([FromQuery] ExportActivitiesInput input)
+    {
+        var result = await _activityAppService.ExportJsonAsync(input);
+        Response.Headers["X-Total-Count"] = result.TotalCount.ToString();
+        Response.Headers["X-Exported-Count"] = result.ExportedCount.ToString();
+        Response.Headers["Cache-Control"] = "no-store, private";
+        Response.Headers["Pragma"] = "no-cache";
         return File(result.Bytes, result.ContentType, result.FileName);
     }
 }

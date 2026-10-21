@@ -596,6 +596,8 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
 | **Workspace Archival Migration & Upgrade Regressions** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~WorkspaceArchivalMigrationTests"` | 10 | 0 | 7.0s | **0** | **[Worker-Reported (Direct Snapshot/TargetModel, Npgsql DDL, Operation-Level & Tracked Migrator Upgrade)]** |
 | **Workspace Capture Retention Policy HTTP Regressions (REQ-DAT-01)** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~WorkspaceCaptureRetentionPolicyHttpTests"` | 12 | 0 | 14.0s | **0** | **[Worker-Reported (Hosted MVC TestServer, Aggregate Auth & Persisted Settings)]** |
 | **Workspace Capture Retention Worker & Domain Regressions (REQ-DAT-01)** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~WorkspaceCaptureRetentionTests"` | 20 | 0 | 11.0s | **0** | **[Worker-Reported (Isolated SQLite & Scripted In-Memory Blob Provider)]** |
+| **Workspace Activity CSV Export Regressions (REQ-DAT-02)** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~WorkspaceActivityExportHttpTests"` | 10 | 0 | 16.0s | **0** | **[Worker-Reported (Hosted MVC TestServer & In-Memory SQLite)]** |
+| **Workspace Activity JSON Export Regressions (REQ-DAT-02)** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~WorkspaceActivityJsonExportHttpTests"` | 11 | 0 | 15.0s | **0** | **[Worker-Reported (Hosted MVC TestServer & In-Memory SQLite)]** |
 | **Concurrent Last-Owner Regressions** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~ConcurrentOwnerProtectionTests"` | 9 | 0 | 9.23s | **0** | **[Worker-Reported (Concurrent SQLite WAL)]** |
 | **Hosted ASP.NET Core MVC TestServer** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~EfCoreWorkspaceHttpAuthorizationTests"` | 9 | 0 | 15.6s | **0** | **[Worker-Reported (Hosted MVC TestServer & Shared SQLite)]** |
 | **Host Route & Resolution Regressions** | `dotnet test test/Dosi.Tracker.HttpApi.Host.Tests/Dosi.Tracker.HttpApi.Host.Tests.csproj` | 127 | 0 | 1.15s | **0** | **[Worker-Reported (Host Test Suite)]** |
@@ -844,11 +846,17 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
 
 ---
 
-## 10. REQ-DAT-02: Authenticated Workspace-Scoped Activity CSV Export (Bounded Full-Product Slice)
+## 10. REQ-DAT-02: Authenticated Workspace-Scoped Activity CSV & JSON Export (Bounded Full-Product Slice)
 
 1. **Architecture & Conventions**:
-   - Implemented via conventional hosted HTTP endpoint: `GET /api/app/activity/export` (`ActivityExportController.cs`), backed by `IActivityAppService.ExportCsvAsync` in `ActivityAppService.cs` and RFC 4180 serialization in `CsvExportHelper.cs`.
-   - Contracts: `ExportActivitiesInput.cs` (query parameters: `From`, `To`, `ProjectId`, `UserId`, `MaxResultCount`) and `ActivityExportResultDto.cs` (binary payload, UTF-8 content type `text/csv; charset=utf-8`, attachment filename, `TotalCount`, `ExportedCount`).
+   - Implemented via conventional hosted HTTP endpoints on `ActivityExportController.cs`:
+     * CSV Export: `GET /api/app/activity/export`, backed by `IActivityAppService.ExportCsvAsync` in `ActivityAppService.cs` and RFC 4180 serialization in `CsvExportHelper.cs`.
+     * JSON Export: `GET /api/app/activity/export/json`, backed by `IActivityAppService.ExportJsonAsync` in `ActivityAppService.cs` and versioned serialization in `JsonExportHelper.cs`.
+   - Reusable Scoped Selector: Extracted shared private `LoadExportActivitiesSnapshotAsync(input)` within `ActivityAppService.cs`, ensuring identical authorization, project scoping, date bounds, query filtering, and `Take(limit + 1)` materialization boundary across both export formats without weaker duplicate query logic.
+   - Contracts:
+     * `ExportActivitiesInput.cs` (query parameters: `From`, `To`, `ProjectId`, `UserId`, `MaxResultCount`).
+     * `ActivityExportResultDto.cs` (binary payload, content type, attachment filename, `TotalCount`, `ExportedCount`).
+     * `ActivityJsonExportDto.cs` (`ActivityJsonExportDocumentDto` root with `Version = "1.0"`, `WorkspaceId`, `ExportedAtUtc`, `TotalCount`, `Activities` array; and `ActivityJsonExportItemDto` record).
    - Domain Shared: `ExportExceedsLimit = "Tracker:ExportExceedsLimit"` in `TrackerDomainErrorCodes.cs`, localized in `en.json`, and mapped to HTTP 400 `BadRequest` in `TrackerHttpApiModule.cs`.
 
 2. **Server-Enforced Authorization & Scoping**:
@@ -860,16 +868,20 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
      * If a regular member supplies `UserId != currentUserId`, request is rejected with 403 Forbidden.
      * If a caller supplies `ProjectId` belonging to another workspace, query filter restricts project lookup and returns 404 NotFound.
      * Spoofed foreign workspace header (`X-Workspace-Id`) rejected with 403 `Tracker:NotWorkspaceMember`.
+     * Inactive / removed member denied with 403 `Tracker:NotWorkspaceMember`.
      * Same-user A+B switching respects workspace-specific roles and visibility (verified via `DualUser` with Owner role in Workspace A and Member role in Workspace B).
 
-3. **Column Contract & Truthful Metrics**:
-   - Minimal stable column schema: `ActivityId,UserId,ProjectId,ProjectTitle,StartedAtUtc,EndedAtUtc,DurationMinutes,DurationSeconds,Description,Productivity,IdleSeconds,MouseClicks,KeyboardHits`.
-   - Omits sensitive captures/blob URLs, raw window titles, hourly pay rates, and extraneous PII fields.
-   - Unavailable values remain blank (`""`), never inventing measured zeros (`0`) for missing metrics.
+3. **Schema Contract & Truthful Metrics**:
+   - Minimal stable summary schema: `activityId`, `userId`, `projectId`, `projectTitle`, `startedAtUtc`, `endedAtUtc`, `durationMinutes`, `durationSeconds`, `description`, `productivity`, `idleSeconds`, `mouseClicks`, `keyboardHits`.
+   - Strict Field Allowlist: Excludes sensitive window titles (`ActiveWindowsJson`), process lists (`RunningProgramsJson`), timeline minute buckets (`TimelineJson`), capture binaries/thumbnails (`Screenshots`), storage/blob URLs, credentials/passwords/tokens, and hourly pay/billing rates.
+   - Truthful Nullability & Historical Zeros: Known unmeasured metrics (`Productivity = null`, `IdleSeconds = null`, `Description = null`) are preserved as JSON `null` (or blank in CSV), never inventing measured zeros. Historical measured zeros (`MouseClicks = 0`, `KeyboardHits = 0`) are preserved as `0`.
+   - Non-ASCII & Unicode Preservation: UTF-8 encoding with `JavaScriptEncoder.UnsafeRelaxedJsonEscaping` preserves Bengali text (e.g. `বাংলা স্প্রিন্ট টাস্ক`), Unicode quotes, newlines, and emojis without corruption.
 
-4. **CSV Escaping & Formula Injection Neutralization**:
-   - RFC 4180 compliant: fields containing commas, double quotes, or newlines are wrapped in double quotes; double quotes are escaped by doubling (`""`).
-   - Spreadsheet formula injection defense: fields starting with `=, +, -, @, \t, \r, |` (including leading whitespace/control variants) are prefixed with a single quote (`'`).
+4. **Response Headers & Download Cache Policy**:
+   - CSV: `Content-Type: text/csv; charset=utf-8`, `Content-Disposition: attachment; filename=activities-{workspaceId:N}-{timestamp}.csv`.
+   - JSON: `Content-Type: application/json; charset=utf-8`, `Content-Disposition: attachment; filename=activities-{workspaceId:N}-{timestamp}.json`.
+   - Metadata headers: `X-Total-Count`, `X-Exported-Count`.
+   - Non-Storable Download Policy: `Cache-Control: no-store, private` and `Pragma: no-cache` explicitly set on JSON download response without modifying global application caching middleware.
 
 5. **Server-Enforced Date Bounds & Workload Limits**:
    - Date validation: `To >= From` and date span `<= 366` days (`Tracker:ReportRangeInvalid`).
@@ -878,26 +890,29 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
    - **Cardinality Hardening at Materialization Boundary**:
      * Prior flaw: Preliminary `CountAsync(query)` verified `totalCount <= limit`, but the query was then materialized without a server-side `Take` bound and without post-materialization cardinality validation. Concurrent ingestion between count and fetch could yield rows exceeding `limit` and stale response metadata (`X-Total-Count < X-Exported-Count`).
      * Hardened correction: Applied deterministic server-side `Take(limit + 1)` bound on production query (`query.OrderByDescending(...).ThenByDescending(...).Take(limit + 1)`).
-     * Post-materialization validation: If `activities.Count > limit`, immediately rejects with `BusinessException(TrackerDomainErrorCodes.ExportExceedsLimit)` (HTTP 400 `BadRequest`). No partial CSV or header stream is emitted.
-     * Snapshot-derived counts: `TotalCount = activities.Count` and `ExportedCount = activities.Count` derived honestly from the bounded materialized snapshot, guaranteeing coherence across `X-Total-Count`, `X-Exported-Count`, and actual CSV data lines.
+     * Post-materialization validation: If `activities.Count > limit`, immediately rejects with `BusinessException(TrackerDomainErrorCodes.ExportExceedsLimit)` (HTTP 400 `BadRequest`). No partial CSV, JSON, or header stream is emitted.
+     * Snapshot-derived counts: `TotalCount = activities.Count` and `ExportedCount = activities.Count` derived honestly from the bounded materialized snapshot, guaranteeing coherence across `X-Total-Count`, `X-Exported-Count`, and actual payload items.
 
 6. **Isolated Regression Evidence**:
-   - Hosted ASP.NET Core `TestServer` regression suite with isolated SQLite database: `backend/test/Dosi.Tracker.EntityFrameworkCore.Tests/EntityFrameworkCore/Applications/Activities/WorkspaceActivityExportHttpTests.cs`.
-   - 10 test scenarios (10 passed, exit 0, repeated twice):
-     1. `Authorized_Workspace_Owner_Exports_Csv_With_Headers_And_Data`: Verifies 200 OK, `text/csv; charset=utf-8`, `attachment; filename=...`, `X-Total-Count`, `X-Exported-Count`, stable column contract, and exact data fields.
-     2. `A_Only_Caller_Denied_B_With_Seeded_Foreign_Sentinel`: Verifies 403 Forbidden on spoofed header; Workspace B sentinel remains untouched.
-     3. `Same_User_A_And_B_Switching_Respects_Workspace_Specific_Roles_And_Data`: Verifies same user with Owner role in A sees all activities and with Member role in B sees only own activity.
-     4. `Regular_Member_Attempting_Other_User_Or_Foreign_Project_Filter_Is_Rejected`: Verifies 403 Forbidden when member filters by other user, and 404 NotFound when member filters by foreign workspace project.
-     5. `Missing_Or_Empty_Workspace_Header_Is_Rejected_With_400_WorkspaceRequired`: Verifies 400 BadRequest with code `Tracker:WorkspaceRequired` on missing or `Guid.Empty` header.
-     6. `Malformed_Or_Out_Of_Bounds_Dates_And_Oversize_Workload_Are_Rejected`: Verifies 400 BadRequest for reversed dates, excessive span (> 366 days), oversize MaxResultCount (> 10000), and candidate overflow past limit (`Tracker:ExportExceedsLimit`).
-     7. `Csv_Escapes_Special_Characters_And_Neutralizes_Formula_Injection_While_Keeping_Unavailable_Values_Blank`: Verifies quotes doubling, newline handling, formula prefixing (`=`, `+`, `@`, `\t`), and blank unavailable metrics.
-     8. `Old_Implementation_Without_Bounded_Take_Violates_Requested_Limit_And_Metadata_When_Row_Added_After_Count`: Proves the former defect under retained old-code query (preliminary count passes at limit 2; concurrent insert adds row 3; unconstrained materialization yields 3 rows; CSV emits 3 data rows violating requested limit; stale `TotalCount` 2 < `ExportedCount` 3). Workspace B sentinel preserved.
-     9. `Production_Export_Rejects_Limit_Plus_One_Candidate_Overflow_At_Materialization_Boundary_Without_Partial_Csv`: Injected `BarrierInterceptor` executes mid-operation row insertion immediately after preliminary `CountAsync`. Proves both direct production `ActivityAppService.ExportCsvAsync` and hosted `TestServer` HTTP endpoint reject limit + 1 candidate overflow with HTTP 400 `Tracker:ExportExceedsLimit` without partial CSV. Workspace B sentinel preserved.
-     10. `Production_Export_Exact_Limit_Succeeds_With_Coherent_Snapshot_Derived_Counts_And_Exact_Csv_Rows`: Verifies requested exact limit (2 activities seeded, limit = 2) returns HTTP 200 OK, matching `X-Total-Count: 2`, `X-Exported-Count: 2`, and exact CSV row count (1 header + 2 data rows).
+   - Hosted ASP.NET Core `TestServer` regression suites with isolated SQLite database:
+     * CSV Export Suite: `backend/test/Dosi.Tracker.EntityFrameworkCore.Tests/EntityFrameworkCore/Applications/Activities/WorkspaceActivityExportHttpTests.cs` (10 tests passed, exit 0).
+     * JSON Export Suite: `backend/test/Dosi.Tracker.EntityFrameworkCore.Tests/EntityFrameworkCore/Applications/Activities/WorkspaceActivityJsonExportHttpTests.cs` (11 tests passed, exit 0).
+   - Test scenarios covered in `WorkspaceActivityJsonExportHttpTests` (11 total):
+     1. `Authorized_Workspace_Owner_Exports_Json_With_Headers_Attachment_And_Valid_Document`: Verifies HTTP 200 OK, `application/json; charset=utf-8`, `attachment; filename=activities-...json`, `X-Total-Count: 1`, `X-Exported-Count: 1`, `Cache-Control: no-store, private`, `Pragma: no-cache`, schema version `1.0`, matching workspace/activity fields.
+     2. `Foreign_Workspace_Caller_Attempting_Json_Export_Is_Denied_With_403_NotWorkspaceMember`: Verifies 403 Forbidden with `Tracker:NotWorkspaceMember` on foreign workspace header; Workspace B sentinel row remains intact and untouched.
+     3. `Same_User_With_Different_Roles_In_Workspaces_A_And_B_Exports_Appropriate_Json_Data`: Verifies same user with Owner role in Workspace A exports all member activities, and with Member role in Workspace B exports only own activities (excluding colleague's row).
+     4. `Regular_Member_Attempting_Other_User_Or_Foreign_Project_Filter_Is_Rejected`: Verifies regular member filtering by other user rejected with 403 Forbidden, and filtering by foreign project rejected with 404/403.
+     5. `Missing_Or_Empty_Workspace_Header_Is_Rejected_With_400_WorkspaceRequired`: Verifies missing header or `Guid.Empty` rejected with 400 BadRequest (`Tracker:WorkspaceRequired`).
+     6. `Inactive_Or_Removed_Workspace_Member_Is_Denied_Json_Export`: Verifies non-member / removed user rejected with 403 Forbidden (`Tracker:NotWorkspaceMember`).
+     7. `Malformed_Or_Out_Of_Bounds_Dates_And_Oversize_Workload_Are_Rejected`: Verifies 400 BadRequest for reversed dates, excessive span (> 366 days), oversize MaxResultCount (> 10000), and candidate overflow past limit (`Tracker:ExportExceedsLimit`).
+     8. `Json_Export_Preserves_Unavailable_Metrics_As_Null_Historical_Zeros_As_Zero_And_Escapes_NonAscii_Correctly`: Verifies unmeasured metrics serialized as explicit JSON `null`, historical 0s serialized as `0`, and Bengali non-ASCII Unicode strings (`বাংলা স্প্রিন্ট টাস্ক`), newlines, and emojis roundtrip losslessly.
+     9. `Json_Export_Field_Allowlist_Excludes_Sensitive_And_Internal_Fields`: Verifies raw JSON string strictly excludes window titles (`activeWindowsJson`, `Confidential Banking Portal`), process lists (`runningProgramsJson`, `keepass.exe`, `secret_daemon.exe`), timeline buckets (`timelineJson`), screenshots, storage URLs, client IDs, pay rates, and passwords/tokens.
+     10. `Production_Json_Export_Rejects_Limit_Plus_One_Candidate_Overflow_At_Materialization_Boundary_Without_Partial_Json`: `BarrierInterceptor` injects mid-operation row between count and materialization; proves production `ExportJsonAsync` and hosted HTTP endpoint reject with 400 `Tracker:ExportExceedsLimit` without partial JSON emission; Workspace B sentinel verified untouched.
+     11. `Production_Json_Export_Exact_Limit_Succeeds_With_Coherent_Snapshot_Derived_Counts_And_Exact_Array_Items`: Verifies exact limit (2 activities, limit = 2) returns HTTP 200 OK with `X-Total-Count: 2`, `X-Exported-Count: 2`, and exactly 2 array items.
 
 7. **Operational Limitations & Remaining Gaps**:
-   - **Async Bulk/Capture Export Gap**: Asynchronous background jobs, multi-file capture packaging, and zip archiving are deferred; this slice delivers synchronous workspace-scoped activity/time CSV export.
-   - **Signed Public URLs Gap**: Temporary signed URLs (e.g. S3 presigned URLs) are not generated; CSV is streamed directly over authenticated session.
+   - **Async Bulk/Capture Export Gap**: Asynchronous background jobs, multi-file capture packaging, and zip archiving are deferred; this slice delivers synchronous workspace-scoped activity/time CSV and JSON summary export.
+   - **Signed Public URLs Gap**: Temporary signed URLs (e.g. S3 presigned URLs) are not generated; files are streamed directly over authenticated session.
    - **Disaster Recovery Gap**: Automated database dump/restore and disaster recovery runbooks remain deferred.
    - **Frontend UI Gap**: Next.js export buttons and modal dialogs are deferred.
 
@@ -1084,15 +1099,15 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
 1. **Privacy Acceptance Pending**:
    - The privacy source audit (commit `14bbe66`) remains **Pending PM Independent Review**. This status is preserved and not bypassed.
 2. **Workspace Lifecycle, Authorization, Retention, Export, Presence, Device & Screenshot Delivery Status**:
-   - Hosted ASP.NET Core `TestServer` MVC invitation recipient decline security acceptance harness (`REQ-WS-07` / `REQ-ISO-05`), explicit-policy workspace activity summary age-retention service (`REQ-DAT-01`), owner-managed workspace capture retention policy lifecycle (`REQ-DAT-01`), non-storable cache policy for private capture delivery (`REQ-ISO-05`), private-capture-delivery acceptance harness (`REQ-ISO-05`), workspace-scoped self-service device revocation (`REQ-DEV-01`), live team presence active membership scoping (`REQ-TRK-04`), authenticated workspace-scoped activity CSV export (`REQ-DAT-02`), workspace-isolated capture retention lifecycle safe first slice (`REQ-DAT-01`), reversible owner-controlled workspace archival (`REQ-WS-08`), concurrent last-owner protection (`REQ-WS-06`), recipient decline direct lifecycle (`REQ-WS-07`), and hosted ASP.NET Core `TestServer` MVC aggregate authorization harness (`REQ-ISO-05`) are implemented and verified via isolated regressions (150 SQLite integration tests total: 12 invitation decline hosted HTTP + 10 invitation decline direct + 14 activity retention + 14 capture retention policy HTTP + 11 screenshot content delivery + 9 device revocation + 7 device migration + 6 team presence + 10 activity export + 20 capture retention + 9 archival lifecycle + 10 archival migration/upgrade + 9 concurrent owner protection + 9 hosted MVC auth).
+   - Hosted ASP.NET Core `TestServer` MVC activity summary JSON export (`REQ-DAT-02`), authenticated workspace-scoped activity CSV export (`REQ-DAT-02`), hosted ASP.NET Core `TestServer` MVC invitation recipient decline security acceptance harness (`REQ-WS-07` / `REQ-ISO-05`), explicit-policy workspace activity summary age-retention service (`REQ-DAT-01`), owner-managed workspace capture retention policy lifecycle (`REQ-DAT-01`), non-storable cache policy for private capture delivery (`REQ-ISO-05`), private-capture-delivery acceptance harness (`REQ-ISO-05`), workspace-scoped self-service device revocation (`REQ-DEV-01`), live team presence active membership scoping (`REQ-TRK-04`), workspace-isolated capture retention lifecycle safe first slice (`REQ-DAT-01`), reversible owner-controlled workspace archival (`REQ-WS-08`), concurrent last-owner protection (`REQ-WS-06`), recipient decline direct lifecycle (`REQ-WS-07`), and hosted ASP.NET Core `TestServer` MVC aggregate authorization harness (`REQ-ISO-05`) are implemented and verified via isolated regressions (161 SQLite integration tests total: 11 activity JSON export + 10 activity CSV export + 12 invitation decline hosted HTTP + 10 invitation decline direct + 14 activity retention + 14 capture retention policy HTTP + 11 screenshot content delivery + 9 device revocation + 7 device migration + 6 team presence + 20 capture retention + 9 archival lifecycle + 10 archival migration/upgrade + 9 concurrent owner protection + 9 hosted MVC auth).
    - Real browser cookie/session testing (`__Host-Dosi-Workspace`), Next.js server actions, OpenIddict token issuer, provider-backed multi-connection transactional commit proof (PostgreSQL/SQL Server), multi-node distributed lock infrastructure (Redis), and PM independent execution remain pending. All reported outcomes are worker-executed, not independent PM QA.
 3. **Execution Limits & Evidence Boundaries**:
-   - TestServer regressions prove conventional MVC routing, aggregate permission checks, fail-closed workspace scoping, binary capture streaming, non-storable capture delivery caching, CSV formula neutralization, Take(limit + 1) hard bounded fetch, active member presence query scoping, device revocation gating before blob side-effects, and server limits on in-memory SQLite, but do NOT replace execution on a real PostgreSQL cluster; no live user/production database was modified.
+   - TestServer regressions prove conventional MVC routing, aggregate permission checks, fail-closed workspace scoping, binary capture streaming, non-storable capture delivery caching, CSV formula neutralization, JSON allowlist filtering and explicit null preservation, Take(limit + 1) hard bounded fetch, active member presence query scoping, device revocation gating before blob side-effects, and server limits on in-memory SQLite, but do NOT replace execution on a real PostgreSQL cluster; no live user/production database was modified.
    - Retention defaults remain disabled (`IsEnabled = false`); no cleanup was executed against user DB or real object storage. Activity retention service remains completely dormant unless explicitly invoked with a validated policy.
 4. **Remaining Backlog Gaps**:
    - Cryptographic client machine enrollment / attestation, token/session revocation, native desktop agent revocation prompt/unenrollment UI, WebSocket / SignalR push live presence notification, asynchronous export background worker, screenshot zip archive, signed download URLs, disaster recovery / automated backup procedures, frontend UI export actions, automated background activity summary cleanup worker / owner activity retention UI, and permanent deletion remain deferred acceptance gaps.
 5. **Overall Product Incomplete**:
    - Full product remains incomplete across backend metric nullability schema migrations (`Activity.cs` truthful nulls vs 0), desktop offline ingestion queue hardening, platform-native interactive client runtimes, code signing, and hosted operational deployment.
 6. **Awaiting PM Guidance**:
-   - Hosted HTTP workspace invitation recipient decline lifecycle and security acceptance (`REQ-WS-07` / `REQ-ISO-05`) complete. Stop and hand off for PM review with exact diff and test evidence.
+   - Workspace-scoped JSON activity summary export (`REQ-DAT-02`) complete. Stop and hand off for PM review with exact diff and test evidence.
 

@@ -855,8 +855,14 @@ public class ActivityAppService : TrackerAppService, IActivityAppService
             .ThenBy(c => c.Id)
             .ToList();
 
-    [RemoteService(IsEnabled = false)]
-    public async Task<ActivityExportResultDto> ExportCsvAsync(ExportActivitiesInput input)
+    private record ExportActivitiesSnapshot(
+        Guid WorkspaceId,
+        DateTime SnapshotTimeUtc,
+        IReadOnlyList<Activity> Activities,
+        IReadOnlyDictionary<Guid, string> Projects,
+        int TotalCount);
+
+    private async Task<ExportActivitiesSnapshot> LoadExportActivitiesSnapshotAsync(ExportActivitiesInput input)
     {
         var currentWorkspaceId = CurrentWorkspace.GetId();
         var callerId = CurrentUser.GetId();
@@ -963,17 +969,46 @@ public class ActivityAppService : TrackerAppService, IActivityAppService
         var projects = (await _projectRepository.GetListAsync(p => projectIds.Contains(p.Id)))
             .ToDictionary(p => p.Id, p => p.Title);
 
-        // 11. Format CSV
-        var csvBytes = CsvExportHelper.BuildActivitiesCsv(activities, projects);
-        var fileName = $"activities-{currentWorkspaceId:N}-{DateTime.UtcNow:yyyyMMddHHmmss}.csv";
+        return new ExportActivitiesSnapshot(currentWorkspaceId, DateTime.UtcNow, activities, projects, totalCount);
+    }
+
+    [RemoteService(IsEnabled = false)]
+    public async Task<ActivityExportResultDto> ExportCsvAsync(ExportActivitiesInput input)
+    {
+        var snapshot = await LoadExportActivitiesSnapshotAsync(input);
+
+        var csvBytes = CsvExportHelper.BuildActivitiesCsv(snapshot.Activities, snapshot.Projects);
+        var fileName = $"activities-{snapshot.WorkspaceId:N}-{snapshot.SnapshotTimeUtc:yyyyMMddHHmmss}.csv";
 
         return new ActivityExportResultDto
         {
             Bytes = csvBytes,
             ContentType = "text/csv; charset=utf-8",
             FileName = fileName,
-            TotalCount = totalCount,
-            ExportedCount = activities.Count
+            TotalCount = snapshot.TotalCount,
+            ExportedCount = snapshot.Activities.Count
+        };
+    }
+
+    [RemoteService(IsEnabled = false)]
+    public async Task<ActivityExportResultDto> ExportJsonAsync(ExportActivitiesInput input)
+    {
+        var snapshot = await LoadExportActivitiesSnapshotAsync(input);
+
+        var jsonBytes = JsonExportHelper.BuildActivitiesJson(
+            snapshot.WorkspaceId,
+            snapshot.SnapshotTimeUtc,
+            snapshot.Activities,
+            snapshot.Projects);
+        var fileName = $"activities-{snapshot.WorkspaceId:N}-{snapshot.SnapshotTimeUtc:yyyyMMddHHmmss}.json";
+
+        return new ActivityExportResultDto
+        {
+            Bytes = jsonBytes,
+            ContentType = "application/json; charset=utf-8",
+            FileName = fileName,
+            TotalCount = snapshot.TotalCount,
+            ExportedCount = snapshot.Activities.Count
         };
     }
 }

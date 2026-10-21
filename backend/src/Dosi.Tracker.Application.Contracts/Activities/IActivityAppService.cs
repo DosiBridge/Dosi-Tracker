@@ -24,4 +24,9 @@ public interface IActivityAppService : IApplicationService
     /// Exports workspace activities to CSV within authorized scope and server-enforced bounds.
     /// </summary>
     Task<ActivityExportResultDto> ExportCsvAsync(ExportActivitiesInput input);
+
+    /// <summary>
+    /// Exports workspace activities to a versioned JSON summary within authorized scope and server-enforced bounds.
+    /// </summary>
+    Task<ActivityExportResultDto> ExportJsonAsync(ExportActivitiesInput input);
 }
