@@ -36,6 +36,7 @@ public class TrackerDbContext :
     public DbSet<Project> Projects { get; set; }
     public DbSet<ProjectMember> ProjectMembers { get; set; }
     public DbSet<ProjectMemberRate> ProjectMemberRates { get; set; }
+    public DbSet<ProjectTask> ProjectTasks { get; set; }
     public DbSet<Activity> Activities { get; set; }
     public DbSet<Screenshot> Screenshots { get; set; }
     public DbSet<AgentPresence> AgentPresences { get; set; }
@@ -161,6 +162,16 @@ public class TrackerDbContext :
             b.ConfigureByConvention();
             // Payroll looks up the rate in effect at a block's start: the member's latest EffectiveFrom <= StartedAt.
             b.HasIndex(x => new { x.WorkspaceId, x.ProjectId, x.UserId, x.EffectiveFrom });
+        });
+
+        builder.Entity<ProjectTask>(b =>
+        {
+            b.ToTable(TrackerConsts.DbTablePrefix + "ProjectTasks", TrackerConsts.DbSchema);
+            b.ConfigureByConvention();
+            b.Property(x => x.Title).IsRequired().HasMaxLength(ProjectTaskConsts.MaxTitleLength);
+            b.Property(x => x.Description).HasMaxLength(ProjectTaskConsts.MaxDescriptionLength);
+            b.HasIndex(x => new { x.WorkspaceId, x.ProjectId });
+            b.HasIndex(x => new { x.WorkspaceId, x.ProjectId, x.IsCompleted });
         });
 
         builder.Entity<Activity>(b =>

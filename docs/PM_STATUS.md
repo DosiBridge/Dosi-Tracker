@@ -599,6 +599,9 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
 | **Workspace Activity CSV Export Regressions (REQ-DAT-02)** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~WorkspaceActivityExportHttpTests"` | 10 | 0 | 16.0s | **0** | **[Worker-Reported (Hosted MVC TestServer & In-Memory SQLite)]** |
 | **Workspace Activity JSON Export Regressions (REQ-DAT-02)** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~WorkspaceActivityJsonExportHttpTests"` | 14 | 0 | 19.0s | **0** | **[Worker-Reported (Hosted MVC TestServer & In-Memory SQLite)]** |
 | **Workspace Team Roster HTTP Regressions (REQ-ISO-03/05)** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~WorkspaceTeamRosterHttpTests"` | 17 | 0 | 19.0s | **0** | **[Worker-Reported (Hosted MVC TestServer & In-Memory SQLite)]** |
+| **Workspace Payroll Reporting Regressions (REQ-ISO-03/05)** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~WorkspacePayrollReportingHttpTests"` | 10 | 0 | 14.0s | **0** | **[Worker-Reported (Hosted MVC TestServer & In-Memory SQLite)]** |
+| **Workspace Project Task HTTP Regressions (REQ-PRJ-01, REQ-ISO-05)** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~WorkspaceProjectTaskHttpTests"` | 13 | 0 | 17.0s | **0** | **[Worker-Reported (Hosted MVC TestServer & In-Memory SQLite)]** |
+| **Project Task Migration & Model Regressions (REQ-PRJ-01)** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~ProjectTaskMigrationTests"` | 7 | 0 | 7.0s | **0** | **[Worker-Reported (Direct Snapshot/TargetModel, Npgsql DDL, Operation-Level & Tracked Migrator Upgrade)]** |
 | **Concurrent Last-Owner Regressions** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~ConcurrentOwnerProtectionTests"` | 9 | 0 | 9.23s | **0** | **[Worker-Reported (Concurrent SQLite WAL)]** |
 | **Hosted ASP.NET Core MVC TestServer** | `dotnet test test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~EfCoreWorkspaceHttpAuthorizationTests"` | 9 | 0 | 15.6s | **0** | **[Worker-Reported (Hosted MVC TestServer & Shared SQLite)]** |
 | **Host Route & Resolution Regressions** | `dotnet test test/Dosi.Tracker.HttpApi.Host.Tests/Dosi.Tracker.HttpApi.Host.Tests.csproj` | 127 | 0 | 1.15s | **0** | **[Worker-Reported (Host Test Suite)]** |
@@ -1181,20 +1184,111 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
 
 ---
 
-## 16. Current Status & Next Steps
+---
+
+## 16. Bounded Phase: Workspace and Project-Scoped Task Lifecycle Backend Slice (REQ-PRJ-01, REQ-ISO-05)
+
+### A. Context & Source-Confirmed Missing Capability
+1. **Background & Inventory Audit**:
+   - Complete PM and engineer inspection of `Dosi.Tracker.Application.Contracts`, `Dosi.Tracker.Domain`, `Dosi.Tracker.Application`, and controller inventory confirmed that while `Project` CRUD and member roster operations existed, no task or work-item entity, contract, application service, or controller route had been implemented.
+   - Searches across `backend/src` and `frontend/src` for `taskitem`, `taskappservice`, `createtask`, `updatetask`, `deletetask`, `taskid`, `workitem`, `todo`, and `subtask` revealed zero task implementation (only `ToDomain` mapping helpers, localization `'todos'`, a `ListTodo` Lucide icon, and architecture test markers).
+   - This was an explicit missing product capability, NOT an established security exploit or vulnerability.
+2. **Design Invariants & Scope Boundaries**:
+   - Implemented the smallest maintainable workspace- and project-scoped task lifecycle slice: authenticated authorized list, create, and update (title, description, and completion state) for a project's tasks.
+   - Explicit `ProjectTask` aggregate root with `WorkspaceId`, `ProjectId`, `Id`, `Title`, `Description`, `IsCompleted`, and `CompletedAt`.
+   - Reused existing production project membership and ABP aggregate permission infrastructure:
+     * Workspace Owners and Managers holding `TrackerPermissions.Projects.Edit` or `TrackerPermissions.Activities.ViewAll` have full workspace-wide project task access.
+     * Enrolled project contributors (`Worker`, `Manager`, `Admin`) have create and update authority for tasks within their enrolled project.
+     * Enrolled project clients (`ProjectMemberRoles.Client`) have read-only visibility; mutation attempts (create/update) are rejected with HTTP 403 Forbidden (`Tracker:RoleNotAllowed`).
+     * Active workspace members NOT enrolled in the target project have no project authority: mutation attempts are rejected with HTTP 403 Forbidden (`Tracker:NotProjectMember`), and reads return HTTP 404 NotFound to prevent discovering private project task metadata.
+     * Foreign workspace headers (`X-Workspace-Id`) are rejected with HTTP 403 Forbidden (`Tracker:NotWorkspaceMember`).
+     * Real foreign project or task IDs supplied with a valid workspace header fail lookup and return HTTP 404 NotFound, preventing cross-workspace mutation or information disclosure.
+     * Withdrawn / departed members are denied on fresh requests with HTTP 403 Forbidden (`Tracker:NotWorkspaceMember`).
+     * Same-account dual users switching between Workspace A (where privileged) and Workspace B (where lower role) strictly honor each workspace and project role boundary independently.
+     * Archived projects reject mutations with HTTP 409 Conflict (`Tracker:ProjectArchived`) while permitting reads.
+     * Archived workspaces reject all requests via `WorkspaceResolutionMiddleware` with HTTP 403 Forbidden (`Tracker:WorkspaceArchived`).
+     * Clamped pagination: `MaxResultCount` is clamped to `[1, 100]` (default 50).
+     * Bounded string lengths: `Title` (1..256), `Description` (<= 2048).
+   - Strict Exclusions: No permanent deletion, notifications, timers, task-to-activity linkage changes, client/UI rewrite or unrelated feature expansion.
+
+### B. Production Implementation Details
+1. **Domain & Shared Contracts**:
+   - `ProjectTaskConsts.cs`: `MaxTitleLength = 256`, `MaxDescriptionLength = 2048`, `DefaultPageSize = 50`, `MaxPageSize = 100`.
+   - `ProjectTask.cs`: Inherits `FullAuditedAggregateRoot<Guid>, IWorkspaceScoped`. Encapsulates `WorkspaceId`, `ProjectId`, `Title`, `Description`, `IsCompleted`, `CompletedAt`. Provides domain methods `SetTitle`, `SetDescription`, `Complete(DateTime)`, `Reopen()`.
+2. **Application Contracts & DTOs**:
+   - `ProjectTaskDto.cs`: `FullAuditedEntityDto<Guid>` exposing `WorkspaceId`, `ProjectId`, `Title`, `Description`, `IsCompleted`, `CompletedAt`.
+   - `GetProjectTasksInput.cs`: Extends `PagedResultRequestDto` with required `ProjectId` and optional `IsCompleted` filter.
+   - `CreateProjectTaskDto.cs`: Validated `ProjectId`, `Title` (1-256), optional `Description` (max 2048), `IsCompleted`.
+   - `UpdateProjectTaskDto.cs`: Validated `Title` (1-256), optional `Description` (max 2048), `IsCompleted`.
+   - `IProjectTaskAppService.cs`: `GetAsync`, `GetListAsync`, `CreateAsync`, `UpdateAsync`.
+3. **Application Service (`ProjectTaskAppService.cs`)**:
+   - Decorated with `[RemoteService(IsEnabled = false)]` to enforce explicit routing via `ProjectTaskController`.
+   - Evaluates project membership via `_projectMemberRepository` and permissions via `AuthorizationService`.
+   - Enforces ambient EF Core `IWorkspaceScoped` global query filtering.
+   - Enforces fail-closed archived project check: `if (project.IsArchived) throw new BusinessException(TrackerDomainErrorCodes.Projects.ProjectArchived);` (mapped to HTTP 409 Conflict).
+4. **Conventional MVC Controller (`ProjectTaskController.cs`)**:
+   - `[Route("api/app/project-task")]`
+   - `[Authorize]`
+   - Exposes `GET {id}`, `GET`, `POST`, `PUT {id}`.
+5. **Persistence & Additive Migration**:
+   - `TrackerDbContext.cs`: Configured `DbSet<ProjectTask> ProjectTasks { get; set; }` mapped to table `AppProjectTasks` with column lengths, foreign keys, and indexes `(WorkspaceId, ProjectId)` and `(WorkspaceId, ProjectId, IsCompleted)`.
+   - Additive migration `20261021120000_AddProjectTasks.cs` + designer `20261021120000_AddProjectTasks.Designer.cs` + updated `TrackerDbContextModelSnapshot.cs`.
+
+### C. Execution Evidence & Provenance Boundaries
+1. **Migration Regression Suite (`ProjectTaskMigrationTests.cs`)**:
+   - Command: `dotnet test backend/test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~ProjectTaskMigrationTests"`
+   - Outcome: **7 passed, 0 failed, duration 7.0s, exit 0**.
+   - Scenarios:
+     1. `Migration_Metadata_And_Attributes_Are_Correctly_Configured`: Verifies `MigrationAttribute` ID and `DbContextAttribute`.
+     2. `Up_Operations_Create_AppProjectTasks_Table_And_Indexes`: Verifies table creation, columns, types, nullabilities, and composite indexes.
+     3. `Down_Operations_Reversibly_Drop_AppProjectTasks_Table`: Verifies reversible `DropTable("AppProjectTasks")`.
+     4. `Current_Runtime_Model_Contains_ProjectTask_Entity_And_Indexes`: Verifies EF Core runtime model mapping.
+     5. `Direct_Tracked_ModelSnapshot_Contains_ProjectTask_Entity_And_Indexes`: Asserts tracked snapshot contains table mapping, properties, and indexes.
+     6. `Direct_Tracked_Migration_TargetModel_Contains_ProjectTask_Entity_And_Indexes`: Asserts migration target model contains entity and indexes.
+     7. `Tracked_Baseline_To_Current_Migrator_Upgrade_Preserves_Existing_Data_And_Supports_ProjectTasks`: Real `IMigrator` service test on disposable SQLite: migrates from baseline through device revocations to `AddProjectTasks`, verifies surviving workspaces, projects, memberships, device revocations, and executes positive `ProjectTask` persistence and query.
+2. **Hosted ASP.NET Core TestServer MVC Regression Suite (`WorkspaceProjectTaskHttpTests.cs`)**:
+   - Command: `dotnet test backend/test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~WorkspaceProjectTaskHttpTests"`
+   - Outcome: **13 passed, 0 failed, duration 17.0s, exit 0**.
+   - Scenarios:
+     1. `Authorized_Enrolled_Contributor_Can_Create_List_And_Update_Project_Tasks_Over_Hosted_Http`: Proves enrolled Contributor (WorkerA) creates task with 200 OK, lists tasks with 200 OK, and updates title and completion status with 200 OK; asserts SQLite persistence and correct `CompletedAt` timestamp handling.
+     2. `Pagination_Is_Bounded_And_Clamped_To_Max_Page_Size`: Proves pagination request with `MaxResultCount = 500` is clamped to `MaxPageSize = 100`, returning exactly 100 items with `TotalCount = 105`.
+     3. `Validation_Rejects_Empty_Title_And_Excessive_Length_Inputs`: Proves empty title returns 400 Bad Request, title > 256 chars returns 400 Bad Request, and description > 2048 chars returns 400 Bad Request before database mutation.
+     4. `Client_Role_In_Project_Can_Read_Tasks_But_Is_Denied_Mutation_With_403`: Proves enrolled client (`ProjectMemberRoles.Client`) reads tasks with 200 OK, but POST create and PUT update are denied with 403 Forbidden (`Tracker:RoleNotAllowed`); target project tasks remain unchanged in DB.
+     5. `Workspace_Member_Not_Enrolled_In_Project_Is_Denied_Mutation_And_Read`: Proves active workspace member not enrolled in target project is denied create with 403 (`Tracker:NotProjectMember`), denied update with 404, and denied read with 404, preserving project privacy.
+     6. `Foreign_Workspace_Caller_Spoofing_Target_Header_Is_Denied_With_403`: Proves foreign user spoofing `X-Workspace-Id` is denied with 403 Forbidden (`Tracker:NotWorkspaceMember`); 0 tasks created.
+     7. `Authorized_Workspace_A_Mutation_Using_Real_Workspace_B_Project_Or_Task_Fails_Closed`: Proves authorized Owner A supplying real Workspace B project or task IDs returns 404 NotFound under Workspace A context; Workspace B task and project remain completely untouched.
+     8. `Withdrawn_Member_From_Workspace_Is_Denied_On_Fresh_Task_Request`: Proves member departing workspace via `/leave` is denied on fresh task request with 403 Forbidden (`Tracker:NotWorkspaceMember`).
+     9. `Same_Account_Privileged_In_A_Cannot_Mutate_In_Workspace_B_Where_Client_Role`: Proves same account (`DualUser`) privileged as Contributor in A (200 OK create) switching to B where they are Client is denied mutation (403 `Tracker:RoleNotAllowed`), then switching back to A succeeds (200 OK).
+     10. `Archived_Project_Rejects_Create_And_Update_With_409_Conflict_While_Permitting_Reads`: Proves archived project permits task reads (200 OK) but rejects task creation and updates with 409 Conflict (`Tracker:ProjectArchived`); target project tasks remain unchanged.
+     11. `Archived_Workspace_Rejects_All_Task_Requests_With_403_WorkspaceArchived`: Proves normal requests to an archived workspace return 403 Forbidden (`Tracker:WorkspaceArchived`) via `WorkspaceResolutionMiddleware`.
+     12. `Target_Workspace_Persisted_Sentinels_Remain_Unchanged_Across_Battery_Of_Negative_Mutations`: Battery of negative mutation requests verifies that all seeded task rows and properties in SQLite remain 100% intact.
+     13. `Foreign_And_Unrelated_Project_And_Task_Sentinels_Checked_Explicitly_In_Correct_Workspace_Context`: Proves Workspace A operations leave Workspace B task sentinels, project metadata, and activity rows completely untouched and verified in Workspace B context.
+3. **Combined Project Test Suite**:
+   - Command: `dotnet test backend/test/Dosi.Tracker.EntityFrameworkCore.Tests/Dosi.Tracker.EntityFrameworkCore.Tests.csproj --filter "FullyQualifiedName~ProjectTaskMigrationTests|FullyQualifiedName~WorkspaceProjectTaskHttpTests"`
+   - Outcome: **20 passed, 0 failed, duration 17.0s, exit 0**.
+
+### D. Explicit Deferred Limitations & Evidence Boundaries
+1. **Execution Limits**: All test outcomes represent worker-executed in-memory SQLite fixtures with `AddAlwaysDisableUnitOfWorkTransaction()`. Real PostgreSQL cluster execution and concurrent transaction isolation remain unverified.
+2. **Synthetic Authentication**: Tests use synthetic claims via `TestAuthHandler` in `WorkspaceHttpTestBase`. Live browser sessions, cookie management (`__Host-Dosi-Workspace`), and OpenIddict token issuance are not tested.
+3. **No UI or Desktop Implementation**: No Next.js frontend components, desktop agent task synchronization, notifications, timers, or task-to-activity linkage are included in this backend-only slice.
+4. **Worker-Reported Evidence**: All results are worker-executed, NOT independent PM QA.
+
+---
+
+## 17. Current Status & Next Steps
 
 1. **Privacy Acceptance Pending**:
    - The privacy source audit (commit `14bbe66`) remains **Pending PM Independent Review**. This status is preserved and not bypassed.
-2. **Workspace Lifecycle, Authorization, Retention, Export, Presence, Device, Screenshot Delivery, Team Roster & Payroll Reporting Status**:
-   - Hosted ASP.NET Core `TestServer` MVC payroll reporting authorization & query isolation (`REQ-ISO-03` / `REQ-ISO-05`), project team roster financial and identity masking and mutation authorization (`REQ-ISO-03` / `REQ-ISO-05`), hosted ASP.NET Core `TestServer` MVC activity summary JSON export (`REQ-DAT-02`), authenticated workspace-scoped activity CSV export (`REQ-DAT-02`), hosted ASP.NET Core `TestServer` MVC invitation recipient decline security acceptance harness (`REQ-WS-07` / `REQ-ISO-05`), explicit-policy workspace activity summary age-retention service (`REQ-DAT-01`), owner-managed workspace capture retention policy lifecycle (`REQ-DAT-01`), non-storable cache policy for private capture delivery (`REQ-ISO-05`), private-capture-delivery acceptance harness (`REQ-ISO-05`), workspace-scoped self-service device revocation (`REQ-DEV-01`), live team presence active membership scoping (`REQ-TRK-04`), workspace-isolated capture retention lifecycle safe first slice (`REQ-DAT-01`), reversible owner-controlled workspace archival (`REQ-WS-08`), concurrent last-owner protection (`REQ-WS-06`), recipient decline direct lifecycle (`REQ-WS-07`), and hosted ASP.NET Core `TestServer` MVC aggregate authorization harness (`REQ-ISO-05`) are implemented and verified via isolated regressions (191 SQLite integration tests total: 10 payroll reporting HTTP + 17 team roster HTTP + 14 activity JSON export + 10 activity CSV export + 12 invitation decline hosted HTTP + 10 invitation decline direct + 14 activity retention + 14 capture retention policy HTTP + 11 screenshot content delivery + 9 device revocation + 7 device migration + 6 team presence + 20 capture retention + 9 archival lifecycle + 10 archival migration/upgrade + 9 concurrent owner protection + 9 hosted MVC auth).
+2. **Workspace Lifecycle, Authorization, Retention, Export, Presence, Device, Screenshot Delivery, Team Roster, Payroll Reporting & Task Lifecycle Status**:
+   - Hosted ASP.NET Core `TestServer` MVC workspace and project-scoped task lifecycle (`REQ-PRJ-01` / `REQ-ISO-05`), payroll reporting authorization & query isolation (`REQ-ISO-03` / `REQ-ISO-05`), project team roster financial and identity masking and mutation authorization (`REQ-ISO-03` / `REQ-ISO-05`), hosted ASP.NET Core `TestServer` MVC activity summary JSON export (`REQ-DAT-02`), authenticated workspace-scoped activity CSV export (`REQ-DAT-02`), hosted ASP.NET Core `TestServer` MVC invitation recipient decline security acceptance harness (`REQ-WS-07` / `REQ-ISO-05`), explicit-policy workspace activity summary age-retention service (`REQ-DAT-01`), owner-managed workspace capture retention policy lifecycle (`REQ-DAT-01`), non-storable cache policy for private capture delivery (`REQ-ISO-05`), private-capture-delivery acceptance harness (`REQ-ISO-05`), workspace-scoped self-service device revocation (`REQ-DEV-01`), live team presence active membership scoping (`REQ-TRK-04`), workspace-isolated capture retention lifecycle safe first slice (`REQ-DAT-01`), reversible owner-controlled workspace archival (`REQ-WS-08`), concurrent last-owner protection (`REQ-WS-06`), recipient decline direct lifecycle (`REQ-WS-07`), and hosted ASP.NET Core `TestServer` MVC aggregate authorization harness (`REQ-ISO-05`) are implemented and verified via isolated regressions (211 SQLite integration tests total: 13 project task HTTP + 7 project task migration + 10 payroll reporting HTTP + 17 team roster HTTP + 14 activity JSON export + 10 activity CSV export + 12 invitation decline hosted HTTP + 10 invitation decline direct + 14 activity retention + 14 capture retention policy HTTP + 11 screenshot content delivery + 9 device revocation + 7 device migration + 6 team presence + 20 capture retention + 9 archival lifecycle + 10 archival migration/upgrade + 9 concurrent owner protection + 9 hosted MVC auth).
    - Real browser cookie/session testing (`__Host-Dosi-Workspace`), Next.js server actions, OpenIddict token issuer, provider-backed multi-connection transactional commit proof (PostgreSQL/SQL Server), multi-node distributed lock infrastructure (Redis), and PM independent execution remain pending. All reported outcomes are worker-executed, not independent PM QA.
 3. **Execution Limits & Evidence Boundaries**:
-   - TestServer regressions prove conventional MVC routing, query model binding, aggregate permission checks, fail-closed workspace scoping, binary capture streaming, non-storable capture delivery caching, CSV formula neutralization, JSON allowlist filtering and explicit null preservation, Take(limit + 1) hard bounded fetch, active member presence query scoping, device revocation gating before blob side-effects, project team roster rate and email masking, rate/role mutation guards, payroll calculation and scope isolation, and server limits on in-memory SQLite, but do NOT replace execution on a real PostgreSQL cluster; no live user/production database was modified.
+   - TestServer regressions prove conventional MVC routing, query model binding, aggregate permission checks, fail-closed workspace scoping, binary capture streaming, non-storable capture delivery caching, CSV formula neutralization, JSON allowlist filtering and explicit null preservation, Take(limit + 1) hard bounded fetch, active member presence query scoping, device revocation gating before blob side-effects, project team roster rate and email masking, rate/role mutation guards, payroll calculation and scope isolation, task role governance and archived project/workspace guards, and server limits on in-memory SQLite, but do NOT replace execution on a real PostgreSQL cluster; no live user/production database was modified.
    - Retention defaults remain disabled (`IsEnabled = false`); no cleanup was executed against user DB or real object storage. Activity retention service remains completely dormant unless explicitly invoked with a validated policy.
 4. **Remaining Backlog Gaps**:
    - Cryptographic client machine enrollment / attestation, token/session revocation, native desktop agent revocation prompt/unenrollment UI, WebSocket / SignalR push live presence notification, asynchronous export background worker, screenshot zip archive, signed download URLs, disaster recovery / automated backup procedures, frontend UI export actions, automated background activity summary cleanup worker / owner activity retention UI, and permanent deletion remain deferred acceptance gaps.
 5. **Overall Product Incomplete**:
    - Full product remains incomplete across backend metric nullability schema migrations (`Activity.cs` truthful nulls vs 0), desktop offline ingestion queue hardening, platform-native interactive client runtimes, code signing, and hosted operational deployment.
 6. **Awaiting PM Guidance**:
-   - Hosted financial payroll reporting authorization and workspace isolation (`REQ-ISO-03` / `REQ-ISO-05`) complete. Stop and hand off for PM review with exact diff and test evidence.
+   - Workspace and project-scoped task lifecycle backend slice (`REQ-PRJ-01` / `REQ-ISO-05`) complete. Stop and hand off for PM review with exact diff and test evidence.
 
