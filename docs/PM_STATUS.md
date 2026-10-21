@@ -852,11 +852,19 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
    - Result: **9 passed, 0 failed, exit 0**.
    - Verified scenarios:
      1. `Own_Device_Revocation_And_Repeated_Revoke_Are_Idempotent_And_Persisted`: Own device revoked successfully (200 OK); repeated revocation returns existing record idempotently without duplicate insertion.
-     2. `Post_Revoke_Heartbeat_And_Activity_Ingestion_Are_Denied_With_Zero_Blob_Effects`: Subsequent heartbeat returns 403 `Tracker:DeviceRevoked`; subsequent activity upload returns 403 `Tracker:DeviceRevoked` with zero screenshots and zero activity DB/blob side-effects.
+     2. `Post_Revoke_Heartbeat_And_Activity_Ingestion_Are_Denied_With_Zero_Blob_Effects`:
+        - Preseeded blob sentinel in `ScriptedBlobProvider`.
+        - Allowed-upload control on active non-revoked device with valid synthetic capture payload proves that the test fixture's blob provider instrumentation truthfully observes actual production blob writes (recording new blob keys under `activities/`).
+        - Subsequent heartbeat from revoked device returns 403 `Tracker:DeviceRevoked`.
+        - Subsequent activity upload from revoked device returns 403 `Tracker:DeviceRevoked`.
+        - Provider-level verification: asserts exact zero save attempts (`_blobProvider.Blobs.Count` unchanged), zero delete attempts (`_blobProvider.DeleteCount` unchanged), zero orphan blobs created for denied activity id, and byte-for-byte preservation of preseeded sentinel and earlier control blobs.
+        - Database-level verification: asserts zero new SQL rows in `AppActivities` and `AppScreenshots`.
      3. `Idempotent_Replay_Of_Pre_Revocation_Block_Succeeds_While_New_Block_Is_Denied`: Replay of pre-revocation block succeeds (200 OK); new block from revoked device is denied (403).
      4. `Live_Presence_Excludes_Revoked_Device_While_Retaining_Historical_Records`: Live presence query excludes revoked device; historical DB presence rows preserved.
      5. `Different_Device_In_A_Works_And_Same_Device_In_B_Is_Unaffected`: Another device for caller in A works normally; same device in Workspace B works normally (strictly workspace-scoped).
-     6. `Denies_Revoking_Another_Members_Device_Or_In_Foreign_Workspace_Without_Tombstones`: Attempt to revoke another member's device in A rejected with 400 `Tracker:DeviceNotObserved`; foreign workspace caller rejected with 403 `Tracker:NotWorkspaceMember`; no tombstones created.
+     6. `Denies_Revoking_Another_Members_Device_Or_In_Foreign_Workspace_Without_Tombstones`:
+        - Rejection of other member's device in A: `UserA` attempting to revoke `ColleagueA`'s device rejected with 400 `Tracker:DeviceNotObserved`; no revocation row created; colleague's device continues to work.
+        - Real-target foreign-workspace negative persistence regression: seeds an actually observed own target device for `UserA` plus nonempty existing sentinels (existing revocation sentinel `priorRevokedDevice`, historical presence, activity, and preseeded blob sentinel) in target workspace `wsA`. `ForeignUser` (with no membership in `wsA`) calls revoke targeting `UserA`'s real observed target device in `wsA`. Call returns 403 `Tracker:NotWorkspaceMember`. Explicit post-call inspection of target workspace `wsA` proves zero new tombstones for `ForeignUser`, `UserA`'s target device remains active and unrevoked, total revocation count in `wsA` remains exactly 1 (the pre-existing sentinel), presence/activity rows remain intact, target device continues to heartbeat successfully, and blob sentinels remain identical.
      7. `Presence_Pruning_Does_Not_Erase_Revocation_And_Unobserved_Target_Creates_No_Record`: Stale presence pruning cannot remove revocation; unobserved/empty target rejected (400) without creating records.
      8. `Status_Inspection_And_Bounded_Listing_Contracts`: Status inspection returns accurate boolean state, timestamp, and reason; bounded listing returns current user's revocations.
      9. `Legacy_Missing_DeviceId_Activity_Behavior_Is_Preserved`: Legacy activity upload without `DeviceId` succeeds normally.
@@ -868,11 +876,13 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
    - `Dosi.Tracker.Application.Tests`: 166 passed, exit 0
    - `Dosi.Tracker.Domain.Tests`: 60 passed, exit 0
 
-### D. Explicit Deferred Limitations
-1. **Device ID Binding**: `DeviceId` is a logical, client-reported UUID. It is NOT a hardware-bound cryptographic credential or TPM/Secure Enclave attestation.
-2. **Session & Token Scoping**: Revoking a logical device ID does NOT revoke OAuth refresh tokens, invalidate JWT bearer tokens, or execute global account logout. New-ID rotation, token revocation, enrollment credentials, and native desktop agent handling remain explicitly deferred.
-3. **Storage & Audit Preservation**: Historical activity blocks, screenshots, memberships, and presence rows are retained and never deleted upon device revocation.
-4. **Environment**: All executions performed on project-local disposable in-memory SQLite fixtures; production PostgreSQL cluster execution, native OS runtimes, and PM independent acceptance remain pending.
+### D. Explicit Deferred Limitations & Evidence Boundaries
+1. **Blob Provider vs SQL Row Counts**: Initial row-count assertions established SQL effects only; `ScriptedBlobProvider` instrumentation in `AfterAddApplication` and `ConfigureTestServerServices` now proves zero provider saves, zero deletes, and exact byte preservation across denied activity ingest.
+2. **Concurrency Caveat**: Sequential transaction-disabled SQLite test fixtures prove server routing, membership enforcement, and aggregate permissions, but do NOT prove atomic revoke/ingest serialization under multi-threaded races beyond the tested unit of work boundary.
+3. **Logical Client ID Rotation**: `DeviceId` is a client-reported UUID. A client rotating to a newly generated logical UUID is not bound to a hardware root of trust. Cryptographic machine attestation (TPM/Secure Enclave) and device enrollment credentials remain explicitly deferred.
+4. **Session & Token Scoping**: Revoking a logical device ID does NOT revoke OAuth refresh tokens, invalidate JWT bearer tokens, or execute global account logout. Machine-level containment is not claimed.
+5. **Storage & Audit Preservation**: Historical activity blocks, screenshots, memberships, and presence rows are retained and never deleted upon device revocation.
+6. **Execution Environment**: All executions performed on project-local disposable in-memory SQLite fixtures; production PostgreSQL cluster execution, native OS runtimes, and PM independent acceptance remain pending. Initial compile/fixture failures during test harness setup are not production failing-before evidence. No production code churn or invented vulnerabilities.
 
 ---
 

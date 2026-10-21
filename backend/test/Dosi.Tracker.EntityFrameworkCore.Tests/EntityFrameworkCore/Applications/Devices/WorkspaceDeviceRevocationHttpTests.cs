@@ -15,6 +15,7 @@ using Dosi.Tracker.Workspaces;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Shouldly;
+using Volo.Abp.BlobStoring;
 using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Guids;
 using Volo.Abp.Identity;
@@ -28,12 +29,14 @@ namespace Dosi.Tracker.EntityFrameworkCore.Applications.Devices;
 /// Regressions for workspace-scoped self-service device revocation:
 /// 1. Own device revoke and repeated revoke (idempotent 200 OK).
 /// 2. Post-revoke heartbeat denied (403 Tracker:DeviceRevoked) with persisted sentinels.
-/// 3. Post-revoke activity ingest denied (403 Tracker:DeviceRevoked) with zero blob/screenshot side-effects.
+/// 3. Post-revoke activity ingest denied (403 Tracker:DeviceRevoked) with zero blob/screenshot side-effects,
+///    verified against an instrumented project-local in-memory ScriptedBlobProvider and allowed-upload control.
 /// 4. Idempotent replay of previously stored block for revoked device succeeds.
 /// 5. Historical records retained and current live presence projection excluded.
 /// 6. Legitimate different device for caller in A continues to work.
 /// 7. Same user/device ID in Workspace B unaffected (strictly workspace-scoped).
-/// 8. Another member's device in A and foreign workspace targets denied without tombstones.
+/// 8. Another member's device in A and real-target foreign workspace revocation denied without creating tombstones,
+///    asserting exact seeded state preservation in target workspace.
 /// 9. Stale presence cleanup cannot remove persistent revocation record.
 /// 10. Malformed/unobserved device targets rejected (400 Tracker:DeviceNotObserved) without creating tombstones.
 /// 11. Status inspection and bounded listing contracts work as expected.
@@ -44,6 +47,8 @@ public class WorkspaceDeviceRevocationHttpTests : WorkspaceHttpTestBase<TrackerH
     private static readonly Guid UserA = Guid.Parse("6a701e62-0953-4dd3-910b-dc6cc93ccb01");
     private static readonly Guid ColleagueA = Guid.Parse("6a701e62-0953-4dd3-910b-dc6cc93ccb02");
     private static readonly Guid ForeignUser = Guid.Parse("6a701e62-0953-4dd3-910b-dc6cc93ccb03");
+
+    private readonly ScriptedBlobProvider _blobProvider = new();
 
     private readonly IRepository<Workspace, Guid> _workspaceRepository;
     private readonly IRepository<WorkspaceMember, Guid> _memberRepository;
@@ -72,6 +77,15 @@ public class WorkspaceDeviceRevocationHttpTests : WorkspaceHttpTestBase<TrackerH
         _currentWorkspace = GetRequiredService<ICurrentWorkspace>();
     }
 
+    protected override void AfterAddApplication(IServiceCollection services)
+    {
+        base.AfterAddApplication(services);
+        services.AddSingleton(_blobProvider);
+        services.AddSingleton<IBlobProvider>(_blobProvider);
+        services.Configure<AbpBlobStoringOptions>(options =>
+            options.Containers.ConfigureDefault(container => container.ProviderType = typeof(ScriptedBlobProvider)));
+    }
+
     protected override void ConfigureTestServerServices(IServiceCollection services)
     {
         var db = ServiceProvider.GetRequiredService<TrackerDbContext>();
@@ -84,6 +98,11 @@ public class WorkspaceDeviceRevocationHttpTests : WorkspaceHttpTestBase<TrackerH
             });
         });
         services.AddAlwaysDisableUnitOfWorkTransaction();
+
+        services.AddSingleton(_blobProvider);
+        services.AddSingleton<IBlobProvider>(_blobProvider);
+        services.Configure<AbpBlobStoringOptions>(options =>
+            options.Containers.ConfigureDefault(container => container.ProviderType = typeof(ScriptedBlobProvider)));
     }
 
     private new static HttpRequestMessage CreateRequest(
@@ -216,40 +235,73 @@ public class WorkspaceDeviceRevocationHttpTests : WorkspaceHttpTestBase<TrackerH
     {
         var (wsA, _, projA, _) = await SeedFixturesAsync();
         var client = CreateHttpClient();
-        var deviceId = _guidGenerator.Create();
+        var allowedDeviceId = _guidGenerator.Create();
+        var revokedDeviceId = _guidGenerator.Create();
 
-        // 1. Observe device via initial heartbeat
-        var initHeartbeat = CreateRequest(HttpMethod.Post, "/api/app/presence/heartbeat", UserA, wsA, new
+        // 1. Preseed a sentinel blob directly into the in-memory provider
+        var sentinelKey = "sentinels/preseeded-blob.bin";
+        var sentinelBytes = new byte[] { 0xDE, 0xAD, 0xBE, 0xEF, 0x42 };
+        _blobProvider.Blobs[sentinelKey] = (byte[])sentinelBytes.Clone();
+        var initialSaveCount = _blobProvider.Blobs.Count; // 1
+
+        // 2. Control upload on an active, non-revoked device with valid synthetic capture payload.
+        // Demonstrates that the test fixture's blob provider instrumentation truthfully observes actual production blob writes!
+        var jpeg = Convert.ToBase64String(new byte[] { 0xFF, 0xD8, 0xFF, 0xE0, 0x01, 0x02, 0xFF, 0xD9 });
+        var controlBlockTime = DateTime.UtcNow.AddMinutes(-30);
+        var controlActId = _guidGenerator.Create();
+        var controlUploadReq = CreateRequest(HttpMethod.Post, "/api/app/activity", UserA, wsA, new
         {
-            deviceId = deviceId,
-            status = "tracking"
+            projectId = projA,
+            clientActivityId = controlActId,
+            startedAt = controlBlockTime,
+            endedAt = controlBlockTime.AddMinutes(10),
+            productivity = 90,
+            deviceId = allowedDeviceId,
+            screenshotPngBase64 = jpeg,
+            screenshotThumbJpgBase64 = jpeg
         });
-        (await client.SendAsync(initHeartbeat)).StatusCode.ShouldBe(HttpStatusCode.OK);
+        var controlResp = await client.SendAsync(controlUploadReq);
+        controlResp.StatusCode.ShouldBe(HttpStatusCode.OK);
 
-        // Count initial screenshots and activities
-        long initialScreenshots = 0;
-        long initialActivities = 0;
+        // Verify that the control upload triggered real production blob writes in our instrumented provider
+        _blobProvider.Blobs.Count.ShouldBeGreaterThan(initialSaveCount);
+        _blobProvider.Blobs.Keys.Any(k => k.StartsWith("activities/")).ShouldBeTrue();
+
+        // 3. Take a strict snapshot of all blob keys and byte arrays, delete count, and SQL counts before the revoked attempt
+        var blobSnapshotBeforeDenied = _blobProvider.Blobs.ToDictionary(k => k.Key, v => v.Value.ToArray());
+        var blobCountBeforeDenied = _blobProvider.Blobs.Count;
+        var deleteCountBeforeDenied = _blobProvider.DeleteCount;
+
+        long sqlScreenshotsBeforeDenied = 0;
+        long sqlActivitiesBeforeDenied = 0;
         await WithUnitOfWorkAsync(async () =>
         {
             using (_currentWorkspace.Change(wsA))
             {
-                initialScreenshots = await _screenshotRepository.GetCountAsync();
-                initialActivities = await _activityRepository.GetCountAsync();
+                sqlScreenshotsBeforeDenied = await _screenshotRepository.GetCountAsync();
+                sqlActivitiesBeforeDenied = await _activityRepository.GetCountAsync();
             }
         });
 
-        // 2. Revoke the device
+        // 4. Observe revokedDeviceId in wsA, then revoke it
+        var initHeartbeat = CreateRequest(HttpMethod.Post, "/api/app/presence/heartbeat", UserA, wsA, new
+        {
+            deviceId = revokedDeviceId,
+            status = "tracking"
+        });
+        (await client.SendAsync(initHeartbeat)).StatusCode.ShouldBe(HttpStatusCode.OK);
+
         var revokeReq = CreateRequest(HttpMethod.Post, "/api/app/device/revoke", UserA, wsA, new
         {
-            deviceId = deviceId,
+            deviceId = revokedDeviceId,
             reason = "Compromised machine"
         });
         (await client.SendAsync(revokeReq)).StatusCode.ShouldBe(HttpStatusCode.OK);
 
-        // 3. Subsequent heartbeat from revoked device is DENIED (403 Forbidden with Tracker:DeviceRevoked)
+        // 5. Subsequent heartbeat from revoked device is DENIED (403 Forbidden with Tracker:DeviceRevoked)
         var deniedHeartbeat = CreateRequest(HttpMethod.Post, "/api/app/presence/heartbeat", UserA, wsA, new
         {
-            deviceId = deviceId,
+            deviceId = revokedDeviceId,
             status = "tracking"
         });
         var hbResp = await client.SendAsync(deniedHeartbeat);
@@ -257,18 +309,17 @@ public class WorkspaceDeviceRevocationHttpTests : WorkspaceHttpTestBase<TrackerH
         var hbBody = await hbResp.Content.ReadAsStringAsync();
         hbBody.ShouldContain("Tracker:DeviceRevoked");
 
-        // 4. Subsequent activity ingestion from revoked device is DENIED (403 Forbidden with Tracker:DeviceRevoked)
-        var blockTime = DateTime.UtcNow.AddMinutes(-10);
-        var jpeg = Convert.ToBase64String(new byte[] { 0xFF, 0xD8, 0xFF, 0xE0, 0x01, 0x02, 0xFF, 0xD9 });
-        var activityClientGuid = _guidGenerator.Create();
+        // 6. Subsequent activity upload from revoked device is DENIED (403 Forbidden with Tracker:DeviceRevoked)
+        var deniedBlockTime = DateTime.UtcNow.AddMinutes(-10);
+        var deniedActId = _guidGenerator.Create();
         var deniedActivityReq = CreateRequest(HttpMethod.Post, "/api/app/activity", UserA, wsA, new
         {
             projectId = projA,
-            clientActivityId = activityClientGuid,
-            startedAt = blockTime,
-            endedAt = blockTime.AddMinutes(10),
+            clientActivityId = deniedActId,
+            startedAt = deniedBlockTime,
+            endedAt = deniedBlockTime.AddMinutes(10),
             productivity = 80,
-            deviceId = deviceId,
+            deviceId = revokedDeviceId,
             screenshotPngBase64 = jpeg,
             screenshotThumbJpgBase64 = jpeg
         });
@@ -278,15 +329,29 @@ public class WorkspaceDeviceRevocationHttpTests : WorkspaceHttpTestBase<TrackerH
         var actBody = await actResp.Content.ReadAsStringAsync();
         actBody.ShouldContain("Tracker:DeviceRevoked");
 
-        // 5. Zero persistence / blob side effects: activity count and screenshot count remain unchanged!
+        // 7. Verify ZERO blob writes, ZERO blob deletes, and exact preserved preseeded/control blob keys & bytes
+        _blobProvider.Blobs.Count.ShouldBe(blobCountBeforeDenied);
+        _blobProvider.DeleteCount.ShouldBe(deleteCountBeforeDenied);
+
+        foreach (var (key, expectedBytes) in blobSnapshotBeforeDenied)
+        {
+            _blobProvider.Blobs.TryGetValue(key, out var currentBytes).ShouldBeTrue();
+            currentBytes.ShouldNotBeNull();
+            currentBytes.SequenceEqual(expectedBytes).ShouldBeTrue();
+        }
+
+        // Prove no orphan blob was created for the denied activity
+        _blobProvider.Blobs.Keys.Any(k => k.Contains(deniedActId.ToString())).ShouldBeFalse();
+
+        // 8. Verify SQL row counts (activities and screenshots) remain completely unchanged
         await WithUnitOfWorkAsync(async () =>
         {
             using (_currentWorkspace.Change(wsA))
             {
-                var finalScreenshots = await _screenshotRepository.GetCountAsync();
-                var finalActivities = await _activityRepository.GetCountAsync();
-                finalScreenshots.ShouldBe(initialScreenshots);
-                finalActivities.ShouldBe(initialActivities);
+                var sqlScreenshotsAfter = await _screenshotRepository.GetCountAsync();
+                var sqlActivitiesAfter = await _activityRepository.GetCountAsync();
+                sqlScreenshotsAfter.ShouldBe(sqlScreenshotsBeforeDenied);
+                sqlActivitiesAfter.ShouldBe(sqlActivitiesBeforeDenied);
             }
         });
     }
@@ -467,13 +532,31 @@ public class WorkspaceDeviceRevocationHttpTests : WorkspaceHttpTestBase<TrackerH
     [Fact]
     public async Task Denies_Revoking_Another_Members_Device_Or_In_Foreign_Workspace_Without_Tombstones()
     {
-        var (wsA, wsB, _, _) = await SeedFixturesAsync();
+        var (wsA, wsB, projA, projB) = await SeedFixturesAsync();
         var client = CreateHttpClient();
         var colleagueDeviceId = _guidGenerator.Create();
+        var userATargetDevice = _guidGenerator.Create();
+        var priorRevokedDevice = _guidGenerator.Create();
 
-        // 1. Observe colleague's device in wsA
+        // 1. Establish observed devices and nonempty sentinels in target workspace wsA:
+        // A. ColleagueA's device
         var hbColleague = CreateRequest(HttpMethod.Post, "/api/app/presence/heartbeat", ColleagueA, wsA, new { deviceId = colleagueDeviceId, status = "tracking" });
         (await client.SendAsync(hbColleague)).StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        // B. UserA's real observed target device in wsA
+        var hbUserA = CreateRequest(HttpMethod.Post, "/api/app/presence/heartbeat", UserA, wsA, new { deviceId = userATargetDevice, status = "tracking" });
+        (await client.SendAsync(hbUserA)).StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        // C. Pre-existing revocation sentinel in wsA for UserA
+        var hbPrior = CreateRequest(HttpMethod.Post, "/api/app/presence/heartbeat", UserA, wsA, new { deviceId = priorRevokedDevice, status = "tracking" });
+        (await client.SendAsync(hbPrior)).StatusCode.ShouldBe(HttpStatusCode.OK);
+        var preRevokeReq = CreateRequest(HttpMethod.Post, "/api/app/device/revoke", UserA, wsA, new { deviceId = priorRevokedDevice, reason = "Pre-existing revocation sentinel" });
+        (await client.SendAsync(preRevokeReq)).StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        // D. Preseeded blob sentinel in wsA
+        var blobSentinelKey = $"workspaces/{wsA}/sentinel.bin";
+        var blobSentinelBytes = new byte[] { 0xAA, 0xBB, 0xCC };
+        _blobProvider.Blobs[blobSentinelKey] = (byte[])blobSentinelBytes.Clone();
 
         // 2. UserA attempts to revoke ColleagueA's device in wsA -> 400 Tracker:DeviceNotObserved (UserA never observed it as own)
         var revokeOtherReq = CreateRequest(HttpMethod.Post, "/api/app/device/revoke", UserA, wsA, new { deviceId = colleagueDeviceId });
@@ -482,7 +565,7 @@ public class WorkspaceDeviceRevocationHttpTests : WorkspaceHttpTestBase<TrackerH
         var errBody = await revokeOtherResp.Content.ReadAsStringAsync();
         errBody.ShouldContain("Tracker:DeviceNotObserved");
 
-        // Verify no revocation record created
+        // Verify no revocation record created for colleagueDeviceId
         await WithUnitOfWorkAsync(async () =>
         {
             using (_currentWorkspace.Change(wsA))
@@ -496,10 +579,53 @@ public class WorkspaceDeviceRevocationHttpTests : WorkspaceHttpTestBase<TrackerH
         var hbColleague2 = CreateRequest(HttpMethod.Post, "/api/app/presence/heartbeat", ColleagueA, wsA, new { deviceId = colleagueDeviceId, status = "tracking" });
         (await client.SendAsync(hbColleague2)).StatusCode.ShouldBe(HttpStatusCode.OK);
 
-        // 3. ForeignUser (only in wsB) attempts to revoke in wsA -> 403 Tracker:NotWorkspaceMember
-        var foreignReq = CreateRequest(HttpMethod.Post, "/api/app/device/revoke", ForeignUser, wsA, new { deviceId = _guidGenerator.Create() });
-        var foreignResp = await client.SendAsync(foreignReq);
-        foreignResp.StatusCode.ShouldBe(HttpStatusCode.Forbidden);
+        // 3. Real-target foreign-workspace negative persistence case:
+        // ForeignUser (who belongs ONLY to wsB, has NO membership in wsA) calls revoke targeting
+        // the REAL observed own device of UserA (userATargetDevice) in wsA!
+        var foreignTargetReq = CreateRequest(HttpMethod.Post, "/api/app/device/revoke", ForeignUser, wsA, new
+        {
+            deviceId = userATargetDevice,
+            reason = "Malicious foreign revoke attempt"
+        });
+        var foreignTargetResp = await client.SendAsync(foreignTargetReq);
+        foreignTargetResp.StatusCode.ShouldBe(HttpStatusCode.Forbidden);
+        var foreignErrBody = await foreignTargetResp.Content.ReadAsStringAsync();
+        foreignErrBody.ShouldContain("Tracker:NotWorkspaceMember");
+
+        // 4. Explicitly inspect target workspace wsA afterward to assert NO new tombstones and exact state preservation:
+        await WithUnitOfWorkAsync(async () =>
+        {
+            using (_currentWorkspace.Change(wsA))
+            {
+                // Assert no revocation tombstone was created for ForeignUser in wsA
+                var foreignRevocationExists = await _revocationRepository.AnyAsync(r => r.WorkspaceId == wsA && r.UserId == ForeignUser);
+                foreignRevocationExists.ShouldBeFalse();
+
+                // Assert userATargetDevice was NOT revoked (remains active and intact)
+                var targetRevocationExists = await _revocationRepository.AnyAsync(r => r.WorkspaceId == wsA && r.DeviceId == userATargetDevice);
+                targetRevocationExists.ShouldBeFalse();
+
+                // Assert exact total revocation count in wsA is still exactly 1 (only priorRevokedDevice)
+                var totalRevocationsInWsA = await _revocationRepository.CountAsync(r => r.WorkspaceId == wsA);
+                totalRevocationsInWsA.ShouldBe(1);
+
+                var priorRevocation = await _revocationRepository.FirstOrDefaultAsync(r => r.WorkspaceId == wsA && r.DeviceId == priorRevokedDevice);
+                priorRevocation.ShouldNotBeNull();
+                priorRevocation.Reason.ShouldBe("Pre-existing revocation sentinel");
+
+                // Assert target presence in wsA survived intact
+                var presenceCountInWsA = await _presenceRepository.CountAsync(p => p.WorkspaceId == wsA);
+                presenceCountInWsA.ShouldBeGreaterThanOrEqualTo(2);
+            }
+        });
+
+        // Assert target device userATargetDevice continues to function normally in wsA
+        var hbUserAAfter = CreateRequest(HttpMethod.Post, "/api/app/presence/heartbeat", UserA, wsA, new { deviceId = userATargetDevice, status = "tracking" });
+        (await client.SendAsync(hbUserAAfter)).StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        // Assert blob sentinel in _blobProvider is preserved
+        _blobProvider.Blobs.ContainsKey(blobSentinelKey).ShouldBeTrue();
+        _blobProvider.Blobs[blobSentinelKey].SequenceEqual(blobSentinelBytes).ShouldBeTrue();
     }
 
     [Fact]
