@@ -14,6 +14,7 @@
 
   <ItemGroup>
     <Compile Include="..\..\src\Dosi.Tracker.HttpApi.Host\Workspaces\WorkspaceResolution.cs" Link="Workspaces\Host\WorkspaceResolution.cs" />
+    <Compile Include="..\..\src\Dosi.Tracker.HttpApi.Host\Security\CaptureDeliveryCachePolicy.cs" Link="Security\Host\CaptureDeliveryCachePolicy.cs" />
   </ItemGroup>
 
   <ItemGroup>

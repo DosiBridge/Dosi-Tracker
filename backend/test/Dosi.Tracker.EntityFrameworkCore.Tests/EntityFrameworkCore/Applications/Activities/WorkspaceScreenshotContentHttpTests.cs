@@ -287,6 +287,7 @@ public class WorkspaceScreenshotContentHttpTests : WorkspaceHttpTestBase<Tracker
         var resp = await client.SendAsync(req);
 
         resp.StatusCode.ShouldBe(HttpStatusCode.Unauthorized);
+        resp.Headers.CacheControl?.NoStore.ShouldBeTrue();
         _blobProvider.GetCount.ShouldBe(0);
         _blobProvider.GetAttempts.ShouldBeEmpty();
     }
@@ -301,6 +302,7 @@ public class WorkspaceScreenshotContentHttpTests : WorkspaceHttpTestBase<Tracker
         var reqMissing = CreateCustomRequest(HttpMethod.Get, $"/api/app/activity/screenshot/{fix.ScA_Dual}/content", DualUser, rawWorkspaceHeader: null);
         var respMissing = await client.SendAsync(reqMissing);
         respMissing.StatusCode.ShouldBe(HttpStatusCode.BadRequest);
+        respMissing.Headers.CacheControl?.NoStore.ShouldBeTrue();
         var bodyMissing = await respMissing.Content.ReadAsStringAsync();
         bodyMissing.ShouldContain("Tracker:WorkspaceRequired");
 
@@ -308,6 +310,7 @@ public class WorkspaceScreenshotContentHttpTests : WorkspaceHttpTestBase<Tracker
         var reqEmpty = CreateCustomRequest(HttpMethod.Get, $"/api/app/activity/screenshot/{fix.ScA_Dual}/content", DualUser, rawWorkspaceHeader: "   ");
         var respEmpty = await client.SendAsync(reqEmpty);
         respEmpty.StatusCode.ShouldBe(HttpStatusCode.BadRequest);
+        respEmpty.Headers.CacheControl?.NoStore.ShouldBeTrue();
         var bodyEmpty = await respEmpty.Content.ReadAsStringAsync();
         bodyEmpty.ShouldContain("Tracker:WorkspaceRequired");
 
@@ -315,6 +318,7 @@ public class WorkspaceScreenshotContentHttpTests : WorkspaceHttpTestBase<Tracker
         var reqMalformed = CreateCustomRequest(HttpMethod.Get, $"/api/app/activity/screenshot/{fix.ScA_Dual}/content", DualUser, rawWorkspaceHeader: "not-a-guid");
         var respMalformed = await client.SendAsync(reqMalformed);
         respMalformed.StatusCode.ShouldBe(HttpStatusCode.BadRequest);
+        respMalformed.Headers.CacheControl?.NoStore.ShouldBeTrue();
         var bodyMalformed = await respMalformed.Content.ReadAsStringAsync();
         bodyMalformed.ShouldContain("Tracker:WorkspaceRequired");
 
@@ -322,6 +326,7 @@ public class WorkspaceScreenshotContentHttpTests : WorkspaceHttpTestBase<Tracker
         var reqZero = CreateCustomRequest(HttpMethod.Get, $"/api/app/activity/screenshot/{fix.ScA_Dual}/content", DualUser, rawWorkspaceHeader: Guid.Empty.ToString());
         var respZero = await client.SendAsync(reqZero);
         respZero.StatusCode.ShouldBe(HttpStatusCode.BadRequest);
+        respZero.Headers.CacheControl?.NoStore.ShouldBeTrue();
         var bodyZero = await respZero.Content.ReadAsStringAsync();
         bodyZero.ShouldContain("Tracker:WorkspaceRequired");
 
@@ -340,6 +345,7 @@ public class WorkspaceScreenshotContentHttpTests : WorkspaceHttpTestBase<Tracker
         var resp = await client.SendAsync(req);
 
         resp.StatusCode.ShouldBe(HttpStatusCode.Forbidden);
+        resp.Headers.CacheControl?.NoStore.ShouldBeTrue();
         var body = await resp.Content.ReadAsStringAsync();
         body.ShouldContain("Tracker:NotWorkspaceMember");
 
@@ -359,6 +365,7 @@ public class WorkspaceScreenshotContentHttpTests : WorkspaceHttpTestBase<Tracker
 
         // EF Core global query filter prevents discovering B's screenshot under A -> non-disclosing 404
         resp.StatusCode.ShouldBe(HttpStatusCode.NotFound);
+        resp.Headers.CacheControl?.NoStore.ShouldBeTrue();
 
         // Body must NOT leak binary image data, storage URL, or foreign activity identifiers
         var body = await resp.Content.ReadAsStringAsync();
@@ -382,6 +389,7 @@ public class WorkspaceScreenshotContentHttpTests : WorkspaceHttpTestBase<Tracker
         var respOther = await client.SendAsync(reqOther);
 
         respOther.StatusCode.ShouldBe(HttpStatusCode.NotFound);
+        respOther.Headers.CacheControl?.NoStore.ShouldBeTrue();
         var bodyOther = await respOther.Content.ReadAsStringAsync();
         bodyOther.ShouldNotContain(fix.StorageUrlB_Other);
         _blobProvider.GetAttempts.Contains(fix.StorageUrlB_Other).ShouldBeFalse();
@@ -392,6 +400,9 @@ public class WorkspaceScreenshotContentHttpTests : WorkspaceHttpTestBase<Tracker
         var respOwn = await client.SendAsync(reqOwn);
 
         respOwn.StatusCode.ShouldBe(HttpStatusCode.OK);
+        respOwn.Headers.CacheControl.ShouldNotBeNull();
+        respOwn.Headers.CacheControl.NoStore.ShouldBeTrue();
+        respOwn.Headers.CacheControl.Private.ShouldBeTrue();
         respOwn.Content.Headers.ContentType?.MediaType.ShouldBe("image/png");
 
         var receivedBytes = await respOwn.Content.ReadAsByteArrayAsync();
@@ -417,13 +428,18 @@ public class WorkspaceScreenshotContentHttpTests : WorkspaceHttpTestBase<Tracker
         var bytesOwnA = await respOwnA.Content.ReadAsByteArrayAsync();
         bytesOwnA.SequenceEqual(fix.BytesA_Dual).ShouldBeTrue();
         respOwnA.Content.Headers.ContentDisposition?.FileName.ShouldBe($"{fix.ActA_Dual}-screen.jpg");
-        // Inspect response cache policy: endpoint returns direct FileContentResult without custom Cache-Control header
-        respOwnA.Headers.CacheControl.ShouldBeNull();
+        // Inspect response cache policy: private capture delivery must enforce explicit non-storable caching
+        respOwnA.Headers.CacheControl.ShouldNotBeNull();
+        respOwnA.Headers.CacheControl.NoStore.ShouldBeTrue();
+        respOwnA.Headers.CacheControl.Private.ShouldBeTrue();
 
         // B. Read colleague's capture in wsA (allowed because Owner has ViewAll in wsA)
         var reqOnlyA = CreateRequest(HttpMethod.Get, $"/api/app/activity/screenshot/{fix.ScA_Only}/content", DualUser, fix.WsA);
         var respOnlyA = await client.SendAsync(reqOnlyA);
         respOnlyA.StatusCode.ShouldBe(HttpStatusCode.OK);
+        respOnlyA.Headers.CacheControl.ShouldNotBeNull();
+        respOnlyA.Headers.CacheControl.NoStore.ShouldBeTrue();
+        respOnlyA.Headers.CacheControl.Private.ShouldBeTrue();
         respOnlyA.Content.Headers.ContentType?.MediaType.ShouldBe("image/jpeg");
         var bytesOnlyA = await respOnlyA.Content.ReadAsByteArrayAsync();
         bytesOnlyA.SequenceEqual(fix.BytesA_Only).ShouldBeTrue();
@@ -434,6 +450,9 @@ public class WorkspaceScreenshotContentHttpTests : WorkspaceHttpTestBase<Tracker
         var reqOwnB = CreateRequest(HttpMethod.Get, $"/api/app/activity/screenshot/{fix.ScB_Dual}/content", DualUser, fix.WsB);
         var respOwnB = await client.SendAsync(reqOwnB);
         respOwnB.StatusCode.ShouldBe(HttpStatusCode.OK);
+        respOwnB.Headers.CacheControl.ShouldNotBeNull();
+        respOwnB.Headers.CacheControl.NoStore.ShouldBeTrue();
+        respOwnB.Headers.CacheControl.Private.ShouldBeTrue();
         respOwnB.Content.Headers.ContentType?.MediaType.ShouldBe("image/png");
         var bytesOwnB = await respOwnB.Content.ReadAsByteArrayAsync();
         bytesOwnB.SequenceEqual(fix.BytesB_Dual).ShouldBeTrue();
@@ -461,6 +480,7 @@ public class WorkspaceScreenshotContentHttpTests : WorkspaceHttpTestBase<Tracker
         var reqInactive = CreateRequest(HttpMethod.Get, $"/api/app/activity/screenshot/{fix.ScA_Only}/content", InactiveUserA, fix.WsA);
         var respInactive = await client.SendAsync(reqInactive);
         respInactive.StatusCode.ShouldBe(HttpStatusCode.Forbidden);
+        respInactive.Headers.CacheControl?.NoStore.ShouldBeTrue();
         var bodyInactive = await respInactive.Content.ReadAsStringAsync();
         bodyInactive.ShouldContain("Tracker:NotWorkspaceMember");
 
@@ -478,6 +498,7 @@ public class WorkspaceScreenshotContentHttpTests : WorkspaceHttpTestBase<Tracker
         var reqRemoved = CreateRequest(HttpMethod.Get, $"/api/app/activity/screenshot/{fix.ScA_Only}/content", UserAOnly, fix.WsA);
         var respRemoved = await client.SendAsync(reqRemoved);
         respRemoved.StatusCode.ShouldBe(HttpStatusCode.Forbidden);
+        respRemoved.Headers.CacheControl?.NoStore.ShouldBeTrue();
         var bodyRemoved = await respRemoved.Content.ReadAsStringAsync();
         bodyRemoved.ShouldContain("Tracker:NotWorkspaceMember");
 
@@ -497,6 +518,7 @@ public class WorkspaceScreenshotContentHttpTests : WorkspaceHttpTestBase<Tracker
 
         // Must yield mapped 404 Not Found, not successful 200 OK with empty 0 bytes
         resp.StatusCode.ShouldBe(HttpStatusCode.NotFound);
+        resp.Headers.CacheControl?.NoStore.ShouldBeTrue();
 
         // Provider instrumentation confirms GetOrNullAsync was attempted for that key and returned null
         _blobProvider.GetCount.ShouldBe(1);
@@ -514,6 +536,7 @@ public class WorkspaceScreenshotContentHttpTests : WorkspaceHttpTestBase<Tracker
         var resp = await client.SendAsync(req);
 
         resp.StatusCode.ShouldBe(HttpStatusCode.NotFound);
+        resp.Headers.CacheControl?.NoStore.ShouldBeTrue();
         _blobProvider.GetCount.ShouldBe(0);
         _blobProvider.GetAttempts.ShouldBeEmpty();
     }

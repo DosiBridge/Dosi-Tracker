@@ -13,6 +13,7 @@ using System.Threading.Tasks;
 using System.Diagnostics;
 using Dosi.Tracker.Permissions;
 using Dosi.Tracker.Projects;
+using Dosi.Tracker.Security;
 using Dosi.Tracker.Workspaces;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authorization;
@@ -223,6 +224,7 @@ public abstract class WorkspaceHttpTestBase<TStartupModule> : TrackerApplication
                 {
                     app.InitializeApplication();
                     app.UseRouting();
+                    app.UseCaptureDeliveryCachePolicy();
                     app.UseAuthentication();
 
                     app.Use(async (context, next) =>

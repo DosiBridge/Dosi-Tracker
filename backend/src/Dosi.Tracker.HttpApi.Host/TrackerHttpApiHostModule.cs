@@ -504,6 +504,7 @@ public class TrackerHttpApiHostModule : AbpModule
         app.UseCors();
         // After CORS, so a 429 still carries Access-Control-Allow-Origin and the web app can tell the user to wait.
         app.UseTrackerAuthRateLimiting();
+        app.UseCaptureDeliveryCachePolicy();
         app.UseAuthentication();
         app.UseAbpOpenIddictValidation();
 
