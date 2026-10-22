@@ -174,6 +174,6 @@ fn installer_lifecycle_full_suite_passes() {
         output.status.success(),
         "Installer lifecycle test suite must pass with exit 0"
     );
-    assert!(stdout.contains("Passed: 10"));
+    assert!(stdout.contains("Passed: 14"));
     assert!(stdout.contains("Failed: 0"));
 }

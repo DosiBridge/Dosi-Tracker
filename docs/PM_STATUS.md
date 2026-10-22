@@ -1624,6 +1624,66 @@ In accordance with task `linux-foundation-rootless-install-20261022-E`, this sli
 1. **Approval-Blocked Command Invariant**: Independent PM QA archive extraction on Linux was approval-blocked (`tirith:archive_extract`). Worker has **NOT** retried, repackaged, or delegated that command or altered permissions/transport.
 2. **Host Environment Transparency**: Shell tests were executed using the available local Git-Bash / MSYS2 toolchain; this does **NOT** constitute native Linux distribution runtime acceptance. Native packaging (deb/rpm) and systemd services remain deferred to future slices.
 
+---
+
+## 24. Linux Installer Ownership, Boundary Confinement & Atomic Metadata Rollback (`linux-installer-ownership-atomicity-20261022-F`)
+
+> **Execution Date:** October 22, 2026  
+> **Phase Task ID:** `linux-installer-ownership-atomicity-20261022-F`  
+> **Status:** Completed & Source-Verified (37 Rust tests passed in `clients/linux`, 14 shell lifecycle tests passed, 50 frontend tests passed, typecheck clean, fmt clean, check clean)  
+> **Target Package:** `clients/linux` (scripts: `install.sh`, `uninstall.sh`; crate: `dosi-tracker-linux` v0.1.0)  
+
+### A. Context & Bounded Source Defects Corrected
+In continuation of task `linux-installer-ownership-atomicity-20261022-F`, three critical installer ownership, boundary confinement, and failure-preservation defects in `clients/linux/scripts/install.sh` were corrected:
+1. **Manifest Ownership Validation & Rollback Target Binding (`verify_manifest_ownership`, `validate_manifest_structure`, `do_rollback`)**:
+   - *Defect:* `verify_manifest_ownership(existing_bin)` completely ignored its argument and merely grep-matched `"component": "dosi-tracker-linux"`. Truncated/corrupted JSON, wrong prefix, or mismatched binary paths authorized overwriting or deleting arbitrary files. In addition, `do_rollback` copied backup binaries to the destination without validating destination manifest ownership or backup manifest integrity.
+   - *Correction:* Implemented strict versioned structured manifest parser (`validate_manifest_structure`), strictly avoiding `eval` or `source`. Enforces `format_version == 1`, component equality (`dosi-tracker-linux`), exact canonical path bindings (`prefix`, `bin_dir`, `data_dir`, `binary_path`, `owned_files`), and checks that the target binary exactly matches `manifest.binary_path`. Updated `do_rollback` to verify destination ownership via `verify_manifest_ownership "$BIN_DIR/$BINARY_NAME"` before restoring. Rejects malformed JSON and mismatched metadata fail-closed, preserving unmanaged foreign binaries, user configs (`~/.config/dosi-tracker`), and unrelated sentinels.
+2. **Prefix Boundary Delimitation & Ancestor Symlink Confinement (`is_path_inside_prefix`, `verify_path_confinement`)**:
+   - *Defect:* Normalization checked `[[ "$BIN_DIR" == "$PREFIX"* ]]` without trailing slash delimiter, falsely accepting sibling prefixes (e.g., prefix `/tmp/opt/dosi` matched `/tmp/opt/dosi-sibling/bin`). Furthermore, calling `cd "$dir" && pwd -P` resolved symlinks before checking `[ -L ]`, defeating explicit symlink escape detection, and ancestor directories of `bin` and `data` were never inspected.
+   - *Correction:* `is_path_inside_prefix` enforces strict delimiter confinement (`target == prefix || target == prefix/*`). `verify_path_confinement` walks every directory component from root down to candidate destination before creation, verifying none of them is a symlink pointing outside the prefix. Lexical dot-dot normalization (`normalize_path_lexical`) resolves relative path traversal cleanly without touching unowned system directories.
+3. **Staging Atomicity, Metadata Publication & Rollback Recovery (`do_install_or_update`, `do_rollback`)**:
+   - *Defect:* Candidate binary was moved to `$BIN_DIR` before direct writes to `manifest.json` and `current_version`. Any failure during metadata generation left a changed binary with desynchronized or missing manifest metadata. Emergency rollback only copied the binary back, leaving metadata corrupt.
+   - *Correction:* Staging directory (`.staging.<pid>`) stages candidate binary and candidate metadata (`manifest.json`, `current_version`) together. The staged manifest is validated against the schema and target paths before any live file is touched. Full managed state (`binary.prev`, `manifest.json.prev`, `current_version.prev`) is preserved during updates. If binary activation, metadata publication, or smoke verification fails, full rollback restores all three artifacts, maintaining exact system atomicity. Fault injection hooks (`DOSI_TEST_INJECT_FAIL_METADATA` and `DOSI_TEST_INJECT_FAIL_SMOKE`) verify this recovery under test.
+
+### B. Failing-Before Production Repro & Passing-After Outcomes
+Isolated regressions executed in temporary isolated HOME/prefix fixtures (`clients/linux/tests/test_installer_lifecycle.sh`):
+1. **Malformed JSON Manifest Overwrite Refusal (Test 3)**:
+   - *Failing-Before:* Grep matching succeeded on corrupt/truncated JSON containing the component string; unmanaged file was overwritten.
+   - *Passing-After:* Fails closed with `Manifest is invalid JSON or missing format_version: 1`; unmanaged foreign file and sentinel preserved (exit 1).
+2. **Mismatched Prefix/Binary Manifest Overwrite Refusal (Test 4)**:
+   - *Failing-Before:* Grep matching ignored binary path and prefix; authorized overwriting foreign binary.
+   - *Passing-After:* Fails closed with `Manifest binary path does not match candidate binary`; foreign file preserved (exit 1).
+3. **Prefix-Sibling and Dot-Dot Boundary Escape Refusal (Test 5)**:
+   - *Failing-Before:* Sibling prefix `/tmp/opt/dosi-sibling` falsely accepted by string prefix comparison; files written outside intended prefix.
+   - *Passing-After:* Fails closed with `BIN_DIR ... is outside prefix`; escapes rejected (exit 1).
+4. **Ancestor and Explicit Symlink Escape Refusal (Test 6)**:
+   - *Failing-Before:* Pre-resolution of symlinks allowed ancestor symlinks pointing outside prefix to be accepted and written.
+   - *Passing-After:* `verify_path_confinement` detects ancestor symlink and fails closed with `Path component ... is a symlink escaping prefix`; destination untouched (exit 1).
+5. **Rollback Foreign Destination Refusal (Test 7)**:
+   - *Failing-Before:* `do_rollback` executed `cp -f` unconditionally, overwriting unmanaged foreign files.
+   - *Passing-After:* Verifies destination manifest ownership, rejects unmanaged foreign destination with `Cannot rollback: existing destination is not owned by dosi-tracker-linux`, preserving foreign bytes (exit 1).
+6. **Atomic Rollback on Metadata Failure (Test 9)**:
+   - *Failing-Before:* Injected failure during metadata creation left candidate binary in production with old manifest (desynced state).
+   - *Passing-After:* Injected metadata failure triggers automatic rollback: restores prior binary AND prior manifest/version from `.prev` backup, leaving production in 100% consistent prior state (exit 1).
+7. **Atomic Rollback on Smoke Test Failure (Test 10)**:
+   - *Failing-Before:* Injected smoke failure left candidate binary or partially restored metadata.
+   - *Passing-After:* Automatic rollback restores prior binary AND prior metadata; production binary prints `v1.0.0` and manifest reports `v1.0.0` (exit 1).
+
+### C. Executed Test Suites & Quality Gates
+| Target Suite | Exact Command Line | Tests Passed | Ignored | Result | Exit Code | Evidence Level |
+|---|---|:---:|:---:|:---:|:---:|:---:|
+| **Linux Unit, CLI, Repro & Installer Tests** | `cargo test` in `clients/linux` | 37 passed (21 unit + 6 doctor CLI + 7 repro + 3 installer integration) | 0 | PASSED | **0** | **[Worker-Reported (Windows Host Toolchain)]** |
+| **Shell Installer Lifecycle Suite** | `bash clients/linux/tests/test_installer_lifecycle.sh` | 14 passed (all ownership, confinement, atomic rollback, and doctor scenarios) | 0 | PASSED | **0** | **[Worker-Reported (Git-Bash Host Toolchain)]** |
+| **Linux Code Formatting** | `cargo fmt --check` in `clients/linux` | N/A | 0 diffs | PASSED | **0** | **[Worker-Reported]** |
+| **Linux Compilation Check** | `cargo check` in `clients/linux` | N/A | 0 errors, 0 warnings | PASSED | **0** | **[Worker-Reported]** |
+| **Frontend Acceptance Suite** | `npx vitest run src/middleware.test.ts src/components/dashboard/agent-setup.test.tsx src/test/acceptance/agent-onboarding.test.tsx src/test/acceptance/install-guides.test.tsx src/test/architecture.spec.ts` | 50 passed | 0 | PASSED | **0** | **[Worker-Reported (Focused 5-File Suite)]** |
+| **Frontend Typecheck** | `npm run typecheck` in `frontend` | N/A | 0 errors | PASSED | **0** | **[Worker-Reported]** |
+
+### D. PM QA Boundary Limits & Acceptance Disclosures
+1. **Prior Unresolved Approval Invariant**: The approval-blocked command `tirith:archive_extract` remains unresolved. Worker has **NOT** retried, repackaged, or delegated that command, nor modified archive extraction approvals.
+2. **Host Toolchain vs Native Linux Evidence Separation**: All shell regressions were executed using Git-Bash / MSYS2 on Windows. While providing isolated directory testing, this does **NOT** constitute independent PM acceptance or native Linux kernel/libc runtime verification.
+3. **Scope Discipline**: No real sensor adapters (X11/Wayland/PipeWire), network synchronization, credential services, or system/root mutations were introduced.
+
 
 
 

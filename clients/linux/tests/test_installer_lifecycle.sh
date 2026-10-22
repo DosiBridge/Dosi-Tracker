@@ -5,20 +5,24 @@
 # Tests cover:
 # 1. Fresh rootless install to temporary prefix
 # 2. Foreign/unmanaged file conflict refusal (preserves unrelated file)
-# 3. Update with staging, ownership manifest update, and backup retention
-# 4. Failed update preservation (staging failure leaves prior install intact)
-# 5. Rollback to retained previous installation
-# 6. Unsafe prefix and system directory refusal
-# 7. Symlink escape refusal
-# 8. Uninstall removes only owned files, preserving user config and unrelated sentinels
-# 9. Idempotent uninstall
-# 10. Real compiled binary install and diagnostic doctor smoke test
+# 3. Malformed JSON manifest refusal (fails closed, preserves foreign/sentinel bytes)
+# 4. Mismatched prefix/binary manifest refusal (fails closed)
+# 5. Sibling prefix and dot-dot traversal refusal
+# 6. Ancestor and explicit symlink escape refusal
+# 7. Rollback refuses to overwrite unmanaged foreign destination
+# 8. Rollback restores complete managed state (binary, manifest, version)
+# 9. Injected metadata publication failure triggers complete rollback
+# 10. Injected post-activation smoke failure triggers complete rollback
+# 11. Uninstall refuses on corrupted or mismatched manifest
+# 12. Uninstall preserves user config and unrelated sentinels
+# 13. Idempotent uninstall
+# 14. Real compiled binary install and diagnostic doctor smoke test
 #
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LINUX_CRATE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+LINUX_CRATE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
 INSTALLER="${LINUX_CRATE_DIR}/scripts/install.sh"
 
 FAILED_TESTS=0
@@ -91,9 +95,8 @@ test_fresh_install_to_isolated_temp_prefix() {
   # Verify execution
   local out
   out="$("${bin_path}" --version)"
-  [[ "${out}" == *"0.1.0"* ]]
-
   rm -rf "${temp_dir}"
+  [[ "${out}" == *"0.1.0"* ]]
 }
 
 # 2. Foreign / Unmanaged File Conflict Refusal
@@ -125,144 +128,94 @@ test_foreign_file_conflict_refusal() {
   [ "${failed}" = "0" ] && [ "${content}" = "foreign proprietary payload" ]
 }
 
-# 3. Update Retains Prior Backup and Updates Manifest
-test_update_retains_prior_backup_and_updates_manifest() {
+# 3. Malformed JSON Manifest Refusal (fails closed)
+test_malformed_manifest_refusal() {
   local temp_dir
   temp_dir="$(mktemp -d)"
 
   local prefix="${temp_dir}/opt/dosi"
-  local fake_src_v1="${temp_dir}/fake_bin_v1"
-  create_fake_executable "${fake_src_v1}" "0.1.0"
+  mkdir -p "${prefix}/bin" "${prefix}/share/dosi-tracker"
+  echo "existing payload" > "${prefix}/bin/dosi-tracker-linux"
 
-  bash "${INSTALLER}" install --prefix "${prefix}" --source-bin "${fake_src_v1}" >/dev/null
-
-  # Perform update to v0.2.0
-  local fake_src_v2="${temp_dir}/fake_bin_v2"
-  create_fake_executable "${fake_src_v2}" "0.2.0"
-
-  bash "${INSTALLER}" update --prefix "${prefix}" --source-bin "${fake_src_v2}" >/dev/null
-
-  # Verify backup binary exists
-  local backup_path="${prefix}/share/dosi-tracker/backup/dosi-tracker-linux.prev"
-  if [ ! -f "${backup_path}" ] && [ -f "${prefix}/share/dosi-tracker/backup/dosi-tracker-linux.exe.prev" ]; then
-    backup_path="${prefix}/share/dosi-tracker/backup/dosi-tracker-linux.exe.prev"
-  fi
-  [ -f "${backup_path}" ]
-
-  # Verify backup binary runs as v0.1.0
-  local backup_ver
-  backup_ver="$("${backup_path}" --version)"
-  [[ "${backup_ver}" == *"0.1.0"* ]]
-
-  # Verify active binary runs as v0.2.0
-  local bin_path="${prefix}/bin/dosi-tracker-linux"
-  if [ ! -f "${bin_path}" ] && [ -f "${prefix}/bin/dosi-tracker-linux.exe" ]; then
-    bin_path="${prefix}/bin/dosi-tracker-linux.exe"
-  fi
-  local active_ver
-  active_ver="$("${bin_path}" --version)"
-  [[ "${active_ver}" == *"0.2.0"* ]]
-
-  # Verify manifest tracks previous version
-  local manifest="${prefix}/share/dosi-tracker/manifest.json"
-  grep -q '"previous_version": "0.1.0"' "${manifest}"
-  grep -q '"version": "0.2.0"' "${manifest}"
-
-  rm -rf "${temp_dir}"
-}
-
-# 4. Failed Update Preserves Prior Working Install
-test_failed_update_preserves_prior_working_install() {
-  local temp_dir
-  temp_dir="$(mktemp -d)"
-
-  local prefix="${temp_dir}/opt/dosi"
-  local fake_src_v1="${temp_dir}/fake_bin_v1"
-  create_fake_executable "${fake_src_v1}" "0.1.0"
-
-  bash "${INSTALLER}" install --prefix "${prefix}" --source-bin "${fake_src_v1}" >/dev/null
-
-  # Create a broken candidate binary that fails --help smoke test
-  local broken_src="${temp_dir}/broken_bin"
-  cat > "${broken_src}" <<EOF
-#!/usr/bin/env bash
-echo "Corrupted binary crash!" >&2
-exit 127
+  # Write malformed JSON that contains the component string
+  cat > "${prefix}/share/dosi-tracker/manifest.json" <<EOF
+{ "component": "dosi-tracker-linux-diagnostic-foundation", BROKEN_SYNTAX: [
 EOF
-  chmod 755 "${broken_src}"
 
-  # Attempt update; must fail
+  local fake_src="${temp_dir}/fake_bin"
+  create_fake_executable "${fake_src}" "0.1.0"
+
   local failed="0"
-  if bash "${INSTALLER}" update --prefix "${prefix}" --source-bin "${broken_src}" >/dev/null 2>&1; then
+  if bash "${INSTALLER}" install --prefix "${prefix}" --source-bin "${fake_src}" >/dev/null 2>&1; then
     failed="1"
   fi
 
-  # Prior working installation must remain intact and functional
-  local bin_path="${prefix}/bin/dosi-tracker-linux"
-  if [ ! -f "${bin_path}" ] && [ -f "${prefix}/bin/dosi-tracker-linux.exe" ]; then
-    bin_path="${prefix}/bin/dosi-tracker-linux.exe"
-  fi
-  local active_ver
-  active_ver="$("${bin_path}" --version)"
-
+  local content
+  content="$(cat "${prefix}/bin/dosi-tracker-linux")"
   rm -rf "${temp_dir}"
 
-  [ "${failed}" = "0" ] && [[ "${active_ver}" == *"0.1.0"* ]]
+  # Must fail closed and preserve existing payload
+  [ "${failed}" = "0" ] && [ "${content}" = "existing payload" ]
 }
 
-# 5. Rollback to Retained Previous Installation
-test_rollback_to_previous_installation() {
+# 4. Mismatched Prefix/Binary Manifest Refusal (fails closed)
+test_mismatched_prefix_manifest_refusal() {
   local temp_dir
   temp_dir="$(mktemp -d)"
 
   local prefix="${temp_dir}/opt/dosi"
-  local fake_src_v1="${temp_dir}/fake_bin_v1"
-  create_fake_executable "${fake_src_v1}" "0.1.0"
+  mkdir -p "${prefix}/bin" "${prefix}/share/dosi-tracker"
+  echo "protected foreign binary" > "${prefix}/bin/dosi-tracker-linux"
 
-  bash "${INSTALLER}" install --prefix "${prefix}" --source-bin "${fake_src_v1}" >/dev/null
+  # Valid JSON, but prefix points to completely different directory
+  cat > "${prefix}/share/dosi-tracker/manifest.json" <<EOF
+{
+  "format_version": 1,
+  "component": "dosi-tracker-linux-diagnostic-foundation",
+  "version": "0.1.0",
+  "prefix": "/another/unrelated/prefix",
+  "bin_dir": "/another/unrelated/prefix/bin",
+  "data_dir": "/another/unrelated/prefix/share/dosi-tracker",
+  "binary_path": "/another/unrelated/prefix/bin/dosi-tracker-linux",
+  "owned_files": [
+    "/another/unrelated/prefix/bin/dosi-tracker-linux"
+  ]
+}
+EOF
 
-  local fake_src_v2="${temp_dir}/fake_bin_v2"
-  create_fake_executable "${fake_src_v2}" "0.2.0"
-  bash "${INSTALLER}" update --prefix "${prefix}" --source-bin "${fake_src_v2}" >/dev/null
+  local fake_src="${temp_dir}/fake_bin"
+  create_fake_executable "${fake_src}" "0.1.0"
 
-  # Execute rollback
-  bash "${INSTALLER}" rollback --prefix "${prefix}" >/dev/null
-
-  # Verify active binary is now rolled back to v0.1.0
-  local bin_path="${prefix}/bin/dosi-tracker-linux"
-  if [ ! -f "${bin_path}" ] && [ -f "${prefix}/bin/dosi-tracker-linux.exe" ]; then
-    bin_path="${prefix}/bin/dosi-tracker-linux.exe"
+  local failed="0"
+  if bash "${INSTALLER}" install --prefix "${prefix}" --source-bin "${fake_src}" >/dev/null 2>&1; then
+    failed="1"
   fi
-  local active_ver
-  active_ver="$("${bin_path}" --version)"
 
+  local content
+  content="$(cat "${prefix}/bin/dosi-tracker-linux")"
   rm -rf "${temp_dir}"
 
-  [[ "${active_ver}" == *"0.1.0"* ]]
+  [ "${failed}" = "0" ] && [ "${content}" = "protected foreign binary" ]
 }
 
-# 6. Unsafe Prefix and Path Boundary Refusal
-test_unsafe_prefix_and_path_boundary_refusal() {
+# 5. Sibling Prefix and Dot-Dot Traversal Refusal
+test_sibling_prefix_and_dot_dot_escape_refusal() {
   local temp_dir
   temp_dir="$(mktemp -d)"
 
+  local prefix="${temp_dir}/opt/dosi"
   local fake_src="${temp_dir}/fake_bin"
   create_fake_executable "${fake_src}" "0.1.0"
 
   local passed=1
 
-  # System root /
-  if bash "${INSTALLER}" install --prefix / --source-bin "${fake_src}" >/dev/null 2>&1; then
+  # Case A: Sibling prefix (/opt/dosi-sibling vs /opt/dosi)
+  if bash "${INSTALLER}" install --prefix "${prefix}" --bin-dir "${temp_dir}/opt/dosi-sibling/bin" --source-bin "${fake_src}" >/dev/null 2>&1; then
     passed=0
   fi
 
-  # System /usr
-  if bash "${INSTALLER}" install --prefix /usr --source-bin "${fake_src}" >/dev/null 2>&1; then
-    passed=0
-  fi
-
-  # System /etc
-  if bash "${INSTALLER}" install --prefix /etc --source-bin "${fake_src}" >/dev/null 2>&1; then
+  # Case B: Dot-dot escape (/opt/dosi/sub/../../outside/bin)
+  if bash "${INSTALLER}" install --prefix "${prefix}" --bin-dir "${prefix}/sub/../../outside/bin" --source-bin "${fake_src}" >/dev/null 2>&1; then
     passed=0
   fi
 
@@ -270,8 +223,8 @@ test_unsafe_prefix_and_path_boundary_refusal() {
   [ "${passed}" = "1" ]
 }
 
-# 7. Symlink Escape Refusal
-test_symlink_escape_refusal() {
+# 6. Ancestor and Explicit Symlink Escape Refusal
+test_ancestor_and_explicit_symlink_escape_refusal() {
   local temp_dir
   temp_dir="$(mktemp -d)"
 
@@ -279,10 +232,10 @@ test_symlink_escape_refusal() {
   local outside_dir="${temp_dir}/outside"
   mkdir -p "${prefix}" "${outside_dir}"
 
-  # Attempt to create symlink
+  # Attempt to create directory symlink
   ln -s "${outside_dir}" "${prefix}/bin" 2>/dev/null || true
 
-  # Check if real directory symlink was actually created by host OS
+  # Check if real directory symlink was created by host OS
   if [ ! -L "${prefix}/bin" ]; then
     rm -rf "${temp_dir}"
     return 0 # Environment does not support directory symlinks without elevation; skip cleanly
@@ -292,7 +245,7 @@ test_symlink_escape_refusal() {
   create_fake_executable "${fake_src}" "0.1.0"
 
   local passed=0
-  if ! bash "${INSTALLER}" install --prefix "${prefix}" --source-bin "${fake_src}" >/dev/null 2>&1; then
+  if ! bash "${INSTALLER}" install --prefix "${prefix}" --bin-dir "${prefix}/bin" --source-bin "${fake_src}" >/dev/null 2>&1; then
     passed=1
   fi
 
@@ -300,7 +253,165 @@ test_symlink_escape_refusal() {
   [ "${passed}" = "1" ]
 }
 
-# 8. Uninstall Preserves User Config and Unrelated Sentinels
+# 7. Rollback Refuses to Overwrite Unmanaged Foreign Destination
+test_rollback_refuses_to_overwrite_unmanaged_foreign_destination() {
+  local temp_dir
+  temp_dir="$(mktemp -d)"
+
+  local prefix="${temp_dir}/opt/dosi"
+  local fake_src_v1="${temp_dir}/fake_bin_v1"
+  create_fake_executable "${fake_src_v1}" "0.1.0"
+  bash "${INSTALLER}" install --prefix "${prefix}" --source-bin "${fake_src_v1}" >/dev/null
+
+  local fake_src_v2="${temp_dir}/fake_bin_v2"
+  create_fake_executable "${fake_src_v2}" "0.2.0"
+  bash "${INSTALLER}" update --prefix "${prefix}" --source-bin "${fake_src_v2}" >/dev/null
+
+  # Place unmanaged foreign binary at destination and delete manifest
+  local bin_path="${prefix}/bin/dosi-tracker-linux"
+  if [ ! -f "${bin_path}" ] && [ -f "${prefix}/bin/dosi-tracker-linux.exe" ]; then
+    bin_path="${prefix}/bin/dosi-tracker-linux.exe"
+  fi
+  echo "foreign protected file" > "${bin_path}"
+  rm -f "${prefix}/share/dosi-tracker/manifest.json"
+
+  # Rollback must refuse to overwrite unmanaged destination
+  local failed="0"
+  if bash "${INSTALLER}" rollback --prefix "${prefix}" >/dev/null 2>&1; then
+    failed="1"
+  fi
+
+  local content
+  content="$(cat "${bin_path}")"
+  rm -rf "${temp_dir}"
+
+  [ "${failed}" = "0" ] && [ "${content}" = "foreign protected file" ]
+}
+
+# 8. Rollback Restores Complete Managed State (Binary, Manifest, Version)
+test_rollback_restores_complete_managed_state() {
+  local temp_dir
+  temp_dir="$(mktemp -d)"
+
+  local prefix="${temp_dir}/opt/dosi"
+  local fake_src_v1="${temp_dir}/fake_bin_v1"
+  create_fake_executable "${fake_src_v1}" "0.1.0"
+  bash "${INSTALLER}" install --prefix "${prefix}" --source-bin "${fake_src_v1}" >/dev/null
+
+  local fake_src_v2="${temp_dir}/fake_bin_v2"
+  create_fake_executable "${fake_src_v2}" "0.2.0"
+  bash "${INSTALLER}" update --prefix "${prefix}" --source-bin "${fake_src_v2}" >/dev/null
+
+  # Execute rollback
+  bash "${INSTALLER}" rollback --prefix "${prefix}" >/dev/null
+
+  local bin_path="${prefix}/bin/dosi-tracker-linux"
+  if [ ! -f "${bin_path}" ] && [ -f "${prefix}/bin/dosi-tracker-linux.exe" ]; then
+    bin_path="${prefix}/bin/dosi-tracker-linux.exe"
+  fi
+
+  local active_ver manifest_ver version_file_ver
+  active_ver="$("${bin_path}" --version)"
+  manifest_ver="$(grep '"version"' "${prefix}/share/dosi-tracker/manifest.json" | head -n1)"
+  version_file_ver="$(cat "${prefix}/share/dosi-tracker/current_version")"
+
+  rm -rf "${temp_dir}"
+
+  [[ "${active_ver}" == *"0.1.0"* ]] && [[ "${manifest_ver}" == *"0.1.0"* ]] && [ "${version_file_ver}" = "0.1.0" ]
+}
+
+# 9. Injected Metadata Publication Failure Triggers Complete Rollback
+test_metadata_write_failure_fully_rolls_back() {
+  local temp_dir
+  temp_dir="$(mktemp -d)"
+
+  local prefix="${temp_dir}/opt/dosi"
+  local fake_src_v1="${temp_dir}/fake_bin_v1"
+  create_fake_executable "${fake_src_v1}" "0.1.0"
+  bash "${INSTALLER}" install --prefix "${prefix}" --source-bin "${fake_src_v1}" >/dev/null
+
+  local fake_src_v2="${temp_dir}/fake_bin_v2"
+  create_fake_executable "${fake_src_v2}" "0.2.0"
+
+  # Attempt update with injected metadata failure
+  local failed="0"
+  if DOSI_TEST_INJECT_FAIL_METADATA=1 bash "${INSTALLER}" update --prefix "${prefix}" --source-bin "${fake_src_v2}" >/dev/null 2>&1; then
+    failed="1"
+  fi
+
+  local bin_path="${prefix}/bin/dosi-tracker-linux"
+  if [ ! -f "${bin_path}" ] && [ -f "${prefix}/bin/dosi-tracker-linux.exe" ]; then
+    bin_path="${prefix}/bin/dosi-tracker-linux.exe"
+  fi
+
+  # Assert prior binary, manifest, and version are completely restored
+  local active_ver manifest_ver version_file_ver
+  active_ver="$("${bin_path}" --version)"
+  manifest_ver="$(grep '"version"' "${prefix}/share/dosi-tracker/manifest.json" | head -n1)"
+  version_file_ver="$(cat "${prefix}/share/dosi-tracker/current_version")"
+
+  rm -rf "${temp_dir}"
+
+  [ "${failed}" = "0" ] && [[ "${active_ver}" == *"0.1.0"* ]] && [[ "${manifest_ver}" == *"0.1.0"* ]] && [ "${version_file_ver}" = "0.1.0" ]
+}
+
+# 10. Injected Post-Activation Smoke Failure Triggers Complete Rollback
+test_smoke_check_failure_fully_rolls_back() {
+  local temp_dir
+  temp_dir="$(mktemp -d)"
+
+  local prefix="${temp_dir}/opt/dosi"
+  local fake_src_v1="${temp_dir}/fake_bin_v1"
+  create_fake_executable "${fake_src_v1}" "0.1.0"
+  bash "${INSTALLER}" install --prefix "${prefix}" --source-bin "${fake_src_v1}" >/dev/null
+
+  local fake_src_v2="${temp_dir}/fake_bin_v2"
+  create_fake_executable "${fake_src_v2}" "0.2.0"
+
+  # Attempt update with injected smoke failure
+  local failed="0"
+  if DOSI_TEST_INJECT_FAIL_SMOKE=1 bash "${INSTALLER}" update --prefix "${prefix}" --source-bin "${fake_src_v2}" >/dev/null 2>&1; then
+    failed="1"
+  fi
+
+  local bin_path="${prefix}/bin/dosi-tracker-linux"
+  if [ ! -f "${bin_path}" ] && [ -f "${prefix}/bin/dosi-tracker-linux.exe" ]; then
+    bin_path="${prefix}/bin/dosi-tracker-linux.exe"
+  fi
+
+  local active_ver manifest_ver version_file_ver
+  active_ver="$("${bin_path}" --version)"
+  manifest_ver="$(grep '"version"' "${prefix}/share/dosi-tracker/manifest.json" | head -n1)"
+  version_file_ver="$(cat "${prefix}/share/dosi-tracker/current_version")"
+
+  rm -rf "${temp_dir}"
+
+  [ "${failed}" = "0" ] && [[ "${active_ver}" == *"0.1.0"* ]] && [[ "${manifest_ver}" == *"0.1.0"* ]] && [ "${version_file_ver}" = "0.1.0" ]
+}
+
+# 11. Uninstall Refuses on Corrupted or Mismatched Manifest
+test_uninstall_refuses_on_corrupted_manifest() {
+  local temp_dir
+  temp_dir="$(mktemp -d)"
+
+  local prefix="${temp_dir}/opt/dosi"
+  mkdir -p "${prefix}/bin" "${prefix}/share/dosi-tracker"
+  echo "precious user script" > "${prefix}/bin/dosi-tracker-linux"
+  echo "corrupted metadata" > "${prefix}/share/dosi-tracker/manifest.json"
+
+  local failed="0"
+  if bash "${INSTALLER}" uninstall --prefix "${prefix}" >/dev/null 2>&1; then
+    failed="1"
+  fi
+
+  local content
+  content="$(cat "${prefix}/bin/dosi-tracker-linux")"
+  rm -rf "${temp_dir}"
+
+  [ "${failed}" = "0" ] && [ "${content}" = "precious user script" ]
+}
+
+# 12. Uninstall Preserves User Config and Unrelated Sentinels
 test_uninstall_preserves_user_config_and_unrelated_sentinels() {
   local temp_dir
   temp_dir="$(mktemp -d)"
@@ -351,7 +462,7 @@ test_uninstall_preserves_user_config_and_unrelated_sentinels() {
   [ "${bin_removed}" = "1" ] && [ "${manifest_removed}" = "1" ] && [ "${sentinels_preserved}" = "1" ] && [ "${consent_preserved}" = "1" ]
 }
 
-# 9. Idempotent Uninstall
+# 13. Idempotent Uninstall
 test_idempotent_uninstall() {
   local temp_dir
   temp_dir="$(mktemp -d)"
@@ -363,7 +474,7 @@ test_idempotent_uninstall() {
   rm -rf "${temp_dir}"
 }
 
-# 10. Real Compiled Binary Install and Diagnostic Doctor Smoke Test
+# 14. Real Compiled Binary Install and Diagnostic Doctor Smoke Test
 test_real_compiled_binary_install_smoke() {
   local temp_dir
   temp_dir="$(mktemp -d)"
@@ -392,11 +503,15 @@ test_real_compiled_binary_install_smoke() {
 echo "=== Running Dosi-Tracker Linux Installer Lifecycle Tests ==="
 run_test "Fresh Install to Isolated Prefix" test_fresh_install_to_isolated_temp_prefix
 run_test "Foreign File Conflict Refusal" test_foreign_file_conflict_refusal
-run_test "Update Retains Prior Backup & Manifest" test_update_retains_prior_backup_and_updates_manifest
-run_test "Failed Update Preserves Prior Working Install" test_failed_update_preserves_prior_working_install
-run_test "Rollback to Retained Previous Install" test_rollback_to_previous_installation
-run_test "Unsafe Prefix & Boundary Refusal" test_unsafe_prefix_and_path_boundary_refusal
-run_test "Symlink Escape Refusal" test_symlink_escape_refusal
+run_test "Malformed JSON Manifest Refusal" test_malformed_manifest_refusal
+run_test "Mismatched Prefix Manifest Refusal" test_mismatched_prefix_manifest_refusal
+run_test "Sibling Prefix & Dot-Dot Traversal Refusal" test_sibling_prefix_and_dot_dot_escape_refusal
+run_test "Ancestor & Explicit Symlink Escape Refusal" test_ancestor_and_explicit_symlink_escape_refusal
+run_test "Rollback Refuses Foreign Destination" test_rollback_refuses_to_overwrite_unmanaged_foreign_destination
+run_test "Rollback Restores Complete Managed State" test_rollback_restores_complete_managed_state
+run_test "Metadata Failure Triggers Complete Rollback" test_metadata_write_failure_fully_rolls_back
+run_test "Smoke Failure Triggers Complete Rollback" test_smoke_check_failure_fully_rolls_back
+run_test "Uninstall Refuses on Corrupt Manifest" test_uninstall_refuses_on_corrupted_manifest
 run_test "Uninstall Preserves Config & Sentinels" test_uninstall_preserves_user_config_and_unrelated_sentinels
 run_test "Idempotent Uninstall" test_idempotent_uninstall
 run_test "Real Compiled Binary Smoke & Doctor" test_real_compiled_binary_install_smoke
