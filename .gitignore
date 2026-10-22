@@ -103,12 +103,14 @@ coverage/
 *.tsbuildinfo
 
 # ==========================================
-# Clients (Rust / Windows)
+# Clients (Rust / Windows & Linux)
 # ==========================================
 clients/windows/target/
+clients/linux/target/
 # Cargo.lock IS committed: the agent is a binary crate, so the lockfile pins exact
 # dependency versions for reproducible builds across machines and CI.
 clients/windows/config.toml
+clients/linux/config.toml
 **/*.rs.bk
 
 # ==========================================

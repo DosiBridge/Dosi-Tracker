@@ -1446,6 +1446,78 @@ Under Task ID `native-install-guides-20261022-A`, public installation and capabi
 2. **Code Signing Gaps**: Neither Apple Developer ID notarization nor Windows Authenticode EV certificates exist in the repository; public guides truthfully instruct users on Gatekeeper and SmartScreen approvals.
 3. **Next Bounded Recommendation**: Implement the smallest source-proven Linux desktop client crate (`clients/linux`) targeting X11 window title capture (`_NET_ACTIVE_WINDOW`) with side-effect-free driver testing.
 
+---
+
+## 21. Linux Client Safe Foundation Delivery (`linux-client-safe-foundation-20261022-C`)
+
+> **Execution Date:** October 22, 2026  
+> **Phase Task ID:** `linux-client-safe-foundation-20261022-C`  
+> **Status:** Completed & Source-Verified (27 Rust tests passed, 50 frontend tests passed, typecheck clean, lint clean)  
+> **Target Package:** `clients/linux` (crate: `dosi-tracker-linux` v0.1.0, binary: `dosi-tracker-linux`)  
+
+### A. Context & Executive Summary
+In accordance with PM directive `linux-client-safe-foundation-20261022-C`, this phase delivers the **FIRST finite Linux implementation slice**: a working, sensor-free headless Linux client foundation with truthful capability diagnostics (`dosi-tracker-linux doctor [--json]`), non-mutating XDG path resolution, default-inactive local consent core, and lifecycle state machine with monotonic generation-based ABA ticket invalidation.
+All native collection hooks and background daemons remain deliberately absent in this slice to establish a verified, privacy-safe architectural baseline.
+
+### B. Delivered Architecture & Component Inventory (`clients/linux`)
+1. **XDG Path Resolution (`clients/linux/src/paths.rs`)**:
+   - Resolves standard XDG Base Directory specification paths: `$XDG_CONFIG_HOME/dosi-tracker`, `$XDG_DATA_HOME/dosi-tracker`, `$XDG_STATE_HOME/dosi-tracker`, and `<config_dir>/consent.json` with `$HOME` fallbacks.
+   - **Strict Non-Mutating Invariant**: Implements pure inspection (`config_dir_exists()`, `consent_file_exists()`). Does NOT call `create_dir_all` or write files during `doctor`, `--help`, or default CLI invocations.
+2. **Capability Diagnostics & Session Detection (`clients/linux/src/diagnostics.rs`)**:
+   - Injected environment detection (`SessionEnvironment`) classifying Wayland, X11, Headless, and Unknown sessions without requiring `DISPLAY`, D-Bus, or credentials.
+   - **Architectural vs Adapter Separation**:
+     - Wayland: Global input counting (`keyboard`, `mouse`) and active window tracking are classified honestly as `ArchitecturallyUnsupported` (`UNSUPPORTED` in JSON), citing Wayland protocol isolation and anti-keylogger invariants prohibiting `root`/`sudo`/`evdev` escalation.
+     - X11: Root window capture (`XShmGetImage`), raw ticks (`XInput2`), and `_NET_ACTIVE_WINDOW` are reported as architecturally supported unconfined.
+     - Adapters: All native collection adapters (`screen_capture`, `input_counter`, `window_sampler`, `webcam_capture`, `offline_queue`, `backend_sync`) are reported truthfully as `NOT_IMPLEMENTED`.
+   - Zero synthetic activity is reported; zero credentials or plaintext secrets exist.
+3. **Default-Inactive Local Consent Core (`clients/linux/src/consent.rs`)**:
+   - `ConsentedPermissions`: Granular capability flags (`screenshot`, `webcam`, `keyboard`, `mouse`, `active_window`, `running_programs`, `blur_screenshots`) defaulting strictly to all-false (`ConsentedPermissions::all_disabled()`).
+   - `LocalConsent`: `Absent` (default-deny), `Granted(ConsentedPermissions)`, `Revoked`.
+   - Effective policy computation: `ProjectPolicy ∩ LocalConsent`. Admin policy cannot grant local consent.
+   - **Fail-Closed Persistence**: Malformed or corrupt JSON fails closed to `LocalConsent::Absent`. Atomic saving via temporary sibling file replacement.
+   - **Immediate In-Memory Revocation on Narrowing**: When consent is narrowed or revoked, in-memory admission is updated immediately, even if disk persistence subsequently returns an error.
+4. **Lifecycle State Machine & ABA Ticket Invalidation (`clients/linux/src/lifecycle.rs`)**:
+   - States: `Unconfigured`, `Stopped`, `Tracking`, `Paused`, `Locked`, `Terminated`.
+   - **Restart Invariant**: Starts in `Unconfigured` or `Stopped`; never auto-tracks on load.
+   - Absent/denied/revoked consent cannot start tracking; explicit per-capability grant plus explicit `start()` required.
+   - `LifecycleGeneration(u64)`: Monotonic generation token incremented on every state or consent transition.
+   - In-flight acquisition tickets require matching lifecycle generation; deterministic ABA regression tests prove that stale tickets issued before a pause/revoke/regrant cycle fail closed upon validation.
+5. **Executable Diagnostic Command (`clients/linux/src/main.rs`)**:
+   - Executable binary: `dosi-tracker-linux`
+   - Commands: `doctor [--json]`, `--help`, `--version`.
+   - Exits 0 with truthful stdout reporting; exits 1 on unknown subcommands.
+6. **CLI Integration Test Harness (`clients/linux/tests/cli_doctor_tests.rs`)**:
+   - Invokes compiled binary via `std::process::Command` in isolated temporary environments.
+   - Asserts truthful Wayland/X11 JSON parsing and verifies zero files or directories are created on disk.
+
+### C. Public Documentation & Verification Alignment
+1. **Public Linux Guide (`frontend/src/app/install/linux/page.tsx`)**:
+   - Discloses status truthfully: **Headless Source Foundation (Diagnostic CLI & Consent Core)**.
+   - Documents actual implemented command syntax: `cargo run --bin dosi-tracker-linux -- doctor [--json]`.
+   - Defines finite next roadmap slices (Slice 1 Delivered: Headless Foundation; Slice 2 Next: Auth & Offline SQLite Queue; Slice 3 Future: Native Adapters; Slice 4 Future: Packaging & Distribution).
+   - Preserves all negative oracles rejecting fabricated CLI/IPC commands.
+2. **Overview & Matrix (`frontend/src/app/install/page.tsx`)**:
+   - Linux card labeled: **Headless Foundation** (`clients/linux`).
+   - Capability matrix updated: **FOUNDATION ONLY (Sensor-Free Crate; 27 Tests Passed; Native Runtime Unverified)**.
+3. **Traceable Verification Matrix (`docs/PRODUCT_ACCEPTANCE.md`)**:
+   - `REQ-CLI-03` updated to **[Worker-Reported (Headless Foundation Crate & Synthetic Driver Verified)]** with exact test and limitation evidence.
+
+### D. Executed Test Suites & Quality Gates
+| Target Suite | Exact Command Line | Tests Passed | Ignored | Result | Exit Code | Evidence Level |
+|---|---|:---:|:---:|:---:|:---:|:---:|
+| **Linux Unit & Integration** | `cargo test` in `clients/linux` | 27 passed (21 unit + 6 CLI integration) | 0 | PASSED | **0** | **[Worker-Reported (Windows Host Toolchain)]** |
+| **Linux Code Formatting** | `cargo fmt --check` in `clients/linux` | N/A | 0 diffs | PASSED | **0** | **[Worker-Reported]** |
+| **Linux Compilation Check** | `cargo check` in `clients/linux` | N/A | 0 errors, 0 warnings | PASSED | **0** | **[Worker-Reported]** |
+| **Frontend Acceptance Suite** | `npx vitest run src/middleware.test.ts src/components/dashboard/agent-setup.test.tsx src/test/acceptance/agent-onboarding.test.tsx src/test/acceptance/install-guides.test.tsx src/test/architecture.spec.ts` | 50 passed | 0 | PASSED | **0** | **[Worker-Reported (Focused 5-File Suite)]** |
+| **Frontend Typecheck** | `npm run typecheck` in `frontend` | N/A | 0 errors | PASSED | **0** | **[Worker-Reported]** |
+| **Frontend Lint** | `npm run lint` in `frontend` | N/A | 0 errors, 3 pre-existing warnings | PASSED | **0** | **[Worker-Reported]** |
+
+### E. Explicit Evidence Boundaries & Next Bounded Recommendations
+1. **Toolchain Evidence Boundary**: All Rust tests were executed on the available Windows host toolchain (`cargo 1.97.1`). While the code is fully cross-platform portable and tested in isolated environments, this does **NOT** constitute evidence of native Linux compilation or runtime execution under a Linux kernel/libc.
+2. **Sensor Isolation**: No native X11, Wayland, PipeWire, GStreamer, V4L2, or evdev sensors were initialized or attached during execution.
+3. **Next Finite Slice (Slice 2)**: Implement authentication, workspace enrollment, credential storage via Freedesktop Secret Service D-Bus, and offline-first SQLite activity queue schema in `clients/linux`.
+
+
 
 
 

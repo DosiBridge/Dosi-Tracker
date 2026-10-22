@@ -13,9 +13,9 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 
 export const metadata = {
-  title: "Linux Desktop Agent Technical Specification & Architecture | Dosi-Tracker",
+  title: "Linux Desktop Agent Foundation & Specification | Dosi-Tracker",
   description:
-    "Technical architecture specification, display server boundaries (X11 vs Wayland), and unprivileged security invariants for future Linux agent implementation.",
+    "Technical architecture specification, headless foundation crate, display server boundaries (X11 vs Wayland), and unprivileged security invariants for Dosi-Tracker Linux.",
 };
 
 export default function LinuxInstallPage() {
@@ -33,13 +33,13 @@ export default function LinuxInstallPage() {
         <div className="flex flex-wrap items-center justify-between gap-3">
           <h1 className="font-display text-2xl sm:text-3xl font-bold tracking-tight text-foreground flex items-center gap-2.5">
             <Terminal className="h-7 w-7 text-primary-strong" aria-hidden="true" />
-            Linux Desktop Agent Specification
+            Linux Desktop Agent Foundation &amp; Specification
           </h1>
-          <Badge tone="warning">Client Not Implemented (Architecture Planned)</Badge>
+          <Badge tone="warning">Headless Source Foundation (No Native Collection / Sync Yet)</Badge>
         </div>
         <p className="mt-2 text-sm text-muted-foreground max-w-3xl leading-relaxed">
-          Technical architecture, display server boundaries (X11 vs. Wayland), and privacy invariants for the planned Linux desktop agent.
-          There is currently no installable client binary or source crate in the repository.
+          Technical architecture, display server boundaries (X11 vs. Wayland), headless diagnostic CLI foundation,
+          and privacy invariants for the Linux desktop agent.
         </p>
       </div>
 
@@ -49,29 +49,61 @@ export default function LinuxInstallPage() {
           <AlertTriangle className="h-5 w-5 text-amber-500 shrink-0 mt-0.5" aria-hidden="true" />
           <div className="space-y-2 text-xs text-muted-foreground">
             <h2 className="font-semibold text-sm text-foreground">
-              Status: Client Not Implemented (Planned Architecture)
+              Status: Headless Source Foundation (Diagnostic CLI &amp; Consent Core)
             </h2>
             <p>
-              There is currently <strong className="text-foreground">no Linux client implementation in the repository</strong> (git tracked files confirm no crate under <code className="font-mono text-foreground font-semibold">clients/linux</code>, no installable binaries, and no CLI executable).
+              The repository now contains the first finite headless Linux implementation slice in{" "}
+              <code className="font-mono text-foreground font-semibold">clients/linux</code> (crate:{" "}
+              <code className="font-mono text-foreground font-semibold">dosi-tracker-linux</code> v0.1.0).
             </p>
             <p>
-              Do not attempt to execute terminal commands or configure local config files; no client process exists to read them.
-              The technical specifications below document the required protocol boundaries, display server privacy constraints, and anti-keylogger invariants for future implementation.
+              It provides a working diagnostic command (<code className="font-mono text-foreground font-semibold">dosi-tracker-linux doctor [--json]</code>),
+              safe non-mutating XDG path resolution, and a default-inactive local consent and lifecycle core with ABA generation invalidation.
+            </p>
+            <p>
+              <strong className="text-foreground">Critical Boundaries:</strong> All native collection adapters (screen capture, keyboard/mouse hooks,
+              active window sampler, webcam) report <code className="font-mono text-foreground font-semibold">NOT_IMPLEMENTED</code>.
+              Global input counting and window titles on Wayland are architecturally <code className="font-mono text-foreground font-semibold">UNSUPPORTED</code>.
+              No native sensor is attached, no offline queue or network sync is active, and no pre-built binaries or installers are released.
+              Tests have been verified on Windows host toolchain (27 passed); native Linux compilation and runtime remain unverified.
             </p>
           </div>
         </div>
       </Card>
 
+      {/* Actual Implemented CLI Command Syntax */}
+      <div className="space-y-4">
+        <h2 className="font-display text-lg font-bold text-foreground">Implemented Diagnostic Command Syntax</h2>
+        <Card className="p-4 space-y-3 text-xs text-muted-foreground">
+          <p>
+            The headless client foundation in <code className="font-mono text-foreground">clients/linux</code> can be inspected
+            using the real diagnostic command. It runs without <code className="font-mono text-foreground">DISPLAY</code>, D-Bus, credentials, or sensor access:
+          </p>
+          <div className="space-y-2 font-mono text-[11px] bg-muted/60 p-3 rounded-lg border border-border/80 text-foreground overflow-x-auto">
+            <div># Run capability and session diagnostics (plain text)</div>
+            <div className="text-primary-strong">cargo run --bin dosi-tracker-linux -- doctor</div>
+            <div className="mt-2"># Run diagnostics with structured JSON output</div>
+            <div className="text-primary-strong">cargo run --bin dosi-tracker-linux -- doctor --json</div>
+            <div className="mt-2"># Inspect usage and privacy invariants</div>
+            <div className="text-primary-strong">cargo run --bin dosi-tracker-linux -- --help</div>
+          </div>
+          <p className="text-[11px]">
+            * Note: The <code className="font-mono text-foreground font-semibold">doctor</code> command performs pure non-mutating inspection:
+            it checks existence of XDG configuration and data paths without creating any directories or files.
+          </p>
+        </Card>
+      </div>
+
       {/* Target Platforms for Future Implementation */}
       <div className="space-y-4">
-        <h2 className="font-display text-lg font-bold text-foreground">Target Platforms for Future Implementation</h2>
+        <h2 className="font-display text-lg font-bold text-foreground">Target Platforms &amp; Architecture</h2>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
           <Card className="p-4">
             <h3 className="font-semibold text-foreground flex items-center gap-2 mb-2">
               <Cpu className="h-4 w-4 text-primary-strong" aria-hidden="true" /> Target Architectures &amp; Kernel
             </h3>
             <ul className="space-y-1 text-muted-foreground list-disc pl-4">
-              <li><strong className="text-foreground">x86_64:</strong> 64-bit AMD / Intel processors (planned tier 1)</li>
+              <li><strong className="text-foreground">x86_64:</strong> 64-bit AMD / Intel processors (tier 1)</li>
               <li><strong className="text-foreground">aarch64:</strong> 64-bit ARM (e.g. Raspberry Pi 5, Asahi Linux)</li>
               <li><strong className="text-foreground">Kernel:</strong> Linux kernel 5.15 LTS or newer</li>
               <li><strong className="text-foreground">C Library:</strong> glibc 2.35+ or musl 1.2+</li>
@@ -79,7 +111,7 @@ export default function LinuxInstallPage() {
           </Card>
           <Card className="p-4">
             <h3 className="font-semibold text-foreground flex items-center gap-2 mb-2">
-              <Layers className="h-4 w-4 text-primary-strong" aria-hidden="true" /> Target Distributions (Planned)
+              <Layers className="h-4 w-4 text-primary-strong" aria-hidden="true" /> Target Distributions
             </h3>
             <ul className="space-y-1 text-muted-foreground list-disc pl-4">
               <li>Ubuntu 22.04 LTS (Jammy Jellyfish) and 24.04 LTS (Noble Numbat)</li>
@@ -96,20 +128,20 @@ export default function LinuxInstallPage() {
       <div className="space-y-4">
         <div>
           <h2 className="font-display text-lg font-bold text-foreground">
-            Planned Display Server Architecture: X11 vs. Wayland
+            Display Server Architecture: X11 vs. Wayland
           </h2>
           <p className="text-xs text-muted-foreground mt-1">
-            Linux display servers enforce fundamentally different security models. The planned architecture respects compositor
+            Linux display servers enforce fundamentally different security models. The architecture respects compositor
             boundaries and strictly forbids privileged keylogging or kernel device inspection.
           </p>
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          {/* Wayland Subsystem (Planned) */}
+          {/* Wayland Subsystem */}
           <Card className="border-border/80">
             <CardHeader className="pb-3 border-b border-border/60 bg-muted/20">
               <div className="flex items-center justify-between">
-                <CardTitle className="text-base font-semibold">Wayland Compositors (Planned)</CardTitle>
+                <CardTitle className="text-base font-semibold">Wayland Compositors</CardTitle>
                 <Badge tone="muted" className="text-[10px]">GNOME, KDE Plasma, Sway</Badge>
               </div>
               <p className="text-xs text-muted-foreground">Default on modern Ubuntu, Fedora, Debian</p>
@@ -134,7 +166,7 @@ export default function LinuxInstallPage() {
                 </div>
                 <p className="pl-5 leading-relaxed">
                   Wayland strictly isolates input events to the focused application surface. Background input monitoring is
-                  <strong className="text-foreground"> architecturally unsupported</strong>. Keyboard hits and mouse clicks will be reported
+                  <strong className="text-foreground"> architecturally unsupported</strong>. Keyboard hits and mouse clicks are reported
                   truthfully as <code className="font-mono text-foreground font-semibold">null</code> (unsupported), never fabricated zeros.
                 </p>
               </div>
@@ -153,11 +185,11 @@ export default function LinuxInstallPage() {
             </CardContent>
           </Card>
 
-          {/* X11 Subsystem (Planned) */}
+          {/* X11 Subsystem */}
           <Card className="border-border/80">
             <CardHeader className="pb-3 border-b border-border/60 bg-muted/20">
               <div className="flex items-center justify-between">
-                <CardTitle className="text-base font-semibold">Legacy X11 Server (Planned)</CardTitle>
+                <CardTitle className="text-base font-semibold">Legacy X11 Server</CardTitle>
                 <Badge tone="muted" className="text-[10px]">Xorg / X.Org</Badge>
               </div>
               <p className="text-xs text-muted-foreground">Traditional unconfined X11 desktop sessions</p>
@@ -210,7 +242,7 @@ export default function LinuxInstallPage() {
         </CardHeader>
         <CardContent className="text-xs text-muted-foreground space-y-2 leading-relaxed">
           <p>
-            When built, the Linux client will operate <strong className="text-foreground">exclusively as an unprivileged user process</strong>.
+            The Linux client operates <strong className="text-foreground">exclusively as an unprivileged user process</strong>.
             The architecture strictly prohibits:
           </p>
           <ul className="list-disc pl-5 space-y-1 text-foreground/80">
@@ -227,42 +259,42 @@ export default function LinuxInstallPage() {
 
       {/* Planned Configuration & Credential Storage Specification */}
       <div className="space-y-4">
-        <h2 className="font-display text-lg font-bold text-foreground">Planned Configuration &amp; Credential Storage Specification</h2>
+        <h2 className="font-display text-lg font-bold text-foreground">Storage &amp; Credential Specification</h2>
         <p className="text-xs text-muted-foreground">
-          Future implementation specification: Configuration must be stored per-user following the XDG Base Directory specification at{" "}
-          <code className="font-mono text-foreground bg-muted px-1.5 py-0.5 rounded">~/.config/dosi-tracker/config.toml</code>, and credentials
-          must be stored in the Freedesktop Secret Service API via D-Bus (<code className="font-mono text-foreground">libsecret</code>, backed by GNOME Keyring or KWallet).
+          Configuration and consent are stored per-user following the XDG Base Directory specification at{" "}
+          <code className="font-mono text-foreground bg-muted px-1.5 py-0.5 rounded">~/.config/dosi-tracker/consent.json</code>.
+          Future credentials will be stored in the Freedesktop Secret Service API via D-Bus (<code className="font-mono text-foreground">libsecret</code>, backed by GNOME Keyring or KWallet).
         </p>
 
         <Card variant="quiet" className="p-4 border border-border/80 text-xs text-muted-foreground space-y-2">
-          <p className="font-semibold text-foreground">Note on Client State:</p>
+          <p className="font-semibold text-foreground">Note on Storage Non-Mutation:</p>
           <p>
-            Because the Linux client is currently not implemented in the repository, <strong className="text-foreground">no configuration file is created or read</strong>.
-            Do not create manual configuration files or attempt to run client commands.
+            Running <code className="font-mono text-foreground font-semibold">dosi-tracker-linux doctor</code> inspects paths without creating
+            directories or writing files. User consent persistence is explicitly managed and tested strictly within isolated directories.
           </p>
         </Card>
       </div>
 
       {/* Implementation Roadmap & Acceptance Gaps */}
       <div className="space-y-4">
-        <h2 className="font-display text-lg font-bold text-foreground">Linux Implementation Roadmap &amp; Acceptance Gaps</h2>
+        <h2 className="font-display text-lg font-bold text-foreground">Linux Implementation Roadmap &amp; Finite Next Slices</h2>
         <Card className="p-4 space-y-3 text-xs text-muted-foreground">
           <div className="flex items-center gap-2 font-semibold text-foreground">
             <Clock className="h-4 w-4 text-primary-strong" aria-hidden="true" />
-            <span>Required Backlog Deliverables Prior to Verification</span>
+            <span>Structured Implementation Slices</span>
           </div>
           <ol className="list-decimal pl-5 space-y-2">
             <li>
-              <strong className="text-foreground">Greenfield Rust Client Crate:</strong> Create <code className="font-mono text-foreground">clients/linux</code> with a decoupled sensor driver (<code className="font-mono text-foreground">SensorDriver</code> trait) matching the Windows decoupled architecture.
+              <strong className="text-foreground">Slice 1 (Delivered):</strong> Headless foundation crate (<code className="font-mono text-foreground">clients/linux</code>), non-mutating <code className="font-mono text-foreground font-semibold">doctor [--json]</code> capability diagnostics, safe XDG path resolution, default-deny consent core, and ABA lifecycle generation invalidation (27 tests passed on Windows toolchain).
             </li>
             <li>
-              <strong className="text-foreground">X11 Protocol Engine:</strong> Implement root window query (<code className="font-mono text-foreground">_NET_ACTIVE_WINDOW</code>) and XInput2 aggregate tick counters with sensor-free unit test fixtures.
+              <strong className="text-foreground">Slice 2 (Next):</strong> Authentication, workspace enrollment, credential storage via Freedesktop Secret Service D-Bus, and offline-first SQLite queue schema.
             </li>
             <li>
-              <strong className="text-foreground">Wayland Desktop Portal Integration:</strong> Implement D-Bus portal calls for ScreenCast dialog handling and verify honest null reporting for unsupported window titles and input counts.
+              <strong className="text-foreground">Slice 3 (Future):</strong> Native consent-gated collection adapters (X11 XInput2 / EWMH, Wayland portal ScreenCast via PipeWire, V4L2 webcam).
             </li>
             <li>
-              <strong className="text-foreground">Packaging &amp; CI Pipeline:</strong> Define RPM/DEB packaging manifests and automated build validation on Linux build agents.
+              <strong className="text-foreground">Slice 4 (Future):</strong> Native Linux packaging (DEB, RPM), systemd user service integration, automated updates, and clean uninstallation.
             </li>
           </ol>
         </Card>

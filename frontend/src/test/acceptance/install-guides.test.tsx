@@ -39,7 +39,7 @@ describe("Public Installation & Onboarding Guides", () => {
   });
 
   describe("InstallOverviewPage", () => {
-    it("renders comparison cards with truthful status: Linux Not Implemented, Windows Source & NSIS", () => {
+    it("renders comparison cards with truthful status: Linux Headless Foundation, Windows Source & NSIS", () => {
       render(<InstallOverviewPage />);
 
       expect(screen.getByRole("heading", { level: 1, name: /desktop agent installation & capabilities/i })).toBeInTheDocument();
@@ -47,10 +47,10 @@ describe("Public Installation & Onboarding Guides", () => {
       // Linux Card
       const linuxHeading = screen.getByRole("heading", { level: 2, name: /^linux$/i });
       const linuxCard = linuxHeading.closest(".card-elev, [class*='rounded']")!;
-      expect(within(linuxCard as HTMLElement).getByText(/Client Not Implemented/i)).toBeInTheDocument();
-      expect(within(linuxCard as HTMLElement).getByText(/No crate in clients\/linux; planned architecture/i)).toBeInTheDocument();
-      expect(within(linuxCard as HTMLElement).getByRole("link", { name: /linux architecture specification/i })).toHaveAttribute("href", "/install/linux");
-      // Negative oracle: must NOT claim "Source Preview"
+      expect(within(linuxCard as HTMLElement).getByText("Headless Foundation")).toBeInTheDocument();
+      expect(within(linuxCard as HTMLElement).getByText(/Headless foundation crate in clients\/linux/i)).toBeInTheDocument();
+      expect(within(linuxCard as HTMLElement).getByRole("link", { name: /linux foundation & specification/i })).toHaveAttribute("href", "/install/linux");
+      // Negative oracle: must NOT claim "Source Preview" or pre-built binaries
       expect(within(linuxCard as HTMLElement).queryByText(/^Source Preview$/i)).not.toBeInTheDocument();
 
       // macOS Card
@@ -70,15 +70,15 @@ describe("Public Installation & Onboarding Guides", () => {
       expect(within(winCard as HTMLElement).queryByText(/^Pre-Built Installer$/i)).not.toBeInTheDocument();
     });
 
-    it("renders capability matrix with truthful Linux Not Implemented status and Windows compilation status", () => {
+    it("renders capability matrix with truthful Linux Foundation status and Windows compilation status", () => {
       render(<InstallOverviewPage />);
 
       const table = screen.getByRole("table");
       expect(table).toBeInTheDocument();
 
-      // Linux rows must explicitly say NOT IMPLEMENTED and None
-      expect(within(table).getAllByText(/None \(Client Not Implemented\)/i).length).toBe(2);
-      expect(within(table).getAllByText(/NOT IMPLEMENTED \(No crate in repo\)/i).length).toBe(2);
+      // Linux rows must explicitly say Source Foundation and FOUNDATION ONLY
+      expect(within(table).getAllByText(/Source Foundation \(clients\/linux\)/i).length).toBe(2);
+      expect(within(table).getAllByText(/FOUNDATION ONLY \(Sensor-Free Crate; 27 Tests Passed; Native Runtime Unverified\)/i).length).toBe(2);
 
       // Windows row must show Compilation Only
       expect(within(table).getByText(/COMPILATION ONLY/i)).toBeInTheDocument();
@@ -98,14 +98,16 @@ describe("Public Installation & Onboarding Guides", () => {
   });
 
   describe("LinuxInstallPage", () => {
-    it("clearly discloses client is not implemented and labels requirements as planned architecture", () => {
+    it("clearly discloses client is headless foundation with doctor command and consent core", () => {
       render(<LinuxInstallPage />);
 
-      expect(screen.getByRole("heading", { level: 1, name: /linux desktop agent specification/i })).toBeInTheDocument();
-      expect(screen.getByText(/Client Not Implemented \(Architecture Planned\)/i)).toBeInTheDocument();
-      expect(screen.getByText(/Status: Client Not Implemented \(Planned Architecture\)/i)).toBeInTheDocument();
-      expect(screen.getByText(/no Linux client implementation in the repository/i)).toBeInTheDocument();
-      expect(screen.getByRole("heading", { name: /Target Platforms for Future Implementation/i })).toBeInTheDocument();
+      expect(screen.getByRole("heading", { level: 1, name: /linux desktop agent foundation & specification/i })).toBeInTheDocument();
+      expect(screen.getByText("Headless Source Foundation (No Native Collection / Sync Yet)")).toBeInTheDocument();
+      expect(screen.getByText("Status: Headless Source Foundation (Diagnostic CLI & Consent Core)")).toBeInTheDocument();
+      expect(screen.getByText(/first finite headless Linux implementation slice in/i)).toBeInTheDocument();
+      expect(screen.getByRole("heading", { name: /Implemented Diagnostic Command Syntax/i })).toBeInTheDocument();
+      expect(screen.getByText("cargo run --bin dosi-tracker-linux -- doctor")).toBeInTheDocument();
+      expect(screen.getByText("cargo run --bin dosi-tracker-linux -- doctor --json")).toBeInTheDocument();
     });
 
     it("details planned Wayland portal consent and anti-keylogger invariants", () => {
@@ -124,8 +126,9 @@ describe("Public Installation & Onboarding Guides", () => {
       expect(screen.getByText(/refuses to implement or recommend evdev workarounds/i)).toBeInTheDocument();
 
       // Roadmap
-      expect(screen.getByRole("heading", { name: /Linux Implementation Roadmap & Acceptance Gaps/i })).toBeInTheDocument();
-      expect(screen.getByText(/Greenfield Rust Client Crate:/i)).toBeInTheDocument();
+      expect(screen.getByRole("heading", { name: /Linux Implementation Roadmap & Finite Next Slices/i })).toBeInTheDocument();
+      expect(screen.getByText(/Slice 1 \(Delivered\):/i)).toBeInTheDocument();
+      expect(screen.getByText(/Slice 2 \(Next\):/i)).toBeInTheDocument();
     });
 
     it("does not present fake CLI commands, operational setup, or uninstallation scripts (Negative Oracles)", () => {

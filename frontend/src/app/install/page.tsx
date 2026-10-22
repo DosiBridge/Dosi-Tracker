@@ -61,19 +61,19 @@ export default function InstallOverviewPage() {
                 <Terminal className="h-5 w-5 text-primary-strong" aria-hidden="true" />
                 <CardTitle className="text-base font-semibold">Linux</CardTitle>
               </div>
-              <Badge tone="muted" className="text-[10px]">Client Not Implemented</Badge>
+              <Badge tone="warning" className="text-[10px]">Headless Foundation</Badge>
             </div>
             <p className="text-xs text-muted-foreground mt-1">Ubuntu 22.04+, Fedora 38+, Arch, Debian 12+</p>
           </CardHeader>
           <CardContent className="flex flex-1 flex-col justify-between gap-4 text-xs text-muted-foreground">
             <div className="space-y-2.5">
               <p>
-                Client implementation not present in repository (architecture planned). Defines an unprivileged user process
-                strictly prohibiting <code className="font-mono text-foreground font-semibold">root</code>, <code className="font-mono text-foreground font-semibold">sudo</code>, or <code className="font-mono text-foreground font-semibold">evdev</code> keylogging.
+                First finite headless client foundation implemented in <code className="font-mono text-foreground font-semibold">clients/linux</code> (diagnostic command <code className="font-mono text-foreground">doctor [--json]</code>, consent core).
+                All native capture adapters report NOT_IMPLEMENTED; pre-built binaries and sync remain unreleased.
               </p>
               <ul className="space-y-1.5 list-disc pl-4 text-foreground/80">
-                <li><strong className="text-foreground">Source Status:</strong> No crate in clients/linux; planned architecture</li>
-                <li><strong className="text-foreground">Packaging:</strong> No installable binaries; technical spec only</li>
+                <li><strong className="text-foreground">Source Status:</strong> Headless foundation crate in clients/linux</li>
+                <li><strong className="text-foreground">Packaging:</strong> Source foundation only; no pre-built binaries or installers</li>
                 <li><strong className="text-foreground">Wayland Policy:</strong> Portal ScreenCast dialog; input activity unsupported (null)</li>
               </ul>
             </div>
@@ -81,7 +81,7 @@ export default function InstallOverviewPage() {
               href="/install/linux"
               className="mt-2 inline-flex items-center justify-center gap-1.5 w-full rounded-lg bg-primary/10 hover:bg-primary/20 text-primary-strong font-medium py-2 transition-colors text-xs"
             >
-              Linux Architecture Specification <ArrowRight className="h-3.5 w-3.5" aria-hidden="true" />
+              Linux Foundation &amp; Specification <ArrowRight className="h-3.5 w-3.5" aria-hidden="true" />
             </Link>
           </CardContent>
         </Card>
@@ -183,24 +183,24 @@ export default function InstallOverviewPage() {
               <tr className="hover:bg-muted/20">
                 <td className="p-3 font-medium text-foreground">Linux (X11)</td>
                 <td className="p-3">Ubuntu 22+, Fedora 38+, Arch</td>
-                <td className="p-3"><Badge tone="muted" className="text-[10px]">None (Client Not Implemented)</Badge></td>
+                <td className="p-3"><Badge tone="warning" className="text-[10px]">Source Foundation (clients/linux)</Badge></td>
                 <td className="p-3">Planned: XShmGetImage / xcap</td>
                 <td className="p-3">Planned: XInput2 raw ticks</td>
                 <td className="p-3">Planned: _NET_ACTIVE_WINDOW</td>
                 <td className="p-3">Planned: Secret Service D-Bus</td>
                 <td className="p-3 font-medium text-success">No (Strictly Unprivileged)</td>
-                <td className="p-3 font-medium text-amber-600 dark:text-amber-400">NOT IMPLEMENTED (No crate in repo)</td>
+                <td className="p-3 font-medium text-amber-600 dark:text-amber-400">FOUNDATION ONLY (Sensor-Free Crate; 27 Tests Passed; Native Runtime Unverified)</td>
               </tr>
               <tr className="hover:bg-muted/20">
                 <td className="p-3 font-medium text-foreground">Linux (Wayland)</td>
                 <td className="p-3">GNOME 42+, KDE Plasma 5.27+</td>
-                <td className="p-3"><Badge tone="muted" className="text-[10px]">None (Client Not Implemented)</Badge></td>
+                <td className="p-3"><Badge tone="warning" className="text-[10px]">Source Foundation (clients/linux)</Badge></td>
                 <td className="p-3">Planned: Portal ScreenCast Dialog</td>
                 <td className="p-3 font-medium text-amber-600 dark:text-amber-400">UNSUPPORTED (Reported as null)</td>
                 <td className="p-3 font-medium text-amber-600 dark:text-amber-400">UNSUPPORTED (Reported as null)</td>
                 <td className="p-3">Planned: Secret Service D-Bus</td>
                 <td className="p-3 font-medium text-success">No (Strictly Prohibited)</td>
-                <td className="p-3 font-medium text-amber-600 dark:text-amber-400">NOT IMPLEMENTED (No crate in repo)</td>
+                <td className="p-3 font-medium text-amber-600 dark:text-amber-400">FOUNDATION ONLY (Sensor-Free Crate; 27 Tests Passed; Native Runtime Unverified)</td>
               </tr>
               <tr className="hover:bg-muted/20">
                 <td className="p-3 font-medium text-foreground">macOS (arm64 &amp; Intel)</td>
