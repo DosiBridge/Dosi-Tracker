@@ -20,11 +20,14 @@ export const AGENT_SERVER_URL = (process.env.NEXT_PUBLIC_API_URL || "https://loc
 /** Where the agents are published. */
 export const AGENT_RELEASES_URL = "https://github.com/DosiBridge/Dosi-Tracker/releases/latest";
 
-/** The macOS agent's setup guide. */
-export const MACOS_GUIDE_URL = "https://github.com/DosiBridge/Dosi-Tracker/tree/main/clients/macos#readme";
+/** In-app and public installation & onboarding guide URLs. */
+export const WINDOWS_GUIDE_URL = "/install/windows";
+export const MACOS_GUIDE_URL = "/install/macos";
+export const LINUX_GUIDE_URL = "/install/linux";
+export const ALL_GUIDES_URL = "/install";
 
 /** The visitor's desktop OS, for recommending an agent; "unknown" before hydration. */
-export type VisitorOs = "windows" | "macos" | "other" | "unknown";
+export type VisitorOs = "windows" | "macos" | "linux" | "other" | "unknown";
 
 /**
  * Which agent fits the browser's computer. iPads report a Mac platform but
@@ -38,6 +41,7 @@ export function visitorOs(input: { platform?: string | null; userAgent?: string 
   if (platform.startsWith("mac") || (!platform && /mac os x|macintosh/.test(agent))) {
     return (input.maxTouchPoints ?? 0) > 1 ? "other" : "macos";
   }
+  if (platform.startsWith("linux") || (!platform && /linux|x11/.test(agent))) return "linux";
   return platform || agent ? "other" : "unknown";
 }
 

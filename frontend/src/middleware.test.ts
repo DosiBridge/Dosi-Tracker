@@ -41,6 +41,13 @@ describe("middleware route gate", () => {
     expect(locationOf(middleware(req("/invite/abc", false)))).toBeNull();
   });
 
+  it("lets anyone open the installation and onboarding guides without signing in", () => {
+    expect(locationOf(middleware(req("/install", false)))).toBeNull();
+    expect(locationOf(middleware(req("/install/linux", false)))).toBeNull();
+    expect(locationOf(middleware(req("/install/macos", false)))).toBeNull();
+    expect(locationOf(middleware(req("/install/windows", false)))).toBeNull();
+  });
+
   it("sends a signed-in user from /login to a same-site ?next=", () => {
     expect(locationOf(middleware(req("/login", true, "next=/invite/abc")))).toMatch(/\/invite\/abc$/);
     expect(locationOf(middleware(req("/login", true, "next=//evil.example")))).toMatch(/\/dashboard$/);

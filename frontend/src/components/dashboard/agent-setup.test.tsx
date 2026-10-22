@@ -5,23 +5,25 @@ import { axe } from "jest-axe";
 import { AGENT_SERVER_URL, SignInDetails, visitorOs } from "./agent-setup";
 
 describe("visitorOs", () => {
-  it("recognises Windows and macOS desktops", () => {
+  it("recognises Windows, macOS and Linux desktops", () => {
     expect(visitorOs({ platform: "Win32", userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" })).toBe("windows");
     expect(visitorOs({ platform: "Windows", userAgent: "" })).toBe("windows");
     expect(visitorOs({ platform: "MacIntel", userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5)", maxTouchPoints: 0 })).toBe("macos");
     expect(visitorOs({ platform: "macOS", userAgent: "" })).toBe("macos");
+    expect(visitorOs({ platform: "Linux x86_64", userAgent: "Mozilla/5.0 (X11; Linux x86_64)" })).toBe("linux");
+    expect(visitorOs({ platform: "linux", userAgent: "" })).toBe("linux");
   });
 
   it("falls back to the user agent when the platform is empty", () => {
     expect(visitorOs({ platform: "", userAgent: "Mozilla/5.0 (Windows NT 10.0)" })).toBe("windows");
     expect(visitorOs({ platform: "", userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15)" })).toBe("macos");
+    expect(visitorOs({ platform: "", userAgent: "Mozilla/5.0 (X11; Ubuntu; Linux x86_64)" })).toBe("linux");
   });
 
-  it("treats phones, iPads (a Mac platform that accepts touch) and Linux as running neither agent", () => {
+  it("treats phones, tablets, iPads (a Mac platform that accepts touch) and Android as other", () => {
     expect(visitorOs({ platform: "iPhone", userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)" })).toBe("other");
     expect(visitorOs({ platform: "MacIntel", userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15)", maxTouchPoints: 5 })).toBe("other");
     expect(visitorOs({ platform: "Linux armv8l", userAgent: "Mozilla/5.0 (Linux; Android 14)" })).toBe("other");
-    expect(visitorOs({ platform: "Linux x86_64", userAgent: "Mozilla/5.0 (X11; Linux x86_64)" })).toBe("other");
     expect(visitorOs({})).toBe("unknown");
   });
 });

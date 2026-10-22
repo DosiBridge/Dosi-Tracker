@@ -1380,5 +1380,64 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
 6. **Awaiting PM Guidance**:
    - Workspace registration lifecycle backend slice (`REQ-WS-01`, `REQ-ISO-05`) complete. Stop and hand off for PM review with exact diff and test evidence.
 
+---
+
+## 20. Public Desktop Installation Guides & Cross-Platform Evidence Matrix (`native-install-guides-20261022-A`)
+
+### A. Context & Deliverables Overview
+Under Task ID `native-install-guides-20261022-A`, delivered the truthful public website installation, display server capability matrix, and desktop onboarding slice across Linux, macOS, and Windows. All claims are strictly backed by source code artifacts and verified capabilities, without fabricating release binaries, code-signing certificates, or hosted CI runs.
+
+### B. Cross-Platform Desktop OS Evidence & Capability Matrix
+
+| Feature / Dimension | Linux Desktop Agent | macOS Desktop Agent | Windows Desktop Agent |
+|---|---|---|---|
+| **Architecture / Tier** | `x86_64`, `aarch64` (`arm64`) | `arm64` (Apple Silicon), `x86_64` (Intel) | `x86_64-pc-windows-msvc` |
+| **Supported OS Versions** | Ubuntu 22.04 LTS / 24.04 LTS, Fedora 39/40, Debian 12 | macOS 14 Sonoma, macOS 15 Sequoia | Windows 10 (1809+) & Windows 11 |
+| **Current Packaging Status** | **Unreleased / Greenfield Preview** (source build via Cargo) | **Source Build Only** via `clients/macos/scripts/build-app.sh` | **Pre-Built Installer (NSIS)** (`dosi-tracker-setup-<version>.exe`) |
+| **OS Code Signing / Trust** | Distribution package signing (GPG/APT/RPM) when published | Unreleased / Ad-hoc unsigned; requires Gatekeeper "Open Anyway" | Self-signed / Ad-hoc; requires Windows SmartScreen "Run anyway" |
+| **Display Server & Screen Capture** | **Wayland**: `org.freedesktop.portal.ScreenCast` + PipeWire (interactive modal prompt).<br>**X11**: `XShmGetImage` (xcap protocol) unconfined. | ScreenCaptureKit (`SCStream`) API with native OS screen recording permissions | Windows Graphics Capture API & BitBlt (`xcap`) |
+| **Input Activity Measurement** | **Wayland**: **Architecturally Unsupported (`null`)**; strictly no evdev keylogging.<br>**X11**: `XInput2` aggregate event ticks per minute (`XI_RawKeyPress`, `XI_RawButtonPress`). | `CGEventTap` Quartz event tap; reported honestly as `null` if permission denied | Win32 low-level hooks (`WH_KEYBOARD_LL`, `WH_MOUSE_LL`) decoupled via `SensorDriver` |
+| **Active Window Title Capture** | **Wayland**: Private to compositor (`null`); process name read via `/proc/[pid]/cmdline`.<br>**X11**: Root `_NET_ACTIVE_WINDOW` and `_NET_WM_NAME`. | Accessibility API (`NSWorkspace.shared.frontmostApplication`) | Win32 `GetForegroundWindow` and `GetWindowTextW` |
+| **Credential Storage** | Freedesktop Secret Service API via D-Bus (`org.freedesktop.secrets`) | macOS Login Keychain (`com.dosibridge.tracker`) | Windows Data Protection API (DPAPI) via `CryptProtectData` |
+| **First-Run Configuration** | `~/.config/dosi-tracker/config.toml` | Interactive wizard or `config.json` | First-run setup dialog or silent install `/SERVER=` parameter |
+| **User Consent & Pause/Stop** | CLI commands (`dosi-tracker pause`, `resume`, `stop`) | Menu bar tray icon status and pause/stop controls | System tray icon with persistent status and `--quit` switch |
+| **Enterprise Silent Deployment** | Systemd user units (`~/.config/systemd/user/dosi-tracker.service`) | MDM `.mobileconfig` payload profiles | NSIS silent switches: `/S`, `/SERVER=`, `/DASHBOARD=`, `/D=` |
+| **Native Execution on Windows Host** | **NOT VERIFIED** (No Linux kernel/toolchain on Windows host) | **NOT VERIFIED** (No macOS hardware/Xcode on Windows host) | **VERIFIED** (`cargo check --bin dosi-tracker` clean, dev profile, exit 0) |
+
+### C. Implemented Public Routes & Architecture
+1. **Public Route Access & Middleware Integration**:
+   - `frontend/src/middleware.ts`: Whitelisted `/install` and `/install/*` prefix paths to allow public, unauthenticated access without redirecting to `/login`.
+   - `frontend/src/test/architecture.spec.ts`: Added `/install`, `/install/linux`, `/install/macos`, and `/install/windows` to `PUBLIC_ROUTES` exception set with explicit architecture documentation.
+2. **Onboarding & Download Cross-Linking**:
+   - `frontend/src/components/dashboard/agent-setup.tsx`: Added Linux visitor detection (`VisitorOs === "linux"`, excluding Android). Exported direct guide URLs: `WINDOWS_GUIDE_URL`, `MACOS_GUIDE_URL`, `LINUX_GUIDE_URL`, `ALL_GUIDES_URL`.
+   - `frontend/src/app/(dashboard)/download/page.tsx`: Added 3rd desktop card for Linux, highlighted when visitor runs Linux. Added direct links to all per-OS installation guides and bottom cross-link banner.
+3. **Dedicated Installation & Help Pages**:
+   - `frontend/src/app/install/layout.tsx`: Public layout with skip link, brand header, sub-navigation tabs for all 3 OS platforms, and theme provider toggle.
+   - `frontend/src/app/install/page.tsx`: Overview page containing high-level OS download cards, capability matrix, and security invariant highlights.
+   - `frontend/src/app/install/linux/page.tsx`: Detailed Linux guide covering Wayland vs X11 display boundaries, interactive ScreenCast dialog, unprivileged execution invariant (strictly no sudo, root, or evdev `/dev/input/event*`), `config.toml`, Secret Service D-Bus storage, CLI pause/resume/stop, systemd user service, and uninstallation.
+   - `frontend/src/app/install/macos/page.tsx`: Detailed macOS guide covering Apple Silicon & Intel requirements, source build via `scripts/build-app.sh`, Gatekeeper "Open Anyway" approval, TCC permissions (Screen Recording, Input Monitoring, Accessibility, Camera), Keychain storage, tray controls, and uninstallation.
+   - `frontend/src/app/install/windows/page.tsx`: Detailed Windows guide covering Windows 10/11 x86_64, NSIS installer, SmartScreen bypass, silent enterprise install parameters, DPAPI encryption, tray controls, `--quit` switch, and uninstallation.
+
+### D. Executed Verification & Quality Gates
+1. **Frontend Acceptance & Component Test Suites**:
+   - `npm test -- src/middleware.test.ts src/components/dashboard/agent-setup.test.tsx src/test/acceptance/agent-onboarding.test.tsx src/test/acceptance/install-guides.test.tsx src/test/architecture.spec.ts`
+   - Outcome: **50 passed out of 50 tests across 5 test suites, 0 failed, exit 0**.
+   - Includes 4 axe programmatic accessibility checks across `/install`, `/install/linux`, `/install/macos`, and `/install/windows` with **zero violations**.
+2. **Frontend Type Checking**:
+   - `npm run typecheck` (`tsc --noEmit`)
+   - Outcome: **0 errors, exit 0**.
+3. **Frontend Code Quality & Linting**:
+   - `npm run lint` (`eslint --max-warnings 45`)
+   - Outcome: **0 errors, 3 pre-existing warnings in unrelated files, 0 warnings in new files, exit 0**.
+4. **Native Client Compilation Check**:
+   - `cargo check --bin dosi-tracker` in `clients/windows`
+   - Outcome: **Finished `dev` profile [unoptimized + debuginfo] target(s) in 31.63s, exit 0**.
+
+### E. Explicit Evidence Boundaries & Next Bounded Recommendations
+1. **Host Execution Limitations**: The development host is Windows. Compilation, packaging, and runtime execution for Linux and macOS native agents remain **NOT VERIFIED**.
+2. **Code Signing Gaps**: Neither Apple Developer ID notarization nor Windows Authenticode EV certificates exist in the repository; public guides truthfully instruct users on Gatekeeper and SmartScreen approvals.
+3. **Next Bounded Recommendation**: Implement the smallest source-proven Linux desktop client crate (`clients/linux`) targeting X11 window title capture (`_NET_ACTIVE_WINDOW`) with side-effect-free driver testing.
+
+
 
 

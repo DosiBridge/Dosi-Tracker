@@ -515,8 +515,19 @@ describe("architecture spec: route-permission consistency", () => {
    *  - "/login"  → the public sign-in page; it must be reachable logged-out.
    *  - "/workspaces" → the workspace chooser: signed in, but before any workspace (so before any role).
    *  - "/invite/[token]" → an invitation link; it must open logged-out.
+   *  - "/install", "/install/linux", "/install/macos", "/install/windows" →
+   *      public desktop installation & capability guides reachable logged-out.
    */
-  const PUBLIC_ROUTES = new Set<string>(["/", "/login", "/workspaces", "/invite/[token]"]);
+  const PUBLIC_ROUTES = new Set<string>([
+    "/",
+    "/login",
+    "/workspaces",
+    "/invite/[token]",
+    "/install",
+    "/install/linux",
+    "/install/macos",
+    "/install/windows",
+  ]);
 
   it("has a real page behind every navAccess permission (no phantom permissions)", () => {
     // RULE 9a — a navAccess key with no page is dead configuration that

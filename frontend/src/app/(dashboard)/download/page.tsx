@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { Download, ExternalLink, Laptop, Monitor, ShieldCheck, Sparkles } from "lucide-react";
+import { Download, ExternalLink, Laptop, Monitor, ShieldCheck, Sparkles, Terminal, BookOpen, ArrowRight } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -10,7 +10,10 @@ import { useSession } from "@/components/session-provider";
 import { linkButtonClass } from "@/components/dashboard/link-button";
 import {
   AGENT_RELEASES_URL,
+  WINDOWS_GUIDE_URL,
   MACOS_GUIDE_URL,
+  LINUX_GUIDE_URL,
+  ALL_GUIDES_URL,
   SignInDetails,
   useVisitorOs,
   type VisitorOs,
@@ -45,18 +48,23 @@ export default function DownloadPage() {
         workspace without it. Then sign in with the email and password you use here.
       </SignInDetails>
 
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
         <AgentCard
           platform="windows"
           os={os}
           icon={Monitor}
           title="Windows"
-          requirement="Windows 10 or 11"
+          requirement="Windows 10 or 11 (x86_64)"
           action={
-            <a href={AGENT_RELEASES_URL} target="_blank" rel="noopener noreferrer" className={linkButtonClass("primary", "md")}>
-              <Download aria-hidden className="h-4 w-4" /> Download for Windows <ExternalLink aria-hidden className="h-3.5 w-3.5 opacity-70" />
-              <span className="sr-only"> (opens in a new tab)</span>
-            </a>
+            <div className="flex flex-col gap-2">
+              <a href={AGENT_RELEASES_URL} target="_blank" rel="noopener noreferrer" className={linkButtonClass("primary", "md")}>
+                <Download aria-hidden className="h-4 w-4" /> Download for Windows <ExternalLink aria-hidden className="h-3.5 w-3.5 opacity-70" />
+                <span className="sr-only"> (opens in a new tab)</span>
+              </a>
+              <Link href={WINDOWS_GUIDE_URL} className="text-xs text-primary-strong hover:underline inline-flex items-center gap-1 justify-center pt-1">
+                Windows setup &amp; troubleshooting guide <ArrowRight className="h-3 w-3" aria-hidden="true" />
+              </Link>
+            </div>
           }
         >
           <ol className="list-decimal space-y-2 pl-5 text-muted-foreground">
@@ -84,12 +92,11 @@ export default function DownloadPage() {
           os={os}
           icon={Laptop}
           title="macOS"
-          requirement="macOS 14 Sonoma or later"
+          requirement="macOS 14 Sonoma or later (arm64 & Intel)"
           action={
-            <a href={MACOS_GUIDE_URL} target="_blank" rel="noopener noreferrer" className={linkButtonClass("outline", "md")}>
-              macOS setup guide <ExternalLink aria-hidden className="h-3.5 w-3.5 opacity-70" />
-              <span className="sr-only"> (opens in a new tab)</span>
-            </a>
+            <Link href={MACOS_GUIDE_URL} className={linkButtonClass("outline", "md")}>
+              macOS setup guide <ArrowRight aria-hidden className="h-3.5 w-3.5 opacity-70" />
+            </Link>
           }
         >
           <p className="text-muted-foreground">
@@ -122,7 +129,60 @@ export default function DownloadPage() {
           </ul>
           <p className="text-xs text-muted-foreground">Skip a permission and only that part is left out — time is still tracked.</p>
         </AgentCard>
+
+        <AgentCard
+          platform="linux"
+          os={os}
+          icon={Terminal}
+          title="Linux"
+          requirement="Ubuntu 22.04+, Fedora 38+, Arch (X11 or Wayland)"
+          action={
+            <Link href={LINUX_GUIDE_URL} className={linkButtonClass("outline", "md")}>
+              Linux setup &amp; capability guide <ArrowRight aria-hidden className="h-3.5 w-3.5 opacity-70" />
+            </Link>
+          }
+        >
+          <p className="text-muted-foreground">
+            Pre-built packages are unreleased (source preview). Operates strictly as an unprivileged user process —
+            never requires <span className="font-medium text-foreground">root</span> or <span className="font-medium text-foreground">sudo</span>.
+          </p>
+          <ol className="list-decimal space-y-2 pl-5 text-muted-foreground">
+            <li>Review the Linux capability guide for your desktop environment.</li>
+            <li>
+              Configure the agent in <span className="font-medium text-foreground">~/.config/dosi-tracker/config.toml</span> with the
+              server address and credentials above.
+            </li>
+            <li>
+              <span className="font-medium text-foreground">Wayland display servers:</span> Screen capture uses an interactive system dialog;
+              global input activity and window titles are isolated by the compositor and reported honestly as unmeasured (null).
+            </li>
+            <li>
+              <span className="font-medium text-foreground">X11 display servers:</span> Screen capture, activity ticks, and active window titles are tracked directly.
+            </li>
+          </ol>
+          <p className="text-xs text-muted-foreground">
+            Strictly prohibits evdev keylogging or root escalation.
+          </p>
+        </AgentCard>
       </div>
+
+      <Card variant="quiet" className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 p-4 text-sm text-muted-foreground border border-border/80">
+        <div className="flex items-start gap-3">
+          <BookOpen aria-hidden className="mt-0.5 h-5 w-5 shrink-0 text-primary-strong" />
+          <div>
+            <p className="font-medium text-foreground">Looking for detailed architecture &amp; installation steps?</p>
+            <p className="text-xs text-muted-foreground mt-0.5">
+              Explore silent deployment switches, Wayland security isolation, and macOS Gatekeeper troubleshooting.
+            </p>
+          </div>
+        </div>
+        <Link
+          href={ALL_GUIDES_URL}
+          className="inline-flex items-center gap-1.5 rounded-lg bg-primary/10 hover:bg-primary/20 text-primary-strong text-xs font-semibold px-3 py-2 transition-colors shrink-0"
+        >
+          View Installation Guides &amp; Matrix <ArrowRight className="h-3.5 w-3.5" aria-hidden="true" />
+        </Link>
+      </Card>
 
       <Card variant="quiet" className="flex items-start gap-3 p-4 text-sm text-muted-foreground">
         <ShieldCheck aria-hidden className="mt-0.5 h-5 w-5 shrink-0" />

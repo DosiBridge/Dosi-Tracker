@@ -16,7 +16,7 @@ export function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl;
   const hasSession = request.cookies.has("dosi-token");
 
-  if (pathname.startsWith("/invite/")) return NextResponse.next();
+  if (pathname.startsWith("/invite/") || pathname.startsWith("/install")) return NextResponse.next();
 
   if (pathname === "/login") {
     if (hasSession) {

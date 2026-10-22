@@ -88,6 +88,16 @@ describe("Feature: Connecting a desktop agent", () => {
 
       expect(within(screen.getByRole("region", { name: /windows/i })).getByText("For this computer")).toBeInTheDocument();
     });
+
+    it("Given a member on Linux When they open Download Then the Linux card is marked for this computer", () => {
+      browseFrom("Linux x86_64");
+      renderAsRole(<DownloadPage />, "worker", { route: "/download" });
+
+      const linux = screen.getByRole("region", { name: /linux/i });
+      expect(within(linux).getByText("For this computer")).toBeInTheDocument();
+      expect(within(screen.getByRole("region", { name: /windows/i })).queryByText("For this computer")).not.toBeInTheDocument();
+      expect(within(screen.getByRole("region", { name: /macos/i })).queryByText("For this computer")).not.toBeInTheDocument();
+    });
   });
 
   describe("Scenario: Every permission says what it is for", () => {
@@ -101,6 +111,7 @@ describe("Feature: Connecting a desktop agent", () => {
       expect(text).toContain("Camera — only if your project turns on webcam photos");
       expect(text).not.toMatch(/Accessibilityin/);
       expect(text).toContain("System Settings → Privacy & Security");
+      expect(within(mac).getByRole("link", { name: /macos setup guide/i })).toHaveAttribute("href", "/install/macos");
     });
 
     it("Given the Download page Then Windows names the installer and needs no special permissions", () => {
@@ -110,6 +121,24 @@ describe("Feature: Connecting a desktop agent", () => {
       expect(within(windows).getByText("dosi-tracker-setup-<version>.exe")).toBeInTheDocument();
       expect(within(windows).getByText(/asks for no special permissions/i)).toBeInTheDocument();
       expect(within(windows).getByRole("link", { name: /download for windows/i })).toHaveAttribute("rel", expect.stringContaining("noopener"));
+      expect(within(windows).getByRole("link", { name: /windows setup & troubleshooting guide/i })).toHaveAttribute("href", "/install/windows");
+    });
+
+    it("Given the Download page Then Linux card explains Wayland portal consent, null input activity, and links to the Linux guide", () => {
+      renderAsRole(<DownloadPage />, "worker", { route: "/download" });
+
+      const linux = screen.getByRole("region", { name: /linux/i });
+      expect(within(linux).getByText(/Pre-built packages are unreleased/i)).toBeInTheDocument();
+      expect(within(linux).getByText(/Wayland display servers/i)).toBeInTheDocument();
+      expect(within(linux).getByText(/reported honestly as unmeasured \(null\)/i)).toBeInTheDocument();
+      expect(linux.textContent).toContain("never requires root or sudo");
+      expect(within(linux).getByText(/Strictly prohibits evdev keylogging or root escalation/i)).toBeInTheDocument();
+      expect(within(linux).getByRole("link", { name: /linux setup & capability guide/i })).toHaveAttribute("href", "/install/linux");
+    });
+
+    it("Given the Download page Then it provides a link to the complete multi-platform installation guides & matrix", () => {
+      renderAsRole(<DownloadPage />, "worker", { route: "/download" });
+      expect(screen.getByRole("link", { name: /view installation guides & matrix/i })).toHaveAttribute("href", "/install");
     });
 
     it("a11y: the Download page has no axe violations", async () => {
