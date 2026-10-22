@@ -11,6 +11,7 @@ pub mod diagnostics;
 pub mod lifecycle;
 pub mod outbox;
 pub mod paths;
+pub mod sync;
 
 pub use consent::{
     ConsentError, ConsentManager, ConsentStorage, ConsentStore, ConsentedPermissions,
@@ -30,3 +31,8 @@ pub use outbox::{
     MAX_WORKSPACE_ID_BYTES, OUTBOX_SCHEMA_VERSION,
 };
 pub use paths::LinuxPaths;
+pub use sync::{
+    run_sync_pass, ActivityFailure, DeliveryOutcome, DeliveryTransport, SyncError, SyncPassConfig,
+    SyncPassCoordinator, SyncPassReport, SyncStopReason, DEFAULT_BATCH_LIMIT, DEFAULT_MAX_ATTEMPTS,
+    MAX_ALLOWED_ATTEMPTS, MAX_ALLOWED_BATCH_LIMIT,
+};

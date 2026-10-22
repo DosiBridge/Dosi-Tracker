@@ -2008,6 +2008,85 @@ Independent PM inspection of Task J identified a remaining library correctness/b
 3. **Prior Unresolved Approval Invariant**: The approval-blocked command `tirith:archive_extract` remains unresolved. Worker has **NOT** retried, repackaged, or delegated that command, nor modified archive extraction approvals.
 4. **Host Toolchain vs Native Linux Evidence Separation**: All tests were executed on Windows host MSVC and Git-Bash toolchains. This does **NOT** constitute independent PM acceptance or native Linux kernel/libc runtime verification.
 
+---
+
+## 30. Sensor-Free Scoped Offline Sync-Pass Coordinator (linux-sensor-free-scoped-sync-pass-20261022-L)
+
+### A. Sourced-Backed Capability Gap & Implementation Architecture
+1. **Source-Confirmed Capability Gap**:
+   - `clients/linux` previously exported `consent`, `diagnostics`, `lifecycle`, `outbox`, and `paths`, but possessed zero sync coordination capability.
+   - The CLI binary was restricted to diagnostics and help, and `DoctorReport.adapters.backend_sync` truthfully reported `NotImplemented`.
+   - Windows uploader (`clients/windows/src/worker/uploader.rs`) and macOS `SyncPass` (`clients/macos/Sources/DosiTrackerCore/Sync/SyncPass.swift`) are platform-specific worker implementations, not Linux integration.
+   - Generic local outbox JSON is not a working backend wire contract (backend `ClientActivityId` is a Guid and scoped ingestion endpoints differ from the local envelope).
+2. **Library-Only Architecture & Injection Seam**:
+   - Implemented `dosi_tracker_linux::sync` (`clients/linux/src/sync.rs`), providing an explicit-call, sensor-free library sync-pass coordinator (`SyncPassCoordinator` and `run_sync_pass`) over the durable SQLite [`Outbox`].
+   - **Explicit Scope & Strict Bound Configuration**:
+     - Operates strictly on a single, immutable, validated [`OutboxScope`] per pass.
+     - Hard finite defaults (`DEFAULT_MAX_ATTEMPTS = 50`, `DEFAULT_BATCH_LIMIT = 20`) and ceilings (`MAX_ALLOWED_ATTEMPTS = 200`, `MAX_ALLOWED_BATCH_LIMIT = 100`).
+     - Configuration validation (`SyncPassConfig::validate`) rejects zero, negative, or overflow values before any store read or transport invocation.
+   - **Decoupled Delivery Interface & Typed Outcomes**:
+     - Injected [`DeliveryTransport`] trait (`deliver(&mut self, entry: &OutboxEntry) -> DeliveryOutcome`) receives the full scoped entry without performing ambient account or workspace lookups.
+     - Strongly-typed outcomes:
+       * `DeliveryOutcome::Accepted { client_activity_id }`: Server definitively accepted the activity.
+       * `DeliveryOutcome::TransientFailure { reason }`: Network timeout, 5xx error, or connection reset.
+       * `DeliveryOutcome::AuthRequired { reason }`: Expired credentials or 401/403 authorization denial.
+       * `DeliveryOutcome::Rejected { reason }`: 400 bad data, 422 unprocessable, or invalid schema.
+   - **Exact Positive Acknowledgement Required**:
+     - Only an `Accepted` outcome returning the exact matching `client_activity_id` permits removing the row from the local outbox via `ack_delivered`.
+     - Mismatched or unknown identity acknowledgement stops the pass immediately with `MismatchedAcknowledgement` and preserves the queue.
+   - **Fail-Closed Non-Accepted Row Preservation**:
+     - `TransientFailure`: updates retry count and bounded diagnostic error message via `mark_attempt_failed`, keeping the row for future passes. Halts pass.
+     - `AuthRequired`: halts pass immediately without deleting rows or claiming credential refresh.
+     - `DefinitiveRejection`: halts pass and visibly reports rejection in `definitive_rejections` without silent dropping.
+     - Never repeatedly retries a failed row in the same pass.
+   - **Concurrency & Mutex Release**:
+     - The SQLite connection mutex is **never** held across the external `DeliveryTransport::deliver` callback. Locks are acquired and released strictly during `peek_pending`, `ack_delivered`, and `mark_attempt_failed`.
+   - **Accurate Transport vs Local Persistence Reporting**:
+     - If transport accepts an activity but local SQLite deletion fails (e.g. injected disk write failure), the pass stops with `AcknowledgementPersistenceFailed`.
+     - The activity is reported in `transport_accepted` but **not** in `persisted_acknowledged`. The row remains intact in SQLite, preserving retry and idempotency reasoning.
+   - **Corrupt Store Safety**:
+     - Store read and corrupt record errors fail closed immediately without calling transport or mutating the queue.
+   - **CLI Non-Mutating Offline Invariants**:
+     - `dosi-tracker-linux doctor` and `help` remain strictly non-mutating and offline, reporting `backend_sync: NOT_IMPLEMENTED`.
+
+### B. Executed Regressions & Test Evidence
+1. **Task L Sync Pass Integration Tests (`tests/sync_tests.rs`, 10 New Tests)**:
+   - `test_successful_bounded_drain_and_reopen`: 3 envelopes enqueued, accepted by fake delivery ledger, fully drained (`attempted_count == 3`, `persisted_acknowledged.len() == 3`, `drained == true`), verified 0 remaining rows after reopen from disk.
+   - `test_same_activity_id_in_different_scopes_stays_isolated`: Same `client_activity_id = "act-shared"` under Scope A and Scope B. Sync pass for Scope A drains Scope A while Scope B remains 100% intact with count 1, retry_count 0, and was never passed to transport.
+   - `test_identical_payload_and_key_preserved_across_retry_and_reopen`: Transient 503 failure updates retry_count to 1 and last_error; all envelope metrics (productivity 85%, mouse clicks, keyboard hits, timestamps, description) remain byte-for-byte identical across disk reopen; second pass delivers identical payload and drains queue.
+   - `test_max_attempts_and_leftovers_handled_cleanly`: 7 envelopes enqueued with `max_attempts = 3, batch_limit = 2`. Exactly 3 attempted and acknowledged; reports `MaxAttemptsReached { limit: 3 }`, `drained == false`; 4 leftovers remain in exact FIFO order and drain on subsequent pass.
+   - `test_transient_auth_and_rejected_outcomes_preserve_unaccepted_rows`: Tests all 3 failure outcomes preserve queue and halt pass without attempting subsequent rows or silent dropping.
+   - `test_mismatched_acknowledgement_preserves_queue_and_halts`: Transport returning rogue ID stops pass with `MismatchedAcknowledgement`; entry is not removed from outbox.
+   - `test_injected_store_failure_reports_acceptance_but_persistence_pending`: Native SQLite trigger simulating disk failure on DELETE causes `ack_delivered` failure; coordinator correctly reports `transport_accepted == ["act-db-error"]`, `persisted_acknowledged == []`, `AcknowledgementPersistenceFailed`, and row remains in outbox.
+   - `test_corrupt_read_does_not_invoke_transport_or_reset_queue`: Corrupted JSON payload fails closed with `OutboxError::CorruptRecord`; ledger called 0 times; database row preserved.
+   - `test_invalid_limits_and_scope_refuse_transport_and_mutation`: Zero/overflow max_attempts, zero/overflow batch_limit, and empty account scope fail closed with `InvalidConfig` / `InvalidScope`; ledger called 0 times; 0 database mutations.
+   - `test_doctor_and_help_remain_strictly_nonmutating_and_offline`: Doctor and help CLI commands exit 0, perform zero network calls, create zero files, and report `backend_sync: NOT_IMPLEMENTED`.
+2. **Existing Test Suites Maintained**:
+   - 28 outbox integration tests passed.
+   - 21 unit tests, 6 doctor CLI tests, 7 consent/policy repro tests, 3 installer integration tests passed.
+   - Total Rust tests in `clients/linux`: **75 passed, 0 failed, exit 0**.
+   - Shell installer lifecycle: 22 passed, exit 0.
+   - Frontend Vitest suite: 50 passed, exit 0.
+   - Frontend typecheck: 0 errors, exit 0.
+
+### C. Executed Test Suites & Quality Gates
+| Target Suite | Exact Command Line | Tests Passed | Ignored | Result | Exit Code | Evidence Level |
+|---|---|:---:|:---:|:---:|:---:|---|
+| **Linux Unit, CLI, Repro, Installer, Outbox & Sync Tests** | `cargo test` in `clients/linux` | 75 passed (21 unit + 6 doctor CLI + 7 repro + 3 installer integration + 28 outbox integration + 10 sync integration) | 0 | PASSED | **0** | **[Worker-Reported (Windows Host Toolchain)]** |
+| **Shell Installer Lifecycle Suite** | `bash clients/linux/tests/test_installer_lifecycle.sh` | 22 passed (all lifecycle, security confinement, and binary doctor checks) | 0 | PASSED | **0** | **[Worker-Reported (Git-Bash Host Toolchain)]** |
+| **Linux Code Formatting** | `cargo fmt --check` in `clients/linux` | N/A | 0 diffs | PASSED | **0** | **[Worker-Reported]** |
+| **Linux Compilation Check** | `cargo check` in `clients/linux` | N/A | 0 errors, 0 warnings | PASSED | **0** | **[Worker-Reported]** |
+| **Frontend Acceptance Suite** | `npx vitest run src/middleware.test.ts src/components/dashboard/agent-setup.test.tsx src/test/acceptance/agent-onboarding.test.tsx src/test/acceptance/install-guides.test.tsx src/test/architecture.spec.ts` | 50 passed | 0 | PASSED | **0** | **[Worker-Reported (Focused 5-File Suite)]** |
+| **Frontend Typecheck** | `npm run typecheck` in `frontend` | N/A | 0 errors | PASSED | **0** | **[Worker-Reported]** |
+
+### D. PM QA Boundary Limits & Acceptance Disclosures
+1. **Missing-Feature RED vs Failing-Before**: Prior codebase had no sync-pass coordinator in `clients/linux` (missing-feature RED); this task implements the bounded library coordinator capability without mutating doctor/help or inventing network wire implementations.
+2. **Library-Only Injection Boundary**: Only the local synchronization coordinator library module is implemented (`dosi_tracker_linux::sync`). No production HTTP client, no daemon/scheduler, and no sensor adapters are active.
+3. **Truthful Capability Diagnostics**: `backend_sync` remains reported as `NOT_IMPLEMENTED` in `dosi-tracker-linux doctor`.
+4. **Prior Unresolved Approval Invariant**: The approval-blocked command `tirith:archive_extract` remains unresolved. Worker has **NOT** retried, repackaged, or delegated that command, nor modified archive extraction approvals.
+5. **Host Toolchain vs Native Linux Evidence Separation**: All tests were executed on Windows host MSVC and Git-Bash toolchains. This does **NOT** constitute independent PM acceptance or native Linux kernel/libc runtime verification.
+
+
 
 
 
