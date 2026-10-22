@@ -202,35 +202,185 @@ impl ConsentStore {
 
         Ok(())
     }
+    /// Check if target file exists.
+    pub fn exists(path: &Path) -> bool {
+        path.is_file()
+    }
 }
 
-/// In-memory manager for local consent with immediate revocation semantics.
+/// Abstract storage trait for consent persistence.
+pub trait ConsentStorage: Send + Sync {
+    fn load(&self) -> Result<LocalConsent, ConsentError>;
+    fn save(&self, consent: &LocalConsent) -> Result<(), ConsentError>;
+}
+
+/// File-backed implementation of `ConsentStorage`.
 #[derive(Debug, Clone)]
+pub struct FileConsentStore {
+    path: PathBuf,
+}
+
+impl FileConsentStore {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl ConsentStorage for FileConsentStore {
+    fn load(&self) -> Result<LocalConsent, ConsentError> {
+        ConsentStore::load(&self.path)
+    }
+
+    fn save(&self, consent: &LocalConsent) -> Result<(), ConsentError> {
+        ConsentStore::save(&self.path, consent)
+    }
+}
+
+pub type SaveBarrier = Box<dyn Fn(&LocalConsent) -> Result<(), ConsentError> + Send + Sync>;
+
+/// In-memory fake consent storage with fault injection and barrier callbacks for deterministic testing.
+pub struct MemoryConsentStore {
+    consent: std::sync::Mutex<LocalConsent>,
+    fail_saves: std::sync::atomic::AtomicBool,
+    fail_loads: std::sync::atomic::AtomicBool,
+    save_count: std::sync::atomic::AtomicUsize,
+    load_count: std::sync::atomic::AtomicUsize,
+    save_barrier: std::sync::Mutex<Option<SaveBarrier>>,
+}
+
+impl Default for MemoryConsentStore {
+    fn default() -> Self {
+        Self::new(LocalConsent::Absent)
+    }
+}
+
+impl MemoryConsentStore {
+    pub fn new(initial: LocalConsent) -> Self {
+        Self {
+            consent: std::sync::Mutex::new(initial),
+            fail_saves: std::sync::atomic::AtomicBool::new(false),
+            fail_loads: std::sync::atomic::AtomicBool::new(false),
+            save_count: std::sync::atomic::AtomicUsize::new(0),
+            load_count: std::sync::atomic::AtomicUsize::new(0),
+            save_barrier: std::sync::Mutex::new(None),
+        }
+    }
+
+    pub fn set_fail_saves(&self, fail: bool) {
+        self.fail_saves
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn set_fail_loads(&self, fail: bool) {
+        self.fail_loads
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn set_save_barrier<F>(&self, barrier: F)
+    where
+        F: Fn(&LocalConsent) -> Result<(), ConsentError> + Send + Sync + 'static,
+    {
+        *self.save_barrier.lock().unwrap() = Some(Box::new(barrier));
+    }
+
+    pub fn clear_save_barrier(&self) {
+        *self.save_barrier.lock().unwrap() = None;
+    }
+
+    pub fn save_count(&self) -> usize {
+        self.save_count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn load_count(&self) -> usize {
+        self.load_count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn current(&self) -> LocalConsent {
+        *self.consent.lock().unwrap()
+    }
+}
+
+impl ConsentStorage for MemoryConsentStore {
+    fn load(&self) -> Result<LocalConsent, ConsentError> {
+        self.load_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail_loads.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(ConsentError::IoError("Simulated load failure".into()));
+        }
+        Ok(*self.consent.lock().unwrap())
+    }
+
+    fn save(&self, consent: &LocalConsent) -> Result<(), ConsentError> {
+        self.save_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(ref barrier) = *self.save_barrier.lock().unwrap() {
+            barrier(consent)?;
+        }
+        if self.fail_saves.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(ConsentError::SaveFailed(
+                "Simulated persistence failure".into(),
+            ));
+        }
+        *self.consent.lock().unwrap() = *consent;
+        Ok(())
+    }
+}
+
+/// In-memory manager for local consent with immediate revocation and persistence-first widening semantics.
+#[derive(Clone)]
 pub struct ConsentManager {
     current: LocalConsent,
-    persist_path: Option<PathBuf>,
+    storage: Option<std::sync::Arc<dyn ConsentStorage>>,
 }
 
 impl ConsentManager {
-    /// Construct manager with an initial state and optional persistence path.
+    /// Construct manager with an initial state and optional file path.
     pub fn new(initial: LocalConsent, persist_path: Option<PathBuf>) -> Self {
+        let storage: Option<std::sync::Arc<dyn ConsentStorage>> = persist_path.map(|p| {
+            std::sync::Arc::new(FileConsentStore::new(p)) as std::sync::Arc<dyn ConsentStorage>
+        });
+        Self::with_storage(initial, storage)
+    }
+
+    /// Construct manager with custom storage provider.
+    pub fn with_storage(
+        initial: LocalConsent,
+        storage: Option<std::sync::Arc<dyn ConsentStorage>>,
+    ) -> Self {
         Self {
             current: initial,
-            persist_path,
+            storage,
         }
+    }
+
+    /// Set or update the file persistence path.
+    pub fn set_persist_path(&mut self, path: Option<PathBuf>) {
+        self.storage = path.map(|p| {
+            std::sync::Arc::new(FileConsentStore::new(p)) as std::sync::Arc<dyn ConsentStorage>
+        });
+    }
+
+    /// Set or update the storage provider.
+    pub fn set_storage(&mut self, storage: Option<std::sync::Arc<dyn ConsentStorage>>) {
+        self.storage = storage;
     }
 
     /// Load from path, failing closed to `LocalConsent::Absent` on malformed file.
     pub fn load_or_fail_closed(path: &Path) -> (Self, Option<ConsentError>) {
-        match ConsentStore::load(path) {
-            Ok(consent) => (Self::new(consent, Some(path.to_path_buf())), None),
-            Err(err) => {
-                // Fail closed: malformed file results in Absent consent
-                (
-                    Self::new(LocalConsent::Absent, Some(path.to_path_buf())),
-                    Some(err),
-                )
-            }
+        let store = FileConsentStore::new(path.to_path_buf());
+        match store.load() {
+            Ok(consent) => (
+                Self::with_storage(consent, Some(std::sync::Arc::new(store))),
+                None,
+            ),
+            Err(err) => (
+                Self::with_storage(LocalConsent::Absent, Some(std::sync::Arc::new(store))),
+                Some(err),
+            ),
         }
     }
 
@@ -248,34 +398,70 @@ impl ConsentManager {
 
     /// Update consent state.
     ///
-    /// CRITICAL PRIVACY INVARIANT:
-    /// If consent is narrowed (capabilities removed) or revoked, `self.current` is updated
-    /// in memory IMMEDIATELY. Even if disk persistence subsequently returns an Err,
-    /// the in-memory admission is already revoked and cannot be exploited.
+    /// CRITICAL PRIVACY & PERSISTENCE INVARIANTS:
+    /// - Capabilities removed in `next` are withdrawn IMMEDIATELY in-memory before disk I/O.
+    /// - Blur tightening (`blur_screenshots` false -> true) is applied IMMEDIATELY as defense-in-depth.
+    /// - Newly added capabilities in `next` are admitted ONLY AFTER persistence succeeds.
+    /// - If persistence fails on a mixed update (narrowing + expansion), removed permissions
+    ///   remain withdrawn and tightened blur remains enforced, but new permissions are NOT granted.
+    /// - Pure widening remains strictly persistence-first.
     pub fn update(&mut self, next: LocalConsent) -> Result<(), ConsentError> {
         let prev = self.current;
-        let is_narrowing = match (prev, next) {
-            (LocalConsent::Granted(p_old), LocalConsent::Granted(p_new)) => {
-                p_new.is_narrower_than(&p_old)
-            }
-            (LocalConsent::Granted(_), LocalConsent::Revoked | LocalConsent::Absent) => true,
-            _ => false,
-        };
+        if prev == next {
+            return Ok(());
+        }
 
-        if is_narrowing {
-            // Immediately drop in memory before touching disk
-            self.current = next;
-            if let Some(ref path) = self.persist_path {
-                ConsentStore::save(path, &next)?;
+        match (prev, next) {
+            (LocalConsent::Granted(p_old), LocalConsent::Granted(p_new)) => {
+                // Compute immediate in-memory grant:
+                // - Only retain capabilities present in BOTH p_old and p_new (withdraw removed; do not admit new).
+                // - Apply blur tightening immediately (defense-in-depth).
+                let p_immediate = ConsentedPermissions {
+                    screenshot: p_old.screenshot && p_new.screenshot,
+                    webcam: p_old.webcam && p_new.webcam,
+                    keyboard: p_old.keyboard && p_new.keyboard,
+                    mouse: p_old.mouse && p_new.mouse,
+                    active_window: p_old.active_window && p_new.active_window,
+                    running_programs: p_old.running_programs && p_new.running_programs,
+                    blur_screenshots: p_old.blur_screenshots || p_new.blur_screenshots,
+                };
+
+                // Immediately drop removed capabilities and enforce tightened blur
+                self.current = LocalConsent::Granted(p_immediate);
+
+                if let Some(ref storage) = self.storage {
+                    storage.save(&next)?;
+                }
+
+                // Persistence succeeded: admit newly added capabilities and loosened blur
+                self.current = next;
+                Ok(())
             }
-            Ok(())
-        } else {
-            // Widening: attempt persistence first. If save fails, do not broaden in memory
-            if let Some(ref path) = self.persist_path {
-                ConsentStore::save(path, &next)?;
+            (LocalConsent::Granted(_), LocalConsent::Revoked | LocalConsent::Absent) => {
+                // Immediate withdrawal of all capabilities before persistence
+                self.current = next;
+
+                if let Some(ref storage) = self.storage {
+                    storage.save(&next)?;
+                }
+                Ok(())
             }
-            self.current = next;
-            Ok(())
+            (LocalConsent::Absent | LocalConsent::Revoked, LocalConsent::Granted(_)) => {
+                // Pure widening from an inactive state: persistence-first. No permissions admitted on save failure.
+                if let Some(ref storage) = self.storage {
+                    storage.save(&next)?;
+                }
+                self.current = next;
+                Ok(())
+            }
+            _ => {
+                // Absent -> Revoked or Revoked -> Absent
+                self.current = next;
+                if let Some(ref storage) = self.storage {
+                    storage.save(&next)?;
+                }
+                Ok(())
+            }
         }
     }
 

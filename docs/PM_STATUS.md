@@ -1517,6 +1517,62 @@ All native collection hooks and background daemons remain deliberately absent in
 2. **Sensor Isolation**: No native X11, Wayland, PipeWire, GStreamer, V4L2, or evdev sensors were initialized or attached during execution.
 3. **Next Finite Slice (Slice 2)**: Implement authentication, workspace enrollment, credential storage via Freedesktop Secret Service D-Bus, and offline-first SQLite activity queue schema in `clients/linux`.
 
+---
+
+## 22. Linux Foundation Consent & Policy Correction (`linux-foundation-consent-policy-correction-20261022-D`)
+
+> **Execution Date:** October 22, 2026  
+> **Phase Task ID:** `linux-foundation-consent-policy-correction-20261022-D`  
+> **Status:** Completed & Source-Verified (34 Rust tests passed in `clients/linux`, 50 frontend tests passed, typecheck clean, fmt clean, check clean)  
+> **Target Package:** `clients/linux` (crate: `dosi-tracker-linux` v0.1.0)  
+
+### A. Context & Bounded Defects Corrected
+Fresh source review of HEAD `15de2ca6a7ad4e6578d584bdd1e1841b94ae4e09` identified three subtle privacy core defects in `clients/linux`:
+1. **Mixed Narrowing + Expansion Update on Save Failure (`clients/linux/src/consent.rs`)**:
+   - *Defect:* `ConsentManager::update` classified any removed permission as narrowing and immediately assigned `self.current = next` before saving to disk. A mixed update (`keyboard=true,screenshot=false` -> `keyboard=false,screenshot=true`) enabled the newly added capability (`screenshot`) in-memory even when persistence failed.
+   - *Correction:* `update` now computes an immediate in-memory representation (`p_immediate`) representing the intersection of old and new permissions with tightened blur (`p_old.blur || p_new.blur`). Removed permissions drop immediately and tightened blur applies immediately before disk write. Newly added permissions are admitted **only after** persistence succeeds. Pure widening remains strictly persistence-first.
+2. **Lifecycle Consent Update Error Handling (`clients/linux/src/lifecycle.rs`)**:
+   - *Defect:* `update_consent` used early `?` on `manager.update(next)` before generation invalidation and state reconciliation. A narrowing persistence failure changed effective consent in-memory but skipped generation increment and state reconciliation to `Stopped`, allowing stale tickets to remain valid.
+   - *Correction:* `update_consent` removes early `?`, checks whether consent or effective permissions changed, increments `self.generation`, and reconciles `Tracking` to `Stopped` if all active capabilities were removed, even when persistence returns `Err`. Unchanged updates do not increment generation.
+3. **Policy Invalidation Across Re-grant Cycles (`clients/linux/src/lifecycle.rs`)**:
+   - *Defect:* `TrackerLifecycle::configure` replaced workspace policy without advancing `self.generation` once configured. Toggling screenshot policy off then on while tracking allowed an older screenshot ticket to validate again (ABA vulnerability).
+   - *Correction:* `configure` compares previous vs new policy (`prev_policy != Some(policy)`). If policy changes, `self.generation` advances, immediately invalidating prior tickets across policy withdrawal and re-grant cycles. If all active capabilities are withdrawn by policy while `Tracking`, state transitions to `Stopped`. Identical policy publication keeps generation stable.
+4. **Deterministic Storage Invariant (`clients/linux/src/consent.rs`)**:
+   - Introduced `ConsentStorage` trait, `FileConsentStore`, and `MemoryConsentStore` with fault injection (`fail_saves`, `fail_loads`), atomic counters, and `set_save_barrier` callback for deterministic test verification without race conditions or `sleep`.
+
+### B. Failing-Before Production Repro & Passing-After Outcomes
+Isolated regressions executed on original production code (`clients/linux/tests/failing_before_repro.rs`):
+1. `test_mixed_narrow_and_expand_save_failure_withdraws_removed_without_granting_additions`:
+   - *Failing-Before:* Panicked with `Newly added capability (screenshot) must NOT be granted when save fails!`
+   - *Passing-After:* Passed (0.00s). Removed `keyboard` is revoked immediately; `screenshot` remains ungranted.
+2. `test_blur_tightening_failure`:
+   - *Failing-Before:* Panicked with `Blur tightening MUST apply immediately even if save fails`
+   - *Passing-After:* Passed (0.00s). Conservative blur tightening applies immediately as defense-in-depth even on disk error.
+3. `test_all_effective_capabilities_removed_leaves_safe_nontracking_state_even_on_save_error`:
+   - *Failing-Before:* Assertion failed: `left: Tracking, right: Stopped` (early `?` skipped state reconciliation).
+   - *Passing-After:* Passed (0.00s). State transitions to `Stopped`, generation advances, tickets fail validation.
+4. `test_old_ticket_rejection_across_policy_withdraw_regrant_and_consent_persistence_transitions`:
+   - *Failing-Before:* Panicked with `Old ticket must be rejected after policy withdrawal and regrant (ABA prevented)`
+   - *Passing-After:* Passed (0.00s). ABA ticket replay defeated across both policy cycles and consent persistence errors.
+5. `test_later_successful_save_enables_only_authorized_additions`: Passed (0.00s).
+6. `test_pure_widening_failure`: Passed (0.00s).
+7. `test_unchanged_policy_update_does_not_fabricate_authorization_transition`: Passed (0.00s).
+
+### C. Executed Test Suites & Quality Gates
+| Target Suite | Exact Command Line | Tests Passed | Ignored | Result | Exit Code | Evidence Level |
+|---|---|:---:|:---:|:---:|:---:|:---:|
+| **Linux Unit & Integration** | `cargo test` in `clients/linux` | 34 passed (21 unit + 6 CLI doctor + 7 repro/regression) | 0 | PASSED | **0** | **[Worker-Reported (Windows Host Toolchain)]** |
+| **Linux Code Formatting** | `cargo fmt --check` in `clients/linux` | N/A | 0 diffs | PASSED | **0** | **[Worker-Reported]** |
+| **Linux Compilation Check** | `cargo check` in `clients/linux` | N/A | 0 errors, 0 warnings | PASSED | **0** | **[Worker-Reported]** |
+| **Frontend Acceptance Suite** | `npx vitest run src/middleware.test.ts src/components/dashboard/agent-setup.test.tsx src/test/acceptance/agent-onboarding.test.tsx src/test/acceptance/install-guides.test.tsx src/test/architecture.spec.ts` | 50 passed | 0 | PASSED | **0** | **[Worker-Reported (Focused 5-File Suite)]** |
+| **Frontend Typecheck** | `npm run typecheck` in `frontend` | N/A | 0 errors | PASSED | **0** | **[Worker-Reported]** |
+
+### D. PM QA Attempt & Evidence Boundary Limits
+1. **PM QA Approval-Blocked Command**: Independent PM executable QA attempted archive extraction on Linux and was approval-blocked (`tirith:archive_extract`). This event is **NOT** execution evidence or approval resolution. Worker has **NOT** retried, repackaged, or delegated that blocked command, nor altered permissions or transport.
+2. **Worker Evidence Boundary**: All worker tests were executed locally on the Windows host toolchain (`cargo 1.97.1`). Native Linux compilation, libc linking, X11/Wayland runtime execution, and packaging remain **NOT VERIFIED**.
+3. **Sensor Isolation**: No native adapters, D-Bus, network, autostart, or real screen/webcam/input tracking were activated.
+
+
 
 
 

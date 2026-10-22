@@ -182,12 +182,36 @@ impl TrackerLifecycle {
     }
 
     /// Configure with a workspace project policy.
-    /// Invariant: Does NOT auto-start; enters `TrackerState::Stopped`.
+    ///
+    /// Invariants:
+    /// - Does NOT auto-start; entering from `Unconfigured` moves to `TrackerState::Stopped`.
+    /// - If policy changes while already configured, increments generation to invalidate
+    ///   stale in-flight acquisition tickets (defeating ABA replay across policy withdrawal/re-grant).
+    /// - If tracking and all capabilities are withdrawn by policy, safely transitions to `Stopped`.
+    /// - If identical policy is republished, generation is NOT incremented unnecessarily.
+    /// - Terminated state remains terminated.
     pub fn configure(&mut self, policy: ConsentedPermissions) {
+        let prev_policy = self.project_policy;
         self.project_policy = Some(policy);
+
         if self.state == TrackerState::Unconfigured {
             self.state = TrackerState::Stopped;
             self.generation = self.generation.next();
+            return;
+        }
+
+        if self.state == TrackerState::Terminated {
+            return;
+        }
+
+        if prev_policy != Some(policy) {
+            self.generation = self.generation.next();
+
+            if self.state == TrackerState::Tracking
+                && !self.effective_permissions().has_any_active_capability()
+            {
+                self.state = TrackerState::Stopped;
+            }
         }
     }
 
@@ -309,23 +333,33 @@ impl TrackerLifecycle {
 
     /// Update local consent choices.
     ///
-    /// Invariant:
-    /// - Always increments generation, invalidating in-flight tickets.
-    /// - If tracking and all capabilities are removed, transitions to Stopped.
+    /// Invariants:
+    /// - Reconciles in-memory effective admission and invalidates generation EVEN IF
+    ///   persistence fails with an error (`ConsentSaveError`).
+    /// - If consent changes (e.g. withdrawal, narrowing, blur tightening), generation is incremented
+    ///   so stale tickets from previous intervals can never validate.
+    /// - If tracking and all capabilities are withdrawn, transitions safely to Stopped even on save error.
+    /// - If consent is identical and unchanged, generation is not bumped unnecessarily.
     pub fn update_consent(&mut self, next: LocalConsent) -> Result<(), LifecycleError> {
-        self.consent_manager
-            .update(next)
-            .map_err(|e| LifecycleError::ConsentSaveError(e.to_string()))?;
+        let prev_consent = self.consent_manager.current();
+        let prev_effective = self.effective_permissions();
 
-        self.generation = self.generation.next();
+        let update_res = self.consent_manager.update(next);
 
-        if self.state == TrackerState::Tracking
-            && !self.effective_permissions().has_any_active_capability()
-        {
-            self.state = TrackerState::Stopped;
+        let new_consent = self.consent_manager.current();
+        let new_effective = self.effective_permissions();
+
+        let changed = prev_consent != new_consent || prev_effective != new_effective;
+
+        if changed {
+            self.generation = self.generation.next();
+
+            if self.state == TrackerState::Tracking && !new_effective.has_any_active_capability() {
+                self.state = TrackerState::Stopped;
+            }
         }
 
-        Ok(())
+        update_res.map_err(|e| LifecycleError::ConsentSaveError(e.to_string()))
     }
 
     /// Issue an acquisition ticket for an upcoming sensor sample.

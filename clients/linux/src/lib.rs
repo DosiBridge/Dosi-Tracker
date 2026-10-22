@@ -11,7 +11,10 @@ pub mod diagnostics;
 pub mod lifecycle;
 pub mod paths;
 
-pub use consent::{ConsentError, ConsentManager, ConsentStore, ConsentedPermissions, LocalConsent};
+pub use consent::{
+    ConsentError, ConsentManager, ConsentStorage, ConsentStore, ConsentedPermissions,
+    FileConsentStore, LocalConsent, MemoryConsentStore,
+};
 pub use diagnostics::{
     ArchitecturalSupport, CapabilityDiagnosis, DiagnosticStatus, DoctorReport, SessionEnvironment,
     SessionType,
