@@ -64,8 +64,8 @@ export default function LinuxInstallPage() {
               <strong className="text-foreground">Critical Boundaries:</strong> All native collection adapters (screen capture, keyboard/mouse hooks,
               active window sampler, webcam) report <code className="font-mono text-foreground font-semibold">NOT_IMPLEMENTED</code>.
               Global input counting and window titles on Wayland are architecturally <code className="font-mono text-foreground font-semibold">UNSUPPORTED</code>.
-              No native sensor is attached, no offline queue or network sync is active, and no pre-built binaries or installers are released.
-              Tests have been verified on Windows host toolchain (27 passed); native Linux compilation and runtime remain unverified.
+              No native sensor is attached; the offline outbox library module is implemented in <code className="font-mono text-foreground font-semibold">clients/linux</code> for local transactional queuing (no background sync worker or network calls are active), and no pre-built binaries or installers are released.
+              Tests have been verified on Windows host toolchain; native Linux compilation and runtime remain unverified.
             </p>
           </div>
         </div>

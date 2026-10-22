@@ -9,6 +9,7 @@
 pub mod consent;
 pub mod diagnostics;
 pub mod lifecycle;
+pub mod outbox;
 pub mod paths;
 
 pub use consent::{
@@ -22,5 +23,9 @@ pub use diagnostics::{
 pub use lifecycle::{
     AcquisitionCapability, AcquisitionError, AcquisitionTicket, LifecycleError,
     LifecycleGeneration, PauseReason, TrackerLifecycle, TrackerState,
+};
+pub use outbox::{
+    ActivityEnvelope, EnqueueResult, Outbox, OutboxEntry, OutboxError, OutboxLimits, OutboxScope,
+    OUTBOX_SCHEMA_VERSION,
 };
 pub use paths::LinuxPaths;

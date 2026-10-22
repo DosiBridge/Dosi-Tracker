@@ -1800,6 +1800,86 @@ In continuation of task `linux-installer-owned-path-confinement-20261022-H`, a s
 4. **No Crash-Atomic Transaction Claims**: Sequential `cp`/`mv` operations do not provide crash-atomic multi-file filesystem transactions across unexpected host power loss or kernel crashes. Staging and backup/rollback mechanisms provide application-level failure recovery during script execution.
 5. **Scope Discipline**: No real sensor adapters (X11/Wayland/PipeWire), network synchronization, credential services, background daemons, or system/root mutations were introduced.
 
+---
+
+## 27. Sensor-Free Durable Outbox Foundation Library (`linux-sensor-free-durable-outbox-20261022-I`)
+
+> **Execution Date:** October 22, 2026  
+> **Phase Task ID:** `linux-sensor-free-durable-outbox-20261022-I`  
+> **Status:** Completed & Source-Verified (51 Rust tests passed in `clients/linux`, 22 shell lifecycle tests passed, 50 frontend tests passed, typecheck clean, fmt clean, check clean)  
+> **Target Package:** `clients/linux` (`src/outbox.rs`, `src/lib.rs`, `Cargo.toml`, `tests/outbox_tests.rs`; `frontend/src/app/install/linux/page.tsx`)  
+
+### A. Context & Source-Backed Capability Gap Addressed
+Source inspection of `clients/linux` (`Cargo.toml`, `src/lib.rs`, `src/main.rs`) confirmed that the crate provided diagnostic CLI commands, non-mutating path resolution, and a local consent/lifecycle core, but lacked any offline persistence, durable outbox queue, or sync store. Neighboring activity ingestion contracts in the backend (`CreateActivityDto`) and Windows agent (`storage.rs`, `model.rs`) were reconciled to build the smallest functional, sensor-free durable outbox library foundation (`dosi_tracker_linux::outbox`), explicitly designed as a standalone library rather than an active uploader or sensor adapter:
+1. **Injectable-Path Transactional SQLite Storage (`Outbox::open`)**:
+   - Explicitly opened with an injectable database file path and configurable bounds ([`OutboxLimits`]).
+   - Uses bundled transactional SQLite (`rusqlite`) with WAL mode (`PRAGMA journal_mode = WAL`) and normal synchronous flushing for power/crash resilience on local filesystems.
+   - Idempotent schema initialization creating table `outbox_entries` and index `idx_outbox_scope_id`.
+   - Integrity verification on open (`PRAGMA quick_check`); corrupted files fail closed with [`OutboxError::CorruptDatabase`] without deleting or resetting user files.
+2. **Explicit Account & Workspace Scoping ([`OutboxScope`])**:
+   - Enforces normalized non-empty `account_id` (trimmed, lowercase) and `workspace_id`.
+   - Records are strictly partitioned by tenant and account scope. Cross-workspace reads or acknowledgments are impossible.
+3. **Stable Client Activity Identity & Composite Unique Index**:
+   - Preserves client-generated `client_activity_id`.
+   - Enforces composite uniqueness: `UNIQUE(account_id, workspace_id, client_activity_id)`. Identical activity IDs recorded under different accounts or workspaces do not collide, overwrite, or leak across tenant boundaries.
+4. **Idempotent Re-Enqueue & Conflict Safety**:
+   - Re-enqueueing identical content under the same scope and activity ID succeeds idempotently ([`EnqueueResult::Idempotent`]) without inserting duplicate rows.
+   - Re-enqueueing conflicting content under an already-queued activity ID fails closed with [`OutboxError::ConflictingIdentity`], strictly preserving the original unmutated record.
+5. **Truthful Nullability (No Fabricated Zeros)**:
+   - Optional measurements (`productivity`, `mouse_clicks`, `keyboard_hits`) default to `None` when unmeasured (e.g. Wayland unprivileged isolation or unconsented sensors). Values are preserved truthfully without inventing `Some(0)`.
+6. **Clean Envelope (Zero Credentials / Media Blobs)**:
+   - `ActivityEnvelope` strictly forbids raw tokens, passwords, session cookies, and bulk capture blobs (screenshots, webcam frames).
+7. **Explicit Bounds & Quota Enforcement (No Silent Drops)**:
+   - Enforces maximum envelope payload size (`max_payload_bytes`), maximum queue record count (`max_records`), and maximum total payload bytes (`max_total_payload_bytes`) inside an immediate transaction before mutation. Overflows are rejected explicitly (`QueueFull`, `PayloadTooLarge`, `QuotaExceeded`).
+8. **Scope-Guarded Acknowledgement & Retry Preservation**:
+   - `ack_delivered` deletes records only when both scope and ID match. Foreign-scope deletion attempts fail with `RecordNotFound` and leave target records intact.
+   - `mark_attempt_failed` increments `retry_count` and records `last_error` while keeping the record intact for future retry.
+9. **Strictly Nonmutating Default CLI Invariant**:
+   - `dosi-tracker-linux doctor [--json]` and `dosi-tracker-linux --help` do not initialize the outbox or create any filesystem directories/files.
+
+### B. Executed Regressions & Test Evidence
+1. **Outbox Integration Suite (`clients/linux/tests/outbox_tests.rs` - 14 Tests Passed)**:
+   - `test_outbox_enqueue_reopen_and_peek`: Verifies durable persistence across process drop/reopen cycles.
+   - `test_outbox_same_scope_identical_retry_is_idempotent`: Verifies identical re-enqueue returns `Idempotent(id)` without duplicate rows.
+   - `test_outbox_same_scope_conflicting_retry_fails_without_clobbering`: Verifies conflicting payload returns `ConflictingIdentity` leaving original intact.
+   - `test_outbox_different_workspace_same_identity_isolated`: Verifies same activity ID under Workspace A and Workspace B create isolated entries.
+   - `test_outbox_different_account_same_identity_isolated`: Verifies same activity ID under Account A and Account B create isolated entries.
+   - `test_outbox_acknowledgement_scope_guard_refuses_cross_workspace_removal`: Verifies cross-scope ack returns `RecordNotFound` preserving target entry.
+   - `test_outbox_failed_retry_preservation`: Verifies delivery failures increment `retry_count` and store error while keeping entry queued.
+   - `test_outbox_cardinality_limit_overflow_rejected`: Verifies 4th entry on 3-record limit returns `QueueFull` explicitly without dropping.
+   - `test_outbox_payload_size_limit_overflow_rejected`: Verifies oversize envelope returns `PayloadTooLarge` before database write.
+   - `test_outbox_deterministic_paging`: Verifies sequential ordered reads (`id ASC`) matching page limits.
+   - `test_outbox_corrupt_database_fails_closed`: Verifies corrupted file returns error without deleting or overwriting the file.
+   - `test_unmeasured_productivity_preserved_truthfully_as_none`: Verifies `None` metrics are preserved without zero fabrication.
+   - `test_measured_productivity_preserved_when_present`: Verifies valid measured values are preserved accurately.
+   - `test_doctor_and_help_remain_strictly_nonmutating`: Verifies CLI commands create zero storage files or directories.
+2. **Existing Test Suites Maintained**:
+   - Shell installer lifecycle: 22 passed, exit 0.
+   - Unit and CLI doctor tests: 27 passed, exit 0.
+   - Consent and ABA repro tests: 7 passed, exit 0.
+   - Installer integration tests: 3 passed, exit 0.
+   - Total Rust tests in `clients/linux`: **51 passed, 0 failed, exit 0**.
+   - Frontend Vitest suite: **50 passed, 0 failed, exit 0**.
+   - Frontend typecheck: **0 errors, exit 0**.
+
+### C. Executed Test Suites & Quality Gates
+| Target Suite | Exact Command Line | Tests Passed | Ignored | Result | Exit Code | Evidence Level |
+|---|---|:---:|:---:|:---:|:---:|---|
+| **Linux Unit, CLI, Repro, Installer & Outbox Tests** | `cargo test` in `clients/linux` | 51 passed (21 unit + 6 doctor CLI + 7 repro + 3 installer integration + 14 outbox integration) | 0 | PASSED | **0** | **[Worker-Reported (Windows Host Toolchain)]** |
+| **Shell Installer Lifecycle Suite** | `bash clients/linux/tests/test_installer_lifecycle.sh` | 22 passed (all lifecycle, security confinement, and binary doctor checks) | 0 | PASSED | **0** | **[Worker-Reported (Git-Bash Host Toolchain)]** |
+| **Linux Code Formatting** | `cargo fmt --check` in `clients/linux` | N/A | 0 diffs | PASSED | **0** | **[Worker-Reported]** |
+| **Linux Compilation Check** | `cargo check` in `clients/linux` | N/A | 0 errors, 0 warnings | PASSED | **0** | **[Worker-Reported]** |
+| **Frontend Acceptance Suite** | `npx vitest run src/middleware.test.ts src/components/dashboard/agent-setup.test.tsx src/test/acceptance/agent-onboarding.test.tsx src/test/acceptance/install-guides.test.tsx src/test/architecture.spec.ts` | 50 passed | 0 | PASSED | **0** | **[Worker-Reported (Focused 5-File Suite)]** |
+| **Frontend Typecheck** | `npm run typecheck` in `frontend` | N/A | 0 errors | PASSED | **0** | **[Worker-Reported]** |
+
+### D. PM QA Boundary Limits & Acceptance Disclosures
+1. **Missing Capability vs Exploit Clarification**: This task addressed a missing product library capability (offline outbox storage), not a reproduced security exploit.
+2. **Outbox Library Scope Boundary**: Only the local transactional outbox library module is implemented (`dosi_tracker_linux::outbox`). No background sync worker, network upload, authentication, credential storage, or sensor adapters are active.
+3. **Durability & Locking Limitations**: SQLite WAL provides crash recovery and single-writer concurrency on local filesystems; cross-process concurrency over network filesystems (NFS/SMB) or non-locking mounts is not supported and not claimed.
+4. **Prior Unresolved Approval Invariant**: The approval-blocked command `tirith:archive_extract` remains unresolved. Worker has **NOT** retried, repackaged, or delegated that command, nor modified archive extraction approvals.
+5. **Host Toolchain vs Native Linux Evidence Separation**: All tests were executed on Windows host MSVC and Git-Bash toolchains. This does **NOT** constitute independent PM acceptance or native Linux kernel/libc runtime verification.
+
+
 
 
 
