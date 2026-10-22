@@ -121,19 +121,19 @@ describe("Feature: Connecting a desktop agent", () => {
       expect(within(windows).getByText("dosi-tracker-setup-<version>.exe")).toBeInTheDocument();
       expect(within(windows).getByText(/asks for no special permissions/i)).toBeInTheDocument();
       expect(within(windows).getByRole("link", { name: /download for windows/i })).toHaveAttribute("rel", expect.stringContaining("noopener"));
-      expect(within(windows).getByRole("link", { name: /windows setup & troubleshooting guide/i })).toHaveAttribute("href", "/install/windows");
+      expect(within(windows).getByRole("link", { name: /windows setup & packaging guide/i })).toHaveAttribute("href", "/install/windows");
     });
 
-    it("Given the Download page Then Linux card explains Wayland portal consent, null input activity, and links to the Linux guide", () => {
+    it("Given the Download page Then Linux card clearly discloses client is not implemented and links to architecture specification", () => {
       renderAsRole(<DownloadPage />, "worker", { route: "/download" });
 
       const linux = screen.getByRole("region", { name: /linux/i });
-      expect(within(linux).getByText(/Pre-built packages are unreleased/i)).toBeInTheDocument();
-      expect(within(linux).getByText(/Wayland display servers/i)).toBeInTheDocument();
-      expect(within(linux).getByText(/reported honestly as unmeasured \(null\)/i)).toBeInTheDocument();
-      expect(linux.textContent).toContain("never requires root or sudo");
-      expect(within(linux).getByText(/Strictly prohibits evdev keylogging or root escalation/i)).toBeInTheDocument();
-      expect(within(linux).getByRole("link", { name: /linux setup & capability guide/i })).toHaveAttribute("href", "/install/linux");
+      expect(within(linux).getByText(/Client Not Implemented \(Architecture Planned\)/i)).toBeInTheDocument();
+      expect(within(linux).getByText(/no Linux client implementation in the repository/i)).toBeInTheDocument();
+      expect(within(linux).getByText(/no root, sudo, or evdev keylogging/i)).toBeInTheDocument();
+      expect(within(linux).getByRole("link", { name: /linux architecture specification/i })).toHaveAttribute("href", "/install/linux");
+      // Negative oracle: must NOT tell the user to configure a nonexistent client or config.toml
+      expect(within(linux).queryByText(/config\.toml/i)).not.toBeInTheDocument();
     });
 
     it("Given the Download page Then it provides a link to the complete multi-platform installation guides & matrix", () => {

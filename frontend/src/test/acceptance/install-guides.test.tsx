@@ -39,17 +39,19 @@ describe("Public Installation & Onboarding Guides", () => {
   });
 
   describe("InstallOverviewPage", () => {
-    it("renders comparison cards for all 3 OS platforms with truthful release status", () => {
+    it("renders comparison cards with truthful status: Linux Not Implemented, Windows Source & NSIS", () => {
       render(<InstallOverviewPage />);
 
-      expect(screen.getByRole("heading", { level: 1, name: /desktop agent installation & capability guides/i })).toBeInTheDocument();
+      expect(screen.getByRole("heading", { level: 1, name: /desktop agent installation & capabilities/i })).toBeInTheDocument();
 
       // Linux Card
       const linuxHeading = screen.getByRole("heading", { level: 2, name: /^linux$/i });
       const linuxCard = linuxHeading.closest(".card-elev, [class*='rounded']")!;
-      expect(within(linuxCard as HTMLElement).getByText(/Source Preview/i)).toBeInTheDocument();
-      expect(within(linuxCard as HTMLElement).getByText(/Ubuntu 22.04\+, Fedora 38\+, Arch/i)).toBeInTheDocument();
-      expect(within(linuxCard as HTMLElement).getByRole("link", { name: /linux setup guide/i })).toHaveAttribute("href", "/install/linux");
+      expect(within(linuxCard as HTMLElement).getByText(/Client Not Implemented/i)).toBeInTheDocument();
+      expect(within(linuxCard as HTMLElement).getByText(/No crate in clients\/linux; planned architecture/i)).toBeInTheDocument();
+      expect(within(linuxCard as HTMLElement).getByRole("link", { name: /linux architecture specification/i })).toHaveAttribute("href", "/install/linux");
+      // Negative oracle: must NOT claim "Source Preview"
+      expect(within(linuxCard as HTMLElement).queryByText(/^Source Preview$/i)).not.toBeInTheDocument();
 
       // macOS Card
       const macHeading = screen.getByRole("heading", { level: 2, name: /^macos$/i });
@@ -61,21 +63,28 @@ describe("Public Installation & Onboarding Guides", () => {
       // Windows Card
       const winHeading = screen.getByRole("heading", { level: 2, name: /^windows$/i });
       const winCard = winHeading.closest(".card-elev, [class*='rounded']")!;
-      expect(within(winCard as HTMLElement).getByText(/Pre-Built Installer/i)).toBeInTheDocument();
-      expect(within(winCard as HTMLElement).getByText(/Windows 10 \(1809\+\) or Windows 11/i)).toBeInTheDocument();
+      expect(within(winCard as HTMLElement).getByText(/Source Crate & NSIS Script/i)).toBeInTheDocument();
+      expect(within(winCard as HTMLElement).getByText(/pre-built binaries are unreleased/i)).toBeInTheDocument();
       expect(within(winCard as HTMLElement).getByRole("link", { name: /windows setup guide/i })).toHaveAttribute("href", "/install/windows");
+      // Negative oracle: must NOT claim pre-built installer
+      expect(within(winCard as HTMLElement).queryByText(/^Pre-Built Installer$/i)).not.toBeInTheDocument();
     });
 
-    it("renders capability matrix with Wayland null reporting and zero admin privileges", () => {
+    it("renders capability matrix with truthful Linux Not Implemented status and Windows compilation status", () => {
       render(<InstallOverviewPage />);
 
       const table = screen.getByRole("table");
       expect(table).toBeInTheDocument();
 
-      // Check Wayland row
-      expect(within(table).getByText("Linux (Wayland)")).toBeInTheDocument();
-      const unsupportedCells = within(table).getAllByText(/UNSUPPORTED \(Reported as null\)/i);
-      expect(unsupportedCells.length).toBeGreaterThanOrEqual(2); // input and window title
+      // Linux rows must explicitly say NOT IMPLEMENTED and None
+      expect(within(table).getAllByText(/None \(Client Not Implemented\)/i).length).toBe(2);
+      expect(within(table).getAllByText(/NOT IMPLEMENTED \(No crate in repo\)/i).length).toBe(2);
+
+      // Windows row must show Compilation Only
+      expect(within(table).getByText(/COMPILATION ONLY/i)).toBeInTheDocument();
+
+      // Negative oracle: table must NOT label pre-built NSIS executable
+      expect(within(table).queryByText("Pre-Built Setup EXE (NSIS)")).not.toBeInTheDocument();
 
       // Check zero admin privileges across all
       const noAdminCells = within(table).getAllByText(/No \(/i);
@@ -89,22 +98,20 @@ describe("Public Installation & Onboarding Guides", () => {
   });
 
   describe("LinuxInstallPage", () => {
-    it("states unreleased status, supported distributions, and architectures", () => {
+    it("clearly discloses client is not implemented and labels requirements as planned architecture", () => {
       render(<LinuxInstallPage />);
 
-      expect(screen.getByRole("heading", { level: 1, name: /linux desktop agent guide/i })).toBeInTheDocument();
-      expect(screen.getByText(/Pre-built Binaries Unreleased/i)).toBeInTheDocument();
-      expect(screen.getByText(/currently unreleased/i)).toBeInTheDocument();
-      expect(screen.getByText(/x86_64:/i)).toBeInTheDocument();
-      expect(screen.getByText(/aarch64:/i)).toBeInTheDocument();
-      expect(screen.getByText(/Ubuntu 22.04 LTS/i)).toBeInTheDocument();
-      expect(screen.getByText(/Fedora Workstation/i)).toBeInTheDocument();
+      expect(screen.getByRole("heading", { level: 1, name: /linux desktop agent specification/i })).toBeInTheDocument();
+      expect(screen.getByText(/Client Not Implemented \(Architecture Planned\)/i)).toBeInTheDocument();
+      expect(screen.getByText(/Status: Client Not Implemented \(Planned Architecture\)/i)).toBeInTheDocument();
+      expect(screen.getByText(/no Linux client implementation in the repository/i)).toBeInTheDocument();
+      expect(screen.getByRole("heading", { name: /Target Platforms for Future Implementation/i })).toBeInTheDocument();
     });
 
-    it("details Wayland portal consent and strictly prohibits root/sudo/evdev escalation", () => {
+    it("details planned Wayland portal consent and anti-keylogger invariants", () => {
       render(<LinuxInstallPage />);
 
-      // Wayland ScreenCast
+      // Wayland ScreenCast planned spec
       expect(screen.getByText(/org.freedesktop.portal.ScreenCast/i)).toBeInTheDocument();
       expect(screen.getByText(/interactive OS dialog/i)).toBeInTheDocument();
       expect(screen.getByText(/Global Input Activity: UNSUPPORTED \(null\)/i)).toBeInTheDocument();
@@ -115,16 +122,23 @@ describe("Public Installation & Onboarding Guides", () => {
       expect(screen.getByText(/exclusively as an unprivileged user process/i)).toBeInTheDocument();
       expect(screen.getByText(/unrestricted hardware keylogger/i)).toBeInTheDocument();
       expect(screen.getByText(/refuses to implement or recommend evdev workarounds/i)).toBeInTheDocument();
+
+      // Roadmap
+      expect(screen.getByRole("heading", { name: /Linux Implementation Roadmap & Acceptance Gaps/i })).toBeInTheDocument();
+      expect(screen.getByText(/Greenfield Rust Client Crate:/i)).toBeInTheDocument();
     });
 
-    it("provides first-run config.toml, Secret Service storage, and CLI controls", () => {
+    it("does not present fake CLI commands, operational setup, or uninstallation scripts (Negative Oracles)", () => {
       render(<LinuxInstallPage />);
 
-      expect(screen.getAllByText(/~\/\.config\/dosi-tracker\/config\.toml/i).length).toBeGreaterThanOrEqual(1);
-      expect(screen.getByText(/api_base_url = "https:\/\/tracker-api\.example\.com"/i)).toBeInTheDocument();
-      expect(screen.getByText(/Freedesktop Secret Service D-Bus API/i)).toBeInTheDocument();
-      expect(screen.getByText(/dosi-tracker pause --minutes 15/i)).toBeInTheDocument();
-      expect(screen.getByText(/echo \$XDG_SESSION_TYPE/i)).toBeInTheDocument();
+      // Negative Oracles: Asserting absence of fabricated capabilities
+      expect(screen.queryByText(/dosi-tracker pause/i)).not.toBeInTheDocument();
+      expect(screen.queryByText(/dosi-tracker resume/i)).not.toBeInTheDocument();
+      expect(screen.queryByText(/dosi-tracker stop/i)).not.toBeInTheDocument();
+      expect(screen.queryByText(/dosi-tracker status/i)).not.toBeInTheDocument();
+      expect(screen.queryByText(/Implemented through org\.freedesktop\.portal/i)).not.toBeInTheDocument();
+      expect(screen.queryByText(/rm -rf ~\/\\.config\/dosi-tracker/i)).not.toBeInTheDocument();
+      expect(screen.queryByText(/api_base_url = "https:\/\/tracker-api\.example\.com"/i)).not.toBeInTheDocument();
     });
 
     it("has no axe violations", async () => {
@@ -173,11 +187,13 @@ describe("Public Installation & Onboarding Guides", () => {
   });
 
   describe("WindowsInstallPage", () => {
-    it("states Windows 10/11 x86_64, NSIS package, SmartScreen handling, and DPAPI protection", () => {
+    it("states Source Crate & NSIS script status, unreleased pre-built binaries, SmartScreen, and DPAPI", () => {
       render(<WindowsInstallPage />);
 
       expect(screen.getByRole("heading", { level: 1, name: /windows desktop agent guide/i })).toBeInTheDocument();
-      expect(screen.getByText(/Pre-Built Installer \(NSIS\)/i)).toBeInTheDocument();
+      expect(screen.getByText(/Source Crate & NSIS Build Script/i)).toBeInTheDocument();
+      expect(screen.getByText(/Pre-built release binary installers are/i)).toBeInTheDocument();
+      expect(screen.getByText(/cargo check --bin dosi-tracker/i)).toBeInTheDocument();
       expect(screen.getByText(/Version 1809 or newer/i)).toBeInTheDocument();
       expect(screen.getAllByText(/Windows 11/i).length).toBeGreaterThanOrEqual(1);
       expect(screen.getByText(/x86_64-pc-windows-msvc/i)).toBeInTheDocument();
@@ -198,6 +214,9 @@ describe("Public Installation & Onboarding Guides", () => {
       // Graceful quit & uninstall
       expect(screen.getByText(/dosi-tracker\.exe --quit/i)).toBeInTheDocument();
       expect(screen.getByText(/%LOCALAPPDATA%\\Programs\\DosiTracker\\uninstall\.exe/i)).toBeInTheDocument();
+
+      // Negative oracle: must NOT claim pre-built installer
+      expect(screen.queryByText(/^Pre-Built Installer \(NSIS\)$/i)).not.toBeInTheDocument();
     });
 
     it("has no axe violations", async () => {

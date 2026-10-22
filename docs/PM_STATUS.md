@@ -1382,47 +1382,55 @@ This harness correction replaces that manual mapping with a genuinely hosted in-
 
 ---
 
-## 20. Public Desktop Installation Guides & Cross-Platform Evidence Matrix (`native-install-guides-20261022-A`)
+## 20. Public Desktop Installation Guides & Cross-Platform Evidence Matrix (`native-install-guides-20261022-A` & Correction `native-guide-truth-correction-20261022-B`)
 
-### A. Context & Deliverables Overview
-Under Task ID `native-install-guides-20261022-A`, delivered the truthful public website installation, display server capability matrix, and desktop onboarding slice across Linux, macOS, and Windows. All claims are strictly backed by source code artifacts and verified capabilities, without fabricating release binaries, code-signing certificates, or hosted CI runs.
+### A. Supervisory Audit & Correction Overview
+Under Task ID `native-install-guides-20261022-A`, public installation and capability guides were initially drafted for Linux, macOS, and Windows. In independent review, the PM identified and rejected a material defect:
+- **Rejected Source-Confirmed Defect**: While the summary matrix noted Linux had no Cargo crate, `frontend/src/app/install/linux/page.tsx` falsely asserted current implementation ("Implemented through org.freedesktop.portal.ScreenCast and PipeWire", Secret Service integration, `~/.config/dosi-tracker/config.toml`, CLI commands `dosi-tracker pause --minutes 15`, `resume`, `stop`, `status`, and uninstall scripts). The overview table labeled X11/XInput2 "Supported" and `/download` instructed configuring this nonexistent client.
+- **Correction Task `native-guide-truth-correction-20261022-B`**: Fully rectified all guide surfaces to reflect repository truth. Linux is explicitly disclosed as **Client Not Implemented (Architecture Planned)** with zero fake operational commands or config files. Windows is accurately labeled as **Source Crate & NSIS Script** with pre-built binaries unreleased and `cargo check` marked as compilation only. Negative oracle fixtures were installed in Vitest to actively reject the old fabricated claims.
 
-### B. Cross-Platform Desktop OS Evidence & Capability Matrix
+### B. Corrected Cross-Platform Desktop OS Evidence & Capability Matrix
 
 | Feature / Dimension | Linux Desktop Agent | macOS Desktop Agent | Windows Desktop Agent |
 |---|---|---|---|
-| **Architecture / Tier** | `x86_64`, `aarch64` (`arm64`) | `arm64` (Apple Silicon), `x86_64` (Intel) | `x86_64-pc-windows-msvc` |
-| **Supported OS Versions** | Ubuntu 22.04 LTS / 24.04 LTS, Fedora 39/40, Debian 12 | macOS 14 Sonoma, macOS 15 Sequoia | Windows 10 (1809+) & Windows 11 |
-| **Current Packaging Status** | **Unreleased / Greenfield Preview** (source build via Cargo) | **Source Build Only** via `clients/macos/scripts/build-app.sh` | **Pre-Built Installer (NSIS)** (`dosi-tracker-setup-<version>.exe`) |
-| **OS Code Signing / Trust** | Distribution package signing (GPG/APT/RPM) when published | Unreleased / Ad-hoc unsigned; requires Gatekeeper "Open Anyway" | Self-signed / Ad-hoc; requires Windows SmartScreen "Run anyway" |
-| **Display Server & Screen Capture** | **Wayland**: `org.freedesktop.portal.ScreenCast` + PipeWire (interactive modal prompt).<br>**X11**: `XShmGetImage` (xcap protocol) unconfined. | ScreenCaptureKit (`SCStream`) API with native OS screen recording permissions | Windows Graphics Capture API & BitBlt (`xcap`) |
-| **Input Activity Measurement** | **Wayland**: **Architecturally Unsupported (`null`)**; strictly no evdev keylogging.<br>**X11**: `XInput2` aggregate event ticks per minute (`XI_RawKeyPress`, `XI_RawButtonPress`). | `CGEventTap` Quartz event tap; reported honestly as `null` if permission denied | Win32 low-level hooks (`WH_KEYBOARD_LL`, `WH_MOUSE_LL`) decoupled via `SensorDriver` |
-| **Active Window Title Capture** | **Wayland**: Private to compositor (`null`); process name read via `/proc/[pid]/cmdline`.<br>**X11**: Root `_NET_ACTIVE_WINDOW` and `_NET_WM_NAME`. | Accessibility API (`NSWorkspace.shared.frontmostApplication`) | Win32 `GetForegroundWindow` and `GetWindowTextW` |
-| **Credential Storage** | Freedesktop Secret Service API via D-Bus (`org.freedesktop.secrets`) | macOS Login Keychain (`com.dosibridge.tracker`) | Windows Data Protection API (DPAPI) via `CryptProtectData` |
-| **First-Run Configuration** | `~/.config/dosi-tracker/config.toml` | Interactive wizard or `config.json` | First-run setup dialog or silent install `/SERVER=` parameter |
-| **User Consent & Pause/Stop** | CLI commands (`dosi-tracker pause`, `resume`, `stop`) | Menu bar tray icon status and pause/stop controls | System tray icon with persistent status and `--quit` switch |
-| **Enterprise Silent Deployment** | Systemd user units (`~/.config/systemd/user/dosi-tracker.service`) | MDM `.mobileconfig` payload profiles | NSIS silent switches: `/S`, `/SERVER=`, `/DASHBOARD=`, `/D=` |
-| **Native Execution on Windows Host** | **NOT VERIFIED** (No Linux kernel/toolchain on Windows host) | **NOT VERIFIED** (No macOS hardware/Xcode on Windows host) | **VERIFIED** (`cargo check --bin dosi-tracker` clean, dev profile, exit 0) |
+| **Tracked Codebase Source** | **None** (`git ls-files clients` has no `clients/linux`) | `clients/macos` (Swift 5.9, Package.swift, AppKit/SwiftUI) | `clients/windows` (Rust 2021, Cargo.toml) |
+| **Packaging / Build Scripts** | **None** (No package manifests or scripts in repo) | `clients/macos/scripts/build-app.sh` (Universal arm64/x86_64) | `clients/windows/installer/dosi-tracker.nsi` (NSIS script) |
+| **Observed Pre-Built Binaries**| **None** (Client unbuilt and unreleased) | **None** (Pre-built notarized packages unreleased) | **None** (Pre-built setup EXE unreleased / not in repo) |
+| **Target OS Versions** | Planned: Ubuntu 22.04+, Fedora 38+, Debian 12 | Target: macOS 14 Sonoma, macOS 15 Sequoia | Target: Windows 10 (1809+) & Windows 11 (x86_64) |
+| **Display Server & Capture** | Planned Spec: Wayland Portal ScreenCast / X11 XShmGetImage | Supported in Source: ScreenCaptureKit (`SCStream`) | Supported in Source: xcap / Win32 GDI |
+| **Input Activity Measurement** | Planned Spec: Wayland unsupported (`null`); X11 `XInput2` ticks | Supported in Source: `CGEventTap` Quartz tap (null if denied) | Supported in Source: Win32 low-level hooks (`FakeSensorDriver` tested) |
+| **Active Window Title Capture** | Planned Spec: Wayland unsupported (`null`); X11 `_NET_ACTIVE_WINDOW` | Supported in Source: Accessibility API | Supported in Source: Win32 `GetForegroundWindow` |
+| **Credential Storage** | Planned Spec: Secret Service D-Bus API (`libsecret`) | Implemented in Source: macOS Login Keychain (`com.dosibridge.tracker`)| Implemented in Source: Windows DPAPI (`%APPDATA%\DosiTracker\credentials.bin`)|
+| **Operational Controls** | **None** (No CLI commands exist; fake commands removed) | Menu bar tray item & pause/stop controls in source | System tray icon & CLI `--quit` switch in source |
+| **OS Code Signing / Trust** | None | Ad-hoc / unsigned; requires Gatekeeper "Open Anyway" | Ad-hoc / unsigned; requires SmartScreen "Run anyway" |
+| **Local Host Compilation Check** | **NOT VERIFIED** (No Linux toolchain on Windows host) | **NOT VERIFIED** (No macOS hardware on Windows host) | **VERIFIED** (`cargo check --bin dosi-tracker` clean, dev profile, exit 0) |
+| **Native OS Interactive Runtime** | **NOT VERIFIED** (No client code in repository) | **NOT VERIFIED** (Host lacks macOS/Xcode; unnotarized) | **UNVERIFIED IN AUTOMATION** (QA uses `FakeSensorDriver`; real hooks unverified) |
 
 ### C. Implemented Public Routes & Architecture
 1. **Public Route Access & Middleware Integration**:
    - `frontend/src/middleware.ts`: Whitelisted `/install` and `/install/*` prefix paths to allow public, unauthenticated access without redirecting to `/login`.
-   - `frontend/src/test/architecture.spec.ts`: Added `/install`, `/install/linux`, `/install/macos`, and `/install/windows` to `PUBLIC_ROUTES` exception set with explicit architecture documentation.
+   - `frontend/src/test/architecture.spec.ts`: Added `/install`, `/install/linux`, `/install/macos`, and `/install/windows` to `PUBLIC_ROUTES` exception set with explicit architecture documentation (12 architecture tests pass, exit 0).
 2. **Onboarding & Download Cross-Linking**:
-   - `frontend/src/components/dashboard/agent-setup.tsx`: Added Linux visitor detection (`VisitorOs === "linux"`, excluding Android). Exported direct guide URLs: `WINDOWS_GUIDE_URL`, `MACOS_GUIDE_URL`, `LINUX_GUIDE_URL`, `ALL_GUIDES_URL`.
-   - `frontend/src/app/(dashboard)/download/page.tsx`: Added 3rd desktop card for Linux, highlighted when visitor runs Linux. Added direct links to all per-OS installation guides and bottom cross-link banner.
+   - `frontend/src/components/dashboard/agent-setup.tsx`: Added Linux visitor detection (`VisitorOs === "linux"`). Exported direct guide URLs: `WINDOWS_GUIDE_URL`, `MACOS_GUIDE_URL`, `LINUX_GUIDE_URL`, `ALL_GUIDES_URL`.
+   - `frontend/src/app/(dashboard)/download/page.tsx`: Linux card explicitly displays **"Client Not Implemented (Architecture Planned)"** and links to the Linux architecture specification. Windows card updated to state pre-built binaries are unreleased, advising building from source or viewing releases if published.
 3. **Dedicated Installation & Help Pages**:
    - `frontend/src/app/install/layout.tsx`: Public layout with skip link, brand header, sub-navigation tabs for all 3 OS platforms, and theme provider toggle.
-   - `frontend/src/app/install/page.tsx`: Overview page containing high-level OS download cards, capability matrix, and security invariant highlights.
-   - `frontend/src/app/install/linux/page.tsx`: Detailed Linux guide covering Wayland vs X11 display boundaries, interactive ScreenCast dialog, unprivileged execution invariant (strictly no sudo, root, or evdev `/dev/input/event*`), `config.toml`, Secret Service D-Bus storage, CLI pause/resume/stop, systemd user service, and uninstallation.
+   - `frontend/src/app/install/page.tsx`: Overview page containing high-level OS download cards, capability matrix, and security invariant highlights. Linux rows marked **None (Client Not Implemented)** and **NOT IMPLEMENTED**. Windows row marked **Source Crate & NSIS Script** and **COMPILATION ONLY**.
+   - `frontend/src/app/install/linux/page.tsx`: Truthful technical specification. Displays prominent **Status: Client Not Implemented (Planned Architecture)** notice. Outlines planned Wayland ScreenCast modal portal and unmeasured (`null`) input telemetry, planned X11 protocol boundaries, and non-negotiable unprivileged invariant (strictly no `sudo`, `root`, or `evdev` `/dev/input/event*` keylogging). Fake CLI commands (`dosi-tracker pause/resume/stop`) and fake uninstallation commands completely removed.
    - `frontend/src/app/install/macos/page.tsx`: Detailed macOS guide covering Apple Silicon & Intel requirements, source build via `scripts/build-app.sh`, Gatekeeper "Open Anyway" approval, TCC permissions (Screen Recording, Input Monitoring, Accessibility, Camera), Keychain storage, tray controls, and uninstallation.
-   - `frontend/src/app/install/windows/page.tsx`: Detailed Windows guide covering Windows 10/11 x86_64, NSIS installer, SmartScreen bypass, silent enterprise install parameters, DPAPI encryption, tray controls, `--quit` switch, and uninstallation.
+   - `frontend/src/app/install/windows/page.tsx`: Detailed Windows guide covering Windows 10/11 x86_64, source crate and NSIS installer script (`installer/dosi-tracker.nsi`), SmartScreen bypass, silent enterprise install parameters (`/S`, `/SERVER=`, `/DASHBOARD=`, `/D=`), DPAPI encryption (`%APPDATA%\DosiTracker\credentials.bin`), tray controls, `--quit` switch, and uninstallation.
 
-### D. Executed Verification & Quality Gates
-1. **Frontend Acceptance & Component Test Suites**:
+### D. Executed Verification, Negative Oracles & Quality Gates
+1. **Frontend Acceptance & Component Test Suites (with Negative Oracles)**:
    - `npm test -- src/middleware.test.ts src/components/dashboard/agent-setup.test.tsx src/test/acceptance/agent-onboarding.test.tsx src/test/acceptance/install-guides.test.tsx src/test/architecture.spec.ts`
    - Outcome: **50 passed out of 50 tests across 5 test suites, 0 failed, exit 0**.
-   - Includes 4 axe programmatic accessibility checks across `/install`, `/install/linux`, `/install/macos`, and `/install/windows` with **zero violations**.
+   - **Negative Oracle Controls**:
+     - `install-guides.test.tsx` actively rejects fabricated CLI commands (`dosi-tracker pause`, `dosi-tracker resume`, `dosi-tracker stop`, `dosi-tracker status`).
+     - `install-guides.test.tsx` actively rejects false implementation claim (`Implemented through org.freedesktop.portal`).
+     - `install-guides.test.tsx` actively rejects fake uninstallation command (`rm -rf ~/.config/dosi-tracker`).
+     - `install-guides.test.tsx` actively rejects false pre-built installer claims (`Pre-Built Installer (NSIS)`, `Pre-Built Setup EXE (NSIS)`).
+     - `agent-onboarding.test.tsx` actively rejects instruction to configure nonexistent `config.toml` on Linux card.
+   - Programmatic Accessibility: 4 axe programmatic accessibility checks across `/install`, `/install/linux`, `/install/macos`, and `/install/windows` with **zero violations**.
 2. **Frontend Type Checking**:
    - `npm run typecheck` (`tsc --noEmit`)
    - Outcome: **0 errors, exit 0**.
@@ -1431,12 +1439,13 @@ Under Task ID `native-install-guides-20261022-A`, delivered the truthful public 
    - Outcome: **0 errors, 3 pre-existing warnings in unrelated files, 0 warnings in new files, exit 0**.
 4. **Native Client Compilation Check**:
    - `cargo check --bin dosi-tracker` in `clients/windows`
-   - Outcome: **Finished `dev` profile [unoptimized + debuginfo] target(s) in 31.63s, exit 0**.
+   - Outcome: **Finished `dev` profile [unoptimized + debuginfo] target(s) in 31.63s, exit 0**. Verified compilation on Windows host only; does NOT verify native OS interactive runtime or hooks.
 
 ### E. Explicit Evidence Boundaries & Next Bounded Recommendations
 1. **Host Execution Limitations**: The development host is Windows. Compilation, packaging, and runtime execution for Linux and macOS native agents remain **NOT VERIFIED**.
 2. **Code Signing Gaps**: Neither Apple Developer ID notarization nor Windows Authenticode EV certificates exist in the repository; public guides truthfully instruct users on Gatekeeper and SmartScreen approvals.
 3. **Next Bounded Recommendation**: Implement the smallest source-proven Linux desktop client crate (`clients/linux`) targeting X11 window title capture (`_NET_ACTIVE_WINDOW`) with side-effect-free driver testing.
+
 
 
 

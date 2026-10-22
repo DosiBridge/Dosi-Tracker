@@ -62,14 +62,14 @@ export default function DownloadPage() {
                 <span className="sr-only"> (opens in a new tab)</span>
               </a>
               <Link href={WINDOWS_GUIDE_URL} className="text-xs text-primary-strong hover:underline inline-flex items-center gap-1 justify-center pt-1">
-                Windows setup &amp; troubleshooting guide <ArrowRight className="h-3 w-3" aria-hidden="true" />
+                Windows setup &amp; packaging guide <ArrowRight className="h-3 w-3" aria-hidden="true" />
               </Link>
             </div>
           }
         >
           <ol className="list-decimal space-y-2 pl-5 text-muted-foreground">
             <li>
-              Download <span className="font-medium text-foreground">dosi-tracker-setup-&lt;version&gt;.exe</span> from the latest release.
+              Obtain <span className="font-medium text-foreground">dosi-tracker-setup-&lt;version&gt;.exe</span> from releases if published, or build locally from source via Cargo and NSIS.
             </li>
             <li>
               Run it. It installs for your Windows user only — no administrator rights needed — and starts when you sign in to
@@ -138,30 +138,19 @@ export default function DownloadPage() {
           requirement="Ubuntu 22.04+, Fedora 38+, Arch (X11 or Wayland)"
           action={
             <Link href={LINUX_GUIDE_URL} className={linkButtonClass("outline", "md")}>
-              Linux setup &amp; capability guide <ArrowRight aria-hidden className="h-3.5 w-3.5 opacity-70" />
+              Linux architecture specification <ArrowRight aria-hidden className="h-3.5 w-3.5 opacity-70" />
             </Link>
           }
         >
-          <p className="text-muted-foreground">
-            Pre-built packages are unreleased (source preview). Operates strictly as an unprivileged user process —
-            never requires <span className="font-medium text-foreground">root</span> or <span className="font-medium text-foreground">sudo</span>.
+          <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-2.5 text-xs text-foreground font-medium mb-3">
+            Client Not Implemented (Architecture Planned)
+          </div>
+          <p className="text-muted-foreground text-xs leading-relaxed">
+            There is currently <span className="font-medium text-foreground">no Linux client implementation in the repository</span> (no pre-built binaries or source crates exist).
+            Do not create configuration files or attempt to run client commands.
           </p>
-          <ol className="list-decimal space-y-2 pl-5 text-muted-foreground">
-            <li>Review the Linux capability guide for your desktop environment.</li>
-            <li>
-              Configure the agent in <span className="font-medium text-foreground">~/.config/dosi-tracker/config.toml</span> with the
-              server address and credentials above.
-            </li>
-            <li>
-              <span className="font-medium text-foreground">Wayland display servers:</span> Screen capture uses an interactive system dialog;
-              global input activity and window titles are isolated by the compositor and reported honestly as unmeasured (null).
-            </li>
-            <li>
-              <span className="font-medium text-foreground">X11 display servers:</span> Screen capture, activity ticks, and active window titles are tracked directly.
-            </li>
-          </ol>
-          <p className="text-xs text-muted-foreground">
-            Strictly prohibits evdev keylogging or root escalation.
+          <p className="text-muted-foreground text-xs leading-relaxed mt-2">
+            The planned architecture specifies an unprivileged user process with no root, sudo, or evdev keylogging, and honest null reporting for Wayland-isolated telemetry.
           </p>
         </AgentCard>
       </div>

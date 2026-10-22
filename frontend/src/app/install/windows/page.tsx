@@ -36,7 +36,7 @@ export default function WindowsInstallPage() {
             <Monitor className="h-7 w-7 text-primary-strong" aria-hidden="true" />
             Windows Desktop Agent Guide
           </h1>
-          <Badge tone="primary">Pre-Built Installer (NSIS)</Badge>
+          <Badge tone="primary">Source Crate &amp; NSIS Build Script</Badge>
         </div>
         <p className="mt-2 text-sm text-muted-foreground max-w-3xl leading-relaxed">
           High-performance Rust desktop agent for Windows 10 and Windows 11. Lives in the Notification Area (system tray),
@@ -44,19 +44,24 @@ export default function WindowsInstallPage() {
         </p>
       </div>
 
-      {/* Code Signing Notice */}
+      {/* Code Signing & Artifact Notice */}
       <Card variant="quiet" className="border-blue-500/30 bg-blue-500/5 p-4 sm:p-5">
         <div className="flex items-start gap-3">
           <AlertTriangle className="h-5 w-5 text-blue-500 shrink-0 mt-0.5" aria-hidden="true" />
           <div className="space-y-1.5 text-xs text-muted-foreground">
-            <h2 className="font-semibold text-sm text-foreground">Authenticode Code Signing Status</h2>
+            <h2 className="font-semibold text-sm text-foreground">Packaging, Compilation &amp; Signing Status</h2>
             <p>
-              The Windows NSIS installer is generated during release packaging. Production Authenticode code signing with an EV certificate is{" "}
-              <strong className="text-foreground">pending enterprise release pipeline configuration</strong>.
+              <strong className="text-foreground">Tracked Codebase Artifacts:</strong> The Rust source crate (<code className="font-mono text-foreground font-semibold">clients/windows</code>) and NSIS installer compilation script (<code className="font-mono text-foreground font-semibold">installer/dosi-tracker.nsi</code>) are tracked in the repository. Pre-built release binary installers are <strong className="text-foreground">unreleased / not distributed in the repository</strong>.
             </p>
             <p>
-              When running the installer on a modern Windows machine, Windows Defender SmartScreen may display an informational notice.
-              Follow the verified SmartScreen instructions below.
+              <strong className="text-foreground">Local Compilation:</strong> Source compilation check is verified on Windows hosts (<code className="font-mono text-foreground">cargo check --bin dosi-tracker</code> exits with code 0). Compiling the release installer binary locally requires:
+            </p>
+            <pre className="font-mono bg-muted/60 p-2 rounded text-[11px] text-foreground overflow-x-auto">
+{`cargo build --release --bin dosi-tracker
+makensis /DVERSION=0.1.0 installer/dosi-tracker.nsi`}
+            </pre>
+            <p>
+              <strong className="text-foreground">Signing &amp; SmartScreen:</strong> No Authenticode EV code-signing certificate exists in the repository (ad-hoc / unsigned). When running locally compiled installers, Windows Defender SmartScreen displays &ldquo;Windows protected your PC&rdquo;. Follow the verified SmartScreen instructions below.
             </p>
           </div>
         </div>
@@ -74,7 +79,7 @@ export default function WindowsInstallPage() {
               <li><strong className="text-foreground">x86_64:</strong> 64-bit Windows PC (AMD64 / Intel 64)</li>
               <li>Native Rust binary target: <code className="font-mono text-foreground">x86_64-pc-windows-msvc</code></li>
               <li>Lightweight execution: ~18 MB RAM consumption</li>
-              <li>Installer package: <code className="font-mono text-foreground">dosi-tracker-setup-&lt;version&gt;.exe</code></li>
+              <li>Installer build target: <code className="font-mono text-foreground">dosi-tracker-setup-&lt;version&gt;.exe</code></li>
             </ul>
           </Card>
           <Card className="p-4">
@@ -101,7 +106,7 @@ export default function WindowsInstallPage() {
         <Card className="p-5 border-border/80 space-y-4 text-xs">
           <ol className="list-decimal pl-5 space-y-3 text-muted-foreground leading-relaxed">
             <li>
-              <strong className="text-foreground">Download the Installer:</strong> Download the latest setup executable from{" "}
+              <strong className="text-foreground">Obtain the Installer:</strong> Build from source using Cargo and NSIS, or download the setup executable if published on{" "}
               <a
                 href={AGENT_RELEASES_URL}
                 target="_blank"
@@ -138,7 +143,7 @@ export default function WindowsInstallPage() {
           Silent Enterprise &amp; Managed Deployment
         </h2>
         <p className="text-xs text-muted-foreground leading-relaxed">
-          System administrators can deploy the agent across fleet workstations silently with pre-configured server addresses:
+          System administrators can deploy the NSIS installer across fleet workstations silently with pre-configured server addresses:
         </p>
 
         <Card className="p-4 bg-muted/40 font-mono text-xs text-foreground overflow-x-auto">
@@ -191,7 +196,7 @@ dosi-tracker-setup-0.1.0.exe /S /SERVER=https://tracker-api.example.com /DASHBOA
             <span>Windows Data Protection API (DPAPI) Keying</span>
           </div>
           <p>
-            Your account credentials and authentication tokens are encrypted using <strong className="text-foreground">Windows DPAPI</strong> (<code className="font-mono text-foreground">CryptProtectData</code>).
+            Your account credentials and authentication tokens are encrypted at rest using <strong className="text-foreground">Windows DPAPI</strong> (<code className="font-mono text-foreground">CryptProtectData</code>) at <code className="font-mono text-foreground">%APPDATA%\DosiTracker\credentials.bin</code>.
             The encryption key is tied to your Windows user logon security identifier (SID). Credentials are never stored in cleartext files or environment variables.
           </p>
         </Card>
@@ -212,12 +217,12 @@ dosi-tracker-setup-0.1.0.exe /S /SERVER=https://tracker-api.example.com /DASHBOA
           </Card>
           <Card className="p-4 space-y-2">
             <h3 className="font-semibold text-foreground">Graceful Termination &amp; Upgrades</h3>
-            <p className="text-muted-foreground">To quit or prepare for an upgrade:</p>
+            <p className="text-muted-foreground">To quit or prepare for an upgrade via CLI:</p>
             <p className="font-mono text-[11px] text-foreground bg-muted/60 p-2 rounded">
               dosi-tracker.exe --quit
             </p>
             <p className="text-muted-foreground">
-              Finishes and uploads the in-progress time block before exiting cleanly.
+              Sends an IPC quit signal to the running instance, which finishes and uploads the in-progress time block before exiting cleanly.
             </p>
           </Card>
         </div>

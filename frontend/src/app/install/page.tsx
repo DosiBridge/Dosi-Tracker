@@ -22,20 +22,34 @@ export default function InstallOverviewPage() {
     <div className="space-y-8">
       {/* Hero Header */}
       <div>
-        <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-primary/10 text-primary-strong text-xs font-semibold mb-3">
-          <ShieldCheck className="h-3.5 w-3.5" aria-hidden="true" />
-          <span>Multi-Platform Desktop Onboarding</span>
+        <div className="flex items-center gap-2 mb-2">
+          <span className="text-xs font-semibold uppercase tracking-wider text-primary-strong">
+            Documentation &amp; Setup
+          </span>
         </div>
-        <h1 className="font-display text-2xl sm:text-3xl font-bold tracking-tight text-foreground">
-          Desktop Agent Installation &amp; Capability Guides
+        <h1 className="font-display text-3xl sm:text-4xl font-bold tracking-tight text-foreground">
+          Desktop Agent Installation &amp; Capabilities
         </h1>
         <p className="mt-2 text-sm text-muted-foreground max-w-3xl leading-relaxed">
-          Dosi-Tracker operates native background desktop agents that record time blocks, active project tasks, and
-          workspace-configured telemetry. This documentation establishes truthful, source-proven installation steps,
-          distinguishes available release packages from source-only builds, and details display-server boundaries
-          across Linux, macOS, and Windows.
+          Source-backed installation guides, display server boundaries, and verified capability matrices for Dosi-Tracker desktop agents.
+          We strictly report verified capabilities from repository source code and explicitly disclose unreleased or unimplemented components.
         </p>
       </div>
+
+      {/* Security Invariant Banner */}
+      <Card variant="quiet" className="border-border/80 bg-card/60 p-4 sm:p-5">
+        <div className="flex items-start gap-3">
+          <ShieldCheck className="h-5 w-5 text-success shrink-0 mt-0.5" aria-hidden="true" />
+          <div className="space-y-1 text-xs text-muted-foreground">
+            <h2 className="font-semibold text-sm text-foreground">Observer-Only Security &amp; Privacy Policy</h2>
+            <p>
+              Dosi-Tracker operates strictly under affirmative local consent. Agents never run as root/administrator, never install global keyloggers,
+              and never bypass platform display isolation. Where telemetry is unsupported by the operating system (e.g. Wayland background input),
+              metrics are reported honestly as unmeasured (<code className="font-mono text-foreground font-semibold">null</code>), never fabricated zeros.
+            </p>
+          </div>
+        </div>
+      </Card>
 
       {/* Platform Cards */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
@@ -47,27 +61,27 @@ export default function InstallOverviewPage() {
                 <Terminal className="h-5 w-5 text-primary-strong" aria-hidden="true" />
                 <CardTitle className="text-base font-semibold">Linux</CardTitle>
               </div>
-              <Badge tone="warning" className="text-[10px]">Source Preview</Badge>
+              <Badge tone="muted" className="text-[10px]">Client Not Implemented</Badge>
             </div>
             <p className="text-xs text-muted-foreground mt-1">Ubuntu 22.04+, Fedora 38+, Arch, Debian 12+</p>
           </CardHeader>
           <CardContent className="flex flex-1 flex-col justify-between gap-4 text-xs text-muted-foreground">
             <div className="space-y-2.5">
               <p>
-                Targeted at modern X11 and Wayland environments. Operates strictly as an unprivileged user process —
-                never requires <code className="font-mono text-foreground font-semibold">root</code> or <code className="font-mono text-foreground font-semibold">sudo</code>.
+                Client implementation not present in repository (architecture planned). Defines an unprivileged user process
+                strictly prohibiting <code className="font-mono text-foreground font-semibold">root</code>, <code className="font-mono text-foreground font-semibold">sudo</code>, or <code className="font-mono text-foreground font-semibold">evdev</code> keylogging.
               </p>
               <ul className="space-y-1.5 list-disc pl-4 text-foreground/80">
-                <li><strong className="text-foreground">Architectures:</strong> x86_64, aarch64</li>
-                <li><strong className="text-foreground">Packaging:</strong> Pre-built packages unreleased; architecture preview</li>
-                <li><strong className="text-foreground">Wayland:</strong> Portal dialog screen selection; input activity unsupported (null)</li>
+                <li><strong className="text-foreground">Source Status:</strong> No crate in clients/linux; planned architecture</li>
+                <li><strong className="text-foreground">Packaging:</strong> No installable binaries; technical spec only</li>
+                <li><strong className="text-foreground">Wayland Policy:</strong> Portal ScreenCast dialog; input activity unsupported (null)</li>
               </ul>
             </div>
             <Link
               href="/install/linux"
               className="mt-2 inline-flex items-center justify-center gap-1.5 w-full rounded-lg bg-primary/10 hover:bg-primary/20 text-primary-strong font-medium py-2 transition-colors text-xs"
             >
-              Linux Setup Guide <ArrowRight className="h-3.5 w-3.5" aria-hidden="true" />
+              Linux Architecture Specification <ArrowRight className="h-3.5 w-3.5" aria-hidden="true" />
             </Link>
           </CardContent>
         </Card>
@@ -113,20 +127,20 @@ export default function InstallOverviewPage() {
                 <Monitor className="h-5 w-5 text-primary-strong" aria-hidden="true" />
                 <CardTitle className="text-base font-semibold">Windows</CardTitle>
               </div>
-              <Badge tone="primary" className="text-[10px]">Pre-Built Installer</Badge>
+              <Badge tone="primary" className="text-[10px]">Source Crate &amp; NSIS Script</Badge>
             </div>
             <p className="text-xs text-muted-foreground mt-1">Windows 10 (1809+) or Windows 11</p>
           </CardHeader>
           <CardContent className="flex flex-1 flex-col justify-between gap-4 text-xs text-muted-foreground">
             <div className="space-y-2.5">
               <p>
-                High-performance Rust/Win32 tray agent. Installs per-user without administrator privileges.
-                Encrypted with Windows DPAPI.
+                High-performance Rust/Win32 tray agent. Source code and NSIS installer script are present in repo;
+                pre-built binaries are unreleased. Installs per-user without administrator privileges.
               </p>
               <ul className="space-y-1.5 list-disc pl-4 text-foreground/80">
                 <li><strong className="text-foreground">Architectures:</strong> x86_64 (64-bit)</li>
-                <li><strong className="text-foreground">Packaging:</strong> <code className="font-mono text-[11px]">dosi-tracker-setup-&lt;version&gt;.exe</code> via NSIS</li>
-                <li><strong className="text-foreground">Signing:</strong> Authenticode signing pending; SmartScreen &ldquo;Run anyway&rdquo;</li>
+                <li><strong className="text-foreground">Packaging:</strong> NSIS script <code className="font-mono text-[11px]">installer/dosi-tracker.nsi</code> in repo</li>
+                <li><strong className="text-foreground">Signing:</strong> Ad-hoc / unsigned; SmartScreen &ldquo;Run anyway&rdquo;</li>
               </ul>
             </div>
             <Link
@@ -155,55 +169,60 @@ export default function InstallOverviewPage() {
             <thead className="bg-muted/50 border-b border-border/80 text-foreground font-semibold">
               <tr>
                 <th className="p-3">Platform</th>
-                <th className="p-3">Supported Versions</th>
-                <th className="p-3">Packaging &amp; Binary Status</th>
+                <th className="p-3">Target Versions</th>
+                <th className="p-3">Packaging &amp; Artifact Status</th>
                 <th className="p-3">Screen Capture</th>
                 <th className="p-3">Input Activity</th>
                 <th className="p-3">Active Window Title</th>
                 <th className="p-3">Credential Vault</th>
-                <th className="p-3">Admin / Root Needed</th>
+                <th className="p-3">Admin / Root</th>
+                <th className="p-3">Verification Status</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-border/60 text-muted-foreground">
               <tr className="hover:bg-muted/20">
                 <td className="p-3 font-medium text-foreground">Linux (X11)</td>
                 <td className="p-3">Ubuntu 22+, Fedora 38+, Arch</td>
-                <td className="p-3"><Badge tone="warning" className="text-[10px]">Source Preview / Unreleased</Badge></td>
-                <td className="p-3">Supported (XShmGetImage / xcap)</td>
-                <td className="p-3">Supported (XInput2 raw counters)</td>
-                <td className="p-3">Supported (_NET_ACTIVE_WINDOW)</td>
-                <td className="p-3">Secret Service API (libsecret)</td>
-                <td className="p-3 font-medium text-success">No (Unprivileged)</td>
+                <td className="p-3"><Badge tone="muted" className="text-[10px]">None (Client Not Implemented)</Badge></td>
+                <td className="p-3">Planned: XShmGetImage / xcap</td>
+                <td className="p-3">Planned: XInput2 raw ticks</td>
+                <td className="p-3">Planned: _NET_ACTIVE_WINDOW</td>
+                <td className="p-3">Planned: Secret Service D-Bus</td>
+                <td className="p-3 font-medium text-success">No (Strictly Unprivileged)</td>
+                <td className="p-3 font-medium text-amber-600 dark:text-amber-400">NOT IMPLEMENTED (No crate in repo)</td>
               </tr>
               <tr className="hover:bg-muted/20">
                 <td className="p-3 font-medium text-foreground">Linux (Wayland)</td>
-                <td className="p-3">GNOME 42+, KDE Plasma 5.27+, Sway</td>
-                <td className="p-3"><Badge tone="warning" className="text-[10px]">Source Preview / Unreleased</Badge></td>
-                <td className="p-3">Supported (xdg-desktop-portal ScreenCast)</td>
+                <td className="p-3">GNOME 42+, KDE Plasma 5.27+</td>
+                <td className="p-3"><Badge tone="muted" className="text-[10px]">None (Client Not Implemented)</Badge></td>
+                <td className="p-3">Planned: Portal ScreenCast Dialog</td>
                 <td className="p-3 font-medium text-amber-600 dark:text-amber-400">UNSUPPORTED (Reported as null)</td>
                 <td className="p-3 font-medium text-amber-600 dark:text-amber-400">UNSUPPORTED (Reported as null)</td>
-                <td className="p-3">Secret Service API (libsecret)</td>
+                <td className="p-3">Planned: Secret Service D-Bus</td>
                 <td className="p-3 font-medium text-success">No (Strictly Prohibited)</td>
+                <td className="p-3 font-medium text-amber-600 dark:text-amber-400">NOT IMPLEMENTED (No crate in repo)</td>
               </tr>
               <tr className="hover:bg-muted/20">
-                <td className="p-3 font-medium text-foreground">macOS (Apple Silicon &amp; Intel)</td>
+                <td className="p-3 font-medium text-foreground">macOS (arm64 &amp; Intel)</td>
                 <td className="p-3">macOS 14 Sonoma, macOS 15 Sequoia</td>
-                <td className="p-3"><Badge tone="warning" className="text-[10px]">Source Build Only (Xcode 15+)</Badge></td>
+                <td className="p-3"><Badge tone="warning" className="text-[10px]">Source Only (clients/macos)</Badge></td>
                 <td className="p-3">Supported (ScreenCaptureKit)</td>
                 <td className="p-3">Supported (Input Monitoring counter)</td>
                 <td className="p-3">Supported (Accessibility API)</td>
                 <td className="p-3">macOS Login Keychain</td>
                 <td className="p-3 font-medium text-success">No (Standard User)</td>
+                <td className="p-3 font-medium text-amber-600 dark:text-amber-400">UNVERIFIED ON HOST (Host lacks macOS/Xcode)</td>
               </tr>
               <tr className="hover:bg-muted/20">
                 <td className="p-3 font-medium text-foreground">Windows Desktop</td>
                 <td className="p-3">Windows 10 (1809+) &amp; 11 (x86_64)</td>
-                <td className="p-3"><Badge tone="primary" className="text-[10px]">Pre-Built Setup EXE (NSIS)</Badge></td>
+                <td className="p-3"><Badge tone="primary" className="text-[10px]">Source Crate &amp; NSIS Script</Badge></td>
                 <td className="p-3">Supported (xcap / Win32 GDI)</td>
-                <td className="p-3">Supported (Low-level hooks counter)</td>
+                <td className="p-3">Supported (Low-level hooks / FakeDriver)</td>
                 <td className="p-3">Supported (GetForegroundWindow)</td>
                 <td className="p-3">Windows DPAPI (CryptProtectData)</td>
                 <td className="p-3 font-medium text-success">No (Per-User Install)</td>
+                <td className="p-3 font-medium text-success">COMPILATION ONLY (cargo check exit 0; OS hooks unverified)</td>
               </tr>
             </tbody>
           </table>
