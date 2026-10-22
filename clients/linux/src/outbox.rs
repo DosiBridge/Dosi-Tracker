@@ -82,36 +82,33 @@ impl OutboxScope {
     /// Called on all public API boundaries to enforce constraints even if the struct
     /// was instantiated directly or deserialized.
     pub fn validate(&self) -> Result<(), OutboxError> {
-        let account = self.account_id.trim();
-        let workspace = self.workspace_id.trim();
-
-        if account.is_empty() {
+        if self.account_id.trim().is_empty() {
             return Err(OutboxError::InvalidScope(
                 "account_id cannot be empty".into(),
             ));
         }
-        if account.len() > MAX_ACCOUNT_ID_BYTES {
+        if self.account_id.len() > MAX_ACCOUNT_ID_BYTES {
             return Err(OutboxError::InvalidScope(format!(
                 "account_id exceeds maximum length of {MAX_ACCOUNT_ID_BYTES} bytes"
             )));
         }
-        if account.chars().any(|c| c.is_control()) {
+        if self.account_id.chars().any(|c| c.is_control()) {
             return Err(OutboxError::InvalidScope(
                 "account_id cannot contain control characters".into(),
             ));
         }
 
-        if workspace.is_empty() {
+        if self.workspace_id.trim().is_empty() {
             return Err(OutboxError::InvalidScope(
                 "workspace_id cannot be empty".into(),
             ));
         }
-        if workspace.len() > MAX_WORKSPACE_ID_BYTES {
+        if self.workspace_id.len() > MAX_WORKSPACE_ID_BYTES {
             return Err(OutboxError::InvalidScope(format!(
                 "workspace_id exceeds maximum length of {MAX_WORKSPACE_ID_BYTES} bytes"
             )));
         }
-        if workspace.chars().any(|c| c.is_control()) {
+        if self.workspace_id.chars().any(|c| c.is_control()) {
             return Err(OutboxError::InvalidScope(
                 "workspace_id cannot contain control characters".into(),
             ));
@@ -165,18 +162,17 @@ impl ActivityEnvelope {
         if self.format_version != Self::CURRENT_FORMAT_VERSION {
             return Err(OutboxError::UnsupportedFormatVersion(self.format_version));
         }
-        let act_id = self.client_activity_id.trim();
-        if act_id.is_empty() {
+        if self.client_activity_id.trim().is_empty() {
             return Err(OutboxError::InvalidEnvelope(
                 "client_activity_id cannot be empty".into(),
             ));
         }
-        if act_id.len() > MAX_CLIENT_ACTIVITY_ID_BYTES {
+        if self.client_activity_id.len() > MAX_CLIENT_ACTIVITY_ID_BYTES {
             return Err(OutboxError::InvalidEnvelope(format!(
                 "client_activity_id exceeds maximum length of {MAX_CLIENT_ACTIVITY_ID_BYTES} bytes"
             )));
         }
-        if act_id.chars().any(|c| c.is_control()) {
+        if self.client_activity_id.chars().any(|c| c.is_control()) {
             return Err(OutboxError::InvalidEnvelope(
                 "client_activity_id cannot contain control characters".into(),
             ));
@@ -715,12 +711,18 @@ impl Outbox {
                 });
             }
 
+            let scope = OutboxScope {
+                account_id,
+                workspace_id,
+            };
+            scope.validate().map_err(|e| OutboxError::CorruptRecord {
+                id,
+                reason: format!("Persisted scope failed validation: {e}"),
+            })?;
+
             entries.push(OutboxEntry {
                 id,
-                scope: OutboxScope {
-                    account_id,
-                    workspace_id,
-                },
+                scope,
                 client_activity_id,
                 enqueued_at,
                 retry_count,

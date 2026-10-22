@@ -1949,6 +1949,66 @@ Independent PM inspection of Task I identified same-phase boundedness and valida
 4. **Prior Unresolved Approval Invariant**: The approval-blocked command `tirith:archive_extract` remains unresolved. Worker has **NOT** retried, repackaged, or delegated that command, nor modified archive extraction approvals.
 5. **Host Toolchain vs Native Linux Evidence Separation**: All tests were executed on Windows host MSVC and Git-Bash toolchains. This does **NOT** constitute independent PM acceptance or native Linux kernel/libc runtime verification.
 
+---
+
+## 29. Raw Persisted Identity Byte Validation & Bounded Lifecycle (`linux-outbox-raw-identity-bounds-20261022-K`)
+
+> **Execution Date:** October 22, 2026  
+> **Phase Task ID:** `linux-outbox-raw-identity-bounds-20261022-K`  
+> **Status:** Completed & Source-Verified (65 Rust tests passed in `clients/linux`, 22 shell lifecycle tests passed, 50 frontend tests passed, typecheck clean, fmt clean, check clean)  
+> **Target Package:** `clients/linux` (`src/outbox.rs`, `tests/outbox_tests.rs`)  
+
+### A. Context & Source-Backed Boundedness Deficiencies Addressed
+Independent PM inspection of Task J identified a remaining library correctness/boundedness defect in identity measurement:
+1. **Measurement of Trimmed Strings vs Raw Persisted Bytes**:
+   - `OutboxScope::validate` previously measured `self.account_id.trim().len()` and `self.workspace_id.trim().len()`.
+   - `ActivityEnvelope::validate` similarly measured `self.client_activity_id.trim().len()`.
+   - However, SQLite query parameters (`params![&scope.account_id, ... &envelope.client_activity_id, ...]`) and JSON payload serialization retained and persisted the *raw* un-trimmed struct fields.
+   - Consequently, directly constructed public structs (`OutboxScope { ... }`) or deserialized JSON objects with huge leading/trailing ASCII or Unicode whitespace padding bypassed advertised byte bounds (e.g. 300 spaces + 5-byte ID was measured as 5 bytes <= 256).
+   - This allowed an oversized padded client ID to enqueue into SQLite, but subsequent `ack_delivered` or `mark_attempt_failed` calls (which measured raw `client_activity_id.len() > MAX_CLIENT_ACTIVITY_ID_BYTES`) rejected operations with `InvalidEnvelope`, permanently stranding the queued record.
+   - *Correction*: Updated `OutboxScope::validate` and `ActivityEnvelope::validate` to measure the raw byte length of the actual retained/persisted fields:
+     - `self.account_id.len() > MAX_ACCOUNT_ID_BYTES` -> `Err(OutboxError::InvalidScope)`
+     - `self.workspace_id.len() > MAX_WORKSPACE_ID_BYTES` -> `Err(OutboxError::InvalidScope)`
+     - `self.client_activity_id.len() > MAX_CLIENT_ACTIVITY_ID_BYTES` -> `Err(OutboxError::InvalidEnvelope)`
+     - Bounded raw length checks reject oversized padded values before database mutation or file writes.
+2. **Deserialized Persisted Scope Validation in `peek_pending`**:
+   - Added `scope.validate().map_err(...)` to validate the retrieved `OutboxScope` before pushing `OutboxEntry`, ensuring any corrupted or oversized persisted database rows fail closed with `OutboxError::CorruptRecord`.
+3. **Preserved Constructor Compatibility & Legitimate In-Bound Identifiers**:
+   - `OutboxScope::new` constructor continues to sanitize and trim legitimate input strings.
+   - Legitimate in-bound identifiers, exact 256-byte boundary strings, and multibyte UTF-8 characters (e.g. Bengali Unicode) are fully supported and verified.
+
+### B. Executed Regressions & Test Evidence
+1. **Task K Outbox Regression Tests (5 New Tests, 28 Total Outbox Tests)**:
+   - `test_directly_constructed_and_deserialized_scopes_with_oversized_ascii_and_unicode_whitespace_rejected`: Directly constructed scopes and JSON deserialized scopes with > 256 B ASCII and Unicode whitespace (`\u{3000}`, `\u{2003}`) rejected with `InvalidScope` on `enqueue`, `peek_pending`, and `count`; asserts zero database mutations.
+   - `test_oversized_padded_activity_ids_rejected_before_mutation`: Direct and deserialized envelopes with oversized ASCII and Unicode padded `client_activity_id` rejected with `InvalidEnvelope`; asserts zero database mutations.
+   - `test_exact_byte_boundaries_and_multibyte_identities`: Exact 256-byte ASCII boundary and exact 256-byte multibyte Bengali UTF-8 string accepted (`Inserted`); 257-byte ASCII and 258-byte Japanese multibyte string rejected with `InvalidEnvelope`.
+   - `test_rejection_preserves_unchanged_persisted_sentinels_a_and_b`: Invalid operations across scopes with oversized padded identities fail closed, preserving Sentinels A and B payloads, retry counts, timestamps, and error states intact.
+   - `test_valid_enqueue_peek_retry_ack_lifecycle_with_bounded_identity`: Complete `enqueue` -> `peek_pending` -> `mark_attempt_failed` -> `peek_pending` -> `ack_delivered` -> `peek_pending` (empty) lifecycle verified.
+2. **Existing Test Suites Maintained**:
+   - 23 initial outbox tests passed.
+   - 21 unit tests, 6 doctor CLI tests, 7 consent/policy repro tests, 3 installer integration tests passed.
+   - Total Rust tests in `clients/linux`: **65 passed, 0 failed, exit 0**.
+   - Shell installer lifecycle: 22 passed, exit 0.
+   - Frontend Vitest suite: 50 passed, exit 0.
+   - Frontend typecheck: 0 errors, exit 0.
+
+### C. Executed Test Suites & Quality Gates
+| Target Suite | Exact Command Line | Tests Passed | Ignored | Result | Exit Code | Evidence Level |
+|---|---|:---:|:---:|:---:|:---:|---|
+| **Linux Unit, CLI, Repro, Installer & Outbox Tests** | `cargo test` in `clients/linux` | 65 passed (21 unit + 6 doctor CLI + 7 repro + 3 installer integration + 28 outbox integration) | 0 | PASSED | **0** | **[Worker-Reported (Windows Host Toolchain)]** |
+| **Shell Installer Lifecycle Suite** | `bash clients/linux/tests/test_installer_lifecycle.sh` | 22 passed (all lifecycle, security confinement, and binary doctor checks) | 0 | PASSED | **0** | **[Worker-Reported (Git-Bash Host Toolchain)]** |
+| **Linux Code Formatting** | `cargo fmt --check` in `clients/linux` | N/A | 0 diffs | PASSED | **0** | **[Worker-Reported]** |
+| **Linux Compilation Check** | `cargo check` in `clients/linux` | N/A | 0 errors, 0 warnings | PASSED | **0** | **[Worker-Reported]** |
+| **Frontend Acceptance Suite** | `npx vitest run src/middleware.test.ts src/components/dashboard/agent-setup.test.tsx src/test/acceptance/agent-onboarding.test.tsx src/test/acceptance/install-guides.test.tsx src/test/architecture.spec.ts` | 50 passed | 0 | PASSED | **0** | **[Worker-Reported (Focused 5-File Suite)]** |
+| **Frontend Typecheck** | `npm run typecheck` in `frontend` | N/A | 0 errors | PASSED | **0** | **[Worker-Reported]** |
+
+### D. PM QA Boundary Limits & Acceptance Disclosures
+1. **Source-Confirmed Correctness Defect**: This task addressed an internal library boundedness and identity measurement consistency defect, not an external or deployed security exploit.
+2. **Outbox Library Scope Boundary**: Only the local transactional outbox library module is implemented (`dosi_tracker_linux::outbox`). No background sync worker, network upload, authentication, credential storage, or sensor adapters are active.
+3. **Prior Unresolved Approval Invariant**: The approval-blocked command `tirith:archive_extract` remains unresolved. Worker has **NOT** retried, repackaged, or delegated that command, nor modified archive extraction approvals.
+4. **Host Toolchain vs Native Linux Evidence Separation**: All tests were executed on Windows host MSVC and Git-Bash toolchains. This does **NOT** constitute independent PM acceptance or native Linux kernel/libc runtime verification.
+
+
 
 
 

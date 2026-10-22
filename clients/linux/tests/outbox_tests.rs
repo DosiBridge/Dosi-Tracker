@@ -822,3 +822,271 @@ fn test_metadata_update_failure_preserves_sentinels() {
         Some("Sentinel B")
     );
 }
+
+#[test]
+fn test_directly_constructed_and_deserialized_scopes_with_oversized_ascii_and_unicode_whitespace_rejected(
+) {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("scope_whitespace.db");
+    let outbox = Outbox::open(&db_path, OutboxLimits::default()).unwrap();
+    let valid_env = synthetic_envelope("act-valid", None);
+
+    // 1. Direct construction with huge leading ASCII whitespace (> 256 bytes raw)
+    let direct_oversized_ascii = OutboxScope {
+        account_id: format!("{}user-1", " ".repeat(300)),
+        workspace_id: "ws-1".to_string(),
+    };
+    assert!(matches!(
+        outbox
+            .enqueue(&direct_oversized_ascii, &valid_env)
+            .unwrap_err(),
+        OutboxError::InvalidScope(_)
+    ));
+    assert!(matches!(
+        outbox
+            .peek_pending(&direct_oversized_ascii, 10)
+            .unwrap_err(),
+        OutboxError::InvalidScope(_)
+    ));
+    assert!(matches!(
+        outbox.count(Some(&direct_oversized_ascii)).unwrap_err(),
+        OutboxError::InvalidScope(_)
+    ));
+
+    // 2. Direct construction with huge trailing Unicode whitespace (\u{3000} ideographic space, 100 chars = 300 bytes)
+    let direct_oversized_unicode = OutboxScope {
+        account_id: "user-1".to_string(),
+        workspace_id: format!("ws-1{}", "\u{3000}".repeat(100)),
+    };
+    assert!(matches!(
+        outbox
+            .enqueue(&direct_oversized_unicode, &valid_env)
+            .unwrap_err(),
+        OutboxError::InvalidScope(_)
+    ));
+
+    // 3. Deserialized from JSON with huge ASCII whitespace
+    let json_ascii = format!(
+        r#"{{"account_id": "{}user-1", "workspace_id": "ws-1"}}"#,
+        " ".repeat(300)
+    );
+    let deserialized_ascii: OutboxScope = serde_json::from_str(&json_ascii).unwrap();
+    assert!(matches!(
+        outbox.enqueue(&deserialized_ascii, &valid_env).unwrap_err(),
+        OutboxError::InvalidScope(_)
+    ));
+
+    // 4. Deserialized from JSON with huge Unicode whitespace (\u{2003} em space)
+    let json_unicode = format!(
+        r#"{{"account_id": "user-1", "workspace_id": "ws-1{}"}}"#,
+        "\u{2003}".repeat(100)
+    );
+    let deserialized_unicode: OutboxScope = serde_json::from_str(&json_unicode).unwrap();
+    assert!(matches!(
+        outbox
+            .enqueue(&deserialized_unicode, &valid_env)
+            .unwrap_err(),
+        OutboxError::InvalidScope(_)
+    ));
+
+    // Assert zero mutations occurred in database
+    assert_eq!(outbox.count(None).unwrap(), 0);
+}
+
+#[test]
+fn test_oversized_padded_activity_ids_rejected_before_mutation() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("padded_activity_ids.db");
+    let outbox = Outbox::open(&db_path, OutboxLimits::default()).unwrap();
+    let valid_scope = OutboxScope::new("user-1", "workspace-1").unwrap();
+
+    // 1. Direct envelope with huge leading ASCII whitespace in client_activity_id (raw len > 256)
+    let direct_padded_ascii = synthetic_envelope(&format!("{}act-1", " ".repeat(300)), None);
+    let err_ascii = outbox
+        .enqueue(&valid_scope, &direct_padded_ascii)
+        .unwrap_err();
+    assert!(matches!(err_ascii, OutboxError::InvalidEnvelope(_)));
+
+    // 2. Direct envelope with huge Unicode whitespace padding (\u{3000}, raw len > 256)
+    let direct_padded_unicode =
+        synthetic_envelope(&format!("act-1{}", "\u{3000}".repeat(100)), None);
+    let err_unicode = outbox
+        .enqueue(&valid_scope, &direct_padded_unicode)
+        .unwrap_err();
+    assert!(matches!(err_unicode, OutboxError::InvalidEnvelope(_)));
+
+    // 3. Deserialized envelope with padded client_activity_id
+    let mut bad_json_envelope = synthetic_envelope("placeholder", None);
+    bad_json_envelope.client_activity_id = format!("{}act-1", " ".repeat(300));
+    let json_str = serde_json::to_string(&bad_json_envelope).unwrap();
+    let deserialized_env: ActivityEnvelope = serde_json::from_str(&json_str).unwrap();
+    let err_deserialized = outbox.enqueue(&valid_scope, &deserialized_env).unwrap_err();
+    assert!(matches!(err_deserialized, OutboxError::InvalidEnvelope(_)));
+
+    // Assert zero records in outbox (rejected before mutation)
+    assert_eq!(outbox.count(None).unwrap(), 0);
+}
+
+#[test]
+fn test_exact_byte_boundaries_and_multibyte_identities() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("exact_boundaries.db");
+    let outbox = Outbox::open(&db_path, OutboxLimits::default()).unwrap();
+
+    // Exactly 256 ASCII bytes for account_id, workspace_id, client_activity_id
+    let exact_256_acc = "a".repeat(256);
+    let exact_256_ws = "w".repeat(256);
+    let exact_256_act = "c".repeat(256);
+
+    let scope_256 = OutboxScope::new(&exact_256_acc, &exact_256_ws).unwrap();
+    let env_256 = synthetic_envelope(&exact_256_act, Some("Exact 256 boundary"));
+
+    let res = outbox.enqueue(&scope_256, &env_256).unwrap();
+    assert!(matches!(res, EnqueueResult::Inserted(1)));
+    assert_eq!(outbox.count(Some(&scope_256)).unwrap(), 1);
+
+    // 257 ASCII bytes for client_activity_id: must be rejected
+    let oversize_257_act = "c".repeat(257);
+    let env_257 = synthetic_envelope(&oversize_257_act, None);
+    assert!(matches!(
+        outbox.enqueue(&scope_256, &env_257).unwrap_err(),
+        OutboxError::InvalidEnvelope(_)
+    ));
+
+    // Multibyte characters: Bengali "বাংলা" is 15 bytes in UTF-8 (5 chars * 3 bytes)
+    // 17 repeats * 15 bytes = 255 bytes + 1 ASCII byte = 256 bytes exact!
+    let bengali_part = "বাংলা".repeat(17); // 255 bytes
+    let exact_256_multibyte = format!("{bengali_part}X"); // 256 bytes exact
+    assert_eq!(exact_256_multibyte.len(), 256);
+
+    let env_mb_256 = synthetic_envelope(&exact_256_multibyte, Some("Bengali 256"));
+    let res_mb = outbox.enqueue(&scope_256, &env_mb_256).unwrap();
+    assert!(matches!(res_mb, EnqueueResult::Inserted(2)));
+
+    // Multibyte 258 bytes: 86 Japanese chars (each 3 bytes) = 258 bytes: must be rejected
+    let jp_258 = "あ".repeat(86);
+    assert_eq!(jp_258.len(), 258);
+    let env_mb_258 = synthetic_envelope(&jp_258, None);
+    assert!(matches!(
+        outbox.enqueue(&scope_256, &env_mb_258).unwrap_err(),
+        OutboxError::InvalidEnvelope(_)
+    ));
+
+    // Verify stored count remains 2
+    assert_eq!(outbox.count(Some(&scope_256)).unwrap(), 2);
+}
+
+#[test]
+fn test_rejection_preserves_unchanged_persisted_sentinels_a_and_b() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("sentinels_preserve.db");
+    let outbox = Outbox::open(&db_path, OutboxLimits::default()).unwrap();
+
+    let scope_a = OutboxScope::new("user-a", "ws-a").unwrap();
+    let scope_b = OutboxScope::new("user-b", "ws-b").unwrap();
+
+    let env_a = synthetic_envelope("act-sentinel-a", Some("Sentinel A Body"));
+    let env_b = synthetic_envelope("act-sentinel-b", Some("Sentinel B Body"));
+
+    outbox.enqueue(&scope_a, &env_a).unwrap();
+    outbox.enqueue(&scope_b, &env_b).unwrap();
+    assert_eq!(outbox.count(None).unwrap(), 2);
+
+    // Attempt invalid operations with oversized padded identities
+    let invalid_padded_scope = OutboxScope {
+        account_id: format!("{}user-a", " ".repeat(300)),
+        workspace_id: "ws-a".to_string(),
+    };
+    let invalid_padded_env = synthetic_envelope(&format!("{}act-new", " ".repeat(300)), None);
+
+    // Enqueue with invalid scope rejected
+    assert!(matches!(
+        outbox.enqueue(&invalid_padded_scope, &env_a).unwrap_err(),
+        OutboxError::InvalidScope(_)
+    ));
+
+    // Enqueue with invalid padded env rejected
+    assert!(matches!(
+        outbox.enqueue(&scope_a, &invalid_padded_env).unwrap_err(),
+        OutboxError::InvalidEnvelope(_)
+    ));
+
+    // Mark failed with invalid padded activity ID rejected
+    let padded_id_str = format!("{}act-sentinel-a", " ".repeat(300));
+    assert!(matches!(
+        outbox
+            .mark_attempt_failed(&scope_a, &padded_id_str, "err")
+            .unwrap_err(),
+        OutboxError::InvalidEnvelope(_)
+    ));
+
+    // Ack with invalid padded activity ID rejected
+    assert!(matches!(
+        outbox.ack_delivered(&scope_a, &padded_id_str).unwrap_err(),
+        OutboxError::InvalidEnvelope(_)
+    ));
+
+    // Assert Sentinels A and B are 100% unchanged
+    let pending_a = outbox.peek_pending(&scope_a, 10).unwrap();
+    assert_eq!(pending_a.len(), 1);
+    assert_eq!(pending_a[0].client_activity_id, "act-sentinel-a");
+    assert_eq!(pending_a[0].retry_count, 0);
+    assert_eq!(pending_a[0].last_error, None);
+    assert_eq!(
+        pending_a[0].envelope.description.as_deref(),
+        Some("Sentinel A Body")
+    );
+
+    let pending_b = outbox.peek_pending(&scope_b, 10).unwrap();
+    assert_eq!(pending_b.len(), 1);
+    assert_eq!(pending_b[0].client_activity_id, "act-sentinel-b");
+    assert_eq!(pending_b[0].retry_count, 0);
+    assert_eq!(pending_b[0].last_error, None);
+    assert_eq!(
+        pending_b[0].envelope.description.as_deref(),
+        Some("Sentinel B Body")
+    );
+}
+
+#[test]
+fn test_valid_enqueue_peek_retry_ack_lifecycle_with_bounded_identity() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("full_lifecycle.db");
+    let outbox = Outbox::open(&db_path, OutboxLimits::default()).unwrap();
+
+    let scope = OutboxScope::new("acct-lifecycle", "ws-lifecycle").unwrap();
+    let env = synthetic_envelope("act-lifecycle-1", Some("Lifecycle Payload"));
+
+    // 1. Enqueue
+    let insert_res = outbox.enqueue(&scope, &env).unwrap();
+    assert!(matches!(insert_res, EnqueueResult::Inserted(1)));
+
+    // 2. Peek pending
+    let pending = outbox.peek_pending(&scope, 10).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].client_activity_id, "act-lifecycle-1");
+    assert_eq!(pending[0].retry_count, 0);
+    assert_eq!(pending[0].last_error, None);
+
+    // 3. Mark attempt failed (retry)
+    outbox
+        .mark_attempt_failed(&scope, "act-lifecycle-1", "Temporary network failure")
+        .unwrap();
+
+    // 4. Peek pending verifies retry count and error message
+    let pending_after_retry = outbox.peek_pending(&scope, 10).unwrap();
+    assert_eq!(pending_after_retry.len(), 1);
+    assert_eq!(pending_after_retry[0].retry_count, 1);
+    assert_eq!(
+        pending_after_retry[0].last_error.as_deref(),
+        Some("Temporary network failure")
+    );
+
+    // 5. Ack delivered
+    outbox.ack_delivered(&scope, "act-lifecycle-1").unwrap();
+
+    // 6. Peek pending is now empty
+    let pending_final = outbox.peek_pending(&scope, 10).unwrap();
+    assert_eq!(pending_final.len(), 0);
+    assert_eq!(outbox.count(Some(&scope)).unwrap(), 0);
+}
