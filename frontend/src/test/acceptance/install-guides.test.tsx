@@ -108,6 +108,14 @@ describe("Public Installation & Onboarding Guides", () => {
       expect(screen.getByRole("heading", { name: /Implemented Diagnostic Command Syntax/i })).toBeInTheDocument();
       expect(screen.getByText("cargo run --bin dosi-tracker-linux -- doctor")).toBeInTheDocument();
       expect(screen.getByText("cargo run --bin dosi-tracker-linux -- doctor --json")).toBeInTheDocument();
+
+      // Rootless installer lifecycle commands
+      expect(screen.getByRole("heading", { name: /Rootless Source-Build Installation Lifecycle/i })).toBeInTheDocument();
+      expect(screen.getByText("bash clients/linux/scripts/install.sh install")).toBeInTheDocument();
+      expect(screen.getByText("bash clients/linux/scripts/install.sh update")).toBeInTheDocument();
+      expect(screen.getByText("bash clients/linux/scripts/install.sh rollback")).toBeInTheDocument();
+      expect(screen.getByText("bash clients/linux/scripts/uninstall.sh")).toBeInTheDocument();
+      expect(screen.getByText("~/.local/bin/dosi-tracker-linux doctor [--json]")).toBeInTheDocument();
     });
 
     it("details planned Wayland portal consent and anti-keylogger invariants", () => {

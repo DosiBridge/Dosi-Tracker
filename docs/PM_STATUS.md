@@ -1572,6 +1572,59 @@ Isolated regressions executed on original production code (`clients/linux/tests/
 2. **Worker Evidence Boundary**: All worker tests were executed locally on the Windows host toolchain (`cargo 1.97.1`). Native Linux compilation, libc linking, X11/Wayland runtime execution, and packaging remain **NOT VERIFIED**.
 3. **Sensor Isolation**: No native adapters, D-Bus, network, autostart, or real screen/webcam/input tracking were activated.
 
+---
+
+## 23. Linux Rootless Source-Build Installation Lifecycle (`linux-foundation-rootless-install-20261022-E`)
+
+> **Execution Date:** October 22, 2026  
+> **Phase Task ID:** `linux-foundation-rootless-install-20261022-E`  
+> **Status:** Completed & Source-Verified (37 Rust tests passed in `clients/linux`, 10 shell lifecycle tests passed, 50 frontend tests passed, typecheck clean, fmt clean, check clean)  
+> **Target Package:** `clients/linux` (scripts: `install.sh`, `uninstall.sh`; crate: `dosi-tracker-linux` v0.1.0)  
+
+### A. Context & Delivered Architecture
+In accordance with task `linux-foundation-rootless-install-20261022-E`, this slice introduces an unprivileged, user-scoped rootless source-build installation, update, rollback, and uninstallation lifecycle for the existing sensor-free diagnostic executable:
+1. **User-Scoped Entrypoints (`clients/linux/scripts/install.sh`, `uninstall.sh`)**:
+   - `install.sh install [--prefix <dir>]`: Builds crate locally via `cargo --locked --release` (or accepts `--source-bin` override), performs pre-activation smoke tests, and atomically activates the binary into `<prefix>/bin/dosi-tracker-linux` (default: `~/.local/bin`).
+   - `install.sh update [--prefix <dir>]`: Stages candidate binary, verifies `--help` invocation, backs up previous working binary to `<prefix>/share/dosi-tracker/backup/dosi-tracker-linux.prev`, and updates manifest.
+   - `install.sh rollback [--prefix <dir>]`: Restores previous working binary from retained backup if needed.
+   - `install.sh uninstall [--prefix <dir>]` / `uninstall.sh`: Reads ownership manifest and deletes only owned files, preserving user configuration and consent at `~/.config/dosi-tracker` and unrelated sentinels.
+   - `install.sh status [--prefix <dir>]`: Inspects installation and manifest metadata.
+2. **Ownership Manifest (`<prefix>/share/dosi-tracker/manifest.json`)**:
+   - Explicit ownership manifest recording `component`, `version`, `installed_at`, `prefix`, `bin_dir`, `data_dir`, `binary_path`, `owned_files`, and `previous_version`.
+   - Refuses overwriting unmanaged foreign files (`dosi-tracker-linux`) if no valid manifest claims them.
+3. **Rootless & Security Invariants**:
+   - Strictly forbids execution as root/sudo.
+   - Rejects system-critical directories (`/`, `/usr`, `/etc`, `/var`, `/lib`, `/root`, etc.) and path traversal escaping user prefixes.
+   - Rejects symlink escapes pointing outside the installation prefix.
+   - Staging atomicity: builds and verifies in `.staging.<pid>` before moving to target.
+   - Sensor-free: does not install systemd units, autostart entries, D-Bus hooks, kernel modules, or background daemons.
+
+### B. Executed Test Suites & Quality Gates
+| Target Suite | Exact Command Line | Tests Passed | Ignored | Result | Exit Code | Evidence Level |
+|---|---|:---:|:---:|:---:|:---:|:---:|
+| **Linux Unit, CLI, Repro & Installer Tests** | `cargo test` in `clients/linux` | 37 passed (21 unit + 6 doctor CLI + 7 repro + 3 installer integration) | 0 | PASSED | **0** | **[Worker-Reported (Windows Host Toolchain)]** |
+| **Shell Installer Lifecycle Suite** | `bash clients/linux/tests/test_installer_lifecycle.sh` | 10 passed (fresh install, conflict refusal, update, staging failure preservation, rollback, unsafe path refusal, symlink refusal, config preservation, idempotent uninstall, real binary smoke) | 0 | PASSED | **0** | **[Worker-Reported (Git-Bash Host Toolchain)]** |
+| **Linux Code Formatting** | `cargo fmt --check` in `clients/linux` | N/A | 0 diffs | PASSED | **0** | **[Worker-Reported]** |
+| **Linux Compilation Check** | `cargo check` in `clients/linux` | N/A | 0 errors, 0 warnings | PASSED | **0** | **[Worker-Reported]** |
+| **Frontend Acceptance Suite** | `npx vitest run src/middleware.test.ts src/components/dashboard/agent-setup.test.tsx src/test/acceptance/agent-onboarding.test.tsx src/test/acceptance/install-guides.test.tsx src/test/architecture.spec.ts` | 50 passed | 0 | PASSED | **0** | **[Worker-Reported (Focused 5-File Suite)]** |
+| **Frontend Typecheck** | `npm run typecheck` in `frontend` | N/A | 0 errors | PASSED | **0** | **[Worker-Reported]** |
+
+### C. Explicit Multi-Dimensional Platform Evidence Matrix
+| Verification Dimension | Linux Desktop Agent | macOS Desktop Agent | Windows Desktop Agent |
+|---|---|---|---|
+| **Source Implementation** | Complete headless foundation (`clients/linux`) | Source build (`clients/macos`) | Source crate & NSIS (`clients/windows`) |
+| **Worker Host Tests** | 37 Rust tests + 10 shell tests passed (Windows host toolchain) | Unverified (host lacks macOS hardware/Xcode) | 89 synthetic tests passed |
+| **Independent PM Execution** | Pending (archive extraction was approval-blocked; not retried) | Pending / Blocked | Prior initial decoupling verified @ 8c1b201 |
+| **Native Kernel/OS Compilation** | Pending (not compiled under native Linux kernel/glibc) | Pending | Verified via `cargo check` on Windows MSVC |
+| **Temporary Rootless Install/Uninstall** | **Verified** in isolated temp prefixes via `install.sh` / tests | Script present (`build-app.sh`); unverified | Script present (`dosi-tracker.nsi`); unverified |
+| **Interactive Runtime & Sensors** | **UNVERIFIED / NOT IMPLEMENTED** (adapters report NOT_IMPLEMENTED) | **UNVERIFIED** (TCC/ScreenCaptureKit) | **UNVERIFIED** in real Win32 hook session |
+| **Code Signing & Distribution** | **Unsigned / Unreleased** (source build only) | **Unnotarized / Unreleased** | **Unsigned / Unreleased** |
+
+### D. PM QA Boundary Limits
+1. **Approval-Blocked Command Invariant**: Independent PM QA archive extraction on Linux was approval-blocked (`tirith:archive_extract`). Worker has **NOT** retried, repackaged, or delegated that command or altered permissions/transport.
+2. **Host Environment Transparency**: Shell tests were executed using the available local Git-Bash / MSYS2 toolchain; this does **NOT** constitute native Linux distribution runtime acceptance. Native packaging (deb/rpm) and systemd services remain deferred to future slices.
+
+
 
 
 

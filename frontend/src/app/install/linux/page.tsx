@@ -94,6 +94,42 @@ export default function LinuxInstallPage() {
         </Card>
       </div>
 
+      {/* Rootless Source-Build Installation Lifecycle */}
+      <div className="space-y-4">
+        <h2 className="font-display text-lg font-bold text-foreground">Rootless Source-Build Installation Lifecycle</h2>
+        <Card className="p-4 space-y-3 text-xs text-muted-foreground">
+          <p>
+            An unprivileged, user-scoped installation lifecycle script is provided at{" "}
+            <code className="font-mono text-foreground font-semibold">clients/linux/scripts/install.sh</code>. It compiles the locked crate locally
+            and installs the diagnostic executable into an explicit user-controlled prefix (default: <code className="font-mono text-foreground">~/.local</code>):
+          </p>
+          <div className="space-y-2 font-mono text-[11px] bg-muted/60 p-3 rounded-lg border border-border/80 text-foreground overflow-x-auto">
+            <div># 1. Fresh rootless install to ~/.local/bin (requires local Rust/Cargo)</div>
+            <div className="text-primary-strong">bash clients/linux/scripts/install.sh install</div>
+            <div className="mt-2"># Or install to an explicit user-controlled prefix:</div>
+            <div className="text-primary-strong">bash clients/linux/scripts/install.sh install --prefix ~/.local</div>
+            <div className="mt-2"># 2. Run installed diagnostic probe</div>
+            <div className="text-primary-strong">~/.local/bin/dosi-tracker-linux doctor [--json]</div>
+            <div className="mt-2"># 3. Update existing installation (with staging and prior backup)</div>
+            <div className="text-primary-strong">bash clients/linux/scripts/install.sh update</div>
+            <div className="mt-2"># 4. Rollback to retained previous installation (if needed)</div>
+            <div className="text-primary-strong">bash clients/linux/scripts/install.sh rollback</div>
+            <div className="mt-2"># 5. Clean rootless uninstallation (preserves user config and consent)</div>
+            <div className="text-primary-strong">bash clients/linux/scripts/uninstall.sh</div>
+          </div>
+          <div className="space-y-1.5 text-[11px] pt-1">
+            <p className="font-semibold text-foreground">Safety &amp; Ownership Invariants:</p>
+            <ul className="list-disc pl-4 space-y-1 text-foreground/80">
+              <li><strong className="text-foreground">Strictly Rootless:</strong> Refuses to run with <code className="font-mono text-foreground">sudo</code> or as root; system paths (<code className="font-mono text-foreground">/usr</code>, <code className="font-mono text-foreground">/etc</code>) and symlink escapes are rejected.</li>
+              <li><strong className="text-foreground">Ownership Manifest:</strong> Writes an explicit manifest (<code className="font-mono text-foreground">~/.local/share/dosi-tracker/manifest.json</code>); refuses to overwrite unmanaged foreign files.</li>
+              <li><strong className="text-foreground">Atomic Staging:</strong> Builds and validates binary in a temporary staging directory before activating.</li>
+              <li><strong className="text-foreground">Consent Preservation:</strong> Uninstallation deletes only owned files; user configuration and consent at <code className="font-mono text-foreground">~/.config/dosi-tracker</code> are strictly preserved.</li>
+              <li><strong className="text-foreground">Diagnostic Scope:</strong> Installs the sensor-free diagnostic foundation executable only; no autostart, systemd service, or background tracking daemons are registered.</li>
+            </ul>
+          </div>
+        </Card>
+      </div>
+
       {/* Target Platforms for Future Implementation */}
       <div className="space-y-4">
         <h2 className="font-display text-lg font-bold text-foreground">Target Platforms &amp; Architecture</h2>
