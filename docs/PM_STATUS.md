@@ -1716,9 +1716,8 @@ In continuation of task `linux-installer-real-manifest-validation-20261022-G`, c
    - *Correction:* Refactored to dynamically assert `output.status.success()`, `stdout.contains("Failed: 0")`, and non-zero passes (`stdout.contains("Passed: ") && !stdout.contains("Passed: 0\n")`).
 
 ### B. Failing-Before Production Repro & Passing-After Outcomes
-1. **Failing-Before Repro on Prior Implementation (`scratch/test_prior_flaw.sh`)**:
-   - Manifest with missing comma between fields and empty `owned_files: []`:
-     - Prior `validate_manifest_structure` exited `0` (accepted malformed JSON and matched `"binary_path"` property key as ownership proof).
+1. **Modeled-Old-Algorithm Evidence on Prior Parsing (`scratch/test_prior_flaw.sh`)**:
+   - Modeled script recreation demonstrating that prior regex/sed algorithm accepted missing comma between fields and empty `owned_files: []` (exit 0) due to matching `"binary_path"` property key name as ownership proof. (Preserved as modeled-old-algorithm evidence, not a full prior-production failing-before execution).
 2. **Passing-After in Expanded Shell Suite (`clients/linux/tests/test_installer_lifecycle.sh` - 17 Tests Total)**:
    - **Test 3 (Malformed JSON Manifest Refusal)**: Verifies that missing commas or trailing garbage after closing brace are rejected fail-closed with `Manifest is invalid JSON: ...` (exit 1).
    - **Test 4 (Duplicate Keys Manifest Refusal)**: Verifies that duplicate JSON keys (e.g. repeated `"version"`) are rejected fail-closed with `Duplicate key in manifest: ...` (exit 1).
@@ -1741,6 +1740,66 @@ In continuation of task `linux-installer-real-manifest-validation-20261022-G`, c
 2. **Host Toolchain vs Native Linux Evidence Separation**: All shell regressions were executed using Git-Bash / MSYS2 on Windows. While providing isolated directory testing, this does **NOT** constitute independent PM acceptance or native Linux kernel/libc runtime verification.
 3. **No Crash-Atomic Transaction Claims**: Sequential `cp`/`mv` operations do not provide crash-atomic multi-file filesystem transactions across unexpected host power loss or kernel crashes. Staging and backup/rollback mechanisms provide application-level failure recovery during script execution.
 4. **Scope Discipline**: No real sensor adapters (X11/Wayland/PipeWire), network synchronization, credential services, background daemons, or system/root mutations were introduced.
+
+---
+
+## 26. Owned-Path Strict Confinement, Traversal Rejection & Bounded Installer Inventory (`linux-installer-owned-path-confinement-20261022-H`)
+
+> **Execution Date:** October 22, 2026  
+> **Phase Task ID:** `linux-installer-owned-path-confinement-20261022-H`  
+> **Status:** Completed & Source-Verified (37 Rust tests passed in `clients/linux`, 22 shell lifecycle tests passed, 50 frontend tests passed, typecheck clean, fmt clean, check clean)  
+> **Target Package:** `clients/linux` (scripts: `install.sh`, `uninstall.sh`; tests: `test_installer_lifecycle.sh`, `installer_lifecycle_tests.rs`)  
+
+### A. Context & Bounded Source Defects Corrected
+In continuation of task `linux-installer-owned-path-confinement-20261022-H`, a source-confirmed corrupt-metadata deletion-boundary defect in `clients/linux/scripts/install.sh` was corrected (identified as an internal corrupt-metadata risk, not a demonstrated external exploit or user data-loss incident):
+1. **Unbounded `owned_files` Acceptance & Deletion Surface (`validate_manifest_with_destination`, `do_uninstall`)**:
+   - *Defect:* Prior `validate_manifest_with_destination` accepted any `owned_files` string starting with `prefix + "/"` (or matching `prefix`) without path canonicalization, traversal checks, or an exact allowlist. In `do_uninstall`, the script iterated over every entry and invoked `rm -f`, allowing traversal entries (`prefix/../../foreign_sentinel.txt`), unmanaged in-prefix sentinels (`prefix/unrelated.txt`), and symlinked parent directory escapes to be deleted simply because a manifest claimed ownership.
+   - *Correction:* Implemented strict exact bounded owned-file inventory in `validate_manifest_with_destination`:
+     - Allowed owned files are strictly restricted to the actual selected binary (`exp_bin_path` or Windows `.exe` variant), canonical live manifest (`exp_data_dir/manifest.json`), and canonical live version (`exp_data_dir/current_version`). Any arbitrary extra path is rejected fail-closed before any mutation.
+     - Enforces canonical absolute paths: rejects relative paths, trailing slashes, double slashes (`//`), traversal segments (`..`), and dot segments (`.`).
+     - Rejects control characters (`ord(c) < 32` or `ord(c) == 127`, e.g. `\n`, `\r`, `\t`, `\0`).
+     - Rejects leading or trailing whitespace tricks (`item != item.strip()`) while preserving valid spaces and quotes in supported path names.
+     - Traversal & symlink escape verification: walks parent directory components up to prefix and verifies none escape prefix via symlinks.
+2. **Path Confusion & Splitting in `get_manifest_owned_files`**:
+   - *Defect:* Prior helper executed `.strip() + "\n"` on owned files and emitted newline-separated lines. This altered pathnames with legitimate whitespace and split entries containing embedded newlines (`\n`) into multiple deletion targets.
+   - *Correction:* `get_manifest_owned_files` now emits a raw NUL-delimited stream (`\0`) without stripping. Bash reads entries with `IFS= read -r -d '' file_to_remove`.
+3. **Independent Path & Confinement Guards in `do_uninstall`**:
+   - *Defect:* Prior uninstallation relied solely on manifest validation without defense-in-depth checks prior to `rm -f`.
+   - *Correction:* `do_uninstall` validates manifest ownership first (failing closed before touching any file), and independently verifies each entry in bash for traversal absence, canonical prefix confinement (`is_path_inside_prefix`), and allowlist membership (`TARGET_BIN_PATH`, `TARGET_BIN_EXE_PATH`, `MANIFEST_PATH`, `CURRENT_VERSION_PATH`) before calling `rm -f`. Backups and directories are removed safely without following symlinks.
+4. **Uniform Manifest Validation Contract Across Lifecycle**:
+   - The same strict validation contract applies to active installation, update staging (`do_install_or_update`), and rollback verification (`do_rollback`). Any unauthorized extra entries in live or backup manifests trigger fail-closed aborts, leaving live binaries, manifests, configs, and sentinels completely untouched.
+
+### B. Failing-Before Production Repro & Passing-After Outcomes
+1. **Real Prior-Production Failing-Before Repro on Actual Script at HEAD `10a4711` (`scratch/repro_defect.sh`, `scratch/test_newline.sh`)**:
+   - Executing actual prior `install.sh uninstall` against an otherwise valid generated manifest with extra entries demonstrated real deletion of unowned files:
+     - Extra in-prefix sentinel `unrelated.txt`: **DELETED** by prior `install.sh` (`Removed owned file: .../unrelated.txt`).
+     - Traversal foreign sentinel `../../foreign_sentinel.txt`: **DELETED** by prior `install.sh` (`Removed owned file: .../foreign_sentinel.txt`).
+     - Embedded newline `bin\nsecret.txt`: split by line parser and `secret.txt`: **DELETED** by prior `install.sh`.
+2. **Passing-After in Expanded Shell Suite (`clients/linux/tests/test_installer_lifecycle.sh` - 22 Tests Total)**:
+   - **Test 6 (Extra In-Prefix Sentinel in `owned_files` Refusal)**: Rejects manifest with `Entry in owned_files is not an allowed installer-managed file` (exit 1). Binary, manifest, version, unrelated in-prefix sentinel, and user config remain 100% untouched.
+   - **Test 7 (Traversal `../` Foreign Sentinel in `owned_files` Refusal)**: Rejects manifest with `Traversal or dot segment in owned_files entry` (exit 1). Foreign sentinel outside prefix and binary remain 100% untouched.
+   - **Test 8 (Symlink Parent Escape in `owned_files` Refusal)**: Rejects manifest with `Entry in owned_files is not an allowed installer-managed file` (exit 1). Outside file and binary remain 100% untouched.
+   - **Test 9 (Embedded Newline & Whitespace Confusion Refusal)**: Rejects manifest with `Control character detected in owned_files entry` and `Leading or trailing whitespace in owned_files entry` (exit 1). Target secret and binary remain 100% untouched.
+   - **Test 10 (Update & Rollback Refuse Unauthorized `owned_files`)**: Update rejects unauthorized extra file in live manifest; rollback rejects unauthorized extra file in backup manifest (exit 1). Live binary version `0.2.0`, metadata, and unrelated sentinel remain 100% untouched.
+   - **Tests 1-5, 11-22**: Fresh installation, conflict refusal, malformed JSON refusal, duplicate keys refusal, invalid owned_files structure refusal, prefix confinement, symlink escape detection, atomic rollback on metadata/smoke failure, doctor diagnostic integration, config preservation, and idempotent uninstallation all pass.
+
+### C. Executed Test Suites & Quality Gates
+| Target Suite | Exact Command Line | Tests Passed | Ignored | Result | Exit Code | Evidence Level |
+|---|---|:---:|:---:|:---:|:---:|---|
+| **Linux Unit, CLI, Repro & Installer Tests** | `cargo test` in `clients/linux` | 37 passed (21 unit + 6 doctor CLI + 7 repro + 3 installer integration) | 0 | PASSED | **0** | **[Worker-Reported (Windows Host Toolchain)]** |
+| **Shell Installer Lifecycle Suite** | `bash clients/linux/tests/test_installer_lifecycle.sh` | 22 passed (all extra sentinels, traversal, symlink parent escapes, newline confusion, update/rollback refusal, and doctor scenarios) | 0 | PASSED | **0** | **[Worker-Reported (Git-Bash Host Toolchain)]** |
+| **Linux Code Formatting** | `cargo fmt --check` in `clients/linux` | N/A | 0 diffs | PASSED | **0** | **[Worker-Reported]** |
+| **Linux Compilation Check** | `cargo check` in `clients/linux` | N/A | 0 errors, 0 warnings | PASSED | **0** | **[Worker-Reported]** |
+| **Frontend Acceptance Suite** | `npx vitest run src/middleware.test.ts src/components/dashboard/agent-setup.test.tsx src/test/acceptance/agent-onboarding.test.tsx src/test/acceptance/install-guides.test.tsx src/test/architecture.spec.ts` | 50 passed | 0 | PASSED | **0** | **[Worker-Reported (Focused 5-File Suite)]** |
+| **Frontend Typecheck** | `npm run typecheck` in `frontend` | N/A | 0 errors | PASSED | **0** | **[Worker-Reported]** |
+
+### D. PM QA Boundary Limits & Acceptance Disclosures
+1. **Internal Risk Characterization**: This defect is a source-confirmed corrupt-metadata deletion-boundary risk, not a demonstrated external exploit or user data loss.
+2. **Prior Unresolved Approval Invariant**: The approval-blocked command `tirith:archive_extract` remains unresolved. Worker has **NOT** retried, repackaged, or delegated that command, nor modified archive extraction approvals.
+3. **Host Toolchain vs Native Linux Evidence Separation**: All shell regressions were executed using Git-Bash / MSYS2 on Windows. While providing isolated directory testing, this does **NOT** constitute independent PM acceptance or native Linux kernel/libc runtime verification.
+4. **No Crash-Atomic Transaction Claims**: Sequential `cp`/`mv` operations do not provide crash-atomic multi-file filesystem transactions across unexpected host power loss or kernel crashes. Staging and backup/rollback mechanisms provide application-level failure recovery during script execution.
+5. **Scope Discipline**: No real sensor adapters (X11/Wayland/PipeWire), network synchronization, credential services, background daemons, or system/root mutations were introduced.
+
 
 
 

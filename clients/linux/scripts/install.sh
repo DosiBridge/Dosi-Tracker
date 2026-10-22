@@ -497,23 +497,83 @@ if not isinstance(owned, list) or len(owned) == 0:
     sys.stderr.write("Error: owned_files must be a non-empty array\n")
     sys.exit(1)
 
-seen_owned = set()
+# Platform binary identity: candidate can be exp_bin_path or exp_bin_path.exe
+valid_bin_candidates = {exp_bin_path}
+if exp_bin_path.endswith(".exe"):
+    valid_bin_candidates.add(exp_bin_path[:-4])
+else:
+    valid_bin_candidates.add(exp_bin_path + ".exe")
+
+# Exact bounded allowed inventory for installer-owned files (unambiguous binary, live manifest, live version)
+allowed_owned = set(valid_bin_candidates)
+allowed_owned.add(f"{exp_data_dir}/manifest.json")
+allowed_owned.add(f"{exp_data_dir}/current_version")
+
 prefix_boundary = exp_prefix.rstrip("/") + "/"
+seen_owned = set()
+
+import posixpath
+import os
+
 for item in owned:
-    if not isinstance(item, str) or not item.strip():
-        sys.stderr.write(f"Error: Entry in owned_files is not a valid non-empty string: {item!r}\n")
+    if not isinstance(item, str):
+        sys.stderr.write(f"Error: Entry in owned_files is not a string: {item!r}\n")
         sys.exit(1)
+
+    # Reject control characters (e.g. \n, \r, \t, \0, DEL)
+    if any(ord(c) < 32 or ord(c) == 127 for c in item):
+        sys.stderr.write(f"Error: Control character detected in owned_files entry: {item!r}\n")
+        sys.exit(1)
+
+    # Reject leading/trailing whitespace tricks
+    if item != item.strip():
+        sys.stderr.write(f"Error: Leading or trailing whitespace in owned_files entry: {item!r}\n")
+        sys.exit(1)
+
+    # Reject non-canonical segments (//, /./, /../, trailing slash, relative paths)
+    if not item.startswith("/"):
+        sys.stderr.write(f"Error: owned_files entry must be an absolute path: {item!r}\n")
+        sys.exit(1)
+
+    if item.endswith("/") or "//" in item:
+        sys.stderr.write(f"Error: Non-canonical path in owned_files entry: {item!r}\n")
+        sys.exit(1)
+
+    parts = item.split("/")
+    if any(p in (".", "..") for p in parts):
+        sys.stderr.write(f"Error: Traversal or dot segment in owned_files entry: {item!r}\n")
+        sys.exit(1)
+
+    # Strict prefix confinement
+    if not item.startswith(prefix_boundary):
+        sys.stderr.write(f"Error: owned file {item!r} is outside prefix {exp_prefix!r}\n")
+        sys.exit(1)
+
+    # Strict allowed inventory check: only actual binary, manifest, and current_version are allowed
+    if item not in allowed_owned:
+        sys.stderr.write(f"Error: Entry in owned_files is not an allowed installer-managed file: {item!r}\n")
+        sys.exit(1)
+
+    # Symlink escape check on parent directory components if they exist on disk
+    curr = posixpath.dirname(item)
+    while curr and curr != exp_prefix and curr.startswith(prefix_boundary):
+        if os.path.islink(curr):
+            try:
+                resolved = os.path.realpath(curr)
+                if not (resolved == exp_prefix or resolved.startswith(prefix_boundary)):
+                    sys.stderr.write(f"Error: Parent directory of owned file is a symlink escaping prefix: {curr!r} -> {resolved!r}\n")
+                    sys.exit(1)
+            except Exception:
+                pass
+        curr = posixpath.dirname(curr)
+
     if item in seen_owned:
         sys.stderr.write(f"Error: Duplicate file in owned_files array: {item!r}\n")
         sys.exit(1)
     seen_owned.add(item)
-    # Confinement check: item must be inside prefix
-    if item != exp_prefix and not item.startswith(prefix_boundary):
-        sys.stderr.write(f"Error: owned file {item!r} is outside prefix {exp_prefix!r}\n")
-        sys.exit(1)
 
-# binary_path MUST be in owned_files array
-if bin_p not in seen_owned and (bin_p + ".exe") not in seen_owned and bin_p.rstrip(".exe") not in seen_owned:
+# binary_path MUST be explicitly in owned_files array
+if bin_p not in seen_owned:
     sys.stderr.write(f"Error: binary_path {bin_p!r} is not contained in owned_files array\n")
     sys.exit(1)
 
@@ -590,7 +650,7 @@ except Exception:
 '
 }
 
-# Helper: extract list of owned files from manifest safely via JSON
+# Helper: extract list of owned files from manifest safely via JSON as null-delimited stream
 get_manifest_owned_files() {
   local manifest_file="$1"
   local py_bin
@@ -600,14 +660,12 @@ get_manifest_owned_files() {
 import sys
 import json
 
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(newline="\n")
-
 try:
     data = json.load(sys.stdin)
     for f in data.get("owned_files", []):
-        if isinstance(f, str) and f.strip():
-            sys.stdout.write(f.strip() + "\n")
+        if isinstance(f, str) and f:
+            # Emit raw UTF-8 bytes followed by NUL byte (no stripping, no newline splitting)
+            sys.stdout.buffer.write(f.encode("utf-8") + b"\0")
 except Exception:
     sys.exit(1)
 '
@@ -654,7 +712,7 @@ for _ in range(10):
 
 component, version, installed_at, prefix, bin_dir, data_dir, binary_path, manifest_path, version_path, prev_version = lines
 
-# Reject unsupported characters (e.g. null bytes) before mutation
+# Reject unsupported characters (e.g. control characters, null bytes) before mutation
 for val, name in [
     (component, "component"),
     (version, "version"),
@@ -662,9 +720,11 @@ for val, name in [
     (bin_dir, "bin_dir"),
     (data_dir, "data_dir"),
     (binary_path, "binary_path"),
+    (manifest_path, "manifest_path"),
+    (version_path, "version_path"),
 ]:
-    if "\x00" in val:
-        sys.stderr.write(f"Error: Invalid null byte in {name}\n")
+    if any(ord(c) < 32 or ord(c) == 127 for c in val):
+        sys.stderr.write(f"Error: Invalid control character or null byte in {name}\n")
         sys.exit(1)
 
 prev_v = prev_version if prev_version != "none" and prev_version != "null" and prev_version != "" else None
@@ -800,11 +860,33 @@ do_uninstall() {
   # Remove owned files explicitly recorded in manifest
   if [ -f "${MANIFEST_PATH}" ]; then
     local file_to_remove
-    while IFS= read -r file_to_remove; do
-      file_to_remove="${file_to_remove%$'\r'}"
-      if [ -n "${file_to_remove}" ] && [ -f "${file_to_remove}" ]; then
-        rm -f "${file_to_remove}"
-        echo "Removed owned file: ${file_to_remove}"
+    while IFS= read -r -d '' file_to_remove; do
+      if [ -n "${file_to_remove}" ]; then
+        # Independent traversal / non-canonical guard in bash
+        if [[ "${file_to_remove}" == *$'\n'* ]] || [[ "${file_to_remove}" == *$'\r'* ]] || [[ "${file_to_remove}" == *"/../"* ]] || [[ "${file_to_remove}" == *".."* ]]; then
+          echo "Error: Refusing to delete non-canonical or traversal path '${file_to_remove}'." >&2
+          exit 1
+        fi
+
+        # Independent confinement guard in bash
+        if ! is_path_inside_prefix "${file_to_remove}" "${CANONICAL_PREFIX}"; then
+          echo "Error: Manifest entry '${file_to_remove}' escapes canonical prefix '${CANONICAL_PREFIX}'." >&2
+          exit 1
+        fi
+
+        # Independent inventory allowlist guard in bash
+        case "${file_to_remove}" in
+          "${TARGET_BIN_PATH}"|"${TARGET_BIN_EXE_PATH}"|"${MANIFEST_PATH}"|"${CURRENT_VERSION_PATH}")
+            if [ -f "${file_to_remove}" ] || [ -L "${file_to_remove}" ]; then
+              rm -f "${file_to_remove}"
+              echo "Removed owned file: ${file_to_remove}"
+            fi
+            ;;
+          *)
+            echo "Error: Refusing to delete unexpected file '${file_to_remove}' not in installer inventory." >&2
+            exit 1
+            ;;
+        esac
       fi
     done < <(get_manifest_owned_files "${MANIFEST_PATH}")
   elif [ -n "${cur_bin}" ] && [ -f "${cur_bin}" ]; then
@@ -812,10 +894,12 @@ do_uninstall() {
     echo "Removed binary: ${cur_bin}"
   fi
 
-  # Remove backups
-  rm -f "${BACKUP_BIN_PATH}" "${BACKUP_BIN_EXE_PATH}" "${BACKUP_MANIFEST_PATH}" "${BACKUP_VERSION_PATH}" 2>/dev/null || true
-  if [ -d "${BACKUP_DIR}" ]; then
+  # Remove backups safely (guard against symlink escapes)
+  if [ -d "${BACKUP_DIR}" ] && [ ! -L "${BACKUP_DIR}" ]; then
+    rm -f "${BACKUP_BIN_PATH}" "${BACKUP_BIN_EXE_PATH}" "${BACKUP_MANIFEST_PATH}" "${BACKUP_VERSION_PATH}" 2>/dev/null || true
     rmdir "${BACKUP_DIR}" 2>/dev/null || true
+  elif [ -L "${BACKUP_DIR}" ]; then
+    rm -f "${BACKUP_DIR}" 2>/dev/null || true
   fi
 
   # Remove current_version
@@ -826,7 +910,7 @@ do_uninstall() {
   echo "Removed manifest: ${MANIFEST_PATH}"
 
   # Clean data dir if empty
-  if [ -d "${DATA_DIR}" ]; then
+  if [ -d "${DATA_DIR}" ] && [ ! -L "${DATA_DIR}" ]; then
     rmdir "${DATA_DIR}" 2>/dev/null || true
   fi
 

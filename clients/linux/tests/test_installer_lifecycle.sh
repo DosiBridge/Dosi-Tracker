@@ -735,12 +735,393 @@ test_real_compiled_binary_install_smoke() {
   [[ "${doctor_json}" == *"dosi-tracker-linux"* ]] && [[ "${doctor_json}" == *"NOT_IMPLEMENTED"* ]]
 }
 
+# 15. Extra Unrelated In-Prefix Sentinel in owned_files Refusal
+test_uninstall_refuses_extra_in_prefix_sentinel() {
+  local temp_dir
+  temp_dir="$(mktemp -d)"
+
+  local prefix="${temp_dir}/opt/dosi"
+  local fake_src="${temp_dir}/fake_bin"
+  create_fake_executable "${fake_src}" "0.1.0"
+
+  bash "${INSTALLER}" install --prefix "${prefix}" --source-bin "${fake_src}" >/dev/null
+
+  # Create unrelated in-prefix sentinel and outside foreign sentinel
+  local unrelated_sentinel="${prefix}/unrelated_sentinel.txt"
+  echo "unrelated sentinel payload" > "${unrelated_sentinel}"
+
+  local foreign_sentinel="${temp_dir}/foreign_sentinel.txt"
+  echo "foreign payload" > "${foreign_sentinel}"
+
+  local mock_home="${temp_dir}/mock_home"
+  mkdir -p "${mock_home}/.config/dosi-tracker"
+  echo '{"user_consent": true}' > "${mock_home}/.config/dosi-tracker/config.json"
+
+  # Inject unauthorized in-prefix file into manifest owned_files alongside legitimate binary
+  local bin_path="${prefix}/bin/dosi-tracker-linux"
+  if [ -f "${prefix}/bin/dosi-tracker-linux.exe" ]; then
+    bin_path="${prefix}/bin/dosi-tracker-linux.exe"
+  fi
+
+  cat > "${prefix}/share/dosi-tracker/manifest.json" <<EOF
+{
+  "format_version": 1,
+  "component": "dosi-tracker-linux-diagnostic-foundation",
+  "version": "0.1.0",
+  "installed_at": "2026-10-22T00:00:00Z",
+  "prefix": "${prefix}",
+  "bin_dir": "${prefix}/bin",
+  "data_dir": "${prefix}/share/dosi-tracker",
+  "binary_path": "${bin_path}",
+  "owned_files": [
+    "${bin_path}",
+    "${prefix}/share/dosi-tracker/manifest.json",
+    "${prefix}/share/dosi-tracker/current_version",
+    "${unrelated_sentinel}"
+  ],
+  "previous_version": null
+}
+EOF
+
+  local failed="0"
+  if HOME="${mock_home}" bash "${INSTALLER}" uninstall --prefix "${prefix}" >/dev/null 2>&1; then
+    failed="1"
+  fi
+
+  # Assert command rejected BEFORE ANY mutation
+  local bin_ok=0
+  local manifest_ok=0
+  local version_ok=0
+  local unrelated_ok=0
+  local foreign_ok=0
+  local config_ok=0
+
+  [ -f "${bin_path}" ] && bin_ok=1
+  [ -f "${prefix}/share/dosi-tracker/manifest.json" ] && manifest_ok=1
+  [ -f "${prefix}/share/dosi-tracker/current_version" ] && version_ok=1
+  [ -f "${unrelated_sentinel}" ] && [ "$(cat "${unrelated_sentinel}")" = "unrelated sentinel payload" ] && unrelated_ok=1
+  [ -f "${foreign_sentinel}" ] && [ "$(cat "${foreign_sentinel}")" = "foreign payload" ] && foreign_ok=1
+  [ -f "${mock_home}/.config/dosi-tracker/config.json" ] && config_ok=1
+
+  rm -rf "${temp_dir}"
+
+  [ "${failed}" = "0" ] && [ "${bin_ok}" = "1" ] && [ "${manifest_ok}" = "1" ] && \
+  [ "${version_ok}" = "1" ] && [ "${unrelated_ok}" = "1" ] && [ "${foreign_ok}" = "1" ] && [ "${config_ok}" = "1" ]
+}
+
+# 16. Traversal ../ Foreign Sentinel in owned_files Refusal
+test_uninstall_refuses_traversal_foreign_sentinel() {
+  local temp_dir
+  temp_dir="$(mktemp -d)"
+
+  local prefix="${temp_dir}/opt/dosi"
+  local fake_src="${temp_dir}/fake_bin"
+  create_fake_executable "${fake_src}" "0.1.0"
+
+  bash "${INSTALLER}" install --prefix "${prefix}" --source-bin "${fake_src}" >/dev/null
+
+  local foreign_sentinel="${temp_dir}/foreign_sentinel.txt"
+  echo "foreign payload" > "${foreign_sentinel}"
+
+  local bin_path="${prefix}/bin/dosi-tracker-linux"
+  if [ -f "${prefix}/bin/dosi-tracker-linux.exe" ]; then
+    bin_path="${prefix}/bin/dosi-tracker-linux.exe"
+  fi
+
+  # Inject ../ traversal entry into owned_files alongside legitimate binary
+  cat > "${prefix}/share/dosi-tracker/manifest.json" <<EOF
+{
+  "format_version": 1,
+  "component": "dosi-tracker-linux-diagnostic-foundation",
+  "version": "0.1.0",
+  "installed_at": "2026-10-22T00:00:00Z",
+  "prefix": "${prefix}",
+  "bin_dir": "${prefix}/bin",
+  "data_dir": "${prefix}/share/dosi-tracker",
+  "binary_path": "${bin_path}",
+  "owned_files": [
+    "${bin_path}",
+    "${prefix}/share/dosi-tracker/manifest.json",
+    "${prefix}/share/dosi-tracker/current_version",
+    "${prefix}/../../foreign_sentinel.txt"
+  ],
+  "previous_version": null
+}
+EOF
+
+  local failed="0"
+  if bash "${INSTALLER}" uninstall --prefix "${prefix}" >/dev/null 2>&1; then
+    failed="1"
+  fi
+
+  local foreign_ok=0
+  local bin_ok=0
+  [ -f "${foreign_sentinel}" ] && [ "$(cat "${foreign_sentinel}")" = "foreign payload" ] && foreign_ok=1
+  [ -f "${bin_path}" ] && bin_ok=1
+
+  rm -rf "${temp_dir}"
+
+  [ "${failed}" = "0" ] && [ "${foreign_ok}" = "1" ] && [ "${bin_ok}" = "1" ]
+}
+
+# 17. Symlink Parent Escape in owned_files Refusal
+test_uninstall_refuses_symlink_parent_escape() {
+  local temp_dir
+  temp_dir="$(mktemp -d)"
+
+  local prefix="${temp_dir}/opt/dosi"
+  local fake_src="${temp_dir}/fake_bin"
+  create_fake_executable "${fake_src}" "0.1.0"
+
+  bash "${INSTALLER}" install --prefix "${prefix}" --source-bin "${fake_src}" >/dev/null
+
+  local outside_dir="${temp_dir}/outside"
+  mkdir -p "${outside_dir}"
+  local secret_file="${outside_dir}/secret.txt"
+  echo "secret payload" > "${secret_file}"
+
+  ln -s "${outside_dir}" "${prefix}/link_dir" 2>/dev/null || true
+
+  local bin_path="${prefix}/bin/dosi-tracker-linux"
+  if [ -f "${prefix}/bin/dosi-tracker-linux.exe" ]; then
+    bin_path="${prefix}/bin/dosi-tracker-linux.exe"
+  fi
+
+  cat > "${prefix}/share/dosi-tracker/manifest.json" <<EOF
+{
+  "format_version": 1,
+  "component": "dosi-tracker-linux-diagnostic-foundation",
+  "version": "0.1.0",
+  "installed_at": "2026-10-22T00:00:00Z",
+  "prefix": "${prefix}",
+  "bin_dir": "${prefix}/bin",
+  "data_dir": "${prefix}/share/dosi-tracker",
+  "binary_path": "${bin_path}",
+  "owned_files": [
+    "${bin_path}",
+    "${prefix}/share/dosi-tracker/manifest.json",
+    "${prefix}/share/dosi-tracker/current_version",
+    "${prefix}/link_dir/secret.txt"
+  ],
+  "previous_version": null
+}
+EOF
+
+  local failed="0"
+  if bash "${INSTALLER}" uninstall --prefix "${prefix}" >/dev/null 2>&1; then
+    failed="1"
+  fi
+
+  local secret_ok=0
+  local bin_ok=0
+  [ -f "${secret_file}" ] && [ "$(cat "${secret_file}")" = "secret payload" ] && secret_ok=1
+  [ -f "${bin_path}" ] && bin_ok=1
+
+  rm -rf "${temp_dir}"
+
+  [ "${failed}" = "0" ] && [ "${secret_ok}" = "1" ] && [ "${bin_ok}" = "1" ]
+}
+
+# 18. Embedded Newline and Whitespace Confusion in owned_files Refusal
+test_uninstall_refuses_embedded_newline_and_whitespace_confusion() {
+  local temp_dir
+  temp_dir="$(mktemp -d)"
+
+  local prefix="${temp_dir}/opt/dosi"
+  local fake_src="${temp_dir}/fake_bin"
+  create_fake_executable "${fake_src}" "0.1.0"
+
+  bash "${INSTALLER}" install --prefix "${prefix}" --source-bin "${fake_src}" >/dev/null
+
+  local secret_file="${prefix}/target_secret.txt"
+  echo "target secret payload" > "${secret_file}"
+
+  local bin_path="${prefix}/bin/dosi-tracker-linux"
+  if [ -f "${prefix}/bin/dosi-tracker-linux.exe" ]; then
+    bin_path="${prefix}/bin/dosi-tracker-linux.exe"
+  fi
+
+  # Case A: Embedded newline path confusion
+  cat > "${prefix}/share/dosi-tracker/manifest.json" <<EOF
+{
+  "format_version": 1,
+  "component": "dosi-tracker-linux-diagnostic-foundation",
+  "version": "0.1.0",
+  "installed_at": "2026-10-22T00:00:00Z",
+  "prefix": "${prefix}",
+  "bin_dir": "${prefix}/bin",
+  "data_dir": "${prefix}/share/dosi-tracker",
+  "binary_path": "${bin_path}",
+  "owned_files": [
+    "${bin_path}",
+    "${prefix}/share/dosi-tracker/manifest.json",
+    "${prefix}/share/dosi-tracker/current_version",
+    "${bin_path}\n${secret_file}"
+  ],
+  "previous_version": null
+}
+EOF
+
+  local failed_nl="0"
+  if bash "${INSTALLER}" uninstall --prefix "${prefix}" >/dev/null 2>&1; then
+    failed_nl="1"
+  fi
+
+  # Case B: Leading/trailing whitespace in path
+  cat > "${prefix}/share/dosi-tracker/manifest.json" <<EOF
+{
+  "format_version": 1,
+  "component": "dosi-tracker-linux-diagnostic-foundation",
+  "version": "0.1.0",
+  "installed_at": "2026-10-22T00:00:00Z",
+  "prefix": "${prefix}",
+  "bin_dir": "${prefix}/bin",
+  "data_dir": "${prefix}/share/dosi-tracker",
+  "binary_path": "${bin_path}",
+  "owned_files": [
+    "  ${bin_path}  ",
+    "${prefix}/share/dosi-tracker/manifest.json",
+    "${prefix}/share/dosi-tracker/current_version"
+  ],
+  "previous_version": null
+}
+EOF
+
+  local failed_ws="0"
+  if bash "${INSTALLER}" uninstall --prefix "${prefix}" >/dev/null 2>&1; then
+    failed_ws="1"
+  fi
+
+  local secret_ok=0
+  local bin_ok=0
+  [ -f "${secret_file}" ] && [ "$(cat "${secret_file}")" = "target secret payload" ] && secret_ok=1
+  [ -f "${bin_path}" ] && bin_ok=1
+
+  rm -rf "${temp_dir}"
+
+  [ "${failed_nl}" = "0" ] && [ "${failed_ws}" = "0" ] && [ "${secret_ok}" = "1" ] && [ "${bin_ok}" = "1" ]
+}
+
+# 19. Update and Rollback Refusal on Unauthorized Extra owned_files
+test_update_and_rollback_refuse_unauthorized_owned_files() {
+  local temp_dir
+  temp_dir="$(mktemp -d)"
+
+  local prefix="${temp_dir}/opt/dosi"
+  local fake_src1="${temp_dir}/fake_bin_1"
+  create_fake_executable "${fake_src1}" "0.1.0"
+
+  bash "${INSTALLER}" install --prefix "${prefix}" --source-bin "${fake_src1}" >/dev/null
+
+  local unrelated_file="${prefix}/unrelated_sentinel.txt"
+  echo "preserve unrelated" > "${unrelated_file}"
+
+  local bin_path="${prefix}/bin/dosi-tracker-linux"
+  if [ -f "${prefix}/bin/dosi-tracker-linux.exe" ]; then
+    bin_path="${prefix}/bin/dosi-tracker-linux.exe"
+  fi
+
+  # Inject unauthorized file into existing live manifest
+  cat > "${prefix}/share/dosi-tracker/manifest.json" <<EOF
+{
+  "format_version": 1,
+  "component": "dosi-tracker-linux-diagnostic-foundation",
+  "version": "0.1.0",
+  "installed_at": "2026-10-22T00:00:00Z",
+  "prefix": "${prefix}",
+  "bin_dir": "${prefix}/bin",
+  "data_dir": "${prefix}/share/dosi-tracker",
+  "binary_path": "${bin_path}",
+  "owned_files": [
+    "${bin_path}",
+    "${prefix}/share/dosi-tracker/manifest.json",
+    "${prefix}/share/dosi-tracker/current_version",
+    "${unrelated_file}"
+  ],
+  "previous_version": null
+}
+EOF
+
+  local fake_src2="${temp_dir}/fake_bin_2"
+  create_fake_executable "${fake_src2}" "0.2.0"
+
+  # Update must refuse before touching live files
+  local update_failed="0"
+  if bash "${INSTALLER}" update --prefix "${prefix}" --source-bin "${fake_src2}" >/dev/null 2>&1; then
+    update_failed="1"
+  fi
+
+  # Now fix live manifest and perform legitimate update to create backup
+  cat > "${prefix}/share/dosi-tracker/manifest.json" <<EOF
+{
+  "format_version": 1,
+  "component": "dosi-tracker-linux-diagnostic-foundation",
+  "version": "0.1.0",
+  "installed_at": "2026-10-22T00:00:00Z",
+  "prefix": "${prefix}",
+  "bin_dir": "${prefix}/bin",
+  "data_dir": "${prefix}/share/dosi-tracker",
+  "binary_path": "${bin_path}",
+  "owned_files": [
+    "${bin_path}",
+    "${prefix}/share/dosi-tracker/manifest.json",
+    "${prefix}/share/dosi-tracker/current_version"
+  ],
+  "previous_version": null
+}
+EOF
+
+  bash "${INSTALLER}" update --prefix "${prefix}" --source-bin "${fake_src2}" >/dev/null
+
+  # Inject unauthorized entry into backup manifest
+  local backup_manifest="${prefix}/share/dosi-tracker/backup/manifest.json.prev"
+  cat > "${backup_manifest}" <<EOF
+{
+  "format_version": 1,
+  "component": "dosi-tracker-linux-diagnostic-foundation",
+  "version": "0.1.0",
+  "installed_at": "2026-10-22T00:00:00Z",
+  "prefix": "${prefix}",
+  "bin_dir": "${prefix}/bin",
+  "data_dir": "${prefix}/share/dosi-tracker",
+  "binary_path": "${bin_path}",
+  "owned_files": [
+    "${bin_path}",
+    "${prefix}/share/dosi-tracker/manifest.json",
+    "${prefix}/share/dosi-tracker/current_version",
+    "${unrelated_file}"
+  ],
+  "previous_version": null
+}
+EOF
+
+  # Rollback must refuse corrupted backup before touching destination
+  local rollback_failed="0"
+  if bash "${INSTALLER}" rollback --prefix "${prefix}" >/dev/null 2>&1; then
+    rollback_failed="1"
+  fi
+
+  local current_ver
+  current_ver="$(cat "${prefix}/share/dosi-tracker/current_version")"
+  local unrelated_ok=0
+  [ -f "${unrelated_file}" ] && [ "$(cat "${unrelated_file}")" = "preserve unrelated" ] && unrelated_ok=1
+
+  rm -rf "${temp_dir}"
+
+  [ "${update_failed}" = "0" ] && [ "${rollback_failed}" = "0" ] && [ "${current_ver}" = "0.2.0" ] && [ "${unrelated_ok}" = "1" ]
+}
+
 echo "=== Running Dosi-Tracker Linux Installer Lifecycle Tests ==="
 run_test "Fresh Install to Isolated Prefix" test_fresh_install_to_isolated_temp_prefix
 run_test "Foreign File Conflict Refusal" test_foreign_file_conflict_refusal
 run_test "Malformed JSON Manifest Refusal" test_malformed_manifest_refusal
 run_test "Duplicate Keys Manifest Refusal" test_duplicate_keys_manifest_refusal
 run_test "Invalid owned_files Structure Refusal" test_invalid_owned_files_refusal
+run_test "Extra In-Prefix Sentinel in owned_files Refusal" test_uninstall_refuses_extra_in_prefix_sentinel
+run_test "Traversal ../ Foreign Sentinel in owned_files Refusal" test_uninstall_refuses_traversal_foreign_sentinel
+run_test "Symlink Parent Escape in owned_files Refusal" test_uninstall_refuses_symlink_parent_escape
+run_test "Embedded Newline & Whitespace Confusion Refusal" test_uninstall_refuses_embedded_newline_and_whitespace_confusion
+run_test "Update & Rollback Refuse Unauthorized owned_files" test_update_and_rollback_refuse_unauthorized_owned_files
 run_test "Mismatched Prefix Manifest Refusal" test_mismatched_prefix_manifest_refusal
 run_test "Sibling Prefix & Dot-Dot Traversal Refusal" test_sibling_prefix_and_dot_dot_escape_refusal
 run_test "Ancestor & Explicit Symlink Escape Refusal" test_ancestor_and_explicit_symlink_escape_refusal
