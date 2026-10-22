@@ -34,5 +34,6 @@ pub use paths::LinuxPaths;
 pub use sync::{
     run_sync_pass, ActivityFailure, DeliveryOutcome, DeliveryTransport, SyncError, SyncPassConfig,
     SyncPassCoordinator, SyncPassReport, SyncStopReason, DEFAULT_BATCH_LIMIT, DEFAULT_MAX_ATTEMPTS,
-    MAX_ALLOWED_ATTEMPTS, MAX_ALLOWED_BATCH_LIMIT,
+    MAX_ALLOWED_ATTEMPTS, MAX_ALLOWED_BATCH_LIMIT, MAX_RECEIVED_ID_BYTES,
+    MAX_REPORT_DIAGNOSTIC_BYTES,
 };

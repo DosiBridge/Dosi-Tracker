@@ -13,16 +13,23 @@
 //! - Exact positive acknowledgement: Only when the transport explicitly acknowledges the exact same
 //!   `client_activity_id` is the entry removed from the local outbox.
 //! - Non-accepted row preservation:
-//!   - `TransientFailure`: Increments retry count and updates last error message; entry remains in queue.
+//!   - `TransientFailure`: When local persistence succeeds, increments retry count and updates last error message;
+//!     entry remains in queue. If persisting retry metadata fails, reports [`SyncStopReason::RetryMetadataPersistenceFailed`]
+//!     and halts without claiming retry metadata was saved.
 //!   - `AuthRequired`: Stops pass immediately without removing entries or claiming token refresh.
 //!   - `DefinitiveRejection`: Halts pass and visibly reports rejection; entry is retained.
 //!   - `MismatchedAcknowledgement`: Halts pass; entry is preserved.
+//! - Bounded diagnostic retention:
+//!   All diagnostic reasons and received IDs retained in [`SyncPassReport`] and [`SyncStopReason`] are truncated
+//!   to explicit UTF-8 byte boundaries ([`MAX_REPORT_DIAGNOSTIC_BYTES`] and [`MAX_RECEIVED_ID_BYTES`]).
+//!   Queue identities ([`OutboxEntry::client_activity_id`]) are never truncated. Total process memory is not
+//!   bounded by this coordinator because injected transports may allocate memory before returning.
 //! - Distinction between transport acceptance and local persistence:
 //!   If the transport accepts an activity, but the local outbox deletion fails (e.g. SQLite disk error),
 //!   the pass halts and reports [`SyncStopReason::AcknowledgementPersistenceFailed`]. The entry is reported
 //!   in `transport_accepted` but **not** in `persisted_acknowledged`.
 
-use crate::outbox::{Outbox, OutboxEntry, OutboxError, OutboxScope, MAX_ERROR_MESSAGE_BYTES};
+use crate::outbox::{Outbox, OutboxEntry, OutboxError, OutboxScope};
 
 /// Default maximum number of queued rows attempted per sync pass.
 pub const DEFAULT_MAX_ATTEMPTS: usize = 50;
@@ -35,6 +42,12 @@ pub const DEFAULT_BATCH_LIMIT: usize = 20;
 
 /// Absolute maximum allowed batch read limit.
 pub const MAX_ALLOWED_BATCH_LIMIT: usize = 100;
+
+/// Maximum UTF-8 bytes retained for diagnostic reason strings in reports.
+pub const MAX_REPORT_DIAGNOSTIC_BYTES: usize = 1024;
+
+/// Maximum UTF-8 bytes retained for unexpected received identifiers in reports.
+pub const MAX_RECEIVED_ID_BYTES: usize = 256;
 
 /// The delivery outcome returned by an injected delivery transport for one queued activity.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,6 +176,12 @@ pub enum SyncStopReason {
         client_activity_id: String,
         error: String,
     },
+    /// Transport reported transient delivery failure, but local SQLite failed to persist updated retry metadata.
+    RetryMetadataPersistenceFailed {
+        client_activity_id: String,
+        transport_reason: String,
+        error: String,
+    },
     /// Outbox store read or mutation error.
     StoreError(String),
 }
@@ -281,7 +300,12 @@ impl<'a> SyncPassCoordinator<'a> {
                     if report.attempted_count == 0 {
                         return Err(SyncError::Outbox(err));
                     } else {
-                        report.stop_reason = Some(SyncStopReason::StoreError(err.to_string()));
+                        let bounded_err = truncate_to_char_boundary(
+                            &err.to_string(),
+                            MAX_REPORT_DIAGNOSTIC_BYTES,
+                        )
+                        .to_string();
+                        report.stop_reason = Some(SyncStopReason::StoreError(bounded_err));
                         break;
                     }
                 }
@@ -301,9 +325,14 @@ impl<'a> SyncPassCoordinator<'a> {
                 match outcome {
                     DeliveryOutcome::Accepted { client_activity_id } => {
                         if client_activity_id != entry.client_activity_id {
+                            let bounded_received = truncate_to_char_boundary(
+                                &client_activity_id,
+                                MAX_RECEIVED_ID_BYTES,
+                            )
+                            .to_string();
                             report.stop_reason = Some(SyncStopReason::MismatchedAcknowledgement {
                                 expected: entry.client_activity_id.clone(),
-                                received: client_activity_id,
+                                received: bounded_received,
                             });
                             break;
                         }
@@ -317,10 +346,15 @@ impl<'a> SyncPassCoordinator<'a> {
                                 report.persisted_acknowledged.push(entry.client_activity_id);
                             }
                             Err(err) => {
+                                let bounded_err = truncate_to_char_boundary(
+                                    &err.to_string(),
+                                    MAX_REPORT_DIAGNOSTIC_BYTES,
+                                )
+                                .to_string();
                                 report.stop_reason =
                                     Some(SyncStopReason::AcknowledgementPersistenceFailed {
                                         client_activity_id: entry.client_activity_id,
-                                        error: err.to_string(),
+                                        error: bounded_err,
                                     });
                                 break;
                             }
@@ -328,37 +362,60 @@ impl<'a> SyncPassCoordinator<'a> {
                     }
                     DeliveryOutcome::TransientFailure { reason } => {
                         let bounded_reason =
-                            truncate_to_char_boundary(&reason, MAX_ERROR_MESSAGE_BYTES).to_string();
-                        let _ = self.outbox.mark_attempt_failed(
+                            truncate_to_char_boundary(&reason, MAX_REPORT_DIAGNOSTIC_BYTES)
+                                .to_string();
+                        match self.outbox.mark_attempt_failed(
                             scope,
                             &entry.client_activity_id,
                             &bounded_reason,
-                        );
-                        report.transient_failures.push(ActivityFailure {
-                            client_activity_id: entry.client_activity_id.clone(),
-                            reason: reason.clone(),
-                        });
-                        report.stop_reason = Some(SyncStopReason::TransientFailure {
+                        ) {
+                            Ok(()) => {
+                                report.transient_failures.push(ActivityFailure {
+                                    client_activity_id: entry.client_activity_id.clone(),
+                                    reason: bounded_reason.clone(),
+                                });
+                                report.stop_reason = Some(SyncStopReason::TransientFailure {
+                                    client_activity_id: entry.client_activity_id,
+                                    reason: bounded_reason,
+                                });
+                            }
+                            Err(err) => {
+                                let bounded_err = truncate_to_char_boundary(
+                                    &err.to_string(),
+                                    MAX_REPORT_DIAGNOSTIC_BYTES,
+                                )
+                                .to_string();
+                                report.stop_reason =
+                                    Some(SyncStopReason::RetryMetadataPersistenceFailed {
+                                        client_activity_id: entry.client_activity_id,
+                                        transport_reason: bounded_reason,
+                                        error: bounded_err,
+                                    });
+                            }
+                        }
+                        break;
+                    }
+                    DeliveryOutcome::AuthRequired { reason } => {
+                        let bounded_reason =
+                            truncate_to_char_boundary(&reason, MAX_REPORT_DIAGNOSTIC_BYTES)
+                                .to_string();
+                        report.stop_reason = Some(SyncStopReason::AuthRequired {
                             client_activity_id: entry.client_activity_id,
                             reason: bounded_reason,
                         });
                         break;
                     }
-                    DeliveryOutcome::AuthRequired { reason } => {
-                        report.stop_reason = Some(SyncStopReason::AuthRequired {
-                            client_activity_id: entry.client_activity_id,
-                            reason,
-                        });
-                        break;
-                    }
                     DeliveryOutcome::Rejected { reason } => {
+                        let bounded_reason =
+                            truncate_to_char_boundary(&reason, MAX_REPORT_DIAGNOSTIC_BYTES)
+                                .to_string();
                         report.definitive_rejections.push(ActivityFailure {
                             client_activity_id: entry.client_activity_id.clone(),
-                            reason: reason.clone(),
+                            reason: bounded_reason.clone(),
                         });
                         report.stop_reason = Some(SyncStopReason::DefinitiveRejection {
                             client_activity_id: entry.client_activity_id,
-                            reason,
+                            reason: bounded_reason,
                         });
                         break;
                     }
@@ -384,7 +441,10 @@ impl<'a> SyncPassCoordinator<'a> {
                     }
                 }
                 Err(err) => {
-                    report.stop_reason = Some(SyncStopReason::StoreError(err.to_string()));
+                    let bounded_err =
+                        truncate_to_char_boundary(&err.to_string(), MAX_REPORT_DIAGNOSTIC_BYTES)
+                            .to_string();
+                    report.stop_reason = Some(SyncStopReason::StoreError(bounded_err));
                 }
             }
         }

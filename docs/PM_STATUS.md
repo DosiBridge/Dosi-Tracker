@@ -2077,14 +2077,76 @@ Independent PM inspection of Task J identified a remaining library correctness/b
 | **Linux Code Formatting** | `cargo fmt --check` in `clients/linux` | N/A | 0 diffs | PASSED | **0** | **[Worker-Reported]** |
 | **Linux Compilation Check** | `cargo check` in `clients/linux` | N/A | 0 errors, 0 warnings | PASSED | **0** | **[Worker-Reported]** |
 | **Frontend Acceptance Suite** | `npx vitest run src/middleware.test.ts src/components/dashboard/agent-setup.test.tsx src/test/acceptance/agent-onboarding.test.tsx src/test/acceptance/install-guides.test.tsx src/test/architecture.spec.ts` | 50 passed | 0 | PASSED | **0** | **[Worker-Reported (Focused 5-File Suite)]** |
+---
+
+## 31. Linux Sync Pass Failure Accounting, Retry Preservation & Diagnostic Bounds (`linux-sync-failure-diagnostics-20261022-M`)
+
+> **Execution Date:** October 22, 2026  
+> **Phase Task ID:** `linux-sync-failure-diagnostics-20261022-M`  
+> **Status:** Completed & Source-Verified (78 Rust tests passed in `clients/linux`, 22 shell lifecycle tests passed, 50 frontend tests passed, typecheck clean, fmt clean, check clean)  
+> **Target Package:** `clients/linux` (src: `src/sync.rs`, `src/lib.rs`; tests: `tests/sync_tests.rs`)  
+
+### A. Context & Delivered Hardening
+In continuation of Task `linux-sync-failure-diagnostics-20261022-M`, the sensor-free offline synchronization pass coordinator (`dosi_tracker_linux::sync`) was hardened with precise retry metadata failure accounting, non-mutating error preservation, and finite UTF-8 byte bounding across all diagnostic and mismatch outcome variants:
+
+1. **Deterministic Retry Metadata Persistence Failure Accounting (`mark_attempt_failed`)**:
+   - *Failure Path Accounting:* When the delivery transport reports `TransientFailure` but the local SQLite store fails while persisting the retry update (`UPDATE outbox_entries SET retry_count = retry_count + 1, last_error = ...`), the pass coordinator halts immediately with `SyncStopReason::RetryMetadataPersistenceFailed { client_activity_id, transport_reason, error }`.
+   - *Zero False Persistence Claims:* `report.transient_failures` does NOT record the failed persistence attempt, truthfully reporting that the retry metadata could not be committed.
+   - *Row & Retry Preservation:* The SQLite entry remains in the database with its previous `retry_count` (0) and `last_error` (`None`), preventing arbitrary data loss or corrupt counter inflation.
+   - *Halt & Foreign Sentinel Isolation:* Pass execution halts immediately without attempting subsequent deliveries in the batch. Foreign-scope and target-scope sentinel rows remain 100% untouched.
+   - *Positive Transient Control:* Verified that under normal SQLite conditions (without disk failure triggers), `mark_attempt_failed` correctly records the retry count and last error in SQLite, populates `report.transient_failures`, and halts with `SyncStopReason::TransientFailure`.
+
+2. **Bounded UTF-8 Diagnostics Across All Outcome Variants (`MAX_REPORT_DIAGNOSTIC_BYTES = 1024`)**:
+   - Upstream or local error strings can contain unbounded payloads (e.g. 5,000-byte error dumps or HTML stack traces). All retained diagnostic reasons are bounded to a maximum of 1024 UTF-8 bytes using `truncate_to_char_boundary`, safely truncating at valid Unicode character boundaries without panicking or producing invalid UTF-8 sequences.
+   - Applied consistently across all affected report and stop-reason variants:
+     - `SyncStopReason::TransientFailure { reason, .. }` and `report.transient_failures[i].reason`
+     - `SyncStopReason::AuthRequired { reason, .. }`
+     - `SyncStopReason::DefinitiveRejection { reason, .. }` and `report.definitive_rejections[i].reason`
+     - `SyncStopReason::AcknowledgementPersistenceFailed { error, .. }`
+     - `SyncStopReason::StoreError(error)`
+     - `SyncStopReason::RetryMetadataPersistenceFailed { transport_reason, error, .. }`
+
+3. **Bounded Rogue Identifier Retention & Exact Matching Semantics (`MAX_RECEIVED_ID_BYTES = 256`)**:
+   - When a delivery transport returns an unexpected or rogue identifier upon delivery acknowledgement, the received ID reported in `SyncStopReason::MismatchedAcknowledgement { expected, received }` is bounded to `MAX_RECEIVED_ID_BYTES = 256` UTF-8 bytes.
+   - *Exact Matching Invariant:* Valid queue entries are strictly compared against the full received string BEFORE any diagnostic bounding. Rogue IDs that share an initial prefix with the expected ID (e.g., `"act-orig"` vs `"act-orig-<1000 characters>"`) are strictly rejected as mismatches, never falsely acknowledged.
+   - *Untruncated Queue Identity:* The `expected` field in `MismatchedAcknowledgement` retains the full, valid queue identity from the outbox entry without truncation.
+   - *Store Preservation:* The affected outbox entry remains safely persisted in SQLite with all original payload and metadata intact.
+
+4. **Public API Exports (`dosi_tracker_linux`)**:
+   - `MAX_RECEIVED_ID_BYTES` and `MAX_REPORT_DIAGNOSTIC_BYTES` are re-exported at the crate root in `clients/linux/src/lib.rs` and `sync.rs` alongside the coordinator API.
+
+### B. Executed Regressions & Test Evidence
+1. **Task M Regression Suite (`tests/sync_tests.rs`, 3 New Integration Tests, Total 13 Sync Tests)**:
+   - `test_retry_metadata_persistence_failure_reports_accurately_and_halts`: Native SQLite trigger (`BEFORE UPDATE OF retry_count ON outbox_entries SELECT RAISE(FAIL, ...)`) simulates deterministic disk failure on retry update; asserts `report.attempted_count == 1`, `ledger.delivered_calls.len() == 1`, `report.transient_failures.is_empty()`, `report.stop_reason == Some(SyncStopReason::RetryMetadataPersistenceFailed { ... })` with matching activity ID, transport reason, and error; asserts SQLite row preserved with `retry_count == 0` and `last_error == None`; asserts second batch entry unattempted; asserts foreign scope sentinel intact; removes trigger and runs positive control verifying normal transient failure records `retry_count == 1` and `last_error` in SQLite and report.
+   - `test_oversized_ascii_and_multibyte_diagnostics_truncated_across_all_variants`: Verifies oversized ASCII (3,000–4,000 bytes) and multibyte Bengali (`"ত্রুটি-..."`, `"অস্বীকৃত-..."`, `"রগ-আইডি-..."`) across `TransientFailure`, `AuthRequired`, `Rejected`, and `MismatchedAcknowledgement`; verifies all retained reasons are bounded to $\le 1024$ bytes and valid UTF-8; verifies rogue received ID bounded to $\le 256$ bytes; verifies rogue ID starting with valid prefix is not falsely matched; verifies expected ID is untruncated; verifies queue rows and envelope payloads remain intact in SQLite.
+   - `test_exact_diagnostic_and_received_id_byte_boundaries`: Tests exact byte boundaries for diagnostic strings (1024 bytes kept, 1025 bytes truncated to 1024, 1023 ASCII + 3-byte Bengali `'অ'` [1026 bytes] truncated cleanly to 1023 bytes without splitting the character) and received IDs (256 bytes kept, 257 bytes truncated to 256, 255 ASCII + 3-byte Bengali `'অ'` [258 bytes] truncated cleanly to 255 bytes).
+2. **Maintained Test Suites**:
+   - 28 outbox integration tests passed (`tests/outbox_tests.rs`).
+   - 21 unit tests, 6 doctor CLI tests, 7 consent/policy repro tests, 3 installer integration tests passed.
+   - Total Rust tests in `clients/linux`: **78 passed, 0 failed, exit 0**.
+   - Shell installer lifecycle: **22 passed, 0 failed, exit 0** via Git-Bash.
+   - Frontend Vitest acceptance: **50 passed, 0 failed, exit 0** (full suite: 1982 passed).
+   - Frontend typecheck: **0 errors, exit 0**.
+   - Rust formatting: `cargo fmt --check` exit 0 (0 diffs).
+   - Rust check: `cargo check` exit 0 (0 errors, 0 warnings).
+
+### C. Executed Test Suites & Quality Gates
+| Target Suite | Exact Command Line | Tests Passed | Ignored | Result | Exit Code | Evidence Level |
+|---|---|:---:|:---:|:---:|:---:|---|
+| **Linux Unit, CLI, Repro, Installer, Outbox & Sync Tests** | `cargo test` in `clients/linux` | 78 passed (21 unit + 6 doctor CLI + 7 repro + 3 installer integration + 28 outbox integration + 13 sync integration) | 0 | PASSED | **0** | **[Worker-Reported (Windows Host Toolchain)]** |
+| **Shell Installer Lifecycle Suite** | `bash clients/linux/tests/test_installer_lifecycle.sh` | 22 passed (all lifecycle, security confinement, and binary doctor checks) | 0 | PASSED | **0** | **[Worker-Reported (Git-Bash Host Toolchain)]** |
+| **Linux Code Formatting** | `cargo fmt --check` in `clients/linux` | N/A | 0 diffs | PASSED | **0** | **[Worker-Reported]** |
+| **Linux Compilation Check** | `cargo check` in `clients/linux` | N/A | 0 errors, 0 warnings | PASSED | **0** | **[Worker-Reported]** |
+| **Frontend Acceptance Suite** | `npx vitest run src/middleware.test.ts src/components/dashboard/agent-setup.test.tsx src/test/acceptance/agent-onboarding.test.tsx src/test/acceptance/install-guides.test.tsx src/test/architecture.spec.ts` | 50 passed | 0 | PASSED | **0** | **[Worker-Reported (Focused 5-File Suite)]** |
+| **Frontend Full Suite** | `npx vitest run` in `frontend` | 1982 passed (93 files) | 0 | PASSED | **0** | **[Worker-Reported]** |
 | **Frontend Typecheck** | `npm run typecheck` in `frontend` | N/A | 0 errors | PASSED | **0** | **[Worker-Reported]** |
 
 ### D. PM QA Boundary Limits & Acceptance Disclosures
-1. **Missing-Feature RED vs Failing-Before**: Prior codebase had no sync-pass coordinator in `clients/linux` (missing-feature RED); this task implements the bounded library coordinator capability without mutating doctor/help or inventing network wire implementations.
-2. **Library-Only Injection Boundary**: Only the local synchronization coordinator library module is implemented (`dosi_tracker_linux::sync`). No production HTTP client, no daemon/scheduler, and no sensor adapters are active.
-3. **Truthful Capability Diagnostics**: `backend_sync` remains reported as `NOT_IMPLEMENTED` in `dosi-tracker-linux doctor`.
-4. **Prior Unresolved Approval Invariant**: The approval-blocked command `tirith:archive_extract` remains unresolved. Worker has **NOT** retried, repackaged, or delegated that command, nor modified archive extraction approvals.
-5. **Host Toolchain vs Native Linux Evidence Separation**: All tests were executed on Windows host MSVC and Git-Bash toolchains. This does **NOT** constitute independent PM acceptance or native Linux kernel/libc runtime verification.
+1. **Approval-Blocked Command Invariant**: The approval-blocked command `tirith:archive_extract` remains unresolved. Worker has **NOT** retried, repackaged, or delegated that check or altered permissions.
+2. **Library-Only Injection Boundary**: The sync pass coordinator (`dosi_tracker_linux::sync`) is an offline library module tested with fake delivery ledgers and injected SQLite stores. No live HTTP networking, no background daemon, and no capture adapters are active.
+3. **Truthful Capability Diagnostics**: `backend_sync` remains reported as `NOT_IMPLEMENTED` in `dosi-tracker-linux doctor [--json]`. Doctor and help commands remain strictly non-mutating and offline.
+4. **Host Toolchain vs Native Linux Evidence Separation**: All tests were executed on Windows host MSVC and Git-Bash toolchains. This does **NOT** constitute independent PM acceptance or native Linux kernel/libc runtime verification.
+
 
 
 

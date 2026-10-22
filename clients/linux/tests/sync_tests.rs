@@ -22,6 +22,7 @@ use dosi_tracker_linux::outbox::{
 use dosi_tracker_linux::sync::{
     run_sync_pass, DeliveryOutcome, DeliveryTransport, SyncError, SyncPassConfig,
     SyncPassCoordinator, SyncStopReason, MAX_ALLOWED_ATTEMPTS, MAX_ALLOWED_BATCH_LIMIT,
+    MAX_RECEIVED_ID_BYTES, MAX_REPORT_DIAGNOSTIC_BYTES,
 };
 use tempfile::tempdir;
 
@@ -621,4 +622,531 @@ fn test_doctor_and_help_remain_strictly_nonmutating_and_offline() {
         parsed["privacy_invariants"]["zero_synthetic_telemetry"],
         true
     );
+}
+
+#[test]
+fn test_retry_metadata_persistence_failure_reports_accurately_and_halts() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("retry_meta_fail.db");
+    let outbox = Outbox::open(&db_path, OutboxLimits::default()).unwrap();
+    let scope = OutboxScope::new("acct-target", "ws-target").unwrap();
+    let foreign_scope = OutboxScope::new("acct-foreign", "ws-foreign").unwrap();
+
+    // Enqueue 2 entries in target scope:
+    // First will experience transient failure, second should NOT be attempted
+    let env1 = synthetic_envelope("act-transient-fail", Some("First envelope"));
+    let env2 = synthetic_envelope("act-second", Some("Second envelope"));
+    outbox.enqueue(&scope, &env1).unwrap();
+    outbox.enqueue(&scope, &env2).unwrap();
+
+    // Enqueue 1 sentinel in foreign scope: must remain 100% untouched
+    let env_foreign = synthetic_envelope("act-foreign-sentinel", Some("Foreign sentinel"));
+    outbox.enqueue(&foreign_scope, &env_foreign).unwrap();
+
+    // Create a native SQLite trigger blocking UPDATE on retry_count
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE TRIGGER fail_retry_update BEFORE UPDATE OF retry_count ON outbox_entries
+             BEGIN
+                 SELECT RAISE(FAIL, 'simulated disk write failure on retry update');
+             END;",
+            [],
+        )
+        .unwrap();
+    }
+
+    let mut ledger = FakeDeliveryLedger::new();
+    ledger.on_id(
+        "act-transient-fail",
+        DeliveryOutcome::TransientFailure {
+            reason: "simulated upstream 503".to_string(),
+        },
+    );
+    ledger.on_id(
+        "act-second",
+        DeliveryOutcome::Accepted {
+            client_activity_id: "act-second".to_string(),
+        },
+    );
+
+    let report = run_sync_pass(&outbox, &scope, SyncPassConfig::default(), &mut ledger).unwrap();
+
+    // 1. Pass attempted exactly 1 item and halted immediately
+    assert_eq!(report.attempted_count, 1);
+    assert_eq!(ledger.delivered_calls.len(), 1);
+    assert_eq!(
+        ledger.delivered_calls[0].client_activity_id,
+        "act-transient-fail"
+    );
+
+    // 2. Report does NOT claim retry metadata was recorded when persistence failed
+    assert!(
+        report.transient_failures.is_empty(),
+        "transient_failures must NOT claim persistence when SQLite UPDATE failed"
+    );
+
+    // 3. Exact failure reporting: RetryMetadataPersistenceFailed with accurate components
+    assert!(matches!(
+        report.stop_reason,
+        Some(SyncStopReason::RetryMetadataPersistenceFailed {
+            ref client_activity_id,
+            ref transport_reason,
+            ref error,
+        }) if client_activity_id == "act-transient-fail"
+            && transport_reason == "simulated upstream 503"
+            && error.contains("simulated disk write failure on retry update")
+    ));
+
+    // 4. In SQLite: row is preserved, retry_count remains 0, last_error remains None
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let (retry_count, last_error): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT retry_count, last_error FROM outbox_entries WHERE client_activity_id = 'act-transient-fail'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(retry_count, 0, "retry_count must NOT be incremented in DB");
+        assert_eq!(last_error, None, "last_error must NOT be updated in DB");
+
+        // Second entry is intact and unattempted
+        let (retry_count2, last_error2): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT retry_count, last_error FROM outbox_entries WHERE client_activity_id = 'act-second'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(retry_count2, 0);
+        assert_eq!(last_error2, None);
+
+        // Foreign sentinel is 100% untouched
+        let (foreign_retry, foreign_err): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT retry_count, last_error FROM outbox_entries WHERE client_activity_id = 'act-foreign-sentinel'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(foreign_retry, 0);
+        assert_eq!(foreign_err, None);
+    }
+
+    // 5. Positive control: drop trigger, verify normal retry metadata persistence succeeds
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute("DROP TRIGGER fail_retry_update", []).unwrap();
+    }
+
+    let mut positive_ledger = FakeDeliveryLedger::new();
+    positive_ledger.on_id(
+        "act-transient-fail",
+        DeliveryOutcome::TransientFailure {
+            reason: "simulated upstream 503".to_string(),
+        },
+    );
+
+    let positive_report = run_sync_pass(
+        &outbox,
+        &scope,
+        SyncPassConfig::default(),
+        &mut positive_ledger,
+    )
+    .unwrap();
+
+    assert_eq!(positive_report.attempted_count, 1);
+    assert_eq!(positive_report.transient_failures.len(), 1);
+    assert_eq!(
+        positive_report.transient_failures[0].client_activity_id,
+        "act-transient-fail"
+    );
+    assert_eq!(
+        positive_report.transient_failures[0].reason,
+        "simulated upstream 503"
+    );
+    assert!(matches!(
+        positive_report.stop_reason,
+        Some(SyncStopReason::TransientFailure {
+            ref client_activity_id,
+            ref reason,
+        }) if client_activity_id == "act-transient-fail" && reason == "simulated upstream 503"
+    ));
+
+    // In SQLite: retry metadata was actually committed
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let (retry_count, last_error): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT retry_count, last_error FROM outbox_entries WHERE client_activity_id = 'act-transient-fail'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(retry_count, 1);
+        assert_eq!(last_error, Some("simulated upstream 503".to_string()));
+    }
+}
+
+#[test]
+fn test_oversized_ascii_and_multibyte_diagnostics_truncated_across_all_variants() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("oversized_diag.db");
+    let outbox = Outbox::open(&db_path, OutboxLimits::default()).unwrap();
+    let scope = OutboxScope::new("acct-diag", "ws-diag").unwrap();
+
+    // 1. TransientFailure with oversized ASCII (3,000 bytes) and multibyte Bengali
+    {
+        let env = synthetic_envelope("act-transient-ascii", Some("Transient ASCII"));
+        outbox.enqueue(&scope, &env).unwrap();
+
+        let mut ledger = FakeDeliveryLedger::new();
+        let huge_ascii = "E".repeat(3000);
+        ledger.on_id(
+            "act-transient-ascii",
+            DeliveryOutcome::TransientFailure { reason: huge_ascii },
+        );
+
+        let report =
+            run_sync_pass(&outbox, &scope, SyncPassConfig::default(), &mut ledger).unwrap();
+        assert_eq!(report.transient_failures.len(), 1);
+        assert_eq!(
+            report.transient_failures[0].reason.len(),
+            MAX_REPORT_DIAGNOSTIC_BYTES
+        );
+        match report.stop_reason {
+            Some(SyncStopReason::TransientFailure { ref reason, .. }) => {
+                assert_eq!(reason.len(), MAX_REPORT_DIAGNOSTIC_BYTES);
+            }
+            ref other => panic!("Unexpected stop reason: {:?}", other),
+        }
+
+        // Clean up row for next test
+        outbox.ack_delivered(&scope, "act-transient-ascii").unwrap();
+    }
+
+    // Multibyte Bengali transient failure: "ত্রুটি-" repeated (16 bytes each)
+    {
+        let env = synthetic_envelope("act-transient-bengali", Some("Transient Bengali"));
+        outbox.enqueue(&scope, &env).unwrap();
+
+        let mut ledger = FakeDeliveryLedger::new();
+        let huge_bengali = "ত্রুটি-সার্ভার-ত্রুটি-".repeat(150); // ~3300 bytes
+        ledger.on_id(
+            "act-transient-bengali",
+            DeliveryOutcome::TransientFailure {
+                reason: huge_bengali,
+            },
+        );
+
+        let report =
+            run_sync_pass(&outbox, &scope, SyncPassConfig::default(), &mut ledger).unwrap();
+        assert_eq!(report.transient_failures.len(), 1);
+        let reason = &report.transient_failures[0].reason;
+        assert!(reason.len() <= MAX_REPORT_DIAGNOSTIC_BYTES);
+        assert!(std::str::from_utf8(reason.as_bytes()).is_ok());
+
+        // Envelope payload preserved in DB
+        let peek = outbox.peek_pending(&scope, 1).unwrap();
+        assert_eq!(peek[0].envelope.client_activity_id, "act-transient-bengali");
+        assert_eq!(
+            peek[0].envelope.description.as_deref(),
+            Some("Transient Bengali")
+        );
+
+        outbox
+            .ack_delivered(&scope, "act-transient-bengali")
+            .unwrap();
+    }
+
+    // 2. AuthRequired with oversized ASCII and multibyte
+    {
+        let env = synthetic_envelope("act-auth-oversize", Some("Auth oversize"));
+        outbox.enqueue(&scope, &env).unwrap();
+
+        let mut ledger = FakeDeliveryLedger::new();
+        let huge_auth = "A".repeat(4000);
+        ledger.on_id(
+            "act-auth-oversize",
+            DeliveryOutcome::AuthRequired { reason: huge_auth },
+        );
+
+        let report =
+            run_sync_pass(&outbox, &scope, SyncPassConfig::default(), &mut ledger).unwrap();
+        match report.stop_reason {
+            Some(SyncStopReason::AuthRequired {
+                ref client_activity_id,
+                ref reason,
+            }) => {
+                assert_eq!(client_activity_id, "act-auth-oversize");
+                assert_eq!(reason.len(), MAX_REPORT_DIAGNOSTIC_BYTES);
+            }
+            ref other => panic!("Unexpected stop reason: {:?}", other),
+        }
+
+        // Queue entry is preserved
+        assert_eq!(outbox.count(Some(&scope)).unwrap(), 1);
+        outbox.ack_delivered(&scope, "act-auth-oversize").unwrap();
+    }
+
+    // 3. Rejected with oversized ASCII and multibyte
+    {
+        let env = synthetic_envelope("act-rejected-oversize", Some("Rejected oversize"));
+        outbox.enqueue(&scope, &env).unwrap();
+
+        let mut ledger = FakeDeliveryLedger::new();
+        let huge_rejected = "অস্বীকৃত-ডেটা-".repeat(200); // multibyte Bengali
+        ledger.on_id(
+            "act-rejected-oversize",
+            DeliveryOutcome::Rejected {
+                reason: huge_rejected,
+            },
+        );
+
+        let report =
+            run_sync_pass(&outbox, &scope, SyncPassConfig::default(), &mut ledger).unwrap();
+        assert_eq!(report.definitive_rejections.len(), 1);
+        assert!(report.definitive_rejections[0].reason.len() <= MAX_REPORT_DIAGNOSTIC_BYTES);
+        match report.stop_reason {
+            Some(SyncStopReason::DefinitiveRejection {
+                ref client_activity_id,
+                ref reason,
+            }) => {
+                assert_eq!(client_activity_id, "act-rejected-oversize");
+                assert!(reason.len() <= MAX_REPORT_DIAGNOSTIC_BYTES);
+                assert!(std::str::from_utf8(reason.as_bytes()).is_ok());
+            }
+            ref other => panic!("Unexpected stop reason: {:?}", other),
+        }
+
+        // Queue entry is preserved
+        assert_eq!(outbox.count(Some(&scope)).unwrap(), 1);
+        outbox
+            .ack_delivered(&scope, "act-rejected-oversize")
+            .unwrap();
+    }
+
+    // 4. MismatchedAcknowledgement with oversized rogue ID (ASCII and multibyte)
+    {
+        let env = synthetic_envelope("act-orig-id", Some("Original valid identity"));
+        outbox.enqueue(&scope, &env).unwrap();
+
+        let mut ledger = FakeDeliveryLedger::new();
+        // Rogue ID starts with the original ID, but has 1000 extra bytes appended.
+        // Verifies exact matching: must NOT falsely match, and received must be bounded!
+        let rogue_id = format!("act-orig-id-{}", "R".repeat(1000));
+        ledger.on_id(
+            "act-orig-id",
+            DeliveryOutcome::Accepted {
+                client_activity_id: rogue_id,
+            },
+        );
+
+        let report =
+            run_sync_pass(&outbox, &scope, SyncPassConfig::default(), &mut ledger).unwrap();
+        match report.stop_reason {
+            Some(SyncStopReason::MismatchedAcknowledgement {
+                ref expected,
+                ref received,
+            }) => {
+                // Expected must be the full valid queue ID, NOT truncated
+                assert_eq!(expected, "act-orig-id");
+                // Received must be bounded to MAX_RECEIVED_ID_BYTES
+                assert_eq!(received.len(), MAX_RECEIVED_ID_BYTES);
+            }
+            ref other => panic!("Unexpected stop reason: {:?}", other),
+        }
+
+        // Queue entry is preserved
+        assert_eq!(outbox.count(Some(&scope)).unwrap(), 1);
+        outbox.ack_delivered(&scope, "act-orig-id").unwrap();
+    }
+
+    // Multibyte rogue ID in MismatchedAcknowledgement
+    {
+        let env = synthetic_envelope("act-orig-2", None);
+        outbox.enqueue(&scope, &env).unwrap();
+
+        let mut ledger = FakeDeliveryLedger::new();
+        let rogue_multibyte = format!("রগ-আইডি-{}", "ভুল-".repeat(100));
+        ledger.on_id(
+            "act-orig-2",
+            DeliveryOutcome::Accepted {
+                client_activity_id: rogue_multibyte,
+            },
+        );
+
+        let report =
+            run_sync_pass(&outbox, &scope, SyncPassConfig::default(), &mut ledger).unwrap();
+        match report.stop_reason {
+            Some(SyncStopReason::MismatchedAcknowledgement {
+                ref expected,
+                ref received,
+            }) => {
+                assert_eq!(expected, "act-orig-2");
+                assert!(received.len() <= MAX_RECEIVED_ID_BYTES);
+                assert!(std::str::from_utf8(received.as_bytes()).is_ok());
+            }
+            ref other => panic!("Unexpected stop reason: {:?}", other),
+        }
+
+        assert_eq!(outbox.count(Some(&scope)).unwrap(), 1);
+    }
+}
+
+#[test]
+fn test_exact_diagnostic_and_received_id_byte_boundaries() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("boundary_check.db");
+    let outbox = Outbox::open(&db_path, OutboxLimits::default()).unwrap();
+    let scope = OutboxScope::new("acct-bounds", "ws-bounds").unwrap();
+
+    // 1. Diagnostic boundary: exactly 1024 bytes -> kept untruncated
+    {
+        let env = synthetic_envelope("act-diag-1024", None);
+        outbox.enqueue(&scope, &env).unwrap();
+
+        let exact_1024 = "D".repeat(1024);
+        let mut ledger = FakeDeliveryLedger::new();
+        ledger.on_id(
+            "act-diag-1024",
+            DeliveryOutcome::TransientFailure {
+                reason: exact_1024.clone(),
+            },
+        );
+
+        let report =
+            run_sync_pass(&outbox, &scope, SyncPassConfig::default(), &mut ledger).unwrap();
+        assert_eq!(report.transient_failures[0].reason.len(), 1024);
+        assert_eq!(report.transient_failures[0].reason, exact_1024);
+        outbox.ack_delivered(&scope, "act-diag-1024").unwrap();
+    }
+
+    // 2. Diagnostic boundary: exactly 1025 bytes -> truncated to 1024 bytes
+    {
+        let env = synthetic_envelope("act-diag-1025", None);
+        outbox.enqueue(&scope, &env).unwrap();
+
+        let exact_1025 = "D".repeat(1025);
+        let mut ledger = FakeDeliveryLedger::new();
+        ledger.on_id(
+            "act-diag-1025",
+            DeliveryOutcome::TransientFailure { reason: exact_1025 },
+        );
+
+        let report =
+            run_sync_pass(&outbox, &scope, SyncPassConfig::default(), &mut ledger).unwrap();
+        assert_eq!(report.transient_failures[0].reason.len(), 1024);
+        outbox.ack_delivered(&scope, "act-diag-1025").unwrap();
+    }
+
+    // 3. Diagnostic boundary: multibyte character crossing 1024 bytes
+    // 1023 ASCII bytes + 3-byte Bengali 'অ' (0xE0 0xA6 0x85) = 1026 bytes.
+    // Truncation must stop at byte 1023 without splitting the 3-byte character.
+    {
+        let env = synthetic_envelope("act-diag-multi-boundary", None);
+        outbox.enqueue(&scope, &env).unwrap();
+
+        let mut boundary_string = "M".repeat(1023);
+        boundary_string.push('অ');
+        assert_eq!(boundary_string.len(), 1026);
+
+        let mut ledger = FakeDeliveryLedger::new();
+        ledger.on_id(
+            "act-diag-multi-boundary",
+            DeliveryOutcome::TransientFailure {
+                reason: boundary_string,
+            },
+        );
+
+        let report =
+            run_sync_pass(&outbox, &scope, SyncPassConfig::default(), &mut ledger).unwrap();
+        assert_eq!(report.transient_failures[0].reason.len(), 1023);
+        assert!(std::str::from_utf8(report.transient_failures[0].reason.as_bytes()).is_ok());
+        outbox
+            .ack_delivered(&scope, "act-diag-multi-boundary")
+            .unwrap();
+    }
+
+    // 4. Received ID boundary: exactly 256 bytes -> kept at 256
+    {
+        let env = synthetic_envelope("act-rcv-256", None);
+        outbox.enqueue(&scope, &env).unwrap();
+
+        let exact_256 = "I".repeat(256);
+        let mut ledger = FakeDeliveryLedger::new();
+        ledger.on_id(
+            "act-rcv-256",
+            DeliveryOutcome::Accepted {
+                client_activity_id: exact_256.clone(),
+            },
+        );
+
+        let report =
+            run_sync_pass(&outbox, &scope, SyncPassConfig::default(), &mut ledger).unwrap();
+        match report.stop_reason {
+            Some(SyncStopReason::MismatchedAcknowledgement { ref received, .. }) => {
+                assert_eq!(received.len(), 256);
+                assert_eq!(received, &exact_256);
+            }
+            ref other => panic!("Unexpected stop reason: {:?}", other),
+        }
+        outbox.ack_delivered(&scope, "act-rcv-256").unwrap();
+    }
+
+    // 5. Received ID boundary: exactly 257 bytes -> truncated to 256
+    {
+        let env = synthetic_envelope("act-rcv-257", None);
+        outbox.enqueue(&scope, &env).unwrap();
+
+        let exact_257 = "I".repeat(257);
+        let mut ledger = FakeDeliveryLedger::new();
+        ledger.on_id(
+            "act-rcv-257",
+            DeliveryOutcome::Accepted {
+                client_activity_id: exact_257,
+            },
+        );
+
+        let report =
+            run_sync_pass(&outbox, &scope, SyncPassConfig::default(), &mut ledger).unwrap();
+        match report.stop_reason {
+            Some(SyncStopReason::MismatchedAcknowledgement { ref received, .. }) => {
+                assert_eq!(received.len(), 256);
+            }
+            ref other => panic!("Unexpected stop reason: {:?}", other),
+        }
+        outbox.ack_delivered(&scope, "act-rcv-257").unwrap();
+    }
+
+    // 6. Received ID boundary: multibyte character crossing 256 bytes
+    // 255 ASCII bytes + 3-byte Bengali 'অ' = 258 bytes.
+    // Truncation must stop at byte 255 without splitting the character.
+    {
+        let env = synthetic_envelope("act-rcv-multi", None);
+        outbox.enqueue(&scope, &env).unwrap();
+
+        let mut boundary_id = "I".repeat(255);
+        boundary_id.push('অ');
+        assert_eq!(boundary_id.len(), 258);
+
+        let mut ledger = FakeDeliveryLedger::new();
+        ledger.on_id(
+            "act-rcv-multi",
+            DeliveryOutcome::Accepted {
+                client_activity_id: boundary_id,
+            },
+        );
+
+        let report =
+            run_sync_pass(&outbox, &scope, SyncPassConfig::default(), &mut ledger).unwrap();
+        match report.stop_reason {
+            Some(SyncStopReason::MismatchedAcknowledgement { ref received, .. }) => {
+                assert_eq!(received.len(), 255);
+                assert!(std::str::from_utf8(received.as_bytes()).is_ok());
+            }
+            ref other => panic!("Unexpected stop reason: {:?}", other),
+        }
+    }
 }
