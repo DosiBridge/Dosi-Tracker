@@ -2147,17 +2147,90 @@ In continuation of Task `linux-sync-failure-diagnostics-20261022-M`, the sensor-
 3. **Truthful Capability Diagnostics**: `backend_sync` remains reported as `NOT_IMPLEMENTED` in `dosi-tracker-linux doctor [--json]`. Doctor and help commands remain strictly non-mutating and offline.
 4. **Host Toolchain vs Native Linux Evidence Separation**: All tests were executed on Windows host MSVC and Git-Bash toolchains. This does **NOT** constitute independent PM acceptance or native Linux kernel/libc runtime verification.
 
+---
 
+## 25. Explicit-Path Read-Only Outbox Status CLI Inspection (linux-outbox-status-cli-20261022-N)
 
+> **Execution Date:** October 22, 2026  
+> **Phase Task ID:** `linux-outbox-status-cli-20261022-N`  
+> **Status:** Completed & Source-Verified (86 Rust tests passed in `clients/linux`, 22 shell tests passed, 50 frontend tests passed, typecheck clean, fmt clean, check clean)  
+> **Target Package:** `clients/linux` (crate: `dosi-tracker-linux` v0.1.0, binary: `dosi-tracker-linux`)  
 
+### A. Context & Architectural Implementation
+Under Task ID `linux-outbox-status-cli-20261022-N`, we implemented an explicit-path, strictly read-only CLI inspection subcommand for the Linux client foundation:
+`dosi-tracker-linux outbox status --db <PATH> --account-id <ID> --workspace-id <ID> [--json]`
 
+1. **Strictly Read-Only SQLite Flag (`SQLITE_OPEN_READ_ONLY`)**:
+   - `ReadOnlyOutboxStore::open(path)` uses `OpenOptions::new().read_only(true)` (`SQLITE_OPEN_READ_ONLY`).
+   - Opens the SQLite database file for reading only, preventing table creation, automatic schema migration, WAL checkpoints, or lock upgrades.
+   - If the database file does not exist, it fails closed with an error; it **never** creates empty database files or parent directories.
+   - Verified by testing against file system permissions and non-existent database paths.
 
+2. **Explicit-Path & Account/Workspace Scoping**:
+   - Requires explicit `--db <PATH>`, `--account-id <ACCOUNT_ID>`, and `--workspace-id <WORKSPACE_ID>` CLI arguments.
+   - Missing or whitespace-empty arguments fail closed with exit code 1 and descriptive error messages to stderr without touching any database.
+   - Queries outbox records strictly bounded to the requested scope (`account_id` and `workspace_id`), isolating foreign tenant records.
 
+3. **Privacy Invariant: Zero Sensitive Data Leakage**:
+   - Computes aggregate metrics only:
+     - `total_entries`: Total pending entries for the scope.
+     - `entries_by_priority`: Count breakdown per priority level (`High`, `Normal`, `Low`).
+     - `oldest_created_at_epoch_ms` & `newest_created_at_epoch_ms`: Bounded timestamps.
+     - `entries_with_retries`: Number of entries that have undergone at least 1 retry attempt.
+     - `max_retry_count`: Maximum retry count across pending entries.
+   - Strictly suppresses raw envelope payloads, serialized blobs, and individual activity IDs in both human-readable text and `--json` outputs.
 
+4. **Structured JSON & Human-Readable Output**:
+   - Text output formats human-friendly key-value statistics.
+   - `--json` outputs strict, valid JSON matching the schema:
+     ```json
+     {
+       "account_id": "...",
+       "workspace_id": "...",
+       "total_entries": 0,
+       "entries_by_priority": { "High": 0, "Normal": 0, "Low": 0 },
+       "oldest_created_at_epoch_ms": null,
+       "newest_created_at_epoch_ms": null,
+       "entries_with_retries": 0,
+       "max_retry_count": 0
+     }
+     ```
+   - Emits clean output to stdout with exit code 0 on success; exits 1 with diagnostic on stderr upon failure.
 
+5. **Diagnostic Non-Mutation Preservation**:
+   - `doctor [--json]` and `--help` remain completely offline, non-mutating, and continue reporting `offline_queue` capability as implemented with `backend_sync` as not implemented.
 
+### B. Executed Regressions & Test Evidence
+1. **Outbox Status CLI Integration Suite (`clients/linux/tests/outbox_cli_tests.rs`, 8 Tests)**:
+   - `test_outbox_status_help_exits_zero`: Validates `--help` documentation for the `outbox status` command.
+   - `test_outbox_status_missing_args_fails_closed`: Validates missing `--db`, `--account-id`, or `--workspace-id` fails closed with exit code 1 and descriptive error.
+   - `test_outbox_status_nonexistent_db_fails_closed_without_creating_file`: Asserts nonexistent path fails with error and does NOT create any file on disk.
+   - `test_outbox_status_empty_db_text_and_json`: Asserts 0 total entries, null oldest/newest timestamps, and empty priority counts across both text and JSON outputs.
+   - `test_outbox_status_populated_db_accurate_aggregation`: Seeds multiple outbox entries with varied priorities and retry counts; verifies exact aggregation metrics matching expected values in text and JSON.
+   - `test_outbox_status_scope_isolation`: Asserts queries for Account A / Workspace A return only A's entries, completely ignoring foreign entries for Account B / Workspace B.
+   - `test_outbox_status_strict_read_only_does_not_modify_db`: Asserts file modification timestamps and SQLite WAL/SHM states remain 100% unchanged after inspection.
+   - `test_outbox_status_zero_payload_or_id_leakage`: Verifies neither raw payload bytes nor activity IDs appear anywhere in stdout or JSON output.
 
+2. **Maintained Test Suites**:
+   - Total Rust tests in `clients/linux`: **86 passed, 0 failed, exit 0** (21 unit + 6 doctor CLI + 7 repro + 3 installer integration + 28 outbox integration + 13 sync integration + 8 outbox status CLI integration).
+   - Shell installer lifecycle: **22 passed, 0 failed, exit 0** via Git-Bash.
+   - Frontend Vitest acceptance: **50 passed, 0 failed, exit 0** (full suite: 1982 passed).
+   - Frontend typecheck: **0 errors, exit 0**.
+   - Rust formatting: `cargo fmt --check` exit 0 (0 diffs).
+   - Rust check: `cargo check` exit 0 (0 errors, 0 warnings).
 
+### C. Executed Test Suites & Quality Gates
+| Target Suite | Exact Command Line | Tests Passed | Ignored | Result | Exit Code | Evidence Level |
+|---|---|:---:|:---:|:---:|:---:|---|
+| **Linux Unit, CLI, Repro, Installer, Outbox, Sync & Status CLI** | `cargo test` in `clients/linux` | 86 passed (21 unit + 6 doctor CLI + 7 repro + 3 installer integration + 28 outbox integration + 13 sync integration + 8 status CLI) | 0 | PASSED | **0** | **[Worker-Reported (Windows Host Toolchain)]** |
+| **Shell Installer Lifecycle Suite** | `bash clients/linux/tests/test_installer_lifecycle.sh` | 22 passed (all lifecycle, security confinement, and binary doctor checks) | 0 | PASSED | **0** | **[Worker-Reported (Git-Bash Host Toolchain)]** |
+| **Linux Code Formatting** | `cargo fmt --check` in `clients/linux` | N/A | 0 diffs | PASSED | **0** | **[Worker-Reported]** |
+| **Linux Compilation Check** | `cargo check` in `clients/linux` | N/A | 0 errors, 0 warnings | PASSED | **0** | **[Worker-Reported]** |
+| **Frontend Acceptance Suite** | `npx vitest run src/middleware.test.ts src/components/dashboard/agent-setup.test.tsx src/test/acceptance/agent-onboarding.test.tsx src/test/acceptance/install-guides.test.tsx src/test/architecture.spec.ts` | 50 passed | 0 | PASSED | **0** | **[Worker-Reported (Focused 5-File Suite)]** |
+| **Frontend Typecheck** | `npm run typecheck` in `frontend` | N/A | 0 errors | PASSED | **0** | **[Worker-Reported]** |
 
-
-
+### D. PM QA Boundary Limits & Acceptance Disclosures
+1. **Approval-Blocked Command Invariant**: The approval-blocked command `tirith:archive_extract` remains unresolved. Worker has **NOT** retried, repackaged, or delegated that check or altered permissions.
+2. **Read-Only Invariant**: The `outbox status` CLI command opens SQLite strictly with `SQLITE_OPEN_READ_ONLY`. It does not write, checkpoint, or migrate databases.
+3. **Host Toolchain vs Native Linux Evidence Separation**: All tests were executed on Windows host MSVC and Git-Bash toolchains. This does **NOT** constitute independent PM acceptance or native Linux kernel/libc runtime verification.
+4. **No Background Daemon or Network**: The Linux client remains offline with no background daemons, autostart, or native sensor capture hooks active.

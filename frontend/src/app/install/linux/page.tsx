@@ -84,12 +84,14 @@ export default function LinuxInstallPage() {
             <div className="text-primary-strong">cargo run --bin dosi-tracker-linux -- doctor</div>
             <div className="mt-2"># Run diagnostics with structured JSON output</div>
             <div className="text-primary-strong">cargo run --bin dosi-tracker-linux -- doctor --json</div>
+            <div className="mt-2"># Inspect durable offline outbox queue status (read-only)</div>
+            <div className="text-primary-strong">cargo run --bin dosi-tracker-linux -- outbox status --db /path/to/outbox.db --account-id &lt;id&gt; --workspace-id &lt;id&gt; [--json]</div>
             <div className="mt-2"># Inspect usage and privacy invariants</div>
             <div className="text-primary-strong">cargo run --bin dosi-tracker-linux -- --help</div>
           </div>
           <p className="text-[11px]">
-            * Note: The <code className="font-mono text-foreground font-semibold">doctor</code> command performs pure non-mutating inspection:
-            it checks existence of XDG configuration and data paths without creating any directories or files.
+            * Note: Both <code className="font-mono text-foreground font-semibold">doctor</code> and <code className="font-mono text-foreground font-semibold">outbox status</code> perform strictly read-only, non-mutating inspection:
+            they never create database files, directories, schema tables, checkpoints, or background workers.
           </p>
         </Card>
       </div>

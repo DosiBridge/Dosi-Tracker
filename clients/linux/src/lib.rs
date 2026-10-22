@@ -26,7 +26,8 @@ pub use lifecycle::{
     LifecycleGeneration, PauseReason, TrackerLifecycle, TrackerState,
 };
 pub use outbox::{
-    ActivityEnvelope, EnqueueResult, Outbox, OutboxEntry, OutboxError, OutboxLimits, OutboxScope,
+    inspect_outbox_status, ActivityEnvelope, DurableQueueSummary, EnqueueResult, Outbox,
+    OutboxEntry, OutboxError, OutboxLimits, OutboxScope, OutboxStatusError, OutboxStatusReport,
     MAX_ACCOUNT_ID_BYTES, MAX_CLIENT_ACTIVITY_ID_BYTES, MAX_ERROR_MESSAGE_BYTES,
     MAX_WORKSPACE_ID_BYTES, OUTBOX_SCHEMA_VERSION,
 };

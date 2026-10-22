@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
 /// Current schema version for outbox storage.
@@ -850,4 +850,334 @@ impl Outbox {
     pub fn path(&self) -> &Path {
         &self.db_path
     }
+}
+
+/// Versioned allowlisted summary of durable outbox queue status for a specific scope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutboxStatusReport {
+    /// Report format version.
+    pub format_version: u32,
+    /// Scoped tenant and workspace context.
+    pub scope: OutboxScope,
+    /// Aggregated metrics for the durable local queue.
+    pub durable_queue: DurableQueueSummary,
+    /// Explicit statement of remote synchronization/acknowledgement state.
+    pub remote_delivery_state: String,
+}
+
+impl OutboxStatusReport {
+    /// Serializes report to formatted JSON string.
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+
+    /// Renders human-readable summary text.
+    pub fn to_pretty_text(&self) -> String {
+        format!(
+            "=======================================================\n\
+             Dosi-Tracker Linux Offline Outbox Status\n\
+             =======================================================\n\n\
+             [Scope]\n\
+               Account ID:   {}\n\
+               Workspace ID: {}\n\n\
+             [Durable Queue Summary]\n\
+               Queued Records:       {}\n\
+               Entries With Retries: {}\n\
+               Max Retry Count:      {}\n\
+               Total Payload Bytes:  {} B\n\
+               Oldest Enqueued:      {}\n\
+               Newest Enqueued:      {}\n\n\
+             [Remote Delivery State]\n\
+               Status: {} (offline storage only; remote sync state is not retained locally)\n",
+            self.scope.account_id,
+            self.scope.workspace_id,
+            self.durable_queue.queued_count,
+            self.durable_queue.entries_with_retries,
+            self.durable_queue.max_retry_count,
+            self.durable_queue.total_payload_bytes,
+            self.durable_queue
+                .oldest_enqueued_at
+                .map(|t| t.to_rfc3339())
+                .as_deref()
+                .unwrap_or("none"),
+            self.durable_queue
+                .newest_enqueued_at
+                .map(|t| t.to_rfc3339())
+                .as_deref()
+                .unwrap_or("none"),
+            self.remote_delivery_state,
+        )
+    }
+}
+
+/// Aggregated durable queue summary for a selected scope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DurableQueueSummary {
+    /// Total number of durable records queued for this scope.
+    pub queued_count: u64,
+    /// Number of records in this scope that have experienced at least one retry attempt.
+    pub entries_with_retries: u64,
+    /// Highest retry count observed among records in this scope.
+    pub max_retry_count: u32,
+    /// Total payload bytes of records in this scope.
+    pub total_payload_bytes: u64,
+    /// Oldest enqueued timestamp in this scope, if any.
+    pub oldest_enqueued_at: Option<DateTime<Utc>>,
+    /// Newest enqueued timestamp in this scope, if any.
+    pub newest_enqueued_at: Option<DateTime<Utc>>,
+}
+
+/// Errors returned by read-only outbox status inspection.
+#[derive(Debug)]
+pub enum OutboxStatusError {
+    /// Database file does not exist.
+    DatabaseNotFound,
+    /// Database path is invalid (e.g. is a directory).
+    InvalidPath(String),
+    /// Scope validation failed.
+    InvalidScope(String),
+    /// Database file is corrupt or fails integrity check.
+    CorruptDatabase(String),
+    /// Database record contains corrupt metadata.
+    CorruptRecord(String),
+    /// Database schema does not match outbox requirements.
+    UnsupportedSchema(String),
+    /// Store schema version is unsupported.
+    UnsupportedStoreVersion(u32),
+    /// Read-only database access failed.
+    AccessDenied(String),
+}
+
+impl std::fmt::Display for OutboxStatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DatabaseNotFound => write!(f, "Database file does not exist"),
+            Self::InvalidPath(msg) => write!(f, "Invalid database path: {msg}"),
+            Self::InvalidScope(msg) => write!(f, "Invalid outbox scope: {msg}"),
+            Self::CorruptDatabase(msg) => write!(f, "Database is corrupted: {msg}"),
+            Self::CorruptRecord(msg) => write!(f, "Database record corrupted: {msg}"),
+            Self::UnsupportedSchema(msg) => write!(f, "Unsupported database schema: {msg}"),
+            Self::UnsupportedStoreVersion(v) => {
+                write!(
+                    f,
+                    "Unsupported outbox store version: {v} (current supported version is {OUTBOX_SCHEMA_VERSION})"
+                )
+            }
+            Self::AccessDenied(msg) => write!(f, "Database access error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for OutboxStatusError {}
+
+/// Performs strictly read-only inspection of the durable outbox queue for a specific scope.
+///
+/// Invariants:
+/// - Explicit existing DB path required; fails closed if path does not exist.
+/// - Never creates files, directories, schemas, or tables.
+/// - Never executes PRAGMA writes, migrations, checkpoints, enqueues, or retries.
+/// - Opens SQLite using `OpenFlags::SQLITE_OPEN_READ_ONLY`.
+/// - Evaluates SQLite WAL mode safely; uncheckpointed WAL frames are read if WAL/SHM
+///   files are readable, and connection conservatively fails closed if SHM/WAL are unreadable.
+/// - Performs single bounded SQL aggregate query without unbounded row materialization.
+/// - Excludes envelopes, payloads, descriptions, and other scope identities.
+pub fn inspect_outbox_status(
+    path: impl AsRef<Path>,
+    scope: &OutboxScope,
+) -> Result<OutboxStatusReport, OutboxStatusError> {
+    let db_path = path.as_ref();
+
+    // 1. Mandatory check: DB path must exist and not be a directory
+    if !db_path.exists() {
+        return Err(OutboxStatusError::DatabaseNotFound);
+    }
+    if db_path.is_dir() {
+        return Err(OutboxStatusError::InvalidPath(
+            "specified path is a directory, not a database file".into(),
+        ));
+    }
+
+    // 2. Validate scope strictly
+    scope
+        .validate()
+        .map_err(|e| OutboxStatusError::InvalidScope(e.to_string()))?;
+
+    // 3. Open connection strictly READ-ONLY
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(db_path, flags).map_err(|e| {
+        OutboxStatusError::AccessDenied(format!("unable to open database in read-only mode: {e}"))
+    })?;
+
+    // 4. Verify integrity via PRAGMA quick_check
+    let mut check_stmt = conn.prepare("PRAGMA quick_check;").map_err(|e| {
+        OutboxStatusError::CorruptDatabase(format!("failed to prepare quick_check: {e}"))
+    })?;
+    let status: String = check_stmt.query_row([], |row| row.get(0)).map_err(|e| {
+        OutboxStatusError::CorruptDatabase(format!("failed to execute quick_check: {e}"))
+    })?;
+    if status != "ok" {
+        return Err(OutboxStatusError::CorruptDatabase(format!(
+            "integrity check failed: {status}"
+        )));
+    }
+
+    // 5. Check schema version via PRAGMA user_version
+    let user_ver: u32 = conn
+        .query_row("PRAGMA user_version;", [], |row| row.get(0))
+        .map_err(|e| {
+            OutboxStatusError::CorruptDatabase(format!("failed to read user_version: {e}"))
+        })?;
+    if user_ver == 0 {
+        return Err(OutboxStatusError::UnsupportedSchema(
+            "database is uninitialized (user_version is 0)".into(),
+        ));
+    }
+    if user_ver > OUTBOX_SCHEMA_VERSION {
+        return Err(OutboxStatusError::UnsupportedStoreVersion(user_ver));
+    }
+
+    // 6. Check table existence
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'outbox_entries';",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|e| {
+            OutboxStatusError::CorruptDatabase(format!("failed to query table schema: {e}"))
+        })?
+        .is_some();
+
+    if !table_exists {
+        return Err(OutboxStatusError::UnsupportedSchema(
+            "outbox_entries table not found".into(),
+        ));
+    }
+
+    // 7. Verify required columns in table
+    let mut table_info_stmt = conn
+        .prepare("PRAGMA table_info(outbox_entries);")
+        .map_err(|e| {
+            OutboxStatusError::CorruptDatabase(format!("failed to inspect table columns: {e}"))
+        })?;
+    let columns: Vec<String> = table_info_stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| OutboxStatusError::CorruptDatabase(format!("failed to read columns: {e}")))?
+        .filter_map(Result::ok)
+        .collect();
+
+    let required_cols = [
+        "account_id",
+        "workspace_id",
+        "client_activity_id",
+        "payload_bytes",
+        "enqueued_at",
+        "retry_count",
+        "last_error",
+    ];
+    for req in required_cols {
+        if !columns.iter().any(|c| c == req) {
+            return Err(OutboxStatusError::UnsupportedSchema(format!(
+                "required column '{req}' missing from outbox_entries"
+            )));
+        }
+    }
+
+    // 8. Fail-closed check: verify no corrupt records with negative retry_count or payload_bytes in selected scope
+    let has_negative: bool = conn
+        .query_row(
+            "SELECT 1 FROM outbox_entries \
+             WHERE account_id = ?1 AND workspace_id = ?2 \
+               AND (retry_count < 0 OR payload_bytes < 0) LIMIT 1",
+            params![&scope.account_id, &scope.workspace_id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|e| {
+            OutboxStatusError::CorruptDatabase(format!("failed querying record integrity: {e}"))
+        })?
+        .is_some();
+
+    if has_negative {
+        return Err(OutboxStatusError::CorruptRecord(
+            "negative retry_count or payload_bytes detected in scope".into(),
+        ));
+    }
+
+    // 9. Execute single aggregate summary query for the selected scope
+    let summary_row = conn
+        .query_row(
+            "SELECT \
+                 COUNT(*), \
+                 COALESCE(SUM(CASE WHEN retry_count > 0 THEN 1 ELSE 0 END), 0), \
+                 COALESCE(MAX(retry_count), 0), \
+                 COALESCE(SUM(payload_bytes), 0), \
+                 MIN(enqueued_at), \
+                 MAX(enqueued_at) \
+             FROM outbox_entries \
+             WHERE account_id = ?1 AND workspace_id = ?2",
+            params![&scope.account_id, &scope.workspace_id],
+            |row| {
+                let queued_count: i64 = row.get(0)?;
+                let entries_with_retries: i64 = row.get(1)?;
+                let max_retry_count: i64 = row.get(2)?;
+                let total_payload_bytes: i64 = row.get(3)?;
+                let oldest_raw: Option<String> = row.get(4)?;
+                let newest_raw: Option<String> = row.get(5)?;
+                Ok((
+                    queued_count,
+                    entries_with_retries,
+                    max_retry_count,
+                    total_payload_bytes,
+                    oldest_raw,
+                    newest_raw,
+                ))
+            },
+        )
+        .map_err(|e| {
+            OutboxStatusError::CorruptDatabase(format!("failed to compute queue summary: {e}"))
+        })?;
+
+    let (queued_count, entries_with_retries, max_retry, total_bytes, oldest_raw, newest_raw) =
+        summary_row;
+
+    // 10. Validate ISO timestamps if present
+    let oldest_enqueued_at = match oldest_raw {
+        Some(ref s) => {
+            let dt = s.parse::<DateTime<Utc>>().map_err(|_| {
+                OutboxStatusError::CorruptRecord(
+                    "invalid persisted timestamp in oldest_enqueued_at".into(),
+                )
+            })?;
+            Some(dt)
+        }
+        None => None,
+    };
+
+    let newest_enqueued_at = match newest_raw {
+        Some(ref s) => {
+            let dt = s.parse::<DateTime<Utc>>().map_err(|_| {
+                OutboxStatusError::CorruptRecord(
+                    "invalid persisted timestamp in newest_enqueued_at".into(),
+                )
+            })?;
+            Some(dt)
+        }
+        None => None,
+    };
+
+    Ok(OutboxStatusReport {
+        format_version: 1,
+        scope: scope.clone(),
+        durable_queue: DurableQueueSummary {
+            queued_count: queued_count as u64,
+            entries_with_retries: entries_with_retries as u64,
+            max_retry_count: max_retry as u32,
+            total_payload_bytes: total_bytes as u64,
+            oldest_enqueued_at,
+            newest_enqueued_at,
+        },
+        remote_delivery_state: "untracked_in_offline_outbox".to_string(),
+    })
 }
