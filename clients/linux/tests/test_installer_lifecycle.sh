@@ -128,7 +128,7 @@ test_foreign_file_conflict_refusal() {
   [ "${failed}" = "0" ] && [ "${content}" = "foreign proprietary payload" ]
 }
 
-# 3. Malformed JSON Manifest Refusal (fails closed)
+# 3. Malformed JSON Manifest Refusal (missing comma or trailing garbage, fails closed)
 test_malformed_manifest_refusal() {
   local temp_dir
   temp_dir="$(mktemp -d)"
@@ -137,9 +137,83 @@ test_malformed_manifest_refusal() {
   mkdir -p "${prefix}/bin" "${prefix}/share/dosi-tracker"
   echo "existing payload" > "${prefix}/bin/dosi-tracker-linux"
 
-  # Write malformed JSON that contains the component string
+  local fake_src="${temp_dir}/fake_bin"
+  create_fake_executable "${fake_src}" "0.1.0"
+
+  local failed="0"
+
+  # Case A: braces and fields present but missing comma
   cat > "${prefix}/share/dosi-tracker/manifest.json" <<EOF
-{ "component": "dosi-tracker-linux-diagnostic-foundation", BROKEN_SYNTAX: [
+{
+  "format_version": 1
+  "component": "dosi-tracker-linux-diagnostic-foundation",
+  "version": "0.1.0",
+  "installed_at": "2026-10-22T00:00:00Z",
+  "prefix": "${prefix}",
+  "bin_dir": "${prefix}/bin",
+  "data_dir": "${prefix}/share/dosi-tracker",
+  "binary_path": "${prefix}/bin/dosi-tracker-linux",
+  "owned_files": [
+    "${prefix}/bin/dosi-tracker-linux"
+  ]
+}
+EOF
+  if bash "${INSTALLER}" install --prefix "${prefix}" --source-bin "${fake_src}" >/dev/null 2>&1; then
+    failed="1"
+  fi
+
+  # Case B: Trailing garbage after closing brace
+  cat > "${prefix}/share/dosi-tracker/manifest.json" <<EOF
+{
+  "format_version": 1,
+  "component": "dosi-tracker-linux-diagnostic-foundation",
+  "version": "0.1.0",
+  "installed_at": "2026-10-22T00:00:00Z",
+  "prefix": "${prefix}",
+  "bin_dir": "${prefix}/bin",
+  "data_dir": "${prefix}/share/dosi-tracker",
+  "binary_path": "${prefix}/bin/dosi-tracker-linux",
+  "owned_files": [
+    "${prefix}/bin/dosi-tracker-linux"
+  ]
+} TRAILING_GARBAGE_BYTES
+EOF
+  if bash "${INSTALLER}" install --prefix "${prefix}" --source-bin "${fake_src}" >/dev/null 2>&1; then
+    failed="1"
+  fi
+
+  local content
+  content="$(cat "${prefix}/bin/dosi-tracker-linux")"
+  rm -rf "${temp_dir}"
+
+  [ "${failed}" = "0" ] && [ "${content}" = "existing payload" ]
+}
+
+# 4. Duplicate Keys in Manifest Refusal
+test_duplicate_keys_manifest_refusal() {
+  local temp_dir
+  temp_dir="$(mktemp -d)"
+
+  local prefix="${temp_dir}/opt/dosi"
+  mkdir -p "${prefix}/bin" "${prefix}/share/dosi-tracker"
+  echo "existing payload" > "${prefix}/bin/dosi-tracker-linux"
+
+  # Manifest with duplicate version key
+  cat > "${prefix}/share/dosi-tracker/manifest.json" <<EOF
+{
+  "format_version": 1,
+  "version": "0.1.0",
+  "version": "0.2.0",
+  "component": "dosi-tracker-linux-diagnostic-foundation",
+  "installed_at": "2026-10-22T00:00:00Z",
+  "prefix": "${prefix}",
+  "bin_dir": "${prefix}/bin",
+  "data_dir": "${prefix}/share/dosi-tracker",
+  "binary_path": "${prefix}/bin/dosi-tracker-linux",
+  "owned_files": [
+    "${prefix}/bin/dosi-tracker-linux"
+  ]
+}
 EOF
 
   local fake_src="${temp_dir}/fake_bin"
@@ -154,11 +228,87 @@ EOF
   content="$(cat "${prefix}/bin/dosi-tracker-linux")"
   rm -rf "${temp_dir}"
 
-  # Must fail closed and preserve existing payload
   [ "${failed}" = "0" ] && [ "${content}" = "existing payload" ]
 }
 
-# 4. Mismatched Prefix/Binary Manifest Refusal (fails closed)
+# 5. Invalid owned_files Structure Refusal
+test_invalid_owned_files_refusal() {
+  local temp_dir
+  temp_dir="$(mktemp -d)"
+
+  local prefix="${temp_dir}/opt/dosi"
+  mkdir -p "${prefix}/bin" "${prefix}/share/dosi-tracker"
+  echo "existing payload" > "${prefix}/bin/dosi-tracker-linux"
+
+  local fake_src="${temp_dir}/fake_bin"
+  create_fake_executable "${fake_src}" "0.1.0"
+
+  local failed="0"
+
+  # Case A: Empty owned_files array
+  cat > "${prefix}/share/dosi-tracker/manifest.json" <<EOF
+{
+  "format_version": 1,
+  "component": "dosi-tracker-linux-diagnostic-foundation",
+  "version": "0.1.0",
+  "installed_at": "2026-10-22T00:00:00Z",
+  "prefix": "${prefix}",
+  "bin_dir": "${prefix}/bin",
+  "data_dir": "${prefix}/share/dosi-tracker",
+  "binary_path": "${prefix}/bin/dosi-tracker-linux",
+  "owned_files": []
+}
+EOF
+  if bash "${INSTALLER}" install --prefix "${prefix}" --source-bin "${fake_src}" >/dev/null 2>&1; then
+    failed="1"
+  fi
+
+  # Case B: owned_files is not an array (string)
+  cat > "${prefix}/share/dosi-tracker/manifest.json" <<EOF
+{
+  "format_version": 1,
+  "component": "dosi-tracker-linux-diagnostic-foundation",
+  "version": "0.1.0",
+  "installed_at": "2026-10-22T00:00:00Z",
+  "prefix": "${prefix}",
+  "bin_dir": "${prefix}/bin",
+  "data_dir": "${prefix}/share/dosi-tracker",
+  "binary_path": "${prefix}/bin/dosi-tracker-linux",
+  "owned_files": "not_an_array"
+}
+EOF
+  if bash "${INSTALLER}" install --prefix "${prefix}" --source-bin "${fake_src}" >/dev/null 2>&1; then
+    failed="1"
+  fi
+
+  # Case C: binary_path not listed in owned_files
+  cat > "${prefix}/share/dosi-tracker/manifest.json" <<EOF
+{
+  "format_version": 1,
+  "component": "dosi-tracker-linux-diagnostic-foundation",
+  "version": "0.1.0",
+  "installed_at": "2026-10-22T00:00:00Z",
+  "prefix": "${prefix}",
+  "bin_dir": "${prefix}/bin",
+  "data_dir": "${prefix}/share/dosi-tracker",
+  "binary_path": "${prefix}/bin/dosi-tracker-linux",
+  "owned_files": [
+    "${prefix}/share/dosi-tracker/other_file"
+  ]
+}
+EOF
+  if bash "${INSTALLER}" install --prefix "${prefix}" --source-bin "${fake_src}" >/dev/null 2>&1; then
+    failed="1"
+  fi
+
+  local content
+  content="$(cat "${prefix}/bin/dosi-tracker-linux")"
+  rm -rf "${temp_dir}"
+
+  [ "${failed}" = "0" ] && [ "${content}" = "existing payload" ]
+}
+
+# 6. Mismatched Prefix/Binary Manifest Refusal (fails closed)
 test_mismatched_prefix_manifest_refusal() {
   local temp_dir
   temp_dir="$(mktemp -d)"
@@ -173,13 +323,15 @@ test_mismatched_prefix_manifest_refusal() {
   "format_version": 1,
   "component": "dosi-tracker-linux-diagnostic-foundation",
   "version": "0.1.0",
+  "installed_at": "2026-10-22T00:00:00Z",
   "prefix": "/another/unrelated/prefix",
   "bin_dir": "/another/unrelated/prefix/bin",
   "data_dir": "/another/unrelated/prefix/share/dosi-tracker",
   "binary_path": "/another/unrelated/prefix/bin/dosi-tracker-linux",
   "owned_files": [
     "/another/unrelated/prefix/bin/dosi-tracker-linux"
-  ]
+  ],
+  "previous_version": null
 }
 EOF
 
@@ -288,7 +440,90 @@ test_rollback_refuses_to_overwrite_unmanaged_foreign_destination() {
   [ "${failed}" = "0" ] && [ "${content}" = "foreign protected file" ]
 }
 
-# 8. Rollback Restores Complete Managed State (Binary, Manifest, Version)
+# 10. Rollback Refuses Foreign-Prefix or Mismatched Backup (Preserves Current State & Sentinels)
+test_rollback_refuses_foreign_prefix_or_mismatched_backup() {
+  local temp_dir
+  temp_dir="$(mktemp -d)"
+
+  local prefix="${temp_dir}/opt/dosi"
+  local fake_src1="${temp_dir}/fake_bin_1"
+  create_fake_executable "${fake_src1}" "1.0.0"
+
+  # Fresh install v1.0.0
+  bash "${INSTALLER}" install --prefix "${prefix}" --source-bin "${fake_src1}" >/dev/null
+
+  # Place user config sentinel
+  local config_dir="${temp_dir}/home/.config/dosi-tracker"
+  mkdir -p "${config_dir}"
+  echo "precious_user_consent" > "${config_dir}/consent.json"
+
+  # Place foreign sentinel file
+  echo "unrelated_sentinel_data" > "${prefix}/share/unrelated.txt"
+
+  # Now craft a backup manifest with a foreign prefix
+  local backup_dir="${prefix}/share/dosi-tracker/backup"
+  mkdir -p "${backup_dir}"
+  local backup_bin="${backup_dir}/dosi-tracker-linux.prev"
+  create_fake_executable "${backup_bin}" "0.9.0"
+
+  # Backup manifest is valid JSON, but has prefix /foreign/opt/dosi
+  cat > "${backup_dir}/manifest.json.prev" <<EOF
+{
+  "format_version": 1,
+  "component": "dosi-tracker-linux-diagnostic-foundation",
+  "version": "0.9.0",
+  "installed_at": "2026-10-22T00:00:00Z",
+  "prefix": "/foreign/opt/dosi",
+  "bin_dir": "/foreign/opt/dosi/bin",
+  "data_dir": "/foreign/opt/dosi/share/dosi-tracker",
+  "binary_path": "/foreign/opt/dosi/bin/dosi-tracker-linux",
+  "owned_files": [
+    "/foreign/opt/dosi/bin/dosi-tracker-linux"
+  ],
+  "previous_version": null
+}
+EOF
+  echo "0.9.0" > "${backup_dir}/current_version.prev"
+
+  # Record current state before rollback attempt
+  local bin_path="${prefix}/bin/dosi-tracker-linux"
+  if [ ! -f "${bin_path}" ] && [ -f "${prefix}/bin/dosi-tracker-linux.exe" ]; then
+    bin_path="${prefix}/bin/dosi-tracker-linux.exe"
+  fi
+
+  local cur_bin_content cur_manifest_content cur_version_content
+  cur_bin_content="$("${bin_path}" --version)"
+  cur_manifest_content="$(cat "${prefix}/share/dosi-tracker/manifest.json")"
+  cur_version_content="$(cat "${prefix}/share/dosi-tracker/current_version")"
+
+  # Attempt rollback: MUST FAIL because backup manifest is bound to /foreign/opt/dosi
+  local failed="0"
+  if bash "${INSTALLER}" rollback --prefix "${prefix}" >/dev/null 2>&1; then
+    failed="1"
+  fi
+
+  # Verify current binary, manifest, and version are 100% UNCHANGED
+  local after_bin_content after_manifest_content after_version_content
+  after_bin_content="$("${bin_path}" --version)"
+  after_manifest_content="$(cat "${prefix}/share/dosi-tracker/manifest.json")"
+  after_version_content="$(cat "${prefix}/share/dosi-tracker/current_version")"
+
+  # Verify config and sentinels are completely intact
+  local after_config after_sentinel
+  after_config="$(cat "${config_dir}/consent.json")"
+  after_sentinel="$(cat "${prefix}/share/unrelated.txt")"
+
+  rm -rf "${temp_dir}"
+
+  [ "${failed}" = "0" ] && \
+  [ "${cur_bin_content}" = "${after_bin_content}" ] && \
+  [ "${cur_manifest_content}" = "${after_manifest_content}" ] && \
+  [ "${cur_version_content}" = "${after_version_content}" ] && \
+  [ "${after_config}" = "precious_user_consent" ] && \
+  [ "${after_sentinel}" = "unrelated_sentinel_data" ]
+}
+
+# 11. Rollback Restores Complete Managed State (Binary, Manifest, Version)
 test_rollback_restores_complete_managed_state() {
   local temp_dir
   temp_dir="$(mktemp -d)"
@@ -504,10 +739,13 @@ echo "=== Running Dosi-Tracker Linux Installer Lifecycle Tests ==="
 run_test "Fresh Install to Isolated Prefix" test_fresh_install_to_isolated_temp_prefix
 run_test "Foreign File Conflict Refusal" test_foreign_file_conflict_refusal
 run_test "Malformed JSON Manifest Refusal" test_malformed_manifest_refusal
+run_test "Duplicate Keys Manifest Refusal" test_duplicate_keys_manifest_refusal
+run_test "Invalid owned_files Structure Refusal" test_invalid_owned_files_refusal
 run_test "Mismatched Prefix Manifest Refusal" test_mismatched_prefix_manifest_refusal
 run_test "Sibling Prefix & Dot-Dot Traversal Refusal" test_sibling_prefix_and_dot_dot_escape_refusal
 run_test "Ancestor & Explicit Symlink Escape Refusal" test_ancestor_and_explicit_symlink_escape_refusal
 run_test "Rollback Refuses Foreign Destination" test_rollback_refuses_to_overwrite_unmanaged_foreign_destination
+run_test "Rollback Refuses Foreign-Prefix or Mismatched Backup" test_rollback_refuses_foreign_prefix_or_mismatched_backup
 run_test "Rollback Restores Complete Managed State" test_rollback_restores_complete_managed_state
 run_test "Metadata Failure Triggers Complete Rollback" test_metadata_write_failure_fully_rolls_back
 run_test "Smoke Failure Triggers Complete Rollback" test_smoke_check_failure_fully_rolls_back

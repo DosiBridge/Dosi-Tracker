@@ -346,71 +346,192 @@ BACKUP_BIN_EXE_PATH="${BACKUP_DIR}/${TARGET_BIN_NAME}.exe.prev"
 BACKUP_MANIFEST_PATH="${BACKUP_DIR}/manifest.json.prev"
 BACKUP_VERSION_PATH="${BACKUP_DIR}/current_version.prev"
 
-# 3. Structured JSON Manifest Parser & Validator (No eval/source)
+# 3. Structured JSON Manifest Parser & Validator (No eval/source, strict destination binding)
 
-extract_json_string() {
-  local key="$1"
-  local file="$2"
-  sed -n -E "s/^[[:space:]]*\"${key}\"[[:space:]]*:[[:space:]]*\"([^\"]*)\".*/\1/p" "${file}" 2>/dev/null | head -n1
+find_python_prerequisite() {
+  if command -v python3 >/dev/null 2>&1; then
+    echo "python3"
+  elif command -v python >/dev/null 2>&1; then
+    if python -c "import sys; sys.exit(0 if sys.version_info.major >= 3 else 1)" >/dev/null 2>&1; then
+      echo "python"
+    else
+      return 1
+    fi
+  else
+    return 1
+  fi
 }
 
-extract_json_int() {
-  local key="$1"
-  local file="$2"
-  sed -n -E "s/^[[:space:]]*\"${key}\"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p" "${file}" 2>/dev/null | head -n1
-}
+# Real structured manifest validator bound to explicit target destination
+validate_manifest_with_destination() {
+  local manifest_path="$1"
+  local exp_prefix="$2"
+  local exp_bin_dir="$3"
+  local exp_data_dir="$4"
+  local exp_bin_path="$5"
+  local exp_component="${6:-${COMPONENT_NAME}}"
 
-validate_manifest_structure() {
-  local file="$1"
-  if [ ! -f "${file}" ]; then
+  local py_bin
+  py_bin="$(find_python_prerequisite)" || {
+    echo "Error: Python 3 is required for structured JSON manifest validation but was not found in PATH." >&2
+    return 1
+  }
+
+  if [ ! -f "${manifest_path}" ]; then
     return 1
   fi
 
-  # Symlink check on manifest file: must not escape DATA_DIR
-  if [ -L "${file}" ]; then
+  # Symlink escape check on manifest file: must not escape DATA_DIR
+  if [ -L "${manifest_path}" ]; then
     local real_file
-    real_file="$(readlink -f "${file}" 2>/dev/null || true)"
-    if ! is_path_inside_prefix "${real_file}" "${DATA_DIR}"; then
+    real_file="$(readlink -f "${manifest_path}" 2>/dev/null || true)"
+    if ! is_path_inside_prefix "${real_file}" "${exp_data_dir}"; then
+      echo "Error: Manifest file '${manifest_path}' is a symlink escaping data dir '${exp_data_dir}'." >&2
       return 1
     fi
   fi
 
-  # Basic JSON structural check: first non-empty line starts with '{', last with '}'
-  local first_char last_char
-  first_char="$(sed -n '/^[[:space:]]*$/d; s/^[[:space:]]*\(.\).*/\1/p; q' "${file}")"
-  last_char="$(sed -n '/^[[:space:]]*$/d; $ s/.*\(.\)[[:space:]]*$/\1/p' "${file}")"
-  if [ "${first_char}" != "{" ] || [ "${last_char}" != "}" ]; then
-    return 1
-  fi
+  {
+    printf '%s\n' "${exp_prefix}"
+    printf '%s\n' "${exp_bin_dir}"
+    printf '%s\n' "${exp_data_dir}"
+    printf '%s\n' "${exp_bin_path}"
+    printf '%s\n' "${exp_component}"
+    cat "${manifest_path}"
+  } | "${py_bin}" -c '
+import sys
+import json
 
-  local fmt comp ver pref b_dir d_dir bin_p
-  fmt="$(extract_json_int "format_version" "${file}")"
-  comp="$(extract_json_string "component" "${file}")"
-  ver="$(extract_json_string "version" "${file}")"
-  pref="$(extract_json_string "prefix" "${file}")"
-  b_dir="$(extract_json_string "bin_dir" "${file}")"
-  d_dir="$(extract_json_string "data_dir" "${file}")"
-  bin_p="$(extract_json_string "binary_path" "${file}")"
+lines = []
+for _ in range(5):
+    lines.append(sys.stdin.readline().rstrip("\r\n"))
 
-  if [ "${fmt}" != "1" ]; then
-    return 1
-  fi
-  if [ "${comp}" != "${COMPONENT_NAME}" ]; then
-    return 1
-  fi
-  if [ -z "${ver}" ] || [ -z "${pref}" ] || [ -z "${b_dir}" ] || [ -z "${d_dir}" ] || [ -z "${bin_p}" ]; then
-    return 1
-  fi
+exp_prefix, exp_bin_dir, exp_data_dir, exp_bin_path, exp_component = lines
+raw_manifest = sys.stdin.read()
 
-  # Check owned_files array contains binary_path and manifest
-  if ! grep -q "\"owned_files\"" "${file}" 2>/dev/null; then
-    return 1
-  fi
-  if ! grep -q "\"${bin_p}\"" "${file}" 2>/dev/null; then
-    return 1
-  fi
+def detect_duplicate_keys(pairs):
+    d = {}
+    for k, v in pairs:
+        if k in d:
+            raise ValueError(f"Duplicate key found in manifest: {k!r}")
+        d[k] = v
+    return d
 
-  return 0
+try:
+    data = json.loads(raw_manifest, object_pairs_hook=detect_duplicate_keys)
+except json.JSONDecodeError as e:
+    sys.stderr.write(f"Error: Manifest is invalid JSON: {e}\n")
+    sys.exit(1)
+except ValueError as e:
+    sys.stderr.write(f"Error: {e}\n")
+    sys.exit(1)
+
+if not isinstance(data, dict):
+    sys.stderr.write("Error: Manifest root must be a JSON object\n")
+    sys.exit(1)
+
+allowed_keys = {
+    "format_version", "component", "version", "installed_at",
+    "prefix", "bin_dir", "data_dir", "binary_path", "owned_files", "previous_version"
+}
+unexpected_keys = set(data.keys()) - allowed_keys
+if unexpected_keys:
+    sys.stderr.write(f"Error: Unexpected keys in manifest: {unexpected_keys}\n")
+    sys.exit(1)
+
+# Format version check: must be integer 1 (not bool)
+fmt = data.get("format_version")
+if type(fmt) is not int or fmt != 1:
+    sys.stderr.write(f"Error: format_version must be integer 1, got {fmt!r}\n")
+    sys.exit(1)
+
+# Component check
+comp = data.get("component")
+if not isinstance(comp, str) or (comp != exp_component and comp != "dosi-tracker-linux"):
+    sys.stderr.write(f"Error: component must be {exp_component!r}, got {comp!r}\n")
+    sys.exit(1)
+
+# Version check: nonempty string
+ver = data.get("version")
+if not isinstance(ver, str) or not ver.strip():
+    sys.stderr.write("Error: version must be a non-empty string\n")
+    sys.exit(1)
+
+# installed_at check: nonempty string
+inst = data.get("installed_at")
+if not isinstance(inst, str) or not inst.strip():
+    sys.stderr.write("Error: installed_at must be a non-empty string\n")
+    sys.exit(1)
+
+# prefix check: exact canonical match
+pref = data.get("prefix")
+if not isinstance(pref, str) or pref != exp_prefix:
+    sys.stderr.write(f"Error: prefix mismatch: expected {exp_prefix!r}, got {pref!r}\n")
+    sys.exit(1)
+
+# bin_dir check: exact canonical match
+b_dir = data.get("bin_dir")
+if not isinstance(b_dir, str) or b_dir != exp_bin_dir:
+    sys.stderr.write(f"Error: bin_dir mismatch: expected {exp_bin_dir!r}, got {b_dir!r}\n")
+    sys.exit(1)
+
+# data_dir check: exact canonical match
+d_dir = data.get("data_dir")
+if not isinstance(d_dir, str) or d_dir != exp_data_dir:
+    sys.stderr.write(f"Error: data_dir mismatch: expected {exp_data_dir!r}, got {d_dir!r}\n")
+    sys.exit(1)
+
+# binary_path check: exact match or with .exe on Windows
+bin_p = data.get("binary_path")
+if not isinstance(bin_p, str):
+    sys.stderr.write("Error: binary_path must be a string\n")
+    sys.exit(1)
+
+if bin_p != exp_bin_path and bin_p != (exp_bin_path + ".exe") and (bin_p + ".exe") != exp_bin_path:
+    sys.stderr.write(f"Error: binary_path mismatch: expected {exp_bin_path!r}, got {bin_p!r}\n")
+    sys.exit(1)
+
+# owned_files check: non-empty array of strings
+owned = data.get("owned_files")
+if not isinstance(owned, list) or len(owned) == 0:
+    sys.stderr.write("Error: owned_files must be a non-empty array\n")
+    sys.exit(1)
+
+seen_owned = set()
+prefix_boundary = exp_prefix.rstrip("/") + "/"
+for item in owned:
+    if not isinstance(item, str) or not item.strip():
+        sys.stderr.write(f"Error: Entry in owned_files is not a valid non-empty string: {item!r}\n")
+        sys.exit(1)
+    if item in seen_owned:
+        sys.stderr.write(f"Error: Duplicate file in owned_files array: {item!r}\n")
+        sys.exit(1)
+    seen_owned.add(item)
+    # Confinement check: item must be inside prefix
+    if item != exp_prefix and not item.startswith(prefix_boundary):
+        sys.stderr.write(f"Error: owned file {item!r} is outside prefix {exp_prefix!r}\n")
+        sys.exit(1)
+
+# binary_path MUST be in owned_files array
+if bin_p not in seen_owned and (bin_p + ".exe") not in seen_owned and bin_p.rstrip(".exe") not in seen_owned:
+    sys.stderr.write(f"Error: binary_path {bin_p!r} is not contained in owned_files array\n")
+    sys.exit(1)
+
+# previous_version: null or nonempty string
+prev_ver = data.get("previous_version")
+if prev_ver is not None and (not isinstance(prev_ver, str) or not prev_ver.strip()):
+    sys.stderr.write(f"Error: previous_version must be null or non-empty string, got {prev_ver!r}\n")
+    sys.exit(1)
+
+sys.exit(0)
+'
+}
+
+# Backward compatible helper: delegates to destination-bound validator
+validate_manifest_structure() {
+  local file="$1"
+  local dest_bin="${2:-${TARGET_BIN_PATH}}"
+  validate_manifest_with_destination "${file}" "${CANONICAL_PREFIX}" "${BIN_DIR}" "${DATA_DIR}" "${dest_bin}"
 }
 
 # Verify manifest ownership of an existing binary
@@ -420,47 +541,153 @@ verify_manifest_ownership() {
     return 1
   fi
 
-  if ! validate_manifest_structure "${MANIFEST_PATH}"; then
+  local target_bin="${existing_bin}"
+  if [ -z "${target_bin}" ]; then
+    target_bin="${TARGET_BIN_PATH}"
+  fi
+
+  if ! validate_manifest_with_destination "${MANIFEST_PATH}" "${CANONICAL_PREFIX}" "${BIN_DIR}" "${DATA_DIR}" "${target_bin}"; then
     return 1
   fi
 
-  local m_prefix m_bin_dir m_data_dir m_bin
-  m_prefix="$(extract_json_string "prefix" "${MANIFEST_PATH}")"
-  m_bin_dir="$(extract_json_string "bin_dir" "${MANIFEST_PATH}")"
-  m_data_dir="$(extract_json_string "data_dir" "${MANIFEST_PATH}")"
-  m_bin="$(extract_json_string "binary_path" "${MANIFEST_PATH}")"
-
-  # Exact canonical path binding verification
-  if [ "${m_prefix}" != "${CANONICAL_PREFIX}" ]; then
-    return 1
-  fi
-  if [ "${m_bin_dir}" != "${BIN_DIR}" ]; then
-    return 1
-  fi
-  if [ "${m_data_dir}" != "${DATA_DIR}" ]; then
-    return 1
-  fi
-
-  # If existing_bin specified, it must match binary_path and be in owned_files
-  if [ -n "${existing_bin}" ]; then
-    if [ "${m_bin}" != "${existing_bin}" ]; then
+  # Symlink escape check on existing binary
+  if [ -n "${existing_bin}" ] && [ -L "${existing_bin}" ]; then
+    local b_real
+    b_real="$(readlink -f "${existing_bin}" 2>/dev/null || true)"
+    if ! is_path_inside_prefix "${b_real}" "${BIN_DIR}"; then
       return 1
-    fi
-    if ! grep -q "\"${existing_bin}\"" "${MANIFEST_PATH}" 2>/dev/null; then
-      return 1
-    fi
-
-    # Symlink escape check on existing binary
-    if [ -L "${existing_bin}" ]; then
-      local b_real
-      b_real="$(readlink -f "${existing_bin}" 2>/dev/null || true)"
-      if ! is_path_inside_prefix "${b_real}" "${BIN_DIR}"; then
-        return 1
-      fi
     fi
   fi
 
   return 0
+}
+
+# Helper: parse single field from manifest safely via JSON
+get_manifest_field() {
+  local manifest_file="$1"
+  local field_name="$2"
+  local py_bin
+  py_bin="$(find_python_prerequisite)" || return 1
+
+  {
+    printf '%s\n' "${field_name}"
+    cat "${manifest_file}"
+  } | "${py_bin}" -c '
+import sys
+import json
+
+field = sys.stdin.readline().rstrip("\r\n")
+try:
+    data = json.load(sys.stdin)
+    val = data.get(field)
+    if val is not None:
+        if isinstance(val, (dict, list)):
+            print(json.dumps(val))
+        else:
+            print(val)
+except Exception:
+    sys.exit(1)
+'
+}
+
+# Helper: extract list of owned files from manifest safely via JSON
+get_manifest_owned_files() {
+  local manifest_file="$1"
+  local py_bin
+  py_bin="$(find_python_prerequisite)" || return 1
+
+  cat "${manifest_file}" | "${py_bin}" -c '
+import sys
+import json
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(newline="\n")
+
+try:
+    data = json.load(sys.stdin)
+    for f in data.get("owned_files", []):
+        if isinstance(f, str) and f.strip():
+            sys.stdout.write(f.strip() + "\n")
+except Exception:
+    sys.exit(1)
+'
+}
+
+# Helper: generate manifest JSON safely with proper escaping and input validation
+generate_manifest_json() {
+  local out_file="$1"
+  local component="$2"
+  local version="$3"
+  local installed_at="$4"
+  local prefix="$5"
+  local bin_dir="$6"
+  local data_dir="$7"
+  local binary_path="$8"
+  local manifest_path="$9"
+  local version_path="${10}"
+  local prev_version="${11}"
+
+  local py_bin
+  py_bin="$(find_python_prerequisite)" || {
+    echo "Error: Python 3 is required for JSON manifest generation." >&2
+    return 1
+  }
+
+  {
+    printf '%s\n' "${component}"
+    printf '%s\n' "${version}"
+    printf '%s\n' "${installed_at}"
+    printf '%s\n' "${prefix}"
+    printf '%s\n' "${bin_dir}"
+    printf '%s\n' "${data_dir}"
+    printf '%s\n' "${binary_path}"
+    printf '%s\n' "${manifest_path}"
+    printf '%s\n' "${version_path}"
+    printf '%s\n' "${prev_version}"
+  } | "${py_bin}" -c '
+import sys
+import json
+
+lines = []
+for _ in range(10):
+    lines.append(sys.stdin.readline().rstrip("\r\n"))
+
+component, version, installed_at, prefix, bin_dir, data_dir, binary_path, manifest_path, version_path, prev_version = lines
+
+# Reject unsupported characters (e.g. null bytes) before mutation
+for val, name in [
+    (component, "component"),
+    (version, "version"),
+    (prefix, "prefix"),
+    (bin_dir, "bin_dir"),
+    (data_dir, "data_dir"),
+    (binary_path, "binary_path"),
+]:
+    if "\x00" in val:
+        sys.stderr.write(f"Error: Invalid null byte in {name}\n")
+        sys.exit(1)
+
+prev_v = prev_version if prev_version != "none" and prev_version != "null" and prev_version != "" else None
+
+data = {
+    "format_version": 1,
+    "component": component,
+    "version": version,
+    "installed_at": installed_at,
+    "prefix": prefix,
+    "bin_dir": bin_dir,
+    "data_dir": data_dir,
+    "binary_path": binary_path,
+    "owned_files": [
+        binary_path,
+        manifest_path,
+        version_path
+    ],
+    "previous_version": prev_v
+}
+
+sys.stdout.write(json.dumps(data, indent=2) + "\n")
+' > "${out_file}"
 }
 
 # Helper: check if target binary exists
@@ -570,8 +797,17 @@ do_uninstall() {
 
   echo "==> Uninstalling Dosi-Tracker Linux diagnostic client from ${CANONICAL_PREFIX}..."
 
-  # Remove owned binary
-  if [ -n "${cur_bin}" ] && [ -f "${cur_bin}" ]; then
+  # Remove owned files explicitly recorded in manifest
+  if [ -f "${MANIFEST_PATH}" ]; then
+    local file_to_remove
+    while IFS= read -r file_to_remove; do
+      file_to_remove="${file_to_remove%$'\r'}"
+      if [ -n "${file_to_remove}" ] && [ -f "${file_to_remove}" ]; then
+        rm -f "${file_to_remove}"
+        echo "Removed owned file: ${file_to_remove}"
+      fi
+    done < <(get_manifest_owned_files "${MANIFEST_PATH}")
+  elif [ -n "${cur_bin}" ] && [ -f "${cur_bin}" ]; then
     rm -f "${cur_bin}"
     echo "Removed binary: ${cur_bin}"
   fi
@@ -612,15 +848,20 @@ do_rollback() {
     exit 1
   fi
 
+  local dest_bin="${TARGET_BIN_PATH}"
+  if [[ "${backup_bin}" == *.exe.prev ]]; then
+    dest_bin="${TARGET_BIN_EXE_PATH}"
+  fi
+
   # Check symlink escapes on backup files
   if [ -L "${backup_bin}" ] || [ -L "${BACKUP_MANIFEST_PATH}" ]; then
     echo "Error: Backup file is a symlink. Rollback aborted." >&2
     exit 1
   fi
 
-  # Validate backup manifest structure
-  if ! validate_manifest_structure "${BACKUP_MANIFEST_PATH}"; then
-    echo "Error: Backup manifest is corrupted or invalid. Rollback aborted." >&2
+  # Validate backup manifest with destination binding
+  if ! validate_manifest_with_destination "${BACKUP_MANIFEST_PATH}" "${CANONICAL_PREFIX}" "${BIN_DIR}" "${DATA_DIR}" "${dest_bin}"; then
+    echo "Error: Backup manifest is corrupted, invalid, or does not match target prefix/binary. Rollback aborted." >&2
     exit 1
   fi
 
@@ -633,11 +874,6 @@ do_rollback() {
       echo "Refusing to overwrite unmanaged foreign destination during rollback." >&2
       exit 1
     fi
-  fi
-
-  local dest_bin="${TARGET_BIN_PATH}"
-  if [[ "${backup_bin}" == *.exe.prev ]]; then
-    dest_bin="${TARGET_BIN_EXE_PATH}"
   fi
 
   # Smoke test backup binary before touching destination
@@ -756,30 +992,24 @@ do_install_or_update() {
   local timestamp
   timestamp="$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date +"%Y-%m-%d %H:%M:%S")"
 
-  cat > "${staged_manifest}" <<EOF
-{
-  "format_version": 1,
-  "component": "${COMPONENT_NAME}",
-  "version": "${detected_version}",
-  "installed_at": "${timestamp}",
-  "prefix": "${CANONICAL_PREFIX}",
-  "bin_dir": "${BIN_DIR}",
-  "data_dir": "${DATA_DIR}",
-  "binary_path": "${final_bin}",
-  "owned_files": [
-    "${final_bin}",
-    "${MANIFEST_PATH}",
-    "${CURRENT_VERSION_PATH}"
-  ],
-  "previous_version": "${prev_version}"
-}
-EOF
+  generate_manifest_json \
+    "${staged_manifest}" \
+    "${COMPONENT_NAME}" \
+    "${detected_version}" \
+    "${timestamp}" \
+    "${CANONICAL_PREFIX}" \
+    "${BIN_DIR}" \
+    "${DATA_DIR}" \
+    "${final_bin}" \
+    "${MANIFEST_PATH}" \
+    "${CURRENT_VERSION_PATH}" \
+    "${prev_version}"
 
   echo "${detected_version}" > "${staged_version}"
 
-  # Validate the staged manifest structure before touching live files
-  if ! validate_manifest_structure "${staged_manifest}"; then
-    echo "Error: Staged manifest failed structural validation." >&2
+  # Validate the staged manifest structure and destination binding before touching live files
+  if ! validate_manifest_with_destination "${staged_manifest}" "${CANONICAL_PREFIX}" "${BIN_DIR}" "${DATA_DIR}" "${final_bin}"; then
+    echo "Error: Staged manifest failed structured validation." >&2
     exit 1
   fi
 

@@ -1684,6 +1684,65 @@ Isolated regressions executed in temporary isolated HOME/prefix fixtures (`clien
 2. **Host Toolchain vs Native Linux Evidence Separation**: All shell regressions were executed using Git-Bash / MSYS2 on Windows. While providing isolated directory testing, this does **NOT** constitute independent PM acceptance or native Linux kernel/libc runtime verification.
 3. **Scope Discipline**: No real sensor adapters (X11/Wayland/PipeWire), network synchronization, credential services, or system/root mutations were introduced.
 
+---
+
+## 25. Real Structured Manifest Validation & Destination-Bound Rollback (`linux-installer-real-manifest-validation-20261022-G`)
+
+> **Execution Date:** October 22, 2026  
+> **Phase Task ID:** `linux-installer-real-manifest-validation-20261022-G`  
+> **Status:** Completed & Source-Verified (37 Rust tests passed in `clients/linux`, 17 shell lifecycle tests passed, 50 frontend tests passed, typecheck clean, fmt clean, check clean)  
+> **Target Package:** `clients/linux` (scripts: `install.sh`, `uninstall.sh`; crate: `dosi-tracker-linux` v0.1.0; tests: `test_installer_lifecycle.sh`, `installer_lifecycle_tests.rs`)  
+
+### A. Context & Bounded Source Defects Corrected
+In continuation of task `linux-installer-real-manifest-validation-20261022-G`, critical manifest structure validation, duplicate-key detection, ownership array parsing, and destination-bound rollback defects in `clients/linux/scripts/install.sh` were corrected:
+1. **Replacement of Pseudo-JSON Parsing with Portable Structured Validation (`validate_manifest_with_destination`)**:
+   - *Defect:* Prior `validate_manifest_structure` relied on rudimentary first/last brace checks (`first_char == '{'`, `last_char == '}'`), line-by-line `sed` extractions, and global `grep -q "\"${bin_p}\""`. This pseudo-parser accepted syntactically malformed JSON (missing commas between fields, trailing garbage), silently tolerated duplicate keys, and failed to parse `owned_files` as a real JSON array. In particular, grepping for `binary_path` matched the `"binary_path": "..."` JSON key declaration itself, falsely validating manifests even when `owned_files` was an empty array `[]` or a non-array scalar!
+   - *Correction:* Replaced all regex and pseudo-JSON handling with real structured JSON validation using an explicit, portable prerequisite (`python3` or `python` with standard library `json`), strictly avoiding `eval` or `source`. Enforces:
+     - Exact `format_version == 1` as an integer (`type(v) is int and not isinstance(v, bool)`).
+     - Component name strictly matching `dosi-tracker-linux-diagnostic-foundation` or `dosi-tracker-linux`.
+     - Non-empty version string.
+     - Detection and rejection of duplicate keys via `object_pairs_hook=detect_duplicate_keys`.
+     - Rejection of malformed JSON, trailing garbage, or truncated documents.
+     - Exact canonical destination bindings for `prefix`, `bin_dir`, `data_dir`, and `binary_path`.
+     - `owned_files` verified as a non-empty array of strings where every item is confined to canonical prefix, and candidate `binary_path` is explicitly verified to be an entry in `owned_files`.
+2. **Destination-Bound Rollback Manifest Validation (`do_rollback`)**:
+   - *Defect:* `do_rollback` only checked the backup manifest structure in isolation and never bound the backup manifest's `prefix`, `bin_dir`, `data_dir`, or `binary_path` to the active destination prefix. As a result, a syntactically valid backup from a foreign prefix could be restored into the current prefix, corrupting local metadata.
+   - *Correction:* `do_rollback` now resolves destination paths (`CANONICAL_PREFIX`, `BIN_DIR`, `DATA_DIR`, `dest_bin`) and invokes `validate_manifest_with_destination "$BACKUP_MANIFEST_PATH" "$CANONICAL_PREFIX" "$BIN_DIR" "$DATA_DIR" "$dest_bin"`. Any backup with a foreign prefix or mismatched binary path is rejected fail-closed before any file is restored, keeping the live binary, manifest, current version, user configs, and foreign sentinels unchanged.
+3. **Safe JSON Generation & Uninstallation Parsing (`generate_manifest_json`, `get_manifest_owned_files`, `do_uninstall`)**:
+   - *Defect:* Manifest generation previously constructed raw JSON via `cat <<EOF` without escaping arbitrary path characters or checking for null bytes before mutation. Uninstallation relied on text filtering instead of structured array reading.
+   - *Correction:* `generate_manifest_json` uses Python's standard `json.dumps` with input validation (rejecting null bytes before filesystem mutations). `do_uninstall` retrieves owned files via `get_manifest_owned_files` (structured JSON extraction), safely removing only owned files while preserving unmanaged user configurations (`~/.config/dosi-tracker`) and foreign sentinels.
+4. **Decoupled Rust Test Harness (`installer_lifecycle_tests.rs`)**:
+   - *Defect:* Rust integration test wrapper asserted a hardcoded string `assert!(stdout.contains("Passed: 14"));`, coupling crate test passes to an obsolete shell test count.
+   - *Correction:* Refactored to dynamically assert `output.status.success()`, `stdout.contains("Failed: 0")`, and non-zero passes (`stdout.contains("Passed: ") && !stdout.contains("Passed: 0\n")`).
+
+### B. Failing-Before Production Repro & Passing-After Outcomes
+1. **Failing-Before Repro on Prior Implementation (`scratch/test_prior_flaw.sh`)**:
+   - Manifest with missing comma between fields and empty `owned_files: []`:
+     - Prior `validate_manifest_structure` exited `0` (accepted malformed JSON and matched `"binary_path"` property key as ownership proof).
+2. **Passing-After in Expanded Shell Suite (`clients/linux/tests/test_installer_lifecycle.sh` - 17 Tests Total)**:
+   - **Test 3 (Malformed JSON Manifest Refusal)**: Verifies that missing commas or trailing garbage after closing brace are rejected fail-closed with `Manifest is invalid JSON: ...` (exit 1).
+   - **Test 4 (Duplicate Keys Manifest Refusal)**: Verifies that duplicate JSON keys (e.g. repeated `"version"`) are rejected fail-closed with `Duplicate key in manifest: ...` (exit 1).
+   - **Test 5 (Invalid `owned_files` Structure Refusal)**: Verifies that empty `owned_files: []`, scalar string `owned_files: "not-an-array"`, or `owned_files` omitting `binary_path` are rejected fail-closed with `Manifest owned_files is not a valid list of files containing binary_path` (exit 1).
+   - **Test 10 (Rollback Refuses Foreign-Prefix or Mismatched Backup)**: Verifies that a valid backup manifest from foreign prefix `/tmp/dosi-foreign-prefix` is refused during rollback with `Manifest prefix does not match expected destination prefix` (exit 1). Asserts that the live binary, live manifest, current version, user config, and foreign sentinels remain 100% unchanged.
+   - **Tests 1, 2, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 17**: Verify valid positive fresh installation, conflict refusal, prefix confinement, symlink escape detection, update staging, atomic rollback on injected metadata/smoke failure, doctor diagnostic integration, config preservation, and idempotent uninstallation.
+
+### C. Executed Test Suites & Quality Gates
+| Target Suite | Exact Command Line | Tests Passed | Ignored | Result | Exit Code | Evidence Level |
+|---|---|:---:|:---:|:---:|:---:|---|
+| **Linux Unit, CLI, Repro & Installer Tests** | `cargo test` in `clients/linux` | 37 passed (21 unit + 6 doctor CLI + 7 repro + 3 installer integration) | 0 | PASSED | **0** | **[Worker-Reported (Windows Host Toolchain)]** |
+| **Shell Installer Lifecycle Suite** | `bash clients/linux/tests/test_installer_lifecycle.sh` | 17 passed (all malformed JSON, duplicate keys, empty ownership, foreign-prefix rollback, atomic rollback, and doctor scenarios) | 0 | PASSED | **0** | **[Worker-Reported (Git-Bash Host Toolchain)]** |
+| **Linux Code Formatting** | `cargo fmt --check` in `clients/linux` | N/A | 0 diffs | PASSED | **0** | **[Worker-Reported]** |
+| **Linux Compilation Check** | `cargo check` in `clients/linux` | N/A | 0 errors, 0 warnings | PASSED | **0** | **[Worker-Reported]** |
+| **Frontend Acceptance Suite** | `npx vitest run src/middleware.test.ts src/components/dashboard/agent-setup.test.tsx src/test/acceptance/agent-onboarding.test.tsx src/test/acceptance/install-guides.test.tsx src/test/architecture.spec.ts` | 50 passed | 0 | PASSED | **0** | **[Worker-Reported (Focused 5-File Suite)]** |
+| **Frontend Typecheck** | `npm run typecheck` in `frontend` | N/A | 0 errors | PASSED | **0** | **[Worker-Reported]** |
+
+### D. PM QA Boundary Limits & Acceptance Disclosures
+1. **Prior Unresolved Approval Invariant**: The approval-blocked command `tirith:archive_extract` remains unresolved. Worker has **NOT** retried, repackaged, or delegated that command, nor modified archive extraction approvals.
+2. **Host Toolchain vs Native Linux Evidence Separation**: All shell regressions were executed using Git-Bash / MSYS2 on Windows. While providing isolated directory testing, this does **NOT** constitute independent PM acceptance or native Linux kernel/libc runtime verification.
+3. **No Crash-Atomic Transaction Claims**: Sequential `cp`/`mv` operations do not provide crash-atomic multi-file filesystem transactions across unexpected host power loss or kernel crashes. Staging and backup/rollback mechanisms provide application-level failure recovery during script execution.
+4. **Scope Discipline**: No real sensor adapters (X11/Wayland/PipeWire), network synchronization, credential services, background daemons, or system/root mutations were introduced.
+
+
 
 
 
