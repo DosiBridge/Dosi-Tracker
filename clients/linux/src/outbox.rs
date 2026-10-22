@@ -6,6 +6,9 @@
 //! Key Invariants:
 //! - Strictly scoped by `(account_id, workspace_id)`. Entries from different workspaces
 //!   or user accounts are isolated; identical activity IDs in different scopes do not collide.
+//! - Bounded metadata on all public boundaries: Account IDs, workspace IDs, client activity IDs,
+//!   diagnostic messages, and numeric limits have explicit finite byte bounds. Bypassing constructors
+//!   via direct struct instantiation or deserialization is caught on every API boundary.
 //! - Idempotent re-enqueue: Re-submitting identical payload with the same identity succeeds
 //!   without creating duplicate entries.
 //! - Conflict safety: Re-submitting different content under an already-queued identity
@@ -16,22 +19,38 @@
 //!   are strictly forbidden from the outbox envelope.
 //! - Explicit bounds enforcement: Queue cardinality and payload size limits are enforced
 //!   before mutation; overflows are rejected explicitly rather than silently dropped.
-//! - Fail-closed corruption recovery: Corrupt or damaged database files fail closed without
-//!   destructive resets or deleting user data.
+//! - Coherent store versioning: Stamped with SQLite `PRAGMA user_version`. Future store
+//!   versions fail closed with [`OutboxError::UnsupportedStoreVersion`] without auto-downgrade.
+//! - Fail-closed corruption recovery: Corrupt database files or malformed persisted rows fail
+//!   closed without destructive resets, deleting user data, or fabricating fallback timestamps.
+//! - Transparent lookup errors: Row lookups use `OptionalExtension::optional` so genuine
+//!   database errors propagate immediately rather than being masked as absent rows.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
 /// Current schema version for outbox storage.
 pub const OUTBOX_SCHEMA_VERSION: u32 = 1;
 
+/// Maximum byte length for account identifier strings (256 bytes).
+pub const MAX_ACCOUNT_ID_BYTES: usize = 256;
+
+/// Maximum byte length for workspace identifier strings (256 bytes).
+pub const MAX_WORKSPACE_ID_BYTES: usize = 256;
+
+/// Maximum byte length for client activity identifier strings (256 bytes).
+pub const MAX_CLIENT_ACTIVITY_ID_BYTES: usize = 256;
+
+/// Maximum byte length for retry diagnostic error messages (1024 bytes).
+pub const MAX_ERROR_MESSAGE_BYTES: usize = 1024;
+
 /// Scope identifying the user account and workspace for an outbox entry.
 ///
-/// Both identifiers are normalized and required to be non-empty.
+/// Both identifiers are normalized and required to be non-empty and bounded.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct OutboxScope {
     pub account_id: String,
@@ -50,21 +69,55 @@ impl OutboxScope {
         let account = account_id.into().trim().to_lowercase();
         let workspace = workspace_id.into().trim().to_string();
 
+        let scope = Self {
+            account_id: account,
+            workspace_id: workspace,
+        };
+        scope.validate()?;
+        Ok(scope)
+    }
+
+    /// Validates scope fields against length, empty, and control character invariants.
+    ///
+    /// Called on all public API boundaries to enforce constraints even if the struct
+    /// was instantiated directly or deserialized.
+    pub fn validate(&self) -> Result<(), OutboxError> {
+        let account = self.account_id.trim();
+        let workspace = self.workspace_id.trim();
+
         if account.is_empty() {
             return Err(OutboxError::InvalidScope(
                 "account_id cannot be empty".into(),
             ));
         }
+        if account.len() > MAX_ACCOUNT_ID_BYTES {
+            return Err(OutboxError::InvalidScope(format!(
+                "account_id exceeds maximum length of {MAX_ACCOUNT_ID_BYTES} bytes"
+            )));
+        }
+        if account.chars().any(|c| c.is_control()) {
+            return Err(OutboxError::InvalidScope(
+                "account_id cannot contain control characters".into(),
+            ));
+        }
+
         if workspace.is_empty() {
             return Err(OutboxError::InvalidScope(
                 "workspace_id cannot be empty".into(),
             ));
         }
+        if workspace.len() > MAX_WORKSPACE_ID_BYTES {
+            return Err(OutboxError::InvalidScope(format!(
+                "workspace_id exceeds maximum length of {MAX_WORKSPACE_ID_BYTES} bytes"
+            )));
+        }
+        if workspace.chars().any(|c| c.is_control()) {
+            return Err(OutboxError::InvalidScope(
+                "workspace_id cannot contain control characters".into(),
+            ));
+        }
 
-        Ok(Self {
-            account_id: account,
-            workspace_id: workspace,
-        })
+        Ok(())
     }
 }
 
@@ -112,10 +165,30 @@ impl ActivityEnvelope {
         if self.format_version != Self::CURRENT_FORMAT_VERSION {
             return Err(OutboxError::UnsupportedFormatVersion(self.format_version));
         }
-        if self.client_activity_id.trim().is_empty() {
+        let act_id = self.client_activity_id.trim();
+        if act_id.is_empty() {
             return Err(OutboxError::InvalidEnvelope(
                 "client_activity_id cannot be empty".into(),
             ));
+        }
+        if act_id.len() > MAX_CLIENT_ACTIVITY_ID_BYTES {
+            return Err(OutboxError::InvalidEnvelope(format!(
+                "client_activity_id exceeds maximum length of {MAX_CLIENT_ACTIVITY_ID_BYTES} bytes"
+            )));
+        }
+        if act_id.chars().any(|c| c.is_control()) {
+            return Err(OutboxError::InvalidEnvelope(
+                "client_activity_id cannot contain control characters".into(),
+            ));
+        }
+        if let Some(ref proj_id) = self.project_id {
+            if proj_id.len() > MAX_CLIENT_ACTIVITY_ID_BYTES
+                || proj_id.chars().any(|c| c.is_control())
+            {
+                return Err(OutboxError::InvalidEnvelope(
+                    "project_id contains invalid characters or exceeds maximum length".into(),
+                ));
+            }
         }
         if self.started_at > self.ended_at {
             return Err(OutboxError::InvalidEnvelope(
@@ -129,11 +202,27 @@ impl ActivityEnvelope {
                 ));
             }
         }
+        if self.platform.len() > 64 || self.agent_version.len() > 64 {
+            return Err(OutboxError::InvalidEnvelope(
+                "platform or agent_version exceeds maximum length".into(),
+            ));
+        }
+        if let Some(ref desc) = self.description {
+            if desc.len() > 2048 {
+                return Err(OutboxError::InvalidEnvelope(
+                    "description exceeds maximum length of 2048 bytes".into(),
+                ));
+            }
+        }
         Ok(())
     }
 }
 
 /// Bounded capacity and size limits for the outbox.
+///
+/// NOTE: `max_total_payload_bytes` bounds envelope payload JSON storage across all queued
+/// rows; it is not a complete disk-space guarantee because database file allocation also
+/// includes SQLite page headers, B-tree indexes, WAL journals, and bounded metadata columns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboxLimits {
     /// Maximum number of queued records across all scopes.
@@ -157,6 +246,38 @@ impl Default for OutboxLimits {
             default_page_limit: 50,
             max_page_limit: 200,
         }
+    }
+}
+
+impl OutboxLimits {
+    /// Validates that numeric limits are positive and coherently bounded.
+    pub fn validate(&self) -> Result<(), OutboxError> {
+        if self.max_records == 0 {
+            return Err(OutboxError::InvalidLimits(
+                "max_records must be greater than zero".into(),
+            ));
+        }
+        if self.max_payload_bytes == 0 {
+            return Err(OutboxError::InvalidLimits(
+                "max_payload_bytes must be greater than zero".into(),
+            ));
+        }
+        if self.max_total_payload_bytes < self.max_payload_bytes as u64 {
+            return Err(OutboxError::InvalidLimits(
+                "max_total_payload_bytes cannot be less than max_payload_bytes".into(),
+            ));
+        }
+        if self.max_page_limit == 0 || self.max_page_limit > (i64::MAX as usize) {
+            return Err(OutboxError::InvalidLimits(
+                "max_page_limit must be greater than zero and within positive integer range".into(),
+            ));
+        }
+        if self.default_page_limit == 0 || self.default_page_limit > self.max_page_limit {
+            return Err(OutboxError::InvalidLimits(
+                "default_page_limit must be greater than zero and <= max_page_limit".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -195,10 +316,16 @@ pub enum OutboxError {
     InvalidScope(String),
     /// Invalid envelope content.
     InvalidEnvelope(String),
-    /// Unsupported format version.
+    /// Invalid queue configuration limits.
+    InvalidLimits(String),
+    /// Unsupported envelope format version.
     UnsupportedFormatVersion(u32),
+    /// Unsupported database store schema version.
+    UnsupportedStoreVersion(u32),
     /// Single envelope payload exceeds configured byte limit.
     PayloadTooLarge { size: usize, max: usize },
+    /// Diagnostic error message exceeds configured byte limit.
+    DiagnosticMessageTooLarge { size: usize, max: usize },
     /// Total record count exceeds queue cardinality limit.
     QueueFull { count: u32, max: u32 },
     /// Total storage quota exceeded.
@@ -211,6 +338,8 @@ pub enum OutboxError {
     ConflictingIdentity { client_activity_id: String },
     /// Operation targeted an entry that does not exist in the specified scope.
     RecordNotFound { client_activity_id: String },
+    /// Persisted record is corrupted or semantically invalid.
+    CorruptRecord { id: i64, reason: String },
     /// Database file is corrupt or invalid.
     CorruptDatabase(String),
     /// SQLite storage error.
@@ -224,11 +353,24 @@ impl std::fmt::Display for OutboxError {
         match self {
             Self::InvalidScope(msg) => write!(f, "Invalid outbox scope: {msg}"),
             Self::InvalidEnvelope(msg) => write!(f, "Invalid activity envelope: {msg}"),
+            Self::InvalidLimits(msg) => write!(f, "Invalid outbox limits: {msg}"),
             Self::UnsupportedFormatVersion(v) => write!(f, "Unsupported format version: {v}"),
+            Self::UnsupportedStoreVersion(v) => {
+                write!(
+                    f,
+                    "Unsupported outbox store version: {v} (current supported version is {OUTBOX_SCHEMA_VERSION})"
+                )
+            }
             Self::PayloadTooLarge { size, max } => {
                 write!(
                     f,
                     "Payload size ({size} bytes) exceeds maximum limit ({max} bytes)"
+                )
+            }
+            Self::DiagnosticMessageTooLarge { size, max } => {
+                write!(
+                    f,
+                    "Diagnostic message size ({size} bytes) exceeds maximum limit ({max} bytes)"
                 )
             }
             Self::QueueFull { count, max } => {
@@ -245,13 +387,19 @@ impl std::fmt::Display for OutboxError {
                 )
             }
             Self::ConflictingIdentity { client_activity_id } => {
-                write!(f, "Conflicting payload already queued for client_activity_id '{client_activity_id}'")
+                write!(
+                    f,
+                    "Conflicting payload already queued for client_activity_id '{client_activity_id}'"
+                )
             }
             Self::RecordNotFound { client_activity_id } => {
                 write!(
                     f,
                     "Record '{client_activity_id}' not found in specified scope"
                 )
+            }
+            Self::CorruptRecord { id, reason } => {
+                write!(f, "Corrupted outbox record #{id}: {reason}")
             }
             Self::CorruptDatabase(msg) => {
                 write!(f, "Outbox database is corrupted or damaged: {msg}")
@@ -285,6 +433,7 @@ impl From<serde_json::Error> for OutboxError {
 }
 
 /// Durable, thread-safe activity outbox.
+#[derive(Debug)]
 pub struct Outbox {
     db_path: PathBuf,
     conn: Mutex<Connection>,
@@ -294,9 +443,13 @@ pub struct Outbox {
 impl Outbox {
     /// Opens or initializes a durable outbox at the specified filesystem path.
     ///
-    /// If the file already exists, it verifies integrity using `PRAGMA quick_check`.
+    /// If the file already exists, it verifies integrity using `PRAGMA quick_check` and
+    /// checks schema version compatibility via `PRAGMA user_version`.
     /// Corrupt databases return [`OutboxError::CorruptDatabase`] and are NOT destroyed.
+    /// Databases with a future store version return [`OutboxError::UnsupportedStoreVersion`].
     pub fn open(path: impl AsRef<Path>, limits: OutboxLimits) -> Result<Self, OutboxError> {
+        limits.validate()?;
+
         let db_path = path.as_ref().to_path_buf();
 
         if let Some(parent) = db_path.parent() {
@@ -321,6 +474,12 @@ impl Outbox {
                 return Err(OutboxError::CorruptDatabase(format!(
                     "Integrity check failed: {status}"
                 )));
+            }
+
+            // Check store schema version
+            let user_ver: u32 = conn.query_row("PRAGMA user_version;", [], |row| row.get(0))?;
+            if user_ver > OUTBOX_SCHEMA_VERSION {
+                return Err(OutboxError::UnsupportedStoreVersion(user_ver));
             }
         }
 
@@ -348,6 +507,9 @@ impl Outbox {
             ",
         )?;
 
+        // Ensure user_version pragma is stamped
+        conn.pragma_update(None, "user_version", OUTBOX_SCHEMA_VERSION)?;
+
         Ok(Self {
             db_path,
             conn: Mutex::new(conn),
@@ -360,11 +522,13 @@ impl Outbox {
     /// - Enforces configured size, cardinality, and quota limits before mutating state.
     /// - If an entry with identical content already exists, returns [`EnqueueResult::Idempotent`].
     /// - If an entry with conflicting content exists under the same identity, returns [`OutboxError::ConflictingIdentity`].
+    /// - Genuine query errors propagate immediately via `OptionalExtension::optional` without silent masking.
     pub fn enqueue(
         &self,
         scope: &OutboxScope,
         envelope: &ActivityEnvelope,
     ) -> Result<EnqueueResult, OutboxError> {
+        scope.validate()?;
         envelope.validate()?;
 
         let payload_json = serde_json::to_string(envelope)?;
@@ -380,7 +544,8 @@ impl Outbox {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        // Check if an entry with this scope and client_activity_id already exists
+        // Check if an entry with this scope and client_activity_id already exists.
+        // Use .optional()? so real database errors propagate rather than collapsing to not-found.
         let existing: Option<(i64, String)> = tx
             .query_row(
                 "SELECT id, payload_json FROM outbox_entries 
@@ -392,7 +557,7 @@ impl Outbox {
                 ],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .ok();
+            .optional()?;
 
         if let Some((existing_id, existing_json)) = existing {
             if existing_json == payload_json {
@@ -461,11 +626,14 @@ impl Outbox {
     /// Reads pending entries for the specified scope up to the requested limit.
     ///
     /// Results are returned in deterministic order (`id ASC`).
+    /// Fails closed on corrupted timestamps, invalid envelopes, or identity mismatches
+    /// without destroying stored rows or inventing timestamps.
     pub fn peek_pending(
         &self,
         scope: &OutboxScope,
         limit: usize,
     ) -> Result<Vec<OutboxEntry>, OutboxError> {
+        scope.validate()?;
         let clamped_limit = limit.max(1).min(self.limits.max_page_limit);
 
         let conn = self.conn.lock().unwrap();
@@ -517,9 +685,35 @@ impl Outbox {
 
             let enqueued_at = DateTime::parse_from_rfc3339(&enqueued_at_str)
                 .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now());
+                .map_err(|e| OutboxError::CorruptRecord {
+                    id,
+                    reason: format!(
+                        "Invalid persisted enqueued_at timestamp '{enqueued_at_str}': {e}"
+                    ),
+                })?;
 
-            let envelope: ActivityEnvelope = serde_json::from_str(&payload_json)?;
+            let envelope: ActivityEnvelope =
+                serde_json::from_str(&payload_json).map_err(|e| OutboxError::CorruptRecord {
+                    id,
+                    reason: format!("Corrupt envelope JSON: {e}"),
+                })?;
+
+            envelope
+                .validate()
+                .map_err(|e| OutboxError::CorruptRecord {
+                    id,
+                    reason: format!("Persisted envelope failed validation: {e}"),
+                })?;
+
+            if envelope.client_activity_id != client_activity_id {
+                return Err(OutboxError::CorruptRecord {
+                    id,
+                    reason: format!(
+                        "Row client_activity_id '{client_activity_id}' does not match envelope identity '{}'",
+                        envelope.client_activity_id
+                    ),
+                });
+            }
 
             entries.push(OutboxEntry {
                 id,
@@ -547,6 +741,17 @@ impl Outbox {
         scope: &OutboxScope,
         client_activity_id: &str,
     ) -> Result<(), OutboxError> {
+        scope.validate()?;
+
+        if client_activity_id.trim().is_empty()
+            || client_activity_id.len() > MAX_CLIENT_ACTIVITY_ID_BYTES
+            || client_activity_id.chars().any(|c| c.is_control())
+        {
+            return Err(OutboxError::InvalidEnvelope(
+                "client_activity_id invalid or too long".into(),
+            ));
+        }
+
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
@@ -570,12 +775,32 @@ impl Outbox {
     /// Records a failed delivery attempt, incrementing retry count and updating last error.
     ///
     /// The entry remains intact in the queue for future retry.
+    /// The diagnostic error message is bounded by [`MAX_ERROR_MESSAGE_BYTES`] to prevent
+    /// unbounded metadata accumulation.
     pub fn mark_attempt_failed(
         &self,
         scope: &OutboxScope,
         client_activity_id: &str,
         error_message: &str,
     ) -> Result<(), OutboxError> {
+        scope.validate()?;
+
+        if client_activity_id.trim().is_empty()
+            || client_activity_id.len() > MAX_CLIENT_ACTIVITY_ID_BYTES
+            || client_activity_id.chars().any(|c| c.is_control())
+        {
+            return Err(OutboxError::InvalidEnvelope(
+                "client_activity_id invalid or too long".into(),
+            ));
+        }
+
+        if error_message.len() > MAX_ERROR_MESSAGE_BYTES {
+            return Err(OutboxError::DiagnosticMessageTooLarge {
+                size: error_message.len(),
+                max: MAX_ERROR_MESSAGE_BYTES,
+            });
+        }
+
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
@@ -604,6 +829,9 @@ impl Outbox {
 
     /// Returns the total number of records in the outbox, optionally filtered by scope.
     pub fn count(&self, scope: Option<&OutboxScope>) -> Result<u32, OutboxError> {
+        if let Some(s) = scope {
+            s.validate()?;
+        }
         let conn = self.conn.lock().unwrap();
         let count: u32 = match scope {
             Some(s) => conn.query_row(

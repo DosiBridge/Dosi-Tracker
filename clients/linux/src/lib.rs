@@ -26,6 +26,7 @@ pub use lifecycle::{
 };
 pub use outbox::{
     ActivityEnvelope, EnqueueResult, Outbox, OutboxEntry, OutboxError, OutboxLimits, OutboxScope,
-    OUTBOX_SCHEMA_VERSION,
+    MAX_ACCOUNT_ID_BYTES, MAX_CLIENT_ACTIVITY_ID_BYTES, MAX_ERROR_MESSAGE_BYTES,
+    MAX_WORKSPACE_ID_BYTES, OUTBOX_SCHEMA_VERSION,
 };
 pub use paths::LinuxPaths;

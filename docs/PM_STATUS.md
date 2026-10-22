@@ -1879,6 +1879,77 @@ Source inspection of `clients/linux` (`Cargo.toml`, `src/lib.rs`, `src/main.rs`)
 4. **Prior Unresolved Approval Invariant**: The approval-blocked command `tirith:archive_extract` remains unresolved. Worker has **NOT** retried, repackaged, or delegated that command, nor modified archive extraction approvals.
 5. **Host Toolchain vs Native Linux Evidence Separation**: All tests were executed on Windows host MSVC and Git-Bash toolchains. This does **NOT** constitute independent PM acceptance or native Linux kernel/libc runtime verification.
 
+---
+
+## 28. Bounded Metadata, Store Versioning & Fail-Closed Deserialization (`linux-outbox-bounded-metadata-validation-20261022-J`)
+
+> **Execution Date:** October 22, 2026  
+> **Phase Task ID:** `linux-outbox-bounded-metadata-validation-20261022-J`  
+> **Status:** Completed & Source-Verified (60 Rust tests passed in `clients/linux`, 22 shell lifecycle tests passed, 50 frontend tests passed, typecheck clean, fmt clean, check clean)  
+> **Target Package:** `clients/linux` (`src/outbox.rs`, `src/lib.rs`, `tests/outbox_tests.rs`)  
+
+### A. Context & Source-Backed Boundedness/Validation Deficiencies Addressed
+Independent PM inspection of Task I identified same-phase boundedness and validation gaps in the outbox implementation:
+1. **Unbounded Metadata Accumulation**:
+   - `mark_attempt_failed` previously permitted unbounded error message text, allowing arbitrary disk writes outside envelope payload quotas.
+   - `OutboxScope` fields were public without validation on public API entry points, allowing direct instantiation or deserialization to bypass `OutboxScope::new` invariants.
+   - *Correction*: Enforced explicit finite byte limits across all public production boundaries:
+     - [`MAX_ACCOUNT_ID_BYTES`] = 256 bytes (rejection of empty, whitespace, oversize, or control characters).
+     - [`MAX_WORKSPACE_ID_BYTES`] = 256 bytes (rejection of empty, whitespace, oversize, or control characters).
+     - [`MAX_CLIENT_ACTIVITY_ID_BYTES`] = 256 bytes (rejection of empty, whitespace, oversize, or control characters).
+     - [`MAX_ERROR_MESSAGE_BYTES`] = 1024 bytes.
+     - Added [`OutboxScope::validate`] invoked on every public method (`enqueue`, `peek_pending`, `ack_delivered`, `mark_attempt_failed`, `count`).
+     - Oversize diagnostic text returns [`OutboxError::DiagnosticMessageTooLarge`] without mutating retry count or clobbering original state.
+2. **Numeric Limits Validation ([`OutboxLimits::validate`])**:
+   - Added validation before opening or mutating files: `max_records > 0`, `max_payload_bytes > 0`, `max_total_payload_bytes >= max_payload_bytes`, and `max_page_limit > 0 && max_page_limit <= i64::MAX as usize`.
+   - Prevents usize-to-i64 negative LIMIT queries or zero-capacity deadlocks.
+3. **Store Schema Versioning via `PRAGMA user_version`**:
+   - Persisted and enforced schema versioning via SQLite `PRAGMA user_version` ([`OUTBOX_SCHEMA_VERSION`] = 1).
+   - On opening an existing database, checks `PRAGMA user_version`. Future store versions (`> 1`) fail closed with [`OutboxError::UnsupportedStoreVersion`] without auto-downgrading, deleting, or mutating user data.
+4. **Fail-Closed Deserialization & No Fabricated Timestamps**:
+   - Removed timestamp fabrication in `peek_pending`: if `enqueued_at_str` is invalid, returns [`OutboxError::CorruptRecord`] rather than substituting `Utc::now()`.
+   - Validates deserialized `ActivityEnvelope` via `envelope.validate()` and asserts that row `client_activity_id` matches `envelope.client_activity_id`.
+   - Row corruption or identity mismatch returns [`OutboxError::CorruptRecord`] without deleting or mutating stored rows.
+5. **Transparent Query Error Propagation**:
+   - Replaced `.ok()` on the existing-row query in `enqueue` with `OptionalExtension::optional()`, ensuring genuine database or decoding errors propagate immediately rather than masking as missing rows.
+
+### B. Executed Regressions & Test Evidence
+1. **Task J Outbox Regression Tests (9 New Tests, 23 Total Outbox Tests)**:
+   - `test_invalid_scope_direct_and_constructed_fails_on_all_public_apis`: Direct struct instantiation with empty, oversize (> 256 B), and control characters rejected on all public APIs.
+   - `test_invalid_numeric_limits_fail_closed_without_touching_fs`: Zero records, zero payload, inverted quota, and zero page limits rejected with `InvalidLimits` before file creation.
+   - `test_oversize_diagnostic_message_rejected_preserving_state`: 1025-byte diagnostic message rejected with `DiagnosticMessageTooLarge`, leaving retry count (0) and last error (`None`) intact.
+   - `test_raw_persisted_corrupt_timestamp_fails_closed_without_fabrication`: Invalid RFC3339 timestamp string returns `CorruptRecord` without fabricating `Utc::now()` or deleting row.
+   - `test_raw_persisted_envelope_validation_failure_fails_closed`: Persisted envelope with invalid invariants (`started_at > ended_at`) returns `CorruptRecord`.
+   - `test_raw_persisted_identity_mismatch_fails_closed`: Row client_activity_id differing from envelope client_activity_id returns `CorruptRecord`.
+   - `test_future_store_version_fails_closed_without_downgrade`: Database stamped with `user_version = 2` returns `UnsupportedStoreVersion(2)` without downgrading.
+   - `test_store_version_1_persisted_and_reopened_cleanly`: Verified `user_version = 1` is stamped and preserved across reopen.
+   - `test_metadata_update_failure_preserves_sentinels`: Failed cross-scope error recording preserves sentinels across both workspaces.
+2. **Existing Test Suites Maintained**:
+   - 14 initial outbox tests passed.
+   - 21 unit tests, 6 doctor CLI tests, 7 consent/policy repro tests, 3 installer integration tests passed.
+   - Total Rust tests in `clients/linux`: **60 passed, 0 failed, exit 0**.
+   - Shell installer lifecycle: 22 passed, exit 0.
+   - Frontend Vitest suite: 50 passed, exit 0.
+   - Frontend typecheck: 0 errors, exit 0.
+
+### C. Executed Test Suites & Quality Gates
+| Target Suite | Exact Command Line | Tests Passed | Ignored | Result | Exit Code | Evidence Level |
+|---|---|:---:|:---:|:---:|:---:|---|
+| **Linux Unit, CLI, Repro, Installer & Outbox Tests** | `cargo test` in `clients/linux` | 60 passed (21 unit + 6 doctor CLI + 7 repro + 3 installer integration + 23 outbox integration) | 0 | PASSED | **0** | **[Worker-Reported (Windows Host Toolchain)]** |
+| **Shell Installer Lifecycle Suite** | `bash clients/linux/tests/test_installer_lifecycle.sh` | 22 passed (all lifecycle, security confinement, and binary doctor checks) | 0 | PASSED | **0** | **[Worker-Reported (Git-Bash Host Toolchain)]** |
+| **Linux Code Formatting** | `cargo fmt --check` in `clients/linux` | N/A | 0 diffs | PASSED | **0** | **[Worker-Reported]** |
+| **Linux Compilation Check** | `cargo check` in `clients/linux` | N/A | 0 errors, 0 warnings | PASSED | **0** | **[Worker-Reported]** |
+| **Frontend Acceptance Suite** | `npx vitest run src/middleware.test.ts src/components/dashboard/agent-setup.test.tsx src/test/acceptance/agent-onboarding.test.tsx src/test/acceptance/install-guides.test.tsx src/test/architecture.spec.ts` | 50 passed | 0 | PASSED | **0** | **[Worker-Reported (Focused 5-File Suite)]** |
+| **Frontend Typecheck** | `npm run typecheck` in `frontend` | N/A | 0 errors | PASSED | **0** | **[Worker-Reported]** |
+
+### D. PM QA Boundary Limits & Acceptance Disclosures
+1. **Same-Phase Defect Correction**: This task corrected internal metadata boundedness, version validation, and fail-closed deserialization gaps identified during inspection; it does not claim external exploit reproduction.
+2. **Storage Budget Clarification**: `max_total_payload_bytes` bounds envelope payload JSON storage across all queued rows; it does not constitute a total filesystem disk allocation guarantee due to SQLite B-tree pages, WAL journals, and bounded metadata columns.
+3. **Outbox Library Scope Boundary**: Only the local transactional outbox library module is implemented (`dosi_tracker_linux::outbox`). No background sync worker, network upload, authentication, credential storage, or sensor adapters are active.
+4. **Prior Unresolved Approval Invariant**: The approval-blocked command `tirith:archive_extract` remains unresolved. Worker has **NOT** retried, repackaged, or delegated that command, nor modified archive extraction approvals.
+5. **Host Toolchain vs Native Linux Evidence Separation**: All tests were executed on Windows host MSVC and Git-Bash toolchains. This does **NOT** constitute independent PM acceptance or native Linux kernel/libc runtime verification.
+
+
 
 
 

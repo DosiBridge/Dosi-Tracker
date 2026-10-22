@@ -441,3 +441,384 @@ fn test_doctor_and_help_remain_strictly_nonmutating() {
         "Doctor/Help must not create XDG_CONFIG_HOME"
     );
 }
+
+#[test]
+fn test_invalid_scope_direct_and_constructed_fails_on_all_public_apis() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("outbox.db");
+    let outbox = Outbox::open(&db_path, OutboxLimits::default()).unwrap();
+    let valid_env = synthetic_envelope("act-valid", None);
+
+    // Empty account_id in OutboxScope::new
+    assert!(matches!(
+        OutboxScope::new("", "workspace-1").unwrap_err(),
+        OutboxError::InvalidScope(_)
+    ));
+
+    // Direct instantiation with empty account_id
+    let invalid_direct_scope = OutboxScope {
+        account_id: "".to_string(),
+        workspace_id: "workspace-1".to_string(),
+    };
+
+    // Verify all public APIs reject invalid scope
+    assert!(matches!(
+        outbox
+            .enqueue(&invalid_direct_scope, &valid_env)
+            .unwrap_err(),
+        OutboxError::InvalidScope(_)
+    ));
+    assert!(matches!(
+        outbox.peek_pending(&invalid_direct_scope, 10).unwrap_err(),
+        OutboxError::InvalidScope(_)
+    ));
+    assert!(matches!(
+        outbox
+            .ack_delivered(&invalid_direct_scope, "act-valid")
+            .unwrap_err(),
+        OutboxError::InvalidScope(_)
+    ));
+    assert!(matches!(
+        outbox
+            .mark_attempt_failed(&invalid_direct_scope, "act-valid", "error")
+            .unwrap_err(),
+        OutboxError::InvalidScope(_)
+    ));
+    assert!(matches!(
+        outbox.count(Some(&invalid_direct_scope)).unwrap_err(),
+        OutboxError::InvalidScope(_)
+    ));
+
+    // Direct instantiation with oversize account_id (> 256 bytes)
+    let oversize_scope = OutboxScope {
+        account_id: "a".repeat(257),
+        workspace_id: "workspace-1".to_string(),
+    };
+    assert!(matches!(
+        outbox.enqueue(&oversize_scope, &valid_env).unwrap_err(),
+        OutboxError::InvalidScope(_)
+    ));
+
+    // Direct instantiation with control characters
+    let control_scope = OutboxScope {
+        account_id: "user\x00evil".to_string(),
+        workspace_id: "workspace-1".to_string(),
+    };
+    assert!(matches!(
+        outbox.enqueue(&control_scope, &valid_env).unwrap_err(),
+        OutboxError::InvalidScope(_)
+    ));
+}
+
+#[test]
+fn test_invalid_numeric_limits_fail_closed_without_touching_fs() {
+    let dir = tempdir().unwrap();
+
+    let invalid_limits_cases = [
+        OutboxLimits {
+            max_records: 0,
+            ..Default::default()
+        },
+        OutboxLimits {
+            max_payload_bytes: 0,
+            ..Default::default()
+        },
+        OutboxLimits {
+            max_total_payload_bytes: 100,
+            max_payload_bytes: 200,
+            ..Default::default()
+        },
+        OutboxLimits {
+            max_page_limit: 0,
+            ..Default::default()
+        },
+        OutboxLimits {
+            default_page_limit: 50,
+            max_page_limit: 20,
+            ..Default::default()
+        },
+    ];
+
+    for (idx, limits) in invalid_limits_cases.iter().enumerate() {
+        let db_path = dir.path().join(format!("invalid_{idx}.db"));
+        let res = Outbox::open(&db_path, limits.clone());
+        assert!(
+            matches!(res.unwrap_err(), OutboxError::InvalidLimits(_)),
+            "Limits case {idx} should be rejected with InvalidLimits"
+        );
+        assert!(
+            !db_path.exists(),
+            "No file should be created for invalid limits"
+        );
+    }
+}
+
+#[test]
+fn test_oversize_diagnostic_message_rejected_preserving_state() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("outbox.db");
+    let scope = OutboxScope::new("user-1", "workspace-1").unwrap();
+    let outbox = Outbox::open(&db_path, OutboxLimits::default()).unwrap();
+
+    let env = synthetic_envelope("act-diag", Some("Initial payload"));
+    outbox.enqueue(&scope, &env).unwrap();
+
+    // Attempting to record diagnostic message > 1024 bytes
+    let oversize_error = "E".repeat(1025);
+    let err = outbox
+        .mark_attempt_failed(&scope, "act-diag", &oversize_error)
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        OutboxError::DiagnosticMessageTooLarge {
+            size: 1025,
+            max: 1024
+        }
+    ));
+
+    // Verify record state is untouched: retry_count is 0, last_error is None
+    let pending = outbox.peek_pending(&scope, 10).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].retry_count, 0);
+    assert_eq!(pending[0].last_error, None);
+    assert_eq!(
+        pending[0].envelope.description.as_deref(),
+        Some("Initial payload")
+    );
+}
+
+#[test]
+fn test_raw_persisted_corrupt_timestamp_fails_closed_without_fabrication() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("outbox.db");
+    let scope = OutboxScope::new("user-1", "workspace-1").unwrap();
+
+    // Create database and initialize schema
+    {
+        let outbox = Outbox::open(&db_path, OutboxLimits::default()).unwrap();
+        assert_eq!(outbox.count(Some(&scope)).unwrap(), 0);
+    }
+
+    // Insert raw corrupt row directly via SQLite
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let env = synthetic_envelope("act-corrupt-time", Some("Valid envelope"));
+        let json = serde_json::to_string(&env).unwrap();
+
+        conn.execute(
+            "INSERT INTO outbox_entries (
+                account_id, workspace_id, client_activity_id, project_id,
+                started_at, ended_at, payload_json, payload_bytes, enqueued_at, retry_count
+            ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8, 0)",
+            rusqlite::params![
+                "user-1",
+                "workspace-1",
+                "act-corrupt-time",
+                "2026-10-22T10:00:00Z",
+                "2026-10-22T10:10:00Z",
+                &json,
+                json.len() as i64,
+                "NOT_AN_RFC3339_TIMESTAMP_STRING"
+            ],
+        )
+        .unwrap();
+    }
+
+    // Reopen via Outbox
+    let outbox = Outbox::open(&db_path, OutboxLimits::default()).unwrap();
+
+    // peek_pending must fail closed with CorruptRecord rather than fabricating Utc::now()
+    let err = outbox.peek_pending(&scope, 10).unwrap_err();
+    assert!(
+        matches!(err, OutboxError::CorruptRecord { id, ref reason } if id == 1 && reason.contains("Invalid persisted enqueued_at timestamp")),
+        "Expected CorruptRecord error on corrupt enqueued_at timestamp, got {err:?}"
+    );
+
+    // Verify row was NOT deleted or mutated
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT count(*) FROM outbox_entries", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 1, "Corrupted row must not be deleted");
+}
+
+#[test]
+fn test_raw_persisted_envelope_validation_failure_fails_closed() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("outbox.db");
+    let scope = OutboxScope::new("user-1", "workspace-1").unwrap();
+
+    {
+        let _ = Outbox::open(&db_path, OutboxLimits::default()).unwrap();
+    }
+
+    // Insert an envelope that is valid JSON but fails envelope.validate() (e.g. started_at > ended_at)
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let mut bad_env = synthetic_envelope("act-bad-env", None);
+        bad_env.started_at = Utc::now();
+        bad_env.ended_at = bad_env.started_at - Duration::minutes(10); // started_at > ended_at!
+        let json = serde_json::to_string(&bad_env).unwrap();
+
+        conn.execute(
+            "INSERT INTO outbox_entries (
+                account_id, workspace_id, client_activity_id, project_id,
+                started_at, ended_at, payload_json, payload_bytes, enqueued_at, retry_count
+            ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8, 0)",
+            rusqlite::params![
+                "user-1",
+                "workspace-1",
+                "act-bad-env",
+                "2026-10-22T10:10:00Z",
+                "2026-10-22T10:00:00Z",
+                &json,
+                json.len() as i64,
+                "2026-10-22T10:05:00Z"
+            ],
+        )
+        .unwrap();
+    }
+
+    let outbox = Outbox::open(&db_path, OutboxLimits::default()).unwrap();
+    let err = outbox.peek_pending(&scope, 10).unwrap_err();
+    assert!(
+        matches!(err, OutboxError::CorruptRecord { id, ref reason } if id == 1 && reason.contains("Persisted envelope failed validation")),
+        "Expected validation failure on semantically invalid envelope, got {err:?}"
+    );
+}
+
+#[test]
+fn test_raw_persisted_identity_mismatch_fails_closed() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("outbox.db");
+    let scope = OutboxScope::new("user-1", "workspace-1").unwrap();
+
+    {
+        let _ = Outbox::open(&db_path, OutboxLimits::default()).unwrap();
+    }
+
+    // Insert row where column client_activity_id != envelope.client_activity_id
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let env = synthetic_envelope("inner-id", None);
+        let json = serde_json::to_string(&env).unwrap();
+
+        conn.execute(
+            "INSERT INTO outbox_entries (
+                account_id, workspace_id, client_activity_id, project_id,
+                started_at, ended_at, payload_json, payload_bytes, enqueued_at, retry_count
+            ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8, 0)",
+            rusqlite::params![
+                "user-1",
+                "workspace-1",
+                "outer-row-id-mismatch",
+                "2026-10-22T10:00:00Z",
+                "2026-10-22T10:10:00Z",
+                &json,
+                json.len() as i64,
+                "2026-10-22T10:05:00Z"
+            ],
+        )
+        .unwrap();
+    }
+
+    let outbox = Outbox::open(&db_path, OutboxLimits::default()).unwrap();
+    let err = outbox.peek_pending(&scope, 10).unwrap_err();
+    assert!(
+        matches!(err, OutboxError::CorruptRecord { id, ref reason } if id == 1 && reason.contains("does not match envelope identity")),
+        "Expected identity mismatch error, got {err:?}"
+    );
+}
+
+#[test]
+fn test_future_store_version_fails_closed_without_downgrade() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("future.db");
+
+    // Manually create SQLite file stamped with future user_version = 2
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.pragma_update(None, "user_version", 2).unwrap();
+    }
+
+    let res = Outbox::open(&db_path, OutboxLimits::default());
+    assert!(
+        matches!(res.unwrap_err(), OutboxError::UnsupportedStoreVersion(2)),
+        "Expected UnsupportedStoreVersion for future store"
+    );
+
+    // Verify user_version was NOT modified or downgraded
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let ver: u32 = conn
+        .query_row("PRAGMA user_version;", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(ver, 2, "Future version must not be downgraded");
+}
+
+#[test]
+fn test_store_version_1_persisted_and_reopened_cleanly() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("version1.db");
+    let scope = OutboxScope::new("user-1", "workspace-1").unwrap();
+
+    {
+        let outbox = Outbox::open(&db_path, OutboxLimits::default()).unwrap();
+        outbox
+            .enqueue(&scope, &synthetic_envelope("act-v1", None))
+            .unwrap();
+    }
+
+    // Check user_version pragma directly on disk
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let ver: u32 = conn
+        .query_row("PRAGMA user_version;", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(ver, 1, "Store version 1 must be stamped on database");
+
+    // Reopen via Outbox
+    let reopened = Outbox::open(&db_path, OutboxLimits::default()).unwrap();
+    let pending = reopened.peek_pending(&scope, 10).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].client_activity_id, "act-v1");
+}
+
+#[test]
+fn test_metadata_update_failure_preserves_sentinels() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("sentinels.db");
+    let scope_a = OutboxScope::new("user-1", "workspace-a").unwrap();
+    let scope_b = OutboxScope::new("user-1", "workspace-b").unwrap();
+    let outbox = Outbox::open(&db_path, OutboxLimits::default()).unwrap();
+
+    let env_a = synthetic_envelope("act-a", Some("Sentinel A"));
+    let env_b = synthetic_envelope("act-b", Some("Sentinel B"));
+
+    outbox.enqueue(&scope_a, &env_a).unwrap();
+    outbox.enqueue(&scope_b, &env_b).unwrap();
+
+    // Attempting to record failure for Scope A's record under Scope B fails
+    let err = outbox
+        .mark_attempt_failed(&scope_b, "act-a", "failed")
+        .unwrap_err();
+    assert!(matches!(err, OutboxError::RecordNotFound { .. }));
+
+    // Both sentinels must remain completely intact
+    let pending_a = outbox.peek_pending(&scope_a, 10).unwrap();
+    assert_eq!(pending_a.len(), 1);
+    assert_eq!(pending_a[0].retry_count, 0);
+    assert_eq!(pending_a[0].last_error, None);
+    assert_eq!(
+        pending_a[0].envelope.description.as_deref(),
+        Some("Sentinel A")
+    );
+
+    let pending_b = outbox.peek_pending(&scope_b, 10).unwrap();
+    assert_eq!(pending_b.len(), 1);
+    assert_eq!(pending_b[0].retry_count, 0);
+    assert_eq!(pending_b[0].last_error, None);
+    assert_eq!(
+        pending_b[0].envelope.description.as_deref(),
+        Some("Sentinel B")
+    );
+}
