@@ -222,6 +222,27 @@ fn validate_target_file(path: &Path) -> Result<(), ConsentError> {
     }
 }
 
+/// Optional hooks for injecting deterministic collision and failure behaviors in tests.
+#[derive(Clone, Default)]
+pub(crate) struct SaveHooks {
+    #[allow(dead_code)]
+    pub(crate) candidate_namer: Option<std::sync::Arc<dyn Fn(&str, usize) -> String + Send + Sync>>,
+    #[allow(dead_code)]
+    pub(crate) fail_after_open: Option<std::sync::Arc<dyn Fn(&Path) -> Result<(), std::io::Error> + Send + Sync>>,
+    #[allow(dead_code)]
+    pub(crate) fail_rename: Option<std::sync::Arc<dyn Fn(&Path, &Path) -> Result<(), std::io::Error> + Send + Sync>>,
+}
+
+impl std::fmt::Debug for SaveHooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SaveHooks")
+            .field("candidate_namer", &self.candidate_namer.is_some())
+            .field("fail_after_open", &self.fail_after_open.is_some())
+            .field("fail_rename", &self.fail_rename.is_some())
+            .finish()
+    }
+}
+
 /// File-backed consent store with private, exclusive atomic persistence.
 pub struct ConsentStore;
 
@@ -258,6 +279,23 @@ impl ConsentStore {
     /// - Flushes and syncs data to disk before atomic replacement via `fs::rename`.
     /// - On failure, removes ONLY the operation's owned temporary file artifact.
     pub fn save(path: &Path, consent: &LocalConsent) -> Result<(), ConsentError> {
+        Self::save_internal(path, consent, &SaveHooks::default())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn save_with_hooks(
+        path: &Path,
+        consent: &LocalConsent,
+        hooks: &SaveHooks,
+    ) -> Result<(), ConsentError> {
+        Self::save_internal(path, consent, hooks)
+    }
+
+    fn save_internal(
+        path: &Path,
+        consent: &LocalConsent,
+        hooks: &SaveHooks,
+    ) -> Result<(), ConsentError> {
         let parent = path.parent().ok_or_else(|| {
             ConsentError::SaveFailed("Target path has no parent directory".into())
         })?;
@@ -318,14 +356,18 @@ impl ConsentStore {
         let mut owned_temp_path = None;
 
         for attempt in 0..MAX_TEMP_RETRIES {
-            let nonce = generate_nonce();
-            let temp_name = format!(
-                ".{}.tmp.{}.{}.{:016x}",
-                file_stem,
-                std::process::id(),
-                attempt,
-                nonce
-            );
+            let temp_name = if let Some(ref namer) = hooks.candidate_namer {
+                namer(file_stem, attempt)
+            } else {
+                let nonce = generate_nonce();
+                format!(
+                    ".{}.tmp.{}.{}.{:016x}",
+                    file_stem,
+                    std::process::id(),
+                    attempt,
+                    nonce
+                )
+            };
             let candidate = parent.join(temp_name);
             match options.open(&candidate) {
                 Ok(f) => {
@@ -360,6 +402,9 @@ impl ConsentStore {
             file.write_all(json.as_bytes())?;
             file.flush()?;
             file.sync_all()?;
+            if let Some(ref fail) = hooks.fail_after_open {
+                fail(&temp_path)?;
+            }
             drop(file);
             Ok(())
         })();
@@ -373,7 +418,13 @@ impl ConsentStore {
             )));
         }
 
-        if let Err(e) = fs::rename(&temp_path, path) {
+        let rename_result = if let Some(ref fail) = hooks.fail_rename {
+            fail(&temp_path, path)
+        } else {
+            fs::rename(&temp_path, path)
+        };
+
+        if let Err(e) = rename_result {
             let _ = fs::remove_file(&temp_path);
             return Err(ConsentError::SaveFailed(format!(
                 "Failed atomically replacing consent file {} with {}: {}",
@@ -405,11 +456,22 @@ pub trait ConsentStorage: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct FileConsentStore {
     path: PathBuf,
+    #[cfg(test)]
+    hooks: SaveHooks,
 }
 
 impl FileConsentStore {
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            #[cfg(test)]
+            hooks: SaveHooks::default(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_hooks(path: PathBuf, hooks: SaveHooks) -> Self {
+        Self { path, hooks }
     }
 
     pub fn path(&self) -> &Path {
@@ -423,7 +485,14 @@ impl ConsentStorage for FileConsentStore {
     }
 
     fn save(&self, consent: &LocalConsent) -> Result<(), ConsentError> {
-        ConsentStore::save(&self.path, consent)
+        #[cfg(test)]
+        {
+            ConsentStore::save_internal(&self.path, consent, &self.hooks)
+        }
+        #[cfg(not(test))]
+        {
+            ConsentStore::save(&self.path, consent)
+        }
     }
 }
 
@@ -826,17 +895,23 @@ mod tests {
         let old_predictable_tmp = consent_path.with_extension(format!("tmp.{}", std::process::id()));
         std::os::unix::fs::symlink(&sentinel_path, &old_predictable_tmp).unwrap();
 
-        // Also pre-create symlink matching dot-stem pattern if an attacker guessed it
-        let candidate_symlink = temp
-            .path()
-            .join(format!(".consent.json.tmp.{}.0.0000000000000000", std::process::id()));
-        std::os::unix::fs::symlink(&sentinel_path, &candidate_symlink).unwrap();
+        // Also precreate candidate 0 symlink matching deterministic test namer
+        let candidate_0_symlink = temp.path().join(".consent.json.tmp.symlink_collision.0");
+        std::os::unix::fs::symlink(&sentinel_path, &candidate_0_symlink).unwrap();
+
+        let namer = std::sync::Arc::new(|stem: &str, attempt: usize| {
+            format!(".{}.tmp.symlink_collision.{}", stem, attempt)
+        });
+        let hooks = SaveHooks {
+            candidate_namer: Some(namer),
+            ..Default::default()
+        };
 
         let mut perms = ConsentedPermissions::all_disabled();
         perms.keyboard = true;
 
-        ConsentStore::save(&consent_path, &LocalConsent::Granted(perms))
-            .expect("Save should succeed using fresh exclusive temp file");
+        ConsentStore::save_with_hooks(&consent_path, &LocalConsent::Granted(perms), &hooks)
+            .expect("Save should succeed using fallback candidate");
 
         let sentinel_content = fs::read_to_string(&sentinel_path).unwrap();
         assert_eq!(
@@ -845,6 +920,10 @@ mod tests {
         );
 
         assert!(fs::symlink_metadata(&old_predictable_tmp)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(fs::symlink_metadata(&candidate_0_symlink)
             .unwrap()
             .file_type()
             .is_symlink());
@@ -903,7 +982,293 @@ mod tests {
     }
 
     #[test]
-    fn test_exclusive_temp_collision_and_unrelated_artifact_preservation() {
+    fn test_exclusive_temp_candidate_collision_and_fallback_save_succeeds() {
+        let temp = tempfile::tempdir().unwrap();
+        let consent_path = temp.path().join("consent.json");
+
+        let cand_0 = temp.path().join(".consent.json.tmp.cand_collision.0");
+        fs::write(&cand_0, b"CAND_0_SENTINEL_CONTENT").unwrap();
+
+        #[cfg(unix)]
+        let victim_path = temp.path().join("victim_sentinel.txt");
+        #[cfg(unix)]
+        fs::write(&victim_path, b"VICTIM_SENTINEL_CONTENT").unwrap();
+
+        let cand_1 = temp.path().join(".consent.json.tmp.cand_collision.1");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&victim_path, &cand_1).unwrap();
+        #[cfg(not(unix))]
+        fs::write(&cand_1, b"CAND_1_SENTINEL_CONTENT").unwrap();
+
+        let namer = std::sync::Arc::new(|stem: &str, attempt: usize| {
+            format!(".{}.tmp.cand_collision.{}", stem, attempt)
+        });
+        let hooks = SaveHooks {
+            candidate_namer: Some(namer),
+            ..Default::default()
+        };
+
+        let mut perms = ConsentedPermissions::all_disabled();
+        perms.screenshot = true;
+        perms.keyboard = true;
+
+        ConsentStore::save_with_hooks(&consent_path, &LocalConsent::Granted(perms), &hooks)
+            .expect("Save should retry past colliding candidates and succeed");
+
+        assert_eq!(
+            fs::read(&cand_0).unwrap(),
+            b"CAND_0_SENTINEL_CONTENT",
+            "Attempted candidate 0 sentinel must remain unchanged"
+        );
+
+        #[cfg(unix)]
+        {
+            assert!(
+                fs::symlink_metadata(&cand_1).unwrap().file_type().is_symlink(),
+                "Candidate 1 must remain a symlink"
+            );
+            assert_eq!(
+                fs::read(&victim_path).unwrap(),
+                b"VICTIM_SENTINEL_CONTENT",
+                "Victim sentinel pointed to by candidate 1 symlink must not be modified or truncated"
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            assert_eq!(
+                fs::read(&cand_1).unwrap(),
+                b"CAND_1_SENTINEL_CONTENT",
+                "Attempted candidate 1 sentinel must remain unchanged"
+            );
+        }
+
+        let loaded = ConsentStore::load(&consent_path).unwrap();
+        assert_eq!(loaded, LocalConsent::Granted(perms));
+    }
+
+    #[test]
+    fn test_exclusive_temp_exhaustion_refuses_without_mutating_candidates_or_valid_consent() {
+        let temp = tempfile::tempdir().unwrap();
+        let consent_path = temp.path().join("consent.json");
+
+        let mut valid_perms = ConsentedPermissions::all_disabled();
+        valid_perms.keyboard = true;
+        ConsentStore::save(&consent_path, &LocalConsent::Granted(valid_perms)).unwrap();
+        let valid_bytes_before = fs::read(&consent_path).unwrap();
+
+        const MAX_RETRIES: usize = 64;
+        let mut candidate_paths = Vec::with_capacity(MAX_RETRIES);
+        for i in 0..MAX_RETRIES {
+            let p = temp.path().join(format!(".consent.json.tmp.exhaust.{}.sentinel", i));
+            fs::write(&p, format!("EXHAUST_SENTINEL_{}", i).as_bytes()).unwrap();
+            candidate_paths.push(p);
+        }
+
+        let namer = std::sync::Arc::new(|stem: &str, attempt: usize| {
+            format!(".{}.tmp.exhaust.{}.sentinel", stem, attempt)
+        });
+        let hooks = SaveHooks {
+            candidate_namer: Some(namer),
+            ..Default::default()
+        };
+
+        let res = ConsentStore::save_with_hooks(&consent_path, &LocalConsent::Revoked, &hooks);
+        assert!(res.is_err(), "Exhaustion of collision retries must fail save");
+        match res.unwrap_err() {
+            ConsentError::SaveFailed(msg) => {
+                assert!(
+                    msg.contains("Exceeded maximum collision retries"),
+                    "Error must indicate retry exhaustion, got: {}",
+                    msg
+                );
+            }
+            other => panic!("Unexpected error variant: {:?}", other),
+        }
+
+        for (i, p) in candidate_paths.iter().enumerate() {
+            assert_eq!(
+                fs::read(p).unwrap(),
+                format!("EXHAUST_SENTINEL_{}", i).as_bytes(),
+                "Candidate sentinel {} must not be modified or deleted",
+                i
+            );
+        }
+
+        let valid_bytes_after = fs::read(&consent_path).unwrap();
+        assert_eq!(
+            valid_bytes_after, valid_bytes_before,
+            "Existing valid consent file must not be modified on retry exhaustion"
+        );
+        let loaded = ConsentStore::load(&consent_path).unwrap();
+        assert_eq!(loaded, LocalConsent::Granted(valid_perms));
+    }
+
+    #[test]
+    fn test_failed_save_write_error_retains_valid_record_and_cleans_temp() {
+        let temp = tempfile::tempdir().unwrap();
+        let consent_file = temp.path().join("consent.json");
+
+        let mut initial_perms = ConsentedPermissions::all_disabled();
+        initial_perms.keyboard = true;
+        ConsentStore::save(&consent_file, &LocalConsent::Granted(initial_perms)).unwrap();
+        let valid_bytes_before = fs::read(&consent_file).unwrap();
+
+        let unrelated_file = temp.path().join("unrelated_data.bin");
+        fs::write(&unrelated_file, b"UNRELATED_KEEP_SAFE").unwrap();
+
+        let unrelated_tmp = temp.path().join(".consent.json.tmp.other_worker");
+        fs::write(&unrelated_tmp, b"OTHER_WORKER_KEEP_SAFE").unwrap();
+
+        let seen_temp = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let seen_clone = seen_temp.clone();
+
+        let hooks = SaveHooks {
+            fail_after_open: Some(std::sync::Arc::new(move |temp_path| {
+                *seen_clone.lock().unwrap() = Some(temp_path.to_path_buf());
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Injected write/flush/sync failure",
+                ))
+            })),
+            ..Default::default()
+        };
+
+        let store = std::sync::Arc::new(FileConsentStore::with_hooks(consent_file.clone(), hooks));
+        let mut manager = ConsentManager::with_storage(
+            LocalConsent::Granted(initial_perms),
+            Some(store),
+        );
+        assert_eq!(manager.current().permissions().keyboard, true);
+        assert_eq!(manager.current().permissions().screenshot, false);
+
+        let mut expanded = initial_perms;
+        expanded.screenshot = true;
+
+        let res = manager.update(LocalConsent::Granted(expanded));
+        assert!(res.is_err(), "Update must fail when persistence write/sync fails");
+
+        assert_eq!(
+            manager.current().permissions().screenshot,
+            false,
+            "Manager must not widen in-memory when disk write fails"
+        );
+        assert_eq!(
+            manager.current().permissions().keyboard,
+            true,
+            "Previous manager permissions must remain in effect"
+        );
+
+        let owned_temp = seen_temp.lock().unwrap().clone().expect("Hook must capture owned temp path");
+        assert!(
+            !owned_temp.exists(),
+            "Owned temporary file must be cleaned up on failure: {}",
+            owned_temp.display()
+        );
+
+        let valid_bytes_after = fs::read(&consent_file).unwrap();
+        assert_eq!(
+            valid_bytes_after, valid_bytes_before,
+            "Existing valid consent file bytes must remain untouched"
+        );
+        let loaded = ConsentStore::load(&consent_file).unwrap();
+        assert_eq!(loaded, LocalConsent::Granted(initial_perms));
+
+        assert_eq!(
+            fs::read(&unrelated_file).unwrap(),
+            b"UNRELATED_KEEP_SAFE",
+            "Unrelated file must not be modified or deleted"
+        );
+        assert_eq!(
+            fs::read(&unrelated_tmp).unwrap(),
+            b"OTHER_WORKER_KEEP_SAFE",
+            "Unrelated temp file must not be modified or deleted"
+        );
+    }
+
+    #[test]
+    fn test_failed_save_rename_error_retains_valid_record_and_cleans_temp() {
+        let temp = tempfile::tempdir().unwrap();
+        let consent_file = temp.path().join("consent.json");
+
+        let mut initial_perms = ConsentedPermissions::all_disabled();
+        initial_perms.mouse = true;
+        ConsentStore::save(&consent_file, &LocalConsent::Granted(initial_perms)).unwrap();
+        let valid_bytes_before = fs::read(&consent_file).unwrap();
+
+        let unrelated_file = temp.path().join("unrelated_data.bin");
+        fs::write(&unrelated_file, b"UNRELATED_KEEP_SAFE").unwrap();
+
+        let unrelated_tmp = temp.path().join(".consent.json.tmp.other_worker");
+        fs::write(&unrelated_tmp, b"OTHER_WORKER_KEEP_SAFE").unwrap();
+
+        let seen_temp = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let seen_clone = seen_temp.clone();
+
+        let hooks = SaveHooks {
+            fail_rename: Some(std::sync::Arc::new(move |temp_path, _target_path| {
+                *seen_clone.lock().unwrap() = Some(temp_path.to_path_buf());
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Injected atomic rename failure",
+                ))
+            })),
+            ..Default::default()
+        };
+
+        let store = std::sync::Arc::new(FileConsentStore::with_hooks(consent_file.clone(), hooks));
+        let mut manager = ConsentManager::with_storage(
+            LocalConsent::Granted(initial_perms),
+            Some(store),
+        );
+        assert_eq!(manager.current().permissions().mouse, true);
+        assert_eq!(manager.current().permissions().active_window, false);
+
+        let mut expanded = initial_perms;
+        expanded.active_window = true;
+
+        let res = manager.update(LocalConsent::Granted(expanded));
+        assert!(res.is_err(), "Update must fail when atomic rename fails");
+
+        assert_eq!(
+            manager.current().permissions().active_window,
+            false,
+            "Manager must not widen in-memory when rename fails"
+        );
+        assert_eq!(
+            manager.current().permissions().mouse,
+            true,
+            "Previous manager permissions must remain in effect"
+        );
+
+        let owned_temp = seen_temp.lock().unwrap().clone().expect("Hook must capture owned temp path");
+        assert!(
+            !owned_temp.exists(),
+            "Owned temporary file must be cleaned up on rename failure: {}",
+            owned_temp.display()
+        );
+
+        let valid_bytes_after = fs::read(&consent_file).unwrap();
+        assert_eq!(
+            valid_bytes_after, valid_bytes_before,
+            "Existing valid consent file bytes must remain untouched"
+        );
+        let loaded = ConsentStore::load(&consent_file).unwrap();
+        assert_eq!(loaded, LocalConsent::Granted(initial_perms));
+
+        assert_eq!(
+            fs::read(&unrelated_file).unwrap(),
+            b"UNRELATED_KEEP_SAFE",
+            "Unrelated file must not be modified or deleted"
+        );
+        assert_eq!(
+            fs::read(&unrelated_tmp).unwrap(),
+            b"OTHER_WORKER_KEEP_SAFE",
+            "Unrelated temp file must not be modified or deleted"
+        );
+    }
+
+    #[test]
+    fn test_unrelated_temp_and_data_artifacts_preserved_during_save() {
         let temp = tempfile::tempdir().unwrap();
         let consent_path = temp.path().join("consent.json");
 
@@ -935,7 +1300,7 @@ mod tests {
     }
 
     #[test]
-    fn test_failed_save_retaining_previous_valid_record_and_manager_not_widening() {
+    fn test_failed_save_on_invalid_target_path_does_not_widen_manager() {
         let temp = tempfile::tempdir().unwrap();
         let consent_file = temp.path().join("consent.json");
 

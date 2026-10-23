@@ -2498,10 +2498,10 @@ Implemented deterministic isolated SQLite write-failure regressions in `clients/
 
 ---
 
-## 30. Linux Consent Storage Hardening: Private Mode, Exclusive Temp Creation & Target Policy (selected-linux-consent-private-storage-20261023)
+## 30. Linux Consent Storage Hardening: Private Mode, Exclusive Temp Creation & Storage Regressions (selected-linux-consent-storage-regression-20261023)
 
 > **Execution Date:** October 23, 2026  
-> **Phase Task ID:** `selected-linux-consent-private-storage-20261023` (continuation of `selected-macos-sqlite-oracle-20261023`)  
+> **Phase Task ID:** `selected-linux-consent-storage-regression-20261023` (continuation of `selected-linux-consent-private-storage-20261023`)  
 > **Status:** Implementation Complete; Source-Verified; Synthetic Tests Passing on Host; Native Unix/Linux Permissions & Symlinks **UNEXECUTED** on Windows Host Toolchain  
 > **Target Package:** `clients/linux` (Package: `dosi-tracker-linux`, module: `consent`)  
 
@@ -2531,23 +2531,36 @@ Implemented deterministic isolated SQLite write-failure regressions in `clients/
      - Legacy records with safe modes (e.g. `0600`, `0644`) load without issue, while world/group-writable files fail closed to `LocalConsent::Absent`.
      - Boundary Disclosure: Target validation checks the target file directly with `symlink_metadata`; it does not implement an `openat2(RESOLVE_NO_SYMLINKS)` ancestor-tree traversal. Multi-process concurrency relies on filesystem atomic rename (last-write-wins) without inter-process file locking.
 
+3. **Deterministic Regression Coverage Corrections**:
+   - Earlier tests overclaimed candidate collision and valid record retention: writing an unrelated `.consent.json.tmp.other_worker` file proved unrelated file preservation, not candidate collision or retry; removing the valid persisted file and creating a directory proved manager nonwidening when the path is a directory, not retaining an existing valid record through a save failure.
+   - **Deterministic Testability Seams (`SaveHooks`)**: Introduced narrow crate-private `SaveHooks` on the production `save` routine (`candidate_namer`, `fail_after_open`, `fail_rename`), maintaining `SaveHooks::default()` in production with zero runtime degradation or safety bypasses.
+   - **Candidate Collision & Exhaustion**:
+     - `test_exclusive_temp_candidate_collision_and_fallback_save_succeeds`: Precreates candidate 0 as regular file (and on Unix candidate 1 as symlink to sentinel victim) with candidate namer; proves attempt 0 (and attempt 1 on Unix) hit `AlreadyExists`, attempted candidate sentinels remain unmodified, and fallback save succeeds with intended consent.
+     - `test_exclusive_temp_exhaustion_refuses_without_mutating_candidates_or_valid_consent`: Precreates sentinels for all 64 bounded candidates; proves save fails closed (`Exceeded maximum collision retries`) without mutating or deleting any candidate sentinel or the pre-existing valid consent file.
+   - **Post-Temp Ownership Failure & Valid Record Retention**:
+     - `test_failed_save_write_error_retains_valid_record_and_cleans_temp`: Injects write/sync failure after owning temp file while previous valid consent file exists; proves previous valid file raw bytes and parsed consent are untouched, owned temp file is deleted, unrelated data and temp files are preserved, and `ConsentManager` widening is unapplied.
+     - `test_failed_save_rename_error_retains_valid_record_and_cleans_temp`: Injects atomic rename failure after owning temp file; proves identical preservation of valid file bytes, cleanup of owned temp, preservation of unrelated files, and rejection of `ConsentManager` widening.
+   - **Accurately Retained Preservations**:
+     - `test_unrelated_temp_and_data_artifacts_preserved_during_save`: Verifies normal save preserves unrelated data files and other workers' temp files.
+     - `test_failed_save_on_invalid_target_path_does_not_widen_manager`: Verifies manager update fails and does not widen in-memory when the target path is an invalid directory.
+
 ### B. Execution Status & Quality Gates
 | Target Suite | Exact Command Line | Tests Passed | Unexecuted | Result | Evidence Level |
 |---|---|:---:|:---:|:---:|---|
-| **Linux Unit & Consent Storage Suite** | `cargo test --lib --manifest-path clients/linux/Cargo.toml` | 24 | 4 (Unix-only: `0600`/`0700` modes, temp symlink sentinel, target symlink refusal, unsafe `0666` load) | PASSED (exit 0) | **[Worker-Reported (Synthetic Host Execution)]** (Windows host executed 24 cross-platform unit tests; 4 `#[cfg(unix)]` tests honestly unexecuted) |
+| **Linux Unit & Consent Storage Suite** | `cargo test --lib --manifest-path clients/linux/Cargo.toml` | 28 | 4 (Unix-only: `0600`/`0700` modes, temp symlink sentinel, target symlink refusal, unsafe `0666` load) | PASSED (exit 0) | **[Worker-Reported (Synthetic Host Execution)]** (Windows host executed 28 cross-platform unit tests; 4 `#[cfg(unix)]` tests honestly unexecuted) |
 | **Linux Doctor CLI Tests** | `cargo test --test cli_doctor_tests --manifest-path clients/linux/Cargo.toml` | 6 | 0 | PASSED (exit 0) | **[Worker-Reported]** |
 | **Linux Consent Lifecycle Failing-Before Suite** | `cargo test --test failing_before_repro --manifest-path clients/linux/Cargo.toml` | 7 | 0 | PASSED (exit 0) | **[Worker-Reported]** |
 | **Linux Outbox Status CLI Tests** | `cargo test --test outbox_status_cli_tests --manifest-path clients/linux/Cargo.toml` | 15 | 0 | PASSED (exit 0) | **[Worker-Reported]** |
 | **Linux Outbox Tests** | `cargo test --test outbox_tests --manifest-path clients/linux/Cargo.toml` | 28 | 0 | PASSED (exit 0) | **[Worker-Reported]** |
 | **Linux Sync Tests** | `cargo test --test sync_tests --manifest-path clients/linux/Cargo.toml` | 13 | 0 | PASSED (exit 0) | **[Worker-Reported]** |
-| **Total Linux Isolated Synthetic Tests** | (Executed across lib and test crates) | 93 | 4 | PASSED (0 errors, 0 warnings, exit 0) | **[Worker-Reported]** |
+| **Total Linux Isolated Synthetic Tests** | (Executed across lib and test crates) | 97 | 4 | PASSED (0 errors, 0 warnings, exit 0) | **[Worker-Reported]** |
 | **Windows Client Compilation Check** | `cargo check --manifest-path clients/windows/Cargo.toml` | N/A | 0 | PASSED (exit 0) | **[Worker-Reported]** |
 
 ### C. PM QA Boundary Limits & Acceptance Disclosures
-1. **Truthful Storage Invariants**: Consent persistence uses exclusive creation (`create_new`), Unix private modes (`0600` file, `0700` dedicated directory), collision-resistant naming, durability flushing, target symlink/directory refusal, and owned-artifact failure cleanup.
+1. **Truthful Storage Invariants**: Consent persistence uses exclusive creation (`create_new`), Unix private modes (`0600` file, `0700` dedicated directory), collision-resistant naming, durability flushing, target symlink/directory refusal, deterministic collision handling, and owned-artifact failure cleanup.
 2. **Host Environment Gaps**: Windows host lacks native Linux kernel permissions and symlinks; 4 Unix-specific regression tests remain **UNEXECUTED** under `#[cfg(unix)]`.
 3. **Approval-Blocked Invariant**: The unresolved `tirith:archive_extract` command remains untouched.
-4. **No Full-Product Acceptance Claim**: This deliverable completes bounded Linux consent store hardening. Native Linux packaging, X11/Wayland sensor drivers, network synchronization, and live desktop verification remain open acceptance gates.
+4. **No Full-Product Acceptance Claim**: This deliverable completes bounded Linux consent store hardening and deterministic regression proof. Native Linux packaging, X11/Wayland sensor drivers, network synchronization, and live desktop verification remain open acceptance gates.
 
 
 
