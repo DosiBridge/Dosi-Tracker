@@ -35,6 +35,9 @@ import {
   parseRetryAfter,
   projectMembersRoute,
   projectRoute,
+  PROJECT_TASK_ROUTES,
+  projectTaskRoute,
+  projectTasksRoute,
   removeFromWorkspaceRoute,
   removeMemberRoute,
   reportingRoute,
@@ -43,6 +46,10 @@ import {
   updateMemberRoute,
   type ActivityDto,
   type ApiErrorInfo,
+  type CreateProjectTaskDto,
+  type GetProjectTasksQuery,
+  type ProjectTaskDto,
+  type UpdateProjectTaskDto,
   type ChangePasswordInput,
   type CollectedPages,
   type CollectPagesOptions,
@@ -794,3 +801,14 @@ export const getDeviceReport = async (query: ReportingQuery): Promise<DeviceRepo
   const rows = await getApi(reportingRoute('devices', query));
   return Array.isArray(rows) ? (rows as DeviceReportRowDto[]) : [];
 };
+
+/** Project Tasks API */
+export const getProjectTasksApi = (query: GetProjectTasksQuery): Promise<PagedResultDto<ProjectTaskDto>> =>
+  getPagedApi<ProjectTaskDto>(projectTasksRoute(query));
+
+export const createProjectTaskApi = (input: CreateProjectTaskDto): Promise<ProjectTaskDto> =>
+  postApi(PROJECT_TASK_ROUTES.collection, input) as Promise<ProjectTaskDto>;
+
+export const updateProjectTaskApi = (id: string, input: UpdateProjectTaskDto): Promise<ProjectTaskDto> =>
+  putApi(projectTaskRoute(id), input) as Promise<ProjectTaskDto>;
+

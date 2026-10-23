@@ -13,6 +13,11 @@ import {
   OWNER_ONLY_ROLES,
   PRESENCE_ONLINE_SECONDS,
   PROJECT_ROLES,
+  PROJECT_TASK_LIMITS,
+  PROJECT_TASK_ROUTES,
+  projectTaskRoute,
+  projectTasksQuery,
+  projectTasksRoute,
   PRESENCE_STATUSES,
   PRESENCE_STATUS_LABELS,
   REPORTING_ROUTES,
@@ -103,6 +108,9 @@ describe("routes", () => {
       suspendSubscriptionRoute("t1"),
       WORKSPACE_SUBSCRIPTIONS_ROUTE,
       markInvoicePaidRoute("i1"),
+      PROJECT_TASK_ROUTES.collection,
+      projectTaskRoute("task-1"),
+      projectTasksRoute({ projectId: "p1" }),
     ];
     expect(routes.filter((r) => !served(r))).toEqual([]);
   });
@@ -416,3 +424,20 @@ describe("labels and rules", () => {
     expect(TRACKER_ERROR_STATUS["Tracker:NotWorkspaceMember"]).toBe(403);
   });
 });
+
+describe("projectTasksQuery", () => {
+  it("builds query with ProjectId, optional IsCompleted, SkipCount, and caps MaxResultCount at 100", () => {
+    expect(projectTasksQuery({ projectId: "p-123" })).toBe("ProjectId=p-123");
+    expect(projectTasksQuery({ projectId: "p-123", isCompleted: true })).toBe("ProjectId=p-123&IsCompleted=true");
+    expect(projectTasksQuery({ projectId: "p-123", isCompleted: false, skipCount: 20, maxResultCount: 20 })).toBe(
+      "ProjectId=p-123&IsCompleted=false&SkipCount=20&MaxResultCount=20"
+    );
+    // Capping maxResultCount at 100 per ProjectTaskConsts
+    expect(projectTasksQuery({ projectId: "p-123", maxResultCount: 500 })).toBe("ProjectId=p-123&MaxResultCount=100");
+    expect(projectTasksRoute({ projectId: "p-123" })).toBe("/api/app/project-task?ProjectId=p-123");
+    expect(projectTaskRoute("task-uuid-1")).toBe("/api/app/project-task/task-uuid-1");
+    expect(PROJECT_TASK_LIMITS.titleMaxLength).toBe(256);
+    expect(PROJECT_TASK_LIMITS.descriptionMaxLength).toBe(2048);
+  });
+});
+

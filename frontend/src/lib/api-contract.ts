@@ -394,6 +394,80 @@ export function isProjectColor(value: unknown): value is string {
   return typeof value === "string" && /^#[0-9a-fA-F]{6}$/.test(value);
 }
 
+/* ----------------------------- §2b Project Tasks ----------------------------- */
+
+/** Limits matching backend ProjectTaskConsts. */
+export const PROJECT_TASK_LIMITS = {
+  titleMaxLength: 256,
+  descriptionMaxLength: 2048,
+  defaultPageSize: 50,
+  maxPageSize: 100,
+} as const;
+
+export const PROJECT_TASK_ROUTES = {
+  collection: "/api/app/project-task",
+} as const;
+
+/** GET /api/app/project-task item. */
+export interface ProjectTaskDto {
+  id: string;
+  workspaceId: string;
+  projectId: string;
+  title: string;
+  description?: string | null;
+  isCompleted: boolean;
+  completedAt?: string | null;
+  creationTime?: string | null;
+  creatorId?: string | null;
+  lastModificationTime?: string | null;
+  lastModifierId?: string | null;
+}
+
+/** POST /api/app/project-task body. */
+export interface CreateProjectTaskDto {
+  projectId: string;
+  title: string;
+  description?: string | null;
+  isCompleted?: boolean;
+}
+
+/** PUT /api/app/project-task/{id} body. */
+export interface UpdateProjectTaskDto {
+  title: string;
+  description?: string | null;
+  isCompleted: boolean;
+}
+
+/** Parameters for GET /api/app/project-task. */
+export interface GetProjectTasksQuery {
+  projectId: string;
+  isCompleted?: boolean;
+  skipCount?: number;
+  maxResultCount?: number;
+}
+
+/** PUT/GET target for one task. */
+export function projectTaskRoute(taskId: string): string {
+  return `/api/app/project-task/${encodeURIComponent(taskId)}`;
+}
+
+/** Query string for GET /api/app/project-task. */
+export function projectTasksQuery(query: GetProjectTasksQuery): string {
+  const qs = new URLSearchParams({ ProjectId: query.projectId });
+  if (query.isCompleted !== undefined) qs.set("IsCompleted", String(query.isCompleted));
+  if (query.skipCount !== undefined) qs.set("SkipCount", String(Math.max(0, Math.trunc(query.skipCount))));
+  if (query.maxResultCount !== undefined) {
+    const max = Math.min(PROJECT_TASK_LIMITS.maxPageSize, Math.max(1, Math.trunc(query.maxResultCount)));
+    qs.set("MaxResultCount", String(max));
+  }
+  return qs.toString();
+}
+
+/** GET /api/app/project-task with query string. */
+export function projectTasksRoute(query: GetProjectTasksQuery): string {
+  return `${PROJECT_TASK_ROUTES.collection}?${projectTasksQuery(query)}`;
+}
+
 /* ----------------------------- §3 Presence ----------------------------- */
 
 export type PresenceStatus = "tracking" | "paused" | "break" | "idle" | "locked" | "choosing" | "signedout" | "stopped";

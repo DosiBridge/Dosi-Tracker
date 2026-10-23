@@ -2756,6 +2756,71 @@ Implemented deterministic isolated SQLite write-failure regressions in `clients/
 4. **Approval-Blocked Invariant**: The historical PM `tirith:archive_extract` check was never run, retried, or bypassed.
 5. **Mocked Execution Disclosure**: All frontend tests ran against isolated mock HTTP/fetch stubs in Vitest/JSDOM; no real network services, production databases, or external token issuers were accessed. Real browser cookie session validation and multi-tenant live browser end-to-end acceptance remain open verification gates.
 
+---
+
+## 34. Frontend Project Task Lifecycle UI Integration (`REQ-PRJ-01`, selected-project-task-ui-20261023)
+
+> **Execution Date:** October 24, 2026  
+> **Phase Task ID:** `selected-project-task-ui-20261023` (bounded `REQ-PRJ-01` frontend project-detail task lifecycle integration)  
+> **Status:** Implementation Complete; All 176 Focused Vitest Tests Across 10 Suites Passed (Exit Code 0); Typecheck Clean (Exit Code 0); ESLint 0 Errors (Exit Code 0)  
+> **Target Package:** `frontend` (`src/app/(dashboard)/projects/[id]/page.tsx`, `src/components/projects/project-tasks.tsx`, `src/hooks/useApi.ts`, `src/lib/api-contract.ts`, `src/lib/api-contract.test.ts`, `src/test/api-contract.json`, `src/test/pages/project-tasks.test.tsx`, `src/app/(dashboard)/projects/projects-pages.test.tsx`)
+
+### A. Context & Bounded Source Implementation
+1. **Source Evidence & Lifecycle Gap**:
+   - Backend `ProjectTaskAppService` and `ProjectTaskController` already provided the full authenticated/authorized workspace and project-scoped task lifecycle (`REQ-PRJ-01`): `POST /api/app/project-task`, `GET /api/app/project-task`, `GET /api/app/project-task/{id}`, and `PUT /api/app/project-task/{id}` with bounded titles (1..256), descriptions (<=2048), pagination (`SkipCount`, `MaxResultCount` clamped to 100), completion toggle (`IsCompleted`), role-scoped permissions, and archived project/workspace rejection.
+   - The frontend previously had zero task UI: `projects/[id]/page.tsx` rendered project settings, members, and tracking options, but lacked any task listing or management surface.
+   - Task `selected-project-task-ui-20261023` integrated the existing backend project-task lifecycle into the project detail UI without modifying backend code or introducing new dependencies.
+
+2. **API Contract & Route Helpers (`api-contract.ts`, `api-contract.json`, `useApi.ts`)**:
+   - Registered `/api/app/project-task` in `api-contract.json` endpoints allowlist, satisfying `src/test/architecture.spec.ts` Rule 4.
+   - Added typed contract definitions in `api-contract.ts`: `ProjectTaskDto`, `CreateProjectTaskDto`, `UpdateProjectTaskDto`, and `GetProjectTasksQuery`.
+   - Defined `PROJECT_TASK_LIMITS`: `titleMaxLength: 256`, `descriptionMaxLength: 2048`, `defaultPageSize: 50`, `maxPageSize: 100`.
+   - Added route helpers: `projectTaskRoute(id)` -> `/api/app/project-task/{id}`, `projectTasksQuery(query)` -> query-string serializer with validation and clamping (`MaxResultCount` clamped to 100), `projectTasksRoute(query)` -> `/api/app/project-task?...`.
+   - In `useApi.ts`, exported typed wrappers: `getProjectTasksApi(query)` (utilizing `getPagedApi<ProjectTaskDto>` to preserve `{ items, totalCount }`), `createProjectTaskApi(input)`, and `updateProjectTaskApi(id, input)`.
+
+3. **Accessible Project Tasks UI (`project-tasks.tsx`)**:
+   - **Paginated Task List**: Displays tasks with pagination controls (10 items/page), current page range, and total count indicator.
+   - **Filter Tabs**: Open (`IsCompleted: false`), Completed (`IsCompleted: true`), and All (unfiltered), with automatic pagination reset on tab change.
+   - **Creation & Edit Dialogs**: Accessible modal dialogs with title (1..256, required) and description (<=2048, optional) input fields, visible character counters, and submit button disabling while in-flight or when title is blank/whitespace.
+   - **Status Toggle**: One-click checkbox toggle completing or reopening tasks, preserving title and description attributes intact.
+   - **Local DTO Reconciliation & GET-Only Retry**:
+     * Immediately reconciles mutation responses locally to eliminate UI stutter and prevent repeat submissions.
+     * On post-mutation refresh failure, displays an accessible `role="alert"` warning banner ("Task was created/updated, but we couldn't refresh the list. Retry to update.") with a "Retry" button that dispatches ONLY `GET /api/app/project-task` (zero repeated POST/PUT calls).
+   - **Scope Switch Safety**: Uses `activeScopeRef` to track current workspace and project IDs, discarding stale in-flight responses across project switches.
+   - **Demo Mode Isolation**: In demo mode (`!isLive`), dispatches zero network requests to `/api/app/project-task`, rendering honest demo task data.
+
+4. **Project Detail Page Integration & Role Governance (`projects/[id]/page.tsx`)**:
+   - Embedded `<ProjectTasksSection key={project.id} projectId={project.id} projectArchived={project.archived} isLive={project.live} canMutate={canMutateTasks} />`. Keying on `project.id` guarantees clean component re-mounting and state disposal upon navigation.
+   - Evaluated `canMutateTasks = !project.archived && (isPrivileged || (isProjectMember && !isClientMember))` matching backend authorization:
+     * Workspace Owners/Managers (`isPrivileged`) or enrolled non-client project contributors (`isProjectMember && !isClientMember`) can mutate tasks.
+     * Project client members (`isClientMember`) or archived projects (`project.archived`) receive read-only task viewing with mutation controls completely excluded or disabled.
+     * UI guards do not replace backend authorization: 403 Forbidden and 409 Conflict are surfaced honestly via error banners.
+
+### B. Execution Status & Quality Gates
+| Target Suite | Exact Command Line | Tests Passed | Failed | Result | Evidence Level |
+|---|---|:---:|:---:|:---:|---|
+| **Project Tasks Component Suite** | `npx vitest run src/test/pages/project-tasks.test.tsx` | 12 | 0 | PASSED (exit 0) | **[Worker-Reported (Vitest / JSDOM)]** |
+| **Projects Pages Suite** | `npx vitest run "src/app/(dashboard)/projects/projects-pages.test.tsx"` | 10 | 0 | PASSED (exit 0) | **[Worker-Reported (Vitest / JSDOM)]** |
+| **API Contract Pure Route Suite** | `npx vitest run src/lib/api-contract.test.ts` | 31 | 0 | PASSED (exit 0) | **[Worker-Reported (Vitest / Node)]** |
+| **Sign-In & Resolution Unit Suite** | `npx vitest run src/lib/sign-in.test.ts` | 45 | 0 | PASSED (exit 0) | **[Worker-Reported (Vitest / JSDOM)]** |
+| **Architecture Specification** | `npx vitest run src/test/architecture.spec.ts` | 12 | 0 | PASSED (exit 0) | **[Worker-Reported (Vitest / Node)]** |
+| **Workspace Chooser Page Suite** | `npx vitest run src/test/pages/workspaces.test.tsx` | 10 | 0 | PASSED (exit 0) | **[Worker-Reported (Vitest / JSDOM)]** |
+| **Live Workspace Switcher Suite** | `npx vitest run src/components/layout/workspace-switcher.live.test.tsx` | 12 | 0 | PASSED (exit 0) | **[Worker-Reported (Vitest / JSDOM)]** |
+| **Demo Switcher Suite** | `npx vitest run src/components/layout/workspace-switcher.test.tsx` | 4 | 0 | PASSED (exit 0) | **[Worker-Reported (Vitest / JSDOM)]** |
+| **Tenant Lifecycle Acceptance** | `npx vitest run src/test/acceptance/tenant-lifecycle.test.tsx` | 4 | 0 | PASSED (exit 0) | **[Worker-Reported (Vitest / JSDOM)]** |
+| **Login Flow & Landing Suite** | `npx vitest run src/test/pages/login.test.tsx` | 36 | 0 | PASSED (exit 0) | **[Worker-Reported (Vitest / JSDOM)]** |
+| **Total Focused Vitest Execution** | `npx vitest run ...` (all 10 suites combined) | 176 | 0 | PASSED (exit 0) | **[Worker-Reported]** |
+| **TypeScript Typecheck** | `npm run typecheck` (`tsc --noEmit`) | N/A | 0 | PASSED (exit 0) | **[Worker-Reported]** |
+| **ESLint Static Analysis** | `npm run lint` (`eslint --max-warnings 45`) | N/A | 0 errors (3 warnings in untouched files) | PASSED (exit 0) | **[Worker-Reported]** |
+
+### C. PM QA Boundary Limits & Acceptance Disclosures
+1. **Bounded Frontend Integration Only**: This slice integrates the existing backend task lifecycle into the project detail page. No backend entities, migrations, or database queries were modified.
+2. **Preserved Backend Authorization**: UI role-based control hiding and button disabling complement but do not replace server-side authorization. Backend `ProjectTaskAppService` strictly validates workspace, project, client role, and archived state boundaries.
+3. **Task Scope Limitations**: In accordance with the `REQ-PRJ-01` specification, task deletion, custom assignment dropdowns, due dates, time tracking linkage, and real-time push subscriptions remain deferred.
+4. **Approval-Blocked Invariant**: The historical PM `tirith:archive_extract` check was never run, retried, or bypassed.
+5. **Mocked Execution Disclosure**: All frontend tests ran against isolated mock HTTP/fetch stubs in Vitest/JSDOM; no real network services, production databases, or external token issuers were accessed. Live browser session testing and real PostgreSQL cluster concurrency remain open verification gates.
+
+
 
 
 

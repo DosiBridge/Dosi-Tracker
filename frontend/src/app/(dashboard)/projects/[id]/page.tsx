@@ -44,7 +44,8 @@ import {
   permissionsFromDto,
   type ProjectDraft,
 } from "@/components/projects/project-form";
-import { editRulesFor, memberNameOf, membershipErrorText, projectRoleLabel } from "@/components/projects/membership";
+import { editRulesFor, memberNameOf, membershipErrorText, projectRoleLabel, projectRoleOf } from "@/components/projects/membership";
+import { ProjectTasksSection } from "@/components/projects/project-tasks";
 import { requestErrorText } from "@/components/layout/request-error";
 import { activitiesForProject, projectById, userById, users } from "@/lib/tenant-data";
 import { averageProductivity, durationMinutes } from "@/lib/metrics";
@@ -384,6 +385,14 @@ export default function ProjectDetailPage() {
     { label: "Members", value: String(memberRows.length), icon: Users },
   ];
 
+  const isPrivileged = user.role === "owner" || user.role === "admin";
+  const myProjectMembership = apiMembers?.find((m) => m.userId === user.id);
+  const isProjectMember = Boolean(myProjectMembership);
+  const isClientMember = myProjectMembership
+    ? projectRoleOf(myProjectMembership.role) === "Client"
+    : user.role === "client";
+  const canMutateTasks = !project.archived && (isPrivileged || (isProjectMember && !isClientMember));
+
   async function toggleArchive() {
     const wasArchived = project.archived;
     setConfirmArchive(false);
@@ -646,6 +655,15 @@ export default function ProjectDetailPage() {
           </CardContent>
         </Card>
       </div>
+
+      {/* Project tasks */}
+      <ProjectTasksSection
+        key={project.id}
+        projectId={project.id}
+        projectArchived={project.archived}
+        isLive={project.live}
+        canMutate={canMutateTasks}
+      />
 
       {/* Recent activity */}
       <Card>

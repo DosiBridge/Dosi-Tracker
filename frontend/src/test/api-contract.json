@@ -10,6 +10,7 @@
     "/api/app/workspace/available-plans",
     "/api/app/billing/invoices",
     "/api/app/project",
+    "/api/app/project-task",
     "/api/app/activity",
     "/api/app/activity/screenshots",
     "/api/app/activity/screenshot",

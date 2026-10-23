@@ -125,6 +125,7 @@ function liveBackend(opts: { roles?: string[]; grants?: Record<string, boolean> 
       });
     }
     if (url.startsWith("/api/app/activity")) return json({ items: [], totalCount: 0 });
+    if (url.startsWith("/api/app/project-task")) return json({ items: [], totalCount: 0 });
     if (url.startsWith("/api/app/project")) return json({ items: [{ id: PROJECT, title: "Apollo", isArchived: archived }] });
     if (url.startsWith("/api/app/workspace/current-subscription")) return json({ planId: "plan-s", status: "active" });
     if (url.startsWith("/api/app/workspace/available-plans")) return json({ items: [{ id: "plan-s", name: "Starter", pricePerUser: 6, maxSeats: 25 }] });
