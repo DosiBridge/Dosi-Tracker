@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { CheckCircle2, Circle, Loader2, Pencil, Plus } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -29,16 +29,40 @@ export interface ProjectTasksSectionProps {
   projectArchived: boolean;
   isLive: boolean;
   canMutate: boolean;
+  workspaceId?: string | null;
 }
 
 const PAGE_SIZE = 10;
+
+function subscribeWorkspace(callback: () => void) {
+  if (typeof window === "undefined") return () => {};
+  window.addEventListener("storage", callback);
+  window.addEventListener("dosi-workspace-change", callback);
+  return () => {
+    window.removeEventListener("storage", callback);
+    window.removeEventListener("dosi-workspace-change", callback);
+  };
+}
 
 export function ProjectTasksSection({
   projectId,
   projectArchived,
   isLive,
   canMutate,
+  workspaceId: propWorkspaceId,
 }: ProjectTasksSectionProps) {
+  const liveStoredWs = useSyncExternalStore(
+    subscribeWorkspace,
+    () => (typeof window !== "undefined" ? currentWorkspaceId() : null),
+    () => null
+  );
+
+  const effectiveWorkspace = propWorkspaceId !== undefined
+    ? propWorkspaceId
+    : (isLive ? liveStoredWs : null);
+
+  const scopeKey = `${isLive ? effectiveWorkspace ?? "" : "demo"}:${projectId}`;
+
   const [tasks, setTasks] = useState<ProjectTaskDto[]>([]);
   const [totalCount, setTotalCount] = useState(0);
   const [page, setPage] = useState(0);
@@ -53,9 +77,38 @@ export function ProjectTasksSection({
   const [createModalOpen, setCreateModalOpen] = useState(false);
   const [editingTask, setEditingTask] = useState<ProjectTaskDto | null>(null);
 
-  // Scope tracking for discard of stale in-flight results
-  const activeScopeRef = useRef<string>("");
-  const currentWorkspace = isLive ? currentWorkspaceId() : null;
+  // Monotonic generation counters for publication safety (accessed only outside render)
+  const scopeGenRef = useRef(0);
+  const requestGenRef = useRef(0);
+  const activeListRequestRef = useRef(0);
+
+  // Reactive scope generation state
+  const [prevScopeKey, setPrevScopeKey] = useState(scopeKey);
+  const [scopeGen, setScopeGen] = useState(0);
+
+  // Immediate state exclusion & reset on scope change (during render)
+  if (prevScopeKey !== scopeKey) {
+    setPrevScopeKey(scopeKey);
+    setScopeGen((g) => g + 1);
+
+    setTasks([]);
+    setTotalCount(0);
+    setPage(0);
+    setFilter("all");
+    setLoading(false);
+    setFetchError(null);
+    setRefreshWarning(null);
+    setRefreshing(false);
+    setBusyTaskId(null);
+    setCreateModalOpen(false);
+    setEditingTask(null);
+  }
+
+  // Sync latest scope generation ref outside render
+  useEffect(() => {
+    scopeGenRef.current = scopeGen;
+    activeListRequestRef.current = ++requestGenRef.current;
+  }, [scopeGen]);
 
   const loadTasks = useCallback(async () => {
     if (!isLive) {
@@ -65,37 +118,53 @@ export function ProjectTasksSection({
       return;
     }
 
-    const currentScope = `${currentWorkspace ?? ""}:${projectId}:${filter}:${page}`;
-    activeScopeRef.current = currentScope;
+    const thisScopeGen = scopeGen;
+    const thisFilter = filter;
+    const thisPage = page;
+    const requestId = ++requestGenRef.current;
+    activeListRequestRef.current = requestId;
 
     setLoading(true);
     setFetchError(null);
 
     const query: GetProjectTasksQuery = {
       projectId,
-      skipCount: page * PAGE_SIZE,
+      skipCount: thisPage * PAGE_SIZE,
       maxResultCount: PAGE_SIZE,
-      isCompleted: filter === "open" ? false : filter === "completed" ? true : undefined,
+      isCompleted: thisFilter === "open" ? false : thisFilter === "completed" ? true : undefined,
     };
 
     try {
       const res = await getProjectTasksApi(query);
-      if (activeScopeRef.current !== currentScope) return; // Discard stale in-flight response
+      if (
+        scopeGenRef.current !== thisScopeGen ||
+        activeListRequestRef.current !== requestId
+      ) {
+        return; // Discard stale in-flight response
+      }
       const paged = toPagedResult<ProjectTaskDto>(res);
       setTasks(paged.items);
       setTotalCount(paged.totalCount);
       setRefreshWarning(null);
     } catch (err) {
-      if (activeScopeRef.current !== currentScope) return;
+      if (
+        scopeGenRef.current !== thisScopeGen ||
+        activeListRequestRef.current !== requestId
+      ) {
+        return;
+      }
       setTasks([]);
       setTotalCount(0);
       setFetchError(requestErrorText(err, "Couldn't load tasks for this project."));
     } finally {
-      if (activeScopeRef.current === currentScope) {
+      if (
+        scopeGenRef.current === thisScopeGen &&
+        activeListRequestRef.current === requestId
+      ) {
         setLoading(false);
       }
     }
-  }, [isLive, currentWorkspace, projectId, filter, page]);
+  }, [isLive, scopeGen, projectId, filter, page]);
 
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- data fetch defers its own setState; see docs/QUALITY.md §10
@@ -105,29 +174,58 @@ export function ProjectTasksSection({
   // Explicit retry sending ONLY GET
   async function reloadTasks() {
     if (refreshing || loading) return;
+
+    const thisScopeGen = scopeGen;
+    const thisFilter = filter;
+    const thisPage = page;
+    const requestId = ++requestGenRef.current;
+    activeListRequestRef.current = requestId;
+
     setRefreshing(true);
     const query: GetProjectTasksQuery = {
       projectId,
-      skipCount: page * PAGE_SIZE,
+      skipCount: thisPage * PAGE_SIZE,
       maxResultCount: PAGE_SIZE,
-      isCompleted: filter === "open" ? false : filter === "completed" ? true : undefined,
+      isCompleted: thisFilter === "open" ? false : thisFilter === "completed" ? true : undefined,
     };
     try {
       const res = await getProjectTasksApi(query);
+      if (
+        scopeGenRef.current !== thisScopeGen ||
+        activeListRequestRef.current !== requestId
+      ) {
+        return;
+      }
       const paged = toPagedResult<ProjectTaskDto>(res);
       setTasks(paged.items);
       setTotalCount(paged.totalCount);
       setRefreshWarning(null);
     } catch {
+      if (
+        scopeGenRef.current !== thisScopeGen ||
+        activeListRequestRef.current !== requestId
+      ) {
+        return;
+      }
       setRefreshWarning("Couldn't refresh tasks. Check your connection and try again.");
     } finally {
-      setRefreshing(false);
+      if (
+        scopeGenRef.current === thisScopeGen &&
+        activeListRequestRef.current === requestId
+      ) {
+        setRefreshing(false);
+      }
     }
   }
 
   // Toggle completion: preserves existing title and description
   async function handleToggleComplete(task: ProjectTaskDto) {
     if (!canMutate || projectArchived || busyTaskId) return;
+
+    const thisScopeGen = scopeGen;
+    const thisFilter = filter;
+    const thisPage = page;
+
     setBusyTaskId(task.id);
     setRefreshWarning(null);
 
@@ -139,6 +237,11 @@ export function ProjectTasksSection({
         isCompleted: nextCompleted,
       });
 
+      // Guard publication of mutation outcome
+      if (scopeGenRef.current !== thisScopeGen) {
+        return;
+      }
+
       // Reconcile locally immediately
       setTasks((prev) => prev.map((t) => (t.id === updated.id ? updated : t)));
       toast({
@@ -146,29 +249,49 @@ export function ProjectTasksSection({
         tone: "success",
       });
 
-      // Background list refresh
+      // Background list refresh with guarded publication
+      const refreshRequestId = ++requestGenRef.current;
+      activeListRequestRef.current = refreshRequestId;
+
       try {
         const query: GetProjectTasksQuery = {
           projectId,
-          skipCount: page * PAGE_SIZE,
+          skipCount: thisPage * PAGE_SIZE,
           maxResultCount: PAGE_SIZE,
-          isCompleted: filter === "open" ? false : filter === "completed" ? true : undefined,
+          isCompleted: thisFilter === "open" ? false : thisFilter === "completed" ? true : undefined,
         };
         const res = await getProjectTasksApi(query);
+        if (
+          scopeGenRef.current !== thisScopeGen ||
+          activeListRequestRef.current !== refreshRequestId
+        ) {
+          return;
+        }
         const paged = toPagedResult<ProjectTaskDto>(res);
         setTasks(paged.items);
         setTotalCount(paged.totalCount);
       } catch {
+        if (
+          scopeGenRef.current !== thisScopeGen ||
+          activeListRequestRef.current !== refreshRequestId
+        ) {
+          return;
+        }
         setRefreshWarning("Task was updated, but we couldn't refresh the list. Retry to update.");
       }
     } catch (err) {
+      if (scopeGenRef.current !== thisScopeGen) {
+        return;
+      }
       toast({
         tone: "danger",
         title: "Couldn't update task",
         description: requestErrorText(err, "The change wasn't saved."),
       });
     } finally {
-      setBusyTaskId(null);
+      if (scopeGenRef.current === thisScopeGen) {
+        setBusyTaskId(null);
+      }
     }
   }
 
@@ -396,6 +519,10 @@ export function ProjectTasksSection({
           initialDescription=""
           onClose={() => setCreateModalOpen(false)}
           onSubmit={async (newTitle, newDesc) => {
+            const thisScopeGen = scopeGen;
+            const thisFilter = filter;
+            const thisPage = page;
+
             const created = await createProjectTaskApi({
               projectId,
               title: newTitle,
@@ -403,26 +530,49 @@ export function ProjectTasksSection({
               isCompleted: false,
             });
 
-            // Reconcile locally immediately
-            if (page === 0 && filter !== "completed") {
-              setTasks((prev) => [created, ...prev]);
+            if (scopeGenRef.current !== thisScopeGen) {
+              return;
             }
-            setTotalCount((c) => c + 1);
+
+            // Reconcile locally immediately:
+            // An open task must NOT increment completed-filter count
+            if (thisFilter === "all" || thisFilter === "open") {
+              setTotalCount((c) => c + 1);
+            }
+            // Local optimistic insertion must not exceed page limits if refresh fails
+            if (thisPage === 0 && thisFilter !== "completed") {
+              setTasks((prev) => [created, ...prev].slice(0, PAGE_SIZE));
+            }
             toast({ title: "Task created", tone: "success" });
 
-            // Background reload
+            // Background reload with guarded publication
+            const refreshRequestId = ++requestGenRef.current;
+            activeListRequestRef.current = refreshRequestId;
+
             try {
               const query: GetProjectTasksQuery = {
                 projectId,
-                skipCount: page * PAGE_SIZE,
+                skipCount: thisPage * PAGE_SIZE,
                 maxResultCount: PAGE_SIZE,
-                isCompleted: filter === "open" ? false : filter === "completed" ? true : undefined,
+                isCompleted: thisFilter === "open" ? false : thisFilter === "completed" ? true : undefined,
               };
               const res = await getProjectTasksApi(query);
+              if (
+                scopeGenRef.current !== thisScopeGen ||
+                activeListRequestRef.current !== refreshRequestId
+              ) {
+                return;
+              }
               const paged = toPagedResult<ProjectTaskDto>(res);
               setTasks(paged.items);
               setTotalCount(paged.totalCount);
             } catch {
+              if (
+                scopeGenRef.current !== thisScopeGen ||
+                activeListRequestRef.current !== refreshRequestId
+              ) {
+                return;
+              }
               setRefreshWarning("Task was created, but we couldn't refresh the list. Retry to update.");
             }
           }}
@@ -437,29 +587,54 @@ export function ProjectTasksSection({
           initialDescription={editingTask.description ?? ""}
           onClose={() => setEditingTask(null)}
           onSubmit={async (updatedTitle, updatedDesc) => {
-            const updated = await updateProjectTaskApi(editingTask.id, {
+            const thisScopeGen = scopeGen;
+            const thisFilter = filter;
+            const thisPage = page;
+            const targetId = editingTask.id;
+            const wasCompleted = editingTask.isCompleted;
+
+            const updated = await updateProjectTaskApi(targetId, {
               title: updatedTitle,
               description: updatedDesc || null,
-              isCompleted: editingTask.isCompleted,
+              isCompleted: wasCompleted,
             });
+
+            if (scopeGenRef.current !== thisScopeGen) {
+              return;
+            }
 
             // Reconcile locally immediately
             setTasks((prev) => prev.map((t) => (t.id === updated.id ? updated : t)));
             toast({ title: "Task updated", tone: "success" });
 
-            // Background reload
+            // Background reload with guarded publication
+            const refreshRequestId = ++requestGenRef.current;
+            activeListRequestRef.current = refreshRequestId;
+
             try {
               const query: GetProjectTasksQuery = {
                 projectId,
-                skipCount: page * PAGE_SIZE,
+                skipCount: thisPage * PAGE_SIZE,
                 maxResultCount: PAGE_SIZE,
-                isCompleted: filter === "open" ? false : filter === "completed" ? true : undefined,
+                isCompleted: thisFilter === "open" ? false : thisFilter === "completed" ? true : undefined,
               };
               const res = await getProjectTasksApi(query);
+              if (
+                scopeGenRef.current !== thisScopeGen ||
+                activeListRequestRef.current !== refreshRequestId
+              ) {
+                return;
+              }
               const paged = toPagedResult<ProjectTaskDto>(res);
               setTasks(paged.items);
               setTotalCount(paged.totalCount);
             } catch {
+              if (
+                scopeGenRef.current !== thisScopeGen ||
+                activeListRequestRef.current !== refreshRequestId
+              ) {
+                return;
+              }
               setRefreshWarning("Task was updated, but we couldn't refresh the list. Retry to update.");
             }
           }}
@@ -488,9 +663,19 @@ function TaskFormModal({
   const [taskDescription, setTaskDescription] = useState(initialDescription);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const isMountedRef = useRef(true);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
+    if (submitting) return;
+
     const trimmedTitle = taskTitle.trim();
     if (!trimmedTitle) {
       setError("The task needs a title.");
@@ -509,11 +694,17 @@ function TaskFormModal({
     setError(null);
     try {
       await onSubmit(trimmedTitle, taskDescription.trim());
-      onClose();
+      if (isMountedRef.current) {
+        onClose();
+      }
     } catch (err) {
-      setError(requestErrorText(err, "Couldn't save task."));
+      if (isMountedRef.current) {
+        setError(requestErrorText(err, "Couldn't save task."));
+      }
     } finally {
-      setSubmitting(false);
+      if (isMountedRef.current) {
+        setSubmitting(false);
+      }
     }
   }
 

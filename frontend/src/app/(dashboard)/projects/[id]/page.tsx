@@ -50,7 +50,7 @@ import { requestErrorText } from "@/components/layout/request-error";
 import { activitiesForProject, projectById, userById, users } from "@/lib/tenant-data";
 import { averageProductivity, durationMinutes } from "@/lib/metrics";
 import { canViewProject } from "@/lib/scope";
-import { agoLabel, referenceNow } from "@/lib/live-session";
+import { agoLabel, currentWorkspaceId, referenceNow } from "@/lib/live-session";
 import { formatDuration } from "@/lib/utils";
 import { addZonedDays, formatDayKey, zonedDayKey, zonedDayRange, zonedPeriod } from "@/lib/time-zone";
 import { useReportingZone } from "@/hooks/use-reporting-zone";
@@ -147,7 +147,7 @@ function summaryTotals(summary: unknown): { minutes: number; perUser: LiveTotals
 
 export default function ProjectDetailPage() {
   const { id } = useParams<{ id: string }>();
-  const { user, isLive, refreshSession } = useSession();
+  const { user, isLive, workspace, refreshSession } = useSession();
   const zone = useReportingZone(isLive);
   const canManage = user.role === "owner" || user.role === "admin";
 
@@ -660,6 +660,7 @@ export default function ProjectDetailPage() {
       <ProjectTasksSection
         key={project.id}
         projectId={project.id}
+        workspaceId={isLive ? workspace?.id ?? currentWorkspaceId() : null}
         projectArchived={project.archived}
         isLive={project.live}
         canMutate={canMutateTasks}

@@ -5,9 +5,10 @@ vi.mock("next/navigation", async () => ({
 }));
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { screen, waitFor, within } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import ProjectDetailPage from "@/app/(dashboard)/projects/[id]/page";
+import { ProjectTasksSection } from "@/components/projects/project-tasks";
 import { SessionProvider } from "@/components/session-provider";
 import { renderAsRole, resetPrototypeState } from "@/test/harness";
 
@@ -634,5 +635,458 @@ describe("Project Tasks Section", () => {
 
     const taskCalls = fetchMock.mock.calls.filter(([u]) => String(u).includes("/api/app/project-task"));
     expect(taskCalls).toHaveLength(0);
+  });
+
+  it("workspace change with same projectId discards in-flight list and isolates state", async () => {
+    const WS_A = "11111111-1111-1111-1111-111111111111";
+    const WS_B = "22222222-2222-2222-2222-222222222222";
+    let resolveWsA: ((res: Response) => void) | null = null;
+
+    localStorage.setItem("dosi-workspace", WS_A);
+
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const wsHeader = (init?.headers as Record<string, string>)?.[ "X-Workspace-Id" ];
+
+      if (url.includes("/api/app/project-task")) {
+        if (wsHeader === WS_A) {
+          return new Promise<Response>((resolve) => {
+            resolveWsA = resolve;
+          });
+        }
+        if (wsHeader === WS_B) {
+          return json({
+            items: [{ id: "task-ws-b", title: "Workspace B Task", isCompleted: false }],
+            totalCount: 1,
+          });
+        }
+      }
+      return json({ items: [], totalCount: 0 });
+    });
+
+    const { rerender } = render(
+      <ProjectTasksSection
+        projectId="p-shared"
+        workspaceId={WS_A}
+        projectArchived={false}
+        isLive={true}
+        canMutate={true}
+      />
+    );
+
+    // Switch to Workspace B with the SAME projectId
+    localStorage.setItem("dosi-workspace", WS_B);
+    rerender(
+      <ProjectTasksSection
+        projectId="p-shared"
+        workspaceId={WS_B}
+        projectArchived={false}
+        isLive={true}
+        canMutate={true}
+      />
+    );
+
+    expect(await screen.findByText("Workspace B Task")).toBeInTheDocument();
+
+    // Resolve delayed Workspace A response
+    if (resolveWsA) {
+      (resolveWsA as (res: Response) => void)(
+        json({
+          items: [{ id: "task-ws-a", title: "Workspace A Leaked Task", isCompleted: false }],
+          totalCount: 1,
+        })
+      );
+    }
+
+    // Workspace A must NOT contaminate Workspace B
+    expect(screen.queryByText("Workspace A Leaked Task")).not.toBeInTheDocument();
+    expect(screen.getByText("Workspace B Task")).toBeInTheDocument();
+  });
+
+  it("post-mutation refresh arriving after filter change does not overwrite new filter results", async () => {
+    let resolveBackgroundRefresh: ((res: Response) => void) | null = null;
+    let refreshCount = 0;
+
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+
+      if (url.includes("/api/app/project-task")) {
+        if (method === "PUT") {
+          return json({
+            id: "t1",
+            projectId: PROJECT_A,
+            title: "Initial Task",
+            isCompleted: true,
+          });
+        }
+        if (method === "GET") {
+          refreshCount++;
+          // Initial load for "all"
+          if (refreshCount === 1) {
+            return json({
+              items: [{ id: "t1", title: "Initial Task", isCompleted: false }],
+              totalCount: 1,
+            });
+          }
+          // Background refresh triggered by toggle
+          if (refreshCount === 2) {
+            return new Promise<Response>((resolve) => {
+              resolveBackgroundRefresh = resolve;
+            });
+          }
+          // Load triggered by switching to "completed" tab
+          if (url.includes("IsCompleted=true")) {
+            return json({
+              items: [{ id: "completed-fresh", title: "Completed Filter Task", isCompleted: true }],
+              totalCount: 1,
+            });
+          }
+        }
+      }
+      return json({ items: [], totalCount: 0 });
+    });
+
+    const user = userEvent.setup();
+    render(
+      <ProjectTasksSection
+        projectId={PROJECT_A}
+        workspaceId={WORKSPACE_ID}
+        projectArchived={false}
+        isLive={true}
+        canMutate={true}
+      />
+    );
+
+    expect(await screen.findByText("Initial Task")).toBeInTheDocument();
+
+    // Toggle completion -> fires PUT, then fires background refresh GET (refreshCount = 2, held pending)
+    const toggleBtn = screen.getByRole("button", { name: /mark "initial task" as completed/i });
+    await user.click(toggleBtn);
+
+    // While background refresh is pending, switch filter tab to "Completed"
+    const completedTab = screen.getByRole("tab", { name: "Completed" });
+    await user.click(completedTab);
+
+    // "Completed" tab loads its fresh items
+    expect(await screen.findByText("Completed Filter Task")).toBeInTheDocument();
+
+    // Now resolve the late background refresh from the earlier mutation (which was for filter="all")
+    if (resolveBackgroundRefresh) {
+      (resolveBackgroundRefresh as (res: Response) => void)(
+        json({
+          items: [{ id: "stale-all-item", title: "Stale All Item", isCompleted: true }],
+          totalCount: 1,
+        })
+      );
+    }
+
+    // Stale background refresh must NOT overwrite the completed tab items
+    expect(screen.queryByText("Stale All Item")).not.toBeInTheDocument();
+    expect(screen.getByText("Completed Filter Task")).toBeInTheDocument();
+  });
+
+  it("GET-only retry resolving after scope change is discarded without repeat mutation", async () => {
+    let resolveRetry: ((res: Response) => void) | null = null;
+    let getCallCount = 0;
+
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+
+      if (url.includes("/api/app/project-task")) {
+        if (method === "GET") {
+          getCallCount++;
+          // Initial load
+          if (getCallCount === 1) {
+            return json({ items: [{ id: "t1", title: "Task 1", isCompleted: false }], totalCount: 1 });
+          }
+          // Background refresh fails after toggle -> causes retry warning
+          if (getCallCount === 2) {
+            return json({ message: "Network timeout" }, 500);
+          }
+          // Explicit Retry click -> held on barrier
+          if (getCallCount === 3) {
+            return new Promise<Response>((resolve) => {
+              resolveRetry = resolve;
+            });
+          }
+          // New scope load
+          return json({ items: [{ id: "t2", title: "Project B Task", isCompleted: false }], totalCount: 1 });
+        }
+        if (method === "PUT") {
+          return json({ id: "t1", title: "Task 1", isCompleted: true });
+        }
+      }
+      return json({ items: [], totalCount: 0 });
+    });
+
+    const user = userEvent.setup();
+    const { rerender } = render(
+      <ProjectTasksSection
+        projectId="p1"
+        workspaceId={WORKSPACE_ID}
+        projectArchived={false}
+        isLive={true}
+        canMutate={true}
+      />
+    );
+
+    expect(await screen.findByText("Task 1")).toBeInTheDocument();
+
+    // Toggle -> PUT succeeds, background GET fails -> alert warning appears
+    await user.click(screen.getByRole("button", { name: /mark "task 1" as completed/i }));
+    const retryBtn = await screen.findByRole("button", { name: /retry/i });
+
+    // Click Retry -> getCallCount = 3, held pending
+    await user.click(retryBtn);
+
+    // Before retry resolves, change scope to project "p2"
+    rerender(
+      <ProjectTasksSection
+        projectId="p2"
+        workspaceId={WORKSPACE_ID}
+        projectArchived={false}
+        isLive={true}
+        canMutate={true}
+      />
+    );
+
+    expect(await screen.findByText("Project B Task")).toBeInTheDocument();
+
+    // Resolve late retry GET
+    if (resolveRetry) {
+      (resolveRetry as (res: Response) => void)(
+        json({
+          items: [{ id: "t1-late-retry", title: "Late Retry Task", isCompleted: true }],
+          totalCount: 1,
+        })
+      );
+    }
+
+    // Late retry must NOT overwrite Project B's task list
+    expect(screen.queryByText("Late Retry Task")).not.toBeInTheDocument();
+    expect(screen.getByText("Project B Task")).toBeInTheDocument();
+
+    // Verify zero repeated PUTs
+    const putCalls = fetchMock.mock.calls.filter(([, i]) => i?.method === "PUT");
+    expect(putCalls).toHaveLength(1);
+  });
+
+  it("pending mutation settlement after scope change does not leak into new scope", async () => {
+    let resolveCreate: ((res: Response) => void) | null = null;
+
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+
+      if (url.includes("/api/app/project-task")) {
+        if (method === "POST") {
+          return new Promise<Response>((resolve) => {
+            resolveCreate = resolve;
+          });
+        }
+        if (url.includes("ProjectId=p2")) {
+          return json({ items: [{ id: "p2-task", title: "P2 Existing", isCompleted: false }], totalCount: 1 });
+        }
+      }
+      return json({ items: [], totalCount: 0 });
+    });
+
+    const user = userEvent.setup();
+    const { rerender } = render(
+      <ProjectTasksSection
+        projectId="p1"
+        workspaceId={WORKSPACE_ID}
+        projectArchived={false}
+        isLive={true}
+        canMutate={true}
+      />
+    );
+
+    // Open create modal
+    const addBtn = await screen.findByRole("button", { name: /add task/i });
+    await user.click(addBtn);
+
+    // Fill in title
+    await user.type(screen.getByLabelText(/^title/i), "Orphaned Task");
+    await user.click(screen.getByRole("button", { name: /save task/i }));
+
+    // POST is in flight; now scope changes to "p2"
+    rerender(
+      <ProjectTasksSection
+        projectId="p2"
+        workspaceId={WORKSPACE_ID}
+        projectArchived={false}
+        isLive={true}
+        canMutate={true}
+      />
+    );
+
+    expect(await screen.findByText("P2 Existing")).toBeInTheDocument();
+
+    // Now resolve late POST
+    if (resolveCreate) {
+      (resolveCreate as (res: Response) => void)(
+        json({
+          id: "created-p1",
+          projectId: "p1",
+          title: "Orphaned Task",
+          isCompleted: false,
+        })
+      );
+    }
+
+    // Must not insert into p2 or increment p2 totalCount
+    expect(screen.queryByText("Orphaned Task")).not.toBeInTheDocument();
+    expect(screen.getByText("P2 Existing")).toBeInTheDocument();
+    expect(screen.getByText("1 task")).toBeInTheDocument();
+  });
+
+  it("repeated same-query requests reject older in-flight responses", async () => {
+    let resolveQuery1: ((res: Response) => void) | null = null;
+    let resolveQueryFinal: ((res: Response) => void) | null = null;
+    let queryCount = 0;
+
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.includes("/api/app/project-task")) {
+        queryCount++;
+        if (queryCount === 1) {
+          // Query 1 for All
+          return new Promise<Response>((resolve) => {
+            resolveQuery1 = resolve;
+          });
+        }
+        if (url.includes("IsCompleted=false")) {
+          // Open tab response
+          return json({ items: [], totalCount: 0 });
+        }
+        if (queryCount >= 3) {
+          // Query 3 for All again (A-B-A sequence)
+          return new Promise<Response>((resolve) => {
+            resolveQueryFinal = resolve;
+          });
+        }
+      }
+      return json({ items: [], totalCount: 0 });
+    });
+
+    const user = userEvent.setup();
+    render(
+      <ProjectTasksSection
+        projectId="p1"
+        workspaceId={WORKSPACE_ID}
+        projectArchived={false}
+        isLive={true}
+        canMutate={true}
+      />
+    );
+
+    // Query 1 in flight for "all".
+    // Toggle filter: Open -> All to issue Query 3 for "all" (A-B-A sequence)
+    const openTab = await screen.findByRole("tab", { name: "Open" });
+    const allTab = screen.getByRole("tab", { name: "All" });
+
+    await user.click(openTab);
+    await user.click(allTab);
+
+    // Resolve Query 3 first with fresh data
+    await waitFor(() => expect(resolveQueryFinal).not.toBeNull());
+    if (resolveQueryFinal) {
+      (resolveQueryFinal as (res: Response) => void)(
+        json({
+          items: [{ id: "fresh-task", title: "Fresh Task Item", isCompleted: false }],
+          totalCount: 1,
+        })
+      );
+    }
+
+    expect(await screen.findByText("Fresh Task Item")).toBeInTheDocument();
+
+    // Now resolve older Query 1 with stale data
+    if (resolveQuery1) {
+      (resolveQuery1 as (res: Response) => void)(
+        json({
+          items: [{ id: "stale-task", title: "Stale Task Item", isCompleted: false }],
+          totalCount: 1,
+        })
+      );
+    }
+
+    // Stale Query 1 must NOT overwrite Fresh Task Item
+    expect(screen.queryByText("Stale Task Item")).not.toBeInTheDocument();
+    expect(screen.getByText("Fresh Task Item")).toBeInTheDocument();
+  });
+
+  it("creating an open task while on completed filter does not increment completed totalCount, and local insertion is bounded", async () => {
+    let getCall = 0;
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+
+      if (url.includes("/api/app/project-task")) {
+        if (method === "GET") {
+          getCall++;
+          if (getCall <= 2) {
+            // initial load (first on All, then on Completed)
+            return json({
+              items: Array.from({ length: 10 }, (_, i) => ({
+                id: `c-${i}`,
+                title: `Completed Task ${i + 1}`,
+                isCompleted: true,
+              })),
+              totalCount: 10,
+            });
+          }
+          // Background refresh after create fails
+          return json({ message: "Network failure" }, 500);
+        }
+        if (method === "POST") {
+          return json({
+            id: "new-open-task",
+            projectId: PROJECT_A,
+            title: "New Open Task",
+            isCompleted: false,
+          });
+        }
+      }
+      return json({ items: [], totalCount: 0 });
+    });
+
+    const user = userEvent.setup();
+    render(
+      <ProjectTasksSection
+        projectId={PROJECT_A}
+        workspaceId={WORKSPACE_ID}
+        projectArchived={false}
+        isLive={true}
+        canMutate={true}
+      />
+    );
+
+    // Switch to Completed tab
+    const completedTab = await screen.findByRole("tab", { name: "Completed" });
+    await user.click(completedTab);
+
+    expect(await screen.findByText("Completed Task 1")).toBeInTheDocument();
+    expect(screen.getByText("10 tasks")).toBeInTheDocument();
+
+    // Create task (which is open)
+    const addBtn = screen.getByRole("button", { name: /add task/i });
+    await user.click(addBtn);
+    await user.type(screen.getByLabelText(/^title/i), "New Open Task");
+    await user.click(screen.getByRole("button", { name: /save task/i }));
+
+    // Refresh fails -> alert banner appears
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(/couldn't refresh/i);
+
+    // totalCount MUST NOT increment to 11! It must remain 10!
+    expect(screen.getByText("10 tasks")).toBeInTheDocument();
+
+    // The open task must NOT be in the completed list
+    expect(screen.queryByText("New Open Task")).not.toBeInTheDocument();
+    expect(screen.getAllByRole("listitem")).toHaveLength(10);
   });
 });
