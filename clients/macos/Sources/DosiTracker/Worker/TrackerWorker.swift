@@ -39,6 +39,10 @@ actor TrackerWorker {
         var setReadsWindowTitles: @Sendable (Bool) -> Void
         /// Synchronously configure driver states according to effective per-capability consent.
         var applyDriverPolicy: @Sendable (ConsentedPermissions) -> Void = { _ in }
+        /// Hook invoked when shutdown reaches the boundary of joining pending tasks.
+        var onShutdownJoining: @Sendable () -> Void = {}
+        /// Hook invoked when any capture task (current or retired) finishes on the worker actor.
+        var onCaptureCompleted: @Sendable (Int, UInt64) -> Void = { _, _ in }
         /// Factory for API clients (injectable with mock/offline URLSessions for tests).
         var makeApiClient: @Sendable (URL, ApiClient.Account) -> ApiClient = { ApiClient(baseURL: $0, account: $1) }
         /// Receives every new snapshot (from the worker's executor).
@@ -185,8 +189,16 @@ actor TrackerWorker {
     /// Screenshots taken for blocks not queued yet, with lifecycle generation ticket.
     private var completedScreens: [Int: StampedScreen] = [:]
     private var lifecycleGeneration: UInt64 = 1
-    /// Screenshots being taken.
-    private var captureTasks: [Int: Task<Void, Never>] = [:]
+    private struct InFlightCapture: Sendable {
+        let acquisitionId: UInt64
+        let generation: UInt64
+        let task: Task<Void, Never>
+    }
+    /// Active screenshots being taken, keyed by block id.
+    private var inFlightCaptureTasks: [Int: InFlightCapture] = [:]
+    /// Cancelled or superseded screenshot tasks whose handles are retained to join on shutdown.
+    private var retiredCaptureTasks: [Task<Void, Never>] = []
+    private var nextAcquisitionId: UInt64 = 1
     /// Finished blocks waiting to be built and queued, oldest first.
     private var recordJobs: [RecordJob] = []
     /// The job the recorder is building now.
@@ -208,8 +220,12 @@ actor TrackerWorker {
     private var totalsDueAt: TimeInterval
     private var totalsWanted = false
     private var projectsInFlight = false
+    private var projectsTask: Task<Void, Never>?
     private var totalsInFlight = false
+    private var totalsTask: Task<Void, Never>?
     private var heartbeatInFlight = false
+    private var heartbeatTask: Task<Void, Never>?
+    private var farewellTask: Task<Void, Never>?
     private var queuedHeartbeat: Heartbeat?
     private var presenceSent: PresenceKey?
     private var presenceSince: Date
@@ -445,7 +461,7 @@ actor TrackerWorker {
         projectsInFlight = true
         let client = current.client
         let owner = current.owner
-        Task {
+        projectsTask = Task {
             let result: Result<[MyProject], ApiError>
             do {
                 result = .success(try await client.myProjects())
@@ -461,6 +477,7 @@ actor TrackerWorker {
 
     private func projectsLoaded(_ result: Result<[MyProject], ApiError>, owner: String, clock: ClockReading?) {
         projectsInFlight = false
+        projectsTask = nil
         guard account?.owner == owner, !expired, !quitting else { return }
         noteClock(clock)
         switch result {
@@ -564,7 +581,7 @@ actor TrackerWorker {
 
     private func runRecorder() async {
         var queued = false
-        while !recordJobs.isEmpty {
+        while !recordJobs.isEmpty && !Task.isCancelled {
             let job = recordJobs.removeFirst()
             recordingJob = job
             let payload = await buildPayload(job)
@@ -585,6 +602,13 @@ actor TrackerWorker {
             uploader?.send(.rowsQueued)
         }
         publish()
+    }
+
+    /// Await any running recorder pass to ensure all finished blocks are queued and published.
+    func flushRecorder() async {
+        if let rec = recorder {
+            _ = await rec.result
+        }
     }
 
     /// The session is ending (log out, restart, shut down): the blocks still
@@ -608,7 +632,10 @@ actor TrackerWorker {
             if commit(assemble(fast, screen: screen(for: job.block), webcam: nil, windowNow: nil, effective: currentEffectivePermissions), job: fast, now: now) {
                 queued = true
             }
-            captureTasks[job.block.id]?.cancel()
+            if let entry = inFlightCaptureTasks.removeValue(forKey: job.block.id) {
+                entry.task.cancel()
+                retiredCaptureTasks.append(entry.task)
+            }
             releaseScreen(job.block.id)
         }
         if queued {
@@ -623,7 +650,7 @@ actor TrackerWorker {
     private func buildPayload(_ job: RecordJob) async -> ActivityPayload {
         let block = job.block
         let currentEffective = currentEffectivePermissions
-        if completedScreens[block.id] == nil, let pending = captureTasks[block.id] {
+        if completedScreens[block.id] == nil, let pending = inFlightCaptureTasks[block.id]?.task {
             await pending.value
         }
         var shot = screen(for: block)
@@ -722,20 +749,29 @@ actor TrackerWorker {
         blocks.markCaptured(id)
         let capturer = deps.screen
         let gen = lifecycleGeneration
-        captureTasks[id] = Task {
+        let acqId = nextAcquisitionId
+        nextAcquisitionId &+= 1
+        let task = Task {
             var shot: ScreenCapture?
             do {
                 shot = try await capturer.capture(blur: blur)
             } catch {
                 CoreLog.warning("worker", "screen capture failed: \(error)")
             }
-            await self.captureFinished(id, shot, generation: gen)
+            await self.captureFinished(id, shot, acquisitionId: acqId, generation: gen)
         }
+        inFlightCaptureTasks[id] = InFlightCapture(acquisitionId: acqId, generation: gen, task: task)
     }
 
-    private func captureFinished(_ id: Int, _ shot: ScreenCapture?, generation gen: UInt64) {
-        guard gen == lifecycleGeneration else { return }
-        captureTasks[id] = nil
+    private func captureFinished(_ id: Int, _ shot: ScreenCapture?, acquisitionId acqId: UInt64, generation gen: UInt64) {
+        defer {
+            deps.onCaptureCompleted(id, acqId)
+        }
+        let wasInFlight = inFlightCaptureTasks[id]?.acquisitionId == acqId
+        if wasInFlight {
+            inFlightCaptureTasks[id] = nil
+        }
+        guard wasInFlight && gen == lifecycleGeneration else { return }
         guard let shot = shot, isLive(id) else { return }
         completedScreens[id] = StampedScreen(screen: shot, generation: gen)
     }
@@ -786,7 +822,10 @@ actor TrackerWorker {
 
     private func releaseScreen(_ id: Int) {
         completedScreens[id] = nil
-        captureTasks[id] = nil
+        if let entry = inFlightCaptureTasks.removeValue(forKey: id) {
+            entry.task.cancel()
+            retiredCaptureTasks.append(entry.task)
+        }
     }
 
     /// Forget screenshots of blocks that are gone (dropped by an idle cut).
@@ -794,9 +833,10 @@ actor TrackerWorker {
         for id in completedScreens.keys where !isLive(id) {
             completedScreens[id] = nil
         }
-        for (id, task) in captureTasks where !isLive(id) {
-            task.cancel()
-            captureTasks[id] = nil
+        for (id, entry) in inFlightCaptureTasks where !isLive(id) {
+            entry.task.cancel()
+            retiredCaptureTasks.append(entry.task)
+            inFlightCaptureTasks[id] = nil
         }
     }
 
@@ -1467,20 +1507,49 @@ actor TrackerWorker {
     func shutdown() async {
         quitting = true
         stopDriversNow()
+
         tickTask?.cancel()
         _ = await tickTask?.result
         tickTask = nil
-        for (_, task) in captureTasks {
+
+        projectsTask?.cancel()
+        _ = await projectsTask?.result
+        projectsTask = nil
+
+        totalsTask?.cancel()
+        _ = await totalsTask?.result
+        totalsTask = nil
+
+        heartbeatTask?.cancel()
+        _ = await heartbeatTask?.result
+        heartbeatTask = nil
+
+        farewellTask?.cancel()
+        _ = await farewellTask?.result
+        farewellTask = nil
+
+        let pendingCaptures = inFlightCaptureTasks.values.map { $0.task } + retiredCaptureTasks
+        inFlightCaptureTasks.removeAll()
+        retiredCaptureTasks.removeAll()
+
+        deps.onShutdownJoining()
+
+        for task in pendingCaptures {
             task.cancel()
         }
-        captureTasks.removeAll()
+        for task in pendingCaptures {
+            _ = await task.result
+        }
         completedScreens.removeAll()
+
         if let loop = uploader {
             await loop.shutdown()
         }
         _ = await uploadTask?.result
         uploadTask = nil
+
         if let rec = recorder {
+            rec.cancel()
             _ = await rec.result
             recorder = nil
         }
@@ -1504,10 +1573,11 @@ actor TrackerWorker {
 
         // Step 1: Invalidate in-flight capture tasks and immediately stop/reconfigure drivers synchronously on the actor
         lifecycleGeneration &+= 1
-        for (_, task) in captureTasks {
-            task.cancel()
+        for (_, entry) in inFlightCaptureTasks {
+            entry.task.cancel()
+            retiredCaptureTasks.append(entry.task)
         }
-        captureTasks.removeAll()
+        inFlightCaptureTasks.removeAll()
         completedScreens.removeAll()
         reconcile(at: deps.now(), reason: .interval)
         publish()
@@ -1590,7 +1660,7 @@ actor TrackerWorker {
         let pastDays = fresh ? [] : TrackedDays.pastDaysOfWeek(now: now, timeZone: zone)
         let fetchDays = !fresh
         let zoneId = DeviceInfo.wireTimeZone(zone.identifier)
-        Task {
+        totalsTask = Task {
             var totals = Totals()
             do {
                 // Scoped to the signed-in user: an owner or a manager would
@@ -1621,6 +1691,7 @@ actor TrackerWorker {
     /// the failure is logged), and the next refresh tries again.
     private func totalsLoaded(_ totals: Totals, owner: String, dayStart: Date, fetchedAt: Date) {
         totalsInFlight = false
+        totalsTask = nil
         guard account?.owner == owner, !quitting else { return }
         noteClock(totals.clock)
         if let today = totals.today {
@@ -1687,7 +1758,7 @@ actor TrackerWorker {
         heartbeatInFlight = true
         let client = current.client
         let owner = current.owner
-        Task {
+        heartbeatTask = Task {
             var failure: ApiError?
             do {
                 _ = try await client.sendHeartbeat(heartbeat, timeout: TrackerWorker.heartbeatTimeout)
@@ -1703,6 +1774,7 @@ actor TrackerWorker {
 
     private func heartbeatFinished(owner: String, failure: ApiError?, clock: ClockReading?) {
         heartbeatInFlight = false
+        heartbeatTask = nil
         guard account?.owner == owner, !expired, !quitting else {
             queuedHeartbeat = nil
             return
@@ -1725,7 +1797,7 @@ actor TrackerWorker {
     /// The last heartbeat before letting go of the account: best effort,
     /// never waited for.
     private func farewell(_ heartbeat: Heartbeat, client: ApiClient) {
-        Task {
+        farewellTask = Task {
             do {
                 _ = try await client.sendHeartbeat(heartbeat, timeout: AgentTiming.finalHeartbeatTimeout)
             } catch {

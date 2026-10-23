@@ -2355,7 +2355,7 @@ Implemented 17 production-path regression tests across two test suites with inje
    - `testMixedChangeAppliesNarrowingBeforeBlockedSaveAndPreservesItOnSaveError`: Proves conservative intersection and tightened blur apply in-memory before save barrier, and remain enforced following simulated disk save failure.
    - `testIdenticalPolicyDoesNotAdvanceGenerationTicket`: Proves generation tickets remain stable under identical updates and advance only on genuine mutations.
 
-2. **`DosiTrackerTests.WorkerConsentLifecycleTests` (10 Tests)**:
+2. **`DosiTrackerTests.WorkerConsentLifecycleTests` (12 Tests)**:
    - `testPositiveControlActiveTrackingStartsFakeDrivers`: Positive control proving affirmative local consent and active session start fake drivers with permitted capabilities, active tracking, and `facts.consentGranted == true`.
    - `testAbsentConsentPreventsStartAndKeepsDriversStopped`: Proves `TrackerWorker` with absent consent does not activate sensor drivers.
    - `testProjectPolicyDenyRestrictsEffectivePermissions`: Proves project policy denial restricts effective permissions even when local user granted consent.
@@ -2365,13 +2365,15 @@ Implemented 17 production-path regression tests across two test suites with inje
    - `testBlockedSaveMixedNarrowExpandPreservesConservativeStateOnSaveFailure`: Proves that upon simulated disk save failure, withdrawn drivers remain stopped, expansions are never admitted, and tightened blur remains enforced.
    - `testBlockedSavePureWideningFailureDoesNotAdmitPermissions`: Proves pure widening from absent state leaves drivers all disabled while save is blocked and after save fails.
    - `testBlockedSaveNewerRevocationSupersedesOlderOutstandingSave`: Proves that if a user revokes consent while an older save is blocked, all drivers stop immediately, and when the older save unblocks with success, its older sequence cannot resurrect withdrawn permissions. Asserts in-memory policy and persisted storage with zero auto-timeout fallback.
-   - `testBlockedProviderRevokeRegrantRejectsStaleFirstPublicationAndAcquiresFresh`: Proves that a capture started under Generation 1 is rejected upon provider completion across revoke/regrant, payload and SQLite queue exclude stale samples, fresh acquisition under the new generation reaches publication and queue, and unrelated keyboard capabilities remain controlled throughout.
+   - `testBlockedProviderRevokeRegrantRejectsStaleFirstPublicationAndAcquiresFresh`: Proves that a capture started under Generation 1 is rejected upon provider completion across revoke/regrant, old task completion is deterministically awaited via production completion seam (`onCaptureCompleted`) before checking publication absence, payload and SQLite queue (`Queue.pendingBatch`) exclude Base64 stale samples, fresh acquisition under the new generation reaches publication and queue, and unrelated keyboard capabilities remain controlled throughout.
+   - `testBlockedActiveProviderShutdownWaitsAtJoiningBoundaryUntilRelease`: Proves that when `worker.shutdown()` starts while an active provider is blocked, shutdown enters the join boundary (`onShutdownJoining`), remains incomplete before release, and upon provider release completes cleanly within a bounded timeout without publishing or queuing stale entries, stopping all drivers.
+   - `testBlockedRetiredProviderShutdownWaitsAtJoiningBoundaryUntilRelease`: Proves that when consent is narrowed during a blocked capture, the task is retired with immediate withdrawal responsiveness; when `shutdown()` executes, it drains and awaits both active and retired capture tasks at the joining boundary, completing cleanly within bounds upon release with no stale publication or queue leakage.
 
 ### C. Execution Status & Quality Gates
 | Target Suite | Exact Command Line | Tests Passed | Unexecuted | Result | Evidence Level |
 |---|---|:---:|:---:|:---:|---|
 | **macOS Core Consent Suite** | `swift test --filter ConsentLifecycleTests` in `clients/macos` | 0 | 7 | **UNEXECUTED** | **[Source-Only / Blocked]** (Host environment lacks Swift runtime / macOS toolchain; reported with null exits) |
-| **macOS Worker Lifecycle Suite**| `swift test --filter WorkerConsentLifecycleTests` in `clients/macos` | 0 | 10 | **UNEXECUTED** | **[Source-Only / Blocked]** (Host environment lacks Swift runtime / macOS toolchain; reported with null exits) |
+| **macOS Worker Lifecycle Suite**| `swift test --filter WorkerConsentLifecycleTests` in `clients/macos` | 0 | 12 | **UNEXECUTED** | **[Source-Only / Blocked]** (Host environment lacks Swift runtime / macOS toolchain; reported with null exits) |
 | **Linux Client Compilation Check** | `cargo check --manifest-path clients/linux/Cargo.toml` | N/A | 0 | PASSED (0 errors, 0 warnings, exit 0) | **[Worker-Reported]** |
 | **Windows Client Compilation Check** | `cargo check --manifest-path clients/windows/Cargo.toml` | N/A | 0 | PASSED (0 errors, 0 warnings, exit 0) | **[Worker-Reported]** |
 
@@ -2379,6 +2381,7 @@ Implemented 17 production-path regression tests across two test suites with inje
 1. **Host Toolchain Gap**: Current Windows operator environment does not contain the `swift` compiler or macOS toolchain. Tests were written against the production architecture and test targets defined in `Package.swift`, but are explicitly marked as **UNEXECUTED** (null exits). They must be run on a native macOS CI runner or development machine (`swift test`).
 2. **No Hardware Sensor Invocation**: Test harnesses use `TestScreenCapturer`, `BlockedScreenCapturer`, `TestWebcamCapturer`, `TestForegroundSource`, `TestRunningPrograms`, `TestIdleSource`, `OfflineTestURLProtocol`, and `DriverPolicyRecorder`. No real Quartz event taps, ScreenCaptureKit sessions, AVFoundation devices, Accessibility queries, or network requests were executed.
 3. **Approval-Blocked Invariant**: The unresolved `tirith:archive_extract` command remains untouched and was not retried or bypassed.
-4. **No Full-Product Acceptance Claim**: This deliverable completes the harness correction and lifecycle gating slice for macOS. Full-product acceptance, native macOS binary notarization, and live desktop verification remain open acceptance gates.
+4. **No Full-Product Acceptance Claim**: This deliverable completes the task joining, retired capture handle drain, and strengthened ABA regression slice for macOS. Full-product acceptance, native macOS binary notarization, and live desktop verification remain open acceptance gates.
+
 
 

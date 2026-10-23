@@ -258,7 +258,10 @@ final class WorkerConsentLifecycleTests: XCTestCase {
         initialConsent: LocalConsent = .absent,
         customStorage: (any ConsentStorage)? = nil,
         screenCapturer: (any ScreenCapturing)? = nil,
-        project: MyProject? = nil
+        project: MyProject? = nil,
+        clock: Box<Date>? = nil,
+        onShutdownJoining: (@Sendable () -> Void)? = nil,
+        onCaptureCompleted: (@Sendable (Int, UInt64) -> Void)? = nil
     ) throws -> (TrackerWorker, ConsentManager, DriverPolicyRecorder, Box<[TrackerSnapshot]>, AppPaths, URLSession, String) {
         let tempDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("worker-consent-\(UUID().uuidString.lowercased())", isDirectory: true)
@@ -321,13 +324,15 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             applyDriverPolicy: { perms in
                 driverRecorder.record(perms)
             },
+            onShutdownJoining: onShutdownJoining ?? {},
+            onCaptureCompleted: onCaptureCompleted ?? { _, _ in },
             makeApiClient: { url, account in
                 ApiClient(baseURL: url, account: account, session: offlineSession)
             },
             publish: { snapshot in
                 snapshotsBox.value.append(snapshot)
             },
-            now: { Date() },
+            now: { clock?.value ?? Date() },
             uptime: { 1000 }
         )
 
@@ -340,13 +345,19 @@ final class WorkerConsentLifecycleTests: XCTestCase {
         customStorage: (any ConsentStorage)? = nil,
         screenCapturer: (any ScreenCapturing)? = nil,
         project: MyProject? = nil,
+        clock: Box<Date>? = nil,
+        onShutdownJoining: (@Sendable () -> Void)? = nil,
+        onCaptureCompleted: (@Sendable (Int, UInt64) -> Void)? = nil,
         _ body: (TrackerWorker, ConsentManager, DriverPolicyRecorder, Box<[TrackerSnapshot]>, AppPaths) async throws -> Void
     ) async throws {
         let (worker, consentManager, driverRecorder, snapshotsBox, paths, session, suiteName) = try makeHarness(
             initialConsent: initialConsent,
             customStorage: customStorage,
             screenCapturer: screenCapturer,
-            project: project
+            project: project,
+            clock: clock,
+            onShutdownJoining: onShutdownJoining,
+            onCaptureCompleted: onCaptureCompleted
         )
         defer {
             session.invalidateAndCancel()
@@ -869,7 +880,23 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             blurScreenshots: false
         )
 
-        try await withHarness(initialConsent: .granted(initialPerms), screenCapturer: capturer) { worker, _, driverRecorder, _, paths in
+        let staleData = Data("stale-first-bytes".utf8)
+        let staleBase64 = staleData.base64EncodedString()
+        let freshData = Data("fresh-second-bytes".utf8)
+        let freshBase64 = freshData.base64EncodedString()
+
+        let captureCompletedSemaphore = DispatchSemaphore(value: 0)
+        let startTime = Date()
+        let clock = Box<Date>(startTime)
+
+        try await withHarness(
+            initialConsent: .granted(initialPerms),
+            screenCapturer: capturer,
+            clock: clock,
+            onCaptureCompleted: { _, _ in
+                captureCompletedSemaphore.signal()
+            }
+        ) { worker, _, driverRecorder, _, paths in
             await worker.start(launchedAtLogin: false, startPeriodicTicks: false)
             guard let initialDrivers = driverRecorder.last else {
                 return XCTFail("Driver policy recording must not be nil after start")
@@ -879,7 +906,7 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             XCTAssertTrue(startSnapshot.facts.trackingActive, "Lifecycle must be actively tracking")
 
             // Block next screen capture in fake provider and assign distinguishable stale bytes
-            capturer.nextCaptureData = Data("stale-first-bytes".utf8)
+            capturer.nextCaptureData = staleData
             capturer.blockNextCapture()
 
             // Trigger active acquisition through the real worker
@@ -915,49 +942,250 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             // Now release Capture #1 (which was initiated under older Gen 1)
             capturer.unblock()
 
+            // Wait for old worker captureFinished actor execution to complete via production completion seam
+            let oldCompleted = captureCompletedSemaphore.wait(timeout: .now() + 3.0) == .success
+            XCTAssertTrue(oldCompleted, "Old capture task must finish executing captureFinished before checking publication absence")
+
             // Discard of stale first publication: assert stale bytes/identity are absent from publication & queue
             let interimSnapshot = await worker.snapshot()
             XCTAssertNil(interimSnapshot.lastScreenshot, "Stale first capture must not be published to lastScreenshot")
             XCTAssertTrue(interimSnapshot.recentBlocks.allSatisfy {
-                $0.payload.screenshotThumbJpgBase64 != Data("stale-first-bytes".utf8).base64EncodedString()
+                $0.payload.screenshotThumbJpgBase64 != staleBase64
             }, "Stale first capture bytes must be absent from recentBlocks")
 
-            let queue = try Queue.open(at: paths.database, legacyOwner: nil, now: Date())
-            let interimQueueRows = try queue.recentRows(owner: "test-ws:user@example.com", limit: 10)
-            XCTAssertTrue(interimQueueRows.allSatisfy {
-                !($0.screenshotThumbJpgBase64?.contains("stale-first-bytes") ?? false)
-            }, "Stale first capture bytes must be absent from SQLite queue")
+            let queue = try Queue.open(at: paths.database, legacyOwner: nil, now: clock.value)
+            let interimQueueBatch = try queue.pendingBatch(owner: "test-ws:user@example.com", afterId: 0, limit: 10)
+            XCTAssertTrue(interimQueueBatch.allSatisfy {
+                $0.payload.screenshotThumbJpgBase64 != staleBase64
+            }, "Stale first capture bytes must be absent from SQLite queue payload")
 
             // Now trigger fresh acquisition through the REAL WORKER:
-            capturer.nextCaptureData = Data("fresh-second-bytes".utf8)
+            capturer.nextCaptureData = freshData
             await worker.triggerActiveCapture()
 
-            // Commit block through the real worker
-            await worker.syncNow(at: Date().addingTimeInterval(70))
+            let freshCompleted = captureCompletedSemaphore.wait(timeout: .now() + 3.0) == .success
+            XCTAssertTrue(freshCompleted, "Fresh capture task must finish executing captureFinished")
+
+            // Advance clock beyond AgentTiming.minimumBlock (60 s) and commit block through real worker
+            clock.value = clock.value.addingTimeInterval(70)
+            await worker.syncNow(at: clock.value)
+            await worker.flushRecorder()
 
             // Assert fresh identity reaches its intended publication / queue boundary
             let freshSnapshot = await worker.snapshot()
             guard let lastScreenshot = freshSnapshot.lastScreenshot else {
                 return XCTFail("Fresh screenshot must reach publication")
             }
-            XCTAssertEqual(lastScreenshot.jpeg, Data("fresh-second-bytes".utf8), "Fresh screenshot must reach lastScreenshot")
+            XCTAssertEqual(lastScreenshot.jpeg, freshData, "Fresh screenshot must reach lastScreenshot")
 
             guard let lastRecent = freshSnapshot.recentBlocks.first else {
                 return XCTFail("Recent block must exist after syncNow")
             }
-            XCTAssertEqual(lastRecent.payload.screenshotThumbJpgBase64, Data("fresh-second-bytes".utf8).base64EncodedString())
-            XCTAssertNotEqual(lastRecent.payload.screenshotThumbJpgBase64, Data("stale-first-bytes".utf8).base64EncodedString())
+            XCTAssertEqual(lastRecent.payload.screenshotThumbJpgBase64, freshBase64)
+            XCTAssertNotEqual(lastRecent.payload.screenshotThumbJpgBase64, staleBase64)
 
-            let freshQueueRows = try queue.recentRows(owner: "test-ws:user@example.com", limit: 10)
-            XCTAssertTrue(freshQueueRows.contains {
-                $0.screenshotThumbJpgBase64 == Data("fresh-second-bytes".utf8).base64EncodedString()
+            let freshQueueBatch = try queue.pendingBatch(owner: "test-ws:user@example.com", afterId: 0, limit: 10)
+            XCTAssertTrue(freshQueueBatch.contains {
+                $0.payload.screenshotThumbJpgBase64 == freshBase64
             }, "Fresh capture must reach SQLite queue")
+            XCTAssertTrue(freshQueueBatch.allSatisfy {
+                $0.payload.screenshotThumbJpgBase64 != staleBase64
+            }, "Stale capture must still be absent from SQLite queue")
 
             guard let finalDrivers = driverRecorder.last else {
                 return XCTFail("Driver policy recording must not be nil at end")
             }
             XCTAssertTrue(finalDrivers.keyboard, "Keyboard capability remains controlled and authorized")
             XCTAssertTrue(finalDrivers.screenshot, "Screenshot capability active after fresh acquisition")
+            XCTAssertFalse(capturer.timedOut, "Provider barrier must not have timed out")
+        }
+    }
+
+    // MARK: - 10. Blocked Provider Shutdown Join Regressions (Active & Retired)
+
+    func testBlockedActiveProviderShutdownWaitsAtJoiningBoundaryUntilRelease() async throws {
+        let capturer = BlockedScreenCapturer()
+        defer { capturer.unblock() }
+
+        let initialPerms = ConsentedPermissions(
+            screenshot: true,
+            webcam: false,
+            keyboard: true,
+            mouse: false,
+            activeWindow: false,
+            runningPrograms: false,
+            blurScreenshots: false
+        )
+
+        let joiningSemaphore = DispatchSemaphore(value: 0)
+
+        try await withHarness(
+            initialConsent: .granted(initialPerms),
+            screenCapturer: capturer,
+            onShutdownJoining: { joiningSemaphore.signal() }
+        ) { worker, _, driverRecorder, _, paths in
+            await worker.start(launchedAtLogin: false, startPeriodicTicks: false)
+            guard let initialDrivers = driverRecorder.last else {
+                return XCTFail("Driver policy recording must not be nil after start")
+            }
+            XCTAssertEqual(initialDrivers, initialPerms, "Positive control: keyboard and screenshot active")
+
+            // Block next screen capture in fake provider and assign distinguishable bytes
+            capturer.nextCaptureData = Data("active-blocked-bytes".utf8)
+            capturer.blockNextCapture()
+
+            // Trigger active acquisition through the real worker
+            await worker.triggerActiveCapture()
+            XCTAssertTrue(capturer.waitForCaptureEntered(timeout: 3.0), "Provider capture must enter and block")
+
+            // Start worker shutdown concurrently while provider is blocked
+            let shutdownFinished = Box<Bool>(false)
+            let shutdownTask = Task {
+                await worker.shutdown()
+                shutdownFinished.value = true
+            }
+
+            // 1. Establish that shutdown has reached the real joining boundary
+            let reachedBoundary = joiningSemaphore.wait(timeout: .now() + 3.0) == .success
+            XCTAssertTrue(reachedBoundary, "Shutdown must reach the joining boundary")
+
+            // 2. Establish that shutdown remains incomplete before release
+            XCTAssertFalse(shutdownFinished.value, "Shutdown must remain incomplete while active provider capture is blocked")
+
+            // 3. Release the blocked provider
+            capturer.unblock()
+
+            // 4. Bounded join: await shutdown completion with timeout guarantee (not indefinite await task.value)
+            let completedWithinBound = await withTaskGroup(of: Bool.self) { group in
+                group.addTask {
+                    _ = await shutdownTask.result
+                    return true
+                }
+                group.addTask {
+                    try? await Task.sleep(nanoseconds: 3_000_000_000)
+                    return false
+                }
+                let first = await group.next() ?? false
+                group.cancelAll()
+                return first
+            }
+            XCTAssertTrue(completedWithinBound, "Shutdown must complete within 3-second bound after provider release")
+            XCTAssertTrue(shutdownFinished.value, "Shutdown must be finished")
+
+            // 5. Prove no further queue / publication after cleanup
+            let finalSnapshot = await worker.snapshot()
+            XCTAssertNil(finalSnapshot.lastScreenshot, "No screenshot must be published after shutdown cleanup")
+            XCTAssertTrue(finalSnapshot.recentBlocks.isEmpty, "No recent blocks must be published after shutdown cleanup")
+
+            let queue = try Queue.open(at: paths.database, legacyOwner: nil, now: Date())
+            let pendingBatch = try queue.pendingBatch(owner: "test-ws:user@example.com", afterId: 0, limit: 10)
+            XCTAssertTrue(pendingBatch.isEmpty, "No queue rows must be created after shutdown cleanup")
+
+            // 6. Drivers stopped
+            guard let finalDrivers = driverRecorder.last else {
+                return XCTFail("Driver policy recording must not be nil at end")
+            }
+            XCTAssertEqual(finalDrivers, ConsentedPermissions.allDisabled, "All drivers must be stopped")
+            XCTAssertFalse(capturer.timedOut, "Provider barrier must not have timed out")
+        }
+    }
+
+    func testBlockedRetiredProviderShutdownWaitsAtJoiningBoundaryUntilRelease() async throws {
+        let capturer = BlockedScreenCapturer()
+        defer { capturer.unblock() }
+
+        let initialPerms = ConsentedPermissions(
+            screenshot: true,
+            webcam: false,
+            keyboard: true,
+            mouse: false,
+            activeWindow: false,
+            runningPrograms: false,
+            blurScreenshots: false
+        )
+
+        let joiningSemaphore = DispatchSemaphore(value: 0)
+
+        try await withHarness(
+            initialConsent: .granted(initialPerms),
+            screenCapturer: capturer,
+            onShutdownJoining: { joiningSemaphore.signal() }
+        ) { worker, _, driverRecorder, _, paths in
+            await worker.start(launchedAtLogin: false, startPeriodicTicks: false)
+            guard let initialDrivers = driverRecorder.last else {
+                return XCTFail("Driver policy recording must not be nil after start")
+            }
+            XCTAssertEqual(initialDrivers, initialPerms, "Positive control: keyboard and screenshot active")
+
+            // Block screen capture in fake provider
+            capturer.nextCaptureData = Data("retired-blocked-bytes".utf8)
+            capturer.blockNextCapture()
+
+            // Trigger active acquisition through the real worker
+            await worker.triggerActiveCapture()
+            XCTAssertTrue(capturer.waitForCaptureEntered(timeout: 3.0), "Provider capture must enter and block")
+
+            // Narrow consent to withdraw screenshot while capture is blocked:
+            // Must return immediately without waiting for blocked provider, retiring the task handle
+            var narrowed = initialPerms
+            narrowed.screenshot = false
+            try await worker.updateConsent(.granted(narrowed))
+
+            guard let narrowedDrivers = driverRecorder.last else {
+                capturer.unblock()
+                return XCTFail("Driver policy recording must not be nil after withdrawal")
+            }
+            XCTAssertFalse(narrowedDrivers.screenshot, "Screenshot driver must be detached upon withdrawal")
+            XCTAssertTrue(narrowedDrivers.keyboard, "Unrelated keyboard capability must stay active")
+
+            // Start worker shutdown concurrently while retired capture task is still blocked
+            let shutdownFinished = Box<Bool>(false)
+            let shutdownTask = Task {
+                await worker.shutdown()
+                shutdownFinished.value = true
+            }
+
+            // 1. Establish that shutdown has reached the real joining boundary
+            let reachedBoundary = joiningSemaphore.wait(timeout: .now() + 3.0) == .success
+            XCTAssertTrue(reachedBoundary, "Shutdown must reach the joining boundary")
+
+            // 2. Establish that shutdown remains incomplete before release
+            XCTAssertFalse(shutdownFinished.value, "Shutdown must remain incomplete while retired provider task is blocked")
+
+            // 3. Release the blocked provider
+            capturer.unblock()
+
+            // 4. Bounded join: await shutdown completion with timeout guarantee (not indefinite await task.value)
+            let completedWithinBound = await withTaskGroup(of: Bool.self) { group in
+                group.addTask {
+                    _ = await shutdownTask.result
+                    return true
+                }
+                group.addTask {
+                    try? await Task.sleep(nanoseconds: 3_000_000_000)
+                    return false
+                }
+                let first = await group.next() ?? false
+                group.cancelAll()
+                return first
+            }
+            XCTAssertTrue(completedWithinBound, "Shutdown must complete within 3-second bound after provider release")
+            XCTAssertTrue(shutdownFinished.value, "Shutdown must be finished")
+
+            // 5. Prove no further queue / publication after cleanup
+            let finalSnapshot = await worker.snapshot()
+            XCTAssertNil(finalSnapshot.lastScreenshot, "No screenshot must be published after shutdown cleanup")
+            XCTAssertTrue(finalSnapshot.recentBlocks.isEmpty, "No recent blocks must be published after shutdown cleanup")
+
+            let queue = try Queue.open(at: paths.database, legacyOwner: nil, now: Date())
+            let pendingBatch = try queue.pendingBatch(owner: "test-ws:user@example.com", afterId: 0, limit: 10)
+            XCTAssertTrue(pendingBatch.isEmpty, "No queue rows must be created after shutdown cleanup")
+
+            // 6. Drivers stopped
+            guard let finalDrivers = driverRecorder.last else {
+                return XCTFail("Driver policy recording must not be nil at end")
+            }
+            XCTAssertEqual(finalDrivers, ConsentedPermissions.allDisabled, "All drivers must be stopped")
             XCTAssertFalse(capturer.timedOut, "Provider barrier must not have timed out")
         }
     }
