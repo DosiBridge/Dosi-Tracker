@@ -2306,45 +2306,46 @@ Under Task ID `selected-status-prescan-correction-20261023`, we resolved the sou
 
 ---
 
-## 27. macOS Affirmative Local Consent, Acquisition Driver Lifecycle, Save-Order Decoupling & Harness Correction (selected-macos-harness-correction-20261023)
+## 27. macOS Affirmative Local Consent, Acquisition Driver Lifecycle, Transport Join Regression & Oracle Ownership Correction (selected-macos-oracle-ownership-20261023)
 
 > **Execution Date:** October 23, 2026  
-> **Phase Task ID:** `selected-macos-harness-correction-20261023` (continuation of `selected-macos-save-order-correction-20261023`)  
+> **Phase Task ID:** `selected-macos-oracle-ownership-20261023` (continuation of `selected-macos-join-oracle-20261023` and `selected-macos-harness-correction-20261023`)  
 > **Status:** Implementation Complete; Source-Verified; Native Execution **UNEXECUTED** on Windows Host Toolchain (Missing Swift / macOS Runner)  
 > **Target Package:** `clients/macos` (Package: `DosiTracker`, targets: `DosiTrackerCore`, `DosiTracker`, `DosiTrackerCoreTests`, `DosiTrackerTests`)  
 
 ### A. Context & Focused Architectural Corrections
-Under Task ID `selected-macos-harness-correction-20261023`, we resolved the source-confirmed persistence ordering, test synchronization, lifecycle publication ABA safety, and harness task cleanup defects:
+Under Task ID `selected-macos-oracle-ownership-20261023`, we resolved the source-confirmed compiler, task ownership, barrier release, and boundary observation defects:
 
-1. **Deterministic Bounded Barrier Sequencing in Supersession Regression**:
-   - In `testBlockedSaveNewerRevocationSupersedesOlderOutstandingSave`:
-     - Because `ConsentManager.persistAsync` executes on a single serial `persistenceQueue`, Save #2 (revocation) queues behind Save #1.
-     - Revocation is launched as a separately tracked asynchronous `Task`.
-     - Using `DriverPolicyRecorder.onRecord` and `DispatchSemaphore`, the test deterministically establishes that Revocation executed its immediate Phase 1 conservative transition (stopping all drivers synchronously on the actor) **while Save #1 is still blocked in persistence**.
-     - Save #1 is then unblocked, and both update tasks are joined with bounded timeouts.
-     - `BlockedConsentStore` barrier wait timeout (`wait(timeout:) == .timedOut`) throws `ConsentError.saveFailed` and records `timedOut = true` rather than silently behaving as a release.
-     - The test asserts zero barrier timeout, all drivers stopped immediately, in-memory policy `.revoked`, and final persisted consent in `store.load() == .revoked`. Zero arbitrary sleeps.
+1. **Actor-Isolated Worker Reconnect Call**:
+   - In `WorkerConsentLifecycleTests.testBlockedTransportUploadShutdownWaitsAtJoiningBoundaryUntilRelease`, `worker.reconnect()` was called without `await`.
+   - Because `TrackerWorker` is an actor and `reconnect()` is actor-isolated, calling it from an asynchronous test context requires `await worker.reconnect()`. Corrected this call and inspected all worker calls to ensure full actor-isolation compliance.
 
-2. **Full Worker-Path ABA Capture Discard & Fresh Acquisition Regression**:
-   - In `testBlockedProviderRevokeRegrantRejectsStaleFirstPublicationAndAcquiresFresh`:
-     - Avoided test pause conflicts by maintaining continuous active tracking with keyboard capability authorized and active throughout.
-     - Triggered active capture through the real worker (`worker.triggerActiveCapture()`), blocking the fake provider under Generation 1 with distinguishable stale sample bytes (`Data("stale-first-bytes".utf8)`).
-     - Withdrew and regranted screenshot consent while keyboard remained authorized and active tracking was sustained.
-     - Released the provider; asserted stale first-publication bytes were rejected and proven completely absent from published snapshots (`lastScreenshot == nil`, `recentBlocks` clear) and absent from the local SQLite queue (`queue.recentRows`).
-     - Fixed an actual production concurrency defect in `TrackerWorker.captureFinished`: previously, `captureTasks[id] = nil` was executed unconditionally, allowing late stale generation callbacks to wipe out active tasks of newer generations. Corrected path gates cleanup on `gen == lifecycleGeneration`.
-     - Triggered fresh acquisition through the real production worker (`capturer.nextCaptureData = Data("fresh-second-bytes".utf8)`, `worker.triggerActiveCapture()`), and committed the block through the real worker (`worker.syncNow(at:)`).
-     - Asserted fresh sample identity reached both the publication boundary (`snapshot.lastScreenshot?.jpeg`, `recentBlocks.first?.payload.screenshotThumbJpgBase64`) and SQLite queue (`queue.recentRows`), without calling fake providers directly as substitutes and without claiming native OS cancellation.
+2. **Explicit Observer Task Ownership & Safe Real Joining**:
+   - The previous `observeTaskCompletion` helper spawned an unstructured background `Task` awaiting `externalTask.result`, cancelled it, and discarded its handle without joining. Swift cancellation does not cancel or interrupt `await task.result`, leaving detached observer tasks running unjoined in the background.
+   - Replaced this with `TaskObserverTracker`. Observers are explicitly tracked in the test fixture and safely joined via `await observerTracker.joinAll()` after underlying operations complete.
+   - Clarified documentation and comments: **bounded observation is NOT a bounded join**. In production, `TrackerWorker.shutdown()` and `UploadLoop.shutdown()` execute real, graceful, unbounded joins (`await task.result`). If an underlying worker defect prevents completion, actual task drain remains unbounded because Swift cancellation is cooperative and shutdown intentionally avoids hard timeouts that abandon uncommitted collection or background work. Removed misleading "genuinely bounded join" and "guaranteed cleanup" wording; retained safe real joining.
 
-3. **Deterministic Scheduling Seams & Explicit Async Teardown Cleanup**:
-   - Added `startPeriodicTicks: Bool = true` parameter to `TrackerWorker.start(launchedAtLogin:startPeriodicTicks:)`, allowing test harnesses to disable the 1-second `runTicks` loop and step time deterministically via `worker.tick(at:)`.
-   - Stored `uploadTask = Task { await loop.run() }` in `TrackerWorker`.
-   - Implemented `UploadLoop.shutdown()` to cancel background wake/pass tasks and close the command inbox, allowing `loop.run()` to cleanly terminate.
-   - Implemented `TrackerWorker.shutdown()` to cleanly cancel and await `tickTask`, `uploadTask`, `recorder`, and `captureTasks`, and stop drivers.
-   - Wrapped test executions in `withHarness` to guarantee async `worker.shutdown()`, `session.invalidateAndCancel()`, `UserDefaults.standard.removePersistentDomain(forName:)`, and directory tree deletion on both success and error paths before deleting resources.
-   - Removed all vacuous optional driver recording assertions, requiring non-nil recordings via `guard let ... else { return XCTFail(...) }` or direct `XCTAssertEqual`.
+3. **Release Fake Barriers Before Inner Fixture Cleanup**:
+   - Previously, fake barriers were released in an outer `defer` at the test function scope. If `withHarness` caught an error or failed an assertion inside `body`, it executed `await worker.shutdown()` before the outer defer could run, causing shutdown to hang indefinitely on the still-blocked barrier, and then deleting temporary data on scope exit.
+   - Updated `withHarness` to take an optional `releaseBarriers: (@Sendable () -> Void)? = nil` handler invoked in both `catch` and normal completion paths *before* `await worker.shutdown()`.
+   - In addition, every test using a blocked barrier executes `defer { barrier.unblock() }` directly inside `body`. This guarantees that fake barriers are released before inner fixture cleanup, worker shutdown, or temporary directory deletion.
 
-### B. Core & Lifecycle Regression Suites (17 Isolated Tests)
-Implemented 17 production-path regression tests across two test suites with injected fake drivers, test doubles, and isolated temporary storage:
+4. **Signal-Before-Await Arrival Confirmation & Post-Boundary Blocked Observation**:
+   - In previous iterations, the initial `.timedOut` observation executed before confirming that `worker.shutdown()` had reached the joining boundary, allowing pre-arrival executor scheduling delays alone to satisfy the negative check.
+   - Corrected the sequence across all shutdown tests:
+     1. Start `shutdownTask = Task { await worker.shutdown() }`.
+     2. Acknowledge entry at the joining boundary via `joiningSemaphore.wait(timeout:)`. (In `TrackerWorker.shutdown()`, `deps.onShutdownJoining()` is signaled immediately prior to awaiting task results, establishing arrival).
+     3. Perform bounded completion observation (`timeout: 0.1s`) **AFTER** reaching the boundary while the fake barrier is still blocked, asserting `.timedOut`. This proves that being at the joining boundary actually blocks shutdown, eliminating scheduler-delay ambiguities.
+     4. Release the barrier (`capturer.unblock()`, `BlockableURLProtocol.unblock()`).
+     5. Observe completion (`timeout: 3.0s`), assert `.completed`, and safely join both `shutdownTask` and observer tasks.
+
+5. **Fake Transport Wait Expiry Detection**:
+   - Updated `BlockableURLProtocol` to record `timedOut = true` if `requestReleaseSemaphore.wait(timeout: .now() + 5.0)` expires without an explicit unblock signal.
+   - In `testBlockedTransportUploadShutdownWaitsAtJoiningBoundaryUntilRelease`, asserted `XCTAssertFalse(BlockableURLProtocol.timedOut)` to prove that the transport barrier was explicitly released rather than timing out.
+   - Maintained negative oracle control `testNegativeOracleBoundedObservationTimesOutWhenOperationRemainsBlocked` demonstrating that bounded observation reliably times out within 0.1s for an intentionally blocked synthetic operation, and subsequently joins cleanly upon barrier release without leaked tasks.
+
+### B. Core & Lifecycle Regression Suites (21 Isolated Tests)
+Implemented 21 production-path regression tests across two test suites with injected fake drivers, test doubles, and isolated temporary storage:
 
 1. **`DosiTrackerCoreTests.ConsentLifecycleTests` (7 Tests)**:
    - `testDefaultConsentIsAbsentAndFailsClosed`: Verifies absent consent defaults to all disabled, failing closed against permissive project policy.
@@ -2366,10 +2367,10 @@ Implemented 17 production-path regression tests across two test suites with inje
    - `testBlockedSavePureWideningFailureDoesNotAdmitPermissions`: Proves pure widening from absent state leaves drivers all disabled while save is blocked and after save fails.
    - `testBlockedSaveNewerRevocationSupersedesOlderOutstandingSave`: Proves that if a user revokes consent while an older save is blocked, all drivers stop immediately, and when the older save unblocks with success, its older sequence cannot resurrect withdrawn permissions. Asserts in-memory policy and persisted storage with zero auto-timeout fallback.
    - `testBlockedProviderRevokeRegrantRejectsStaleFirstPublicationAndAcquiresFresh`: Proves that a capture started under Generation 1 is rejected upon provider completion across revoke/regrant, old task completion is deterministically awaited via production completion seam (`onCaptureCompleted`) before checking publication absence, payload and SQLite queue (`Queue.pendingBatch`) exclude Base64 stale samples, fresh acquisition under the new generation reaches publication and queue, and unrelated keyboard capabilities remain controlled throughout.
-   - `testBlockedActiveProviderShutdownWaitsAtJoiningBoundaryUntilRelease`: Proves that when `worker.shutdown()` starts while an active provider is blocked, shutdown enters the join boundary (`onShutdownJoining`), bounded observation (`XCTWaiter.fulfillment`) establishes it remains incomplete before release without hanging, and upon provider release completes cleanly within bounds without publishing or queuing stale entries, stopping all drivers.
-   - `testBlockedRetiredProviderShutdownWaitsAtJoiningBoundaryUntilRelease`: Proves that when consent is narrowed during a blocked capture, the task is retired with immediate withdrawal responsiveness; when `shutdown()` executes, it drains and awaits both active and retired capture tasks at the joining boundary, establishing non-completion before release via bounded observation, and completing cleanly within bounds upon release with no stale publication or queue leakage.
-   - `testBlockedTransportUploadShutdownWaitsAtJoiningBoundaryUntilRelease`: Proves that when `worker.shutdown()` starts while an upload pass is in-flight and blocked in transport (`BlockableURLProtocol`), shutdown waits for `UploadLoop`'s `passTask` and `wakeTask` at the join boundary, establishes non-completion before release via bounded observation, and upon transport release completes cleanly without data corruption or unauthorized queue mutation.
-   - `testNegativeOracleBoundedObservationTimesOutWhenOperationRemainsBlocked`: Negative oracle control proving that the test harness's `observeAsyncCompletion` helper reliably returns `.timedOut` when an operation remains blocked on a synthetic barrier rather than hanging indefinitely, and subsequently completes and joins cleanly upon barrier release without leaking background tasks or deleting in-use data.
+   - `testBlockedActiveProviderShutdownWaitsAtJoiningBoundaryUntilRelease`: Proves that when `worker.shutdown()` starts while an active provider is blocked, shutdown enters the join boundary (`onShutdownJoining`), bounded observation (`XCTWaiter.fulfillment`) after boundary arrival confirms it remains incomplete before release without hanging, and upon provider release completes cleanly within bounds without publishing or queuing stale entries, stopping all drivers.
+   - `testBlockedRetiredProviderShutdownWaitsAtJoiningBoundaryUntilRelease`: Proves that when consent is narrowed during a blocked capture, the task is retired with immediate withdrawal responsiveness; when `shutdown()` executes, it drains and awaits both active and retired capture tasks at the joining boundary, establishing non-completion after boundary arrival via bounded observation, and completing cleanly within bounds upon release with no stale publication or queue leakage.
+   - `testBlockedTransportUploadShutdownWaitsAtJoiningBoundaryUntilRelease`: Proves that when `worker.shutdown()` starts while an upload pass is in-flight and blocked in transport (`BlockableURLProtocol`), shutdown waits for `UploadLoop`'s `passTask` and `wakeTask` at the join boundary, establishes non-completion after boundary arrival via bounded observation, and upon transport release completes cleanly without data corruption or unauthorized queue mutation.
+   - `testNegativeOracleBoundedObservationTimesOutWhenOperationRemainsBlocked`: Negative oracle control proving that `TaskObserverTracker.observe` reliably returns `.timedOut` when an operation remains blocked on a synthetic barrier rather than hanging indefinitely, and subsequently completes and joins cleanly upon barrier release without leaking background tasks or deleting in-use data.
 
 ### C. Execution Status & Quality Gates
 | Target Suite | Exact Command Line | Tests Passed | Unexecuted | Result | Evidence Level |
@@ -2380,11 +2381,11 @@ Implemented 17 production-path regression tests across two test suites with inje
 | **Windows Client Compilation Check** | `cargo check --manifest-path clients/windows/Cargo.toml` | N/A | 0 | PASSED (0 errors, 0 warnings, exit 0) | **[Worker-Reported]** |
 
 ### D. PM QA Boundary Limits & Acceptance Disclosures
-1. **Production Shutdown vs Harness Observation Semantics**: In production, `TrackerWorker.shutdown()` and `UploadLoop.shutdown()` execute full, graceful, unbounded joins (`await task.result`) of all active and retired capture handles, upload loop tasks, and worker-owned tasks without an arbitrary hard timeout (which would abandon uncommitted collection or background work). If an external provider or network operation hangs indefinitely, production shutdown remains suspended (Swift concurrency cancellation is cooperative). The isolated test harness uses genuinely bounded async observation (`XCTWaiter.fulfillment` with explicitly owned completion observers) to observe task progress and timeouts without structured task group (`withTaskGroup`) scope-exit blocking, and releases all synthetic barriers in `defer` to ensure clean task drainage without deleting temp data while tasks remain alive.
+1. **Production Shutdown vs Harness Observation Semantics**: In production, `TrackerWorker.shutdown()` and `UploadLoop.shutdown()` execute full, graceful, unbounded joins (`await task.result`) of all active and retired capture handles, upload loop tasks, and worker-owned tasks without an arbitrary hard timeout (which would abandon uncommitted collection or background work). If an external provider or network operation hangs indefinitely, production shutdown remains suspended (Swift concurrency cancellation is cooperative). The isolated test harness uses bounded async observation (`XCTWaiter.fulfillment` with explicitly owned completion observers via `TaskObserverTracker`) to observe task progress and timeouts without structured task group (`withTaskGroup`) scope-exit blocking. Bounded observation is strictly an observation deadline in tests, NOT a bounded join. Barriers are released before inner fixture cleanup in both success and error paths, and all observer tasks are joined after completion to ensure clean task drainage without deleting temp data while tasks remain alive.
 2. **Host Toolchain Gap**: Current Windows operator environment does not contain the `swift` compiler or macOS toolchain. Tests were written against the production architecture and test targets defined in `Package.swift`, but are explicitly marked as **UNEXECUTED** (null exits). They must be run on a native macOS CI runner or development machine (`swift test`).
 3. **No Hardware Sensor Invocation**: Test harnesses use `TestScreenCapturer`, `BlockedScreenCapturer`, `TestWebcamCapturer`, `TestForegroundSource`, `TestRunningPrograms`, `TestIdleSource`, `OfflineTestURLProtocol`, `BlockableURLProtocol`, and `DriverPolicyRecorder`. No real Quartz event taps, ScreenCaptureKit sessions, AVFoundation devices, Accessibility queries, or network requests were executed.
 4. **Approval-Blocked Invariant**: The unresolved `tirith:archive_extract` command remains untouched and was not retried or bypassed.
-5. **No Full-Product Acceptance Claim**: This deliverable completes the join oracle, genuine bounded observation harness, transport shutdown regression, and negative oracle slice for macOS. Full-product acceptance, native macOS binary notarization, and live desktop verification remain open acceptance gates.
+5. **No Full-Product Acceptance Claim**: This deliverable completes the oracle ownership correction, explicit observer tracking, transport shutdown regression, and negative oracle slice for macOS. Full-product acceptance, native macOS binary notarization, and live desktop verification remain open acceptance gates.
 
 
 

@@ -27,11 +27,13 @@ final class WorkerConsentLifecycleTests: XCTestCase {
         private static let requestEnteredSemaphore = DispatchSemaphore(value: 0)
         private static let requestReleaseSemaphore = DispatchSemaphore(value: 0)
         private static var requestCount = 0
+        private(set) static var timedOut = false
 
         static func reset() {
             lock.lock()
             isBlocked = false
             requestCount = 0
+            timedOut = false
             lock.unlock()
         }
 
@@ -63,7 +65,12 @@ final class WorkerConsentLifecycleTests: XCTestCase {
 
             if blocked {
                 Self.requestEnteredSemaphore.signal()
-                _ = Self.requestReleaseSemaphore.wait(timeout: .now() + 5.0)
+                let waitResult = Self.requestReleaseSemaphore.wait(timeout: .now() + 5.0)
+                if waitResult == .timedOut {
+                    Self.lock.lock()
+                    Self.timedOut = true
+                    Self.lock.unlock()
+                }
             }
 
             client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))
@@ -304,48 +311,49 @@ final class WorkerConsentLifecycleTests: XCTestCase {
         }
     }
 
-    // MARK: - Bounded Async Observation Helpers
+    // MARK: - Bounded Async Observation & Task Ownership Helpers
 
-    /// Starts an asynchronous operation inside an owned `Task` and bounds observation of its
-    /// completion using an `XCTestExpectation` and `XCTWaiter.fulfillment`.
+    /// Explicitly tracks and owns completion observer tasks so observers are never leaked,
+    /// discarded, or left unjoined.
     ///
-    /// Unlike structured task groups (`withTaskGroup`), `XCTWaiter.fulfillment` guarantees return
-    /// after `timeout` even if the underlying operation remains suspended or blocked, avoiding the
-    /// Swift structured concurrency trap where task groups implicitly await child tasks on scope exit.
-    ///
-    /// The caller retains ownership of the returned `Task` and must ensure any synthetic barriers
-    /// are released in both success and failure paths before joining the task to prevent resource leaks.
-    private func observeAsyncCompletion<T: Sendable>(
-        description: String = "async operation",
-        timeout: TimeInterval,
-        operation: @escaping @Sendable () async -> T
-    ) async -> (result: XCTWaiter.Result, task: Task<T, Never>) {
-        let exp = XCTestExpectation(description: description)
-        let task = Task {
-            let val = await operation()
-            exp.fulfill()
-            return val
-        }
-        let waitResult = await XCTWaiter.fulfillment(of: [exp], timeout: timeout)
-        return (waitResult, task)
-    }
+    /// NOTE ON BOUNDED OBSERVATION VS BOUNDED JOIN:
+    /// Bounded observation via `XCTWaiter.fulfillment` bounds the time the test runner waits to
+    /// observe whether an operation has finished. It is NOT a bounded join: production shutdown
+    /// executes a real, graceful, unbounded join (`await task.result`). If an underlying worker defect
+    /// prevents completion, actual task drain remains unbounded because Swift task cancellation is
+    /// cooperative and production shutdown intentionally avoids hard timeouts that abandon work or
+    /// corrupt local state. In tests, observer tasks are explicitly owned and joined after underlying
+    /// operations complete to ensure no background tasks are leaked.
+    private final class TaskObserverTracker: @unchecked Sendable {
+        private let lock = NSLock()
+        private var observers: [Task<Void, Never>] = []
 
-    /// Bounds observation of an already-started `Task`'s completion using an `XCTestExpectation`
-    /// and `XCTWaiter.fulfillment`. Returns promptly after `timeout` without hanging if the task
-    /// is still in flight.
-    private func observeTaskCompletion<T: Sendable>(
-        task: Task<T, Never>,
-        description: String = "task completion",
-        timeout: TimeInterval
-    ) async -> XCTWaiter.Result {
-        let exp = XCTestExpectation(description: description)
-        let observerTask = Task {
-            _ = await task.result
-            exp.fulfill()
+        func observe<T: Sendable>(
+            task: Task<T, Never>,
+            description: String,
+            timeout: TimeInterval
+        ) async -> XCTWaiter.Result {
+            let exp = XCTestExpectation(description: description)
+            let observerTask = Task {
+                _ = await task.result
+                exp.fulfill()
+            }
+            lock.lock()
+            observers.append(observerTask)
+            lock.unlock()
+
+            return await XCTWaiter.fulfillment(of: [exp], timeout: timeout)
         }
-        let waitResult = await XCTWaiter.fulfillment(of: [exp], timeout: timeout)
-        observerTask.cancel()
-        return waitResult
+
+        func joinAll() async {
+            lock.lock()
+            let list = observers
+            observers.removeAll()
+            lock.unlock()
+            for observer in list {
+                _ = await observer.result
+            }
+        }
     }
 
     // MARK: - Harness Setup
@@ -446,6 +454,7 @@ final class WorkerConsentLifecycleTests: XCTestCase {
         onShutdownJoining: (@Sendable () -> Void)? = nil,
         onCaptureCompleted: (@Sendable (Int, UInt64) -> Void)? = nil,
         urlProtocolClass: AnyClass? = nil,
+        releaseBarriers: (@Sendable () -> Void)? = nil,
         _ body: (TrackerWorker, ConsentManager, DriverPolicyRecorder, Box<[TrackerSnapshot]>, AppPaths) async throws -> Void
     ) async throws {
         let (worker, consentManager, driverRecorder, snapshotsBox, paths, session, suiteName) = try makeHarness(
@@ -466,9 +475,11 @@ final class WorkerConsentLifecycleTests: XCTestCase {
         do {
             try await body(worker, consentManager, driverRecorder, snapshotsBox, paths)
         } catch {
+            releaseBarriers?()
             await worker.shutdown()
             throw error
         }
+        releaseBarriers?()
         await worker.shutdown()
     }
 
@@ -670,9 +681,13 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             blurScreenshots: false
         )
         let store = BlockedConsentStore(initial: .granted(initialPerms))
-        defer { store.unblock(fail: false) }
 
-        try await withHarness(initialConsent: .granted(initialPerms), customStorage: store) { worker, _, driverRecorder, _, _ in
+        try await withHarness(
+            initialConsent: .granted(initialPerms),
+            customStorage: store,
+            releaseBarriers: { store.unblock(fail: false) }
+        ) { worker, _, driverRecorder, _, _ in
+            defer { store.unblock(fail: false) }
             await worker.start(launchedAtLogin: false, startPeriodicTicks: false)
             guard let initial = driverRecorder.last else {
                 return XCTFail("Driver policy recording must not be nil after start")
@@ -750,9 +765,13 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             blurScreenshots: false
         )
         let store = BlockedConsentStore(initial: .granted(initialPerms))
-        defer { store.unblock(fail: false) }
 
-        try await withHarness(initialConsent: .granted(initialPerms), customStorage: store) { worker, _, driverRecorder, _, _ in
+        try await withHarness(
+            initialConsent: .granted(initialPerms),
+            customStorage: store,
+            releaseBarriers: { store.unblock(fail: true) }
+        ) { worker, _, driverRecorder, _, _ in
+            defer { store.unblock(fail: true) }
             await worker.start(launchedAtLogin: false, startPeriodicTicks: false)
             guard let initial = driverRecorder.last else {
                 return XCTFail("Driver policy recording must not be nil after start")
@@ -818,9 +837,13 @@ final class WorkerConsentLifecycleTests: XCTestCase {
 
     func testBlockedSavePureWideningFailureDoesNotAdmitPermissions() async throws {
         let store = BlockedConsentStore(initial: .absent)
-        defer { store.unblock(fail: false) }
 
-        try await withHarness(initialConsent: .absent, customStorage: store) { worker, _, driverRecorder, _, _ in
+        try await withHarness(
+            initialConsent: .absent,
+            customStorage: store,
+            releaseBarriers: { store.unblock(fail: true) }
+        ) { worker, _, driverRecorder, _, _ in
+            defer { store.unblock(fail: true) }
             await worker.start(launchedAtLogin: false, startPeriodicTicks: false)
             guard let initial = driverRecorder.last else {
                 return XCTFail("Driver policy recording must not be nil after start")
@@ -886,9 +909,13 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             blurScreenshots: false
         )
         let store = BlockedConsentStore(initial: .granted(allLocalGranted))
-        defer { store.unblock(fail: false) }
 
-        try await withHarness(initialConsent: .granted(allLocalGranted), customStorage: store) { worker, _, driverRecorder, _, _ in
+        try await withHarness(
+            initialConsent: .granted(allLocalGranted),
+            customStorage: store,
+            releaseBarriers: { store.unblock(fail: false) }
+        ) { worker, _, driverRecorder, _, _ in
+            defer { store.unblock(fail: false) }
             await worker.start(launchedAtLogin: false, startPeriodicTicks: false)
             guard let initial = driverRecorder.last else {
                 return XCTFail("Driver policy recording must not be nil after start")
@@ -994,8 +1021,10 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             clock: clock,
             onCaptureCompleted: { _, _ in
                 captureCompletedSemaphore.signal()
-            }
+            },
+            releaseBarriers: { capturer.unblock() }
         ) { worker, _, driverRecorder, _, paths in
+            defer { capturer.unblock() }
             await worker.start(launchedAtLogin: false, startPeriodicTicks: false)
             guard let initialDrivers = driverRecorder.last else {
                 return XCTFail("Driver policy recording must not be nil after start")
@@ -1121,8 +1150,11 @@ final class WorkerConsentLifecycleTests: XCTestCase {
         try await withHarness(
             initialConsent: .granted(initialPerms),
             screenCapturer: capturer,
-            onShutdownJoining: { joiningSemaphore.signal() }
+            onShutdownJoining: { joiningSemaphore.signal() },
+            releaseBarriers: { capturer.unblock() }
         ) { worker, _, driverRecorder, _, paths in
+            defer { capturer.unblock() }
+
             await worker.start(launchedAtLogin: false, startPeriodicTicks: false)
             guard let initialDrivers = driverRecorder.last else {
                 return XCTFail("Driver policy recording must not be nil after start")
@@ -1137,32 +1169,38 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             await worker.triggerActiveCapture()
             XCTAssertTrue(capturer.waitForCaptureEntered(timeout: 3.0), "Provider capture must enter and block")
 
-            // Start worker shutdown inside an owned Task and observe with genuinely bounded async window
-            let (initialWaitResult, shutdownTask) = await observeAsyncCompletion(
-                description: "shutdown while active capture blocked",
-                timeout: 0.1
-            ) {
+            let observerTracker = TaskObserverTracker()
+
+            // Start worker shutdown inside an explicitly owned Task
+            let shutdownTask = Task {
                 await worker.shutdown()
             }
 
-            // 1. Establish that shutdown has reached the real joining boundary
+            // 1. Establish that shutdown has reached the real joining boundary (signal emitted before awaiting task.result)
             let reachedBoundary = joiningSemaphore.wait(timeout: .now() + 3.0) == .success
             XCTAssertTrue(reachedBoundary, "Shutdown must reach the joining boundary")
 
-            // 2. Establish that shutdown remains incomplete before release via bounded observation
-            XCTAssertEqual(initialWaitResult, .timedOut, "Shutdown must remain incomplete while active provider capture is blocked")
+            // 2. Bounded observation AFTER reaching the boundary while provider is still blocked
+            // Proves shutdown remains suspended at the join boundary rather than completing prematurely
+            let blockedWaitResult = await observerTracker.observe(
+                task: shutdownTask,
+                description: "shutdown while active capture blocked at joining boundary",
+                timeout: 0.1
+            )
+            XCTAssertEqual(blockedWaitResult, .timedOut, "Shutdown must remain incomplete while active provider capture is blocked")
 
-            // 3. Release the blocked provider barrier (also guarded by test defer)
+            // 3. Release the blocked provider barrier
             capturer.unblock()
 
-            // 4. Genuinely bounded join: observe shutdown completion using XCTWaiter (no withTaskGroup scope-exit hang)
-            let completedResult = await observeTaskCompletion(
+            // 4. Bounded observation & real join: observe shutdown completion after release and join tasks safely
+            let completedResult = await observerTracker.observe(
                 task: shutdownTask,
                 description: "shutdown completion after provider release",
                 timeout: 3.0
             )
             XCTAssertEqual(completedResult, .completed, "Shutdown must complete within 3-second bound after provider release")
             _ = await shutdownTask.result
+            await observerTracker.joinAll()
 
             // 5. Prove no further queue / publication after cleanup
             let finalSnapshot = await worker.snapshot()
@@ -1184,8 +1222,6 @@ final class WorkerConsentLifecycleTests: XCTestCase {
 
     func testBlockedRetiredProviderShutdownWaitsAtJoiningBoundaryUntilRelease() async throws {
         let capturer = BlockedScreenCapturer()
-        defer { capturer.unblock() }
-
         let initialPerms = ConsentedPermissions(
             screenshot: true,
             webcam: false,
@@ -1201,8 +1237,11 @@ final class WorkerConsentLifecycleTests: XCTestCase {
         try await withHarness(
             initialConsent: .granted(initialPerms),
             screenCapturer: capturer,
-            onShutdownJoining: { joiningSemaphore.signal() }
+            onShutdownJoining: { joiningSemaphore.signal() },
+            releaseBarriers: { capturer.unblock() }
         ) { worker, _, driverRecorder, _, paths in
+            defer { capturer.unblock() }
+
             await worker.start(launchedAtLogin: false, startPeriodicTicks: false)
             guard let initialDrivers = driverRecorder.last else {
                 return XCTFail("Driver policy recording must not be nil after start")
@@ -1230,32 +1269,37 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             XCTAssertFalse(narrowedDrivers.screenshot, "Screenshot driver must be detached upon withdrawal")
             XCTAssertTrue(narrowedDrivers.keyboard, "Unrelated keyboard capability must stay active")
 
-            // Start worker shutdown inside an owned Task and observe with genuinely bounded async window
-            let (initialWaitResult, shutdownTask) = await observeAsyncCompletion(
-                description: "shutdown while retired capture blocked",
-                timeout: 0.1
-            ) {
+            let observerTracker = TaskObserverTracker()
+
+            // Start worker shutdown inside an explicitly owned Task
+            let shutdownTask = Task {
                 await worker.shutdown()
             }
 
-            // 1. Establish that shutdown has reached the real joining boundary
+            // 1. Establish that shutdown has reached the real joining boundary (signal emitted before awaiting task.result)
             let reachedBoundary = joiningSemaphore.wait(timeout: .now() + 3.0) == .success
             XCTAssertTrue(reachedBoundary, "Shutdown must reach the joining boundary")
 
-            // 2. Establish that shutdown remains incomplete before release via bounded observation
-            XCTAssertEqual(initialWaitResult, .timedOut, "Shutdown must remain incomplete while retired provider task is blocked")
+            // 2. Bounded observation AFTER reaching the boundary while provider is still blocked
+            let blockedWaitResult = await observerTracker.observe(
+                task: shutdownTask,
+                description: "shutdown while retired capture blocked at joining boundary",
+                timeout: 0.1
+            )
+            XCTAssertEqual(blockedWaitResult, .timedOut, "Shutdown must remain incomplete while retired provider task is blocked")
 
-            // 3. Release the blocked provider barrier (also guarded by test defer)
+            // 3. Release the blocked provider barrier
             capturer.unblock()
 
-            // 4. Genuinely bounded join: observe shutdown completion using XCTWaiter (no withTaskGroup scope-exit hang)
-            let completedResult = await observeTaskCompletion(
+            // 4. Bounded observation & real join: observe shutdown completion after release and join tasks safely
+            let completedResult = await observerTracker.observe(
                 task: shutdownTask,
                 description: "shutdown completion after provider release",
                 timeout: 3.0
             )
             XCTAssertEqual(completedResult, .completed, "Shutdown must complete within 3-second bound after provider release")
             _ = await shutdownTask.result
+            await observerTracker.joinAll()
 
             // 5. Prove no further queue / publication after cleanup
             let finalSnapshot = await worker.snapshot()
@@ -1276,7 +1320,6 @@ final class WorkerConsentLifecycleTests: XCTestCase {
     }
 
     func testBlockedTransportUploadShutdownWaitsAtJoiningBoundaryUntilRelease() async throws {
-        defer { BlockableURLProtocol.unblock() }
         BlockableURLProtocol.reset()
         BlockableURLProtocol.blockNextRequest()
 
@@ -1295,8 +1338,11 @@ final class WorkerConsentLifecycleTests: XCTestCase {
         try await withHarness(
             initialConsent: .granted(initialPerms),
             onShutdownJoining: { joiningSemaphore.signal() },
-            urlProtocolClass: BlockableURLProtocol.self
+            urlProtocolClass: BlockableURLProtocol.self,
+            releaseBarriers: { BlockableURLProtocol.unblock() }
         ) { worker, _, driverRecorder, _, paths in
+            defer { BlockableURLProtocol.unblock() }
+
             // Seed one pending activity in the SQLite queue before starting worker so UploadLoop has immediate work
             let queue = try Queue.open(at: paths.database, legacyOwner: nil, now: Date())
             let payload = ActivityPayload(
@@ -1318,39 +1364,44 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             }
             XCTAssertEqual(initialDrivers, initialPerms, "Positive control: drivers active")
 
-            // Kick an immediate upload pass
-            worker.reconnect()
+            // Kick an immediate upload pass (actor call properly awaited)
+            await worker.reconnect()
 
             // Establish that the upload pass reached transport and blocked in BlockableURLProtocol
             let transportEntered = BlockableURLProtocol.waitForRequestEntered(timeout: 3.0)
             XCTAssertTrue(transportEntered, "Upload pass must enter transport and block in BlockableURLProtocol")
 
-            // Start worker shutdown inside an owned Task and observe with genuinely bounded async window
-            let (initialWaitResult, shutdownTask) = await observeAsyncCompletion(
-                description: "shutdown while upload transport is blocked",
-                timeout: 0.1
-            ) {
+            let observerTracker = TaskObserverTracker()
+
+            // Start worker shutdown inside an explicitly owned Task
+            let shutdownTask = Task {
                 await worker.shutdown()
             }
 
-            // 1. Establish that shutdown has reached the joining boundary
+            // 1. Establish that shutdown has reached the real joining boundary (signal emitted before awaiting task.result)
             let reachedBoundary = joiningSemaphore.wait(timeout: .now() + 3.0) == .success
             XCTAssertTrue(reachedBoundary, "Shutdown must reach the joining boundary")
 
-            // 2. Establish that shutdown remains incomplete before release via bounded observation
-            XCTAssertEqual(initialWaitResult, .timedOut, "Shutdown must remain incomplete while upload pass is blocked in transport")
+            // 2. Bounded observation AFTER reaching the boundary while transport is still blocked
+            let blockedWaitResult = await observerTracker.observe(
+                task: shutdownTask,
+                description: "shutdown while upload transport is blocked at joining boundary",
+                timeout: 0.1
+            )
+            XCTAssertEqual(blockedWaitResult, .timedOut, "Shutdown must remain incomplete while upload pass is blocked in transport")
 
             // 3. Release the blocked transport barrier
             BlockableURLProtocol.unblock()
 
-            // 4. Genuinely bounded join: observe shutdown completion using XCTWaiter
-            let completedResult = await observeTaskCompletion(
+            // 4. Bounded observation & real join: observe shutdown completion after release and join tasks safely
+            let completedResult = await observerTracker.observe(
                 task: shutdownTask,
                 description: "shutdown completion after transport release",
                 timeout: 3.0
             )
             XCTAssertEqual(completedResult, .completed, "Shutdown must complete within 3-second bound after transport release")
             _ = await shutdownTask.result
+            await observerTracker.joinAll()
 
             // 5. Prove completion/cleanup and no queue corruption or unintended mutation
             let finalQueue = try Queue.open(at: paths.database, legacyOwner: nil, now: Date())
@@ -1359,11 +1410,12 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             let rejectedCount = try finalQueue.rejectedCount(owner: "test-ws:user@example.com")
             XCTAssertEqual(rejectedCount, 0, "No blocks must be parked as rejected")
 
-            // 6. Drivers stopped
+            // 6. Drivers stopped & transport wait did not expire
             guard let finalDrivers = driverRecorder.last else {
                 return XCTFail("Driver policy recording must not be nil at end")
             }
             XCTAssertEqual(finalDrivers, ConsentedPermissions.allDisabled, "All drivers must be stopped")
+            XCTAssertFalse(BlockableURLProtocol.timedOut, "Transport barrier must not have timed out waiting for release")
         }
     }
 
@@ -1371,38 +1423,44 @@ final class WorkerConsentLifecycleTests: XCTestCase {
         let barrier = DispatchSemaphore(value: 0)
         let enteredSemaphore = DispatchSemaphore(value: 0)
         let released = Box<Bool>(false)
+        let observerTracker = TaskObserverTracker()
         defer {
             if !released.value {
                 barrier.signal()
             }
         }
 
-        // Start intentionally blocked synthetic operation and observe with bounded window
-        let (initialResult, task) = await observeAsyncCompletion(
-            description: "intentionally blocked synthetic operation",
-            timeout: 0.1
-        ) {
+        // Start intentionally blocked synthetic operation in an owned Task
+        let task = Task {
             enteredSemaphore.signal()
-            _ = barrier.wait(timeout: .now() + 5.0)
+            let waitResult = barrier.wait(timeout: .now() + 5.0)
+            return waitResult == .success
         }
 
-        // Establish operation entered blocked state
+        // 1. Establish operation entered blocked state
         let entered = enteredSemaphore.wait(timeout: .now() + 1.0) == .success
         XCTAssertTrue(entered, "Synthetic operation must enter blocked barrier")
 
-        // Oracle demonstration: bounded observation reliably times out rather than hanging indefinitely
+        // 2. Negative oracle: bounded observation AFTER arrival reliably times out rather than hanging indefinitely
+        let initialResult = await observerTracker.observe(
+            task: task,
+            description: "intentionally blocked synthetic operation",
+            timeout: 0.1
+        )
         XCTAssertEqual(initialResult, .timedOut, "Negative oracle: bounded observation must return .timedOut when operation is blocked")
 
-        // Release barrier and verify task can now be cleanly joined without leaks
+        // 3. Release barrier and verify task can now be cleanly joined without leaks
         released.value = true
         barrier.signal()
 
-        let completionResult = await observeTaskCompletion(
+        let completionResult = await observerTracker.observe(
             task: task,
-            description: "join after releasing synthetic barrier",
+            description: "completion after releasing synthetic barrier",
             timeout: 1.0
         )
         XCTAssertEqual(completionResult, .completed, "Negative oracle: task must complete promptly after barrier release")
-        _ = await task.result
+        let operationSuccess = await task.result
+        XCTAssertEqual(operationSuccess, true, "Synthetic operation must finish with explicit barrier release rather than timeout")
+        await observerTracker.joinAll()
     }
 }
