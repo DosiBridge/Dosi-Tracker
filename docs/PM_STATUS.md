@@ -2684,6 +2684,72 @@ Implemented deterministic isolated SQLite write-failure regressions in `clients/
 3. **Approval-Blocked Invariant**: The unresolved `tirith:archive_extract` command remains untouched.
 4. **No Full-Product Acceptance Claim**: This deliverable completes bounded macOS immediate-parent consent storage hardening and test harness definitions. Native macOS compilation, ScreenCaptureKit/Quartz sensor drivers, network synchronization, and live desktop verification remain open acceptance gates.
 
+---
+
+## 33. Frontend Workspace Archival & Restoration Integration (`REQ-WS-08`, selected-workspace-archive-ui-20261023)
+
+> **Execution Date:** October 23, 2026  
+> **Phase Task ID:** `selected-workspace-archive-ui-20261023` (bounded `REQ-WS-08` frontend integration)  
+> **Status:** Implementation Complete; All 115 Focused Vitest Tests Passed (Exit Code 0); Typecheck Clean (Exit Code 0); ESLint 0 Errors (Exit Code 0)  
+> **Target Package:** `frontend` (`src/app/workspaces/page.tsx`, `src/components/layout/workspace-switcher.tsx`, `src/hooks/useApi.ts`, `src/lib/api-contract.ts`, `src/lib/sign-in.ts`)  
+
+### A. Context & Bounded Source Implementation
+1. **Source Evidence & Lifecycle Gap**:
+   - Backend `WorkspacesController` and `WorkspaceAppService` already provided `POST /api/app/workspaces/{id}/archive` and `/restore`, and `GetMineAsync` returns `IsArchived` and `ArchivedTime`.
+   - The frontend previously had zero UI integration for workspace archival: `WorkspaceMembership` in `lib/sign-in.ts` omitted `isArchived`, `workspaces/page.tsx` treated all returned rows as selectable, `WorkspaceSwitcher` lacked archive controls, and `pickWorkspace` lacked archived workspace filtering.
+   - `REQ-WS-08` explicitly designated frontend UI archival/restoration integration as deferred; this slice integrates that frontend lifecycle without altering backend contracts or building destructive deletion.
+
+2. **Domain Membership Types & Navigation Policy (`sign-in.ts`)**:
+   - `WorkspaceMembership` interface carried `isArchived?: boolean` and `archivedTime?: string | null`.
+   - Introduced `isWorkspaceOwner(w: WorkspaceMembership): boolean` checking `w.isOwner === true` or case-insensitive `role === "owner"`.
+   - Updated `pickWorkspace(mine, lastUsed)`:
+     * Filters active workspaces `active = mine.filter(w => !w.isArchived)`.
+     * If `mine.length === 0`, returns `{ kind: "create" }`.
+     * If all memberships are archived (`active.length === 0`), returns `{ kind: "choose" }`. This prevents misclassifying an account with archived workspaces as having no memberships, ensuring archived owner rows remain reachable for restoration.
+     * When auto-selecting (e.g. `lastUsed`), targets must match in `active`, preventing archived workspaces from ever being auto-selected.
+
+3. **Typed Route Helpers & API Contracts (`api-contract.ts`, `useApi.ts`)**:
+   - Added `archiveWorkspaceRoute(workspaceId: string): string` -> `/api/app/workspaces/${encodeURIComponent(workspaceId)}/archive`.
+   - Added `restoreWorkspaceRoute(workspaceId: string): string` -> `/api/app/workspaces/${encodeURIComponent(workspaceId)}/restore`.
+   - Added typed API wrappers `archiveWorkspaceApi(workspaceId: string): Promise<void>` and `restoreWorkspaceApi(workspaceId: string): Promise<void>`.
+   - Route prefix `/api/app/workspaces` is in `UNSCOPED_PREFIXES`, ensuring requests are dispatched without `X-Workspace-Id` header to ABP's `[WorkspaceNotRequired]` endpoints.
+
+4. **Accessible Chooser & Switcher UI Components (`workspaces/page.tsx`, `workspace-switcher.tsx`)**:
+   - **Account-Level Chooser (`/workspaces`)**:
+     * Active workspaces display switch button and (for owners) an "Archive" button.
+     * Archived workspaces render non-switchable rows with `<Badge tone="muted">Archived</Badge>`.
+     * Owners of archived workspaces receive a "Restore" button with busy indicator (`busyId === w.id`), invoking `restoreWorkspaceApi` and refreshing the list.
+     * Non-owners receive zero mutation controls (UI role hiding preserving backend authorization guards).
+     * Archive action opens accessible `ConfirmDialog` accurately explaining reversibility ("restore at any time"), data preservation, and that subscription billing is NOT cancelled.
+     * On confirmed successful archive: if current workspace was archived, clears `dosi-workspace` and drops live datasets via `dropLiveDatasets()`; refreshes memberships.
+     * On rejected request or network failure: preserves state, shows accessible `role="alert"` and error toast without changing workspaces.
+   - **Workspace Switcher (`WorkspaceSwitcher`)**:
+     * Archived items in `LiveWorkspaceList` render with `aria-disabled="true"` and `<Badge tone="muted">Archived</Badge>`, and ignore clicks.
+     * Owner on active current workspace sees "Archive workspace" action in the dropdown menu.
+     * Confirming archive calls `archiveWorkspaceApi`, clears current workspace and datasets, and redirects to `/workspaces`.
+     * Non-owners and demo mode do not display archive options; demo mode dispatches zero network requests.
+
+### B. Execution Status & Quality Gates
+| Target Suite | Exact Command Line | Tests Passed | Failed | Result | Evidence Level |
+|---|---|:---:|:---:|:---:|---|
+| **Workspace Chooser Page Suite** | `npx vitest run src/test/pages/workspaces.test.tsx` | 8 | 0 | PASSED (exit 0) | **[Worker-Reported (Vitest / JSDOM)]** |
+| **Live Workspace Switcher Suite** | `npx vitest run src/components/layout/workspace-switcher.live.test.tsx` | 12 | 0 | PASSED (exit 0) | **[Worker-Reported (Vitest / JSDOM)]** |
+| **Sign-In & Resolution Unit Suite** | `npx vitest run src/lib/sign-in.test.ts` | 45 | 0 | PASSED (exit 0) | **[Worker-Reported (Vitest / JSDOM)]** |
+| **API Contract Pure Route Suite** | `npx vitest run src/lib/api-contract.test.ts` | 30 | 0 | PASSED (exit 0) | **[Worker-Reported (Vitest / JSDOM)]** |
+| **Login Flow & Landing Suite** | `npx vitest run src/test/pages/login.test.tsx` | 36 | 0 | PASSED (exit 0) | **[Worker-Reported (Vitest / JSDOM)]** |
+| **Architecture Specification** | `npx vitest run src/test/architecture.spec.ts` | 12 | 0 | PASSED (exit 0) | **[Worker-Reported (Vitest / Node)]** |
+| **Demo Switcher & Acceptance Suites** | `npx vitest run src/components/layout/workspace-switcher.test.tsx src/test/acceptance/tenant-lifecycle.test.tsx` | 8 | 0 | PASSED (exit 0) | **[Worker-Reported (Vitest / JSDOM)]** |
+| **Total Focused Vitest Execution** | `npx vitest run ...` (all 7 suites combined) | 115 | 0 | PASSED (exit 0) | **[Worker-Reported]** |
+| **TypeScript Typecheck** | `npm run typecheck` (`tsc --noEmit`) | N/A | 0 | PASSED (exit 0) | **[Worker-Reported]** |
+| **ESLint Static Analysis** | `npm run lint` (`eslint --max-warnings 45`) | N/A | 0 errors | PASSED (exit 0) | **[Worker-Reported]** |
+
+### C. PM QA Boundary Limits & Acceptance Disclosures
+1. **Preserved Backend Authorization**: UI role hiding does not replace server authorization; backend `WorkspaceManager.ArchiveAsync` and `RestoreAsync` strictly enforce active owner checks.
+2. **Reversible Scope Limitation**: Hard deletion, retention grace-period enforcement, data purging, and billing subscription cancellations remain strictly deferred per `REQ-WS-08`.
+3. **Approval-Blocked Invariant**: The historical PM `tirith:archive_extract` check was never run, retried, or bypassed.
+4. **Mocked Execution Disclosure**: All frontend tests ran against isolated mock HTTP/fetch stubs in Vitest/JSDOM; no real network services, production databases, or external token issuers were accessed. Real browser cookie session validation and multi-tenant live browser end-to-end acceptance remain open verification gates.
+
+
 
 
 

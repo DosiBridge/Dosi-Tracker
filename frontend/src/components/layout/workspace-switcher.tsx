@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { Check, ChevronsUpDown, Plus, Building2, Loader2, LogOut } from "lucide-react";
+import { Check, ChevronsUpDown, Plus, Building2, Loader2, LogOut, Archive } from "lucide-react";
 import { Modal } from "@/components/ui/modal";
 import { Input, Select } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
@@ -11,9 +11,10 @@ import { useSession } from "@/components/session-provider";
 import { planById, planNameFor, statusLabel, type PlanId } from "@/lib/saas-data";
 import { toast } from "@/components/toast";
 import { cn } from "@/lib/utils";
-import { createWorkspaceApi, getApi, getMyWorkspacesApi, leaveWorkspaceApi } from "@/hooks/useApi";
-import { currentWorkspaceId, switchToWorkspace, WORKSPACE_CHOOSER_PATH } from "@/lib/live-session";
-import { workspaceInitial, workspaceRoleLabel, type WorkspaceMembership } from "@/lib/sign-in";
+import { archiveWorkspaceApi, createWorkspaceApi, getApi, getMyWorkspacesApi, leaveWorkspaceApi } from "@/hooks/useApi";
+import { clearCurrentWorkspace, currentWorkspaceId, switchToWorkspace, WORKSPACE_CHOOSER_PATH } from "@/lib/live-session";
+import { dropLiveDatasets } from "@/lib/tenant-data";
+import { isWorkspaceOwner, workspaceInitial, workspaceRoleLabel, type WorkspaceMembership } from "@/lib/sign-in";
 import type { ApiPlanDto } from "@/lib/live-identity";
 
 export function WorkspaceSwitcher({ collapsed }: { collapsed: boolean }) {
@@ -23,6 +24,7 @@ export function WorkspaceSwitcher({ collapsed }: { collapsed: boolean }) {
   const [mine, setMine] = useState<WorkspaceMembership[] | null>(null);
   const [mineError, setMineError] = useState(false);
   const [leaving, setLeaving] = useState(false);
+  const [archiving, setArchiving] = useState(false);
   const [liveCreateOpen, setLiveCreateOpen] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
   const [name, setName] = useState("");
@@ -49,8 +51,10 @@ export function WorkspaceSwitcher({ collapsed }: { collapsed: boolean }) {
 
   const currentId = currentWorkspaceId();
   const current = mine?.find((w) => w.id.toLowerCase() === currentId?.toLowerCase()) ?? null;
+  const isCurrentOwner = current ? isWorkspaceOwner(current) : false;
 
   function pick(w: WorkspaceMembership) {
+    if (w.isArchived) return;
     if (w.id.toLowerCase() === currentId?.toLowerCase()) {
       setOpen(false);
       return;
@@ -111,6 +115,7 @@ export function WorkspaceSwitcher({ collapsed }: { collapsed: boolean }) {
               currentId={currentId}
               onPick={pick}
               onCreate={() => { setOpen(false); setLiveCreateOpen(true); }}
+              onArchive={isCurrentOwner && !current?.isArchived ? () => { setOpen(false); setArchiving(true); } : undefined}
               onLeave={current ? () => { setOpen(false); setLeaving(true); } : undefined}
             />
           ) : workspaces.map((w) => {
@@ -149,6 +154,7 @@ export function WorkspaceSwitcher({ collapsed }: { collapsed: boolean }) {
       )}
 
       <CreateWorkspaceModal open={liveCreateOpen} onClose={() => setLiveCreateOpen(false)} />
+      {current && <ArchiveWorkspaceDialog open={archiving} workspace={current} onClose={() => setArchiving(false)} />}
       {current && <LeaveWorkspaceDialog open={leaving} workspace={current} onClose={() => setLeaving(false)} />}
 
       <Modal open={createOpen} onClose={() => setCreateOpen(false)} title="Create a workspace">
@@ -202,6 +208,7 @@ function LiveWorkspaceList({
   currentId,
   onPick,
   onCreate,
+  onArchive,
   onLeave,
 }: {
   items: WorkspaceMembership[] | null;
@@ -209,6 +216,7 @@ function LiveWorkspaceList({
   currentId: string | null;
   onPick: (w: WorkspaceMembership) => void;
   onCreate: () => void;
+  onArchive?: () => void;
   onLeave?: () => void;
 }) {
   return (
@@ -222,9 +230,23 @@ function LiveWorkspaceList({
       ) : (
         items.map((w) => {
           const isCurrent = w.id.toLowerCase() === currentId?.toLowerCase();
-          return (
+          const isArchived = !!w.isArchived;
+          return isArchived ? (
+            <div
+              key={w.id}
+              aria-disabled="true"
+              className="flex w-full items-center gap-2.5 rounded-lg px-2 py-2 text-left opacity-60 cursor-not-allowed select-none"
+            >
+              <span aria-hidden="true" className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-muted text-xs font-bold text-muted-foreground">
+                {workspaceInitial(w)}
+              </span>
+              <span className="min-w-0 flex-1 truncate text-sm font-medium text-muted-foreground">{w.name}</span>
+              <Badge tone="muted">Archived</Badge>
+            </div>
+          ) : (
             <button
               key={w.id}
+              type="button"
               onClick={() => onPick(w)}
               aria-current={isCurrent ? "true" : undefined}
               className="flex w-full items-center gap-2.5 rounded-lg px-2 py-2 text-left hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
@@ -249,6 +271,18 @@ function LiveWorkspaceList({
         </span>
         Create workspace
       </button>
+      {onArchive && (
+        <button
+          type="button"
+          onClick={onArchive}
+          className="flex w-full items-center gap-2.5 rounded-lg px-2 py-2 text-sm text-danger-on-tint hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          <span className="flex h-7 w-7 items-center justify-center rounded-md">
+            <Archive className="h-4 w-4" aria-hidden="true" />
+          </span>
+          Archive workspace
+        </button>
+      )}
       {onLeave && (
         <button
           onClick={onLeave}
@@ -261,6 +295,43 @@ function LiveWorkspaceList({
         </button>
       )}
     </>
+  );
+}
+
+function ArchiveWorkspaceDialog({ open, workspace, onClose }: { open: boolean; workspace: WorkspaceMembership; onClose: () => void }) {
+  const [busy, setBusy] = useState(false);
+
+  async function archive() {
+    setBusy(true);
+    try {
+      await archiveWorkspaceApi(workspace.id);
+    } catch (err) {
+      const e = errorFields(err);
+      toast({
+        title: "Couldn't archive the workspace",
+        description: e.serverMessage || "Try again.",
+        tone: "danger",
+      });
+      setBusy(false);
+      onClose();
+      return;
+    }
+    clearCurrentWorkspace();
+    dropLiveDatasets();
+    window.location.assign(WORKSPACE_CHOOSER_PATH);
+  }
+
+  return (
+    <ConfirmDialog
+      open={open}
+      onCancel={onClose}
+      onConfirm={() => void archive()}
+      busy={busy}
+      title={`Archive ${workspace.name}?`}
+      description="This workspace will be archived and hidden from normal switching. You can restore it at any time, and its projects, activities, and settings will be preserved. Subscription billing is not cancelled."
+      confirmLabel="Archive workspace"
+      tone="danger"
+    />
   );
 }
 

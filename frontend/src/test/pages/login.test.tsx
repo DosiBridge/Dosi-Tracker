@@ -606,6 +606,23 @@ describe("login page — which workspace opens after sign-in", () => {
     expect(localStorage.getItem("dosi-workspace")).toBeNull();
   });
 
+  it("when all workspaces are archived, goes to the chooser and does not auto-select", async () => {
+    stubBackend("tok-arch", { mine: [{ ...ws(ACME, "Acme"), isArchived: true }] });
+    await signIn();
+    await waitFor(() => expect(__router.push).toHaveBeenCalledWith("/workspaces"), { timeout: 2000 });
+    expect(localStorage.getItem("dosi-workspace")).toBeNull();
+  });
+
+  it("never auto-selects archived workspace even if last-used was that workspace", async () => {
+    localStorage.setItem("dosi-workspace", ACME);
+    stubBackend("tok-arch2", {
+      mine: [{ ...ws(ACME, "Acme"), isArchived: true }, ws(BETA, "Beta", "member")],
+    });
+    await signIn();
+    await waitFor(() => expect(__router.push).toHaveBeenCalledWith("/dashboard"), { timeout: 2000 });
+    expect(localStorage.getItem("dosi-workspace")).toBe(BETA);
+  });
+
   it("?next= (an invitation) is where a sign-in returns to", async () => {
     window.history.pushState({}, "", "/login?next=%2Finvite%2Ftok-1");
     try {

@@ -272,9 +272,15 @@ export type WorkspaceRole = "owner" | "manager" | "member";
 export interface WorkspaceMembership {
   id: string;
   name: string;
-  role: WorkspaceRole | string;
+  role?: WorkspaceRole | string | null;
   planName?: string | null;
   isOwner?: boolean;
+  isArchived?: boolean;
+  archivedTime?: string | null;
+}
+
+export function isWorkspaceOwner(w: WorkspaceMembership): boolean {
+  return w.isOwner === true || (typeof w.role === "string" && w.role.toLowerCase() === "owner");
 }
 
 export const WORKSPACE_ROLE_LABELS: Record<WorkspaceRole, string> = { owner: "Owner", manager: "Manager", member: "Member" };
@@ -293,11 +299,13 @@ export type WorkspaceLanding =
   | { kind: "select"; id: string }
   | { kind: "choose" };
 
-/** After sign-in: none → create one; one → open it; several → the last used one if still a member, else choose. */
+/** After sign-in: none → create one; one active → open it; several → the last used active one if still a member, else choose. Archived workspaces are never auto-selected. If all memberships are archived, choose so the owner can restore. */
 export function pickWorkspace(mine: readonly WorkspaceMembership[], lastUsed: string | null): WorkspaceLanding {
   if (mine.length === 0) return { kind: "create" };
-  if (mine.length === 1) return { kind: "select", id: mine[0].id };
-  const last = lastUsed ? mine.find((w) => w.id.toLowerCase() === lastUsed.toLowerCase()) : undefined;
+  const active = mine.filter((w) => !w.isArchived);
+  if (active.length === 0) return { kind: "choose" };
+  if (active.length === 1) return { kind: "select", id: active[0].id };
+  const last = lastUsed ? active.find((w) => w.id.toLowerCase() === lastUsed.toLowerCase()) : undefined;
   return last ? { kind: "select", id: last.id } : { kind: "choose" };
 }
 

@@ -30,6 +30,8 @@ import {
   TEAM_INVITATIONS_ROUTE,
   WORKSPACE_ROUTES,
   leaveWorkspaceRoute,
+  archiveWorkspaceRoute,
+  restoreWorkspaceRoute,
   invitationRoute,
   acceptInvitationRoute,
   declineInvitationRoute,
@@ -92,6 +94,8 @@ describe("routes", () => {
       revokeInvitationRoute("i1"),
       ...Object.values(WORKSPACE_ROUTES),
       leaveWorkspaceRoute("w1"),
+      archiveWorkspaceRoute("w1"),
+      restoreWorkspaceRoute("w1"),
       invitationRoute("tok"),
       acceptInvitationRoute("tok"),
       changeWorkspacePlanRoute("t1", "p1"),
@@ -117,6 +121,8 @@ describe("routes", () => {
     expect(workspaceRoleRoute("u 1", "owner")).toBe("/api/app/team/workspace-role?userId=u%201&role=owner");
     expect(revokeInvitationRoute("i1")).toBe("/api/app/team/i1/invitation");
     expect(leaveWorkspaceRoute("w1")).toBe("/api/app/workspaces/w1/leave");
+    expect(archiveWorkspaceRoute("w 1")).toBe("/api/app/workspaces/w%201/archive");
+    expect(restoreWorkspaceRoute("w 1")).toBe("/api/app/workspaces/w%201/restore");
     expect(acceptInvitationRoute("a b")).toBe("/api/app/invitations/a%20b/accept");
     expect(declineInvitationRoute("a b")).toBe("/api/app/invitations/a%20b/decline");
     expect(removeFromWorkspaceRoute("u1")).toBe("/api/app/team/from-workspace?userId=u1");

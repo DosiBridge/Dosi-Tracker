@@ -9,6 +9,7 @@ const api = vi.hoisted(() => ({
   getMyWorkspacesApi: vi.fn(),
   createWorkspaceApi: vi.fn(),
   leaveWorkspaceApi: vi.fn(),
+  archiveWorkspaceApi: vi.fn(),
   getApi: vi.fn(),
 }));
 const toasts = vi.hoisted(() => ({ toast: vi.fn() }));
@@ -138,5 +139,81 @@ describe("WorkspaceSwitcher (live)", () => {
     await waitFor(() => expect(toasts.toast).toHaveBeenCalled());
     expect(toasts.toast.mock.calls[0][0].description).toMatch(/last owner/i);
     expect(assign).not.toHaveBeenCalled();
+  });
+
+  it("renders archived workspaces with Archived badge and disabled; clicking does not switch", async () => {
+    const GAMMA = "33333333-3333-3333-3333-333333333333";
+    api.getMyWorkspacesApi.mockResolvedValue([
+      ...items,
+      { id: GAMMA, name: "Gamma", role: "member", planName: "Free", isOwner: false, isArchived: true },
+    ]);
+    const user = await openMenu();
+    const archivedItem = screen.getByText("Gamma").closest("div");
+    expect(archivedItem).toHaveAttribute("aria-disabled", "true");
+    expect(within(archivedItem!).getByText("Archived")).toBeInTheDocument();
+
+    await user.click(within(archivedItem!).getByText("Gamma"));
+    expect(assign).not.toHaveBeenCalled();
+    expect(localStorage.getItem("dosi-workspace")).toBe(ACME);
+  });
+
+  it("owner sees archive option; cancelling makes zero requests and stays put", async () => {
+    const user = await openMenu();
+    const archiveBtn = screen.getByRole("button", { name: /archive workspace/i });
+    expect(archiveBtn).toBeInTheDocument();
+
+    await user.click(archiveBtn);
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog).toHaveTextContent(/archive acme\?/i);
+    expect(dialog).toHaveTextContent(/subscription billing is not cancelled/i);
+
+    await user.click(within(dialog).getByRole("button", { name: /cancel/i }));
+    expect(api.archiveWorkspaceApi).not.toHaveBeenCalled();
+    expect(assign).not.toHaveBeenCalled();
+    expect(localStorage.getItem("dosi-workspace")).toBe(ACME);
+  });
+
+  it("owner confirms archive: calls archiveWorkspaceApi, clears current workspace and goes to chooser", async () => {
+    api.archiveWorkspaceApi.mockResolvedValue(undefined);
+    const user = await openMenu();
+    await user.click(screen.getByRole("button", { name: /archive workspace/i }));
+    const dialog = await screen.findByRole("dialog");
+    await user.click(within(dialog).getByRole("button", { name: /^archive workspace$/i }));
+
+    await waitFor(() => expect(api.archiveWorkspaceApi).toHaveBeenCalledWith(ACME));
+    expect(localStorage.getItem("dosi-workspace")).toBeNull();
+    expect(assign).toHaveBeenCalledWith("/workspaces");
+  });
+
+  it("archive failure displays error toast and does not redirect or clear workspace", async () => {
+    api.archiveWorkspaceApi.mockRejectedValue({
+      serverMessage: "Forbidden: Only owners may archive",
+      status: 403,
+    });
+    const user = await openMenu();
+    await user.click(screen.getByRole("button", { name: /archive workspace/i }));
+    const dialog = await screen.findByRole("dialog");
+    await user.click(within(dialog).getByRole("button", { name: /^archive workspace$/i }));
+
+    await waitFor(() => expect(toasts.toast).toHaveBeenCalled());
+    expect(toasts.toast).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: "Couldn't archive the workspace",
+        description: "Forbidden: Only owners may archive",
+        tone: "danger",
+      })
+    );
+    expect(assign).not.toHaveBeenCalled();
+    expect(localStorage.getItem("dosi-workspace")).toBe(ACME);
+  });
+
+  it("non-owner does not see archive option", async () => {
+    localStorage.setItem("dosi-workspace", BETA);
+    const user = userEvent.setup();
+    render(<WorkspaceSwitcher collapsed={false} />);
+    await user.click(screen.getByRole("button", { name: /acme/i }));
+    await screen.findByRole("button", { current: true });
+
+    expect(screen.queryByRole("button", { name: /archive workspace/i })).not.toBeInTheDocument();
   });
 });

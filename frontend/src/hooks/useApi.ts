@@ -22,6 +22,8 @@ import {
   changeWorkspacePlanRoute,
   invitationRoute,
   leaveWorkspaceRoute,
+  archiveWorkspaceRoute,
+  restoreWorkspaceRoute,
   revokeInvitationRoute,
   TEAM_INVITATIONS_ROUTE,
   WORKSPACE_ROUTES,
@@ -631,6 +633,16 @@ export const createWorkspaceApi = (name: string, planId?: string | null): Promis
 /** Leave a workspace (409 Tracker:LastOwnerCannotLeave for its last owner). */
 export const leaveWorkspaceApi = async (workspaceId: string): Promise<void> => {
   await postApi(leaveWorkspaceRoute(workspaceId), {});
+};
+
+/** Archive a workspace (owner only). */
+export const archiveWorkspaceApi = async (workspaceId: string): Promise<void> => {
+  await postApi(archiveWorkspaceRoute(workspaceId), {});
+};
+
+/** Restore an archived workspace (owner only). */
+export const restoreWorkspaceApi = async (workspaceId: string): Promise<void> => {
+  await postApi(restoreWorkspaceRoute(workspaceId), {});
 };
 
 /** Anonymous JSON call: never a token, never a workspace. */

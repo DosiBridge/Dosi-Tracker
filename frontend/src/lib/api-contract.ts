@@ -1070,6 +1070,14 @@ export function leaveWorkspaceRoute(workspaceId: string): string {
   return `/api/app/workspaces/${encodeURIComponent(workspaceId)}/leave`;
 }
 
+export function archiveWorkspaceRoute(workspaceId: string): string {
+  return `/api/app/workspaces/${encodeURIComponent(workspaceId)}/archive`;
+}
+
+export function restoreWorkspaceRoute(workspaceId: string): string {
+  return `/api/app/workspaces/${encodeURIComponent(workspaceId)}/restore`;
+}
+
 export function invitationRoute(token: string): string {
   return `/api/app/invitations/${encodeURIComponent(token)}`;
 }

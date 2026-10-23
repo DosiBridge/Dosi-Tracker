@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   API_BASE_URL,
+  isWorkspaceOwner,
   pickWorkspace,
   workspaceInitial,
   workspaceRoleLabel,
@@ -198,14 +199,40 @@ describe("changePasswordAtSignIn — ABP's change-at-sign-in exchange", () => {
 describe("workspace choices", () => {
   const a = { id: "11111111-1111-1111-1111-111111111111", name: "Acme", role: "owner" };
   const b = { id: "22222222-2222-2222-2222-222222222222", name: "Beta", role: "member" };
+  const c = { id: "33333333-3333-3333-3333-333333333333", name: "Gamma", role: "member" };
+  const aArchived = { ...a, isArchived: true };
+  const bArchived = { ...b, isArchived: true };
 
   it("none → create, one → open it, several → the last used one while still a member, else choose", () => {
     expect(pickWorkspace([], null)).toEqual({ kind: "create" });
     expect(pickWorkspace([a], null)).toEqual({ kind: "select", id: a.id });
     expect(pickWorkspace([a], b.id)).toEqual({ kind: "select", id: a.id });
     expect(pickWorkspace([a, b], b.id.toUpperCase())).toEqual({ kind: "select", id: b.id });
-    expect(pickWorkspace([a, b], "33333333-3333-3333-3333-333333333333")).toEqual({ kind: "choose" });
+    expect(pickWorkspace([a, b], "44444444-4444-4444-4444-444444444444")).toEqual({ kind: "choose" });
     expect(pickWorkspace([a, b], null)).toEqual({ kind: "choose" });
+  });
+
+  it("never auto-selects archived workspaces; all-archived leads to chooser (not create)", () => {
+    // An account with only archived memberships must NOT be misclassified as no memberships (create)
+    expect(pickWorkspace([aArchived], null)).toEqual({ kind: "choose" });
+    expect(pickWorkspace([aArchived, bArchived], null)).toEqual({ kind: "choose" });
+
+    // Active single workspace is selected even if last-used was an archived one
+    expect(pickWorkspace([aArchived, b], aArchived.id)).toEqual({ kind: "select", id: b.id });
+    expect(pickWorkspace([aArchived, b], null)).toEqual({ kind: "select", id: b.id });
+
+    // When multiple active exist, last-used to an archived workspace does not select it
+    expect(pickWorkspace([aArchived, b, c], aArchived.id)).toEqual({ kind: "choose" });
+    expect(pickWorkspace([aArchived, b, c], b.id)).toEqual({ kind: "select", id: b.id });
+  });
+
+  it("identifies owners by role string or isOwner flag", () => {
+    expect(isWorkspaceOwner(a)).toBe(true);
+    expect(isWorkspaceOwner({ id: "x", name: "X", role: "OWNER" })).toBe(true);
+    expect(isWorkspaceOwner({ id: "x", name: "X", role: "member", isOwner: true })).toBe(true);
+    expect(isWorkspaceOwner(b)).toBe(false);
+    expect(isWorkspaceOwner({ id: "x", name: "X", role: "manager" })).toBe(false);
+    expect(isWorkspaceOwner({ id: "x", name: "X", role: null })).toBe(false);
   });
 
   it("labels roles and initials", () => {
