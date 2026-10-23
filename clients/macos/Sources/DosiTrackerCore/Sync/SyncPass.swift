@@ -32,7 +32,7 @@ public enum SyncStop: Equatable, Sendable {
     /// The saved credentials were refused: "Sign-in expired" (stop capturing,
     /// keep the queue, ask for the password).
     case signInExpired(AuthRejection)
-    /// The queue itself could not be read.
+    /// The queue itself could not be read or updated.
     case queueError(String)
 }
 
@@ -42,9 +42,9 @@ public struct SyncReport: Equatable, Sendable {
     public var attempted = 0
     /// Rows the server accepted (and that left the queue).
     public var uploaded: [Int64] = []
-    /// Rows parked as rejected.
+    /// Rows parked as locally rejected.
     public var parked: [ParkedRow] = []
-    /// Rows whose images were stripped after a 413 / capture error.
+    /// Rows whose images were stripped after a 413 / capture error and persisted in the queue.
     public var stripped: [Int64] = []
     /// Projects the server refused that are gone from the project list: the
     /// worker leaves "Tracking" for "Choose a project" if one is current.
@@ -115,9 +115,16 @@ public enum SyncPass {
                     // The images are the problem: the time data goes up
                     // without them, at once.
                     CoreLog.warning("sync", "server refused the captures of activity \(row.id) (\(reason)); stripping them")
-                    let stillQueued = (try? queue.stripCaptures(id: row.id)) ?? false
-                    report.stripped.append(row.id)
+                    let stillQueued: Bool
+                    do {
+                        stillQueued = try queue.stripCaptures(id: row.id)
+                    } catch {
+                        CoreLog.error("sync", "could not strip captures of activity \(row.id): \(error)")
+                        report.stop = .queueError("\(error)")
+                        break pass
+                    }
                     guard stillQueued else { continue }
+                    report.stripped.append(row.id)
                     decision = UploadPolicy.decide(await upload(row.payload.strippingCaptures()))
                     if case .stripCapturesAndResend = decision {
                         // Refused again without images: not something stripping
@@ -130,13 +137,17 @@ public enum SyncPass {
                 case .uploaded:
                     do {
                         try queue.removeSynced(id: row.id)
+                        report.uploaded.append(row.id)
                     } catch {
-                        CoreLog.warning("sync", "uploaded activity \(row.id) could not leave the queue: \(error)")
+                        CoreLog.error("sync", "uploaded activity \(row.id) could not leave the queue: \(error)")
+                        report.stop = .queueError("\(error)")
+                        break pass
                     }
-                    report.uploaded.append(row.id)
 
                 case .park(let reason):
-                    park(row, reason: reason, in: queue, report: &report)
+                    guard park(row, reason: reason, in: queue, report: &report) else {
+                        break pass
+                    }
 
                 case .verifyProject(let code, let message):
                     let projectId = row.payload.projectId
@@ -149,9 +160,11 @@ public enum SyncPass {
                     }
                     if verdict == .gone {
                         CoreLog.warning("sync", "project \(projectId) is gone (\(code)); parking activity \(row.id)")
-                        park(row, reason: message, in: queue, report: &report)
                         if !report.goneProjects.contains(where: { $0.caseInsensitiveCompare(projectId) == .orderedSame }) {
                             report.goneProjects.append(projectId)
+                        }
+                        guard park(row, reason: message, in: queue, report: &report) else {
+                            break pass
                         }
                     } else {
                         note(row, RetryReason.projectUnavailable.userMessage, in: queue)
@@ -185,14 +198,18 @@ public enum SyncPass {
         return report
     }
 
-    private static func park(_ row: QueuedActivity, reason: String, in queue: Queue, report: inout SyncReport) {
+    @discardableResult
+    private static func park(_ row: QueuedActivity, reason: String, in queue: Queue, report: inout SyncReport) -> Bool {
         CoreLog.warning("sync", "server rejected activity \(row.id); parking it (\(reason))")
         do {
             try queue.markRejected(id: row.id, reason: reason)
+            report.parked.append(ParkedRow(id: row.id, projectId: row.payload.projectId, reason: reason))
+            return true
         } catch {
             CoreLog.error("sync", "could not park activity \(row.id): \(error)")
+            report.stop = .queueError("\(error)")
+            return false
         }
-        report.parked.append(ParkedRow(id: row.id, projectId: row.payload.projectId, reason: reason))
     }
 
     private static func note(_ row: QueuedActivity, _ reason: String, in queue: Queue) {

@@ -195,4 +195,216 @@ final class SyncPassTests: XCTestCase {
         XCTAssertEqual(recent.items.first { $0.rowId == ids[1] }?.upload, .rejected)
         XCTAssertEqual(recent.items.first { $0.rowId == ids[1] }?.message, "Too long")
     }
+
+    // MARK: - Persistence Failure Regressions
+
+    func testAcceptedResponseRemoveFailureHaltsPassRetainsQueuedRowWithoutReportingUploadedAndRecovers() async throws {
+        let otherOwner = "acme\u{1F}bob@acme.com"
+        let ids = try enqueue(["p1", "p2", "p3"])
+        let bobSentinel = try queue.enqueue(payload("bob-project"), owner: otherOwner)
+
+        var recent = RecentBlocks()
+        for (id, project) in zip(ids, ["p1", "p2", "p3"]) {
+            recent.push(RecentBlock(rowId: id, projectTitle: project, payload: payload(project)))
+        }
+
+        // Deterministic isolated SQLite failure injection: prevent deletion in removeSynced
+        try queue.db.execute("CREATE TRIGGER fail_delete BEFORE DELETE ON activities BEGIN SELECT RAISE(ABORT, 'injected delete failure'); END;")
+
+        let server = FakeServer()
+        let report = await run(server)
+
+        // Truthful outcome reporting:
+        // Even though the server accepted p1, local removeSynced failed, so p1 MUST NOT be reported uploaded
+        XCTAssertTrue(report.uploaded.isEmpty, "Row that failed local queue removal must not be reported as uploaded")
+        XCTAssertFalse(report.drained, "Pass must not report drained when queue removal fails")
+        if case .some(.queueError(let message)) = report.stop {
+            XCTAssertTrue(message.contains("injected delete failure"), "Stop reason must reflect sanitized queue failure: \(message)")
+        } else {
+            XCTFail("Expected .queueError stop reason, got \(String(describing: report.stop))")
+        }
+
+        // Halt on fatal mutation failure: subsequent rows must NOT be uploaded
+        XCTAssertEqual(server.sent.count, 1, "Must halt immediately; p2 and p3 must not be uploaded after local mutation failure")
+        XCTAssertEqual(server.sent[0].projectId, "p1")
+
+        // Preserved pending payload and clientActivityId
+        XCTAssertEqual(try queue.pendingCount(owner: owner), 3, "All 3 rows must remain pending in the queue")
+        let pending = try queue.pendingBatch(owner: owner, afterId: 0, limit: 1)
+        XCTAssertEqual(pending.count, 1)
+        XCTAssertEqual(pending[0].id, ids[0])
+        XCTAssertEqual(pending[0].payload.clientActivityId, server.sent[0].clientActivityId, "clientActivityId must be preserved for idempotent retry")
+        XCTAssertEqual(pending[0].payload.projectId, "p1")
+
+        // No false RecentBlocks uploaded transition
+        recent.apply(report)
+        for id in ids {
+            XCTAssertEqual(recent.items.first { $0.rowId == id }?.upload, .queued, "Recent blocks must remain .queued on mutation failure")
+        }
+
+        // Other-owner sentinel intact
+        XCTAssertEqual(try queue.pendingCount(owner: otherOwner), 1)
+        let bobPending = try queue.pendingBatch(owner: otherOwner, afterId: 0, limit: 5)
+        XCTAssertEqual(bobPending.map { $0.id }, [bobSentinel])
+
+        // Recovery: remove injected trigger, verify queue drains successfully
+        try queue.db.execute("DROP TRIGGER fail_delete;")
+        let recoveryReport = await run(server)
+        XCTAssertEqual(recoveryReport.uploaded, ids, "All rows must upload and leave the queue after failure is resolved")
+        XCTAssertTrue(recoveryReport.drained)
+        XCTAssertNil(recoveryReport.stop)
+        XCTAssertEqual(try queue.pendingCount(owner: owner), 0)
+        XCTAssertEqual(try queue.pendingCount(owner: otherOwner), 1, "Other-owner sentinel preserved")
+
+        recent.apply(recoveryReport)
+        for id in ids {
+            XCTAssertEqual(recent.items.first { $0.rowId == id }?.upload, .uploaded)
+        }
+    }
+
+    func testRejectionParkFailureHaltsPassRetainsQueuedRowWithoutReportingParkedAndRecovers() async throws {
+        let otherOwner = "acme\u{1F}bob@acme.com"
+        let ids = try enqueue(["p1", "p2"])
+        let bobSentinel = try queue.enqueue(payload("bob-project"), owner: otherOwner)
+
+        var recent = RecentBlocks()
+        for (id, project) in zip(ids, ["p1", "p2"]) {
+            recent.push(RecentBlock(rowId: id, projectTitle: project, payload: payload(project)))
+        }
+
+        let server = FakeServer()
+        server.answers["p1"] = [http(409, UploadPolicy.Code.activityOverlaps, "Overlaps another block.")]
+
+        // Deterministic isolated SQLite failure injection: prevent update to synced = 2 in markRejected
+        try queue.db.execute("CREATE TRIGGER fail_park BEFORE UPDATE OF synced ON activities BEGIN SELECT RAISE(ABORT, 'injected park failure'); END;")
+
+        let report = await run(server)
+
+        // Truthful outcome reporting:
+        // Even though the server rejected p1, local markRejected failed, so p1 MUST NOT be reported parked
+        XCTAssertTrue(report.parked.isEmpty, "Row that failed local queue parking must not be reported as parked")
+        XCTAssertTrue(report.uploaded.isEmpty)
+        XCTAssertFalse(report.drained)
+        if case .some(.queueError(let message)) = report.stop {
+            XCTAssertTrue(message.contains("injected park failure"), "Stop reason must reflect sanitized queue failure: \(message)")
+        } else {
+            XCTFail("Expected .queueError stop reason, got \(String(describing: report.stop))")
+        }
+
+        // Halt on mutation failure: p2 must NOT be uploaded
+        XCTAssertEqual(server.sent.count, 1, "Must halt immediately; p2 must not be uploaded after local parking failure")
+
+        // Queued data retained as pending, not marked rejected
+        XCTAssertEqual(try queue.pendingCount(owner: owner), 2)
+        XCTAssertEqual(try queue.rejectedCount(owner: owner), 0, "Row must not be marked rejected when write fails")
+        let pending = try queue.pendingBatch(owner: owner, afterId: 0, limit: 1)
+        XCTAssertEqual(pending[0].payload.clientActivityId, server.sent[0].clientActivityId)
+
+        // No false RecentBlocks rejected transition
+        recent.apply(report)
+        XCTAssertEqual(recent.items.first { $0.rowId == ids[0] }?.upload, .queued, "Recent block must not be marked rejected when write fails")
+        XCTAssertEqual(recent.items.first { $0.rowId == ids[1] }?.upload, .queued)
+
+        // Other-owner sentinel intact
+        XCTAssertEqual(try queue.pendingCount(owner: otherOwner), 1)
+
+        // Recovery: remove injected trigger, verify p1 parks and p2 uploads
+        try queue.db.execute("DROP TRIGGER fail_park;")
+        let recoveryReport = await run(server)
+        XCTAssertEqual(recoveryReport.parked.map { $0.id }, [ids[0]])
+        XCTAssertEqual(recoveryReport.uploaded, [ids[1]])
+        XCTAssertTrue(recoveryReport.drained)
+        XCTAssertNil(recoveryReport.stop)
+        XCTAssertEqual(try queue.rejectedCount(owner: owner), 1)
+        XCTAssertEqual(try queue.pendingCount(owner: owner), 0)
+        XCTAssertEqual(try queue.pendingCount(owner: otherOwner), 1)
+
+        recent.apply(recoveryReport)
+        XCTAssertEqual(recent.items.first { $0.rowId == ids[0] }?.upload, .rejected)
+        XCTAssertEqual(recent.items.first { $0.rowId == ids[1] }?.upload, .uploaded)
+    }
+
+    func testStripCapturesMutationFailureHaltsPassDoesNotReportStrippedAndRecovers() async throws {
+        let otherOwner = "acme\u{1F}bob@acme.com"
+        let ids = try enqueue(["p1", "p2"], captures: true)
+        _ = try queue.enqueue(payload("bob-project"), owner: otherOwner)
+
+        let server = FakeServer()
+        server.answers["p1"] = [http(413)]
+
+        // Deterministic isolated SQLite failure injection: prevent update to stripped = 1 in stripCaptures
+        try queue.db.execute("CREATE TRIGGER fail_strip BEFORE UPDATE OF stripped ON activities BEGIN SELECT RAISE(ABORT, 'injected strip failure'); END;")
+
+        let report = await run(server)
+
+        // Truthful outcome reporting:
+        // Local strip mutation failed, so p1 MUST NOT be reported stripped
+        XCTAssertTrue(report.stripped.isEmpty, "Row that failed local capture stripping must not be reported as stripped")
+        XCTAssertTrue(report.uploaded.isEmpty)
+        XCTAssertFalse(report.drained)
+        if case .some(.queueError(let message)) = report.stop {
+            XCTAssertTrue(message.contains("injected strip failure"), "Stop reason must reflect sanitized queue failure: \(message)")
+        } else {
+            XCTFail("Expected .queueError stop reason, got \(String(describing: report.stop))")
+        }
+
+        // Resend must NOT be attempted because local strip mutation failed; p2 must not be attempted
+        XCTAssertEqual(server.sent.count, 1, "Must not resend payload without images when local strip mutation fails")
+
+        // Captures are still intact on the queued row
+        XCTAssertEqual(try queue.pendingCount(owner: owner), 2)
+        let pending = try queue.pendingBatch(owner: owner, afterId: 0, limit: 1)
+        XCTAssertTrue(pending[0].payload.hasCaptures, "Captures must remain intact in local queue when stripping fails")
+        XCTAssertEqual(pending[0].payload.clientActivityId, server.sent[0].clientActivityId)
+
+        // Other-owner sentinel intact
+        XCTAssertEqual(try queue.pendingCount(owner: otherOwner), 1)
+
+        // Recovery: remove injected trigger, verify strip and upload succeed
+        try queue.db.execute("DROP TRIGGER fail_strip;")
+        let recoveryReport = await run(server)
+        XCTAssertEqual(recoveryReport.stripped, [ids[0]])
+        XCTAssertEqual(recoveryReport.uploaded, ids)
+        XCTAssertTrue(recoveryReport.drained)
+        XCTAssertNil(recoveryReport.stop)
+        XCTAssertEqual(try queue.pendingCount(owner: owner), 0)
+        XCTAssertEqual(try queue.pendingCount(owner: otherOwner), 1)
+    }
+
+    func testProjectGonePolicyRecordedEvenWhenParkingPersistenceFails() async throws {
+        let otherOwner = "acme\u{1F}bob@acme.com"
+        let ids = try enqueue(["gone", "p2"])
+        _ = try queue.enqueue(payload("bob-project"), owner: otherOwner)
+
+        let server = FakeServer()
+        server.answers["gone"] = [http(409, UploadPolicy.Code.projectArchived, "The project is archived.")]
+        server.verdict = .gone
+
+        // Deterministic isolated SQLite failure injection: fail markRejected
+        try queue.db.execute("CREATE TRIGGER fail_park BEFORE UPDATE OF synced ON activities BEGIN SELECT RAISE(ABORT, 'injected park failure'); END;")
+
+        let report = await run(server)
+
+        // Project-gone policy is separate from whether parking write persisted:
+        // The server verdict holds, so goneProjects records the gone project
+        XCTAssertEqual(report.goneProjects, ["gone"], "Server project-gone verdict must be recorded regardless of parking persistence")
+        XCTAssertTrue(report.parked.isEmpty, "Parking write failed, so row must not be reported as parked")
+        XCTAssertTrue(report.uploaded.isEmpty, "Subsequent row must not be uploaded after local mutation failure")
+        if case .some(.queueError(let message)) = report.stop {
+            XCTAssertTrue(message.contains("injected park failure"))
+        } else {
+            XCTFail("Expected .queueError stop reason, got \(String(describing: report.stop))")
+        }
+
+        XCTAssertEqual(try queue.pendingCount(owner: owner), 2)
+        XCTAssertEqual(try queue.pendingCount(owner: otherOwner), 1)
+
+        // Recovery
+        try queue.db.execute("DROP TRIGGER fail_park;")
+        let recoveryReport = await run(server)
+        XCTAssertEqual(recoveryReport.goneProjects, ["gone"])
+        XCTAssertEqual(recoveryReport.parked.map { $0.id }, [ids[0]])
+        XCTAssertEqual(recoveryReport.uploaded, [ids[1]])
+        XCTAssertTrue(recoveryReport.drained)
+    }
 }
