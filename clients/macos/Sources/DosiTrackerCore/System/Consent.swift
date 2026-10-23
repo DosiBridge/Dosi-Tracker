@@ -235,15 +235,73 @@ public final class FileConsentStore: ConsentStorage, @unchecked Sendable {
         self.hooks = hooks
     }
 
-    /// Check if target file exists and is a regular, non-symlink file.
+    /// Shared non-following immediate-parent directory validator.
+    /// Checks that parent path is a regular directory (not a symlink),
+    /// owned by the current effective UID, and not group- or world-writable.
+    /// If `allowMissing` is true and path does not exist (ENOENT), returns false.
+    @discardableResult
+    private static func validateParentDirectory(atPath path: String, allowMissing: Bool = false) throws -> Bool {
+        var st = stat()
+        if lstat(path, &st) != 0 {
+            if allowMissing && errno == ENOENT {
+                return false
+            }
+            let err = String(cString: strerror(errno))
+            throw ConsentError.ioError("Failed inspecting parent directory metadata for \(path): \(err)")
+        }
+
+        let mode = Int32(st.st_mode)
+        let fileType = mode & Int32(S_IFMT)
+        if fileType == Int32(S_IFLNK) {
+            throw ConsentError.unsafeStorage("Parent directory \(path) is a symbolic link")
+        }
+        if fileType != Int32(S_IFDIR) {
+            throw ConsentError.unsafeStorage("Parent path \(path) is not a directory")
+        }
+
+        let currentUid = geteuid()
+        if st.st_uid != currentUid {
+            throw ConsentError.unsafeStorage("Parent directory \(path) is owned by UID \(st.st_uid), expected current UID \(currentUid)")
+        }
+
+        if (mode & Int32(S_IWGRP | S_IWOTH)) != 0 {
+            let octal = String(format: "%o", mode & 0o777)
+            throw ConsentError.unsafeStorage("Parent directory \(path) has unsafe permissions \(octal) (group or world writable)")
+        }
+
+        return true
+    }
+
+    /// Check if target file exists and is a regular, non-symlink file under a safe immediate-parent directory.
     public static func exists(at fileURL: URL) -> Bool {
+        let parentDir = fileURL.deletingLastPathComponent()
+        let parentPath = parentDir.path
+        if !parentPath.isEmpty {
+            do {
+                let parentExists = try validateParentDirectory(atPath: parentPath, allowMissing: true)
+                if !parentExists {
+                    return false
+                }
+            } catch {
+                return false
+            }
+        }
         var st = stat()
         if lstat(fileURL.path, &st) != 0 {
             return false
         }
         let mode = Int32(st.st_mode)
         let fileType = mode & Int32(S_IFMT)
-        return fileType == Int32(S_IFREG)
+        if fileType != Int32(S_IFREG) {
+            return false
+        }
+        if st.st_uid != geteuid() {
+            return false
+        }
+        if (mode & Int32(S_IWGRP | S_IWOTH)) != 0 {
+            return false
+        }
+        return true
     }
 
     private static func validateTargetFile(atPath path: String) throws {
@@ -279,24 +337,70 @@ public final class FileConsentStore: ConsentStorage, @unchecked Sendable {
     public func load() throws -> LocalConsent {
         lock.lock()
         defer { lock.unlock() }
+
+        let parentDir = fileURL.deletingLastPathComponent()
+        let parentPath = parentDir.path
+        if parentPath.isEmpty {
+            throw ConsentError.unsafeStorage("Target path has no parent directory")
+        }
+
+        let parentExists = try Self.validateParentDirectory(atPath: parentPath, allowMissing: true)
+        if !parentExists {
+            return .absent
+        }
+
         let path = fileURL.path
         try Self.validateTargetFile(atPath: path)
 
-        var st = stat()
-        if lstat(path, &st) != 0 {
+        let fd = Darwin.open(path, O_RDONLY | O_NOFOLLOW)
+        if fd < 0 {
             if errno == ENOENT {
                 return .absent
             }
+            if errno == ELOOP || errno == EMLINK {
+                throw ConsentError.unsafeStorage("Target path \(path) is a symbolic link")
+            }
             let err = String(cString: strerror(errno))
-            throw ConsentError.ioError("Cannot stat \(path): \(err)")
+            throw ConsentError.ioError("Cannot open \(path): \(err)")
+        }
+        defer { Darwin.close(fd) }
+
+        var st = stat()
+        if Darwin.fstat(fd, &st) != 0 {
+            let err = String(cString: strerror(errno))
+            throw ConsentError.ioError("Cannot fstat \(path): \(err)")
         }
 
-        let data: Data
-        do {
-            data = try Data(contentsOf: fileURL)
-        } catch {
-            throw ConsentError.ioError("Cannot read \(path): \(error.localizedDescription)")
+        let mode = Int32(st.st_mode)
+        let fileType = mode & Int32(S_IFMT)
+        if fileType != Int32(S_IFREG) {
+            throw ConsentError.unsafeStorage("Target path \(path) is not a regular file")
         }
+
+        let currentUid = geteuid()
+        if st.st_uid != currentUid {
+            throw ConsentError.unsafeStorage("Target path \(path) is owned by UID \(st.st_uid), expected current UID \(currentUid)")
+        }
+
+        if (mode & Int32(S_IWGRP | S_IWOTH)) != 0 {
+            let octal = String(format: "%o", mode & 0o777)
+            throw ConsentError.unsafeStorage("Target path \(path) has unsafe permissions \(octal) (group or world writable)")
+        }
+
+        var data = Data()
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        while true {
+            let bytesRead = Darwin.read(fd, &buffer, buffer.count)
+            if bytesRead < 0 {
+                let err = String(cString: strerror(errno))
+                throw ConsentError.ioError("Cannot read \(path): \(err)")
+            }
+            if bytesRead == 0 {
+                break
+            }
+            data.append(buffer, count: bytesRead)
+        }
+
         do {
             return try JSONDecoder().decode(LocalConsent.self, from: data)
         } catch {
@@ -314,26 +418,15 @@ public final class FileConsentStore: ConsentStorage, @unchecked Sendable {
             throw ConsentError.saveFailed("Target path has no parent directory")
         }
 
-        var parentStat = stat()
-        if lstat(parentPath, &parentStat) == 0 {
-            let parentMode = Int32(parentStat.st_mode)
-            let parentType = parentMode & Int32(S_IFMT)
-            if parentType == Int32(S_IFLNK) {
-                throw ConsentError.saveFailed("Parent directory \(parentPath) is a symbolic link")
-            }
-            if parentType != Int32(S_IFDIR) {
-                throw ConsentError.saveFailed("Parent path \(parentPath) is not a directory")
-            }
-        } else if errno == ENOENT {
+        let parentExists = try Self.validateParentDirectory(atPath: parentPath, allowMissing: true)
+        if !parentExists {
             do {
                 try FileManager.default.createDirectory(at: parentDir, withIntermediateDirectories: true,
                                                         attributes: [.posixPermissions: 0o700])
             } catch {
                 throw ConsentError.saveFailed("Cannot create directory \(parentPath): \(error.localizedDescription)")
             }
-        } else {
-            let err = String(cString: strerror(errno))
-            throw ConsentError.saveFailed("Cannot inspect parent directory \(parentPath): \(err)")
+            _ = try Self.validateParentDirectory(atPath: parentPath, allowMissing: false)
         }
 
         let targetPath = fileURL.path

@@ -626,4 +626,226 @@ final class ConsentLifecycleTests: XCTestCase {
             "ConsentManager must fail closed to .absent on unsafe file permissions"
         )
     }
+
+    func testImmediateParentSymlinkRefusalPreservesVictimConsent() throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("consent-parent-symlink-\(UUID().uuidString.lowercased())", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        // Create a genuine safe real directory with private permissions
+        let realDir = tempDir.appendingPathComponent("real_safe_dir", isDirectory: true)
+        try FileManager.default.createDirectory(at: realDir, withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+        let realFile = realDir.appendingPathComponent("consent.json")
+        let realStore = FileConsentStore(fileURL: realFile)
+
+        let victimGrant = ConsentedPermissions(screenshot: true, blurScreenshots: false)
+        try realStore.save(.granted(victimGrant))
+        let victimBytesBefore = try Data(contentsOf: realFile)
+
+        // Create immediate parent symlink pointing to the real safe directory
+        let symlinkDir = tempDir.appendingPathComponent("symlink_parent_dir")
+        XCTAssertEqual(Darwin.symlink(realDir.path, symlinkDir.path), 0)
+
+        let targetThroughSymlink = symlinkDir.appendingPathComponent("consent.json")
+        let symlinkStore = FileConsentStore(fileURL: targetThroughSymlink)
+
+        // 1. load() through parent symlink must refuse and throw unsafeStorage
+        XCTAssertThrowsError(try symlinkStore.load()) { error in
+            guard let consentErr = error as? ConsentError else {
+                return XCTFail("Expected ConsentError, got \(error)")
+            }
+            if case .unsafeStorage = consentErr {
+                // Expected
+            } else {
+                XCTFail("Expected unsafeStorage, got \(consentErr)")
+            }
+        }
+
+        // 2. ConsentManager.loadOrFailClosed must fail closed to .absent
+        let (manager, loadErr) = ConsentManager.loadOrFailClosed(store: symlinkStore)
+        XCTAssertNotNil(loadErr)
+        XCTAssertEqual(
+            manager.current,
+            .absent,
+            "ConsentManager must fail closed to .absent when immediate parent is a symlink"
+        )
+
+        // 3. save() through parent symlink must refuse and throw unsafeStorage
+        XCTAssertThrowsError(try symlinkStore.save(.revoked)) { error in
+            guard let consentErr = error as? ConsentError else {
+                return XCTFail("Expected ConsentError, got \(error)")
+            }
+            if case .unsafeStorage = consentErr {
+                // Expected
+            } else {
+                XCTFail("Expected unsafeStorage, got \(consentErr)")
+            }
+        }
+
+        // 4. Manager update through symlink parent must reject widening without expanding
+        let wideningManager = ConsentManager(initial: .absent, storage: symlinkStore)
+        var expanded = ConsentedPermissions.allDisabled
+        expanded.keyboard = true
+        XCTAssertThrowsError(try wideningManager.update(.granted(expanded)))
+        XCTAssertEqual(
+            wideningManager.current,
+            .absent,
+            "ConsentManager must not admit widening expansion when save fails on parent symlink"
+        )
+
+        // 5. Victim consent bytes in real directory must be completely untouched
+        let victimBytesAfter = try Data(contentsOf: realFile)
+        XCTAssertEqual(victimBytesAfter, victimBytesBefore, "Victim consent file must not be modified through symlink parent")
+        let loadedReal = try realStore.load()
+        XCTAssertEqual(loadedReal, .granted(victimGrant))
+    }
+
+    func testOwnerCreatedWritableParentRefusalForLoadAndSave() throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("consent-writable-parent-\(UUID().uuidString.lowercased())", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let parentDir = tempDir.appendingPathComponent("writable_parent_dir", isDirectory: true)
+        try FileManager.default.createDirectory(at: parentDir, withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+
+        let fileURL = parentDir.appendingPathComponent("consent.json")
+        let initialStore = FileConsentStore(fileURL: fileURL)
+        let initialPerms = ConsentedPermissions(keyboard: true, mouse: true)
+        try initialStore.save(.granted(initialPerms))
+        let validBytesBefore = try Data(contentsOf: fileURL)
+
+        // Explicitly set parent directory to 0777 (world & group writable; owner-created, no root chmod assumption)
+        XCTAssertEqual(Darwin.chmod(parentDir.path, mode_t(0o777)), 0)
+
+        let store = FileConsentStore(fileURL: fileURL)
+
+        // 1. load() must refuse under 0777 parent
+        XCTAssertThrowsError(try store.load()) { error in
+            guard let consentErr = error as? ConsentError else {
+                return XCTFail("Expected ConsentError, got \(error)")
+            }
+            if case .unsafeStorage = consentErr {
+                // Expected
+            } else {
+                XCTFail("Expected unsafeStorage, got \(consentErr)")
+            }
+        }
+
+        // 2. ConsentManager.loadOrFailClosed must fail closed to .absent
+        let (manager777, loadErr777) = ConsentManager.loadOrFailClosed(store: store)
+        XCTAssertNotNil(loadErr777)
+        XCTAssertEqual(
+            manager777.current,
+            .absent,
+            "Manager must fail closed to .absent when parent is mode 0777"
+        )
+
+        // 3. save() must refuse under 0777 parent
+        XCTAssertThrowsError(try store.save(.revoked)) { error in
+            guard let consentErr = error as? ConsentError else {
+                return XCTFail("Expected ConsentError, got \(error)")
+            }
+            if case .unsafeStorage = consentErr {
+                // Expected
+            } else {
+                XCTFail("Expected unsafeStorage, got \(consentErr)")
+            }
+        }
+
+        // 4. Manager update must refuse and prevent widening
+        let updateManager777 = ConsentManager(initial: .absent, storage: store)
+        var expanded777 = initialPerms
+        expanded777.screenshot = true
+        XCTAssertThrowsError(try updateManager777.update(.granted(expanded777)))
+        XCTAssertEqual(updateManager777.current, .absent)
+
+        // 5. Existing record bytes must remain untouched
+        let validBytesAfter777 = try Data(contentsOf: fileURL)
+        XCTAssertEqual(validBytesAfter777, validBytesBefore)
+
+        // 6. Test explicit mode 0770 (group-writable, not world-writable)
+        XCTAssertEqual(Darwin.chmod(parentDir.path, mode_t(0o770)), 0)
+        XCTAssertThrowsError(try store.load())
+        XCTAssertThrowsError(try store.save(.revoked))
+
+        let (manager770, loadErr770) = ConsentManager.loadOrFailClosed(store: store)
+        XCTAssertNotNil(loadErr770)
+        XCTAssertEqual(manager770.current, .absent)
+
+        let validBytesAfter770 = try Data(contentsOf: fileURL)
+        XCTAssertEqual(validBytesAfter770, validBytesBefore)
+
+        // 7. Positive control: restoring safe owner-only mode 0700 permits load and save
+        XCTAssertEqual(Darwin.chmod(parentDir.path, mode_t(0o700)), 0)
+        let loaded = try store.load()
+        XCTAssertEqual(loaded, .granted(initialPerms))
+    }
+
+    func testSafeParentPositiveControlAndMissingParentLoadAbsent() throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("consent-parent-controls-\(UUID().uuidString.lowercased())", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        // 1. Missing parent: load returns .absent and loadOrFailClosed succeeds without error
+        let nonExistentDir = tempDir.appendingPathComponent("missing_parent_subdir", isDirectory: true)
+        let missingFileURL = nonExistentDir.appendingPathComponent("consent.json")
+        let missingStore = FileConsentStore(fileURL: missingFileURL)
+
+        let missingConsent = try missingStore.load()
+        XCTAssertEqual(missingConsent, .absent, "Load on missing parent directory must return .absent")
+
+        let (missingManager, missingErr) = ConsentManager.loadOrFailClosed(store: missingStore)
+        XCTAssertNil(missingErr, "loadOrFailClosed on missing parent must not report an error")
+        XCTAssertEqual(missingManager.current, .absent)
+
+        // 2. Newly created directory created with private mode 0700 directly
+        let perms = ConsentedPermissions(webcam: true, runningPrograms: true)
+        try missingStore.save(.granted(perms))
+
+        var dirStat = stat()
+        XCTAssertEqual(Darwin.lstat(nonExistentDir.path, &dirStat), 0)
+        XCTAssertEqual(
+            Int32(dirStat.st_mode) & 0o777,
+            0o700,
+            "Newly created parent directory must have private mode 0700"
+        )
+        XCTAssertEqual(
+            dirStat.st_uid,
+            Darwin.geteuid(),
+            "Newly created parent directory must be owned by current effective UID"
+        )
+
+        var fileStat = stat()
+        XCTAssertEqual(Darwin.lstat(missingFileURL.path, &fileStat), 0)
+        XCTAssertEqual(
+            Int32(fileStat.st_mode) & 0o777,
+            0o600,
+            "Saved consent file must have private mode 0600"
+        )
+
+        let loadedSaved = try missingStore.load()
+        XCTAssertEqual(loadedSaved, .granted(perms))
+
+        // 3. Positive control: standard safe owner directory mode 0755
+        let safe755Dir = tempDir.appendingPathComponent("safe_755_dir", isDirectory: true)
+        try FileManager.default.createDirectory(at: safe755Dir, withIntermediateDirectories: true)
+        XCTAssertEqual(Darwin.chmod(safe755Dir.path, mode_t(0o755)), 0)
+
+        let file755 = safe755Dir.appendingPathComponent("consent.json")
+        let store755 = FileConsentStore(fileURL: file755)
+        let grant755 = ConsentedPermissions(mouse: true)
+        try store755.save(.granted(grant755))
+
+        let loaded755 = try store755.load()
+        XCTAssertEqual(loaded755, .granted(grant755))
+
+        // Note: Foreign UID enforcement (st.st_uid != geteuid()) is implemented in
+        // validateParentDirectory and validateTargetFile, but cannot be executed in this unprivileged
+        // test harness without multi-user root escalation; marked unexecuted in tests.
+    }
 }

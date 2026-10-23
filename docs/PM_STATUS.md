@@ -2626,6 +2626,65 @@ Implemented deterministic isolated SQLite write-failure regressions in `clients/
 3. **Approval-Blocked Invariant**: The unresolved `tirith:archive_extract` command remains untouched.
 4. **No Full-Product Acceptance Claim**: This deliverable completes bounded macOS private consent storage hardening and test harness definitions. Native macOS compilation, ScreenCaptureKit/Quartz sensor drivers, network synchronization, and live desktop verification remain open acceptance gates.
 
+---
+
+## 32. macOS Consent Storage: Shared Immediate-Parent Policy & Non-Following Target Descriptor Read (selected-macos-consent-parent-policy-20261023)
+
+> **Execution Date:** October 23, 2026  
+> **Phase Task ID:** `selected-macos-consent-parent-policy-20261023` (correction to `selected-macos-private-consent-storage-20261023`)  
+> **Status:** Implementation Complete; Source-Verified; Native Swift Toolchain **UNAVAILABLE** on Windows Host Toolchain (All macOS Tests Honestly Unexecuted)  
+> **Target Package:** `clients/macos` (Framework: `DosiTrackerCore`, module: `System/Consent.swift`, tests: `ConsentLifecycleTests.swift`)  
+
+### A. Context & Bounded Source Correction
+1. **Identified Parent Policy Defect**:
+   - `save()` previously checked only symlink and directory file types on the parent directory, missing checks for parent UID ownership and group/world writability (`0o022`).
+   - `load()` did not inspect the immediate parent directory at all, allowing a legitimate user-owned target file located under an attacker-controlled, world-writable, or symlinked parent directory to be read as valid consent.
+   - `load()` previously read the file by path via Foundation `Data(contentsOf:)` after a separate `lstat`, introducing a path-following window rather than reading from a verified descriptor.
+
+2. **Hardened Shared Immediate-Parent & Target Read Implementation (`Consent.swift`)**:
+   - **Shared Non-Following Immediate-Parent Validator**:
+     - Introduced `validateParentDirectory(atPath:allowMissing:)` shared by `FileConsentStore.load()`, `save()`, and `exists(at:)`.
+     - Validates immediate parent path using non-following `lstat`:
+       - Rejects symbolic links (`S_IFLNK`) with `ConsentError.unsafeStorage`.
+       - Rejects non-directory types with `ConsentError.unsafeStorage`.
+       - Enforces current effective UID ownership (`st.st_uid == geteuid()`).
+       - Enforces no group or world writable permissions (`(st.st_mode & 0o022) == 0`). Safe owner modes (e.g. `0700`, `0755`, `0750`) pass; `0777` and `0770` fail.
+     - When parent is genuinely absent (`ENOENT`):
+       - `load()` returns `LocalConsent.absent` (preserving missing-file absent semantics without error).
+       - `save()` creates the directory with `attributes: [.posixPermissions: 0o700]` and then immediately re-validates the newly created directory with `validateParentDirectory(atPath: parentPath, allowMissing: false)`.
+   - **Non-Following Target Descriptor Read (`load()`)**:
+     - Pre-validates target metadata with non-following `lstat`.
+     - Opens target descriptor with `Darwin.open(path, O_RDONLY | O_NOFOLLOW)`. If `open` fails with `ENOENT`, returns `.absent`; if `ELOOP` or `EMLINK`, throws `ConsentError.unsafeStorage`.
+     - Re-validates the open file descriptor via `Darwin.fstat(fd, &st)` ensuring `S_IFREG`, `st.st_uid == geteuid()`, and `(st.st_mode & 0o022) == 0`.
+     - Reads bytes directly from the verified file descriptor using `Darwin.read` into a memory buffer before decoding JSON.
+   - **Preserved Public API & Invariants**:
+     - Public `ConsentStorage` protocol signature unchanged (`load() throws -> LocalConsent`, `save(_: LocalConsent) throws`).
+     - `ConsentManager` narrowing-before-persistence and non-widening behavior strictly preserved.
+
+3. **Isolated Production-Store Regressions (`ConsentLifecycleTests.swift`)**:
+   Added 3 focused regression tests to `ConsentLifecycleTests.swift` (17 total tests in suite; 47 across all macOS targets):
+   - `testImmediateParentSymlinkRefusalPreservesVictimConsent`: Tests that pointing `FileConsentStore` through an immediate-parent symlink causes both `load()` and `save()` to fail with `ConsentError.unsafeStorage`, `ConsentManager.loadOrFailClosed` fails closed to `.absent`, manager update expansion is blocked, and victim consent bytes in the real directory remain strictly unmodified.
+   - `testOwnerCreatedWritableParentRefusalForLoadAndSave`: Tests owner-created writable parent directory (`0777` and `0770`, avoiding root chmod denial assumptions) causes `load()` and `save()` to fail with `ConsentError.unsafeStorage`, `loadOrFailClosed` fails closed to `.absent`, manager expansion is blocked, existing consent file bytes remain untouched, and restoring safe owner mode `0700` allows positive load.
+   - `testSafeParentPositiveControlAndMissingParentLoadAbsent`: Tests that missing parent directory causes `load()` to return `.absent` and `loadOrFailClosed` succeeds with `.absent` without error; saving into missing parent creates dedicated directory with private mode `0700` and file mode `0600`; and ordinary safe owner directory mode `0755` loads and saves successfully as positive control.
+   - **Foreign UID Testing Limitation**: Documented in test and status report that testing foreign UID (`st.st_uid != geteuid()`) cannot be executed without root/multi-user privilege escalation in this test harness; verified by source inspection of `validateParentDirectory` and `validateTargetFile`.
+
+### B. Execution Status & Quality Gates
+| Target Suite | Exact Command Line | Tests Passed | Unexecuted | Result | Evidence Level |
+|---|---|:---:|:---:|:---:|---|
+| **macOS Core Consent Lifecycle Suite** | `swift test --filter ConsentLifecycleTests` | 0 | 17 (all tests unexecuted; Swift not on PATH) | **UNEXECUTED** | **[Source-Only / Blocked]** (Swift toolchain unavailable on Windows worker host; source implementation & consistency verified) |
+| **macOS Worker Consent Lifecycle Suite** | `swift test --filter WorkerConsentLifecycleTests` | 0 | 14 | **UNEXECUTED** | **[Source-Only / Blocked]** |
+| **macOS SyncPass Tests** | `swift test --filter SyncPassTests` | 0 | 16 | **UNEXECUTED** | **[Source-Only / Blocked]** |
+| **Total macOS Isolated Synthetic Tests** | (Across macOS test targets) | 0 | 47 | **UNEXECUTED** | **[Source-Only / Blocked]** |
+| **Linux Unit & Storage Regressions** | `cargo test --lib --manifest-path clients/linux/Cargo.toml` | 28 | 4 (Unix-only) | PASSED (exit 0) | **[Worker-Reported]** |
+| **Windows Client Compilation Check** | `cargo check --manifest-path clients/windows/Cargo.toml` | N/A | 0 | PASSED (exit 0) | **[Worker-Reported]** |
+
+### C. PM QA Boundary Limits & Acceptance Disclosures
+1. **Truthful macOS Invariants**: Consent persistence uses shared non-following immediate parent validation (`lstat`, `S_IFDIR`, `geteuid()`, no `0o022` writability), descriptor-backed target read (`O_RDONLY | O_NOFOLLOW` and `fstat`), exclusive creation (`O_CREAT | O_EXCL`), Darwin private modes (`0600` file, `0700` dedicated directory), collision-resistant naming, durability flushing (`fsync`), atomic replacement (`Darwin.rename`), target symlink/directory refusal, deterministic collision handling, and owned-artifact failure cleanup (`unlink`).
+2. **Host Environment Gaps**: Windows host lacks Swift and macOS toolchains; all 47 macOS tests remain **UNEXECUTED**.
+3. **Approval-Blocked Invariant**: The unresolved `tirith:archive_extract` command remains untouched.
+4. **No Full-Product Acceptance Claim**: This deliverable completes bounded macOS immediate-parent consent storage hardening and test harness definitions. Native macOS compilation, ScreenCaptureKit/Quartz sensor drivers, network synchronization, and live desktop verification remain open acceptance gates.
+
+
 
 
 
