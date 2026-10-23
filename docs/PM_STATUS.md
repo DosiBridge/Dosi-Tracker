@@ -2496,6 +2496,60 @@ Implemented deterministic isolated SQLite write-failure regressions in `clients/
 3. **Approval-Blocked Invariant**: The unresolved `tirith:archive_extract` command remains untouched.
 4. **No Full-Product Acceptance Claim**: This deliverable completes the oracle correction for SQLite trigger extended result codes. Full-product acceptance, native macOS binary notarization, and live desktop verification remain open acceptance gates.
 
+---
+
+## 30. Linux Consent Storage Hardening: Private Mode, Exclusive Temp Creation & Target Policy (selected-linux-consent-private-storage-20261023)
+
+> **Execution Date:** October 23, 2026  
+> **Phase Task ID:** `selected-linux-consent-private-storage-20261023` (continuation of `selected-macos-sqlite-oracle-20261023`)  
+> **Status:** Implementation Complete; Source-Verified; Synthetic Tests Passing on Host; Native Unix/Linux Permissions & Symlinks **UNEXECUTED** on Windows Host Toolchain  
+> **Target Package:** `clients/linux` (Package: `dosi-tracker-linux`, module: `consent`)  
+
+### A. Context & Bounded Production Hardening
+1. **Unsafe Storage Invariants Identified**:
+   - `ConsentStore::save` previously generated predictable temporary paths via `path.with_extension(format!("tmp.{}", std::process::id()))` and wrote using `fs::write`, which follows existing symbolic links and truncates their target before renaming.
+   - Newly created temporary files did not set explicit Unix private permissions (`0600`) at creation, exposing consent states to other local users if umask permitted.
+   - `ConsentStore::load` read target paths without validating file types, ownership, or permission modes, risking reading from symlinks or unsafe files.
+   - While installer path checks enforced hygiene on binary/manifest locations, the runtime consent file storage boundary lacked private exclusive guarantees.
+
+2. **Hardened Storage Implementation**:
+   - **Exclusive Creation & Private Modes**:
+     - `fs::OpenOptions::new().write(true).create_new(true)` (`O_CREAT | O_EXCL`) guarantees exclusive temporary file creation without following pre-existing symlinks or overwriting existing files.
+     - Unix mode `0600` (`S_IRUSR | S_IWUSR`) is applied at creation via `OpenOptionsExt::mode(0o600)`, eliminating exposure before `chmod`.
+     - Newly created dedicated parent directories are created with private Unix mode `0700` (`DirBuilderExt::mode(0o700)`); existing directories or broad ancestors (`/home`, `~/.config`) are never chmod'd.
+   - **Collision-Resistant Naming**:
+     - Temporary filenames are structured as `.{file_stem}.tmp.{pid}.{attempt}.{:016x}` using PID, monotonic atomic counter, timestamp, and 64-bit entropy (from `/dev/urandom` on Unix).
+     - Bounded collision handling retries up to 64 times if `ErrorKind::AlreadyExists` is encountered.
+   - **Durability & Clean Replacement**:
+     - Complete payload write is flushed (`file.flush()`) and synced (`file.sync_all()`) before dropping file descriptors and performing atomic rename via `fs::rename`.
+     - On write or rename failure, only the operation's owned temporary file artifact is removed (`fs::remove_file(&temp_path)`), preserving all unrelated files.
+   - **Conservative Target Policy**:
+     - Inspects target path with `fs::symlink_metadata` (never following symlinks).
+     - Rejects symbolic links with `ConsentError::UnsafeStorage`.
+     - Rejects non-regular files (directories, sockets, devices) with `ConsentError::UnsafeStorage`.
+     - On Unix: verifies the file belongs to current effective UID (`meta.uid() == geteuid()`) and has no group or world write permissions (`mode & 0o022 == 0`).
+     - Legacy records with safe modes (e.g. `0600`, `0644`) load without issue, while world/group-writable files fail closed to `LocalConsent::Absent`.
+     - Boundary Disclosure: Target validation checks the target file directly with `symlink_metadata`; it does not implement an `openat2(RESOLVE_NO_SYMLINKS)` ancestor-tree traversal. Multi-process concurrency relies on filesystem atomic rename (last-write-wins) without inter-process file locking.
+
+### B. Execution Status & Quality Gates
+| Target Suite | Exact Command Line | Tests Passed | Unexecuted | Result | Evidence Level |
+|---|---|:---:|:---:|:---:|---|
+| **Linux Unit & Consent Storage Suite** | `cargo test --lib --manifest-path clients/linux/Cargo.toml` | 24 | 4 (Unix-only: `0600`/`0700` modes, temp symlink sentinel, target symlink refusal, unsafe `0666` load) | PASSED (exit 0) | **[Worker-Reported (Synthetic Host Execution)]** (Windows host executed 24 cross-platform unit tests; 4 `#[cfg(unix)]` tests honestly unexecuted) |
+| **Linux Doctor CLI Tests** | `cargo test --test cli_doctor_tests --manifest-path clients/linux/Cargo.toml` | 6 | 0 | PASSED (exit 0) | **[Worker-Reported]** |
+| **Linux Consent Lifecycle Failing-Before Suite** | `cargo test --test failing_before_repro --manifest-path clients/linux/Cargo.toml` | 7 | 0 | PASSED (exit 0) | **[Worker-Reported]** |
+| **Linux Outbox Status CLI Tests** | `cargo test --test outbox_status_cli_tests --manifest-path clients/linux/Cargo.toml` | 15 | 0 | PASSED (exit 0) | **[Worker-Reported]** |
+| **Linux Outbox Tests** | `cargo test --test outbox_tests --manifest-path clients/linux/Cargo.toml` | 28 | 0 | PASSED (exit 0) | **[Worker-Reported]** |
+| **Linux Sync Tests** | `cargo test --test sync_tests --manifest-path clients/linux/Cargo.toml` | 13 | 0 | PASSED (exit 0) | **[Worker-Reported]** |
+| **Total Linux Isolated Synthetic Tests** | (Executed across lib and test crates) | 93 | 4 | PASSED (0 errors, 0 warnings, exit 0) | **[Worker-Reported]** |
+| **Windows Client Compilation Check** | `cargo check --manifest-path clients/windows/Cargo.toml` | N/A | 0 | PASSED (exit 0) | **[Worker-Reported]** |
+
+### C. PM QA Boundary Limits & Acceptance Disclosures
+1. **Truthful Storage Invariants**: Consent persistence uses exclusive creation (`create_new`), Unix private modes (`0600` file, `0700` dedicated directory), collision-resistant naming, durability flushing, target symlink/directory refusal, and owned-artifact failure cleanup.
+2. **Host Environment Gaps**: Windows host lacks native Linux kernel permissions and symlinks; 4 Unix-specific regression tests remain **UNEXECUTED** under `#[cfg(unix)]`.
+3. **Approval-Blocked Invariant**: The unresolved `tirith:archive_extract` command remains untouched.
+4. **No Full-Product Acceptance Claim**: This deliverable completes bounded Linux consent store hardening. Native Linux packaging, X11/Wayland sensor drivers, network synchronization, and live desktop verification remain open acceptance gates.
+
+
 
 
 

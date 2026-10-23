@@ -130,6 +130,7 @@ pub enum ConsentError {
     IoError(String),
     MalformedJson(String),
     SaveFailed(String),
+    UnsafeStorage(String),
 }
 
 impl std::fmt::Display for ConsentError {
@@ -138,22 +139,104 @@ impl std::fmt::Display for ConsentError {
             ConsentError::IoError(s) => write!(f, "Consent I/O error: {}", s),
             ConsentError::MalformedJson(s) => write!(f, "Malformed consent JSON: {}", s),
             ConsentError::SaveFailed(s) => write!(f, "Consent save failed: {}", s),
+            ConsentError::UnsafeStorage(s) => write!(f, "Unsafe consent storage: {}", s),
         }
     }
 }
 
 impl std::error::Error for ConsentError {}
 
-/// File-backed consent store.
+#[cfg(unix)]
+extern "C" {
+    fn geteuid() -> u32;
+}
+
+static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn generate_nonce() -> u64 {
+    #[cfg(unix)]
+    {
+        if let Ok(mut f) = fs::File::open("/dev/urandom") {
+            use std::io::Read;
+            let mut buf = [0u8; 8];
+            if f.read_exact(&mut buf).is_ok() {
+                return u64::from_ne_bytes(buf);
+            }
+        }
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id() as u64;
+    let counter = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let addr = &counter as *const _ as usize as u64;
+    (ts as u64) ^ (pid << 32) ^ (counter << 16) ^ addr
+}
+
+fn validate_target_file(path: &Path) -> Result<(), ConsentError> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(ConsentError::UnsafeStorage(format!(
+                    "Target path {} is a symbolic link",
+                    path.display()
+                )));
+            }
+            if !meta.file_type().is_file() {
+                return Err(ConsentError::UnsafeStorage(format!(
+                    "Target path {} is not a regular file",
+                    path.display()
+                )));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                use std::os::unix::fs::PermissionsExt;
+                let current_uid = unsafe { geteuid() };
+                if meta.uid() != current_uid {
+                    return Err(ConsentError::UnsafeStorage(format!(
+                        "Target path {} is owned by UID {}, expected current UID {}",
+                        path.display(),
+                        meta.uid(),
+                        current_uid
+                    )));
+                }
+                let mode = meta.permissions().mode();
+                if (mode & 0o022) != 0 {
+                    return Err(ConsentError::UnsafeStorage(format!(
+                        "Target path {} has unsafe permissions {:o} (group or world writable)",
+                        path.display(),
+                        mode & 0o777
+                    )));
+                }
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(ConsentError::IoError(format!(
+            "Failed inspecting metadata for {}: {}",
+            path.display(),
+            e
+        ))),
+    }
+}
+
+/// File-backed consent store with private, exclusive atomic persistence.
 pub struct ConsentStore;
 
 impl ConsentStore {
     /// Load persisted consent from file.
-    /// Invariant:
+    /// Invariants:
     /// - If file does not exist, returns `Ok(LocalConsent::Absent)`.
+    /// - Target path is inspected with `symlink_metadata` (never following symlinks).
+    ///   Rejects symlinks, directories, non-regular files, and (on Unix) files with
+    ///   foreign UID or group/world-writable bits.
     /// - If file exists but is corrupted/malformed, returns `Err(ConsentError::MalformedJson)`
     ///   so caller fails closed.
     pub fn load(path: &Path) -> Result<LocalConsent, ConsentError> {
+        validate_target_file(path)?;
+
         if !path.exists() {
             return Ok(LocalConsent::Absent);
         }
@@ -166,45 +249,149 @@ impl ConsentStore {
     }
 
     /// Save consent state atomically to file.
-    /// Writes to `<path>.tmp` first, then atomically renames to `<path>`.
+    /// Invariants:
+    /// - Inspects target file if present: refuses symlinks, directories, or unsafe permissions.
+    /// - Newly created parent directories are given private Unix mode 0700; existing ancestors are never modified.
+    /// - Creates a fresh, collision-resistant temporary file exclusively (`create_new(true)`) with Unix mode 0600
+    ///   directly at creation (no chmod after exposure).
+    /// - Does not follow pre-existing temporary symlinks or overwrite unrelated temporary files.
+    /// - Flushes and syncs data to disk before atomic replacement via `fs::rename`.
+    /// - On failure, removes ONLY the operation's owned temporary file artifact.
     pub fn save(path: &Path, consent: &LocalConsent) -> Result<(), ConsentError> {
         let parent = path.parent().ok_or_else(|| {
             ConsentError::SaveFailed("Target path has no parent directory".into())
         })?;
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+
+        if let Ok(meta) = fs::symlink_metadata(parent) {
+            if meta.file_type().is_symlink() {
+                return Err(ConsentError::SaveFailed(format!(
+                    "Parent directory {} is a symbolic link",
+                    parent.display()
+                )));
+            }
+            if !meta.file_type().is_dir() {
+                return Err(ConsentError::SaveFailed(format!(
+                    "Parent path {} is not a directory",
+                    parent.display()
+                )));
+            }
+        }
 
         if !parent.exists() {
-            fs::create_dir_all(parent).map_err(|e| {
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            builder.create(parent).map_err(|e| {
                 ConsentError::SaveFailed(format!("Cannot create dir {}: {}", parent.display(), e))
             })?;
         }
 
+        validate_target_file(path)?;
+
         let json = serde_json::to_string_pretty(consent)
             .map_err(|e| ConsentError::SaveFailed(e.to_string()))?;
 
-        let tmp_path = path.with_extension(format!("tmp.{}", std::process::id()));
-        fs::write(&tmp_path, json.as_bytes()).map_err(|e| {
-            ConsentError::SaveFailed(format!(
-                "Failed writing temp file {}: {}",
-                tmp_path.display(),
-                e
-            ))
-        })?;
+        let file_stem = path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("consent");
 
-        fs::rename(&tmp_path, path).map_err(|e| {
-            let _ = fs::remove_file(&tmp_path);
-            ConsentError::SaveFailed(format!(
-                "Failed renaming {} to {}: {}",
-                tmp_path.display(),
-                path.display(),
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+
+        const MAX_TEMP_RETRIES: usize = 64;
+        let mut temp_file = None;
+        let mut owned_temp_path = None;
+
+        for attempt in 0..MAX_TEMP_RETRIES {
+            let nonce = generate_nonce();
+            let temp_name = format!(
+                ".{}.tmp.{}.{}.{:016x}",
+                file_stem,
+                std::process::id(),
+                attempt,
+                nonce
+            );
+            let candidate = parent.join(temp_name);
+            match options.open(&candidate) {
+                Ok(f) => {
+                    temp_file = Some(f);
+                    owned_temp_path = Some(candidate);
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    continue;
+                }
+                Err(e) => {
+                    return Err(ConsentError::SaveFailed(format!(
+                        "Failed opening exclusive temporary file {}: {}",
+                        candidate.display(),
+                        e
+                    )));
+                }
+            }
+        }
+
+        let (mut file, temp_path) = match (temp_file, owned_temp_path) {
+            (Some(f), Some(p)) => (f, p),
+            _ => {
+                return Err(ConsentError::SaveFailed(
+                    "Exceeded maximum collision retries creating temporary consent file".into(),
+                ));
+            }
+        };
+
+        let write_result = (|| -> Result<(), std::io::Error> {
+            use std::io::Write;
+            file.write_all(json.as_bytes())?;
+            file.flush()?;
+            file.sync_all()?;
+            drop(file);
+            Ok(())
+        })();
+
+        if let Err(e) = write_result {
+            let _ = fs::remove_file(&temp_path);
+            return Err(ConsentError::SaveFailed(format!(
+                "Failed writing temporary consent file {}: {}",
+                temp_path.display(),
                 e
-            ))
-        })?;
+            )));
+        }
+
+        if let Err(e) = fs::rename(&temp_path, path) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(ConsentError::SaveFailed(format!(
+                "Failed atomically replacing consent file {} with {}: {}",
+                path.display(),
+                temp_path.display(),
+                e
+            )));
+        }
 
         Ok(())
     }
-    /// Check if target file exists.
+
+    /// Check if target file exists and is a regular, non-symlink file.
     pub fn exists(path: &Path) -> bool {
-        path.is_file()
+        match fs::symlink_metadata(path) {
+            Ok(meta) => !meta.file_type().is_symlink() && meta.file_type().is_file(),
+            Err(_) => false,
+        }
     }
 }
 
@@ -567,18 +754,250 @@ mod tests {
     }
 
     #[test]
-    fn atomic_save_and_load_round_trip() {
+    fn test_consent_store_positive_roundtrip() {
         let temp = tempfile::tempdir().unwrap();
-        let consent_file = temp.path().join("sub").join("consent.json");
+        let file = temp.path().join("dedicated_dir").join("consent.json");
 
         let mut perms = ConsentedPermissions::all_disabled();
         perms.keyboard = true;
         perms.mouse = true;
+        let initial = LocalConsent::Granted(perms);
 
-        ConsentStore::save(&consent_file, &LocalConsent::Granted(perms)).unwrap();
-        assert!(consent_file.is_file());
+        let store = FileConsentStore::new(file.clone());
+        assert!(!ConsentStore::exists(&file));
 
-        let loaded = ConsentStore::load(&consent_file).unwrap();
+        store.save(&initial).expect("save should succeed");
+        assert!(ConsentStore::exists(&file));
+
+        let loaded = store.load().expect("load should succeed");
+        assert_eq!(loaded, initial);
+
+        let revoked = LocalConsent::Revoked;
+        store.save(&revoked).expect("save revoked should succeed");
+        let loaded_revoked = store.load().expect("load revoked should succeed");
+        assert_eq!(loaded_revoked, revoked);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_private_file_and_new_directory_modes_on_unix() {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let sub = temp.path().join("private_consent_dir");
+        let file = sub.join("consent.json");
+
+        let perms = ConsentedPermissions::all_disabled();
+        ConsentStore::save(&file, &LocalConsent::Granted(perms)).unwrap();
+
+        let dir_meta = fs::symlink_metadata(&sub).unwrap();
+        assert_eq!(
+            dir_meta.permissions().mode() & 0o777,
+            0o700,
+            "Newly created dedicated directory must have private mode 0700"
+        );
+
+        let file_meta = fs::symlink_metadata(&file).unwrap();
+        assert_eq!(
+            file_meta.permissions().mode() & 0o777,
+            0o600,
+            "Saved consent file must have private mode 0600 directly at creation"
+        );
+
+        let current_uid = unsafe { geteuid() };
+        assert_eq!(
+            file_meta.uid(),
+            current_uid,
+            "Saved consent file must be owned by current UID"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_precreated_predictable_temp_symlink_plus_sentinel_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let sentinel_path = temp.path().join("victim_sentinel.txt");
+        fs::write(&sentinel_path, b"CONFIDENTIAL_SENTINEL_CONTENT").unwrap();
+
+        let consent_path = temp.path().join("consent.json");
+
+        // Old predictable temp file format: path.with_extension("tmp.<PID>")
+        let old_predictable_tmp = consent_path.with_extension(format!("tmp.{}", std::process::id()));
+        std::os::unix::fs::symlink(&sentinel_path, &old_predictable_tmp).unwrap();
+
+        // Also pre-create symlink matching dot-stem pattern if an attacker guessed it
+        let candidate_symlink = temp
+            .path()
+            .join(format!(".consent.json.tmp.{}.0.0000000000000000", std::process::id()));
+        std::os::unix::fs::symlink(&sentinel_path, &candidate_symlink).unwrap();
+
+        let mut perms = ConsentedPermissions::all_disabled();
+        perms.keyboard = true;
+
+        ConsentStore::save(&consent_path, &LocalConsent::Granted(perms))
+            .expect("Save should succeed using fresh exclusive temp file");
+
+        let sentinel_content = fs::read_to_string(&sentinel_path).unwrap();
+        assert_eq!(
+            sentinel_content, "CONFIDENTIAL_SENTINEL_CONTENT",
+            "Sentinel file MUST NOT be truncated or overwritten via precreated symlinks"
+        );
+
+        assert!(fs::symlink_metadata(&old_predictable_tmp)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        let loaded = ConsentStore::load(&consent_path).unwrap();
         assert_eq!(loaded, LocalConsent::Granted(perms));
+    }
+
+    #[test]
+    fn test_target_directory_refusal() {
+        let temp = tempfile::tempdir().unwrap();
+        let target_dir = temp.path().join("blocker_directory.json");
+        fs::create_dir_all(&target_dir).unwrap();
+
+        let load_err = ConsentStore::load(&target_dir).unwrap_err();
+        assert!(
+            matches!(load_err, ConsentError::UnsafeStorage(_)),
+            "Directory load must fail with UnsafeStorage"
+        );
+
+        let save_err = ConsentStore::save(&target_dir, &LocalConsent::Absent).unwrap_err();
+        assert!(
+            matches!(save_err, ConsentError::UnsafeStorage(_)),
+            "Directory save must fail with UnsafeStorage"
+        );
+
+        assert!(target_dir.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_target_symlink_refusal_under_policy() {
+        let temp = tempfile::tempdir().unwrap();
+        let legitimate_target = temp.path().join("real_consent.json");
+        fs::write(&legitimate_target, b"\"Absent\"").unwrap();
+
+        let symlink_path = temp.path().join("symlink_consent.json");
+        std::os::unix::fs::symlink(&legitimate_target, &symlink_path).unwrap();
+
+        let load_res = ConsentStore::load(&symlink_path);
+        assert!(
+            matches!(load_res, Err(ConsentError::UnsafeStorage(_))),
+            "load must refuse symlink target"
+        );
+
+        let mut perms = ConsentedPermissions::all_disabled();
+        perms.screenshot = true;
+        let save_res = ConsentStore::save(&symlink_path, &LocalConsent::Granted(perms));
+        assert!(
+            matches!(save_res, Err(ConsentError::UnsafeStorage(_))),
+            "save must refuse symlink target"
+        );
+
+        let content = fs::read_to_string(&legitimate_target).unwrap();
+        assert_eq!(content, "\"Absent\"");
+    }
+
+    #[test]
+    fn test_exclusive_temp_collision_and_unrelated_artifact_preservation() {
+        let temp = tempfile::tempdir().unwrap();
+        let consent_path = temp.path().join("consent.json");
+
+        let unrelated_file = temp.path().join("unrelated_data.bin");
+        fs::write(&unrelated_file, b"UNRELATED_DO_NOT_DELETE").unwrap();
+
+        let unrelated_tmp = temp.path().join(".consent.json.tmp.other_worker");
+        fs::write(&unrelated_tmp, b"OTHER_WORKER_ARTIFACT").unwrap();
+
+        let mut perms = ConsentedPermissions::all_disabled();
+        perms.mouse = true;
+        ConsentStore::save(&consent_path, &LocalConsent::Granted(perms)).unwrap();
+
+        assert_eq!(
+            fs::read(&unrelated_file).unwrap(),
+            b"UNRELATED_DO_NOT_DELETE",
+            "Unrelated file must not be modified or deleted"
+        );
+        assert_eq!(
+            fs::read(&unrelated_tmp).unwrap(),
+            b"OTHER_WORKER_ARTIFACT",
+            "Unrelated temp file must not be modified or deleted"
+        );
+
+        assert_eq!(
+            ConsentStore::load(&consent_path).unwrap(),
+            LocalConsent::Granted(perms)
+        );
+    }
+
+    #[test]
+    fn test_failed_save_retaining_previous_valid_record_and_manager_not_widening() {
+        let temp = tempfile::tempdir().unwrap();
+        let consent_file = temp.path().join("consent.json");
+
+        let mut initial = ConsentedPermissions::all_disabled();
+        initial.keyboard = true;
+        ConsentStore::save(&consent_file, &LocalConsent::Granted(initial)).unwrap();
+
+        let store = std::sync::Arc::new(FileConsentStore::new(consent_file.clone()));
+        let mut manager = ConsentManager::with_storage(LocalConsent::Granted(initial), Some(store));
+        assert_eq!(manager.current().permissions().keyboard, true);
+
+        // Replace consent_file with an unsafe directory so subsequent disk saves fail validation
+        fs::remove_file(&consent_file).unwrap();
+        fs::create_dir_all(&consent_file).unwrap();
+
+        let mut expanded = initial;
+        expanded.screenshot = true;
+
+        let res = manager.update(LocalConsent::Granted(expanded));
+        assert!(
+            res.is_err(),
+            "Save should fail because target path is an unsafe directory"
+        );
+
+        assert!(
+            !manager.current().permissions().screenshot,
+            "Newly widened permission (screenshot) must NOT be admitted when disk save fails"
+        );
+        assert_eq!(
+            manager.current().permissions().keyboard,
+            true,
+            "Previously consented permission (keyboard) remains intact"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_unsafe_permissions_load_fails_closed_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let consent_file = temp.path().join("unsafe_mode.json");
+
+        let mut perms = ConsentedPermissions::all_disabled();
+        perms.screenshot = true;
+        let json = serde_json::to_string_pretty(&LocalConsent::Granted(perms)).unwrap();
+        fs::write(&consent_file, json.as_bytes()).unwrap();
+
+        fs::set_permissions(&consent_file, PermissionsExt::from_mode(0o666)).unwrap();
+
+        let load_err = ConsentStore::load(&consent_file).unwrap_err();
+        assert!(
+            matches!(load_err, ConsentError::UnsafeStorage(_)),
+            "Load must fail with UnsafeStorage for group/world-writable file"
+        );
+
+        let (manager, err) = ConsentManager::load_or_fail_closed(&consent_file);
+        assert!(err.is_some());
+        assert_eq!(
+            manager.current(),
+            LocalConsent::Absent,
+            "ConsentManager must fail closed to Absent on unsafe file permissions"
+        );
     }
 }
