@@ -1089,4 +1089,431 @@ describe("Project Tasks Section", () => {
     expect(screen.queryByText("New Open Task")).not.toBeInTheDocument();
     expect(screen.getAllByRole("listitem")).toHaveLength(10);
   });
+
+  it("pending toggle mutation settlement after filter change does not overwrite current query results", async () => {
+    let resolvePut: ((res: Response) => void) | null = null;
+
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+
+      if (url.includes("/api/app/project-task")) {
+        if (method === "PUT") {
+          return new Promise<Response>((resolve) => {
+            resolvePut = resolve;
+          });
+        }
+        if (method === "GET") {
+          // Completed tab query
+          if (url.includes("IsCompleted=true")) {
+            return json({
+              items: [{ id: "completed-1", title: "Completed Task 1", isCompleted: true }],
+              totalCount: 1,
+            });
+          }
+          // Obsolete refresh query (all tasks, without IsCompleted)
+          if (!url.includes("IsCompleted=")) {
+            return json({
+              items: [
+                { id: "t1", title: "Initial Open Task", isCompleted: true },
+                { id: "t2", title: "Other Open Task", isCompleted: false },
+              ],
+              totalCount: 2,
+            });
+          }
+        }
+      }
+      return json({ items: [], totalCount: 0 });
+    });
+
+    // Provide initial state with t1 as open
+    fetchMock.mockImplementationOnce(async () => {
+      return json({
+        items: [
+          { id: "t1", title: "Initial Open Task", isCompleted: false },
+          { id: "t2", title: "Other Open Task", isCompleted: false },
+        ],
+        totalCount: 2,
+      });
+    });
+
+    const user = userEvent.setup();
+    render(
+      <ProjectTasksSection
+        projectId={PROJECT_A}
+        workspaceId={WORKSPACE_ID}
+        projectArchived={false}
+        isLive={true}
+        canMutate={true}
+      />
+    );
+
+    // Initial load displays the task
+    expect(await screen.findByText("Initial Open Task")).toBeInTheDocument();
+    expect(screen.getByText("2 tasks")).toBeInTheDocument();
+
+    // Click toggle on t1 to complete it: PUT is dispatched and HELD by barrier
+    const toggleBtn = screen.getByRole("button", { name: /mark "initial open task" as completed/i });
+    await user.click(toggleBtn);
+
+    expect(resolvePut).not.toBeNull();
+
+    // While PUT is STILL PENDING, user clicks the "Completed" tab
+    const completedTab = screen.getByRole("tab", { name: "Completed" });
+    await user.click(completedTab);
+
+    // The current query establishes results for Completed tab
+    expect(await screen.findByText("Completed Task 1")).toBeInTheDocument();
+    expect(screen.getByText("1 task")).toBeInTheDocument();
+    expect(screen.queryByText("Other Open Task")).not.toBeInTheDocument();
+
+    // Now release the held PUT write settlement
+    (resolvePut as unknown as (res: Response) => void)(
+      json({
+        id: "t1",
+        projectId: PROJECT_A,
+        title: "Initial Open Task",
+        isCompleted: true,
+      })
+    );
+
+    // Give time for any microtasks/promises to settle
+    await waitFor(() => {
+      // Completed tab results must NOT be overwritten by the obsolete refresh
+      expect(screen.getByText("Completed Task 1")).toBeInTheDocument();
+    });
+
+    // The other open task from the obsolete "all" query must NOT appear in Completed tab!
+    expect(screen.queryByText("Other Open Task")).not.toBeInTheDocument();
+    // Total count must remain 1 task, not 2 tasks!
+    expect(screen.getByText("1 task")).toBeInTheDocument();
+  });
+
+  it("toggling completion on open filter removes task from view and decrements count when refresh fails", async () => {
+    let backgroundRefreshFailed = false;
+
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+
+      if (url.includes("/api/app/project-task")) {
+        if (method === "GET") {
+          // If background refresh after PUT
+          if (backgroundRefreshFailed) {
+            return json({ message: "Server error" }, 500);
+          }
+          if (url.includes("IsCompleted=false")) {
+            return json({
+              items: [{ id: "open-1", title: "Open Work Item", isCompleted: false }],
+              totalCount: 1,
+            });
+          }
+          // initial load on "all"
+          return json({
+            items: [{ id: "open-1", title: "Open Work Item", isCompleted: false }],
+            totalCount: 1,
+          });
+        }
+        if (method === "PUT") {
+          backgroundRefreshFailed = true;
+          return json({
+            id: "open-1",
+            projectId: PROJECT_A,
+            title: "Open Work Item",
+            isCompleted: true, // Now completed!
+          });
+        }
+      }
+      return json({ items: [], totalCount: 0 });
+    });
+
+    const user = userEvent.setup();
+    render(
+      <ProjectTasksSection
+        projectId={PROJECT_A}
+        workspaceId={WORKSPACE_ID}
+        projectArchived={false}
+        isLive={true}
+        canMutate={true}
+      />
+    );
+
+    // Switch to Open filter
+    const openTab = await screen.findByRole("tab", { name: "Open" });
+    await user.click(openTab);
+
+    expect(await screen.findByText("Open Work Item")).toBeInTheDocument();
+    expect(screen.getByText("1 task")).toBeInTheDocument();
+
+    // Toggle complete
+    const toggleBtn = screen.getByRole("button", { name: /mark "open work item" as completed/i });
+    await user.click(toggleBtn);
+
+    // Refresh fails -> alert banner shown
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(/couldn't refresh/i);
+
+    // The completed item MUST NOT remain visible in the Open filter list!
+    expect(screen.queryByText("Open Work Item")).not.toBeInTheDocument();
+    // Count should be decremented to 0
+    expect(screen.getByText("0 tasks")).toBeInTheDocument();
+  });
+
+  it("pending create mutation settlement after filter change does not contaminate new filter", async () => {
+    let resolveCreate: ((res: Response) => void) | null = null;
+
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+
+      if (url.includes("/api/app/project-task")) {
+        if (method === "POST") {
+          return new Promise<Response>((resolve) => {
+            resolveCreate = resolve;
+          });
+        }
+        if (method === "GET") {
+          if (url.includes("IsCompleted=true")) {
+            return json({
+              items: [{ id: "comp-1", title: "Existing Completed", isCompleted: true }],
+              totalCount: 1,
+            });
+          }
+          if (url.includes("IsCompleted=false")) {
+            return json({
+              items: [{ id: "open-1", title: "Existing Open", isCompleted: false }],
+              totalCount: 1,
+            });
+          }
+        }
+      }
+      return json({ items: [], totalCount: 0 });
+    });
+
+    const user = userEvent.setup();
+    render(
+      <ProjectTasksSection
+        projectId={PROJECT_A}
+        workspaceId={WORKSPACE_ID}
+        projectArchived={false}
+        isLive={true}
+        canMutate={true}
+      />
+    );
+
+    // Switch to Open filter
+    const openTab = await screen.findByRole("tab", { name: "Open" });
+    await user.click(openTab);
+    expect(await screen.findByText("Existing Open")).toBeInTheDocument();
+
+    // Click Add Task and submit
+    const addBtn = screen.getByRole("button", { name: /add task/i });
+    await user.click(addBtn);
+    await user.type(screen.getByLabelText(/^title/i), "Orphaned Create Task");
+    await user.click(screen.getByRole("button", { name: /save task/i }));
+
+    expect(resolveCreate).not.toBeNull();
+
+    // While POST is STILL PENDING, user clicks the "Completed" tab
+    const completedTab = screen.getByRole("tab", { name: "Completed" });
+    await user.click(completedTab);
+
+    // Establish Completed tab results
+    expect(await screen.findByText("Existing Completed")).toBeInTheDocument();
+    expect(screen.getByText("1 task")).toBeInTheDocument();
+
+    // Release held POST
+    (resolveCreate as unknown as (res: Response) => void)(
+      json({
+        id: "created-new",
+        projectId: PROJECT_A,
+        title: "Orphaned Create Task",
+        isCompleted: false,
+      })
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("Existing Completed")).toBeInTheDocument();
+    });
+
+    // Orphaned Create Task must NOT be added to Completed tab!
+    expect(screen.queryByText("Orphaned Create Task")).not.toBeInTheDocument();
+    expect(screen.getByText("1 task")).toBeInTheDocument();
+  });
+
+  it("page transition while toggle mutation is pending does not overwrite current page items", async () => {
+    let resolvePut: ((res: Response) => void) | null = null;
+
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+
+      if (url.includes("/api/app/project-task")) {
+        if (method === "PUT") {
+          return new Promise<Response>((resolve) => {
+            resolvePut = resolve;
+          });
+        }
+        if (method === "GET") {
+          const skipCount = Number(new URL(url, "https://localhost").searchParams.get("SkipCount") || "0");
+          if (skipCount === 0) {
+            return json({
+              items: Array.from({ length: 10 }, (_, i) => ({
+                id: `p0-${i}`,
+                title: `Page 0 Item ${i + 1}`,
+                isCompleted: false,
+              })),
+              totalCount: 15,
+            });
+          }
+          if (skipCount === 10) {
+            return json({
+              items: Array.from({ length: 5 }, (_, i) => ({
+                id: `p1-${i}`,
+                title: `Page 1 Item ${i + 1}`,
+                isCompleted: false,
+              })),
+              totalCount: 15,
+            });
+          }
+        }
+      }
+      return json({ items: [], totalCount: 0 });
+    });
+
+    const user = userEvent.setup();
+    render(
+      <ProjectTasksSection
+        projectId={PROJECT_A}
+        workspaceId={WORKSPACE_ID}
+        projectArchived={false}
+        isLive={true}
+        canMutate={true}
+      />
+    );
+
+    expect(await screen.findByText("Page 0 Item 1")).toBeInTheDocument();
+    expect(screen.getByText("Page 1 of 2")).toBeInTheDocument();
+
+    // Toggle item on Page 0: PUT dispatched and held
+    const toggleBtn = screen.getByRole("button", { name: /mark "page 0 item 1" as completed/i });
+    await user.click(toggleBtn);
+    expect(resolvePut).not.toBeNull();
+
+    // While PUT is pending, user clicks Next button to navigate to Page 1
+    const nextBtn = screen.getByRole("button", { name: /next/i });
+    await user.click(nextBtn);
+
+    // Page 1 items established
+    expect(await screen.findByText("Page 1 Item 1")).toBeInTheDocument();
+    expect(screen.getByText("Page 2 of 2")).toBeInTheDocument();
+    expect(screen.queryByText("Page 0 Item 1")).not.toBeInTheDocument();
+
+    // Release held PUT from Page 0
+    (resolvePut as unknown as (res: Response) => void)(
+      json({
+        id: "p0-0",
+        projectId: PROJECT_A,
+        title: "Page 0 Item 1",
+        isCompleted: true,
+      })
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("Page 1 Item 1")).toBeInTheDocument();
+    });
+
+    // Page 1 must not be overwritten by Page 0 items
+    expect(screen.queryByText("Page 0 Item 1")).not.toBeInTheDocument();
+    expect(screen.getByText("Page 2 of 2")).toBeInTheDocument();
+  });
+
+  it("query ABA transition (All -> Open -> All) rejects delayed old mutation settlement", async () => {
+    let resolvePut1: ((res: Response) => void) | null = null;
+    let allQueryCount = 0;
+
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+
+      if (url.includes("/api/app/project-task")) {
+        if (method === "PUT") {
+          return new Promise<Response>((resolve) => {
+            resolvePut1 = resolve;
+          });
+        }
+        if (method === "GET") {
+          if (url.includes("IsCompleted=false")) {
+            return json({
+              items: [{ id: "open-only", title: "Open Only Task", isCompleted: false }],
+              totalCount: 1,
+            });
+          }
+          if (!url.includes("IsCompleted=")) {
+            allQueryCount++;
+            if (allQueryCount === 1) {
+              return json({
+                items: [{ id: "t1", title: "Initial Query 1 Item", isCompleted: false }],
+                totalCount: 1,
+              });
+            }
+            // Second time visiting "All" (Query 3 in ABA)
+            return json({
+              items: [{ id: "t3", title: "Fresh Query 3 Item", isCompleted: false }],
+              totalCount: 1,
+            });
+          }
+        }
+      }
+      return json({ items: [], totalCount: 0 });
+    });
+
+    const user = userEvent.setup();
+    render(
+      <ProjectTasksSection
+        projectId={PROJECT_A}
+        workspaceId={WORKSPACE_ID}
+        projectArchived={false}
+        isLive={true}
+        canMutate={true}
+      />
+    );
+
+    // Initial load for All (Query 1)
+    expect(await screen.findByText("Initial Query 1 Item")).toBeInTheDocument();
+
+    // Toggle on Query 1: PUT held by barrier
+    const toggleBtn = screen.getByRole("button", { name: /mark "initial query 1 item" as completed/i });
+    await user.click(toggleBtn);
+    expect(resolvePut1).not.toBeNull();
+
+    // Switch to Open (Query 2 in ABA)
+    const openTab = screen.getByRole("tab", { name: "Open" });
+    await user.click(openTab);
+    expect(await screen.findByText("Open Only Task")).toBeInTheDocument();
+
+    // Switch back to All (Query 3 in ABA)
+    const allTab = screen.getByRole("tab", { name: "All" });
+    await user.click(allTab);
+    expect(await screen.findByText("Fresh Query 3 Item")).toBeInTheDocument();
+
+    // Now release held PUT from Query 1
+    (resolvePut1 as unknown as (res: Response) => void)(
+      json({
+        id: "t1",
+        projectId: PROJECT_A,
+        title: "Initial Query 1 Item",
+        isCompleted: true,
+      })
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("Fresh Query 3 Item")).toBeInTheDocument();
+    });
+
+    // Query 3 items must remain active; Query 1 obsolete refresh must not overwrite
+    expect(screen.queryByText("Initial Query 1 Item")).not.toBeInTheDocument();
+    expect(screen.getByText("Fresh Query 3 Item")).toBeInTheDocument();
+  });
 });
+

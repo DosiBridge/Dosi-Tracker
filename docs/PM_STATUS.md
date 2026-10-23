@@ -2758,11 +2758,11 @@ Implemented deterministic isolated SQLite write-failure regressions in `clients/
 
 ---
 
-## 34. Frontend Project Task Lifecycle UI Integration & Async Scope Publication Correction (`REQ-PRJ-01`, `selected-project-task-ui-20261023` / `selected-project-task-scope-correction-20261023`)
+## 34. Frontend Project Task Lifecycle UI Integration, Async Scope & Query Ordering Correction (`REQ-PRJ-01`, `selected-project-task-ui-20261023` / `selected-project-task-scope-correction-20261023` / `selected-project-task-query-order-correction-20261023`)
 
 > **Execution Date:** October 24, 2026  
-> **Phase Task ID:** `selected-project-task-ui-20261023` / `selected-project-task-scope-correction-20261023` (bounded `REQ-PRJ-01` frontend project-detail task lifecycle integration and asynchronous scope publication correction)  
-> **Status:** Implementation Complete; All 182 Focused Vitest Tests Across 10 Suites Passed (Exit Code 0); Typecheck Clean (Exit Code 0); ESLint 0 Errors (Exit Code 0)  
+> **Phase Task ID:** `selected-project-task-ui-20261023` / `selected-project-task-scope-correction-20261023` / `selected-project-task-query-order-correction-20261023` (bounded `REQ-PRJ-01` frontend project-detail task lifecycle integration, asynchronous scope publication and query ordering correction)  
+> **Status:** Implementation Complete; All 187 Focused Vitest Tests Across 10 Suites Passed (Exit Code 0); Typecheck Clean (Exit Code 0); ESLint 0 Errors (Exit Code 0)  
 > **Target Package:** `frontend` (`src/app/(dashboard)/projects/[id]/page.tsx`, `src/components/projects/project-tasks.tsx`, `src/hooks/useApi.ts`, `src/lib/api-contract.ts`, `src/lib/api-contract.test.ts`, `src/test/api-contract.json`, `src/test/pages/project-tasks.test.tsx`, `src/app/(dashboard)/projects/projects-pages.test.tsx`)
 
 ### A. Context & Bounded Source Implementation
@@ -2802,10 +2802,17 @@ Implemented deterministic isolated SQLite write-failure regressions in `clients/
    - **Honest Completion Filter Counts & Bounded Optimistic Insertion**: Creating an open task increments `totalCount` only when viewing `all` or `open` filters (`if (thisFilter === "all" || thisFilter === "open") setTotalCount((c) => c + 1)`), preventing count inflation when viewing `completed`. Optimistic first-page insertion is strictly bounded to page size: `[created, ...prev].slice(0, PAGE_SIZE)`.
    - **Duplicate Submission Guard**: `TaskFormModal` enforces `if (submitting) return;` and unmount cleanup (`isMountedRef`) preventing double submits or post-unmount publication.
 
+6. **Mutation & Query Ordering Protection (`selected-project-task-query-order-correction-20261023`)**:
+   - **Source Defect**: In `handleToggleComplete`, `create onSubmit`, and `edit onSubmit`, `thisFilter` and `thisPage` were captured before awaiting the asynchronous PUT/POST. If the user switched filter tabs or navigated pages while the write was pending, the late write return checked only `scopeGen`, claimed `activeListRequestRef` with a newly incremented request ID, and issued a background refresh for the OLD `thisFilter`/`thisPage`. That obsolete refresh arrived and published old-query tasks/counts into the newly selected filter/page view.
+   - **Reactive Query Generation (`queryGen`)**: Formulates composite `currentQueryKey = ${scopeKey}:${filter}:${page}`. Tracks `queryGen` state incremented during render whenever `prevQueryKey !== currentQueryKey`, synced outside render via `useEffect` to `queryGenRef.current`.
+   - **Obsolete Query Publication Suppression**: Mutations capture `thisQueryGen = queryGen` at dispatch. Upon write return, if `queryGenRef.current !== thisQueryGen`, publication of obsolete-query tasks, total counts, refresh warnings, and background GET reloads is strictly suppressed, while preserving honest successful-write reporting (`toast({ title: ..., tone: "success" })`) and clearing busy tracking (`setBusyTaskId(null)`).
+   - **Filtered Local Reconciliation on Completion Toggle**: When a task is toggled on `filter === "open"` (becoming completed) or `filter === "completed"` (becoming open), local optimistic reconciliation filters the task out of the active view (`prev.filter((t) => t.id !== updated.id)`) and decrements `totalCount` (`Math.max(0, c - 1)`). If the post-mutation refresh fails, the non-matching item does not linger in the filtered view.
+   - **Deterministic Regression Coverage**: 5 new tests with deferred write barriers verify toggle settlement after filter change, completion filter reconciliation on refresh failure, create settlement after filter change, page transition during toggle, and query ABA transitions (All -> Open -> All). Genuine production failing-before demonstrated with exit code 1, followed by clean passing-after exit code 0.
+
 ### B. Execution Status & Quality Gates
 | Target Suite | Exact Command Line | Tests Passed | Failed | Result | Evidence Level |
 |---|---|:---:|:---:|:---:|---|
-| **Project Tasks Component Suite** | `npx vitest run src/test/pages/project-tasks.test.tsx` | 18 | 0 | PASSED (exit 0) | **[Worker-Reported (Vitest / JSDOM)]** |
+| **Project Tasks Component Suite** | `npx vitest run src/test/pages/project-tasks.test.tsx` | 23 | 0 | PASSED (exit 0) | **[Worker-Reported (Vitest / JSDOM)]** |
 | **Projects Pages Suite** | `npx vitest run "src/app/(dashboard)/projects/projects-pages.test.tsx"` | 10 | 0 | PASSED (exit 0) | **[Worker-Reported (Vitest / JSDOM)]** |
 | **API Contract Pure Route Suite** | `npx vitest run src/lib/api-contract.test.ts` | 31 | 0 | PASSED (exit 0) | **[Worker-Reported (Vitest / Node)]** |
 | **Sign-In & Resolution Unit Suite** | `npx vitest run src/lib/sign-in.test.ts` | 45 | 0 | PASSED (exit 0) | **[Worker-Reported (Vitest / JSDOM)]** |
@@ -2815,23 +2822,29 @@ Implemented deterministic isolated SQLite write-failure regressions in `clients/
 | **Demo Switcher Suite** | `npx vitest run src/components/layout/workspace-switcher.test.tsx` | 4 | 0 | PASSED (exit 0) | **[Worker-Reported (Vitest / JSDOM)]** |
 | **Tenant Lifecycle Acceptance** | `npx vitest run src/test/acceptance/tenant-lifecycle.test.tsx` | 4 | 0 | PASSED (exit 0) | **[Worker-Reported (Vitest / JSDOM)]** |
 | **Login Flow & Landing Suite** | `npx vitest run src/test/pages/login.test.tsx` | 36 | 0 | PASSED (exit 0) | **[Worker-Reported (Vitest / JSDOM)]** |
-| **Total Focused Vitest Execution** | `npx vitest run ...` (all 10 suites combined) | 182 | 0 | PASSED (exit 0) | **[Worker-Reported]** |
+| **Total Focused Vitest Execution** | `npx vitest run ...` (all 10 suites combined) | 187 | 0 | PASSED (exit 0) | **[Worker-Reported]** |
 | **TypeScript Typecheck** | `npm run typecheck` (`tsc --noEmit`) | N/A | 0 | PASSED (exit 0) | **[Worker-Reported]** |
 | **ESLint Static Analysis** | `npm run lint` (`eslint --max-warnings 45`) | N/A | 0 errors (3 warnings in untouched files) | PASSED (exit 0) | **[Worker-Reported]** |
 
 ### C. PM QA Boundary Limits & Acceptance Disclosures
-1. **Bounded Frontend Component Correction Only**: This slice corrects asynchronous publication and scope isolation within the frontend project-task component and project-detail page. No backend entities, migrations, or database queries were modified.
-2. **Deterministic Regression Tests with Deferred Barriers**: Six new real component regression tests in `project-tasks.test.tsx` (totaling 18 tests) verify:
+1. **Bounded Frontend Component Correction Only**: This slice corrects mutation/query ordering and filtered local reconciliation within the frontend project-task component and project-detail page. No backend entities, migrations, or database queries were modified.
+2. **Deterministic Regression Tests with Deferred Barriers**: 11 total regression tests with deferred barriers in `project-tasks.test.tsx` (23 tests total) verify:
    - Workspace change A -> B with same `projectId` discards in-flight list responses from A and excludes old tasks;
    - Post-mutation background refresh arriving after user switches filter/page is discarded and does not overwrite current filter view;
    - GET-only retry resolving after scope/filter change is discarded and does not publish stale retry data;
    - Pending create/edit/toggle settlement resolving after scope change discards modal/toggle publications and resets forms;
    - Repeated same-query / A-B-A transitions reject old returns without reviving stale results;
-   - Creating an open task while viewing completed filter preserves completed total count, displays refresh warning on reload failure, and bounds optimistic insertion to page size.
+   - Creating an open task while viewing completed filter preserves completed total count, displays refresh warning on reload failure, and bounds optimistic insertion to page size;
+   - Pending toggle write settlement resolving after filter change suppresses obsolete-query publication and preserves current-query results;
+   - Completion toggle on Open/Completed filter reconciles locally by removing the non-matching item and decrementing total count on refresh failure;
+   - Pending create write settlement resolving after filter change does not contaminate the new filter view;
+   - Page navigation while toggle write is pending preserves current page items against obsolete previous-page refresh;
+   - Query ABA transition (All -> Open -> All) rejects delayed old mutation settlement without overwriting fresh query results.
 3. **Preserved Backend Authorization**: UI role-based control hiding and button disabling complement but do not replace server-side authorization. Backend `ProjectTaskAppService` strictly validates workspace, project, client role, and archived state boundaries.
 4. **Task Scope Limitations**: In accordance with the `REQ-PRJ-01` specification, task deletion, custom assignment dropdowns, due dates, time tracking linkage, and real-time push subscriptions remain deferred.
 5. **Approval-Blocked Invariant**: The historical PM `tirith:archive_extract` check was never run, retried, or bypassed.
 6. **Mocked Execution Disclosure**: All frontend tests ran against isolated mock HTTP/fetch stubs in Vitest/JSDOM; no real network services, production databases, or external token issuers were accessed. Live browser session testing and real PostgreSQL cluster concurrency remain open verification gates.
+
 
 
 

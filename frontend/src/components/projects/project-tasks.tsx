@@ -86,6 +86,18 @@ export function ProjectTasksSection({
   const [prevScopeKey, setPrevScopeKey] = useState(scopeKey);
   const [scopeGen, setScopeGen] = useState(0);
 
+  // Reactive query generation state (scopeKey + filter + page)
+  const currentQueryKey = `${scopeKey}:${filter}:${page}`;
+  const [prevQueryKey, setPrevQueryKey] = useState(currentQueryKey);
+  const [queryGen, setQueryGen] = useState(0);
+  const queryGenRef = useRef(0);
+
+  // Immediate query generation bump on filter, page or scope change (during render)
+  if (prevQueryKey !== currentQueryKey) {
+    setPrevQueryKey(currentQueryKey);
+    setQueryGen((g) => g + 1);
+  }
+
   // Immediate state exclusion & reset on scope change (during render)
   if (prevScopeKey !== scopeKey) {
     setPrevScopeKey(scopeKey);
@@ -104,11 +116,15 @@ export function ProjectTasksSection({
     setEditingTask(null);
   }
 
-  // Sync latest scope generation ref outside render
+  // Sync latest scope & query generation refs outside render
   useEffect(() => {
     scopeGenRef.current = scopeGen;
     activeListRequestRef.current = ++requestGenRef.current;
   }, [scopeGen]);
+
+  useEffect(() => {
+    queryGenRef.current = queryGen;
+  }, [queryGen]);
 
   const loadTasks = useCallback(async () => {
     if (!isLive) {
@@ -119,6 +135,7 @@ export function ProjectTasksSection({
     }
 
     const thisScopeGen = scopeGen;
+    const thisQueryGen = queryGen;
     const thisFilter = filter;
     const thisPage = page;
     const requestId = ++requestGenRef.current;
@@ -138,6 +155,7 @@ export function ProjectTasksSection({
       const res = await getProjectTasksApi(query);
       if (
         scopeGenRef.current !== thisScopeGen ||
+        queryGenRef.current !== thisQueryGen ||
         activeListRequestRef.current !== requestId
       ) {
         return; // Discard stale in-flight response
@@ -149,6 +167,7 @@ export function ProjectTasksSection({
     } catch (err) {
       if (
         scopeGenRef.current !== thisScopeGen ||
+        queryGenRef.current !== thisQueryGen ||
         activeListRequestRef.current !== requestId
       ) {
         return;
@@ -159,12 +178,13 @@ export function ProjectTasksSection({
     } finally {
       if (
         scopeGenRef.current === thisScopeGen &&
+        queryGenRef.current === thisQueryGen &&
         activeListRequestRef.current === requestId
       ) {
         setLoading(false);
       }
     }
-  }, [isLive, scopeGen, projectId, filter, page]);
+  }, [isLive, scopeGen, queryGen, projectId, filter, page]);
 
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- data fetch defers its own setState; see docs/QUALITY.md §10
@@ -176,6 +196,7 @@ export function ProjectTasksSection({
     if (refreshing || loading) return;
 
     const thisScopeGen = scopeGen;
+    const thisQueryGen = queryGen;
     const thisFilter = filter;
     const thisPage = page;
     const requestId = ++requestGenRef.current;
@@ -192,6 +213,7 @@ export function ProjectTasksSection({
       const res = await getProjectTasksApi(query);
       if (
         scopeGenRef.current !== thisScopeGen ||
+        queryGenRef.current !== thisQueryGen ||
         activeListRequestRef.current !== requestId
       ) {
         return;
@@ -203,6 +225,7 @@ export function ProjectTasksSection({
     } catch {
       if (
         scopeGenRef.current !== thisScopeGen ||
+        queryGenRef.current !== thisQueryGen ||
         activeListRequestRef.current !== requestId
       ) {
         return;
@@ -223,6 +246,7 @@ export function ProjectTasksSection({
     if (!canMutate || projectArchived || busyTaskId) return;
 
     const thisScopeGen = scopeGen;
+    const thisQueryGen = queryGen;
     const thisFilter = filter;
     const thisPage = page;
 
@@ -237,17 +261,35 @@ export function ProjectTasksSection({
         isCompleted: nextCompleted,
       });
 
-      // Guard publication of mutation outcome
+      // Guard publication of mutation outcome against scope change
       if (scopeGenRef.current !== thisScopeGen) {
         return;
       }
 
-      // Reconcile locally immediately
-      setTasks((prev) => prev.map((t) => (t.id === updated.id ? updated : t)));
+      // Always report successful write toast honestly
       toast({
         title: updated.isCompleted ? "Task completed" : "Task reopened",
         tone: "success",
       });
+
+      // If filter or page changed while the write was in-flight, suppress obsolete-query publication
+      if (queryGenRef.current !== thisQueryGen) {
+        return;
+      }
+
+      // Reconcile locally immediately on the current query
+      if (thisFilter === "open") {
+        // If task became completed, it no longer belongs in Open
+        setTasks((prev) => prev.filter((t) => t.id !== updated.id));
+        setTotalCount((c) => Math.max(0, c - 1));
+      } else if (thisFilter === "completed") {
+        // If task became reopened, it no longer belongs in Completed
+        setTasks((prev) => prev.filter((t) => t.id !== updated.id));
+        setTotalCount((c) => Math.max(0, c - 1));
+      } else {
+        // "all": update status in place
+        setTasks((prev) => prev.map((t) => (t.id === updated.id ? updated : t)));
+      }
 
       // Background list refresh with guarded publication
       const refreshRequestId = ++requestGenRef.current;
@@ -263,6 +305,7 @@ export function ProjectTasksSection({
         const res = await getProjectTasksApi(query);
         if (
           scopeGenRef.current !== thisScopeGen ||
+          queryGenRef.current !== thisQueryGen ||
           activeListRequestRef.current !== refreshRequestId
         ) {
           return;
@@ -273,6 +316,7 @@ export function ProjectTasksSection({
       } catch {
         if (
           scopeGenRef.current !== thisScopeGen ||
+          queryGenRef.current !== thisQueryGen ||
           activeListRequestRef.current !== refreshRequestId
         ) {
           return;
@@ -520,6 +564,7 @@ export function ProjectTasksSection({
           onClose={() => setCreateModalOpen(false)}
           onSubmit={async (newTitle, newDesc) => {
             const thisScopeGen = scopeGen;
+            const thisQueryGen = queryGen;
             const thisFilter = filter;
             const thisPage = page;
 
@@ -534,6 +579,14 @@ export function ProjectTasksSection({
               return;
             }
 
+            // Always report success toast honestly
+            toast({ title: "Task created", tone: "success" });
+
+            // If query changed while write was pending, suppress obsolete-query publication
+            if (queryGenRef.current !== thisQueryGen) {
+              return;
+            }
+
             // Reconcile locally immediately:
             // An open task must NOT increment completed-filter count
             if (thisFilter === "all" || thisFilter === "open") {
@@ -543,7 +596,6 @@ export function ProjectTasksSection({
             if (thisPage === 0 && thisFilter !== "completed") {
               setTasks((prev) => [created, ...prev].slice(0, PAGE_SIZE));
             }
-            toast({ title: "Task created", tone: "success" });
 
             // Background reload with guarded publication
             const refreshRequestId = ++requestGenRef.current;
@@ -559,6 +611,7 @@ export function ProjectTasksSection({
               const res = await getProjectTasksApi(query);
               if (
                 scopeGenRef.current !== thisScopeGen ||
+                queryGenRef.current !== thisQueryGen ||
                 activeListRequestRef.current !== refreshRequestId
               ) {
                 return;
@@ -569,6 +622,7 @@ export function ProjectTasksSection({
             } catch {
               if (
                 scopeGenRef.current !== thisScopeGen ||
+                queryGenRef.current !== thisQueryGen ||
                 activeListRequestRef.current !== refreshRequestId
               ) {
                 return;
@@ -588,6 +642,7 @@ export function ProjectTasksSection({
           onClose={() => setEditingTask(null)}
           onSubmit={async (updatedTitle, updatedDesc) => {
             const thisScopeGen = scopeGen;
+            const thisQueryGen = queryGen;
             const thisFilter = filter;
             const thisPage = page;
             const targetId = editingTask.id;
@@ -603,9 +658,16 @@ export function ProjectTasksSection({
               return;
             }
 
+            // Always report success toast honestly
+            toast({ title: "Task updated", tone: "success" });
+
+            // If query changed while write was pending, suppress obsolete-query publication
+            if (queryGenRef.current !== thisQueryGen) {
+              return;
+            }
+
             // Reconcile locally immediately
             setTasks((prev) => prev.map((t) => (t.id === updated.id ? updated : t)));
-            toast({ title: "Task updated", tone: "success" });
 
             // Background reload with guarded publication
             const refreshRequestId = ++requestGenRef.current;
@@ -621,6 +683,7 @@ export function ProjectTasksSection({
               const res = await getProjectTasksApi(query);
               if (
                 scopeGenRef.current !== thisScopeGen ||
+                queryGenRef.current !== thisQueryGen ||
                 activeListRequestRef.current !== refreshRequestId
               ) {
                 return;
@@ -631,6 +694,7 @@ export function ProjectTasksSection({
             } catch {
               if (
                 scopeGenRef.current !== thisScopeGen ||
+                queryGenRef.current !== thisQueryGen ||
                 activeListRequestRef.current !== refreshRequestId
               ) {
                 return;
