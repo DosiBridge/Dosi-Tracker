@@ -2237,23 +2237,26 @@ Under Task ID `linux-outbox-status-cli-20261022-N`, we implemented an explicit-p
 
 ---
 
-## 26. Outbox Status Inspection Hardening & Bounded Evaluation (selected-session-linux-status-correction-20261023)
+## 26. Outbox Status Inspection Hardening, Prescan Elimination & SQLite Work Budget Enforcement (selected-status-prescan-correction-20261023)
 
 > **Execution Date:** October 23, 2026  
-> **Phase Task ID:** `selected-session-linux-status-correction-20261023`  
-> **Status:** Completed & Source-Verified (90 Rust tests passed in `clients/linux`, 22 shell tests passed, 50 frontend tests passed, typecheck clean, fmt clean, check clean)  
+> **Phase Task ID:** `selected-status-prescan-correction-20261023` (continuation of `selected-session-linux-status-correction-20261023`)  
+> **Status:** Completed & Source-Verified (93 Rust tests passed in `clients/linux`, 22 shell tests passed, 50 frontend tests passed, typecheck clean, fmt clean, check clean)  
 > **Target Package:** `clients/linux` (crate: `dosi-tracker-linux` v0.1.0, binary: `dosi-tracker-linux`)  
 
 ### A. Context & Focused Architectural Corrections
-Under Task ID `selected-session-linux-status-correction-20261023`, we implemented a targeted correction of `clients/linux/src/outbox.rs` (`inspect_outbox_status` / `inspect_outbox_status_bounded`) and its CLI regressions:
+Under Task ID `selected-status-prescan-correction-20261023`, we resolved the source-confirmed incomplete correction in `clients/linux/src/outbox.rs` (`inspect_outbox_status`, `inspect_outbox_status_bounded`, and `inspect_outbox_status_with_budget`):
 
-1. **Finite Work Budget & Scoped Row Bounds (`MAX_STATUS_ROW_BOUND = 10_000`)**:
-   - Eliminated unbounded whole-database `PRAGMA quick_check;` sweeps from operational scoped status inspection.
-   - Replaced unbounded aggregation with a single bounded Common Table Expression (`scoped_rows`) bounded by `LIMIT fetch_limit` (`row_limit + 1`).
-   - If scoped records exceed `row_limit`, fails closed with `OutboxStatusError::WorkloadExceeded` without returning partial successful counts.
-   - Retains 100% accurate small-scope (A/B fixtures) and empty-scope (zero control) summaries.
+1. **Explicit Distinction Between Output Row Bound & Total SQLite Work Budget**:
+   - **Output Row Bound (`MAX_STATUS_ROW_BOUND = 10_000`)**: Enforces maximum cardinality of examined records for the target scope. Upfront validated before any narrowing or arithmetic to ensure large `u64` values (`0`, `MAX+1`, `i64::MAX as u64`, `(i64::MAX as u64) + 1`, `u64::MAX`) cannot overflow, become negative SQLite `LIMIT` values, or bypass the documented fixed cap.
+   - **Total SQLite Work Budget (`DEFAULT_MAX_SQLITE_WORK_STEPS = 25_000` at `PROGRESS_OPCODES_PER_STEP = 20`)**: Enforces a non-bypassable execution work budget covering **all** queries on the connection (`PRAGMA user_version`, `sqlite_master`, `PRAGMA table_info`, and the CTE aggregate query). Active via `sqlite3_progress_handler` with an RAII unregistration guard (`ProgressGuard`), halting missing-index full table scans, foreign-scope data scans, or malformed B-tree loops with `OutboxStatusError::WorkloadExceeded`.
 
-2. **Allowlisted Bounded Status Error Categories**:
+2. **Removal & Folding of the Unbounded Invalid-Record Prescan**:
+   - Eliminated the separate prescan query (`SELECT retry_count, payload_bytes ... WHERE scope AND (invalid...) LIMIT 1`) which previously scanned the entire scope when rows were valid to prove absence of corrupt records.
+   - Folded corruption checks directly into the single bounded Common Table Expression (`scoped_rows` bounded by `LIMIT row_limit + 1`) using aggregate projections: `MIN(retry_count)`, `MIN(payload_bytes)`, `MAX(retry_count)`, and `COALESCE(SUM(payload_bytes), 0)`.
+   - The query examines at most `row_limit + 1` rows, instantly rejecting scopes exceeding `row_limit` without scanning the rest of the table or returning partial counts.
+
+3. **Allowlisted Bounded Status Error Categories**:
    - Replaced raw rusqlite and engine diagnostic strings in `OutboxStatusError` with finite, allowlisted category enums:
      - `ScopeErrorKind`: `EmptyAccountId`, `OversizedAccountId`, `ControlCharAccountId`, `EmptyWorkspaceId`, `OversizedWorkspaceId`, `ControlCharWorkspaceId`.
      - `DatabaseCorruptionKind`: `InvalidFormat`, `MalformedDiskImage`, `QueryExecutionFailed`.
@@ -2261,14 +2264,16 @@ Under Task ID `selected-session-linux-status-correction-20261023`, we implemente
      - `SchemaErrorKind`: `Uninitialized`, `MissingTable`, `MissingRequiredColumns`.
    - Invariant: Error messages never leak database paths, envelope payloads, foreign identities, or raw SQLite engine messages.
 
-3. **Checked Range & Type Validation for Retry Counts**:
+4. **Checked Range & Type Validation for Retry Counts**:
    - Replaced unchecked `i64 as u32` conversions with checked `u32::try_from(max_retry)`.
-   - Pre-query fail-closed validation asserts `(retry_count < 0 OR retry_count > u32::MAX OR payload_bytes < 0) LIMIT 1`.
    - Persisted values exceeding `u32::MAX` fail closed with `RecordCorruptionKind::RetryCountOverflow` rather than wrapping.
    - Persisted fixtures and SQLite WAL visibility remain bit-for-bit unchanged (no writes, no schema migrations, no WAL checkpoints, and no `?immutable=1` stale WAL workarounds).
 
 ### B. Executed Regressions & Test Evidence
-1. **Outbox Status CLI Integration Suite (`clients/linux/tests/outbox_status_cli_tests.rs`, 12 Tests)**:
+1. **Outbox Status CLI Integration Suite (`clients/linux/tests/outbox_status_cli_tests.rs`, 15 Tests)**:
+   - `test_outbox_status_public_api_boundary_inputs_fail_closed`: Validates public API boundary inputs (`0`, `MAX_STATUS_ROW_BOUND + 1`, `i64::MAX as u64`, `(i64::MAX as u64) + 1`, `u64::MAX`) and work step boundary inputs (`0`, `DEFAULT_MAX_SQLITE_WORK_STEPS + 1`, `u64::MAX`), proving they fail closed with `WorkloadExceeded` before narrowing, while in-range positive controls succeed and database bytes remain strictly unchanged.
+   - `test_outbox_status_sqlite_work_budget_exhaustion_on_foreign_scope_scan`: Proves deterministic step budget exhaustion during validation / foreign data scan using instrumented step controls (`restricted_steps = 5` halts query before completion with `WorkloadExceeded`), while positive control with sufficient budget (`500` steps) succeeds with `queued_count = 0`.
+   - `test_outbox_status_missing_index_and_no_match_exhaustion_refusal`: Proves missing-index and no-match behavior. In an un-indexed table containing 1,500 foreign records, querying a non-matching target scope requires ~230 steps (full table scan), exhausting a 150-step budget and failing closed with `WorkloadExceeded`. When the index is created on the exact same database file, the identical query seeks the B-tree, scans 0 rows, and succeeds in <= 20 steps (taking ~7 steps). Bit-for-bit database file sentinels verified.
    - `test_cli_outbox_status_bounded_workload_exhaustion_refusal`: Asserts that scopes exceeding `MAX_STATUS_ROW_BOUND` (10,001 rows) fail closed with exit code 1, emitting allowlisted `Workload bound exceeded` error and zero partial count JSON output.
    - `test_cli_outbox_status_retry_overflow_and_negative_counts_fail_closed`: Asserts that rows with `retry_count = 5_000_000_000` fail closed with `persisted retry_count exceeds u32::MAX limit` without wrapping (rejecting wrapped artifact `705032704`), and negative retry/payload values fail closed.
    - `test_cli_outbox_status_sanitized_errors_and_malformed_schema_sentinels`: Asserts that corrupt DB headers, missing required columns, and invalid timestamps output strictly allowlisted categories without leaking sensitive path canaries, payload tokens, or SQLite engine strings.
@@ -2276,7 +2281,7 @@ Under Task ID `selected-session-linux-status-correction-20261023`, we implemente
    - 8 existing status CLI tests (argument validation, nonexistent path refusal, A/B fixtures and zero control, WAL visibility, direct API, subcommands, help) all pass.
 
 2. **Maintained Test Suites**:
-   - Total Rust tests in `clients/linux`: **90 passed, 0 failed, exit 0** (21 unit + 6 doctor CLI + 7 repro + 3 installer integration + 28 outbox integration + 13 sync integration + 12 outbox status CLI integration).
+   - Total Rust tests in `clients/linux`: **93 passed, 0 failed, exit 0** (21 unit + 6 doctor CLI + 7 repro + 3 installer integration + 28 outbox integration + 13 sync integration + 15 outbox status CLI integration).
    - Shell installer lifecycle: **22 passed, 0 failed, exit 0** via Git-Bash.
    - Frontend Vitest acceptance: **50 passed, 0 failed, exit 0** (full suite: 1982 passed).
    - Frontend typecheck: **0 errors, exit 0**.
@@ -2286,7 +2291,7 @@ Under Task ID `selected-session-linux-status-correction-20261023`, we implemente
 ### C. Executed Test Suites & Quality Gates
 | Target Suite | Exact Command Line | Tests Passed | Ignored | Result | Exit Code | Evidence Level |
 |---|---|:---:|:---:|:---:|:---:|---|
-| **Linux Unit, CLI, Repro, Installer, Outbox, Sync & Status CLI** | `cargo test` in `clients/linux` | 90 passed (21 unit + 6 doctor CLI + 7 repro + 3 installer integration + 28 outbox integration + 13 sync integration + 12 status CLI) | 0 | PASSED | **0** | **[Worker-Reported (Windows Host Toolchain)]** |
+| **Linux Unit, CLI, Repro, Installer, Outbox, Sync & Status CLI** | `cargo test` in `clients/linux` | 93 passed (21 unit + 6 doctor CLI + 7 repro + 3 installer integration + 28 outbox integration + 13 sync integration + 15 status CLI) | 0 | PASSED | **0** | **[Worker-Reported (Windows Host Toolchain)]** |
 | **Shell Installer Lifecycle Suite** | `bash clients/linux/tests/test_installer_lifecycle.sh` | 22 passed (all lifecycle, security confinement, and binary doctor checks) | 0 | PASSED | **0** | **[Worker-Reported (Git-Bash Host Toolchain)]** |
 | **Linux Code Formatting** | `cargo fmt --check` in `clients/linux` | N/A | 0 diffs | PASSED | **0** | **[Worker-Reported]** |
 | **Linux Compilation Check** | `cargo check --all-targets` in `clients/linux` | N/A | 0 errors, 0 warnings | PASSED | **0** | **[Worker-Reported]** |

@@ -26,11 +26,13 @@ pub use lifecycle::{
     LifecycleGeneration, PauseReason, TrackerLifecycle, TrackerState,
 };
 pub use outbox::{
-    inspect_outbox_status, inspect_outbox_status_bounded, ActivityEnvelope, DatabaseCorruptionKind,
+    inspect_outbox_status, inspect_outbox_status_bounded, inspect_outbox_status_instrumented,
+    inspect_outbox_status_with_budget, ActivityEnvelope, DatabaseCorruptionKind,
     DurableQueueSummary, EnqueueResult, Outbox, OutboxEntry, OutboxError, OutboxLimits,
     OutboxScope, OutboxStatusError, OutboxStatusReport, RecordCorruptionKind, SchemaErrorKind,
-    ScopeErrorKind, MAX_ACCOUNT_ID_BYTES, MAX_CLIENT_ACTIVITY_ID_BYTES, MAX_ERROR_MESSAGE_BYTES,
-    MAX_STATUS_ROW_BOUND, MAX_WORKSPACE_ID_BYTES, OUTBOX_SCHEMA_VERSION,
+    ScopeErrorKind, SqliteWorkBudget, DEFAULT_MAX_SQLITE_WORK_STEPS, MAX_ACCOUNT_ID_BYTES,
+    MAX_CLIENT_ACTIVITY_ID_BYTES, MAX_ERROR_MESSAGE_BYTES, MAX_STATUS_ROW_BOUND,
+    MAX_WORKSPACE_ID_BYTES, OUTBOX_SCHEMA_VERSION, PROGRESS_OPCODES_PER_STEP,
 };
 pub use paths::LinuxPaths;
 pub use sync::{

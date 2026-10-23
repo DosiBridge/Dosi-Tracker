@@ -27,6 +27,7 @@
 //!   database errors propagate immediately rather than being masked as absent rows.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
@@ -1094,6 +1095,64 @@ impl std::error::Error for OutboxStatusError {}
 /// Maximum records examined for scoped read-only outbox status inspection.
 pub const MAX_STATUS_ROW_BOUND: u64 = 10_000;
 
+/// Number of SQLite virtual machine opcodes per progress step.
+pub const PROGRESS_OPCODES_PER_STEP: i32 = 20;
+
+/// Default maximum SQLite execution work steps allowed across all status inspection queries.
+/// At 20 opcodes per step, 25,000 steps corresponds to 500,000 SQLite VDBE opcodes,
+/// providing ample headroom for bounded (<= 10,000 row) indexed scope queries while
+/// strictly halting full table scans on missing/malformed indexes or massive foreign datasets.
+pub const DEFAULT_MAX_SQLITE_WORK_STEPS: u64 = 25_000;
+
+/// Configurable finite SQLite execution work budget for status queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SqliteWorkBudget {
+    pub max_work_steps: u64,
+}
+
+impl Default for SqliteWorkBudget {
+    fn default() -> Self {
+        Self {
+            max_work_steps: DEFAULT_MAX_SQLITE_WORK_STEPS,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ProgressContext<'a> {
+    steps_taken: AtomicU64,
+    max_steps: u64,
+    external_counter: Option<&'a AtomicU64>,
+}
+
+unsafe extern "C" fn sqlite_progress_callback(arg: *mut std::ffi::c_void) -> std::ffi::c_int {
+    if arg.is_null() {
+        return 1;
+    }
+    let ctx = &*(arg as *const ProgressContext);
+    let prev = ctx.steps_taken.fetch_add(1, Ordering::Relaxed);
+    if let Some(ext) = ctx.external_counter {
+        ext.store(prev + 1, Ordering::Relaxed);
+    }
+    if prev >= ctx.max_steps {
+        1 // Non-zero interrupts execution (produces SQLITE_INTERRUPT)
+    } else {
+        0
+    }
+}
+
+struct ProgressGuard {
+    handle: *mut rusqlite::ffi::sqlite3,
+}
+
+impl Drop for ProgressGuard {
+    fn drop(&mut self) {
+        unsafe {
+            rusqlite::ffi::sqlite3_progress_handler(self.handle, 0, None, std::ptr::null_mut());
+        }
+    }
+}
+
 fn validate_scope_for_status(scope: &OutboxScope) -> Result<(), OutboxStatusError> {
     if scope.account_id.trim().is_empty() {
         return Err(OutboxStatusError::InvalidScope(
@@ -1168,7 +1227,8 @@ fn map_sqlite_query_error(err: rusqlite::Error) -> OutboxStatusError {
 /// - Opens SQLite using `OpenFlags::SQLITE_OPEN_READ_ONLY`.
 /// - Evaluates SQLite WAL mode safely; uncheckpointed WAL frames are read if WAL/SHM
 ///   files are readable, and connection conservatively fails closed if SHM/WAL are unreadable.
-/// - Strictly bounded work budget: evaluates at most [`MAX_STATUS_ROW_BOUND`] records,
+/// - Strictly bounded work budget: evaluates at most [`MAX_STATUS_ROW_BOUND`] records
+///   and [`DEFAULT_MAX_SQLITE_WORK_STEPS`] SQLite virtual machine execution steps,
 ///   rejecting overflows without returning partial successful counts.
 /// - Excludes envelopes, payloads, descriptions, foreign identities, and raw engine strings.
 pub fn inspect_outbox_status(
@@ -1184,9 +1244,40 @@ pub fn inspect_outbox_status_bounded(
     scope: &OutboxScope,
     row_limit: u64,
 ) -> Result<OutboxStatusReport, OutboxStatusError> {
+    inspect_outbox_status_with_budget(path, scope, row_limit, DEFAULT_MAX_SQLITE_WORK_STEPS)
+}
+
+/// Performs strictly read-only inspection of the durable outbox queue with explicit row bound and SQLite work step budget.
+pub fn inspect_outbox_status_with_budget(
+    path: impl AsRef<Path>,
+    scope: &OutboxScope,
+    row_limit: u64,
+    max_work_steps: u64,
+) -> Result<OutboxStatusReport, OutboxStatusError> {
+    inspect_outbox_status_instrumented(path, scope, row_limit, max_work_steps, None)
+}
+
+/// Performs strictly read-only inspection of the durable outbox queue with step instrumentation.
+pub fn inspect_outbox_status_instrumented(
+    path: impl AsRef<Path>,
+    scope: &OutboxScope,
+    row_limit: u64,
+    max_work_steps: u64,
+    step_counter: Option<&AtomicU64>,
+) -> Result<OutboxStatusReport, OutboxStatusError> {
+    // 1. Check row_limit range BEFORE narrowing or arithmetic
+    if row_limit == 0 || row_limit > MAX_STATUS_ROW_BOUND {
+        return Err(OutboxStatusError::WorkloadExceeded);
+    }
+
+    // 2. Check max_work_steps range against documented non-bypassable limit
+    if max_work_steps == 0 || max_work_steps > DEFAULT_MAX_SQLITE_WORK_STEPS {
+        return Err(OutboxStatusError::WorkloadExceeded);
+    }
+
     let db_path = path.as_ref();
 
-    // 1. Mandatory check: DB path must exist and not be a directory
+    // 3. Mandatory check: DB path must exist and not be a directory
     if !db_path.exists() {
         return Err(OutboxStatusError::DatabaseNotFound);
     }
@@ -1194,18 +1285,31 @@ pub fn inspect_outbox_status_bounded(
         return Err(OutboxStatusError::InvalidPath);
     }
 
-    // 2. Validate scope strictly with allowlisted categories
+    // 4. Validate scope strictly with allowlisted categories
     validate_scope_for_status(scope)?;
 
-    if row_limit == 0 {
-        return Err(OutboxStatusError::WorkloadExceeded);
-    }
-
-    // 3. Open connection strictly READ-ONLY
+    // 5. Open connection strictly READ-ONLY
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = Connection::open_with_flags(db_path, flags).map_err(map_sqlite_open_error)?;
 
-    // 4. Check schema version via PRAGMA user_version
+    // 6. Install finite execution work budget handler covering all validation and summary queries
+    let raw_handle = unsafe { conn.handle() };
+    let progress_ctx = ProgressContext {
+        steps_taken: AtomicU64::new(0),
+        max_steps: max_work_steps,
+        external_counter: step_counter,
+    };
+    let _progress_guard = ProgressGuard { handle: raw_handle };
+    unsafe {
+        rusqlite::ffi::sqlite3_progress_handler(
+            raw_handle,
+            PROGRESS_OPCODES_PER_STEP,
+            Some(sqlite_progress_callback),
+            &progress_ctx as *const ProgressContext as *mut std::ffi::c_void,
+        );
+    }
+
+    // 7. Check schema version via PRAGMA user_version
     let user_ver: u32 = conn
         .query_row("PRAGMA user_version;", [], |row| row.get(0))
         .map_err(map_sqlite_query_error)?;
@@ -1218,7 +1322,7 @@ pub fn inspect_outbox_status_bounded(
         return Err(OutboxStatusError::UnsupportedStoreVersion(user_ver));
     }
 
-    // 5. Check table existence
+    // 8. Check table existence
     let table_exists: bool = conn
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'outbox_entries';",
@@ -1235,7 +1339,7 @@ pub fn inspect_outbox_status_bounded(
         ));
     }
 
-    // 6. Verify required columns in table
+    // 9. Verify required columns in table
     let mut table_info_stmt = conn
         .prepare("PRAGMA table_info(outbox_entries);")
         .map_err(map_sqlite_query_error)?;
@@ -1262,38 +1366,10 @@ pub fn inspect_outbox_status_bounded(
         }
     }
 
-    // 7. Fail-closed check: verify no corrupt records (negative payload_bytes, negative retry_count, or retry_count > u32::MAX) in selected scope
-    let invalid_record: Option<(i64, i64)> = conn
-        .query_row(
-            "SELECT retry_count, payload_bytes FROM outbox_entries \
-             WHERE account_id = ?1 AND workspace_id = ?2 \
-               AND (retry_count < 0 OR retry_count > ?3 OR payload_bytes < 0) LIMIT 1",
-            params![&scope.account_id, &scope.workspace_id, u32::MAX as i64],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()
-        .map_err(map_sqlite_query_error)?;
-
-    if let Some((retry_count, payload_bytes)) = invalid_record {
-        if retry_count > u32::MAX as i64 {
-            return Err(OutboxStatusError::CorruptRecord(
-                RecordCorruptionKind::RetryCountOverflow,
-            ));
-        }
-        if retry_count < 0 || payload_bytes < 0 {
-            return Err(OutboxStatusError::CorruptRecord(
-                RecordCorruptionKind::NegativeValue,
-            ));
-        }
-    }
-
-    // 8. Execute single bounded SQL aggregate summary query for the selected scope.
-    // We bind limit to row_limit + 1 so we can detect workload overflow deterministically
-    // without scanning unboundedly.
-    let fetch_limit = match (row_limit as i64).checked_add(1) {
-        Some(lim) => lim,
-        None => i64::MAX,
-    };
+    // 10. Execute single bounded SQL aggregate summary query with folded metadata validation.
+    // fetch_limit is safe from overflow because row_limit <= MAX_STATUS_ROW_BOUND (10,000).
+    // The CTE bounds examined rows to fetch_limit (row_limit + 1). No unbounded prescan is performed.
+    let fetch_limit = (row_limit as i64) + 1;
 
     let summary_row = conn
         .query_row(
@@ -1307,6 +1383,8 @@ pub fn inspect_outbox_status_bounded(
                  COUNT(*), \
                  COALESCE(SUM(CASE WHEN retry_count > 0 THEN 1 ELSE 0 END), 0), \
                  COALESCE(MAX(retry_count), 0), \
+                 MIN(retry_count), \
+                 MIN(payload_bytes), \
                  COALESCE(SUM(payload_bytes), 0), \
                  MIN(enqueued_at), \
                  MAX(enqueued_at) \
@@ -1316,13 +1394,17 @@ pub fn inspect_outbox_status_bounded(
                 let queued_count: i64 = row.get(0)?;
                 let entries_with_retries: i64 = row.get(1)?;
                 let max_retry_count: i64 = row.get(2)?;
-                let total_payload_bytes: i64 = row.get(3)?;
-                let oldest_raw: Option<String> = row.get(4)?;
-                let newest_raw: Option<String> = row.get(5)?;
+                let min_retry_count: Option<i64> = row.get(3)?;
+                let min_payload_bytes: Option<i64> = row.get(4)?;
+                let total_payload_bytes: i64 = row.get(5)?;
+                let oldest_raw: Option<String> = row.get(6)?;
+                let newest_raw: Option<String> = row.get(7)?;
                 Ok((
                     queued_count,
                     entries_with_retries,
                     max_retry_count,
+                    min_retry_count,
+                    min_payload_bytes,
                     total_payload_bytes,
                     oldest_raw,
                     newest_raw,
@@ -1331,8 +1413,16 @@ pub fn inspect_outbox_status_bounded(
         )
         .map_err(map_sqlite_query_error)?;
 
-    let (queued_count, entries_with_retries, max_retry, total_bytes, oldest_raw, newest_raw) =
-        summary_row;
+    let (
+        queued_count,
+        entries_with_retries,
+        max_retry_count,
+        min_retry_count,
+        min_payload_bytes,
+        total_payload_bytes,
+        oldest_raw,
+        newest_raw,
+    ) = summary_row;
 
     // Check workload overflow: if count exceeds the bounded limit, fail closed.
     // Rejects partial counts completely!
@@ -1340,17 +1430,43 @@ pub fn inspect_outbox_status_bounded(
         return Err(OutboxStatusError::WorkloadExceeded);
     }
 
+    // Fail-closed checks on examined records:
+    if let Some(min_r) = min_retry_count {
+        if min_r < 0 {
+            return Err(OutboxStatusError::CorruptRecord(
+                RecordCorruptionKind::NegativeValue,
+            ));
+        }
+    }
+    if let Some(min_p) = min_payload_bytes {
+        if min_p < 0 {
+            return Err(OutboxStatusError::CorruptRecord(
+                RecordCorruptionKind::NegativeValue,
+            ));
+        }
+    }
+    if max_retry_count > u32::MAX as i64 {
+        return Err(OutboxStatusError::CorruptRecord(
+            RecordCorruptionKind::RetryCountOverflow,
+        ));
+    }
+    if total_payload_bytes < 0 {
+        return Err(OutboxStatusError::CorruptRecord(
+            RecordCorruptionKind::NegativeValue,
+        ));
+    }
+
     // Checked numeric conversions
     let queued_count = u64::try_from(queued_count)
         .map_err(|_| OutboxStatusError::CorruptRecord(RecordCorruptionKind::NegativeValue))?;
     let entries_with_retries = u64::try_from(entries_with_retries)
         .map_err(|_| OutboxStatusError::CorruptRecord(RecordCorruptionKind::NegativeValue))?;
-    let max_retry_count = u32::try_from(max_retry)
+    let max_retry_count = u32::try_from(max_retry_count)
         .map_err(|_| OutboxStatusError::CorruptRecord(RecordCorruptionKind::RetryCountOverflow))?;
-    let total_payload_bytes = u64::try_from(total_bytes)
+    let total_payload_bytes = u64::try_from(total_payload_bytes)
         .map_err(|_| OutboxStatusError::CorruptRecord(RecordCorruptionKind::NegativeValue))?;
 
-    // 9. Validate ISO timestamps if present
+    // 11. Validate ISO timestamps if present
     let oldest_enqueued_at = match oldest_raw {
         Some(ref s) => {
             let dt = s.parse::<DateTime<Utc>>().map_err(|_| {

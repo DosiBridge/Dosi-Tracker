@@ -11,14 +11,17 @@
 
 use std::fs;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::Utc;
 use rusqlite::Connection;
 
 use dosi_tracker_linux::outbox::{
-    inspect_outbox_status, inspect_outbox_status_bounded, ActivityEnvelope, DatabaseCorruptionKind,
-    Outbox, OutboxLimits, OutboxScope, OutboxStatusError, OutboxStatusReport, RecordCorruptionKind,
-    SchemaErrorKind, MAX_STATUS_ROW_BOUND, OUTBOX_SCHEMA_VERSION,
+    inspect_outbox_status, inspect_outbox_status_bounded, inspect_outbox_status_instrumented,
+    inspect_outbox_status_with_budget, ActivityEnvelope, DatabaseCorruptionKind, Outbox,
+    OutboxLimits, OutboxScope, OutboxStatusError, OutboxStatusReport, RecordCorruptionKind,
+    SchemaErrorKind, SqliteWorkBudget, DEFAULT_MAX_SQLITE_WORK_STEPS, MAX_STATUS_ROW_BOUND,
+    OUTBOX_SCHEMA_VERSION, PROGRESS_OPCODES_PER_STEP,
 };
 
 fn make_test_envelope(client_id: &str, secret_desc: Option<&str>) -> ActivityEnvelope {
@@ -1200,4 +1203,256 @@ fn test_cli_outbox_status_persisted_fixtures_and_wal_remain_strictly_unchanged()
             "SQLite WAL file must remain 100% bit-for-bit unchanged"
         );
     }
+}
+
+#[test]
+fn test_outbox_status_public_api_boundary_inputs_fail_closed() {
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("boundary_inputs.db");
+    let scope = OutboxScope::new("acc-bound", "ws-bound").unwrap();
+
+    let outbox = Outbox::open(&db_path, OutboxLimits::default()).unwrap();
+    let env1 = make_test_envelope("act-b1", None);
+    outbox.enqueue(&scope, &env1).unwrap();
+    drop(outbox);
+
+    let initial_db_bytes = fs::read(&db_path).unwrap();
+
+    // 1. row_limit boundary inputs that MUST fail closed with WorkloadExceeded BEFORE any narrowing
+    let rejected_row_limits: [u64; 5] = [
+        0,                        // Zero row limit
+        MAX_STATUS_ROW_BOUND + 1, // MAX + 1 (10,001)
+        i64::MAX as u64,          // i64::MAX as u64 (9,223,372,036,854,775,807)
+        (i64::MAX as u64) + 1, // i64::MAX as u64 + 1 (9,223,372,036,854,775,808, negative if cast to i64)
+        u64::MAX,              // u64::MAX (18,446,744,073,709,551,615, -1 if cast to i64)
+    ];
+
+    for &row_limit in &rejected_row_limits {
+        let res = inspect_outbox_status_bounded(&db_path, &scope, row_limit);
+        assert_eq!(
+            res.unwrap_err(),
+            OutboxStatusError::WorkloadExceeded,
+            "Boundary input row_limit={row_limit} must fail closed with WorkloadExceeded"
+        );
+    }
+
+    // 2. max_work_steps boundary inputs that MUST fail closed with WorkloadExceeded
+    let rejected_work_steps: [u64; 3] = [0, DEFAULT_MAX_SQLITE_WORK_STEPS + 1, u64::MAX];
+
+    for &work_steps in &rejected_work_steps {
+        let res = inspect_outbox_status_with_budget(&db_path, &scope, 10, work_steps);
+        assert_eq!(
+            res.unwrap_err(),
+            OutboxStatusError::WorkloadExceeded,
+            "Boundary input max_work_steps={work_steps} must fail closed with WorkloadExceeded"
+        );
+    }
+
+    // 3. Positive control: valid in-range limits succeed accurately
+    let valid_report = inspect_outbox_status_bounded(&db_path, &scope, MAX_STATUS_ROW_BOUND)
+        .expect("Valid row bound MAX_STATUS_ROW_BOUND must succeed");
+    assert_eq!(valid_report.durable_queue.queued_count, 1);
+
+    let valid_budget_report =
+        inspect_outbox_status_with_budget(&db_path, &scope, 10, DEFAULT_MAX_SQLITE_WORK_STEPS)
+            .expect("Valid default work budget must succeed");
+    assert_eq!(valid_budget_report.durable_queue.queued_count, 1);
+
+    // 4. Invariant: Default budget and step constants documented and verified
+    let default_budget = SqliteWorkBudget::default();
+    assert_eq!(default_budget.max_work_steps, DEFAULT_MAX_SQLITE_WORK_STEPS);
+    assert_eq!(PROGRESS_OPCODES_PER_STEP, 20);
+
+    // 5. Invariant: Database bytes strictly unchanged
+    assert_eq!(initial_db_bytes, fs::read(&db_path).unwrap());
+}
+
+#[test]
+fn test_outbox_status_sqlite_work_budget_exhaustion_on_foreign_scope_scan() {
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("foreign_scope_scan.db");
+    let foreign_scope = OutboxScope::new("acc-foreign", "ws-foreign").unwrap();
+    let target_scope = OutboxScope::new("acc-target", "ws-target").unwrap();
+
+    let outbox = Outbox::open(&db_path, OutboxLimits::default()).unwrap();
+    for i in 0..100 {
+        let env = make_test_envelope(&format!("act-foreign-{i}"), None);
+        outbox.enqueue(&foreign_scope, &env).unwrap();
+    }
+    drop(outbox);
+
+    let initial_db_bytes = fs::read(&db_path).unwrap();
+
+    // 1. Query target scope with an intentionally restricted work step budget (e.g. 5 steps = 100 opcodes)
+    let step_counter = AtomicU64::new(0);
+    let restricted_steps = 5;
+    let err = inspect_outbox_status_instrumented(
+        &db_path,
+        &target_scope,
+        100,
+        restricted_steps,
+        Some(&step_counter),
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        err,
+        OutboxStatusError::WorkloadExceeded,
+        "Exhausting step budget during query/validation must fail closed with WorkloadExceeded"
+    );
+    let steps_recorded = step_counter.load(Ordering::Relaxed);
+    assert!(
+        steps_recorded >= restricted_steps,
+        "Expected at least {restricted_steps} steps before interrupt, got {steps_recorded}"
+    );
+
+    // 2. Positive control: query target scope with sufficient work budget (500 steps)
+    let positive_counter = AtomicU64::new(0);
+    let report = inspect_outbox_status_instrumented(
+        &db_path,
+        &target_scope,
+        100,
+        500,
+        Some(&positive_counter),
+    )
+    .expect("Sufficient budget must succeed");
+
+    assert_eq!(report.durable_queue.queued_count, 0);
+    let pos_steps = positive_counter.load(Ordering::Relaxed);
+    assert!(
+        pos_steps < 500,
+        "Completed query must take fewer than 500 steps, took {pos_steps}"
+    );
+
+    // 3. Positive control via real CLI with default budget succeeds on the same fixture
+    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+    let out = Command::new(exe)
+        .args([
+            "outbox",
+            "status",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--account-id",
+            "acc-target",
+            "--workspace-id",
+            "ws-target",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("\"queued_count\": 0"));
+
+    // 4. Invariant: Database bytes strictly unchanged
+    assert_eq!(initial_db_bytes, fs::read(&db_path).unwrap());
+}
+
+#[test]
+fn test_outbox_status_missing_index_and_no_match_exhaustion_refusal() {
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("missing_index.db");
+    let target_scope = OutboxScope::new("acc-target", "ws-target").unwrap();
+
+    // 1. Create outbox database table WITHOUT any indices
+    let conn = Connection::open(&db_path).unwrap();
+    conn.pragma_update(None, "user_version", OUTBOX_SCHEMA_VERSION)
+        .unwrap();
+    conn.execute_batch(
+        "CREATE TABLE outbox_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            client_activity_id TEXT NOT NULL UNIQUE,
+            project_id TEXT,
+            started_at TEXT NOT NULL,
+            ended_at TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            payload_bytes INTEGER NOT NULL,
+            enqueued_at TEXT NOT NULL,
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT
+        );",
+    )
+    .unwrap();
+
+    // Insert foreign rows. Without an index on (account_id, workspace_id), querying for target scope requires a full table scan.
+    let tx = conn.unchecked_transaction().unwrap();
+    {
+        let mut stmt = tx
+            .prepare(
+                "INSERT INTO outbox_entries (
+                    account_id, workspace_id, client_activity_id, project_id,
+                    started_at, ended_at, payload_json, payload_bytes, enqueued_at, retry_count
+                ) VALUES (?1, ?2, ?3, NULL, '2026-10-23T00:00:00Z', '2026-10-23T00:05:00Z', '{}', 2, '2026-10-23T00:05:00Z', 0)",
+            )
+            .unwrap();
+        // Insert 1,500 foreign records
+        for i in 0..1500 {
+            let act_id = format!("act-foreign-{i}");
+            stmt.execute(rusqlite::params!["acc-foreign", "ws-foreign", &act_id])
+                .unwrap();
+        }
+    }
+    tx.commit().unwrap();
+    drop(conn);
+
+    let initial_db_bytes = fs::read(&db_path).unwrap();
+
+    // 2. In un-indexed table, scanning 1,500 foreign rows requires ~230 steps, exceeding a budget of 150 steps
+    let missing_index_counter = AtomicU64::new(0);
+    let err = inspect_outbox_status_instrumented(
+        &db_path,
+        &target_scope,
+        1000,
+        150,
+        Some(&missing_index_counter),
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        err,
+        OutboxStatusError::WorkloadExceeded,
+        "Missing index full table scan over foreign rows must fail closed with WorkloadExceeded"
+    );
+    assert!(
+        missing_index_counter.load(Ordering::Relaxed) >= 150,
+        "Work budget exhaustion must reach or exceed the 150-step limit"
+    );
+
+    // Invariant: Un-indexed inspection never altered the database file
+    assert_eq!(initial_db_bytes, fs::read(&db_path).unwrap());
+
+    // 3. Now create the index on the exact same database file:
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE INDEX idx_outbox_scope_enqueued ON outbox_entries (account_id, workspace_id, enqueued_at);",
+            [],
+        )
+        .unwrap();
+    }
+
+    let indexed_db_bytes = fs::read(&db_path).unwrap();
+
+    // 4. Positive control: with index in place, target scope lookup seeks B-tree, scans 0 rows, and succeeds under 150 steps (takes ~7 steps)!
+    let indexed_counter = AtomicU64::new(0);
+    let report = inspect_outbox_status_instrumented(
+        &db_path,
+        &target_scope,
+        1000,
+        150,
+        Some(&indexed_counter),
+    )
+    .expect("Indexed no-match scope lookup must complete well under 150 steps");
+
+    assert_eq!(report.durable_queue.queued_count, 0);
+    let indexed_steps = indexed_counter.load(Ordering::Relaxed);
+    assert!(
+        indexed_steps <= 20,
+        "Indexed no-match lookup required {indexed_steps} steps, expected <= 20"
+    );
+
+    // 5. Invariant: Database bytes strictly unchanged after indexed read-only inspection
+    assert_eq!(indexed_db_bytes, fs::read(&db_path).unwrap());
 }
