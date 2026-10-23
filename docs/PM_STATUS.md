@@ -2423,22 +2423,22 @@ Implemented deterministic isolated SQLite write-failure regressions in `clients/
 
 1. **`testAcceptedResponseRemoveFailureHaltsPassRetainsQueuedRowWithoutReportingUploadedAndRecovers`**:
    - Injected trigger: `CREATE TRIGGER fail_delete ... RAISE(ABORT, 'CONFIDENTIAL_DB_PATH=/Users/victim/Library/dosi.db\nUSER_SECRET=tok_1234567890\t\u{1F}--unbounded-padding')`.
-   - Invariants: Asserts `report.uploaded.isEmpty`, `report.drained == false`, `report.stop` matches exact sanitized `"queue_remove_failed (sqlite code 1)"`, length $\le 64$, zero leakage of paths, tokens, newlines, or control characters. Proves subsequent rows (`p2`, `p3`) are not uploaded. Asserts preserved pending rows, `clientActivityId`, `RecentBlocks` stays `.queued`, and other-owner sentinel intact.
+   - Invariants: Asserts `report.uploaded.isEmpty`, `report.drained == false`, `report.stop` matches exact sanitized `"queue_remove_failed (sqlite code \(SQLITE_CONSTRAINT_TRIGGER))"` (1811), length $\le 64$, zero leakage of paths, tokens, newlines, or control characters. Proves subsequent rows (`p2`, `p3`) are not uploaded. Asserts preserved pending rows, `clientActivityId`, `RecentBlocks` stays `.queued`, and other-owner sentinel intact.
    - Recovery: Dropping trigger drains queue via idempotent server retry (`server.sent[0].clientActivityId == server.sent[1].clientActivityId`, total 4 uploads).
 
 2. **`testRejectionParkFailureHaltsPassRetainsQueuedRowWithoutReportingParkedAndRecovers`**:
    - Injected trigger: `CREATE TRIGGER fail_park ... RAISE(ABORT, 'SECRET_PARK_LEAK=/var/db/app.db\nCREDENTIAL_BEARER=secret_jwt_xyz\t\u{1F}--unbounded-padding')`.
-   - Invariants: Asserts `report.parked.isEmpty`, `report.uploaded.isEmpty`, `report.stop` matches exact sanitized `"queue_park_failed (sqlite code 1)"`, length $\le 64$, zero credential/path leakage. Asserts pending row preserved (`synced = 0`, `rejectedCount == 0`).
+   - Invariants: Asserts `report.parked.isEmpty`, `report.uploaded.isEmpty`, `report.stop` matches exact sanitized `"queue_park_failed (sqlite code \(SQLITE_CONSTRAINT_TRIGGER))"` (1811), length $\le 64$, zero credential/path leakage. Asserts pending row preserved (`synced = 0`, `rejectedCount == 0`).
    - Recovery: Re-arms `server.answers["p1"]` with 409, drops trigger, and verifies recovery sequence: 1 initial failed park + 1 recovery park + 1 recovery upload of `p2` (total 3 uploads), preserving `clientActivityId`. Asserts `ids[0]` parked, `ids[1]` uploaded, `RecentBlocks` updated.
 
 3. **`testStripCapturesMutationFailureHaltsPassDoesNotReportStrippedAndRecovers`**:
    - Injected trigger: `CREATE TRIGGER fail_strip ... RAISE(ABORT, 'SECRET_STRIP_LEAK=/private/var/queue.db\nPAYLOAD_KEY=capture_token_abc\t\u{1F}--unbounded-padding')`.
-   - Invariants: Asserts `report.stripped.isEmpty`, `report.uploaded.isEmpty`, `report.stop` matches exact sanitized `"queue_strip_failed (sqlite code 1)"`, length $\le 64$, zero payload key/path leakage. Asserts resend not attempted on failure, captures intact on queued row.
+   - Invariants: Asserts `report.stripped.isEmpty`, `report.uploaded.isEmpty`, `report.stop` matches exact sanitized `"queue_strip_failed (sqlite code \(SQLITE_CONSTRAINT_TRIGGER))"` (1811), length $\le 64$, zero payload key/path leakage. Asserts resend not attempted on failure, captures intact on queued row.
    - Recovery: Re-arms `server.answers["p1"]` with 413, drops trigger, and verifies recovery sequence: 1 initial with captures + 1 recovery initial with captures + 1 recovery resend without captures + 1 recovery `p2` (total 4 uploads), preserving `clientActivityId` across all resends. Asserts `ids[0]` stripped and all uploaded.
 
 4. **`testProjectGonePolicyRecordedEvenWhenParkingPersistenceFails`**:
    - Injected trigger: `CREATE TRIGGER fail_park ... RAISE(ABORT, 'SECRET_GONE_LEAK=/path/to/db\nGONE_TOKEN=xyz\t\u{1F}--unbounded-padding')`.
-   - Invariants: Asserts `report.goneProjects == ["gone"]` (server verdict preserved), `report.parked.isEmpty` (local failure not claimed parked), `report.stop` matches exact sanitized `"queue_park_failed (sqlite code 1)"`, zero token/path leakage.
+   - Invariants: Asserts `report.goneProjects == ["gone"]` (server verdict preserved), `report.parked.isEmpty` (local failure not claimed parked), `report.stop` matches exact sanitized `"queue_park_failed (sqlite code \(SQLITE_CONSTRAINT_TRIGGER))"` (1811), zero token/path leakage.
    - Recovery: Re-arms `server.answers["gone"]` with 409 archived, drops trigger, and verifies recovery sequence: 1 initial gone + 1 recovery gone + 1 recovery `p2` (total 3 uploads), preserving `clientActivityId`. Asserts `ids[0]` parked and `ids[1]` uploaded.
 
 5. **`testSanitizedQueueErrorProducesFiniteSafeStringAndHandlesUnknownError`**:
@@ -2457,6 +2457,45 @@ Implemented deterministic isolated SQLite write-failure regressions in `clients/
 3. **No External Dependencies**: Regressions use temporary SQL triggers on disposable test databases; no real keychain, network, or OS hooks involved.
 4. **Approval-Blocked Invariant**: The unresolved `tirith:archive_extract` command remains untouched.
 5. **No Full-Product Acceptance Claim**: This deliverable completes truthful sync-persistence outcome reporting, finite error sanitization, and rearmed recovery sequence verification for macOS. Full-product acceptance, native macOS binary notarization, and live desktop verification remain open acceptance gates.
+
+---
+
+## 29. macOS SQLite Trigger Extended-Result-Code Regression Oracle Correction (selected-macos-sqlite-oracle-20261023)
+
+> **Execution Date:** October 23, 2026  
+> **Phase Task ID:** `selected-macos-sqlite-oracle-20261023` (continuation of `selected-macos-sync-sanitization-20261023`)  
+> **Status:** Implementation Complete; Source-Verified; Native Execution **UNEXECUTED** on Windows Host Toolchain (Missing Swift / macOS Runner)  
+> **Target Package:** `clients/macos` (Package: `DosiTracker`, targets: `DosiTrackerCore`, `DosiTrackerCoreTests`)  
+
+### A. Context & Bounded Oracle Defect Correction
+1. **Regression Oracle Defect**:
+   - In `clients/macos/Tests/DosiTrackerCoreTests/SyncPassTests.swift`, the four deterministic SQLite write-failure regression fixtures injected `RAISE(ABORT, ...)` triggers and expected generic SQLite error code 1 (`queue_remove_failed (sqlite code 1)`, `queue_park_failed (sqlite code 1)`, `queue_strip_failed (sqlite code 1)`).
+   - In `SQLiteDatabase.swift`, `sqlite3_extended_result_codes(handle, 1)` is enabled on every connection handle, and `SQLiteDatabase.run` forwards `sqlite3_step`'s result status unchanged to `QueueError(code: status, message: lastMessage)`.
+   - An SQLite trigger abort via `SELECT RAISE(ABORT, ...)` is an SQLite constraint failure with extended result code `SQLITE_CONSTRAINT_TRIGGER` (numeric value 1811 = `SQLITE_CONSTRAINT 19 | (7 << 8)`), not generic `SQLITE_ERROR` (1).
+   - The test oracle expectations were out of alignment with the actual extended result codes returned by system SQLite for trigger aborts.
+
+2. **Bounded Correction Applied**:
+   - Added `import SQLite3` to `clients/macos/Tests/DosiTrackerCoreTests/SyncPassTests.swift`.
+   - Corrected the four trigger expectation assertions to expect `"queue_remove_failed (sqlite code \(SQLITE_CONSTRAINT_TRIGGER))"`, `"queue_park_failed (sqlite code \(SQLITE_CONSTRAINT_TRIGGER))"`, `"queue_strip_failed (sqlite code \(SQLITE_CONSTRAINT_TRIGGER))"`, and `"queue_park_failed (sqlite code \(SQLITE_CONSTRAINT_TRIGGER))"`.
+   - Kept the oracle strictly independent of the production formatter: the expected string is not derived from `SanitizedQueueError` or `SyncPass.sanitizeQueueError`, nor weakened to substring `contains` or arbitrary numeric codes.
+   - The unit formatter test `testSanitizedQueueErrorProducesFiniteSafeStringAndHandlesUnknownError` with explicitly constructed `QueueError(code: 1, ...)` remains untouched and valid.
+   - Preserved all invariant checks: finite length $\le 64$, exclusion of raw trigger text, database paths, tokens, newlines, tabs, and control characters, no false success transitions in `report` or `RecentBlocks`, other-owner sentinels, preserved `clientActivityId`, exact rearmed recovery scripts, and recovery sequence assertions.
+   - Zero production churn: `SyncPass.swift` and `SQLiteDatabase.swift` remain untouched.
+   - Inspected test suite for read-error tests and other trigger assertions: none exist in `SyncPassTests.swift` or `QueueTests.swift`.
+
+### B. Execution Status & Quality Gates
+| Target Suite | Exact Command Line | Tests Passed | Unexecuted | Result | Evidence Level |
+|---|---|:---:|:---:|:---:|---|
+| **macOS Sync Pass Regressions** | `swift test --filter SyncPassTests` in `clients/macos` | 0 | 16 (11 existing + 5 regressions) | **UNEXECUTED** | **[Source-Only / Blocked]** (Host environment lacks Swift runtime / macOS toolchain; reported with null exits) |
+| **Linux Client Compilation Check** | `cargo check --manifest-path clients/linux/Cargo.toml` | N/A | 0 | PASSED (0 errors, 0 warnings, exit 0) | **[Worker-Reported]** |
+| **Windows Client Compilation Check** | `cargo check --manifest-path clients/windows/Cargo.toml` | N/A | 0 | PASSED (0 errors, 0 warnings, exit 0) | **[Worker-Reported]** |
+
+### C. PM QA Boundary Limits & Acceptance Disclosures
+1. **Truthful Regression Expectations**: Corrected trigger failure assertions from generic code 1 to exact named constant `SQLITE_CONSTRAINT_TRIGGER` (1811) matching system SQLite behavior under `sqlite3_extended_result_codes`.
+2. **Host Toolchain Gap**: Windows host lacks Swift runtime; all Swift tests remain **UNEXECUTED** (null exits/counts).
+3. **Approval-Blocked Invariant**: The unresolved `tirith:archive_extract` command remains untouched.
+4. **No Full-Product Acceptance Claim**: This deliverable completes the oracle correction for SQLite trigger extended result codes. Full-product acceptance, native macOS binary notarization, and live desktop verification remain open acceptance gates.
+
 
 
 
