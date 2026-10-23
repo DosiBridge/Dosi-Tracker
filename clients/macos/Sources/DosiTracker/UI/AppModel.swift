@@ -82,6 +82,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var inputCapture: InputCaptureState = .stopped
     @Published private(set) var loginItem: LoginItemState
     @Published private(set) var goals: Goals
+    @Published private(set) var localConsent: LocalConsent = .absent
     @Published var selectedTab: MainTab = .timer
     /// A short-lived message (e.g. "Could not open the browser").
     @Published private(set) var message: String?
@@ -90,6 +91,7 @@ final class AppModel: ObservableObject {
     let worker: TrackerWorker
     let device: DeviceInfo
     let paths: AppPaths
+    let consentManager: ConsentManager
     private let configSource: ConfigSource
     private let preferences: Preferences
     private let input: InputLog
@@ -108,6 +110,7 @@ final class AppModel: ObservableObject {
         self.worker = worker
         device = services.device
         paths = services.paths
+        consentManager = services.consentManager
         configSource = services.configSource
         preferences = services.preferences
         input = services.input
@@ -117,6 +120,7 @@ final class AppModel: ObservableObject {
         permissions = Permissions.status()
         loginItem = LoginItem.state
         goals = services.preferences.goals
+        localConsent = services.consentManager.current
     }
 
     /// Read the permissions and the login item now and every few seconds (the
@@ -156,6 +160,7 @@ final class AppModel: ObservableObject {
         guard next.revision > snapshot.revision else { return }
         let old = snapshot
         snapshot = next
+        localConsent = next.localConsent
         if pendingAction == .pausing && next.status.isPaused {
             pendingAction = nil
         } else if pendingAction == .resuming && !next.status.isPaused {
@@ -172,6 +177,32 @@ final class AppModel: ObservableObject {
             notifier.post(id: "notice-\(notice.id)", title: AgentInfo.displayName, body: notice.text)
         }
         onSnapshotChange?(old, next)
+    }
+
+    // MARK: Consent
+
+    func updateConsent(permissions: ConsentedPermissions) {
+        let worker = self.worker
+        Task {
+            do {
+                try await worker.updateConsent(.granted(permissions))
+                settingsError = nil
+            } catch {
+                settingsError = "Could not save consent: \(error)"
+            }
+        }
+    }
+
+    func revokeConsent() {
+        let worker = self.worker
+        Task {
+            do {
+                try await worker.updateConsent(.revoked)
+                settingsError = nil
+            } catch {
+                settingsError = "Could not save consent revocation: \(error)"
+            }
+        }
     }
 
     // MARK: Commands

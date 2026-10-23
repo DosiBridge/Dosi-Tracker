@@ -137,6 +137,13 @@ struct CaptureFlags: Equatable, Sendable {
                   runningPrograms: permissions.runningPrograms, blurScreenshots: session.blurScreenshots)
     }
 
+    /// The flags of consented permissions.
+    init(consented: ConsentedPermissions) {
+        self.init(screenshot: consented.screenshot, webcam: consented.webcam, keyboard: consented.keyboard,
+                  mouse: consented.mouse, activeWindow: consented.activeWindow,
+                  runningPrograms: consented.runningPrograms, blurScreenshots: consented.blurScreenshots)
+    }
+
     /// Nothing known yet (no project). Not named `none`, which would read as
     /// `Optional.none`.
     static let nothing = CaptureFlags(screenshot: false, webcam: false, keyboard: false, mouse: false,

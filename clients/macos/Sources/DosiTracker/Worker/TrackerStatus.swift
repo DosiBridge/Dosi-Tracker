@@ -145,6 +145,7 @@ struct StatusFacts: Equatable, Sendable {
     /// Asleep, or the session is ending (shutdown, restart, log out).
     var suspended = false
     var away = false
+    var consentGranted = false
     var tracking = false
 
     var status: TrackerStatus {
@@ -165,6 +166,9 @@ struct StatusFacts: Equatable, Sendable {
                 return .choosingProject
             }
             return contacting ? .connecting : .offline
+        }
+        if !consentGranted {
+            return .stopped("Consent required")
         }
         if suspended {
             return .asleep

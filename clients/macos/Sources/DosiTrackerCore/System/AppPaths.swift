@@ -51,6 +51,9 @@ public struct AppPaths: Equatable, Sendable {
     /// The current log file; rotated copies sit next to it.
     public var logFile: URL { logs.appendingPathComponent("dosi-tracker.log", isDirectory: false) }
 
+    /// The affirmative local consent state file.
+    public var consentFile: URL { applicationSupport.appendingPathComponent("consent.json", isDirectory: false) }
+
     /// Create both folders (user-only access).
     public func createDirectories(fileManager: FileManager = .default) throws {
         let attributes: [FileAttributeKey: Any] = [.posixPermissions: 0o700]

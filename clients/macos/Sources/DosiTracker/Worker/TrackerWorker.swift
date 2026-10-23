@@ -22,6 +22,7 @@ actor TrackerWorker {
         var credentials: any CredentialsStore
         var preferences: Preferences
         var projectCache: ProjectCacheStore
+        var consentManager: ConsentManager
         var device: DeviceInfo
         var input: InputLog
         var usage: UsageRecorder
@@ -36,6 +37,8 @@ actor TrackerWorker {
         /// Whether window titles may be read (the tracked project records the
         /// active window).
         var setReadsWindowTitles: @Sendable (Bool) -> Void
+        /// Synchronously configure driver states according to effective per-capability consent.
+        var applyDriverPolicy: @Sendable (ConsentedPermissions) -> Void = { _ in }
         /// Receives every new snapshot (from the worker's executor).
         var publish: @Sendable (TrackerSnapshot) -> Void
         var now: @Sendable () -> Date = { Date() }
@@ -172,8 +175,13 @@ actor TrackerWorker {
 
     // Blocks and captures.
     private var blocks = BlockTimeline()
-    /// Screenshots taken for blocks not queued yet.
-    private var completedScreens: [Int: ScreenCapture] = [:]
+    private struct StampedScreen: Sendable {
+        let screen: ScreenCapture
+        let generation: UInt64
+    }
+    /// Screenshots taken for blocks not queued yet, with lifecycle generation ticket.
+    private var completedScreens: [Int: StampedScreen] = [:]
+    private var lifecycleGeneration: UInt64 = 1
     /// Screenshots being taken.
     private var captureTasks: [Int: Task<Void, Never>] = [:]
     /// Finished blocks waiting to be built and queued, oldest first.
@@ -466,15 +474,25 @@ actor TrackerWorker {
 
     // MARK: - Tracking on or off
 
+    private var currentEffectivePermissions: ConsentedPermissions {
+        guard shouldTrack, let current = session else { return .allDisabled }
+        return deps.consentManager.effectivePermissions(project: current.project.allowedCaptures)
+    }
+
     private var shouldTrack: Bool {
         queue != nil && account != nil && !expired && session != nil && pauseRecord == nil && away == nil
             && !locked && !disconnected && suspended == nil && shuttingDown == nil && !quitting
+            && deps.consentManager.current.isGranted
+            && deps.consentManager.current.permissions.hasAnyActiveCapability
     }
 
     /// Start or stop the stretch to match the facts; a stop ends the block at
     /// `moment` by `reason`.
     private func reconcile(at moment: Date, reason: EndReason) {
         let now = deps.now()
+        let effective = currentEffectivePermissions
+        deps.applyDriverPolicy(effective)
+
         if shouldTrack {
             guard !blocks.isOpen, let current = session else { return }
             blocks.start(at: min(moment, now), policy: BlockPolicy(session: current), description: taskNote,
@@ -487,6 +505,11 @@ actor TrackerWorker {
             let finished = blocks.end(at: moment, now: now, reason: reason)
             record(finished, speed: Speed.forReason(reason))
         }
+    }
+
+    /// Synchronously signal drivers to stop immediately before any long operations or waits.
+    private func stopDriversNow() {
+        deps.applyDriverPolicy(.allDisabled)
     }
 
     // MARK: - Recording
@@ -510,7 +533,7 @@ actor TrackerWorker {
             // after the upload, replace the estimate.
             addEstimate(start: block.startedAt, end: block.endedAt, sign: 1, now: now)
             if speed == .fast {
-                if commit(assemble(job, screen: screen(for: block), webcam: nil, windowNow: nil), job: job, now: now) {
+                if commit(assemble(job, screen: screen(for: block), webcam: nil, windowNow: nil, effective: currentEffectivePermissions), job: job, now: now) {
                     queuedFast = true
                 }
                 releaseScreen(block.id)
@@ -577,7 +600,7 @@ actor TrackerWorker {
         for job in pending {
             let fast = RecordJob(block: job.block, speed: .fast, owner: job.owner, projectTitle: job.projectTitle,
                                  late: job.late)
-            if commit(assemble(fast, screen: screen(for: job.block), webcam: nil, windowNow: nil), job: fast, now: now) {
+            if commit(assemble(fast, screen: screen(for: job.block), webcam: nil, windowNow: nil, effective: currentEffectivePermissions), job: fast, now: now) {
                 queued = true
             }
             captureTasks[job.block.id]?.cancel()
@@ -594,41 +617,42 @@ actor TrackerWorker {
     /// may take one at the end), its webcam photo, and the window in front.
     private func buildPayload(_ job: RecordJob) async -> ActivityPayload {
         let block = job.block
+        let currentEffective = currentEffectivePermissions
         if completedScreens[block.id] == nil, let pending = captureTasks[block.id] {
             await pending.value
         }
         var shot = screen(for: block)
         let policy = block.policy
-        if shot == nil && !job.late && block.captureAtEnd && policy.permissions.screenshot
-            && block.endReason.allowsCaptureAtEnd {
-            shot = await captureScreenNow(blur: policy.blurScreenshots)
+        if shot == nil && !job.late && block.captureAtEnd && currentEffective.screenshot
+            && policy.permissions.screenshot && block.endReason.allowsCaptureAtEnd {
+            shot = await captureScreenNow(blur: currentEffective.blurScreenshots || policy.blurScreenshots)
         }
         var photo: Data?
-        if policy.permissions.webcam && !job.late && block.endReason.allowsCaptureAtEnd {
+        if currentEffective.webcam && policy.permissions.webcam && !job.late && block.endReason.allowsCaptureAtEnd {
             photo = await capturePhotoNow()
         }
-        // The window in front now is the block's last one — unless the block
-        // ended long ago.
+        // The window in front now is the block's last one — gated on current effective permission
         var windowNow: ForegroundWindow?
-        if !job.late {
+        if !job.late && currentEffective.activeWindow && policy.permissions.activeWindow {
             windowNow = await deps.foreground.currentWindow()
         }
-        return assemble(job, screen: shot, webcam: photo, windowNow: windowNow)
+        return assemble(job, screen: shot, webcam: photo, windowNow: windowNow, effective: currentEffective)
     }
 
     /// Measure and assemble the payload of `job` over its own window only
     /// (the core's `BlockAssembler`, identical to the Windows agent's).
     private func assemble(_ job: RecordJob, screen shot: ScreenCapture?, webcam: Data?,
-                          windowNow: ForegroundWindow?) -> ActivityPayload {
+                          windowNow: ForegroundWindow?, effective: ConsentedPermissions) -> ActivityPayload {
         let block = job.block
         var permissions = block.policy.permissions
         if job.speed == .fast || job.late {
             permissions.webcam = false
         }
         let spec = BlockSpec(projectId: block.policy.projectId, permissions: permissions,
-                             blurScreenshots: block.policy.blurScreenshots, startedAt: block.startedAt,
-                             endedAt: block.endedAt, endReason: block.endReason, taskNote: block.description)
-        let programs = permissions.runningPrograms ? deps.running.runningProgramNames() : []
+                             blurScreenshots: effective.blurScreenshots || block.policy.blurScreenshots,
+                             startedAt: block.startedAt, endedAt: block.endedAt, endReason: block.endReason,
+                             taskNote: block.description)
+        let programs = (effective.runningPrograms && permissions.runningPrograms) ? deps.running.runningProgramNames() : []
         let measured = BlockAssembler.measure(spec, input: deps.input, usage: deps.usage, windowNow: windowNow,
                                               runningPrograms: programs, screen: shot, webcamJpeg: webcam)
         return BlockAssembler.build(spec, measured: measured, device: deps.device,
@@ -683,9 +707,12 @@ actor TrackerWorker {
     /// The screenshot moment of block `id` has come: take it now.
     private func startCapture(_ id: Int) {
         guard let stretch = blocks.stretch else { return }
-        let blur = stretch.block.policy.blurScreenshots
+        let currentEffective = currentEffectivePermissions
+        guard currentEffective.screenshot && stretch.block.policy.permissions.screenshot else { return }
+        let blur = currentEffective.blurScreenshots || stretch.block.policy.blurScreenshots
         blocks.markCaptured(id)
         let capturer = deps.screen
+        let gen = lifecycleGeneration
         captureTasks[id] = Task {
             var shot: ScreenCapture?
             do {
@@ -693,25 +720,26 @@ actor TrackerWorker {
             } catch {
                 CoreLog.warning("worker", "screen capture failed: \(error)")
             }
-            await self.captureFinished(id, shot)
+            await self.captureFinished(id, shot, generation: gen)
         }
     }
 
-    private func captureFinished(_ id: Int, _ shot: ScreenCapture?) {
+    private func captureFinished(_ id: Int, _ shot: ScreenCapture?, generation gen: UInt64) {
         captureTasks[id] = nil
-        guard let shot = shot, isLive(id) else { return }
-        completedScreens[id] = shot
+        guard let shot = shot, isLive(id), gen == lifecycleGeneration else { return }
+        completedScreens[id] = StampedScreen(screen: shot, generation: gen)
     }
 
     /// The block's own screenshot, if one was taken in time: one taken after
     /// its end (e.g. after an idle cut) shows time that is not in it.
     private func screen(for block: FinishedBlock) -> ScreenCapture? {
-        guard let shot = completedScreens[block.id],
-              shot.capturedAt <= block.endedAt.addingTimeInterval(WorkerRules.captureSlack)
+        guard let stamped = completedScreens[block.id],
+              stamped.generation == lifecycleGeneration,
+              stamped.screen.capturedAt <= block.endedAt.addingTimeInterval(WorkerRules.captureSlack)
         else {
             return nil
         }
-        return shot
+        return stamped.screen
     }
 
     private func captureScreenNow(blur: Bool) async -> ScreenCapture? {
@@ -952,10 +980,12 @@ actor TrackerWorker {
         let moment = event.at
         switch event.kind {
         case .screenLocked:
+            stopDriversNow()
             locked = true
             freezeAway(at: moment)
             reconcile(at: moment, reason: .lock)
         case .sessionDidResignActive:
+            stopDriversNow()
             disconnected = true
             freezeAway(at: moment)
             reconcile(at: moment, reason: .lock)
@@ -966,6 +996,7 @@ actor TrackerWorker {
             disconnected = false
             backAtComputer(at: moment)
         case .willSleep:
+            stopDriversNow()
             if suspended == nil {
                 suspended = moment
             }
@@ -980,6 +1011,7 @@ actor TrackerWorker {
                 uploader?.send(.rowsQueued)
             }
         case .willPowerOff:
+            stopDriversNow()
             if shuttingDown == nil {
                 shuttingDown = moment
                 freezeAway(at: moment)
@@ -1164,6 +1196,7 @@ actor TrackerWorker {
     /// a while, in the background).
     func signOut(at moment: Date) async {
         guard queue != nil, !quitting else { return }
+        stopDriversNow()
         let now = deps.now()
         let leaving = account
         if let leaving = leaving {
@@ -1261,6 +1294,7 @@ actor TrackerWorker {
     /// pause survives a restart.
     func pause(resumeAfter: TimeInterval?, at moment: Date) {
         guard queue != nil, !quitting, account != nil, !expired else { return }
+        stopDriversNow()
         userActed(at: moment)
         let until = resumeAfter.map { moment.addingTimeInterval($0) }
         if let current = pauseRecord {
@@ -1386,6 +1420,7 @@ actor TrackerWorker {
     func quit(at moment: Date, systemShutdown: Bool) async {
         guard !quitting else { return }
         quitting = true
+        stopDriversNow()
         tickTask?.cancel()
         let started = deps.now()
         let finished = blocks.end(at: moment, now: started, reason: systemShutdown ? .shutdown : .quit)
@@ -1410,6 +1445,33 @@ actor TrackerWorker {
             }
         }
         await uploader?.finish(until: started.addingTimeInterval(AgentTiming.quitSyncBudget))
+    }
+
+    /// Update local affirmative consent and reconcile active collection drivers immediately.
+    func updateConsent(_ next: LocalConsent) async throws {
+        var updateError: Error?
+        let changed: Bool
+        do {
+            changed = try deps.consentManager.update(next)
+        } catch {
+            updateError = error
+            changed = true
+        }
+
+        if changed {
+            lifecycleGeneration &+= 1
+            for (_, task) in captureTasks {
+                task.cancel()
+            }
+            captureTasks.removeAll()
+            completedScreens.removeAll()
+            reconcile(at: deps.now(), reason: .interval)
+            publish()
+        }
+
+        if let err = updateError {
+            throw err
+        }
     }
 
     // MARK: - What the uploader reports
@@ -1719,6 +1781,7 @@ actor TrackerWorker {
         facts.locked = locked || disconnected
         facts.suspended = suspended != nil || shuttingDown != nil
         facts.away = away != nil
+        facts.consentGranted = deps.consentManager.current.isGranted && deps.consentManager.current.permissions.hasAnyActiveCapability
         facts.tracking = blocks.isOpen
         return facts
     }
@@ -1745,6 +1808,8 @@ actor TrackerWorker {
         next.intervalMinutes = session.map { WorkerRules.minutes($0.interval) } ?? config.intervalMinutes
         next.idleThresholdMinutes = session.flatMap { $0.idleThreshold > 0 ? WorkerRules.minutes($0.idleThreshold) : nil }
         next.capture = session.map { CaptureFlags(session: $0) } ?? CaptureFlags.nothing
+        next.localConsent = deps.consentManager.current
+        next.effectiveCapture = CaptureFlags(consented: currentEffectivePermissions)
         next.taskNote = taskNote ?? ""
         next.serverReachable = reachable
         next.serverURLIsManaged = config.serverURLIsManaged

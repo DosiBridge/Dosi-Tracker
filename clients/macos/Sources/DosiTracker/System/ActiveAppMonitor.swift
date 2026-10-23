@@ -92,6 +92,13 @@ public final class ActiveAppMonitor: ForegroundWindowSource, @unchecked Sendable
         sampler.resume()
     }
 
+    /// Whether the monitor is currently running.
+    public var isRunning: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return timer != nil
+    }
+
     /// Stop following and sampling.
     public func stop() {
         lock.lock()
@@ -99,6 +106,7 @@ public final class ActiveAppMonitor: ForegroundWindowSource, @unchecked Sendable
         let token = observer
         timer = nil
         observer = nil
+        front = nil
         lock.unlock()
         sampler?.cancel()
         if let token = token {
@@ -132,7 +140,12 @@ public final class ActiveAppMonitor: ForegroundWindowSource, @unchecked Sendable
 
     /// The app and window in front now, read on the sampler queue.
     public func currentWindow() async -> ForegroundWindow? {
-        await withCheckedContinuation { continuation in
+        lock.lock()
+        let running = timer != nil
+        lock.unlock()
+        guard running else { return nil }
+
+        return await withCheckedContinuation { continuation in
             queue.async { [weak self] in
                 continuation.resume(returning: self?.readWindow())
             }

@@ -313,26 +313,62 @@ public final class InputFilter: @unchecked Sendable {
 
     private let log: InputLog
     private let lock = NSLock()
+    private var allowedKeyboard: Bool
+    private var allowedMouse: Bool
     /// Per key: when its latest down (or repeat) arrived, Unix ms. Absent
     /// while the key is up.
     private var keyDownAt: [Int: Int64] = [:]
 
-    public init(log: InputLog) {
+    public init(log: InputLog, keyboard: Bool = true, mouse: Bool = true) {
         self.log = log
+        self.allowedKeyboard = keyboard
+        self.allowedMouse = mouse
+    }
+
+    /// Set current affirmative input capture permissions.
+    public func setPermissions(keyboard: Bool, mouse: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        allowedKeyboard = keyboard
+        allowedMouse = mouse
+        if !keyboard {
+            keyDownAt.removeAll()
+        }
+    }
+
+    /// The currently admitted input kinds.
+    public var permissions: (keyboard: Bool, mouse: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (allowedKeyboard, allowedMouse)
     }
 
     /// Count one event at `atMs` (Unix ms).
     public func apply(_ input: RawInput, injected: Bool, atMs ms: Int64) {
+        lock.lock()
+        let kbAllowed = allowedKeyboard
+        let mouseAllowed = allowedMouse
+        lock.unlock()
+
+        let isKb: Bool
+        switch input {
+        case .keyDown, .keyRepeat, .keyUp:
+            isKb = true
+        case .buttonDown, .buttonUp, .move, .wheel:
+            isKb = false
+        }
+
+        // Native admission gating: drop unconsented events before recording or waking health
+        if isKb && !kbAllowed { return }
+        if !isKb && !mouseAllowed { return }
+
         log.sawEvent(atMs: ms)
         if injected {
             // Seen, reported, never counted as the user's input.
-            switch input {
-            case .keyDown, .keyRepeat:
+            if isKb {
                 log.recordInjected(keyboard: true, atMs: ms)
-            case .buttonDown, .move, .wheel:
+            } else {
                 log.recordInjected(keyboard: false, atMs: ms)
-            case .keyUp, .buttonUp:
-                break
             }
             return
         }

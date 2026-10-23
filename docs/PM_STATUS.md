@@ -2304,3 +2304,77 @@ Under Task ID `selected-status-prescan-correction-20261023`, we resolved the sou
 3. **Host Toolchain vs Native Linux Evidence Separation**: All tests were executed on Windows host MSVC and Git-Bash toolchains. This does **NOT** constitute independent PM acceptance or native Linux kernel/libc runtime verification.
 4. **No Background Daemon or Network**: The Linux client remains offline with no background daemons, autostart, or native sensor capture hooks active.
 
+---
+
+## 27. macOS Affirmative Local Consent, Acquisition Driver Lifecycle & Provenance Gating (selected-macos-consent-lifecycle-20261023)
+
+> **Execution Date:** October 23, 2026  
+> **Phase Task ID:** `selected-macos-consent-lifecycle-20261023`  
+> **Status:** Implementation Complete; Source-Verified; Native Execution **UNEXECUTED** on Windows Host Toolchain (Missing Swift / macOS Runner)  
+> **Target Package:** `clients/macos` (Package: `DosiTracker`, targets: `DosiTrackerCore`, `DosiTracker`, `DosiTrackerCoreTests`, `DosiTrackerTests`)  
+
+### A. Context & Source-Confirmed Gap Resolution
+Under Task ID `selected-macos-consent-lifecycle-20261023`, we resolved the source-confirmed missing admission and acquisition lifecycle controls in the macOS Swift client architecture:
+1. **Explicit Local Consent Persistence (`LocalConsent`, `ConsentedPermissions`)**:
+   - Greenfield `Consent.swift` in `DosiTrackerCore`: Strict default-deny schema where all capability permissions (`screenshot`, `webcam`, `keyboard`, `mouse`, `activeWindow`, `runningPrograms`) default to `false` and `blurScreenshots` defaults to `true`.
+   - `LocalConsent` enum (`absent`, `granted(ConsentedPermissions)`, `revoked`). Default-deny decoding fails closed on absent, invalid, or unreadable files.
+   - Formula: `Effective = LocalConsent ∩ ProjectPolicy ∩ LifecycleState` (active tracking, signed in, screen unlocked, session active, system awake, non-quitting).
+   - Atomic disk persistence via `FileConsentStore` using POSIX 0700 directories, ephemeral staging files, and atomic replacement via `FileManager.replaceItemAt`.
+   - Dedicated `MemoryConsentStore` with fault injection and barrier callbacks for deterministic regression verification without touching real AppSupport.
+
+2. **Persistence Ordering & Strict Privacy Invariants**:
+   - Monotonic narrowing: Removed capabilities and tightened blur (`blurScreenshots` false -> true) apply **immediately** in-memory before disk I/O, guaranteeing that slow or failing disk saves never prolong denied collection.
+   - Conservative intersection: Mixed updates (e.g. withdraw mouse + add active window) apply conservative intersection in-memory prior to save.
+   - Persistence-first widening: Added capabilities are admitted **only after** successful disk persistence.
+   - Fail-closed error preservation: Disk save failures keep narrowed permissions in effect; unpersisted expansions are never granted; generation tickets advance only on genuine consent state mutations (identical updates do not manufacture invalidation).
+
+3. **Driver Lifecycle Detachment & Hardware Admission Gating**:
+   - `AgentServices.start()` no longer starts `ActiveAppMonitor` or `InputMonitor` unconditionally at startup. Only non-collection system event monitoring (`systemEvents.start()`) starts at launch.
+   - Gated driver lifecycle in `InputMonitor`: `setPermissions(keyboard:mouse:)` attaches/detaches event tap threads dynamically. If both permissions are false, tap is not created and capture state reports `stopped`. The watchdog thread checks permissions before attempting reattachment, preventing hook resurrection.
+   - Gated admission in `InputFilter`: Native admission check drops unpermitted keyboard or mouse events at entry, preventing `log.sawEvent`, keypress/click recording, held key state mutation, or activity seconds accumulation.
+   - Gated `ActiveAppMonitor`: `currentWindow()` checks `isRunning` before querying Accessibility or AppKit frontmost application. When stopped, returns `nil` without performing OS queries.
+   - Immediate driver shutdown: `TrackerWorker.stopDriversNow()` executes synchronously upon `pause`, `signOut`, `quit`, screen lock, session resignation, sleep, and power-off before any network waits (heartbeats, uploader finish) or persistence I/O.
+
+4. **Acquisition Boundary Gating & Provenance Ticket Invalidation**:
+   - `TrackerWorker` entry points (`startCapture`, `captureScreenNow`, `capturePhotoNow`, `currentWindow()`, `runningProgramNames()`) verify current effective authorization immediately prior to provider invocation.
+   - Generation stamping: In-flight screen captures are tagged with `lifecycleGeneration`. If consent changes or is revoked while a capture task is in-flight, `screen(for:)` discards the stale sample upon arrival.
+   - Truthful metric reporting: Discarded samples are never fabricated as measured zero; unconsented or unavailable metrics remain truthful `nil`.
+   - Historical record preservation: Previously captured and authorized activity records are preserved in queue databases without deleting user queues upon consent withdrawal.
+
+5. **UI & User Controls**:
+   - Added visible granular consent card in `SettingsTab.swift` with per-capability toggles for keyboard, mouse, active window, running programs, screenshots (with optional blur), and webcam, plus explicit Opt-In / Grant and Revoke actions.
+   - Real-time binding via `AppModel.updateConsent(permissions:)` and `AppModel.revokeConsent()`, reflecting persistence errors honestly to the user without restoring withdrawn capture.
+
+### B. Core & Lifecycle Regression Suites (11 Isolated Tests)
+Implemented 11 production-path regression tests across two test suites with injected fake drivers, test doubles, and isolated temporary storage:
+
+1. **`DosiTrackerCoreTests.ConsentLifecycleTests` (6 Tests)**:
+   - `testDefaultConsentIsAbsentAndFailsClosed`: Verifies absent consent defaults to all disabled, failing closed against permissive project policy.
+   - `testMalformedJsonFileFailsClosed`: Verifies corrupted or invalid JSON in storage fails closed to `.absent` and zero effective permissions.
+   - `testPerInputCapabilityNativeAdmissionGating`: Proves `InputFilter` native admission gating for both-disabled, keyboard-only, and mouse-only modes, asserting zero event leakage.
+   - `testSuccessfulOptInAndRevocationFilePersistence`: Proves atomic file persistence and reload for explicit grant and revocation.
+   - `testPureWideningSaveFailureDoesNotAdmitPermissions`: Proves persistence-first widening: save failure leaves runtime in absent/fail-closed state.
+   - `testMixedChangeAppliesNarrowingBeforeBlockedSaveAndPreservesItOnSaveError`: Proves conservative intersection and tightened blur apply in-memory before save barrier, and remain enforced following simulated disk save failure.
+   - `testIdenticalPolicyDoesNotAdvanceGenerationTicket`: Proves generation tickets remain stable under identical updates and advance only on genuine mutations.
+
+2. **`DosiTrackerTests.WorkerConsentLifecycleTests` (5 Tests)**:
+   - `testAbsentConsentPreventsStartAndKeepsDriversStopped`: Proves `TrackerWorker` with absent consent does not activate sensor drivers.
+   - `testProjectPolicyDenyRestrictsEffectivePermissions`: Proves project policy denial restricts effective permissions even when local user granted consent.
+   - `testPauseSignoutLockSleepQuitImmediatelyStopsDrivers`: Proves synchronous immediate driver stopping on pause, lock, sleep, and signout, and safe restoration on resume, unlock, and wake.
+   - `testDenialRetryCannotReattach`: Proves revocation stops drivers and subsequent system event ticks/retries cannot reattach.
+   - `testRevokeRegrantInvalidatesStaleCaptureResults`: Proves generation ticket invalidation drops stale in-flight capture results while preserving unrelated retained capabilities.
+
+### C. Execution Status & Quality Gates
+| Target Suite | Exact Command Line | Tests Passed | Unexecuted | Result | Evidence Level |
+|---|---|:---:|:---:|:---:|---|
+| **macOS Core Consent Suite** | `swift test --filter ConsentLifecycleTests` in `clients/macos` | 0 | 6 | **UNEXECUTED** | **[Source-Only / Blocked]** (Host environment lacks Swift runtime / macOS toolchain) |
+| **macOS Worker Lifecycle Suite**| `swift test --filter WorkerConsentLifecycleTests` in `clients/macos` | 0 | 5 | **UNEXECUTED** | **[Source-Only / Blocked]** (Host environment lacks Swift runtime / macOS toolchain) |
+| **Linux Client Quality Gate** | `cargo check --manifest-path clients/linux/Cargo.toml` | N/A | 0 | PASSED (0 errors, 0 warnings) | **[Worker-Reported]** |
+
+### D. PM QA Boundary Limits & Acceptance Disclosures
+1. **Host Toolchain Gap**: Current Windows operator environment does not contain the `swift` compiler or macOS toolchain. Tests were written against the production architecture and test targets defined in `Package.swift`, but are explicitly marked as **UNEXECUTED**. They must be run on a macOS CI runner or development machine (`swift test`).
+2. **No Hardware Sensor Invocation**: Test harnesses use `TestScreenCapturer`, `TestWebcamCapturer`, `TestForegroundSource`, `TestRunningPrograms`, `TestIdleSource`, and `DriverPolicyRecorder`. No real Quartz event taps, ScreenCaptureKit sessions, AVFoundation devices, or Accessibility queries were started.
+3. **Approval-Blocked Invariant**: The unresolved `tirith:archive_extract` command remains untouched and was not retried or bypassed.
+4. **No Full-Product Acceptance Claim**: This deliverable completes the affirmative local consent and driver lifecycle architecture slice for macOS. Full-product acceptance, native macOS binary notarization, and live desktop verification remain open acceptance gates.
+
+

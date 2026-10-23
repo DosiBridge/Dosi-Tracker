@@ -17,6 +17,7 @@ final class AgentServices {
     let device: DeviceInfo
     let credentials: KeychainCredentialsStore
     let projectCache: ProjectCacheStore
+    let consentManager: ConsentManager
 
     let input: InputLog
     let usage: UsageRecorder
@@ -36,6 +37,13 @@ final class AgentServices {
         credentials = KeychainCredentialsStore()
         projectCache = ProjectCacheStore()
 
+        let consentStore = FileConsentStore(fileURL: paths.consentFile)
+        let (manager, error) = ConsentManager.loadOrFailClosed(store: consentStore)
+        if let err = error {
+            CoreLog.warning("consent", "Consent failed closed on load: \(err)")
+        }
+        consentManager = manager
+
         let inputLog = InputLog()
         let usageRecorder = UsageRecorder()
         let frontApp = ActiveAppMonitor(usage: usageRecorder)
@@ -53,12 +61,10 @@ final class AgentServices {
         systemEvents = SystemEvents()
     }
 
-    /// Start listening. The event tap does not ask for Input Monitoring by
-    /// itself: the app asks once a project needs keyboard or mouse activity.
+    /// Start listening for non-collection system events (lock, sleep, power).
+    /// Native collection drivers (ActiveAppMonitor, InputMonitor) remain stopped
+    /// by default until affirmative consent, active policy, and tracking state permit them.
     func start() {
-        activeApp.readsWindowTitles = false
-        activeApp.start()
-        inputMonitor.start(requestingPermission: false)
         systemEvents.start()
     }
 
@@ -71,12 +77,14 @@ final class AgentServices {
     /// The worker's dependencies; `publish` receives every snapshot.
     func workerDependencies(publish: @escaping @Sendable (TrackerSnapshot) -> Void) -> TrackerWorker.Dependencies {
         let frontApp = activeApp
+        let inMonitor = inputMonitor
         return TrackerWorker.Dependencies(
             paths: paths,
             configSource: configSource,
             credentials: credentials,
             preferences: preferences,
             projectCache: projectCache,
+            consentManager: consentManager,
             device: device,
             input: input,
             usage: usage,
@@ -88,6 +96,21 @@ final class AgentServices {
             hardwareIdle: IdleMonitor(stateID: .hidSystemState),
             setReadsWindowTitles: { reads in
                 frontApp.readsWindowTitles = reads
+            },
+            applyDriverPolicy: { @Sendable perms in
+                inMonitor.setPermissions(keyboard: perms.keyboard, mouse: perms.mouse)
+                if perms.keyboard || perms.mouse {
+                    inMonitor.start(requestingPermission: false)
+                } else {
+                    inMonitor.stop()
+                }
+                if perms.activeWindow {
+                    frontApp.readsWindowTitles = true
+                    frontApp.start()
+                } else {
+                    frontApp.readsWindowTitles = false
+                    frontApp.stop()
+                }
             },
             publish: publish
         )

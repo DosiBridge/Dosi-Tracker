@@ -72,6 +72,19 @@ public final class InputMonitor: @unchecked Sendable {
         stop()
     }
 
+    /// Set current affirmative input capture permissions.
+    public func setPermissions(keyboard: Bool, mouse: Bool) {
+        filter.setPermissions(keyboard: keyboard, mouse: mouse)
+        lock.lock()
+        let allowed = keyboard || mouse
+        let isRunning = (current != nil)
+        lock.unlock()
+
+        if !allowed && isRunning {
+            stop()
+        }
+    }
+
     /// The capture's state now.
     public var state: InputCaptureState {
         lock.lock()
@@ -94,6 +107,11 @@ public final class InputMonitor: @unchecked Sendable {
     ///   is then created once the permission is granted.
     public func start(requestingPermission: Bool = true) {
         lock.lock()
+        let perms = filter.permissions
+        guard perms.keyboard || perms.mouse else {
+            lock.unlock()
+            return
+        }
         guard current == nil else {
             lock.unlock()
             return
@@ -240,6 +258,12 @@ private final class TapThread: @unchecked Sendable {
     private func attach() {
         let now = EpochTime.milliseconds(Date())
         lastAttemptMs = now
+        let perms = filter.permissions
+        guard perms.keyboard || perms.mouse else {
+            log.markCaptureUnavailable(sinceMs: now)
+            report(.stopped)
+            return
+        }
         let access = Permissions.inputMonitoringState()
         guard access != .notDetermined || requestsPermission else {
             // Never asked, and the app asks itself: creating the tap now
@@ -290,6 +314,15 @@ private final class TapThread: @unchecked Sendable {
     /// withdrawn permission, and run the watchdog.
     private func check() {
         let now = EpochTime.milliseconds(Date())
+        let perms = filter.permissions
+        guard perms.keyboard || perms.mouse else {
+            if tap != nil {
+                detach()
+                log.markCaptureUnavailable(sinceMs: now)
+                report(.stopped)
+            }
+            return
+        }
         guard let port = tap else {
             attach()
             return

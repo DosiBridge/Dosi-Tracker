@@ -20,6 +20,7 @@ struct SettingsTab: View {
             }
             generalCard
             goalsCard
+            consentCard
             permissionsCard
             policyCard
             deviceCard
@@ -91,6 +92,141 @@ struct SettingsTab: View {
             Text("Weekly goal: \(Formatting.hoursLabel(goals.weeklySeconds / 3600)). Goals are personal and only shown on this Mac.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: Local Consent
+
+    private var consentCard: some View {
+        let consent = model.localConsent
+        let perms = consent.permissions
+        let trailingBadge: String = {
+            switch consent {
+            case .granted: return "Opted In"
+            case .revoked: return "Revoked"
+            case .absent: return "Not Consented"
+            }
+        }()
+
+        return Card("Local Consent & Data Collection", trailing: trailingBadge) {
+            settingRow("Keyboard Activity", "Record hardware keypress counts (never what you type).") {
+                Toggle("", isOn: Binding(
+                    get: { perms.keyboard },
+                    set: { val in
+                        var next = perms
+                        next.keyboard = val
+                        model.updateConsent(permissions: next)
+                    }
+                ))
+                .toggleStyle(.switch)
+                .labelsHidden()
+            }
+            Divider()
+            settingRow("Mouse Activity", "Record mouse clicks, scroll and movement counts.") {
+                Toggle("", isOn: Binding(
+                    get: { perms.mouse },
+                    set: { val in
+                        var next = perms
+                        next.mouse = val
+                        model.updateConsent(permissions: next)
+                    }
+                ))
+                .toggleStyle(.switch)
+                .labelsHidden()
+            }
+            Divider()
+            settingRow("Active Window & App", "Record which application and window title was active.") {
+                Toggle("", isOn: Binding(
+                    get: { perms.activeWindow },
+                    set: { val in
+                        var next = perms
+                        next.activeWindow = val
+                        model.updateConsent(permissions: next)
+                    }
+                ))
+                .toggleStyle(.switch)
+                .labelsHidden()
+            }
+            Divider()
+            settingRow("Running Programs", "Record names of active running desktop applications.") {
+                Toggle("", isOn: Binding(
+                    get: { perms.runningPrograms },
+                    set: { val in
+                        var next = perms
+                        next.runningPrograms = val
+                        model.updateConsent(permissions: next)
+                    }
+                ))
+                .toggleStyle(.switch)
+                .labelsHidden()
+            }
+            Divider()
+            settingRow("Screen Captures", "Take interval screenshots of your work display.") {
+                Toggle("", isOn: Binding(
+                    get: { perms.screenshot },
+                    set: { val in
+                        var next = perms
+                        next.screenshot = val
+                        model.updateConsent(permissions: next)
+                    }
+                ))
+                .toggleStyle(.switch)
+                .labelsHidden()
+            }
+            if perms.screenshot {
+                Divider()
+                settingRow("Blur Screenshots", "Blur captured screenshots beyond recognition before saving.") {
+                    Toggle("", isOn: Binding(
+                        get: { perms.blurScreenshots },
+                        set: { val in
+                            var next = perms
+                            next.blurScreenshots = val
+                            model.updateConsent(permissions: next)
+                        }
+                    ))
+                    .toggleStyle(.switch)
+                    .labelsHidden()
+                }
+            }
+            Divider()
+            settingRow("Webcam Photos", "Capture periodic webcam photos.") {
+                Toggle("", isOn: Binding(
+                    get: { perms.webcam },
+                    set: { val in
+                        var next = perms
+                        next.webcam = val
+                        model.updateConsent(permissions: next)
+                    }
+                ))
+                .toggleStyle(.switch)
+                .labelsHidden()
+            }
+            Divider()
+            HStack {
+                if consent.isGranted {
+                    Button(role: .destructive) {
+                        model.revokeConsent()
+                    } label: {
+                        Text("Revoke All Consent")
+                    }
+                } else {
+                    Button {
+                        var initial = ConsentedPermissions.allDisabled
+                        initial.keyboard = true
+                        initial.mouse = true
+                        initial.activeWindow = true
+                        initial.screenshot = true
+                        initial.blurScreenshots = true
+                        model.updateConsent(permissions: initial)
+                    } label: {
+                        Text("Grant Standard Consent")
+                    }
+                }
+            }
+            Text("Explicit local user consent is required on this Mac. Capture is admitted only when granted locally AND allowed by your project policy. Revocation detaches drivers immediately.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 

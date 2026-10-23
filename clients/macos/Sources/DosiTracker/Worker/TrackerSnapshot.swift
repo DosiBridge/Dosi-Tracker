@@ -171,6 +171,10 @@ struct TrackerSnapshot: Equatable, Sendable {
     /// project turned idle detection off (or no project is known).
     var idleThresholdMinutes: Int?
     var capture = CaptureFlags.nothing
+    /// Current local affirmative consent state.
+    var localConsent = LocalConsent.absent
+    /// Current effective capture flags (local consent intersected with project policy).
+    var effectiveCapture = CaptureFlags.nothing
     /// "What are you working on?" — sent as each block's description.
     var taskNote = ""
 
