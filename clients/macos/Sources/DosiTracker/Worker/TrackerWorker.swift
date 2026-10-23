@@ -39,6 +39,8 @@ actor TrackerWorker {
         var setReadsWindowTitles: @Sendable (Bool) -> Void
         /// Synchronously configure driver states according to effective per-capability consent.
         var applyDriverPolicy: @Sendable (ConsentedPermissions) -> Void = { _ in }
+        /// Factory for API clients (injectable with mock/offline URLSessions for tests).
+        var makeApiClient: @Sendable (URL, ApiClient.Account) -> ApiClient = { ApiClient(baseURL: $0, account: $1) }
         /// Receives every new snapshot (from the worker's executor).
         var publish: @Sendable (TrackerSnapshot) -> Void
         var now: @Sendable () -> Date = { Date() }
@@ -333,7 +335,7 @@ actor TrackerWorker {
         pauseRecord = restored
         taskNote = WorkerRules.cleanNote(deps.preferences.taskNote)
 
-        let client = ApiClient(baseURL: config.apiBaseURL, account: savedSignIn.account)
+        let client = deps.makeApiClient(config.apiBaseURL, savedSignIn.account)
         let context = AccountContext(client: client, owner: savedSignIn.ownerKey, workspace: savedSignIn.workspace,
                                      username: savedSignIn.username, serverURL: config.apiBaseURL)
         // Offline first: the saved list is used at once; the server's answer
@@ -625,7 +627,11 @@ actor TrackerWorker {
         let policy = block.policy
         if shot == nil && !job.late && block.captureAtEnd && currentEffective.screenshot
             && policy.permissions.screenshot && block.endReason.allowsCaptureAtEnd {
-            shot = await captureScreenNow(blur: currentEffective.blurScreenshots || policy.blurScreenshots)
+            let gen = lifecycleGeneration
+            let captured = await captureScreenNow(blur: currentEffective.blurScreenshots || policy.blurScreenshots)
+            if gen == lifecycleGeneration && currentEffectivePermissions.screenshot {
+                shot = captured
+            }
         }
         var photo: Data?
         if currentEffective.webcam && policy.permissions.webcam && !job.late && block.endReason.allowsCaptureAtEnd {
@@ -1080,9 +1086,9 @@ actor TrackerWorker {
         shared.loginError = nil
         publish()
 
-        let candidate = ApiClient(baseURL: url, account: ApiClient.Account(workspace: trimmedWorkspace,
-                                                                          username: trimmedUsername,
-                                                                          password: password))
+        let candidate = deps.makeApiClient(url, ApiClient.Account(workspace: trimmedWorkspace,
+                                                                   username: trimmedUsername,
+                                                                   password: password))
         do {
             try await candidate.signIn(passwordChange: change)
         } catch {
@@ -1448,29 +1454,48 @@ actor TrackerWorker {
     }
 
     /// Update local affirmative consent and reconcile active collection drivers immediately.
+    ///
+    /// TRANSITION & PERSISTENCE ORDERING INVARIANTS:
+    /// 1. Withdrawals and tightened blur apply IMMEDIATELY and synchronously on the actor before disk I/O.
+    /// 2. Active drivers are stopped/reconfigured synchronously before persistence can block.
+    /// 3. In-flight samples and completed screens are invalidated immediately.
+    /// 4. Persistence runs asynchronously off the actor on a dedicated serial queue so pause/lock/quit
+    ///    and newer updates remain completely responsive without blocking actor execution.
+    /// 5. Only successful persistence admits expansions.
+    /// 6. If a newer transition arrives while an older save is outstanding, the older save cannot
+    ///    resurrect withdrawn permissions (superseded check).
+    /// 7. On save failure, conservative narrowing remains enforced; expansions are denied.
     func updateConsent(_ next: LocalConsent) async throws {
-        var updateError: Error?
-        let changed: Bool
-        do {
-            changed = try deps.consentManager.update(next)
-        } catch {
-            updateError = error
-            changed = true
-        }
+        let (transition, changed) = deps.consentManager.prepareTransition(to: next)
+        guard changed else { return }
 
-        if changed {
-            lifecycleGeneration &+= 1
-            for (_, task) in captureTasks {
-                task.cancel()
-            }
-            captureTasks.removeAll()
-            completedScreens.removeAll()
+        // Step 1: Invalidate in-flight capture tasks and immediately stop/reconfigure drivers synchronously on the actor
+        lifecycleGeneration &+= 1
+        for (_, task) in captureTasks {
+            task.cancel()
+        }
+        captureTasks.removeAll()
+        completedScreens.removeAll()
+        reconcile(at: deps.now(), reason: .interval)
+        publish()
+
+        // Step 2: Perform persistence off-actor so pause/lock/quit and newer updates remain responsive
+        do {
+            try await deps.consentManager.persistAsync(transition.target)
+        } catch {
+            // On save failure: conservative state is preserved!
+            deps.consentManager.failTransition(transition)
             reconcile(at: deps.now(), reason: .interval)
             publish()
+            throw error
         }
 
-        if let err = updateError {
-            throw err
+        // Step 3: Persistence succeeded: commit target state if not superseded by a newer transition
+        let committed = deps.consentManager.commitTransition(transition)
+        if committed {
+            lifecycleGeneration &+= 1
+            reconcile(at: deps.now(), reason: .interval)
+            publish()
         }
     }
 

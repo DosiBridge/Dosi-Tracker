@@ -319,12 +319,31 @@ public final class MemoryConsentStore: ConsentStorage, @unchecked Sendable {
     }
 }
 
+/// Explicit transition record tracking serialization, immediate conservative state, and target state.
+public struct ConsentTransition: Equatable, Sendable {
+    public let sequence: UInt64
+    public let immediate: LocalConsent
+    public let target: LocalConsent
+    public let changed: Bool
+
+    public init(sequence: UInt64, immediate: LocalConsent, target: LocalConsent, changed: Bool) {
+        self.sequence = sequence
+        self.immediate = immediate
+        self.target = target
+        self.changed = changed
+    }
+}
+
 /// In-memory manager for local consent with immediate revocation and persistence-first widening semantics.
 public final class ConsentManager: @unchecked Sendable {
     private let lock = NSLock()
     private var currentConsent: LocalConsent
-    private let storage: (any ConsentStorage)?
+    public let storage: (any ConsentStorage)?
     public private(set) var generation: UInt64 = 1
+    private var transitionSequence: UInt64 = 0
+
+    /// Dedicated serial queue ensuring disk persistence operations execute in strict FIFO order off any actor.
+    private let persistenceQueue = DispatchQueue(label: "com.dosibridge.dositracker.consent.persistence", qos: .userInitiated)
 
     public init(initial: LocalConsent = .absent, storage: (any ConsentStorage)? = nil) {
         self.currentConsent = initial
@@ -362,6 +381,104 @@ public final class ConsentManager: @unchecked Sendable {
         }
     }
 
+    /// Prepares an explicit transition to `next`.
+    /// Synchronously computes the conservative in-memory immediate state
+    /// (withdrawals applied, blur tightened, expansions deferred) under lock,
+    /// advances sequence, and updates `currentConsent` to the immediate conservative state.
+    public func prepareTransition(to next: LocalConsent) -> (transition: ConsentTransition, changed: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+
+        let prev = currentConsent
+        if prev == next {
+            let transition = ConsentTransition(sequence: transitionSequence, immediate: prev, target: next, changed: false)
+            return (transition, false)
+        }
+
+        transitionSequence &+= 1
+        generation &+= 1
+        let seq = transitionSequence
+
+        let immediate: LocalConsent
+        switch (prev, next) {
+        case (.granted(let pOld), .granted(let pNew)):
+            // Conservative intersection: only capabilities present in BOTH are kept.
+            // Blur is enforced if either requested it (defense-in-depth).
+            let pImmediate = ConsentedPermissions(
+                screenshot: pOld.screenshot && pNew.screenshot,
+                webcam: pOld.webcam && pNew.webcam,
+                keyboard: pOld.keyboard && pNew.keyboard,
+                mouse: pOld.mouse && pNew.mouse,
+                activeWindow: pOld.activeWindow && pNew.activeWindow,
+                runningPrograms: pOld.runningPrograms && pNew.runningPrograms,
+                blurScreenshots: pOld.blurScreenshots || pNew.blurScreenshots
+            )
+            immediate = .granted(pImmediate)
+
+        case (.granted, .revoked), (.granted, .absent):
+            // Immediate withdrawal
+            immediate = next
+
+        case (.absent, .granted), (.revoked, .granted):
+            // Pure widening: expansions must NOT be admitted before save succeeds!
+            // Immediate state remains the inactive state (all disabled).
+            immediate = prev
+
+        default:
+            // absent <-> revoked
+            immediate = next
+        }
+
+        currentConsent = immediate
+        let transition = ConsentTransition(sequence: seq, immediate: immediate, target: next, changed: true)
+        return (transition, true)
+    }
+
+    /// Commits the target state of a successful transition if it has not been superseded.
+    /// Returns true if committed; false if superseded by a newer transition.
+    @discardableResult
+    public func commitTransition(_ transition: ConsentTransition) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard transition.sequence == transitionSequence else {
+            // Superseded by a newer transition! Do not resurrect or mutate state.
+            return false
+        }
+
+        currentConsent = transition.target
+        return true
+    }
+
+    /// Reconciles state after a failed transition.
+    /// If not superseded, leaves `currentConsent` as the conservative immediate state
+    /// (narrowings preserved, expansions denied).
+    public func failTransition(_ transition: ConsentTransition) {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard transition.sequence == transitionSequence else {
+            return
+        }
+
+        currentConsent = transition.immediate
+    }
+
+    /// Executes persistence asynchronously on the serial persistence queue, off any actor.
+    public func persistAsync(_ consent: LocalConsent) async throws {
+        guard let storage = storage else { return }
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            persistenceQueue.async {
+                do {
+                    try storage.save(consent)
+                    continuation.resume()
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
     /// Update consent state.
     ///
     /// CRITICAL PRIVACY & PERSISTENCE INVARIANTS:
@@ -374,86 +491,20 @@ public final class ConsentManager: @unchecked Sendable {
     /// - Identical policy does NOT manufacture ticket invalidation; actual policy/consent withdrawal/regrant does.
     @discardableResult
     public func update(_ next: LocalConsent) throws -> Bool {
-        lock.lock()
-        let prev = currentConsent
-        if prev == next {
-            lock.unlock()
-            return false
+        let (transition, changed) = prepareTransition(to: next)
+        guard changed else { return false }
+
+        if let storage = storage {
+            do {
+                try storage.save(transition.target)
+            } catch {
+                failTransition(transition)
+                throw error
+            }
         }
 
-        // We have an actual change: advance generation ticket immediately
-        generation &+= 1
-
-        switch (prev, next) {
-        case (.granted(let pOld), .granted(let pNew)):
-            // Mixed or pure narrow/expand:
-            // Immediate in-memory grant: conservative intersection + blur tightening
-            let pImmediate = ConsentedPermissions(
-                screenshot: pOld.screenshot && pNew.screenshot,
-                webcam: pOld.webcam && pNew.webcam,
-                keyboard: pOld.keyboard && pNew.keyboard,
-                mouse: pOld.mouse && pNew.mouse,
-                activeWindow: pOld.activeWindow && pNew.activeWindow,
-                runningPrograms: pOld.runningPrograms && pNew.runningPrograms,
-                blurScreenshots: pOld.blurScreenshots || pNew.blurScreenshots
-            )
-            currentConsent = .granted(pImmediate)
-            lock.unlock()
-
-            if let storage = storage {
-                do {
-                    try storage.save(next)
-                } catch {
-                    // On error, pImmediate remains in currentConsent (narrowings kept!)
-                    throw error
-                }
-            }
-
-            // Save succeeded: now admit newly expanded capabilities
-            lock.lock()
-            currentConsent = next
-            lock.unlock()
-            return true
-
-        case (.granted, .revoked), (.granted, .absent):
-            // Immediate withdrawal before save
-            currentConsent = next
-            lock.unlock()
-
-            if let storage = storage {
-                do {
-                    try storage.save(next)
-                } catch {
-                    // Withdrawal remains in currentConsent!
-                    throw error
-                }
-            }
-            return true
-
-        case (.absent, .granted), (.revoked, .granted):
-            // Pure widening from inactive state: persistence-first!
-            // Do NOT update currentConsent before save!
-            lock.unlock()
-
-            if let storage = storage {
-                try storage.save(next)
-            }
-
-            lock.lock()
-            currentConsent = next
-            lock.unlock()
-            return true
-
-        default:
-            // absent <-> revoked
-            currentConsent = next
-            lock.unlock()
-
-            if let storage = storage {
-                try storage.save(next)
-            }
-            return true
-        }
+        _ = commitTransition(transition)
+        return true
     }
 
     /// Revoke all consent immediately.
