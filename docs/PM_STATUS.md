@@ -2538,7 +2538,8 @@ Implemented deterministic isolated SQLite write-failure regressions in `clients/
      - `test_exclusive_temp_candidate_collision_and_fallback_save_succeeds`: Precreates candidate 0 as regular file (and on Unix candidate 1 as symlink to sentinel victim) with candidate namer; proves attempt 0 (and attempt 1 on Unix) hit `AlreadyExists`, attempted candidate sentinels remain unmodified, and fallback save succeeds with intended consent.
      - `test_exclusive_temp_exhaustion_refuses_without_mutating_candidates_or_valid_consent`: Precreates sentinels for all 64 bounded candidates; proves save fails closed (`Exceeded maximum collision retries`) without mutating or deleting any candidate sentinel or the pre-existing valid consent file.
    - **Post-Temp Ownership Failure & Valid Record Retention**:
-     - `test_failed_save_write_error_retains_valid_record_and_cleans_temp`: Injects write/sync failure after owning temp file while previous valid consent file exists; proves previous valid file raw bytes and parsed consent are untouched, owned temp file is deleted, unrelated data and temp files are preserved, and `ConsentManager` widening is unapplied.
+     - `test_failed_save_write_error_retains_valid_record_and_cleans_temp`: Injects failure after owning temp file while previous valid consent file exists; proves previous valid file raw bytes and parsed consent are untouched, owned temp file is deleted, unrelated data and temp files are preserved, and `ConsentManager` widening is unapplied.
+     - *Hook Limitation Disclosure:* The `fail_after_open` hook fires after `write_all`, `flush`, and `sync_all`; it models an injected post-write failure and cleanup after owning and persisting the temp file, rather than an early write syscall failure.
      - `test_failed_save_rename_error_retains_valid_record_and_cleans_temp`: Injects atomic rename failure after owning temp file; proves identical preservation of valid file bytes, cleanup of owned temp, preservation of unrelated files, and rejection of `ConsentManager` widening.
    - **Accurately Retained Preservations**:
      - `test_unrelated_temp_and_data_artifacts_preserved_during_save`: Verifies normal save preserves unrelated data files and other workers' temp files.
@@ -2561,6 +2562,69 @@ Implemented deterministic isolated SQLite write-failure regressions in `clients/
 2. **Host Environment Gaps**: Windows host lacks native Linux kernel permissions and symlinks; 4 Unix-specific regression tests remain **UNEXECUTED** under `#[cfg(unix)]`.
 3. **Approval-Blocked Invariant**: The unresolved `tirith:archive_extract` command remains untouched.
 4. **No Full-Product Acceptance Claim**: This deliverable completes bounded Linux consent store hardening and deterministic regression proof. Native Linux packaging, X11/Wayland sensor drivers, network synchronization, and live desktop verification remain open acceptance gates.
+
+---
+
+## 31. macOS Consent Storage Hardening: Private Mode, Exclusive Temp Creation & Target Policy (selected-macos-private-consent-storage-20261023)
+
+> **Execution Date:** October 23, 2026  
+> **Phase Task ID:** `selected-macos-private-consent-storage-20261023` (continuation of `selected-linux-consent-storage-regression-20261023`)  
+> **Status:** Implementation Complete; Source-Verified; Native Swift Toolchain **UNAVAILABLE** on Windows Host Toolchain (All macOS Tests Honestly Unexecuted)  
+> **Target Package:** `clients/macos` (Framework: `DosiTrackerCore`, module: `System/Consent.swift`)  
+
+### A. Context & Bounded Production Hardening
+1. **Unsafe Storage Invariants Identified**:
+   - `FileConsentStore.load` previously checked `FileManager.default.fileExists(atPath:)` and read via `Data(contentsOf:)` without non-following target metadata validation, risking following symlinks or reading from attacker-controlled or permissive files.
+   - `FileConsentStore.save` created parent directories with `0700` but wrote data via Foundation `data.write(to:options: .atomic)` to a predictable or random UUID path without setting private Unix permissions (`0600`) at file creation, relying on default process umask.
+   - UUID randomness and Foundation `.atomic` writes do not guarantee `O_CREAT | O_EXCL` symlink non-following or private-at-creation modes.
+   - Existing `ConsentLifecycleTests` covered basic roundtrip and in-memory manager semantics, but lacked filesystem security boundary regressions.
+
+2. **Hardened Storage Implementation (`Consent.swift`)**:
+   - **Darwin POSIX Exclusive Creation & Private Modes**:
+     - Uses Darwin `open(candidatePath, O_WRONLY | O_CREAT | O_EXCL, mode_t(S_IRUSR | S_IWUSR))` guaranteeing mode `0600` (`S_IRUSR | S_IWUSR`) directly at creation time before file descriptor exposure.
+     - POSIX `O_CREAT | O_EXCL` fails with `EEXIST` if the path exists or is an existing symbolic link, without following the symlink or truncating its target.
+     - Newly created dedicated parent directories are created with private mode `0700` (`attributes: [.posixPermissions: 0o700]`); existing directories or broad ancestors are never modified.
+   - **Collision-Resistant Naming**:
+     - Temporary filenames are structured as `.{fileStem}.tmp.{pid}.{attempt}.{:016llx}` using PID, attempt counter, and 64-bit cryptographic entropy (`UInt64.random`).
+     - Bounded collision handling retries up to 64 times on `EEXIST`.
+   - **Durability & Clean Replacement**:
+     - Complete payload is written via Darwin `write`, flushed and synced via Darwin `fsync(openedFd)`, and closed before atomic replacement via `Darwin.rename`.
+     - On write, fsync, or rename failure, only the operation's owned temporary file artifact is removed (`unlink(tempPath)`), preserving all unrelated files and target sentinels.
+   - **Conservative Target Policy**:
+     - Inspects target path with `lstat` (never following symlinks).
+     - Rejects symbolic links with `ConsentError.unsafeStorage`.
+     - Rejects non-regular files (directories, sockets, fifos) with `ConsentError.unsafeStorage`.
+     - Verifies file ownership matches current effective UID (`st.st_uid == geteuid()`).
+     - Rejects group or world writable permissions (`st.st_mode & 0o022 != 0`).
+     - Safe legacy records (e.g. `0600`, `0644`) load without issue, while world/group-writable files fail closed to `LocalConsent.absent`.
+   - **Deterministic Testability Seam (`SaveHooks`)**:
+     - Introduced internal `SaveHooks` struct (`candidateNamer`, `failAfterOpen`, `failRename`) on `FileConsentStore(fileURL:hooks:)`, defaulting to `nil` in production with zero safety bypasses.
+
+3. **Isolated Production-Store Regressions (`ConsentLifecycleTests.swift`)**:
+   Added 7 isolated regression tests to `ConsentLifecycleTests.swift` (14 total tests in suite):
+   - `testPositiveRoundtripAndPrivateModesOnMac`: Verifies positive save/load roundtrip, dedicated directory mode `0700`, saved consent file private mode `0600` at creation, and current UID ownership.
+   - `testTargetSymlinkAndDirectoryRefusalUnderPolicy`: Verifies `FileConsentStore.load` and `save` fail with `ConsentError.unsafeStorage` on directory and symlink targets, leaving legitimate target files untouched.
+   - `testCandidateCollisionFallbackSaveSucceeds`: Precreates candidate 0 regular file sentinel and candidate 1 symlink pointing to a victim sentinel file; proves collision detection advances to candidate 2, fallback save succeeds, candidate 0 sentinel is unchanged, candidate 1 remains a symlink, and victim content is not truncated or overwritten.
+   - `testCandidateCollisionExhaustionPreservesCandidatesAndValidConsent`: Precreates 64 candidate files; proves save fails with retry exhaustion (`Exceeded maximum collision retries`) without mutating or deleting any candidate sentinel or existing valid consent file.
+   - `testPostOwnershipFailureRetainsValidRecordAndCleansTemp`: Injects post-write failure after owning temp file while valid consent file exists; proves previous valid file bytes and parsed consent are untouched, owned temp file is unlinked, unrelated files are preserved, and `ConsentManager` widening is unapplied.
+   - `testRenameRefusalRetainsValidRecordAndCleansTemp`: Injects atomic rename failure; proves previous valid file bytes and parsed consent are untouched, owned temp file is unlinked, unrelated files are preserved, and `ConsentManager` widening is unapplied.
+   - `testUnsafePermissionsLoadFailsClosedOnMac`: Verifies group/world-writable `0666` file fails load with `ConsentError.unsafeStorage` and `ConsentManager.loadOrFailClosed` fails closed to `.absent`.
+
+### B. Execution Status & Quality Gates
+| Target Suite | Exact Command Line | Tests Passed | Unexecuted | Result | Evidence Level |
+|---|---|:---:|:---:|:---:|---|
+| **macOS Core Consent Lifecycle Suite** | `swift test --filter ConsentLifecycleTests` | 0 | 14 (all tests unexecuted; Swift not on PATH) | **UNEXECUTED** | **[Source-Only / Blocked]** (Swift toolchain unavailable on Windows worker host; source implementation & consistency verified) |
+| **macOS Worker Consent Lifecycle Suite** | `swift test --filter WorkerConsentLifecycleTests` | 0 | 14 | **UNEXECUTED** | **[Source-Only / Blocked]** |
+| **macOS SyncPass Tests** | `swift test --filter SyncPassTests` | 0 | 16 | **UNEXECUTED** | **[Source-Only / Blocked]** |
+| **Total macOS Isolated Synthetic Tests** | (Across macOS test targets) | 0 | 44 | **UNEXECUTED** | **[Source-Only / Blocked]** |
+| **Linux Unit & Storage Regressions** | `cargo test --lib --manifest-path clients/linux/Cargo.toml` | 28 | 4 (Unix-only) | PASSED (exit 0) | **[Worker-Reported]** |
+| **Windows Client Compilation Check** | `cargo check --manifest-path clients/windows/Cargo.toml` | N/A | 0 | PASSED (exit 0) | **[Worker-Reported]** |
+
+### C. PM QA Boundary Limits & Acceptance Disclosures
+1. **Truthful macOS Invariants**: Consent persistence uses exclusive creation (`O_CREAT | O_EXCL`), Darwin private modes (`0600` file, `0700` dedicated directory), collision-resistant naming, durability flushing (`fsync`), atomic replacement (`Darwin.rename`), target symlink/directory refusal, deterministic collision handling, and owned-artifact failure cleanup (`unlink`).
+2. **Host Environment Gaps**: Windows host lacks Swift and macOS toolchains; all 44 macOS tests remain **UNEXECUTED**.
+3. **Approval-Blocked Invariant**: The unresolved `tirith:archive_extract` command remains untouched.
+4. **No Full-Product Acceptance Claim**: This deliverable completes bounded macOS private consent storage hardening and test harness definitions. Native macOS compilation, ScreenCaptureKit/Quartz sensor drivers, network synchronization, and live desktop verification remain open acceptance gates.
 
 
 

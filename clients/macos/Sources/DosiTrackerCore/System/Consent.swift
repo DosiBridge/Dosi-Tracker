@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 /// Granular capability permissions consented to by the local user.
 /// Strict default-deny: all capabilities default to false.
@@ -188,12 +189,14 @@ public enum ConsentError: Error, Equatable, Sendable, CustomStringConvertible {
     case ioError(String)
     case malformedJson(String)
     case saveFailed(String)
+    case unsafeStorage(String)
 
     public var description: String {
         switch self {
         case .ioError(let s): return "Consent I/O error: \(s)"
         case .malformedJson(let s): return "Malformed consent JSON: \(s)"
         case .saveFailed(let s): return "Consent save failed: \(s)"
+        case .unsafeStorage(let s): return "Unsafe consent storage: \(s)"
         }
     }
 }
@@ -204,22 +207,90 @@ public protocol ConsentStorage: AnyObject, Sendable {
     func save(_ consent: LocalConsent) throws
 }
 
-/// File-backed atomic consent store.
+/// Internal hooks for injecting deterministic collision and failure behaviors in tests.
+public struct SaveHooks: @unchecked Sendable {
+    public var candidateNamer: (@Sendable (_ fileStem: String, _ attempt: Int) -> String)?
+    public var failAfterOpen: (@Sendable (_ tempPath: String) throws -> Void)?
+    public var failRename: (@Sendable (_ tempPath: String, _ targetPath: String) throws -> Void)?
+
+    public init(
+        candidateNamer: (@Sendable (_ fileStem: String, _ attempt: Int) -> String)? = nil,
+        failAfterOpen: (@Sendable (_ tempPath: String) throws -> Void)? = nil,
+        failRename: (@Sendable (_ tempPath: String, _ targetPath: String) throws -> Void)? = nil
+    ) {
+        self.candidateNamer = candidateNamer
+        self.failAfterOpen = failAfterOpen
+        self.failRename = failRename
+    }
+}
+
+/// File-backed atomic consent store with private, exclusive atomic persistence.
 public final class FileConsentStore: ConsentStorage, @unchecked Sendable {
     public let fileURL: URL
     private let lock = NSLock()
+    internal var hooks: SaveHooks?
 
-    public init(fileURL: URL) {
+    public init(fileURL: URL, hooks: SaveHooks? = nil) {
         self.fileURL = fileURL
+        self.hooks = hooks
+    }
+
+    /// Check if target file exists and is a regular, non-symlink file.
+    public static func exists(at fileURL: URL) -> Bool {
+        var st = stat()
+        if lstat(fileURL.path, &st) != 0 {
+            return false
+        }
+        let mode = Int32(st.st_mode)
+        let fileType = mode & Int32(S_IFMT)
+        return fileType == Int32(S_IFREG)
+    }
+
+    private static func validateTargetFile(atPath path: String) throws {
+        var st = stat()
+        if lstat(path, &st) != 0 {
+            if errno == ENOENT {
+                return
+            }
+            let err = String(cString: strerror(errno))
+            throw ConsentError.ioError("Failed inspecting metadata for \(path): \(err)")
+        }
+
+        let mode = Int32(st.st_mode)
+        let fileType = mode & Int32(S_IFMT)
+        if fileType == Int32(S_IFLNK) {
+            throw ConsentError.unsafeStorage("Target path \(path) is a symbolic link")
+        }
+        if fileType != Int32(S_IFREG) {
+            throw ConsentError.unsafeStorage("Target path \(path) is not a regular file")
+        }
+
+        let currentUid = geteuid()
+        if st.st_uid != currentUid {
+            throw ConsentError.unsafeStorage("Target path \(path) is owned by UID \(st.st_uid), expected current UID \(currentUid)")
+        }
+
+        if (mode & Int32(S_IWGRP | S_IWOTH)) != 0 {
+            let octal = String(format: "%o", mode & 0o777)
+            throw ConsentError.unsafeStorage("Target path \(path) has unsafe permissions \(octal) (group or world writable)")
+        }
     }
 
     public func load() throws -> LocalConsent {
         lock.lock()
         defer { lock.unlock() }
         let path = fileURL.path
-        guard FileManager.default.fileExists(atPath: path) else {
-            return .absent
+        try Self.validateTargetFile(atPath: path)
+
+        var st = stat()
+        if lstat(path, &st) != 0 {
+            if errno == ENOENT {
+                return .absent
+            }
+            let err = String(cString: strerror(errno))
+            throw ConsentError.ioError("Cannot stat \(path): \(err)")
         }
+
         let data: Data
         do {
             data = try Data(contentsOf: fileURL)
@@ -236,13 +307,37 @@ public final class FileConsentStore: ConsentStorage, @unchecked Sendable {
     public func save(_ consent: LocalConsent) throws {
         lock.lock()
         defer { lock.unlock() }
+
         let parentDir = fileURL.deletingLastPathComponent()
-        do {
-            try FileManager.default.createDirectory(at: parentDir, withIntermediateDirectories: true,
-                                                    attributes: [.posixPermissions: 0o700])
-        } catch {
-            throw ConsentError.saveFailed("Cannot create directory \(parentDir.path): \(error.localizedDescription)")
+        let parentPath = parentDir.path
+        if parentPath.isEmpty {
+            throw ConsentError.saveFailed("Target path has no parent directory")
         }
+
+        var parentStat = stat()
+        if lstat(parentPath, &parentStat) == 0 {
+            let parentMode = Int32(parentStat.st_mode)
+            let parentType = parentMode & Int32(S_IFMT)
+            if parentType == Int32(S_IFLNK) {
+                throw ConsentError.saveFailed("Parent directory \(parentPath) is a symbolic link")
+            }
+            if parentType != Int32(S_IFDIR) {
+                throw ConsentError.saveFailed("Parent path \(parentPath) is not a directory")
+            }
+        } else if errno == ENOENT {
+            do {
+                try FileManager.default.createDirectory(at: parentDir, withIntermediateDirectories: true,
+                                                        attributes: [.posixPermissions: 0o700])
+            } catch {
+                throw ConsentError.saveFailed("Cannot create directory \(parentPath): \(error.localizedDescription)")
+            }
+        } else {
+            let err = String(cString: strerror(errno))
+            throw ConsentError.saveFailed("Cannot inspect parent directory \(parentPath): \(err)")
+        }
+
+        let targetPath = fileURL.path
+        try Self.validateTargetFile(atPath: targetPath)
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -253,18 +348,95 @@ public final class FileConsentStore: ConsentStorage, @unchecked Sendable {
             throw ConsentError.saveFailed("Cannot encode consent: \(error)")
         }
 
-        let pid = ProcessInfo.processInfo.processIdentifier
-        let tmpURL = parentDir.appendingPathComponent("consent.tmp.\(pid).\(UUID().uuidString.lowercased())", isDirectory: false)
-        do {
-            try data.write(to: tmpURL, options: .atomic)
-            if FileManager.default.fileExists(atPath: fileURL.path) {
-                _ = try FileManager.default.replaceItemAt(fileURL, withItemAt: tmpURL)
+        let fileStem = fileURL.lastPathComponent
+        let maxRetries = 64
+        var openedFd: Int32 = -1
+        var ownedTempPath: String?
+
+        for attempt in 0..<maxRetries {
+            let tempName: String
+            if let namer = hooks?.candidateNamer {
+                tempName = namer(fileStem, attempt)
             } else {
-                try FileManager.default.moveItem(at: tmpURL, to: fileURL)
+                let pid = ProcessInfo.processInfo.processIdentifier
+                let nonce = UInt64.random(in: 0...UInt64.max)
+                tempName = String(format: ".%@.tmp.%d.%d.%016llx", fileStem, pid, attempt, nonce)
             }
-        } catch {
-            try? FileManager.default.removeItem(at: tmpURL)
-            throw ConsentError.saveFailed("Failed to atomically save \(fileURL.path): \(error.localizedDescription)")
+
+            let candidatePath = (parentPath as NSString).appendingPathComponent(tempName)
+            let fd = open(candidatePath, O_WRONLY | O_CREAT | O_EXCL, mode_t(S_IRUSR | S_IWUSR))
+            if fd >= 0 {
+                openedFd = fd
+                ownedTempPath = candidatePath
+                break
+            } else if errno == EEXIST {
+                continue
+            } else {
+                let err = String(cString: strerror(errno))
+                throw ConsentError.saveFailed("Failed opening exclusive temporary file \(candidatePath): \(err)")
+            }
+        }
+
+        guard openedFd >= 0, let tempPath = ownedTempPath else {
+            throw ConsentError.saveFailed("Exceeded maximum collision retries creating temporary consent file")
+        }
+
+        var writeFailed = false
+        var failureMessage = ""
+
+        data.withUnsafeBytes { rawBuffer in
+            guard let baseAddress = rawBuffer.baseAddress else { return }
+            var ptr = baseAddress
+            var remaining = data.count
+            while remaining > 0 {
+                let written = write(openedFd, ptr, remaining)
+                if written < 0 {
+                    if errno == EINTR { continue }
+                    writeFailed = true
+                    failureMessage = "Write failed on \(tempPath): \(String(cString: strerror(errno)))"
+                    return
+                }
+                remaining -= written
+                ptr = ptr.advanced(by: written)
+            }
+        }
+
+        if !writeFailed {
+            if fsync(openedFd) != 0 {
+                writeFailed = true
+                failureMessage = "fsync failed on \(tempPath): \(String(cString: strerror(errno)))"
+            }
+        }
+
+        if let failAfterOpen = hooks?.failAfterOpen, !writeFailed {
+            do {
+                try failAfterOpen(tempPath)
+            } catch {
+                writeFailed = true
+                failureMessage = "Injected post-write failure on \(tempPath): \(error.localizedDescription)"
+            }
+        }
+
+        close(openedFd)
+
+        if writeFailed {
+            unlink(tempPath)
+            throw ConsentError.saveFailed(failureMessage)
+        }
+
+        if let failRename = hooks?.failRename {
+            do {
+                try failRename(tempPath, targetPath)
+            } catch {
+                unlink(tempPath)
+                throw ConsentError.saveFailed("Injected rename failure for \(targetPath): \(error.localizedDescription)")
+            }
+        }
+
+        if Darwin.rename(tempPath, targetPath) != 0 {
+            let err = String(cString: strerror(errno))
+            unlink(tempPath)
+            throw ConsentError.saveFailed("Failed atomically replacing consent file \(targetPath) with \(tempPath): \(err)")
         }
     }
 }
