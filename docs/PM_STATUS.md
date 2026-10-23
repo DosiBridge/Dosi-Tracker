@@ -2389,67 +2389,74 @@ Implemented 21 production-path regression tests across two test suites with inje
 
 ---
 
-## 28. macOS Sync Pass Outcome Reporting & Deterministic SQLite Persistence Failure Handling (selected-macos-sync-persistence-20261023)
+## 28. macOS Sync Pass Outcome Reporting, Finite SQLite Error Sanitization & Rearmed Recovery Verification (selected-macos-sync-sanitization-20261023)
 
 > **Execution Date:** October 23, 2026  
-> **Phase Task ID:** `selected-macos-sync-persistence-20261023` (continuation of `selected-macos-oracle-ownership-20261023`)  
+> **Phase Task ID:** `selected-macos-sync-sanitization-20261023` (continuation of `selected-macos-sync-persistence-20261023` and `selected-macos-oracle-ownership-20261023`)  
 > **Status:** Implementation Complete; Source-Verified; Native Execution **UNEXECUTED** on Windows Host Toolchain (Missing Swift / macOS Runner)  
 > **Target Package:** `clients/macos` (Package: `DosiTracker`, targets: `DosiTrackerCore`, `DosiTrackerCoreTests`)  
 
 ### A. Context & Bounded Production-Path Correction
-1. **Inconsistent Outcome Reporting Source Defect**:
+1. **Inconsistent Outcome Reporting & Error Leakage Defect**:
    - `SyncPass.swift` documents `uploaded` as server accepted AND left queue, and `parked` as locally rejected.
-   - However, prior implementation caught errors in `queue.removeSynced(id: row.id)` and `queue.markRejected(id: row.id, reason: reason)` with simple warnings, and unconditionally appended `row.id` to `report.uploaded` and `report.parked`.
-   - In addition, capture stripping (`queue.stripCaptures(id: row.id)`) unconditionally appended `row.id` to `report.stripped` even when SQLite threw.
-   - Downstream consumers suffered from this inconsistency: `RecentBlocks.apply` consumed `report.uploaded` and `report.parked`, setting blocks to `.uploaded` or `.rejected` when the local database write had failed; `UploadLoop` reset its exponential backoff counter (`backoffFailures = 0`) on `report.uploaded` even when the row remained in the queue.
-   - This was a source-confirmed inconsistent outcome reporting defect, not an executed disk failure reproduction or claimed remote exploit.
+   - The prior implementation caught errors in `queue.removeSynced`, `queue.markRejected`, and `queue.stripCaptures`, but logged raw errors and assigned `report.stop = .queueError("\(error)")`, where `SQLiteDatabase.QueueError.description` interpolates raw SQLite messages containing query strings, database paths, trigger text, and unbounded strings.
+   - Downstream consumers (`RecentBlocks.apply`, `UploadLoop`) require truthful state transitions without raw engine leaks.
+   - Recovery test fixtures previously failed to account for `FakeServer.upload` consuming response scripts, which defaulted subsequent recovery uploads to 200 accepted rather than exercising the intended server rejection / 413 strip flows.
 
-2. **Truthful Local-Persistence Outcome Handling**:
-   - **Uploaded Reporting**: `report.uploaded.append(row.id)` is executed strictly after `try queue.removeSynced(id: row.id)` succeeds. If local removal throws, the error is logged, `report.stop` is set to `.queueError("\(error)")`, and the pass loop halts immediately (`break pass`). The unremoved row remains safely in the queue (`synced = 0`), preserving its payload and `clientActivityId` for idempotent retry.
-   - **Parked Reporting**: `report.parked.append(...)` is executed strictly after `try queue.markRejected(id: row.id, reason: reason)` succeeds. If local rejection persistence throws, `report.stop` is set to `.queueError("\(error)")`, the row is NOT added to `report.parked`, and the pass halts immediately (`break pass`). The row remains pending (`synced = 0`) in the queue rather than corrupted or falsely marked rejected.
-   - **Strip-Captures Reporting**: `try queue.stripCaptures(id: row.id)` is checked. If it throws, `report.stop` is set to `.queueError("\(error)")`, `report.stripped` does NOT record the row, and the pass halts immediately (`break pass`), preventing unsanctioned resends of unstripped payloads.
-   - **Project-Gone Policy vs Parking Persistence**: In `case .verifyProject`, when the server verdict is `.gone`, `report.goneProjects.append(projectId)` records the server verdict regardless of whether the local parking write succeeds. If the subsequent local parking write throws, `report.stop` is set to `.queueError`, `report.parked` does NOT claim the row was parked, and the pass halts.
-   - **Downstream Reconcilement**:
-     - `RecentBlocks.apply` does not falsely transition blocks to `.uploaded` or `.rejected` upon write failures.
-     - `UploadLoop` handles `.queueError(let message)` by backing off for `UploadLoop.queueRetry` (60s) without resetting `backoffFailures`, preventing tight retry loops when local storage is constrained.
-     - Server acceptance and client idempotency semantics `(WorkspaceId, UserId, ClientActivityId)` remain fully preserved.
+2. **Truthful Local-Persistence & Finite Error Sanitization**:
+   - **Public Sanitized Error Mapping**: Introduced `SyncQueueOperation` (`read`, `strip`, `remove`, `park`) and `SanitizedQueueError` in `SyncPass.swift`. When SQLite throws on any queue operation:
+     - Formats finite, safe strings: `"queue_\(operation.rawValue)_failed (sqlite code \(code))"`.
+     - Provides safe fallback for non-SQLite/unknown errors: `"queue_\(operation.rawValue)_failed (unknown error)"`.
+     - Omits raw SQL text, trigger messages, database paths, payloads, newlines, and control characters from both `SyncReport.stop` and `CoreLog`.
+     - Preserves `QueueError.isDamage` internal detection in `SQLiteDatabase.swift` without modification or partial substring truncation.
+   - **Truthful Outcome Transitions**:
+     - `report.uploaded` is appended strictly after `queue.removeSynced(id: row.id)` succeeds; on throw, pass halts with `report.stop = .queueError(sanitized)`, retaining the row pending (`synced = 0`) with intact `clientActivityId`.
+     - `report.parked` is appended strictly after `queue.markRejected(id: row.id, reason: reason)` succeeds; on throw, pass halts without claiming parked.
+     - `report.stripped` is appended strictly after `queue.stripCaptures(id: row.id)` succeeds; on throw, pass halts without attempting resend.
+     - `report.goneProjects` preserves server project verdict in `case .verifyProject` independently of whether local parking succeeds.
+   - **Downstream Consumer Safety**:
+     - `RecentBlocks.apply` preserves `.queued` status during local failure, preventing false UI success.
+     - `UploadLoop` receives finite sanitized `queueError`, executes 60s backoff without resetting `backoffFailures`, and avoids tight loop retries.
 
-### B. Isolated Deterministic SQLite Failure Regressions (4 Regressions)
+### B. Isolated Deterministic SQLite Failure & Rearmed Recovery Regressions (5 Regressions)
 Implemented deterministic isolated SQLite write-failure regressions in `clients/macos/Tests/DosiTrackerCoreTests/SyncPassTests.swift` using temporary SQL triggers on disposable test databases (`RAISE(ABORT, ...)`):
 
 1. **`testAcceptedResponseRemoveFailureHaltsPassRetainsQueuedRowWithoutReportingUploadedAndRecovers`**:
-   - Inject: `CREATE TRIGGER fail_delete BEFORE DELETE ON activities BEGIN SELECT RAISE(ABORT, 'injected delete failure'); END;`
-   - Invariants: Server accepts row 1; local `removeSynced` throws. Asserts `report.uploaded.isEmpty`, `report.drained == false`, `report.stop` is `.queueError` with `"injected delete failure"`, no subsequent rows (`p2`, `p3`) uploaded, all 3 rows retained pending in queue with intact `clientActivityId`, `RecentBlocks` retains `.queued` with zero false transitions, other-owner sentinel (`bob@acme.com`) remains intact.
-   - Recovery: Dropping trigger and running pass drains all rows, reports them uploaded, updates `RecentBlocks` to `.uploaded`, and preserves other-owner sentinel.
+   - Injected trigger: `CREATE TRIGGER fail_delete ... RAISE(ABORT, 'CONFIDENTIAL_DB_PATH=/Users/victim/Library/dosi.db\nUSER_SECRET=tok_1234567890\t\u{1F}--unbounded-padding')`.
+   - Invariants: Asserts `report.uploaded.isEmpty`, `report.drained == false`, `report.stop` matches exact sanitized `"queue_remove_failed (sqlite code 1)"`, length $\le 64$, zero leakage of paths, tokens, newlines, or control characters. Proves subsequent rows (`p2`, `p3`) are not uploaded. Asserts preserved pending rows, `clientActivityId`, `RecentBlocks` stays `.queued`, and other-owner sentinel intact.
+   - Recovery: Dropping trigger drains queue via idempotent server retry (`server.sent[0].clientActivityId == server.sent[1].clientActivityId`, total 4 uploads).
 
 2. **`testRejectionParkFailureHaltsPassRetainsQueuedRowWithoutReportingParkedAndRecovers`**:
-   - Inject: `CREATE TRIGGER fail_park BEFORE UPDATE OF synced ON activities BEGIN SELECT RAISE(ABORT, 'injected park failure'); END;`
-   - Invariants: Server returns 409 rejection; local `markRejected` throws. Asserts `report.parked.isEmpty`, `report.uploaded.isEmpty`, `report.stop` is `.queueError` with `"injected park failure"`, no subsequent row uploaded, row retained as pending (`synced = 0`, `rejectedCount == 0`), `RecentBlocks` stays `.queued`, other-owner sentinel intact.
-   - Recovery: Dropping trigger and running pass parks row 1 as `.rejected`, uploads row 2, drains queue, and updates `RecentBlocks`.
+   - Injected trigger: `CREATE TRIGGER fail_park ... RAISE(ABORT, 'SECRET_PARK_LEAK=/var/db/app.db\nCREDENTIAL_BEARER=secret_jwt_xyz\t\u{1F}--unbounded-padding')`.
+   - Invariants: Asserts `report.parked.isEmpty`, `report.uploaded.isEmpty`, `report.stop` matches exact sanitized `"queue_park_failed (sqlite code 1)"`, length $\le 64$, zero credential/path leakage. Asserts pending row preserved (`synced = 0`, `rejectedCount == 0`).
+   - Recovery: Re-arms `server.answers["p1"]` with 409, drops trigger, and verifies recovery sequence: 1 initial failed park + 1 recovery park + 1 recovery upload of `p2` (total 3 uploads), preserving `clientActivityId`. Asserts `ids[0]` parked, `ids[1]` uploaded, `RecentBlocks` updated.
 
 3. **`testStripCapturesMutationFailureHaltsPassDoesNotReportStrippedAndRecovers`**:
-   - Inject: `CREATE TRIGGER fail_strip BEFORE UPDATE OF stripped ON activities BEGIN SELECT RAISE(ABORT, 'injected strip failure'); END;`
-   - Invariants: Server returns 413; local `stripCaptures` throws. Asserts `report.stripped.isEmpty`, `report.uploaded.isEmpty`, `report.stop` is `.queueError` with `"injected strip failure"`, resend is NOT attempted, captures remain intact on queued row, other-owner sentinel intact.
-   - Recovery: Dropping trigger and running pass strips captures, resends, uploads row, and drains queue.
+   - Injected trigger: `CREATE TRIGGER fail_strip ... RAISE(ABORT, 'SECRET_STRIP_LEAK=/private/var/queue.db\nPAYLOAD_KEY=capture_token_abc\t\u{1F}--unbounded-padding')`.
+   - Invariants: Asserts `report.stripped.isEmpty`, `report.uploaded.isEmpty`, `report.stop` matches exact sanitized `"queue_strip_failed (sqlite code 1)"`, length $\le 64$, zero payload key/path leakage. Asserts resend not attempted on failure, captures intact on queued row.
+   - Recovery: Re-arms `server.answers["p1"]` with 413, drops trigger, and verifies recovery sequence: 1 initial with captures + 1 recovery initial with captures + 1 recovery resend without captures + 1 recovery `p2` (total 4 uploads), preserving `clientActivityId` across all resends. Asserts `ids[0]` stripped and all uploaded.
 
 4. **`testProjectGonePolicyRecordedEvenWhenParkingPersistenceFails`**:
-   - Inject: `CREATE TRIGGER fail_park BEFORE UPDATE OF synced ON activities BEGIN SELECT RAISE(ABORT, 'injected park failure'); END;`
-   - Invariants: Server returns 409 archived; `verifyProject` returns `.gone`. Asserts `report.goneProjects == ["gone"]` (server verdict recorded), `report.parked.isEmpty` (local write failure not reported as parked), `report.uploaded.isEmpty`, `report.stop` is `.queueError`, row retained pending in queue, other-owner sentinel intact.
-   - Recovery: Dropping trigger and running pass parks row 1 and uploads subsequent row.
+   - Injected trigger: `CREATE TRIGGER fail_park ... RAISE(ABORT, 'SECRET_GONE_LEAK=/path/to/db\nGONE_TOKEN=xyz\t\u{1F}--unbounded-padding')`.
+   - Invariants: Asserts `report.goneProjects == ["gone"]` (server verdict preserved), `report.parked.isEmpty` (local failure not claimed parked), `report.stop` matches exact sanitized `"queue_park_failed (sqlite code 1)"`, zero token/path leakage.
+   - Recovery: Re-arms `server.answers["gone"]` with 409 archived, drops trigger, and verifies recovery sequence: 1 initial gone + 1 recovery gone + 1 recovery `p2` (total 3 uploads), preserving `clientActivityId`. Asserts `ids[0]` parked and `ids[1]` uploaded.
+
+5. **`testSanitizedQueueErrorProducesFiniteSafeStringAndHandlesUnknownError`**:
+   - Unit test for `SanitizedQueueError`: verifies exact formatting for `.read`, `.strip`, `.remove`, `.park` with SQLite codes, verifies sensitive `QueueError` messages are discarded, and verifies non-SQLite `NSError` unknown error fallback to `"queue_read_failed (unknown error)"`.
 
 ### C. Execution Status & Quality Gates
 | Target Suite | Exact Command Line | Tests Passed | Unexecuted | Result | Evidence Level |
 |---|---|:---:|:---:|:---:|---|
-| **macOS Sync Pass Regressions** | `swift test --filter SyncPassTests` in `clients/macos` | 0 | 15 (11 existing + 4 new) | **UNEXECUTED** | **[Source-Only / Blocked]** (Host environment lacks Swift runtime / macOS toolchain; reported with null exits) |
+| **macOS Sync Pass Regressions** | `swift test --filter SyncPassTests` in `clients/macos` | 0 | 16 (11 existing + 5 new) | **UNEXECUTED** | **[Source-Only / Blocked]** (Host environment lacks Swift runtime / macOS toolchain; reported with null exits) |
 | **Linux Client Compilation Check** | `cargo check --manifest-path clients/linux/Cargo.toml` | N/A | 0 | PASSED (0 errors, 0 warnings, exit 0) | **[Worker-Reported]** |
 | **Windows Client Compilation Check** | `cargo check --manifest-path clients/windows/Cargo.toml` | N/A | 0 | PASSED (0 errors, 0 warnings, exit 0) | **[Worker-Reported]** |
 
 ### D. PM QA Boundary Limits & Acceptance Disclosures
-1. **Truthful Outcome Reporting Only**: All outcomes (`uploaded`, `parked`, `stripped`) represent verified local SQLite state transitions. Write failures halt passes with sanitized `.queueError` and back off without claiming drain or resetting failure counters.
+1. **Truthful Finite Outcome & Error Reporting**: All reported queue errors are mapped to finite, constant-bounded category strings with numeric SQLite codes, eliminating leakage of raw SQL text, database paths, trigger bodies, or control characters.
 2. **Host Toolchain Gap**: Windows host lacks Swift runtime; all Swift tests remain **UNEXECUTED** (null exits/counts).
 3. **No External Dependencies**: Regressions use temporary SQL triggers on disposable test databases; no real keychain, network, or OS hooks involved.
 4. **Approval-Blocked Invariant**: The unresolved `tirith:archive_extract` command remains untouched.
-5. **No Full-Product Acceptance Claim**: This deliverable completes the truthful sync-persistence outcome reporting and regression suite for macOS. Full-product acceptance, native macOS binary notarization, and live desktop verification remain open acceptance gates.
+5. **No Full-Product Acceptance Claim**: This deliverable completes truthful sync-persistence outcome reporting, finite error sanitization, and rearmed recovery sequence verification for macOS. Full-product acceptance, native macOS binary notarization, and live desktop verification remain open acceptance gates.
 
 
 

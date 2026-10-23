@@ -25,6 +25,41 @@ public struct ParkedRow: Equatable, Sendable {
     }
 }
 
+/// An offline queue operation that failed during a sync pass.
+public enum SyncQueueOperation: String, Sendable, Equatable, CustomStringConvertible {
+    case read = "read"
+    case strip = "strip"
+    case remove = "remove"
+    case park = "park"
+
+    public var description: String { rawValue }
+}
+
+/// A finite, sanitized summary of a local queue failure for SyncReport and logging.
+/// Omits raw SQLite messages, SQL/trigger text, database paths, payloads, and unbounded strings.
+public struct SanitizedQueueError: Equatable, Sendable, CustomStringConvertible {
+    public let operation: SyncQueueOperation
+    public let sqliteCode: Int32?
+
+    public init(operation: SyncQueueOperation, sqliteCode: Int32?) {
+        self.operation = operation
+        self.sqliteCode = sqliteCode
+    }
+
+    public init(operation: SyncQueueOperation, error: Error) {
+        self.operation = operation
+        self.sqliteCode = (error as? QueueError)?.code
+    }
+
+    public var description: String {
+        if let code = sqliteCode {
+            return "queue_\(operation.rawValue)_failed (sqlite code \(code))"
+        } else {
+            return "queue_\(operation.rawValue)_failed (unknown error)"
+        }
+    }
+}
+
 /// Why a pass stopped before the queue was drained.
 public enum SyncStop: Equatable, Sendable {
     /// Keep the remaining rows; try again after the plan's delay.
@@ -77,6 +112,10 @@ public struct SyncReport: Equatable, Sendable {
 /// a few passes. Rows of any other account are never read. Freed pages go
 /// back to the disk at the end.
 public enum SyncPass {
+    public static func sanitizeQueueError(operation: SyncQueueOperation, error: Error) -> String {
+        SanitizedQueueError(operation: operation, error: error).description
+    }
+
     public static func run(
         queue: Queue,
         owner: String,
@@ -95,8 +134,9 @@ public enum SyncPass {
                 batch = try queue.pendingBatch(owner: owner, afterId: cursor,
                                                limit: max(min(batchSize, maxUploads - report.attempted), 1))
             } catch {
-                CoreLog.error("sync", "failed to read pending activities: \(error)")
-                report.stop = .queueError("\(error)")
+                let sanitized = sanitizeQueueError(operation: .read, error: error)
+                CoreLog.error("sync", "failed to read pending activities: \(sanitized)")
+                report.stop = .queueError(sanitized)
                 break
             }
             if batch.isEmpty {
@@ -119,8 +159,9 @@ public enum SyncPass {
                     do {
                         stillQueued = try queue.stripCaptures(id: row.id)
                     } catch {
-                        CoreLog.error("sync", "could not strip captures of activity \(row.id): \(error)")
-                        report.stop = .queueError("\(error)")
+                        let sanitized = sanitizeQueueError(operation: .strip, error: error)
+                        CoreLog.error("sync", "could not strip captures of activity \(row.id): \(sanitized)")
+                        report.stop = .queueError(sanitized)
                         break pass
                     }
                     guard stillQueued else { continue }
@@ -139,8 +180,9 @@ public enum SyncPass {
                         try queue.removeSynced(id: row.id)
                         report.uploaded.append(row.id)
                     } catch {
-                        CoreLog.error("sync", "uploaded activity \(row.id) could not leave the queue: \(error)")
-                        report.stop = .queueError("\(error)")
+                        let sanitized = sanitizeQueueError(operation: .remove, error: error)
+                        CoreLog.error("sync", "uploaded activity \(row.id) could not leave the queue: \(sanitized)")
+                        report.stop = .queueError(sanitized)
                         break pass
                     }
 
@@ -193,7 +235,7 @@ public enum SyncPass {
         do {
             try queue.reclaimSpace()
         } catch {
-            CoreLog.warning("sync", "could not reclaim the local queue's free space: \(error)")
+            CoreLog.warning("sync", "could not reclaim the local queue's free space")
         }
         return report
     }
@@ -206,8 +248,9 @@ public enum SyncPass {
             report.parked.append(ParkedRow(id: row.id, projectId: row.payload.projectId, reason: reason))
             return true
         } catch {
-            CoreLog.error("sync", "could not park activity \(row.id): \(error)")
-            report.stop = .queueError("\(error)")
+            let sanitized = sanitizeQueueError(operation: .park, error: error)
+            CoreLog.error("sync", "could not park activity \(row.id): \(sanitized)")
+            report.stop = .queueError(sanitized)
             return false
         }
     }
@@ -216,7 +259,7 @@ public enum SyncPass {
         do {
             try queue.noteAttempt(id: row.id, reason: reason)
         } catch {
-            CoreLog.warning("sync", "could not note the failed attempt on activity \(row.id): \(error)")
+            CoreLog.warning("sync", "could not note the failed attempt on activity \(row.id)")
         }
     }
 }

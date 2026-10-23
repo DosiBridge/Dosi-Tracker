@@ -208,8 +208,8 @@ final class SyncPassTests: XCTestCase {
             recent.push(RecentBlock(rowId: id, projectTitle: project, payload: payload(project)))
         }
 
-        // Deterministic isolated SQLite failure injection: prevent deletion in removeSynced
-        try queue.db.execute("CREATE TRIGGER fail_delete BEFORE DELETE ON activities BEGIN SELECT RAISE(ABORT, 'injected delete failure'); END;")
+        // Deterministic isolated SQLite failure injection: distinctive private/long/control-character trigger text
+        try queue.db.execute("CREATE TRIGGER fail_delete BEFORE DELETE ON activities BEGIN SELECT RAISE(ABORT, 'CONFIDENTIAL_DB_PATH=/Users/victim/Library/dosi.db\nUSER_SECRET=tok_1234567890\t\u{1F}--unbounded-control-payload-message-padding-XXXX'); END;")
 
         let server = FakeServer()
         let report = await run(server)
@@ -219,7 +219,14 @@ final class SyncPassTests: XCTestCase {
         XCTAssertTrue(report.uploaded.isEmpty, "Row that failed local queue removal must not be reported as uploaded")
         XCTAssertFalse(report.drained, "Pass must not report drained when queue removal fails")
         if case .some(.queueError(let message)) = report.stop {
-            XCTAssertTrue(message.contains("injected delete failure"), "Stop reason must reflect sanitized queue failure: \(message)")
+            XCTAssertEqual(message, "queue_remove_failed (sqlite code 1)", "Stop reason must match finite sanitized category and code")
+            XCTAssertLessThanOrEqual(message.count, 64, "Error message must be short and bounded")
+            XCTAssertFalse(message.contains("CONFIDENTIAL_DB_PATH"), "Raw SQL/trigger text must never leak into report")
+            XCTAssertFalse(message.contains("/Users/victim"), "Database paths must never leak into report")
+            XCTAssertFalse(message.contains("tok_1234567890"), "Secrets/payloads must never leak into report")
+            XCTAssertFalse(message.contains("\n"), "Newlines must never appear in report")
+            XCTAssertFalse(message.contains("\t"), "Tabs must never appear in report")
+            XCTAssertFalse(message.contains("\u{1F}"), "Control characters must never appear in report")
         } else {
             XCTFail("Expected .queueError stop reason, got \(String(describing: report.stop))")
         }
@@ -247,7 +254,7 @@ final class SyncPassTests: XCTestCase {
         let bobPending = try queue.pendingBatch(owner: otherOwner, afterId: 0, limit: 5)
         XCTAssertEqual(bobPending.map { $0.id }, [bobSentinel])
 
-        // Recovery: remove injected trigger, verify queue drains successfully
+        // Recovery: remove injected trigger, verify queue drains successfully with idempotent server retry
         try queue.db.execute("DROP TRIGGER fail_delete;")
         let recoveryReport = await run(server)
         XCTAssertEqual(recoveryReport.uploaded, ids, "All rows must upload and leave the queue after failure is resolved")
@@ -255,6 +262,12 @@ final class SyncPassTests: XCTestCase {
         XCTAssertNil(recoveryReport.stop)
         XCTAssertEqual(try queue.pendingCount(owner: owner), 0)
         XCTAssertEqual(try queue.pendingCount(owner: otherOwner), 1, "Other-owner sentinel preserved")
+
+        // Sequence verification: 1 initial attempt for p1 + 3 recovery uploads (p1, p2, p3)
+        XCTAssertEqual(server.sent.count, 4, "Total uploads: 1 initial failed remove + 3 recovery uploads")
+        XCTAssertEqual(server.sent[0].clientActivityId, server.sent[1].clientActivityId, "clientActivityId must match on idempotent retry")
+        XCTAssertEqual(server.sent[2].projectId, "p2")
+        XCTAssertEqual(server.sent[3].projectId, "p3")
 
         recent.apply(recoveryReport)
         for id in ids {
@@ -275,8 +288,8 @@ final class SyncPassTests: XCTestCase {
         let server = FakeServer()
         server.answers["p1"] = [http(409, UploadPolicy.Code.activityOverlaps, "Overlaps another block.")]
 
-        // Deterministic isolated SQLite failure injection: prevent update to synced = 2 in markRejected
-        try queue.db.execute("CREATE TRIGGER fail_park BEFORE UPDATE OF synced ON activities BEGIN SELECT RAISE(ABORT, 'injected park failure'); END;")
+        // Deterministic isolated SQLite failure injection: distinctive private/long/control-character trigger text
+        try queue.db.execute("CREATE TRIGGER fail_park BEFORE UPDATE OF synced ON activities BEGIN SELECT RAISE(ABORT, 'SECRET_PARK_LEAK=/var/db/app.db\nCREDENTIAL_BEARER=secret_jwt_xyz\t\u{1F}--unbounded-park-padding-XXXX'); END;")
 
         let report = await run(server)
 
@@ -286,7 +299,13 @@ final class SyncPassTests: XCTestCase {
         XCTAssertTrue(report.uploaded.isEmpty)
         XCTAssertFalse(report.drained)
         if case .some(.queueError(let message)) = report.stop {
-            XCTAssertTrue(message.contains("injected park failure"), "Stop reason must reflect sanitized queue failure: \(message)")
+            XCTAssertEqual(message, "queue_park_failed (sqlite code 1)", "Stop reason must match finite sanitized category and code")
+            XCTAssertLessThanOrEqual(message.count, 64)
+            XCTAssertFalse(message.contains("SECRET_PARK_LEAK"), "Raw trigger text must never leak into report")
+            XCTAssertFalse(message.contains("secret_jwt_xyz"), "Secrets must never leak into report")
+            XCTAssertFalse(message.contains("\n"))
+            XCTAssertFalse(message.contains("\t"))
+            XCTAssertFalse(message.contains("\u{1F}"))
         } else {
             XCTFail("Expected .queueError stop reason, got \(String(describing: report.stop))")
         }
@@ -308,10 +327,18 @@ final class SyncPassTests: XCTestCase {
         // Other-owner sentinel intact
         XCTAssertEqual(try queue.pendingCount(owner: otherOwner), 1)
 
-        // Recovery: remove injected trigger, verify p1 parks and p2 uploads
+        // Recovery: remove injected trigger, explicitly rearm server response script for p1, and run pass
         try queue.db.execute("DROP TRIGGER fail_park;")
+        server.answers["p1"] = [http(409, UploadPolicy.Code.activityOverlaps, "Overlaps another block.")]
         let recoveryReport = await run(server)
+
+        // Sequence verification: 1 initial attempt for p1 + 1 recovery park for p1 + 1 recovery upload for p2
+        XCTAssertEqual(server.sent.count, 3, "Total uploads: 1 initial failed park + 1 recovery park + 1 recovery upload of p2")
+        XCTAssertEqual(server.sent[0].clientActivityId, server.sent[1].clientActivityId, "clientActivityId must be preserved on retry")
+        XCTAssertEqual(server.sent[2].projectId, "p2")
+
         XCTAssertEqual(recoveryReport.parked.map { $0.id }, [ids[0]])
+        XCTAssertEqual(recoveryReport.parked.first?.reason, "Overlaps another block.")
         XCTAssertEqual(recoveryReport.uploaded, [ids[1]])
         XCTAssertTrue(recoveryReport.drained)
         XCTAssertNil(recoveryReport.stop)
@@ -332,8 +359,8 @@ final class SyncPassTests: XCTestCase {
         let server = FakeServer()
         server.answers["p1"] = [http(413)]
 
-        // Deterministic isolated SQLite failure injection: prevent update to stripped = 1 in stripCaptures
-        try queue.db.execute("CREATE TRIGGER fail_strip BEFORE UPDATE OF stripped ON activities BEGIN SELECT RAISE(ABORT, 'injected strip failure'); END;")
+        // Deterministic isolated SQLite failure injection: distinctive private/long/control-character trigger text
+        try queue.db.execute("CREATE TRIGGER fail_strip BEFORE UPDATE OF stripped ON activities BEGIN SELECT RAISE(ABORT, 'SECRET_STRIP_LEAK=/private/var/queue.db\nPAYLOAD_KEY=capture_token_abc\t\u{1F}--unbounded-strip-padding-XXXX'); END;")
 
         let report = await run(server)
 
@@ -343,7 +370,13 @@ final class SyncPassTests: XCTestCase {
         XCTAssertTrue(report.uploaded.isEmpty)
         XCTAssertFalse(report.drained)
         if case .some(.queueError(let message)) = report.stop {
-            XCTAssertTrue(message.contains("injected strip failure"), "Stop reason must reflect sanitized queue failure: \(message)")
+            XCTAssertEqual(message, "queue_strip_failed (sqlite code 1)", "Stop reason must match finite sanitized category and code")
+            XCTAssertLessThanOrEqual(message.count, 64)
+            XCTAssertFalse(message.contains("SECRET_STRIP_LEAK"), "Raw trigger text must never leak into report")
+            XCTAssertFalse(message.contains("capture_token_abc"), "Payload keys must never leak into report")
+            XCTAssertFalse(message.contains("\n"))
+            XCTAssertFalse(message.contains("\t"))
+            XCTAssertFalse(message.contains("\u{1F}"))
         } else {
             XCTFail("Expected .queueError stop reason, got \(String(describing: report.stop))")
         }
@@ -360,9 +393,21 @@ final class SyncPassTests: XCTestCase {
         // Other-owner sentinel intact
         XCTAssertEqual(try queue.pendingCount(owner: otherOwner), 1)
 
-        // Recovery: remove injected trigger, verify strip and upload succeed
+        // Recovery: remove injected trigger, explicitly rearm 413 for p1, and run pass
         try queue.db.execute("DROP TRIGGER fail_strip;")
+        server.answers["p1"] = [http(413)]
         let recoveryReport = await run(server)
+
+        // Sequence verification:
+        // 1 initial (with captures) + 1 recovery initial (with captures) + 1 recovery resend (stripped) + 1 recovery p2
+        XCTAssertEqual(server.sent.count, 4, "Total uploads: 1 initial (with captures) + 1 recovery initial (with captures) + 1 recovery resend (stripped) + 1 recovery p2")
+        XCTAssertTrue(server.sent[0].hasCaptures)
+        XCTAssertTrue(server.sent[1].hasCaptures)
+        XCTAssertFalse(server.sent[2].hasCaptures, "Recovery resend must strip captures")
+        XCTAssertEqual(server.sent[0].clientActivityId, server.sent[1].clientActivityId)
+        XCTAssertEqual(server.sent[1].clientActivityId, server.sent[2].clientActivityId, "Resent payload must preserve clientActivityId")
+        XCTAssertEqual(server.sent[3].projectId, "p2")
+
         XCTAssertEqual(recoveryReport.stripped, [ids[0]])
         XCTAssertEqual(recoveryReport.uploaded, ids)
         XCTAssertTrue(recoveryReport.drained)
@@ -380,8 +425,8 @@ final class SyncPassTests: XCTestCase {
         server.answers["gone"] = [http(409, UploadPolicy.Code.projectArchived, "The project is archived.")]
         server.verdict = .gone
 
-        // Deterministic isolated SQLite failure injection: fail markRejected
-        try queue.db.execute("CREATE TRIGGER fail_park BEFORE UPDATE OF synced ON activities BEGIN SELECT RAISE(ABORT, 'injected park failure'); END;")
+        // Deterministic isolated SQLite failure injection: distinctive private/long/control-character trigger text
+        try queue.db.execute("CREATE TRIGGER fail_park BEFORE UPDATE OF synced ON activities BEGIN SELECT RAISE(ABORT, 'SECRET_GONE_LEAK=/path/to/db\nGONE_TOKEN=xyz\t\u{1F}--unbounded-gone-padding-XXXX'); END;")
 
         let report = await run(server)
 
@@ -391,7 +436,13 @@ final class SyncPassTests: XCTestCase {
         XCTAssertTrue(report.parked.isEmpty, "Parking write failed, so row must not be reported as parked")
         XCTAssertTrue(report.uploaded.isEmpty, "Subsequent row must not be uploaded after local mutation failure")
         if case .some(.queueError(let message)) = report.stop {
-            XCTAssertTrue(message.contains("injected park failure"))
+            XCTAssertEqual(message, "queue_park_failed (sqlite code 1)", "Stop reason must match finite sanitized category and code")
+            XCTAssertLessThanOrEqual(message.count, 64)
+            XCTAssertFalse(message.contains("SECRET_GONE_LEAK"))
+            XCTAssertFalse(message.contains("GONE_TOKEN"))
+            XCTAssertFalse(message.contains("\n"))
+            XCTAssertFalse(message.contains("\t"))
+            XCTAssertFalse(message.contains("\u{1F}"))
         } else {
             XCTFail("Expected .queueError stop reason, got \(String(describing: report.stop))")
         }
@@ -399,12 +450,42 @@ final class SyncPassTests: XCTestCase {
         XCTAssertEqual(try queue.pendingCount(owner: owner), 2)
         XCTAssertEqual(try queue.pendingCount(owner: otherOwner), 1)
 
-        // Recovery
+        // Recovery: remove injected trigger, explicitly rearm 409 archived for gone, and run pass
         try queue.db.execute("DROP TRIGGER fail_park;")
+        server.answers["gone"] = [http(409, UploadPolicy.Code.projectArchived, "The project is archived.")]
         let recoveryReport = await run(server)
+
+        // Sequence verification: 1 initial gone + 1 recovery gone + 1 recovery p2
+        XCTAssertEqual(server.sent.count, 3, "Total uploads: 1 initial gone + 1 recovery gone + 1 recovery p2")
+        XCTAssertEqual(server.sent[0].clientActivityId, server.sent[1].clientActivityId)
+        XCTAssertEqual(server.sent[2].projectId, "p2")
+
         XCTAssertEqual(recoveryReport.goneProjects, ["gone"])
         XCTAssertEqual(recoveryReport.parked.map { $0.id }, [ids[0]])
+        XCTAssertEqual(recoveryReport.parked.first?.reason, "The project is archived.")
         XCTAssertEqual(recoveryReport.uploaded, [ids[1]])
         XCTAssertTrue(recoveryReport.drained)
+        XCTAssertNil(recoveryReport.stop)
+        XCTAssertEqual(try queue.rejectedCount(owner: owner), 1)
+        XCTAssertEqual(try queue.pendingCount(owner: owner), 0)
+        XCTAssertEqual(try queue.pendingCount(owner: otherOwner), 1)
+    }
+
+    func testSanitizedQueueErrorProducesFiniteSafeStringAndHandlesUnknownError() {
+        XCTAssertEqual(SanitizedQueueError(operation: .read, sqliteCode: 1).description, "queue_read_failed (sqlite code 1)")
+        XCTAssertEqual(SanitizedQueueError(operation: .strip, sqliteCode: 13).description, "queue_strip_failed (sqlite code 13)")
+        XCTAssertEqual(SanitizedQueueError(operation: .remove, sqliteCode: 1).description, "queue_remove_failed (sqlite code 1)")
+        XCTAssertEqual(SanitizedQueueError(operation: .park, sqliteCode: 5).description, "queue_park_failed (sqlite code 5)")
+
+        let sensitiveError = QueueError(code: 1, message: "RAW_SECRET_QUERY_PATH=/path/to/db\nTOKEN=xyz\t\u{1F}")
+        let sanitized = SanitizedQueueError(operation: .remove, error: sensitiveError).description
+        XCTAssertEqual(sanitized, "queue_remove_failed (sqlite code 1)")
+        XCTAssertFalse(sanitized.contains("RAW_SECRET_QUERY_PATH"))
+        XCTAssertFalse(sanitized.contains("\n"))
+
+        let unknownError = NSError(domain: "test.unknown", code: 999, userInfo: [NSLocalizedDescriptionKey: "unbounded private text"])
+        let unknownSanitized = SanitizedQueueError(operation: .read, error: unknownError).description
+        XCTAssertEqual(unknownSanitized, "queue_read_failed (unknown error)")
+        XCTAssertFalse(unknownSanitized.contains("unbounded private text"))
     }
 }
