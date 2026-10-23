@@ -112,6 +112,16 @@ actor UploadLoop {
         passDeadline = nil
     }
 
+    /// Cleanly cancel background tasks and close the command inbox so run() exits.
+    func shutdown() async {
+        stopped = true
+        wakeTask?.cancel()
+        wakeTask = nil
+        passTask?.cancel()
+        passTask = nil
+        inbox.finish()
+    }
+
     // MARK: Commands
 
     private func apply(_ command: UploadCommand) {

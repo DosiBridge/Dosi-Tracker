@@ -1,4 +1,5 @@
 import DosiTrackerCore
+import Foundation
 import XCTest
 @testable import DosiTracker
 
@@ -19,6 +20,11 @@ final class WorkerConsentLifecycleTests: XCTestCase {
         override func stopLoading() {}
     }
 
+    private struct TestCaptureError: Error, LocalizedError {
+        let message: String
+        var errorDescription: String? { message }
+    }
+
     /// Blockable fake consent store enabling deterministic testing of in-flight persistence
     /// without relying on arbitrary sleeps.
     private final class BlockedConsentStore: ConsentStorage, @unchecked Sendable {
@@ -29,6 +35,7 @@ final class WorkerConsentLifecycleTests: XCTestCase {
         private var isBlocked = false
         var shouldFailSave = false
         private(set) var saveCount = 0
+        private(set) var timedOut = false
 
         init(initial: LocalConsent = .absent) {
             self.consent = initial
@@ -67,7 +74,13 @@ final class WorkerConsentLifecycleTests: XCTestCase {
 
             if blocked {
                 saveEnteredSemaphore.signal()
-                _ = saveReleaseSemaphore.wait(timeout: .now() + 5.0)
+                let waitResult = saveReleaseSemaphore.wait(timeout: .now() + 5.0)
+                if waitResult == .timedOut {
+                    lock.lock()
+                    timedOut = true
+                    lock.unlock()
+                    throw ConsentError.saveFailed("BlockedConsentStore barrier timed out waiting for release")
+                }
             }
 
             lock.lock()
@@ -90,7 +103,8 @@ final class WorkerConsentLifecycleTests: XCTestCase {
         private let captureReleaseSemaphore = DispatchSemaphore(value: 0)
         private var isBlocked = false
         private(set) var captureCount = 0
-        var capturedScreens: [ScreenCapture] = []
+        private(set) var timedOut = false
+        var nextCaptureData: Data?
 
         func blockNextCapture() {
             lock.lock()
@@ -115,25 +129,28 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             let blocked = isBlocked
             captureCount += 1
             let count = captureCount
+            let customData = nextCaptureData
             lock.unlock()
 
             if blocked {
                 captureEnteredSemaphore.signal()
-                _ = captureReleaseSemaphore.wait(timeout: .now() + 5.0)
+                let waitResult = captureReleaseSemaphore.wait(timeout: .now() + 5.0)
+                if waitResult == .timedOut {
+                    lock.lock()
+                    timedOut = true
+                    lock.unlock()
+                    throw TestCaptureError(message: "BlockedScreenCapturer barrier timed out waiting for release")
+                }
             }
 
-            let data = Data([UInt8(count & 0xFF), UInt8(count & 0xFF)])
-            let screen = ScreenCapture(
+            let data = customData ?? Data([UInt8(count & 0xFF), UInt8(count & 0xFF)])
+            return ScreenCapture(
                 displayID: CGDirectDisplayID(count),
                 fullJpeg: data,
                 thumbnailJpeg: data,
                 capturedAt: Date(),
                 blurred: blur
             )
-            lock.lock()
-            capturedScreens.append(screen)
-            lock.unlock()
-            return screen
         }
     }
 
@@ -188,11 +205,14 @@ final class WorkerConsentLifecycleTests: XCTestCase {
     private final class DriverPolicyRecorder: @unchecked Sendable {
         private let lock = NSLock()
         private var history: [ConsentedPermissions] = []
+        var onRecord: (@Sendable (ConsentedPermissions) -> Void)?
 
         func record(_ perms: ConsentedPermissions) {
             lock.lock()
             history.append(perms)
+            let callback = onRecord
             lock.unlock()
+            callback?(perms)
         }
 
         var last: ConsentedPermissions? {
@@ -239,7 +259,7 @@ final class WorkerConsentLifecycleTests: XCTestCase {
         customStorage: (any ConsentStorage)? = nil,
         screenCapturer: (any ScreenCapturing)? = nil,
         project: MyProject? = nil
-    ) throws -> (TrackerWorker, ConsentManager, DriverPolicyRecorder, Box<[TrackerSnapshot]>, URL) {
+    ) throws -> (TrackerWorker, ConsentManager, DriverPolicyRecorder, Box<[TrackerSnapshot]>, AppPaths, URLSession, String) {
         let tempDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("worker-consent-\(UUID().uuidString.lowercased())", isDirectory: true)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
@@ -253,7 +273,8 @@ final class WorkerConsentLifecycleTests: XCTestCase {
         let credentials = TestCredentialsStore()
         credentials.saved = StoredSignIn(account: ApiClient.Account(workspace: "test-ws", username: "user@example.com", password: "pwd"))
 
-        let userDefaults = UserDefaults(suiteName: "test-\(UUID().uuidString)")!
+        let suiteName = "test-\(UUID().uuidString.lowercased())"
+        let userDefaults = UserDefaults(suiteName: suiteName)!
         let preferences = Preferences(defaults: userDefaults)
         preferences.rememberedProjectId = project?.id ?? "p-test"
 
@@ -311,7 +332,34 @@ final class WorkerConsentLifecycleTests: XCTestCase {
         )
 
         let worker = TrackerWorker(dependencies: deps)
-        return (worker, consentManager, driverRecorder, snapshotsBox, tempDir)
+        return (worker, consentManager, driverRecorder, snapshotsBox, paths, offlineSession, suiteName)
+    }
+
+    private func withHarness(
+        initialConsent: LocalConsent = .absent,
+        customStorage: (any ConsentStorage)? = nil,
+        screenCapturer: (any ScreenCapturing)? = nil,
+        project: MyProject? = nil,
+        _ body: (TrackerWorker, ConsentManager, DriverPolicyRecorder, Box<[TrackerSnapshot]>, AppPaths) async throws -> Void
+    ) async throws {
+        let (worker, consentManager, driverRecorder, snapshotsBox, paths, session, suiteName) = try makeHarness(
+            initialConsent: initialConsent,
+            customStorage: customStorage,
+            screenCapturer: screenCapturer,
+            project: project
+        )
+        defer {
+            session.invalidateAndCancel()
+            UserDefaults.standard.removePersistentDomain(forName: suiteName)
+            try? FileManager.default.removeItem(at: paths.root)
+        }
+        do {
+            try await body(worker, consentManager, driverRecorder, snapshotsBox, paths)
+        } catch {
+            await worker.shutdown()
+            throw error
+        }
+        await worker.shutdown()
     }
 
     // MARK: - 1. Positive Control & Absent Consent
@@ -326,29 +374,31 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             runningPrograms: true,
             blurScreenshots: false
         )
-        let (worker, _, driverRecorder, _, tempDir) = try makeHarness(initialConsent: .granted(allLocalGranted))
-        defer { try? FileManager.default.removeItem(at: tempDir) }
+        try await withHarness(initialConsent: .granted(allLocalGranted)) { worker, _, driverRecorder, _, _ in
+            await worker.start(launchedAtLogin: false, startPeriodicTicks: false)
 
-        await worker.start(launchedAtLogin: false)
-
-        // Positive control: With affirmative local consent and active session, drivers must be started with all permissions
-        XCTAssertEqual(driverRecorder.last, allLocalGranted, "Positive control: active tracking must be established with fake drivers started")
-        let snapshot = await worker.snapshot()
-        XCTAssertTrue(snapshot.facts.consentGranted)
-        XCTAssertEqual(snapshot.localConsent, .granted(allLocalGranted))
+            guard let lastDrivers = driverRecorder.last else {
+                return XCTFail("Driver policy recording must not be nil after start")
+            }
+            XCTAssertEqual(lastDrivers, allLocalGranted, "Positive control: active tracking must be established with fake drivers started")
+            let snapshot = await worker.snapshot()
+            XCTAssertTrue(snapshot.facts.consentGranted)
+            XCTAssertEqual(snapshot.localConsent, .granted(allLocalGranted))
+        }
     }
 
     func testAbsentConsentPreventsStartAndKeepsDriversStopped() async throws {
-        let (worker, _, driverRecorder, _, tempDir) = try makeHarness(initialConsent: .absent)
-        defer { try? FileManager.default.removeItem(at: tempDir) }
+        try await withHarness(initialConsent: .absent) { worker, _, driverRecorder, _, _ in
+            await worker.start(launchedAtLogin: false, startPeriodicTicks: false)
 
-        await worker.start(launchedAtLogin: false)
-
-        // Drivers must remain completely disabled
-        XCTAssertEqual(driverRecorder.last, ConsentedPermissions.allDisabled)
-        let snapshot = await worker.snapshot()
-        XCTAssertFalse(snapshot.facts.consentGranted)
-        XCTAssertEqual(snapshot.localConsent, .absent)
+            guard let lastDrivers = driverRecorder.last else {
+                return XCTFail("Driver policy recording must not be nil after start")
+            }
+            XCTAssertEqual(lastDrivers, ConsentedPermissions.allDisabled)
+            let snapshot = await worker.snapshot()
+            XCTAssertFalse(snapshot.facts.consentGranted)
+            XCTAssertEqual(snapshot.localConsent, .absent)
+        }
     }
 
     // MARK: - 2. Project Policy Deny Restricts Effective Permissions
@@ -376,24 +426,18 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             blurScreenshots: false
         )
 
-        let (worker, _, driverRecorder, _, tempDir) = try makeHarness(
-            initialConsent: .granted(allLocalGranted),
-            project: restrictedProject
-        )
-        defer { try? FileManager.default.removeItem(at: tempDir) }
+        try await withHarness(initialConsent: .granted(allLocalGranted), project: restrictedProject) { worker, _, driverRecorder, _, _ in
+            await worker.start(launchedAtLogin: false, startPeriodicTicks: false)
 
-        await worker.start(launchedAtLogin: false)
-
-        // Effective permissions must be intersection: only keyboard and mouse permitted
-        if let last = driverRecorder.last {
+            guard let last = driverRecorder.last else {
+                return XCTFail("Driver policy recording must not be nil")
+            }
             XCTAssertTrue(last.keyboard)
             XCTAssertTrue(last.mouse)
             XCTAssertFalse(last.screenshot, "Project policy denied screenshot")
             XCTAssertFalse(last.webcam, "Project policy denied webcam")
             XCTAssertFalse(last.activeWindow, "Project policy denied activeWindow")
             XCTAssertFalse(last.runningPrograms, "Project policy denied runningPrograms")
-        } else {
-            XCTFail("Expected driver policy call")
         }
     }
 
@@ -410,39 +454,62 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             blurScreenshots: false
         )
 
-        let (worker, _, driverRecorder, _, tempDir) = try makeHarness(initialConsent: .granted(allLocalGranted))
-        defer { try? FileManager.default.removeItem(at: tempDir) }
+        try await withHarness(initialConsent: .granted(allLocalGranted)) { worker, _, driverRecorder, _, _ in
+            await worker.start(launchedAtLogin: false, startPeriodicTicks: false)
+            guard let initial = driverRecorder.last else {
+                return XCTFail("Driver policy recording must not be nil after start")
+            }
+            XCTAssertEqual(initial, allLocalGranted)
 
-        await worker.start(launchedAtLogin: false)
-        XCTAssertEqual(driverRecorder.last, allLocalGranted)
+            // 1. Pause
+            await worker.pause(resumeAfter: nil, at: Date())
+            guard let paused = driverRecorder.last else {
+                return XCTFail("Driver policy recording must not be nil after pause")
+            }
+            XCTAssertEqual(paused, ConsentedPermissions.allDisabled, "Pause must immediately stop drivers")
 
-        // 1. Pause
-        await worker.pause(resumeAfter: nil, at: Date())
-        XCTAssertEqual(driverRecorder.last, ConsentedPermissions.allDisabled, "Pause must immediately stop drivers")
+            // Resume
+            await worker.resume(at: Date())
+            guard let resumed = driverRecorder.last else {
+                return XCTFail("Driver policy recording must not be nil after resume")
+            }
+            XCTAssertEqual(resumed, allLocalGranted, "Resume restores active drivers")
 
-        // Resume
-        await worker.resume(at: Date())
-        XCTAssertEqual(driverRecorder.last, allLocalGranted, "Resume restores active drivers")
+            // 2. Lock
+            await worker.handleSystemEvent(SystemEvent(at: Date(), kind: .screenLocked))
+            guard let locked = driverRecorder.last else {
+                return XCTFail("Driver policy recording must not be nil after lock")
+            }
+            XCTAssertEqual(locked, ConsentedPermissions.allDisabled, "Screen lock must immediately stop drivers")
 
-        // 2. Lock
-        await worker.handleSystemEvent(SystemEvent(at: Date(), kind: .screenLocked))
-        XCTAssertEqual(driverRecorder.last, ConsentedPermissions.allDisabled, "Screen lock must immediately stop drivers")
+            // Unlock
+            await worker.handleSystemEvent(SystemEvent(at: Date(), kind: .screenUnlocked))
+            guard let unlocked = driverRecorder.last else {
+                return XCTFail("Driver policy recording must not be nil after unlock")
+            }
+            XCTAssertEqual(unlocked, allLocalGranted, "Unlock restores active drivers")
 
-        // Unlock
-        await worker.handleSystemEvent(SystemEvent(at: Date(), kind: .screenUnlocked))
-        XCTAssertEqual(driverRecorder.last, allLocalGranted, "Unlock restores active drivers")
+            // 3. Sleep
+            await worker.handleSystemEvent(SystemEvent(at: Date(), kind: .willSleep))
+            guard let sleeping = driverRecorder.last else {
+                return XCTFail("Driver policy recording must not be nil after sleep")
+            }
+            XCTAssertEqual(sleeping, ConsentedPermissions.allDisabled, "Sleep must immediately stop drivers")
 
-        // 3. Sleep
-        await worker.handleSystemEvent(SystemEvent(at: Date(), kind: .willSleep))
-        XCTAssertEqual(driverRecorder.last, ConsentedPermissions.allDisabled, "Sleep must immediately stop drivers")
+            // Wake
+            await worker.handleSystemEvent(SystemEvent(at: Date(), kind: .didWake))
+            guard let awake = driverRecorder.last else {
+                return XCTFail("Driver policy recording must not be nil after wake")
+            }
+            XCTAssertEqual(awake, allLocalGranted, "Wake restores active drivers")
 
-        // Wake
-        await worker.handleSystemEvent(SystemEvent(at: Date(), kind: .didWake))
-        XCTAssertEqual(driverRecorder.last, allLocalGranted, "Wake restores active drivers")
-
-        // 4. Sign out
-        await worker.signOut(at: Date())
-        XCTAssertEqual(driverRecorder.last, ConsentedPermissions.allDisabled, "Sign out must immediately stop drivers")
+            // 4. Sign out
+            await worker.signOut(at: Date())
+            guard let signedOut = driverRecorder.last else {
+                return XCTFail("Driver policy recording must not be nil after sign out")
+            }
+            XCTAssertEqual(signedOut, ConsentedPermissions.allDisabled, "Sign out must immediately stop drivers")
+        }
     }
 
     // MARK: - 4. Denial Retry Cannot Reattach
@@ -458,21 +525,26 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             blurScreenshots: false
         )
 
-        let (worker, _, driverRecorder, _, tempDir) = try makeHarness(initialConsent: .granted(allLocalGranted))
-        defer { try? FileManager.default.removeItem(at: tempDir) }
+        try await withHarness(initialConsent: .granted(allLocalGranted)) { worker, _, driverRecorder, _, _ in
+            await worker.start(launchedAtLogin: false, startPeriodicTicks: false)
+            guard let initial = driverRecorder.last else {
+                return XCTFail("Driver policy recording must not be nil after start")
+            }
+            XCTAssertEqual(initial, allLocalGranted)
 
-        await worker.start(launchedAtLogin: false)
-        XCTAssertEqual(driverRecorder.last, allLocalGranted)
+            // Revoke consent
+            try await worker.updateConsent(.revoked)
+            guard let revoked = driverRecorder.last else {
+                return XCTFail("Driver policy recording must not be nil after revoke")
+            }
+            XCTAssertEqual(revoked, ConsentedPermissions.allDisabled)
 
-        // Revoke consent
-        try await worker.updateConsent(.revoked)
-        XCTAssertEqual(driverRecorder.last, ConsentedPermissions.allDisabled)
+            driverRecorder.clear()
 
-        driverRecorder.clear()
-
-        // Multiple subsequent system event ticks / wakeups must NOT reattach
-        await worker.handleSystemEvent(SystemEvent(at: Date(), kind: .screensDidWake))
-        XCTAssertTrue(driverRecorder.all.allSatisfy { $0 == ConsentedPermissions.allDisabled } || driverRecorder.all.isEmpty)
+            // Multiple subsequent system event ticks / wakeups must NOT reattach
+            await worker.handleSystemEvent(SystemEvent(at: Date(), kind: .screensDidWake))
+            XCTAssertTrue(driverRecorder.all.allSatisfy { $0 == ConsentedPermissions.allDisabled } || driverRecorder.all.isEmpty)
+        }
     }
 
     // MARK: - 5. Blocked Save: Mixed Narrow/Expand with Pre-Save Detach and Post-Save Expansion
@@ -488,71 +560,70 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             blurScreenshots: false
         )
         let store = BlockedConsentStore(initial: .granted(initialPerms))
-        let (worker, _, driverRecorder, _, tempDir) = try makeHarness(
-            initialConsent: .granted(initialPerms),
-            customStorage: store
-        )
-        defer {
-            store.unblock(fail: false)
-            try? FileManager.default.removeItem(at: tempDir)
-        }
+        defer { store.unblock(fail: false) }
 
-        await worker.start(launchedAtLogin: false)
-        XCTAssertEqual(driverRecorder.last, initialPerms, "Positive control: initial drivers started")
+        try await withHarness(initialConsent: .granted(initialPerms), customStorage: store) { worker, _, driverRecorder, _, _ in
+            await worker.start(launchedAtLogin: false, startPeriodicTicks: false)
+            guard let initial = driverRecorder.last else {
+                return XCTFail("Driver policy recording must not be nil after start")
+            }
+            XCTAssertEqual(initial, initialPerms, "Positive control: initial drivers started")
 
-        // Block next save
-        store.blockNextSave()
+            // Block next save
+            store.blockNextSave()
 
-        // Mixed update: withdraw keyboard and activeWindow, expand screenshot, keep mouse, tighten blur
-        let mixedPerms = ConsentedPermissions(
-            screenshot: true,
-            webcam: false,
-            keyboard: false,
-            mouse: true,
-            activeWindow: false,
-            runningPrograms: false,
-            blurScreenshots: true
-        )
+            // Mixed update: withdraw keyboard and activeWindow, expand screenshot, keep mouse, tighten blur
+            let mixedPerms = ConsentedPermissions(
+                screenshot: true,
+                webcam: false,
+                keyboard: false,
+                mouse: true,
+                activeWindow: false,
+                runningPrograms: false,
+                blurScreenshots: true
+            )
 
-        let updateTask = Task {
-            try await worker.updateConsent(.granted(mixedPerms))
-        }
+            let updateTask = Task {
+                try await worker.updateConsent(.granted(mixedPerms))
+            }
 
-        // Wait until save is blocked inside the persistence thread
-        XCTAssertTrue(store.waitForSaveEntered(timeout: 3.0), "Save must be reached and blocked")
+            // Wait until save is blocked inside the persistence thread
+            XCTAssertTrue(store.waitForSaveEntered(timeout: 3.0), "Save must be reached and blocked")
 
-        // ASSERTIONS WHILE SAVE IS BLOCKED:
-        // 1. Withdrawn keyboard driver must be STOPPED before save!
-        // 2. Withdrawn activeWindow must be STOPPED before save!
-        // 3. Retained mouse capability stays CONTROLLED and ACTIVE!
-        // 4. Expanded screenshot capability must NOT be admitted yet!
-        // 5. Blur must be tightened immediately as defense-in-depth!
-        if let currentDrivers = driverRecorder.last {
+            // ASSERTIONS WHILE SAVE IS BLOCKED:
+            // 1. Withdrawn keyboard driver must be STOPPED before save!
+            // 2. Withdrawn activeWindow must be STOPPED before save!
+            // 3. Retained mouse capability stays CONTROLLED and ACTIVE!
+            // 4. Expanded screenshot capability must NOT be admitted yet!
+            // 5. Blur must be tightened immediately as defense-in-depth!
+            guard let currentDrivers = driverRecorder.last else {
+                store.unblock(fail: false)
+                _ = try? await updateTask.value
+                return XCTFail("Expected driver policy recording while save is blocked")
+            }
             XCTAssertFalse(currentDrivers.keyboard, "Keyboard must be stopped before persistence blocks")
             XCTAssertFalse(currentDrivers.activeWindow, "ActiveWindow must be stopped before persistence blocks")
             XCTAssertTrue(currentDrivers.mouse, "Retained mouse capability must stay controlled while save is blocked")
             XCTAssertFalse(currentDrivers.screenshot, "Screenshot expansion must NOT be admitted before save succeeds")
             XCTAssertTrue(currentDrivers.blurScreenshots, "Blur tightening must be applied immediately")
-        } else {
-            XCTFail("Expected driver policy recording while save is blocked")
-        }
 
-        // Now unblock save with success
-        store.unblock(fail: false)
-        try await updateTask.value
+            // Now unblock save with success
+            store.unblock(fail: false)
+            try await updateTask.value
+            XCTAssertFalse(store.timedOut, "Store barrier must not have timed out")
 
-        // POST-SAVE ASSERTIONS:
-        // 1. Screenshot expansion is now admitted
-        // 2. Keyboard and activeWindow remain stopped
-        // 3. Mouse remains active
-        if let finalDrivers = driverRecorder.last {
+            // POST-SAVE ASSERTIONS:
+            // 1. Screenshot expansion is now admitted
+            // 2. Keyboard and activeWindow remain stopped
+            // 3. Mouse remains active
+            guard let finalDrivers = driverRecorder.last else {
+                return XCTFail("Expected driver policy recording post-save")
+            }
             XCTAssertTrue(finalDrivers.screenshot, "Screenshot expansion admitted post-save")
             XCTAssertFalse(finalDrivers.keyboard, "Withdrawn keyboard remains stopped")
             XCTAssertFalse(finalDrivers.activeWindow, "Withdrawn activeWindow remains stopped")
             XCTAssertTrue(finalDrivers.mouse, "Mouse remains active")
             XCTAssertTrue(finalDrivers.blurScreenshots, "Blur remains enforced")
-        } else {
-            XCTFail("Expected driver policy recording post-save")
         }
     }
 
@@ -569,59 +640,62 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             blurScreenshots: false
         )
         let store = BlockedConsentStore(initial: .granted(initialPerms))
-        let (worker, _, driverRecorder, _, tempDir) = try makeHarness(
-            initialConsent: .granted(initialPerms),
-            customStorage: store
-        )
-        defer {
-            store.unblock(fail: false)
-            try? FileManager.default.removeItem(at: tempDir)
-        }
+        defer { store.unblock(fail: false) }
 
-        await worker.start(launchedAtLogin: false)
-        XCTAssertEqual(driverRecorder.last, initialPerms, "Positive control: initial drivers started")
+        try await withHarness(initialConsent: .granted(initialPerms), customStorage: store) { worker, _, driverRecorder, _, _ in
+            await worker.start(launchedAtLogin: false, startPeriodicTicks: false)
+            guard let initial = driverRecorder.last else {
+                return XCTFail("Driver policy recording must not be nil after start")
+            }
+            XCTAssertEqual(initial, initialPerms, "Positive control: initial drivers started")
 
-        // Block next save
-        store.blockNextSave()
+            // Block next save
+            store.blockNextSave()
 
-        let mixedPerms = ConsentedPermissions(
-            screenshot: true,
-            webcam: false,
-            keyboard: false,
-            mouse: true,
-            activeWindow: false,
-            runningPrograms: false,
-            blurScreenshots: true
-        )
+            let mixedPerms = ConsentedPermissions(
+                screenshot: true,
+                webcam: false,
+                keyboard: false,
+                mouse: true,
+                activeWindow: false,
+                runningPrograms: false,
+                blurScreenshots: true
+            )
 
-        let updateTask = Task {
-            try await worker.updateConsent(.granted(mixedPerms))
-        }
+            let updateTask = Task {
+                try await worker.updateConsent(.granted(mixedPerms))
+            }
 
-        XCTAssertTrue(store.waitForSaveEntered(timeout: 3.0), "Save must be reached and blocked")
+            XCTAssertTrue(store.waitForSaveEntered(timeout: 3.0), "Save must be reached and blocked")
 
-        // While save is blocked, assert narrowings applied and expansions off
-        if let currentDrivers = driverRecorder.last {
+            guard let currentDrivers = driverRecorder.last else {
+                store.unblock(fail: false)
+                _ = try? await updateTask.value
+                return XCTFail("Expected driver policy recording while save is blocked")
+            }
             XCTAssertFalse(currentDrivers.keyboard)
             XCTAssertFalse(currentDrivers.activeWindow)
             XCTAssertTrue(currentDrivers.mouse)
             XCTAssertFalse(currentDrivers.screenshot)
-        }
 
-        // Unblock with SIMULATED FAILURE
-        store.unblock(fail: true)
+            // Unblock with SIMULATED FAILURE
+            store.unblock(fail: true)
 
-        do {
-            try await updateTask.value
-            XCTFail("Expected updateConsent to throw on save failure")
-        } catch {
-            // Expected
-        }
+            do {
+                try await updateTask.value
+                XCTFail("Expected updateConsent to throw on save failure")
+            } catch {
+                // Expected
+            }
 
-        // POST-FAILURE ASSERTIONS:
-        // Conservative narrowing must NOT be rolled back!
-        // Unpersisted expansions must NOT be granted!
-        if let finalDrivers = driverRecorder.last {
+            XCTAssertFalse(store.timedOut, "Store barrier must not have timed out")
+
+            // POST-FAILURE ASSERTIONS:
+            // Conservative narrowing must NOT be rolled back!
+            // Unpersisted expansions must NOT be granted!
+            guard let finalDrivers = driverRecorder.last else {
+                return XCTFail("Driver policy recording must not be nil after failure")
+            }
             XCTAssertFalse(finalDrivers.keyboard, "Withdrawn keyboard must remain stopped after save failure")
             XCTAssertFalse(finalDrivers.activeWindow, "Withdrawn activeWindow must remain stopped after save failure")
             XCTAssertTrue(finalDrivers.mouse, "Retained mouse capability remains controlled")
@@ -634,51 +708,59 @@ final class WorkerConsentLifecycleTests: XCTestCase {
 
     func testBlockedSavePureWideningFailureDoesNotAdmitPermissions() async throws {
         let store = BlockedConsentStore(initial: .absent)
-        let (worker, _, driverRecorder, _, tempDir) = try makeHarness(
-            initialConsent: .absent,
-            customStorage: store
-        )
-        defer {
-            store.unblock(fail: false)
-            try? FileManager.default.removeItem(at: tempDir)
+        defer { store.unblock(fail: false) }
+
+        try await withHarness(initialConsent: .absent, customStorage: store) { worker, _, driverRecorder, _, _ in
+            await worker.start(launchedAtLogin: false, startPeriodicTicks: false)
+            guard let initial = driverRecorder.last else {
+                return XCTFail("Driver policy recording must not be nil after start")
+            }
+            XCTAssertEqual(initial, ConsentedPermissions.allDisabled)
+
+            store.blockNextSave()
+
+            let wideningGrant = ConsentedPermissions(
+                screenshot: true,
+                webcam: true,
+                keyboard: true,
+                mouse: true,
+                activeWindow: true,
+                runningPrograms: true,
+                blurScreenshots: false
+            )
+
+            let updateTask = Task {
+                try await worker.updateConsent(.granted(wideningGrant))
+            }
+
+            XCTAssertTrue(store.waitForSaveEntered(timeout: 3.0))
+
+            // While save is blocked: pure widening means drivers MUST remain disabled!
+            guard let duringSave = driverRecorder.last else {
+                store.unblock(fail: false)
+                _ = try? await updateTask.value
+                return XCTFail("Driver policy recording must not be nil during save")
+            }
+            XCTAssertEqual(duringSave, ConsentedPermissions.allDisabled)
+
+            // Fail the save
+            store.unblock(fail: true)
+
+            do {
+                try await updateTask.value
+                XCTFail("Expected pure widening to throw on save failure")
+            } catch {
+                // Expected
+            }
+
+            XCTAssertFalse(store.timedOut, "Store barrier must not have timed out")
+
+            // Post-failure: drivers must remain all disabled
+            guard let postFailure = driverRecorder.last else {
+                return XCTFail("Driver policy recording must not be nil after failure")
+            }
+            XCTAssertEqual(postFailure, ConsentedPermissions.allDisabled)
         }
-
-        await worker.start(launchedAtLogin: false)
-        XCTAssertEqual(driverRecorder.last, ConsentedPermissions.allDisabled)
-
-        store.blockNextSave()
-
-        let wideningGrant = ConsentedPermissions(
-            screenshot: true,
-            webcam: true,
-            keyboard: true,
-            mouse: true,
-            activeWindow: true,
-            runningPrograms: true,
-            blurScreenshots: false
-        )
-
-        let updateTask = Task {
-            try await worker.updateConsent(.granted(wideningGrant))
-        }
-
-        XCTAssertTrue(store.waitForSaveEntered(timeout: 3.0))
-
-        // While save is blocked: pure widening means drivers MUST remain disabled!
-        XCTAssertEqual(driverRecorder.last, ConsentedPermissions.allDisabled)
-
-        // Fail the save
-        store.unblock(fail: true)
-
-        do {
-            try await updateTask.value
-            XCTFail("Expected pure widening to throw on save failure")
-        } catch {
-            // Expected
-        }
-
-        // Post-failure: drivers must remain all disabled
-        XCTAssertEqual(driverRecorder.last, ConsentedPermissions.allDisabled)
     }
 
     // MARK: - 8. Blocked Save: Newer Revocation Supersedes Older Outstanding Save
@@ -694,57 +776,89 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             blurScreenshots: false
         )
         let store = BlockedConsentStore(initial: .granted(allLocalGranted))
-        let (worker, _, driverRecorder, _, tempDir) = try makeHarness(
-            initialConsent: .granted(allLocalGranted),
-            customStorage: store
-        )
-        defer {
+        defer { store.unblock(fail: false) }
+
+        try await withHarness(initialConsent: .granted(allLocalGranted), customStorage: store) { worker, _, driverRecorder, _, _ in
+            await worker.start(launchedAtLogin: false, startPeriodicTicks: false)
+            guard let initial = driverRecorder.last else {
+                return XCTFail("Driver policy recording must not be nil after start")
+            }
+            XCTAssertEqual(initial, allLocalGranted, "Positive control: all drivers active")
+
+            // Block Save #1
+            store.blockNextSave()
+
+            // Update #1 attempts to withdraw screenshot
+            var update1Perms = allLocalGranted
+            update1Perms.screenshot = false
+            let updateTask1 = Task {
+                try await worker.updateConsent(.granted(update1Perms))
+            }
+
+            XCTAssertTrue(store.waitForSaveEntered(timeout: 3.0), "Save #1 must enter store and block")
+            guard let duringSave1Drivers = driverRecorder.last else {
+                store.unblock(fail: false)
+                _ = try? await updateTask1.value
+                return XCTFail("Driver policy recording must not be nil during Save #1")
+            }
+            XCTAssertEqual(duringSave1Drivers.screenshot, false)
+            XCTAssertEqual(duringSave1Drivers.keyboard, true)
+
+            // Set up deterministic acknowledgement for Update #2 (revocation) immediate driver stop
+            let driverRevocationAck = DispatchSemaphore(value: 0)
+            driverRecorder.onRecord = { perms in
+                if perms == ConsentedPermissions.allDisabled {
+                    driverRevocationAck.signal()
+                }
+            }
+
+            // Launch Update #2 (revocation) as a separately tracked operation
+            let updateTask2 = Task {
+                try await worker.updateConsent(.revoked)
+            }
+
+            // Establish its immediate conservative transition and driver stop while Save #1 remains blocked!
+            let ackResult = driverRevocationAck.wait(timeout: .now() + 3.0)
+            XCTAssertEqual(ackResult, .success, "Update #2 must immediately stop all drivers while Save #1 is blocked")
+            guard let duringSave2Drivers = driverRecorder.last else {
+                store.unblock(fail: false)
+                _ = try? await updateTask1.value
+                _ = try? await updateTask2.value
+                return XCTFail("Driver policy recording must not be nil after revocation")
+            }
+            XCTAssertEqual(duringSave2Drivers, ConsentedPermissions.allDisabled, "Revocation must stop all drivers immediately")
+
+            // Now release Save #1
             store.unblock(fail: false)
-            try? FileManager.default.removeItem(at: tempDir)
+
+            // Bounded join for both update tasks
+            _ = try await updateTask1.value
+            _ = try await updateTask2.value
+
+            XCTAssertFalse(store.timedOut, "Store barrier must not have timed out")
+
+            // Even though Save #1 succeeded on disk, its older sequence must NOT resurrect permissions!
+            guard let finalDrivers = driverRecorder.last else {
+                return XCTFail("Driver policy recording must not be nil at end")
+            }
+            XCTAssertEqual(finalDrivers, ConsentedPermissions.allDisabled, "Older save cannot resurrect permissions superseded by revocation")
+
+            // Assert in-memory policy
+            let finalSnapshot = await worker.snapshot()
+            XCTAssertEqual(finalSnapshot.localConsent, .revoked)
+
+            // Assert final persisted consent in store
+            let persistedConsent = try store.load()
+            XCTAssertEqual(persistedConsent, .revoked, "Final persisted consent in store must be revoked")
         }
-
-        await worker.start(launchedAtLogin: false)
-        XCTAssertEqual(driverRecorder.last, allLocalGranted, "Positive control")
-
-        // Block Save #1
-        store.blockNextSave()
-
-        // Update #1 attempts to update permissions
-        var update1Perms = allLocalGranted
-        update1Perms.screenshot = false // withdraw screenshot, keep others
-        let updateTask1 = Task {
-            try await worker.updateConsent(.granted(update1Perms))
-        }
-
-        XCTAssertTrue(store.waitForSaveEntered(timeout: 3.0), "Save #1 must be blocked")
-        // While Save #1 is blocked, screenshot is stopped, others active
-        XCTAssertEqual(driverRecorder.last?.screenshot, false)
-        XCTAssertEqual(driverRecorder.last?.keyboard, true)
-
-        // WHILE SAVE #1 IS STILL BLOCKED:
-        // User explicitly revokes ALL consent (Update #2)!
-        // Because the worker actor is not blocked, it processes this immediately!
-        try await worker.updateConsent(.revoked)
-
-        // All drivers MUST be stopped immediately!
-        XCTAssertEqual(driverRecorder.last, ConsentedPermissions.allDisabled, "Revocation must stop all drivers immediately")
-
-        // Now unblock Save #1 with SUCCESS
-        store.unblock(fail: false)
-        _ = try? await updateTask1.value
-
-        // CRITICAL ASSERTION:
-        // Even though Save #1 succeeded on disk, its older sequence must NOT resurrect permissions!
-        // Drivers must REMAIN all disabled!
-        XCTAssertEqual(driverRecorder.last, ConsentedPermissions.allDisabled, "Older save cannot resurrect permissions superseded by revocation")
-        let finalSnapshot = await worker.snapshot()
-        XCTAssertEqual(finalSnapshot.localConsent, .revoked)
     }
 
     // MARK: - 9. Blocked Provider Revoke/Regrant Stale-Sample Rejection & Fresh Acquisition
 
     func testBlockedProviderRevokeRegrantRejectsStaleFirstPublicationAndAcquiresFresh() async throws {
         let capturer = BlockedScreenCapturer()
+        defer { capturer.unblock() }
+
         let initialPerms = ConsentedPermissions(
             screenshot: true,
             webcam: false,
@@ -755,52 +869,96 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             blurScreenshots: false
         )
 
-        let (worker, _, driverRecorder, _, tempDir) = try makeHarness(
-            initialConsent: .granted(initialPerms),
-            screenCapturer: capturer
-        )
-        defer {
+        try await withHarness(initialConsent: .granted(initialPerms), screenCapturer: capturer) { worker, _, driverRecorder, _, paths in
+            await worker.start(launchedAtLogin: false, startPeriodicTicks: false)
+            guard let initialDrivers = driverRecorder.last else {
+                return XCTFail("Driver policy recording must not be nil after start")
+            }
+            XCTAssertEqual(initialDrivers, initialPerms, "Positive control: keyboard and screenshot active")
+            let startSnapshot = await worker.snapshot()
+            XCTAssertTrue(startSnapshot.facts.trackingActive, "Lifecycle must be actively tracking")
+
+            // Block next screen capture in fake provider and assign distinguishable stale bytes
+            capturer.nextCaptureData = Data("stale-first-bytes".utf8)
+            capturer.blockNextCapture()
+
+            // Trigger active acquisition through the real worker
+            await worker.triggerActiveCapture()
+            XCTAssertTrue(capturer.waitForCaptureEntered(timeout: 3.0), "Provider capture must be reached and blocked under Gen 1")
+
+            // WHILE CAPTURE #1 IS BLOCKED IN PROVIDER:
+            // 1. Withdraw screenshot consent ONLY (unrelated keyboard remains authorized and lifecycle active)
+            var narrowed = initialPerms
+            narrowed.screenshot = false
+            try await worker.updateConsent(.granted(narrowed))
+
+            guard let narrowedDrivers = driverRecorder.last else {
+                capturer.unblock()
+                return XCTFail("Driver policy recording must not be nil after withdrawal")
+            }
+            XCTAssertFalse(narrowedDrivers.screenshot, "Screenshot driver must be detached upon withdrawal")
+            XCTAssertTrue(narrowedDrivers.keyboard, "Unrelated keyboard capability must stay controlled and active")
+            let narrowedSnapshot = await worker.snapshot()
+            XCTAssertTrue(narrowedSnapshot.facts.trackingActive, "Worker lifecycle must remain actively tracking")
+
+            // 2. Regrant screenshot consent (keyboard still authorized, lifecycle still active)
+            try await worker.updateConsent(.granted(initialPerms))
+            guard let regrantedDrivers = driverRecorder.last else {
+                capturer.unblock()
+                return XCTFail("Driver policy recording must not be nil after regrant")
+            }
+            XCTAssertTrue(regrantedDrivers.screenshot, "Screenshot driver reattached upon regrant")
+            XCTAssertTrue(regrantedDrivers.keyboard, "Keyboard capability remains controlled")
+            let regrantedSnapshot = await worker.snapshot()
+            XCTAssertTrue(regrantedSnapshot.facts.trackingActive, "Worker lifecycle remains actively tracking")
+
+            // Now release Capture #1 (which was initiated under older Gen 1)
             capturer.unblock()
-            try? FileManager.default.removeItem(at: tempDir)
+
+            // Discard of stale first publication: assert stale bytes/identity are absent from publication & queue
+            let interimSnapshot = await worker.snapshot()
+            XCTAssertNil(interimSnapshot.lastScreenshot, "Stale first capture must not be published to lastScreenshot")
+            XCTAssertTrue(interimSnapshot.recentBlocks.allSatisfy {
+                $0.payload.screenshotThumbJpgBase64 != Data("stale-first-bytes".utf8).base64EncodedString()
+            }, "Stale first capture bytes must be absent from recentBlocks")
+
+            let queue = try Queue.open(at: paths.database, legacyOwner: nil, now: Date())
+            let interimQueueRows = try queue.recentRows(owner: "test-ws:user@example.com", limit: 10)
+            XCTAssertTrue(interimQueueRows.allSatisfy {
+                !($0.screenshotThumbJpgBase64?.contains("stale-first-bytes") ?? false)
+            }, "Stale first capture bytes must be absent from SQLite queue")
+
+            // Now trigger fresh acquisition through the REAL WORKER:
+            capturer.nextCaptureData = Data("fresh-second-bytes".utf8)
+            await worker.triggerActiveCapture()
+
+            // Commit block through the real worker
+            await worker.syncNow(at: Date().addingTimeInterval(70))
+
+            // Assert fresh identity reaches its intended publication / queue boundary
+            let freshSnapshot = await worker.snapshot()
+            guard let lastScreenshot = freshSnapshot.lastScreenshot else {
+                return XCTFail("Fresh screenshot must reach publication")
+            }
+            XCTAssertEqual(lastScreenshot.jpeg, Data("fresh-second-bytes".utf8), "Fresh screenshot must reach lastScreenshot")
+
+            guard let lastRecent = freshSnapshot.recentBlocks.first else {
+                return XCTFail("Recent block must exist after syncNow")
+            }
+            XCTAssertEqual(lastRecent.payload.screenshotThumbJpgBase64, Data("fresh-second-bytes".utf8).base64EncodedString())
+            XCTAssertNotEqual(lastRecent.payload.screenshotThumbJpgBase64, Data("stale-first-bytes".utf8).base64EncodedString())
+
+            let freshQueueRows = try queue.recentRows(owner: "test-ws:user@example.com", limit: 10)
+            XCTAssertTrue(freshQueueRows.contains {
+                $0.screenshotThumbJpgBase64 == Data("fresh-second-bytes".utf8).base64EncodedString()
+            }, "Fresh capture must reach SQLite queue")
+
+            guard let finalDrivers = driverRecorder.last else {
+                return XCTFail("Driver policy recording must not be nil at end")
+            }
+            XCTAssertTrue(finalDrivers.keyboard, "Keyboard capability remains controlled and authorized")
+            XCTAssertTrue(finalDrivers.screenshot, "Screenshot capability active after fresh acquisition")
+            XCTAssertFalse(capturer.timedOut, "Provider barrier must not have timed out")
         }
-
-        await worker.start(launchedAtLogin: false)
-        XCTAssertEqual(driverRecorder.last, initialPerms, "Positive control: keyboard and screenshot active")
-
-        // Block next screen capture
-        capturer.blockNextCapture()
-
-        // Trigger block completion recording: pause worker to finalize block with capture
-        let pauseTask = Task {
-            await worker.pause(resumeAfter: nil, at: Date())
-        }
-
-        XCTAssertTrue(capturer.waitForCaptureEntered(timeout: 3.0), "Provider capture must be reached and blocked under Gen 1")
-
-        // WHILE CAPTURE IS BLOCKED:
-        // 1. Withdraw screenshot consent (keyboard remains true)
-        var narrowed = initialPerms
-        narrowed.screenshot = false
-        try await worker.updateConsent(.granted(narrowed))
-
-        // Assert drivers: screenshot is stopped; unrelated keyboard remains controlled and active!
-        XCTAssertEqual(driverRecorder.last?.screenshot, false, "Screenshot driver must be detached upon withdrawal")
-        XCTAssertEqual(driverRecorder.last?.keyboard, true, "Unrelated keyboard capability must stay controlled and active")
-
-        // 2. Regrant screenshot consent
-        try await worker.updateConsent(.granted(initialPerms))
-        XCTAssertEqual(driverRecorder.last?.screenshot, true, "Screenshot driver reattached upon regrant")
-        XCTAssertEqual(driverRecorder.last?.keyboard, true, "Keyboard capability remains controlled")
-
-        // Now unblock the first capture (which was initiated under older Gen 1)
-        capturer.unblock()
-        await pauseTask.value
-
-        // The stale first capture from Gen 1 was rejected/discarded due to generation mismatch.
-        // Now trigger fresh capture under the new generation:
-        let freshCapture = try await capturer.capture(blur: false)
-        XCTAssertNotNil(freshCapture)
-        XCTAssertGreaterThanOrEqual(capturer.captureCount, 2, "Fresh capture must be performed")
-        XCTAssertEqual(driverRecorder.last, initialPerms, "Unrelated keyboard capability remains intact and controlled")
     }
 }

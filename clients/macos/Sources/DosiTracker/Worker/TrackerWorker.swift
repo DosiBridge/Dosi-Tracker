@@ -138,6 +138,7 @@ actor TrackerWorker {
     private var storageFailure: String?
     private var storageRetryAt: TimeInterval = 0
     private var uploader: UploadLoop?
+    private var uploadTask: Task<Void, Never>?
 
     // The account.
     private var saved: StoredSignIn?
@@ -239,14 +240,16 @@ actor TrackerWorker {
     /// Pick up where the last run left off: the saved sign-in, its pause and
     /// task note, and — when the server cannot be reached — the project list
     /// saved with it (at most a week old), so tracking starts offline too.
-    func start(launchedAtLogin: Bool) {
+    func start(launchedAtLogin: Bool, startPeriodicTicks: Bool = true) {
         guard !started else { return }
         started = true
         self.launchedAtLogin = launchedAtLogin
         openStorage(now: deps.now())
         publish()
-        tickTask = Task {
-            await self.runTicks()
+        if startPeriodicTicks {
+            tickTask = Task {
+                await self.runTicks()
+            }
         }
     }
 
@@ -269,7 +272,7 @@ actor TrackerWorker {
             await self?.handleUpload(event)
         }
         uploader = loop
-        Task {
+        uploadTask = Task {
             await loop.run()
         }
         // Reclaim space (old rejects, other accounts' expired rows, over-limit
@@ -731,9 +734,16 @@ actor TrackerWorker {
     }
 
     private func captureFinished(_ id: Int, _ shot: ScreenCapture?, generation gen: UInt64) {
+        guard gen == lifecycleGeneration else { return }
         captureTasks[id] = nil
-        guard let shot = shot, isLive(id), gen == lifecycleGeneration else { return }
+        guard let shot = shot, isLive(id) else { return }
         completedScreens[id] = StampedScreen(screen: shot, generation: gen)
+    }
+
+    /// Trigger an active capture for the current open block if screenshot capability is consented and authorized.
+    func triggerActiveCapture() {
+        guard let stretch = blocks.stretch else { return }
+        startCapture(stretch.block.id)
     }
 
     /// The block's own screenshot, if one was taken in time: one taken after
@@ -803,8 +813,8 @@ actor TrackerWorker {
         }
     }
 
-    private func tick() {
-        let now = deps.now()
+    func tick(at moment: Date? = nil) {
+        let now = moment ?? deps.now()
         guard queue != nil else {
             if deps.uptime() >= storageRetryAt {
                 openStorage(now: now)
@@ -1451,6 +1461,29 @@ actor TrackerWorker {
             }
         }
         await uploader?.finish(until: started.addingTimeInterval(AgentTiming.quitSyncBudget))
+    }
+
+    /// Cleanly shut down all asynchronous background tasks, join loops, and stop drivers.
+    func shutdown() async {
+        quitting = true
+        stopDriversNow()
+        tickTask?.cancel()
+        _ = await tickTask?.result
+        tickTask = nil
+        for (_, task) in captureTasks {
+            task.cancel()
+        }
+        captureTasks.removeAll()
+        completedScreens.removeAll()
+        if let loop = uploader {
+            await loop.shutdown()
+        }
+        _ = await uploadTask?.result
+        uploadTask = nil
+        if let rec = recorder {
+            _ = await rec.result
+            recorder = nil
+        }
     }
 
     /// Update local affirmative consent and reconcile active collection drivers immediately.

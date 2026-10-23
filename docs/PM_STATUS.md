@@ -2306,34 +2306,42 @@ Under Task ID `selected-status-prescan-correction-20261023`, we resolved the sou
 
 ---
 
-## 27. macOS Affirmative Local Consent, Acquisition Driver Lifecycle, Save-Order Decoupling & Provenance Gating (selected-macos-save-order-correction-20261023)
+## 27. macOS Affirmative Local Consent, Acquisition Driver Lifecycle, Save-Order Decoupling & Harness Correction (selected-macos-harness-correction-20261023)
 
 > **Execution Date:** October 23, 2026  
-> **Phase Task ID:** `selected-macos-save-order-correction-20261023` (continuation of `selected-macos-consent-lifecycle-20261023`)  
+> **Phase Task ID:** `selected-macos-harness-correction-20261023` (continuation of `selected-macos-save-order-correction-20261023`)  
 > **Status:** Implementation Complete; Source-Verified; Native Execution **UNEXECUTED** on Windows Host Toolchain (Missing Swift / macOS Runner)  
 > **Target Package:** `clients/macos` (Package: `DosiTracker`, targets: `DosiTrackerCore`, `DosiTracker`, `DosiTrackerCoreTests`, `DosiTrackerTests`)  
 
 ### A. Context & Focused Architectural Corrections
-Under Task ID `selected-macos-save-order-correction-20261023`, we resolved the source-confirmed persistence ordering, actor responsiveness, and test isolation defects in the macOS Swift client architecture:
+Under Task ID `selected-macos-harness-correction-20261023`, we resolved the source-confirmed persistence ordering, test synchronization, lifecycle publication ABA safety, and harness task cleanup defects:
 
-1. **Synchronous Actor Transition Boundary BEFORE Disk Persistence**:
-   - In `TrackerWorker.updateConsent`, transition execution is separated into three distinct phases:
-     - **Phase 1 (Actor Synchronous Invalidation):** `deps.consentManager.prepareTransition(to: next)` calculates the conservative in-memory immediate state (`transition.immediate`), advances the transition sequence, increments `lifecycleGeneration`, cancels and purges in-flight capture tasks, and synchronously invokes `reconcile()` and `deps.applyDriverPolicy()`. Withdrawn drivers (`keyboard`, `mouse`, `activeWindow`, etc.) and tightened blur (`blurScreenshots`) are stopped/enforced **synchronously on the actor before disk persistence I/O begins**.
-     - **Phase 2 (Asynchronous Serial Persistence Off-Actor):** Persistence executes via `deps.consentManager.persistAsync(transition.target)` on a dedicated serial dispatch queue (`persistenceQueue`). Because `await withCheckedThrowingContinuation` yields the `TrackerWorker` actor, the worker remains fully responsive to `pause`, `signOut`, `handleSystemEvent(.screenLocked)`, `willSleep`, `quit`, and newer consent updates without blocking the actor thread or risking deadlocks.
-     - **Phase 3 (Post-Save Commitment & Supersession Guard):** Upon persistence success, `deps.consentManager.commitTransition(transition)` verifies `transition.sequence == transitionSequence`. If a newer transition (e.g. user revocation) arrived while the older save was blocked, the older save is marked superseded (`commitTransition` returns `false`), strictly preventing an older save from resurrecting permissions withdrawn by a newer update. Expansions are admitted into memory and drivers only if not superseded.
-     - **Failure Preservation:** On persistence failure, `deps.consentManager.failTransition(transition)` leaves `currentConsent` as `transition.immediate`, ensuring conservative narrowings remain permanently enforced and unpersisted expansions are never admitted.
+1. **Deterministic Bounded Barrier Sequencing in Supersession Regression**:
+   - In `testBlockedSaveNewerRevocationSupersedesOlderOutstandingSave`:
+     - Because `ConsentManager.persistAsync` executes on a single serial `persistenceQueue`, Save #2 (revocation) queues behind Save #1.
+     - Revocation is launched as a separately tracked asynchronous `Task`.
+     - Using `DriverPolicyRecorder.onRecord` and `DispatchSemaphore`, the test deterministically establishes that Revocation executed its immediate Phase 1 conservative transition (stopping all drivers synchronously on the actor) **while Save #1 is still blocked in persistence**.
+     - Save #1 is then unblocked, and both update tasks are joined with bounded timeouts.
+     - `BlockedConsentStore` barrier wait timeout (`wait(timeout:) == .timedOut`) throws `ConsentError.saveFailed` and records `timedOut = true` rather than silently behaving as a release.
+     - The test asserts zero barrier timeout, all drivers stopped immediately, in-memory policy `.revoked`, and final persisted consent in `store.load() == .revoked`. Zero arbitrary sleeps.
 
-2. **Network & Transport Isolation Seam (`deps.makeApiClient`)**:
-   - Added `makeApiClient: @Sendable (URL, ApiClient.Account) -> ApiClient` to `TrackerWorker.Dependencies`.
-   - In production (`AgentServices`), defaults to standard `ApiClient(baseURL:account:)`.
-   - In testing (`WorkerConsentLifecycleTests`), injects an ephemeral `URLSession` configured with `OfflineTestURLProtocol`, failing all network requests immediately with `URLError(.notConnectedToInternet)`. Completely eliminates real `URLSession` background tasks, socket allocation, and external connectivity risks during automated tests.
+2. **Full Worker-Path ABA Capture Discard & Fresh Acquisition Regression**:
+   - In `testBlockedProviderRevokeRegrantRejectsStaleFirstPublicationAndAcquiresFresh`:
+     - Avoided test pause conflicts by maintaining continuous active tracking with keyboard capability authorized and active throughout.
+     - Triggered active capture through the real worker (`worker.triggerActiveCapture()`), blocking the fake provider under Generation 1 with distinguishable stale sample bytes (`Data("stale-first-bytes".utf8)`).
+     - Withdrew and regranted screenshot consent while keyboard remained authorized and active tracking was sustained.
+     - Released the provider; asserted stale first-publication bytes were rejected and proven completely absent from published snapshots (`lastScreenshot == nil`, `recentBlocks` clear) and absent from the local SQLite queue (`queue.recentRows`).
+     - Fixed an actual production concurrency defect in `TrackerWorker.captureFinished`: previously, `captureTasks[id] = nil` was executed unconditionally, allowing late stale generation callbacks to wipe out active tasks of newer generations. Corrected path gates cleanup on `gen == lifecycleGeneration`.
+     - Triggered fresh acquisition through the real production worker (`capturer.nextCaptureData = Data("fresh-second-bytes".utf8)`, `worker.triggerActiveCapture()`), and committed the block through the real worker (`worker.syncNow(at:)`).
+     - Asserted fresh sample identity reached both the publication boundary (`snapshot.lastScreenshot?.jpeg`, `recentBlocks.first?.payload.screenshotThumbJpgBase64`) and SQLite queue (`queue.recentRows`), without calling fake providers directly as substitutes and without claiming native OS cancellation.
 
-3. **Deterministic Blocked Fake Provider Revoke/Regrant & Stale Sample Invalidation**:
-   - Resolved the prior test overclaim by implementing a real `BlockedScreenCapturer` with deterministic semaphore barriers.
-   - Proves that when a screen capture is in-flight under Generation 1, withdrawing and regranting screenshot consent advances `lifecycleGeneration` to Generation 3.
-   - When the first capture unblocks, it delivers older Generation 1 data, which `TrackerWorker.captureFinished` and `TrackerWorker.screen(for:)` discard due to generation mismatch.
-   - The subsequent block payload publication contains zero stale data, while a fresh capture under Generation 3 succeeds.
-   - Unrelated authorized capabilities (`keyboard`) remain controlled and active throughout, and sample discard is asserted truthfully without claiming native OS cancellation.
+3. **Deterministic Scheduling Seams & Explicit Async Teardown Cleanup**:
+   - Added `startPeriodicTicks: Bool = true` parameter to `TrackerWorker.start(launchedAtLogin:startPeriodicTicks:)`, allowing test harnesses to disable the 1-second `runTicks` loop and step time deterministically via `worker.tick(at:)`.
+   - Stored `uploadTask = Task { await loop.run() }` in `TrackerWorker`.
+   - Implemented `UploadLoop.shutdown()` to cancel background wake/pass tasks and close the command inbox, allowing `loop.run()` to cleanly terminate.
+   - Implemented `TrackerWorker.shutdown()` to cleanly cancel and await `tickTask`, `uploadTask`, `recorder`, and `captureTasks`, and stop drivers.
+   - Wrapped test executions in `withHarness` to guarantee async `worker.shutdown()`, `session.invalidateAndCancel()`, `UserDefaults.standard.removePersistentDomain(forName:)`, and directory tree deletion on both success and error paths before deleting resources.
+   - Removed all vacuous optional driver recording assertions, requiring non-nil recordings via `guard let ... else { return XCTFail(...) }` or direct `XCTAssertEqual`.
 
 ### B. Core & Lifecycle Regression Suites (17 Isolated Tests)
 Implemented 17 production-path regression tests across two test suites with injected fake drivers, test doubles, and isolated temporary storage:
@@ -2356,21 +2364,21 @@ Implemented 17 production-path regression tests across two test suites with inje
    - `testBlockedSaveMixedNarrowExpandStopsWithdrawnDriversBeforeSaveAndAdmitsExpansionsOnSuccess`: Proves that while disk persistence is blocked in a mixed update, withdrawn keyboard and activeWindow drivers are stopped immediately, retained mouse capability stays active, expansion is off, and expansions are admitted only after save unblocks with success.
    - `testBlockedSaveMixedNarrowExpandPreservesConservativeStateOnSaveFailure`: Proves that upon simulated disk save failure, withdrawn drivers remain stopped, expansions are never admitted, and tightened blur remains enforced.
    - `testBlockedSavePureWideningFailureDoesNotAdmitPermissions`: Proves pure widening from absent state leaves drivers all disabled while save is blocked and after save fails.
-   - `testBlockedSaveNewerRevocationSupersedesOlderOutstandingSave`: Proves that if a user revokes consent while an older save is blocked, all drivers stop immediately, and when the older save unblocks with success, its older sequence cannot resurrect withdrawn permissions.
-   - `testBlockedProviderRevokeRegrantRejectsStaleFirstPublicationAndAcquiresFresh`: Proves that a capture started under Generation 1 is rejected upon provider completion across revoke/regrant, payload excludes stale samples, fresh acquisition under the new generation succeeds, and unrelated keyboard capabilities remain controlled throughout.
+   - `testBlockedSaveNewerRevocationSupersedesOlderOutstandingSave`: Proves that if a user revokes consent while an older save is blocked, all drivers stop immediately, and when the older save unblocks with success, its older sequence cannot resurrect withdrawn permissions. Asserts in-memory policy and persisted storage with zero auto-timeout fallback.
+   - `testBlockedProviderRevokeRegrantRejectsStaleFirstPublicationAndAcquiresFresh`: Proves that a capture started under Generation 1 is rejected upon provider completion across revoke/regrant, payload and SQLite queue exclude stale samples, fresh acquisition under the new generation reaches publication and queue, and unrelated keyboard capabilities remain controlled throughout.
 
 ### C. Execution Status & Quality Gates
 | Target Suite | Exact Command Line | Tests Passed | Unexecuted | Result | Evidence Level |
 |---|---|:---:|:---:|:---:|---|
-| **macOS Core Consent Suite** | `swift test --filter ConsentLifecycleTests` in `clients/macos` | 0 | 7 | **UNEXECUTED** | **[Source-Only / Blocked]** (Host environment lacks Swift runtime / macOS toolchain) |
-| **macOS Worker Lifecycle Suite**| `swift test --filter WorkerConsentLifecycleTests` in `clients/macos` | 0 | 10 | **UNEXECUTED** | **[Source-Only / Blocked]** (Host environment lacks Swift runtime / macOS toolchain) |
-| **Linux Client Compilation Check** | `cargo check --manifest-path clients/linux/Cargo.toml` | N/A | 0 | PASSED (0 errors, 0 warnings) | **[Worker-Reported]** |
-| **Windows Client Compilation Check** | `cargo check --manifest-path clients/windows/Cargo.toml` | N/A | 0 | PASSED (0 errors, 0 warnings) | **[Worker-Reported]** |
+| **macOS Core Consent Suite** | `swift test --filter ConsentLifecycleTests` in `clients/macos` | 0 | 7 | **UNEXECUTED** | **[Source-Only / Blocked]** (Host environment lacks Swift runtime / macOS toolchain; reported with null exits) |
+| **macOS Worker Lifecycle Suite**| `swift test --filter WorkerConsentLifecycleTests` in `clients/macos` | 0 | 10 | **UNEXECUTED** | **[Source-Only / Blocked]** (Host environment lacks Swift runtime / macOS toolchain; reported with null exits) |
+| **Linux Client Compilation Check** | `cargo check --manifest-path clients/linux/Cargo.toml` | N/A | 0 | PASSED (0 errors, 0 warnings, exit 0) | **[Worker-Reported]** |
+| **Windows Client Compilation Check** | `cargo check --manifest-path clients/windows/Cargo.toml` | N/A | 0 | PASSED (0 errors, 0 warnings, exit 0) | **[Worker-Reported]** |
 
 ### D. PM QA Boundary Limits & Acceptance Disclosures
-1. **Host Toolchain Gap**: Current Windows operator environment does not contain the `swift` compiler or macOS toolchain. Tests were written against the production architecture and test targets defined in `Package.swift`, but are explicitly marked as **UNEXECUTED**. They must be run on a macOS CI runner or development machine (`swift test`).
+1. **Host Toolchain Gap**: Current Windows operator environment does not contain the `swift` compiler or macOS toolchain. Tests were written against the production architecture and test targets defined in `Package.swift`, but are explicitly marked as **UNEXECUTED** (null exits). They must be run on a native macOS CI runner or development machine (`swift test`).
 2. **No Hardware Sensor Invocation**: Test harnesses use `TestScreenCapturer`, `BlockedScreenCapturer`, `TestWebcamCapturer`, `TestForegroundSource`, `TestRunningPrograms`, `TestIdleSource`, `OfflineTestURLProtocol`, and `DriverPolicyRecorder`. No real Quartz event taps, ScreenCaptureKit sessions, AVFoundation devices, Accessibility queries, or network requests were executed.
 3. **Approval-Blocked Invariant**: The unresolved `tirith:archive_extract` command remains untouched and was not retried or bypassed.
-4. **No Full-Product Acceptance Claim**: This deliverable completes the save-order correction and lifecycle gating slice for macOS. Full-product acceptance, native macOS binary notarization, and live desktop verification remain open acceptance gates.
+4. **No Full-Product Acceptance Claim**: This deliverable completes the harness correction and lifecycle gating slice for macOS. Full-product acceptance, native macOS binary notarization, and live desktop verification remain open acceptance gates.
 
 
