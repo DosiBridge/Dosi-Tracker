@@ -16,8 +16,9 @@ use chrono::Utc;
 use rusqlite::Connection;
 
 use dosi_tracker_linux::outbox::{
-    inspect_outbox_status, ActivityEnvelope, Outbox, OutboxLimits, OutboxScope, OutboxStatusReport,
-    OUTBOX_SCHEMA_VERSION,
+    inspect_outbox_status, inspect_outbox_status_bounded, ActivityEnvelope, DatabaseCorruptionKind,
+    Outbox, OutboxLimits, OutboxScope, OutboxStatusError, OutboxStatusReport, RecordCorruptionKind,
+    SchemaErrorKind, MAX_STATUS_ROW_BOUND, OUTBOX_SCHEMA_VERSION,
 };
 
 fn make_test_envelope(client_id: &str, secret_desc: Option<&str>) -> ActivityEnvelope {
@@ -807,4 +808,396 @@ fn test_module_inspect_outbox_status_direct_api() {
     assert_eq!(report.format_version, 1);
     assert_eq!(report.durable_queue.queued_count, 1);
     assert_eq!(report.remote_delivery_state, "untracked_in_offline_outbox");
+}
+
+#[test]
+fn test_cli_outbox_status_bounded_workload_exhaustion_refusal() {
+    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("workload_overflow.db");
+
+    let conn = Connection::open(&db_path).unwrap();
+    conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+    conn.pragma_update(None, "user_version", OUTBOX_SCHEMA_VERSION)
+        .unwrap();
+    conn.execute_batch(
+        "CREATE TABLE outbox_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            client_activity_id TEXT NOT NULL,
+            project_id TEXT,
+            started_at TEXT NOT NULL,
+            ended_at TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            payload_bytes INTEGER NOT NULL,
+            enqueued_at TEXT NOT NULL,
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            UNIQUE(account_id, workspace_id, client_activity_id)
+        );
+        CREATE INDEX idx_outbox_scope_id ON outbox_entries (account_id, workspace_id, id ASC);",
+    )
+    .unwrap();
+
+    let tx = conn.unchecked_transaction().unwrap();
+    {
+        let mut stmt = tx
+            .prepare(
+                "INSERT INTO outbox_entries (
+                    account_id, workspace_id, client_activity_id, project_id,
+                    started_at, ended_at, payload_json, payload_bytes, enqueued_at, retry_count
+                ) VALUES (?1, ?2, ?3, NULL, '2026-10-23T00:00:00Z', '2026-10-23T00:05:00Z', '{}', 2, '2026-10-23T00:05:00Z', 0)",
+            )
+            .unwrap();
+        // Insert MAX_STATUS_ROW_BOUND + 1 rows
+        for i in 0..=(MAX_STATUS_ROW_BOUND as usize) {
+            let act_id = format!("act-{i}");
+            stmt.execute(rusqlite::params!["acc-over", "ws-over", &act_id])
+                .unwrap();
+        }
+    }
+    tx.commit().unwrap();
+    drop(conn);
+
+    let scope = OutboxScope::new("acc-over", "ws-over").unwrap();
+
+    // 1. Direct API invocation must fail closed with WorkloadExceeded
+    let err = inspect_outbox_status(&db_path, &scope).unwrap_err();
+    assert_eq!(err, OutboxStatusError::WorkloadExceeded);
+
+    // 2. Direct API with smaller explicit row bound (5 rows) on a 6-row subset
+    let err_small = inspect_outbox_status_bounded(&db_path, &scope, 5).unwrap_err();
+    assert_eq!(err_small, OutboxStatusError::WorkloadExceeded);
+
+    // 3. Real CLI invocation: exits 1, outputs allowlisted Workload bound message, rejects partial successful counts
+    let out = Command::new(exe)
+        .args([
+            "outbox",
+            "status",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--account-id",
+            "acc-over",
+            "--workspace-id",
+            "ws-over",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("Workload bound exceeded"));
+    assert!(stderr.contains("scoped record count exceeds maximum inspection limit"));
+
+    // Crucial: No partial successful count emitted to stdout!
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("\"queued_count\""),
+        "No partial JSON counts permitted upon workload exhaustion"
+    );
+    assert!(
+        !stdout.contains("10001"),
+        "No partial count values permitted upon workload exhaustion"
+    );
+}
+
+#[test]
+fn test_cli_outbox_status_retry_overflow_and_negative_counts_fail_closed() {
+    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("retry_overflow.db");
+
+    let scope = OutboxScope::new("acc-retry", "ws-retry").unwrap();
+    let outbox = Outbox::open(&db_path, OutboxLimits::default()).unwrap();
+    let env1 = make_test_envelope("act-retry-1", None);
+    outbox.enqueue(&scope, &env1).unwrap();
+    drop(outbox);
+
+    // 1. Persisted retry_count set to 5_000_000_000 (> u32::MAX)
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE outbox_entries SET retry_count = 5000000000 WHERE client_activity_id = 'act-retry-1';",
+            [],
+        )
+        .unwrap();
+    }
+
+    // Direct API: fails closed with RecordCorruptionKind::RetryCountOverflow
+    let err = inspect_outbox_status(&db_path, &scope).unwrap_err();
+    assert_eq!(
+        err,
+        OutboxStatusError::CorruptRecord(RecordCorruptionKind::RetryCountOverflow)
+    );
+
+    // Real CLI: exits 1, prints allowlisted category, does not wrap
+    let out = Command::new(exe)
+        .args([
+            "outbox",
+            "status",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--account-id",
+            "acc-retry",
+            "--workspace-id",
+            "ws-retry",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("Database record corrupted"));
+    assert!(stderr.contains("persisted retry_count exceeds u32::MAX limit"));
+    // Ensure no wrapping artifact (705032704 is 5000000000 % 2^32)
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("705032704"));
+    assert!(!stderr.contains("705032704"));
+
+    // 2. Negative retry count (-1)
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE outbox_entries SET retry_count = -1 WHERE client_activity_id = 'act-retry-1';",
+            [],
+        )
+        .unwrap();
+    }
+
+    let err = inspect_outbox_status(&db_path, &scope).unwrap_err();
+    assert_eq!(
+        err,
+        OutboxStatusError::CorruptRecord(RecordCorruptionKind::NegativeValue)
+    );
+
+    let out = Command::new(exe)
+        .args([
+            "outbox",
+            "status",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--account-id",
+            "acc-retry",
+            "--workspace-id",
+            "ws-retry",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("negative retry_count or payload_bytes"));
+
+    // 3. Negative payload bytes (-10)
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE outbox_entries SET retry_count = 0, payload_bytes = -10 WHERE client_activity_id = 'act-retry-1';",
+            [],
+        )
+        .unwrap();
+    }
+
+    let err = inspect_outbox_status(&db_path, &scope).unwrap_err();
+    assert_eq!(
+        err,
+        OutboxStatusError::CorruptRecord(RecordCorruptionKind::NegativeValue)
+    );
+}
+
+#[test]
+fn test_cli_outbox_status_sanitized_errors_and_malformed_schema_sentinels() {
+    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+    let temp = tempfile::tempdir().unwrap();
+    let secret_path_canary = "classified-vault-alpha";
+    let canary_dir = temp.path().join(secret_path_canary);
+    fs::create_dir_all(&canary_dir).unwrap();
+
+    // 1. Corrupt database header with secret name
+    let corrupt_db = canary_dir.join("secret_corrupt.db");
+    fs::write(&corrupt_db, b"GARBAGE_NOT_SQLITE_PAYLOAD_SECRET_TOKEN").unwrap();
+
+    let out = Command::new(exe)
+        .args([
+            "outbox",
+            "status",
+            "--db",
+            corrupt_db.to_str().unwrap(),
+            "--account-id",
+            "acc-1",
+            "--workspace-id",
+            "ws-1",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("Database is corrupted: file is not a valid SQLite database"));
+    assert!(!stderr.contains(secret_path_canary));
+    assert!(!stderr.contains("GARBAGE_NOT_SQLITE_PAYLOAD_SECRET_TOKEN"));
+    assert!(!stderr.contains("sqlite3_step"));
+
+    let err_corrupt =
+        inspect_outbox_status(&corrupt_db, &OutboxScope::new("acc-1", "ws-1").unwrap())
+            .unwrap_err();
+    assert_eq!(
+        err_corrupt,
+        OutboxStatusError::CorruptDatabase(DatabaseCorruptionKind::InvalidFormat)
+    );
+
+    // 2. Missing required columns
+    let missing_cols_db = canary_dir.join("missing_cols.db");
+    {
+        let conn = Connection::open(&missing_cols_db).unwrap();
+        conn.pragma_update(None, "user_version", OUTBOX_SCHEMA_VERSION)
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE outbox_entries (
+                id INTEGER PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                workspace_id TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+    }
+
+    let out = Command::new(exe)
+        .args([
+            "outbox",
+            "status",
+            "--db",
+            missing_cols_db.to_str().unwrap(),
+            "--account-id",
+            "acc-1",
+            "--workspace-id",
+            "ws-1",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr
+        .contains("Unsupported database schema: required columns missing from outbox_entries"));
+    assert!(!stderr.contains(secret_path_canary));
+
+    let err_schema = inspect_outbox_status(
+        &missing_cols_db,
+        &OutboxScope::new("acc-1", "ws-1").unwrap(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        err_schema,
+        OutboxStatusError::UnsupportedSchema(SchemaErrorKind::MissingRequiredColumns)
+    );
+
+    // 3. Corrupted enqueued_at timestamp
+    let bad_timestamp_db = canary_dir.join("bad_ts.db");
+    let scope = OutboxScope::new("acc-ts", "ws-ts").unwrap();
+    let outbox = Outbox::open(&bad_timestamp_db, OutboxLimits::default()).unwrap();
+    let env1 = make_test_envelope("act-ts-1", None);
+    outbox.enqueue(&scope, &env1).unwrap();
+    drop(outbox);
+
+    {
+        let conn = Connection::open(&bad_timestamp_db).unwrap();
+        conn.execute(
+            "UPDATE outbox_entries SET enqueued_at = 'GARBAGE_TIMESTAMP_SECRET_VALUE' WHERE client_activity_id = 'act-ts-1';",
+            [],
+        )
+        .unwrap();
+    }
+
+    let out = Command::new(exe)
+        .args([
+            "outbox",
+            "status",
+            "--db",
+            bad_timestamp_db.to_str().unwrap(),
+            "--account-id",
+            "acc-ts",
+            "--workspace-id",
+            "ws-ts",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Database record corrupted: invalid persisted timestamp in RFC3339 format")
+    );
+    assert!(!stderr.contains("GARBAGE_TIMESTAMP_SECRET_VALUE"));
+    assert!(!stderr.contains(secret_path_canary));
+
+    let err_ts = inspect_outbox_status(&bad_timestamp_db, &scope).unwrap_err();
+    assert_eq!(
+        err_ts,
+        OutboxStatusError::CorruptRecord(RecordCorruptionKind::InvalidTimestamp)
+    );
+}
+
+#[test]
+fn test_cli_outbox_status_persisted_fixtures_and_wal_remain_strictly_unchanged() {
+    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("fixtures_unchanged.db");
+
+    let scope_a = OutboxScope::new("acc-fix-a", "ws-fix-a").unwrap();
+    let scope_b = OutboxScope::new("acc-fix-b", "ws-fix-b").unwrap();
+    let outbox = Outbox::open(&db_path, OutboxLimits::default()).unwrap();
+
+    let env_a = make_test_envelope("act-fix-a", Some("payload a"));
+    let env_b = make_test_envelope("act-fix-b", Some("payload b"));
+    outbox.enqueue(&scope_a, &env_a).unwrap();
+    outbox.enqueue(&scope_b, &env_b).unwrap();
+    drop(outbox);
+
+    let wal_path = temp.path().join("fixtures_unchanged.db-wal");
+    let initial_db_bytes = fs::read(&db_path).unwrap();
+    let initial_wal_bytes = if wal_path.exists() {
+        fs::read(&wal_path).unwrap()
+    } else {
+        Vec::new()
+    };
+
+    // Run various status queries (Scope A, Scope B, non-existent scope, zero control)
+    for (acc, ws) in [
+        ("acc-fix-a", "ws-fix-a"),
+        ("acc-fix-b", "ws-fix-b"),
+        ("acc-zero", "ws-zero"),
+    ] {
+        let out = Command::new(exe)
+            .args([
+                "outbox",
+                "status",
+                "--db",
+                db_path.to_str().unwrap(),
+                "--account-id",
+                acc,
+                "--workspace-id",
+                ws,
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+    }
+
+    // Verify exact bit-for-bit preservation of database and WAL files
+    let post_db_bytes = fs::read(&db_path).unwrap();
+    assert_eq!(
+        initial_db_bytes, post_db_bytes,
+        "Main SQLite database file must remain 100% bit-for-bit unchanged"
+    );
+
+    if wal_path.exists() {
+        let post_wal_bytes = fs::read(&wal_path).unwrap();
+        assert_eq!(
+            initial_wal_bytes, post_wal_bytes,
+            "SQLite WAL file must remain 100% bit-for-bit unchanged"
+        );
+    }
 }

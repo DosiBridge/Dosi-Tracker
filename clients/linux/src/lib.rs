@@ -26,10 +26,11 @@ pub use lifecycle::{
     LifecycleGeneration, PauseReason, TrackerLifecycle, TrackerState,
 };
 pub use outbox::{
-    inspect_outbox_status, ActivityEnvelope, DurableQueueSummary, EnqueueResult, Outbox,
-    OutboxEntry, OutboxError, OutboxLimits, OutboxScope, OutboxStatusError, OutboxStatusReport,
-    MAX_ACCOUNT_ID_BYTES, MAX_CLIENT_ACTIVITY_ID_BYTES, MAX_ERROR_MESSAGE_BYTES,
-    MAX_WORKSPACE_ID_BYTES, OUTBOX_SCHEMA_VERSION,
+    inspect_outbox_status, inspect_outbox_status_bounded, ActivityEnvelope, DatabaseCorruptionKind,
+    DurableQueueSummary, EnqueueResult, Outbox, OutboxEntry, OutboxError, OutboxLimits,
+    OutboxScope, OutboxStatusError, OutboxStatusReport, RecordCorruptionKind, SchemaErrorKind,
+    ScopeErrorKind, MAX_ACCOUNT_ID_BYTES, MAX_CLIENT_ACTIVITY_ID_BYTES, MAX_ERROR_MESSAGE_BYTES,
+    MAX_STATUS_ROW_BOUND, MAX_WORKSPACE_ID_BYTES, OUTBOX_SCHEMA_VERSION,
 };
 pub use paths::LinuxPaths;
 pub use sync::{

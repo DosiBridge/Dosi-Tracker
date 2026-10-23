@@ -2222,7 +2222,7 @@ Under Task ID `linux-outbox-status-cli-20261022-N`, we implemented an explicit-p
 ### C. Executed Test Suites & Quality Gates
 | Target Suite | Exact Command Line | Tests Passed | Ignored | Result | Exit Code | Evidence Level |
 |---|---|:---:|:---:|:---:|:---:|---|
-| **Linux Unit, CLI, Repro, Installer, Outbox, Sync & Status CLI** | `cargo test` in `clients/linux` | 86 passed (21 unit + 6 doctor CLI + 7 repro + 3 installer integration + 28 outbox integration + 13 sync integration + 8 status CLI) | 0 | PASSED | **0** | **[Worker-Reported (Windows Host Toolchain)]** |
+| **Linux Unit, CLI, Repro, Installer, Outbox, Sync & Status CLI** | `cargo test` in `clients/linux` | 90 passed (21 unit + 6 doctor CLI + 7 repro + 3 installer integration + 28 outbox integration + 13 sync integration + 12 status CLI) | 0 | PASSED | **0** | **[Worker-Reported (Windows Host Toolchain)]** |
 | **Shell Installer Lifecycle Suite** | `bash clients/linux/tests/test_installer_lifecycle.sh` | 22 passed (all lifecycle, security confinement, and binary doctor checks) | 0 | PASSED | **0** | **[Worker-Reported (Git-Bash Host Toolchain)]** |
 | **Linux Code Formatting** | `cargo fmt --check` in `clients/linux` | N/A | 0 diffs | PASSED | **0** | **[Worker-Reported]** |
 | **Linux Compilation Check** | `cargo check` in `clients/linux` | N/A | 0 errors, 0 warnings | PASSED | **0** | **[Worker-Reported]** |
@@ -2234,3 +2234,68 @@ Under Task ID `linux-outbox-status-cli-20261022-N`, we implemented an explicit-p
 2. **Read-Only Invariant**: The `outbox status` CLI command opens SQLite strictly with `SQLITE_OPEN_READ_ONLY`. It does not write, checkpoint, or migrate databases.
 3. **Host Toolchain vs Native Linux Evidence Separation**: All tests were executed on Windows host MSVC and Git-Bash toolchains. This does **NOT** constitute independent PM acceptance or native Linux kernel/libc runtime verification.
 4. **No Background Daemon or Network**: The Linux client remains offline with no background daemons, autostart, or native sensor capture hooks active.
+
+---
+
+## 26. Outbox Status Inspection Hardening & Bounded Evaluation (selected-session-linux-status-correction-20261023)
+
+> **Execution Date:** October 23, 2026  
+> **Phase Task ID:** `selected-session-linux-status-correction-20261023`  
+> **Status:** Completed & Source-Verified (90 Rust tests passed in `clients/linux`, 22 shell tests passed, 50 frontend tests passed, typecheck clean, fmt clean, check clean)  
+> **Target Package:** `clients/linux` (crate: `dosi-tracker-linux` v0.1.0, binary: `dosi-tracker-linux`)  
+
+### A. Context & Focused Architectural Corrections
+Under Task ID `selected-session-linux-status-correction-20261023`, we implemented a targeted correction of `clients/linux/src/outbox.rs` (`inspect_outbox_status` / `inspect_outbox_status_bounded`) and its CLI regressions:
+
+1. **Finite Work Budget & Scoped Row Bounds (`MAX_STATUS_ROW_BOUND = 10_000`)**:
+   - Eliminated unbounded whole-database `PRAGMA quick_check;` sweeps from operational scoped status inspection.
+   - Replaced unbounded aggregation with a single bounded Common Table Expression (`scoped_rows`) bounded by `LIMIT fetch_limit` (`row_limit + 1`).
+   - If scoped records exceed `row_limit`, fails closed with `OutboxStatusError::WorkloadExceeded` without returning partial successful counts.
+   - Retains 100% accurate small-scope (A/B fixtures) and empty-scope (zero control) summaries.
+
+2. **Allowlisted Bounded Status Error Categories**:
+   - Replaced raw rusqlite and engine diagnostic strings in `OutboxStatusError` with finite, allowlisted category enums:
+     - `ScopeErrorKind`: `EmptyAccountId`, `OversizedAccountId`, `ControlCharAccountId`, `EmptyWorkspaceId`, `OversizedWorkspaceId`, `ControlCharWorkspaceId`.
+     - `DatabaseCorruptionKind`: `InvalidFormat`, `MalformedDiskImage`, `QueryExecutionFailed`.
+     - `RecordCorruptionKind`: `NegativeValue`, `RetryCountOverflow`, `InvalidTimestamp`.
+     - `SchemaErrorKind`: `Uninitialized`, `MissingTable`, `MissingRequiredColumns`.
+   - Invariant: Error messages never leak database paths, envelope payloads, foreign identities, or raw SQLite engine messages.
+
+3. **Checked Range & Type Validation for Retry Counts**:
+   - Replaced unchecked `i64 as u32` conversions with checked `u32::try_from(max_retry)`.
+   - Pre-query fail-closed validation asserts `(retry_count < 0 OR retry_count > u32::MAX OR payload_bytes < 0) LIMIT 1`.
+   - Persisted values exceeding `u32::MAX` fail closed with `RecordCorruptionKind::RetryCountOverflow` rather than wrapping.
+   - Persisted fixtures and SQLite WAL visibility remain bit-for-bit unchanged (no writes, no schema migrations, no WAL checkpoints, and no `?immutable=1` stale WAL workarounds).
+
+### B. Executed Regressions & Test Evidence
+1. **Outbox Status CLI Integration Suite (`clients/linux/tests/outbox_status_cli_tests.rs`, 12 Tests)**:
+   - `test_cli_outbox_status_bounded_workload_exhaustion_refusal`: Asserts that scopes exceeding `MAX_STATUS_ROW_BOUND` (10,001 rows) fail closed with exit code 1, emitting allowlisted `Workload bound exceeded` error and zero partial count JSON output.
+   - `test_cli_outbox_status_retry_overflow_and_negative_counts_fail_closed`: Asserts that rows with `retry_count = 5_000_000_000` fail closed with `persisted retry_count exceeds u32::MAX limit` without wrapping (rejecting wrapped artifact `705032704`), and negative retry/payload values fail closed.
+   - `test_cli_outbox_status_sanitized_errors_and_malformed_schema_sentinels`: Asserts that corrupt DB headers, missing required columns, and invalid timestamps output strictly allowlisted categories without leaking sensitive path canaries, payload tokens, or SQLite engine strings.
+   - `test_cli_outbox_status_persisted_fixtures_and_wal_remain_strictly_unchanged`: Asserts bit-for-bit raw byte identity of main SQLite database and WAL files across multiple status inspection queries.
+   - 8 existing status CLI tests (argument validation, nonexistent path refusal, A/B fixtures and zero control, WAL visibility, direct API, subcommands, help) all pass.
+
+2. **Maintained Test Suites**:
+   - Total Rust tests in `clients/linux`: **90 passed, 0 failed, exit 0** (21 unit + 6 doctor CLI + 7 repro + 3 installer integration + 28 outbox integration + 13 sync integration + 12 outbox status CLI integration).
+   - Shell installer lifecycle: **22 passed, 0 failed, exit 0** via Git-Bash.
+   - Frontend Vitest acceptance: **50 passed, 0 failed, exit 0** (full suite: 1982 passed).
+   - Frontend typecheck: **0 errors, exit 0**.
+   - Rust formatting: `cargo fmt --check` exit 0 (0 diffs).
+   - Rust check: `cargo check --all-targets` exit 0 (0 errors, 0 warnings).
+
+### C. Executed Test Suites & Quality Gates
+| Target Suite | Exact Command Line | Tests Passed | Ignored | Result | Exit Code | Evidence Level |
+|---|---|:---:|:---:|:---:|:---:|---|
+| **Linux Unit, CLI, Repro, Installer, Outbox, Sync & Status CLI** | `cargo test` in `clients/linux` | 90 passed (21 unit + 6 doctor CLI + 7 repro + 3 installer integration + 28 outbox integration + 13 sync integration + 12 status CLI) | 0 | PASSED | **0** | **[Worker-Reported (Windows Host Toolchain)]** |
+| **Shell Installer Lifecycle Suite** | `bash clients/linux/tests/test_installer_lifecycle.sh` | 22 passed (all lifecycle, security confinement, and binary doctor checks) | 0 | PASSED | **0** | **[Worker-Reported (Git-Bash Host Toolchain)]** |
+| **Linux Code Formatting** | `cargo fmt --check` in `clients/linux` | N/A | 0 diffs | PASSED | **0** | **[Worker-Reported]** |
+| **Linux Compilation Check** | `cargo check --all-targets` in `clients/linux` | N/A | 0 errors, 0 warnings | PASSED | **0** | **[Worker-Reported]** |
+| **Frontend Acceptance Suite** | `npx vitest run src/middleware.test.ts src/components/dashboard/agent-setup.test.tsx src/test/acceptance/agent-onboarding.test.tsx src/test/acceptance/install-guides.test.tsx src/test/architecture.spec.ts` | 50 passed | 0 | PASSED | **0** | **[Worker-Reported (Focused 5-File Suite)]** |
+| **Frontend Typecheck** | `npm run typecheck` in `frontend` | N/A | 0 errors | PASSED | **0** | **[Worker-Reported]** |
+
+### D. PM QA Boundary Limits & Acceptance Disclosures
+1. **Approval-Blocked Command Invariant**: The approval-blocked command `tirith:archive_extract` remains unresolved. Worker has **NOT** retried, repackaged, or delegated that check or altered permissions.
+2. **Read-Only Invariant**: The `outbox status` CLI command opens SQLite strictly with `SQLITE_OPEN_READ_ONLY`. It does not write, checkpoint, or migrate databases.
+3. **Host Toolchain vs Native Linux Evidence Separation**: All tests were executed on Windows host MSVC and Git-Bash toolchains. This does **NOT** constitute independent PM acceptance or native Linux kernel/libc runtime verification.
+4. **No Background Daemon or Network**: The Linux client remains offline with no background daemons, autostart, or native sensor capture hooks active.
+
