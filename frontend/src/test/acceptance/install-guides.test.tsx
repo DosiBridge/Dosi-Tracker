@@ -78,7 +78,7 @@ describe("Public Installation & Onboarding Guides", () => {
 
       // Linux rows must explicitly say Source Foundation and FOUNDATION ONLY
       expect(within(table).getAllByText(/Source Foundation \(clients\/linux\)/i).length).toBe(2);
-      expect(within(table).getAllByText(/FOUNDATION ONLY \(Sensor-Free Crate; 27 Tests Passed; Native Runtime Unverified\)/i).length).toBe(2);
+      expect(within(table).getAllByText(/FOUNDATION ONLY \(Sensor-Free Crate; 101 Tests Passed on Host; Native Runtime Unverified\)/i).length).toBe(2);
 
       // Windows row must show Compilation Only
       expect(within(table).getByText(/COMPILATION ONLY/i)).toBeInTheDocument();

@@ -29,6 +29,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// 1. Mixed narrow+expand save failure withdraws removed permissions but does not grant additions.
+///
 /// Also asserts blocked-store ordering using an explicit fake-store barrier.
 #[test]
 fn test_mixed_narrow_and_expand_save_failure_withdraws_removed_without_granting_additions() {

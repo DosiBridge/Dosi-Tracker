@@ -91,20 +91,15 @@ impl ConsentedPermissions {
 }
 
 /// Explicit local user consent state on this computer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum LocalConsent {
     /// No consent choice has been made. Fails closed (all captures blocked).
+    #[default]
     Absent,
     /// User explicitly consented to the specified capabilities.
     Granted(ConsentedPermissions),
     /// User explicitly revoked or declined tracking consent.
     Revoked,
-}
-
-impl Default for LocalConsent {
-    fn default() -> Self {
-        LocalConsent::Absent
-    }
 }
 
 impl LocalConsent {
@@ -222,15 +217,21 @@ fn validate_target_file(path: &Path) -> Result<(), ConsentError> {
     }
 }
 
+pub(crate) type CandidateNamerHook = std::sync::Arc<dyn Fn(&str, usize) -> String + Send + Sync>;
+pub(crate) type FailAfterOpenHook =
+    std::sync::Arc<dyn Fn(&Path) -> Result<(), std::io::Error> + Send + Sync>;
+pub(crate) type FailRenameHook =
+    std::sync::Arc<dyn Fn(&Path, &Path) -> Result<(), std::io::Error> + Send + Sync>;
+
 /// Optional hooks for injecting deterministic collision and failure behaviors in tests.
 #[derive(Clone, Default)]
 pub(crate) struct SaveHooks {
     #[allow(dead_code)]
-    pub(crate) candidate_namer: Option<std::sync::Arc<dyn Fn(&str, usize) -> String + Send + Sync>>,
+    pub(crate) candidate_namer: Option<CandidateNamerHook>,
     #[allow(dead_code)]
-    pub(crate) fail_after_open: Option<std::sync::Arc<dyn Fn(&Path) -> Result<(), std::io::Error> + Send + Sync>>,
+    pub(crate) fail_after_open: Option<FailAfterOpenHook>,
     #[allow(dead_code)]
-    pub(crate) fail_rename: Option<std::sync::Arc<dyn Fn(&Path, &Path) -> Result<(), std::io::Error> + Send + Sync>>,
+    pub(crate) fail_rename: Option<FailRenameHook>,
 }
 
 impl std::fmt::Debug for SaveHooks {
@@ -892,7 +893,8 @@ mod tests {
         let consent_path = temp.path().join("consent.json");
 
         // Old predictable temp file format: path.with_extension("tmp.<PID>")
-        let old_predictable_tmp = consent_path.with_extension(format!("tmp.{}", std::process::id()));
+        let old_predictable_tmp =
+            consent_path.with_extension(format!("tmp.{}", std::process::id()));
         std::os::unix::fs::symlink(&sentinel_path, &old_predictable_tmp).unwrap();
 
         // Also precreate candidate 0 symlink matching deterministic test namer
@@ -1024,7 +1026,10 @@ mod tests {
         #[cfg(unix)]
         {
             assert!(
-                fs::symlink_metadata(&cand_1).unwrap().file_type().is_symlink(),
+                fs::symlink_metadata(&cand_1)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
                 "Candidate 1 must remain a symlink"
             );
             assert_eq!(
@@ -1059,7 +1064,9 @@ mod tests {
         const MAX_RETRIES: usize = 64;
         let mut candidate_paths = Vec::with_capacity(MAX_RETRIES);
         for i in 0..MAX_RETRIES {
-            let p = temp.path().join(format!(".consent.json.tmp.exhaust.{}.sentinel", i));
+            let p = temp
+                .path()
+                .join(format!(".consent.json.tmp.exhaust.{}.sentinel", i));
             fs::write(&p, format!("EXHAUST_SENTINEL_{}", i).as_bytes()).unwrap();
             candidate_paths.push(p);
         }
@@ -1073,7 +1080,10 @@ mod tests {
         };
 
         let res = ConsentStore::save_with_hooks(&consent_path, &LocalConsent::Revoked, &hooks);
-        assert!(res.is_err(), "Exhaustion of collision retries must fail save");
+        assert!(
+            res.is_err(),
+            "Exhaustion of collision retries must fail save"
+        );
         match res.unwrap_err() {
             ConsentError::SaveFailed(msg) => {
                 assert!(
@@ -1125,40 +1135,40 @@ mod tests {
         let hooks = SaveHooks {
             fail_after_open: Some(std::sync::Arc::new(move |temp_path| {
                 *seen_clone.lock().unwrap() = Some(temp_path.to_path_buf());
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "Injected write/flush/sync failure",
-                ))
+                Err(std::io::Error::other("Injected write/flush/sync failure"))
             })),
             ..Default::default()
         };
 
         let store = std::sync::Arc::new(FileConsentStore::with_hooks(consent_file.clone(), hooks));
-        let mut manager = ConsentManager::with_storage(
-            LocalConsent::Granted(initial_perms),
-            Some(store),
-        );
-        assert_eq!(manager.current().permissions().keyboard, true);
-        assert_eq!(manager.current().permissions().screenshot, false);
+        let mut manager =
+            ConsentManager::with_storage(LocalConsent::Granted(initial_perms), Some(store));
+        assert!(manager.current().permissions().keyboard);
+        assert!(!manager.current().permissions().screenshot);
 
         let mut expanded = initial_perms;
         expanded.screenshot = true;
 
         let res = manager.update(LocalConsent::Granted(expanded));
-        assert!(res.is_err(), "Update must fail when persistence write/sync fails");
+        assert!(
+            res.is_err(),
+            "Update must fail when persistence write/sync fails"
+        );
 
-        assert_eq!(
-            manager.current().permissions().screenshot,
-            false,
+        assert!(
+            !manager.current().permissions().screenshot,
             "Manager must not widen in-memory when disk write fails"
         );
-        assert_eq!(
+        assert!(
             manager.current().permissions().keyboard,
-            true,
             "Previous manager permissions must remain in effect"
         );
 
-        let owned_temp = seen_temp.lock().unwrap().clone().expect("Hook must capture owned temp path");
+        let owned_temp = seen_temp
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("Hook must capture owned temp path");
         assert!(
             !owned_temp.exists(),
             "Owned temporary file must be cleaned up on failure: {}",
@@ -1207,21 +1217,16 @@ mod tests {
         let hooks = SaveHooks {
             fail_rename: Some(std::sync::Arc::new(move |temp_path, _target_path| {
                 *seen_clone.lock().unwrap() = Some(temp_path.to_path_buf());
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "Injected atomic rename failure",
-                ))
+                Err(std::io::Error::other("Injected atomic rename failure"))
             })),
             ..Default::default()
         };
 
         let store = std::sync::Arc::new(FileConsentStore::with_hooks(consent_file.clone(), hooks));
-        let mut manager = ConsentManager::with_storage(
-            LocalConsent::Granted(initial_perms),
-            Some(store),
-        );
-        assert_eq!(manager.current().permissions().mouse, true);
-        assert_eq!(manager.current().permissions().active_window, false);
+        let mut manager =
+            ConsentManager::with_storage(LocalConsent::Granted(initial_perms), Some(store));
+        assert!(manager.current().permissions().mouse);
+        assert!(!manager.current().permissions().active_window);
 
         let mut expanded = initial_perms;
         expanded.active_window = true;
@@ -1229,18 +1234,20 @@ mod tests {
         let res = manager.update(LocalConsent::Granted(expanded));
         assert!(res.is_err(), "Update must fail when atomic rename fails");
 
-        assert_eq!(
-            manager.current().permissions().active_window,
-            false,
+        assert!(
+            !manager.current().permissions().active_window,
             "Manager must not widen in-memory when rename fails"
         );
-        assert_eq!(
+        assert!(
             manager.current().permissions().mouse,
-            true,
             "Previous manager permissions must remain in effect"
         );
 
-        let owned_temp = seen_temp.lock().unwrap().clone().expect("Hook must capture owned temp path");
+        let owned_temp = seen_temp
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("Hook must capture owned temp path");
         assert!(
             !owned_temp.exists(),
             "Owned temporary file must be cleaned up on rename failure: {}",
@@ -1310,7 +1317,7 @@ mod tests {
 
         let store = std::sync::Arc::new(FileConsentStore::new(consent_file.clone()));
         let mut manager = ConsentManager::with_storage(LocalConsent::Granted(initial), Some(store));
-        assert_eq!(manager.current().permissions().keyboard, true);
+        assert!(manager.current().permissions().keyboard);
 
         // Replace consent_file with an unsafe directory so subsequent disk saves fail validation
         fs::remove_file(&consent_file).unwrap();
@@ -1329,9 +1336,8 @@ mod tests {
             !manager.current().permissions().screenshot,
             "Newly widened permission (screenshot) must NOT be admitted when disk save fails"
         );
-        assert_eq!(
+        assert!(
             manager.current().permissions().keyboard,
-            true,
             "Previously consented permission (keyboard) remains intact"
         );
     }

@@ -27,6 +27,7 @@ Dosi-Tracker/
 ├── backend/            # .NET 10 + ABP Framework (DDD / Clean Architecture), REST API, PostgreSQL
 ├── frontend/           # Next.js (App Router, TypeScript, Tailwind) web dashboard
 ├── clients/
+│   ├── linux/          # Rust headless foundation, capability diagnostics & installer
 │   ├── windows/        # Rust background agent (low RAM / low CPU)
 │   └── macos/          # Swift background agent (ScreenCaptureKit / AVFoundation / Accessibility)
 ├── docs/
@@ -46,6 +47,7 @@ Dosi-Tracker/
 |-----------|------|---------|
 | **Backend** | .NET 10, ABP Framework, EF Core, PostgreSQL | Auth, projects, teams, activities, reports; auto-generated REST API |
 | **Frontend** | Next.js, TypeScript, Tailwind CSS | Web dashboard: projects, reports, team management |
+| **Linux client** | Rust | Headless foundation, capability diagnostics, outbox & installer lifecycle |
 | **Windows client** | Rust | Background tracking agent for Windows |
 | **macOS client** | Swift | Background tracking agent for macOS |
 
@@ -54,6 +56,7 @@ Dosi-Tracker/
 ```mermaid
 flowchart LR
     subgraph Clients
+        L[Linux Agent - Rust]
         W[Windows Agent - Rust]
         M[macOS Agent - Swift]
     end
@@ -63,13 +66,14 @@ flowchart LR
     end
     FE[Next.js Dashboard]
 
+    L -->|diagnostics / offline queue| API
     W -->|login / submit activity| API
     M -->|login / submit activity| API
     FE -->|projects / reports| API
     API --> DB
 ```
 
-Both agents share the same design:
+The desktop agents share a common architecture:
 
 - **Offline-first**: snapshots saved to a local SQLite queue, then synced.
 - **Event-driven input**: OS pushes keyboard/mouse events → ~0% idle CPU.
@@ -84,6 +88,7 @@ Each component has its own README with setup details:
 
 - [`backend/`](./backend) — run `abp` solution; configure PostgreSQL + run migrations (`Dosi.Tracker.DbMigrator` also seeds the default plans and admin)
 - [`frontend/`](./frontend) — `npm install && npm run dev`
+- [`clients/linux/`](./clients/linux/README.md) — install Rust, then `cargo run --bin dosi-tracker-linux -- doctor`
 - [`clients/windows/`](./clients/windows/README.md) — install Rust, then `cargo run --release`
 - [`clients/macos/`](./clients/macos/README.md) — build on a Mac with `swift run`
 

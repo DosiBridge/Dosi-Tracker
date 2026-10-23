@@ -323,7 +323,7 @@ export default function LinuxInstallPage() {
           </div>
           <ol className="list-decimal pl-5 space-y-2">
             <li>
-              <strong className="text-foreground">Slice 1 (Delivered):</strong> Headless foundation crate (<code className="font-mono text-foreground">clients/linux</code>), non-mutating <code className="font-mono text-foreground font-semibold">doctor [--json]</code> capability diagnostics, safe XDG path resolution, default-deny consent core, and ABA lifecycle generation invalidation (27 tests passed on Windows toolchain).
+              <strong className="text-foreground">Slice 1 (Delivered):</strong> Headless foundation crate (<code className="font-mono text-foreground">clients/linux</code>), non-mutating <code className="font-mono text-foreground font-semibold">doctor [--json]</code> capability diagnostics, safe XDG path resolution, default-deny consent core, ABA lifecycle generation invalidation, transactional SQLite outbox, and rootless installer lifecycle (101 tests passed on Windows toolchain, 22 installer lifecycle tests).
             </li>
             <li>
               <strong className="text-foreground">Slice 2 (Next):</strong> Authentication, workspace enrollment, credential storage via Freedesktop Secret Service D-Bus, and offline-first SQLite queue schema.

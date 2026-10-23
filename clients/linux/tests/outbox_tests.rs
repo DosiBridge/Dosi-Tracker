@@ -88,7 +88,7 @@ fn test_outbox_same_scope_conflicting_retry_fails_without_clobbering() {
     outbox.enqueue(&scope, &env1).unwrap();
 
     let mut env2 = synthetic_envelope("act-conflict", Some("Conflicting payload"));
-    env2.ended_at = env2.ended_at + Duration::seconds(30);
+    env2.ended_at += Duration::seconds(30);
 
     let err = outbox.enqueue(&scope, &env2).unwrap_err();
     assert!(
@@ -1089,4 +1089,37 @@ fn test_valid_enqueue_peek_retry_ack_lifecycle_with_bounded_identity() {
     let pending_final = outbox.peek_pending(&scope, 10).unwrap();
     assert_eq!(pending_final.len(), 0);
     assert_eq!(outbox.count(Some(&scope)).unwrap(), 0);
+}
+
+#[test]
+fn test_outbox_lock_poisoning_returns_recoverable_error() {
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("poison_test.db");
+    let outbox = Outbox::open(&db_path, OutboxLimits::default()).unwrap();
+    let scope = OutboxScope::new("acc-poison", "ws-poison").unwrap();
+    let env = synthetic_envelope("act-poison", Some("Testing lock poisoning recovery"));
+
+    // Verify healthy first
+    outbox.enqueue(&scope, &env).unwrap();
+
+    // Poison the internal mutex
+    outbox.poison_lock_for_test();
+
+    // Verify all outbox methods return Err(OutboxError::LockPoisoned) without panicking
+    let err_enqueue = outbox.enqueue(&scope, &env).unwrap_err();
+    assert!(matches!(err_enqueue, OutboxError::LockPoisoned));
+
+    let err_peek = outbox.peek_pending(&scope, 10).unwrap_err();
+    assert!(matches!(err_peek, OutboxError::LockPoisoned));
+
+    let err_ack = outbox.ack_delivered(&scope, "act-poison").unwrap_err();
+    assert!(matches!(err_ack, OutboxError::LockPoisoned));
+
+    let err_fail = outbox
+        .mark_attempt_failed(&scope, "act-poison", "err")
+        .unwrap_err();
+    assert!(matches!(err_fail, OutboxError::LockPoisoned));
+
+    let err_count = outbox.count(Some(&scope)).unwrap_err();
+    assert!(matches!(err_count, OutboxError::LockPoisoned));
 }

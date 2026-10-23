@@ -343,6 +343,8 @@ pub enum OutboxError {
     Database(rusqlite::Error),
     /// JSON serialization or deserialization failure.
     Serialization(serde_json::Error),
+    /// Outbox database connection lock was poisoned by a prior panic.
+    LockPoisoned,
 }
 
 impl std::fmt::Display for OutboxError {
@@ -403,6 +405,12 @@ impl std::fmt::Display for OutboxError {
             }
             Self::Database(err) => write!(f, "Outbox database error: {err}"),
             Self::Serialization(err) => write!(f, "Serialization error: {err}"),
+            Self::LockPoisoned => {
+                write!(
+                    f,
+                    "Outbox database connection lock was poisoned by a prior panic"
+                )
+            }
         }
     }
 }
@@ -514,6 +522,19 @@ impl Outbox {
         })
     }
 
+    fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, OutboxError> {
+        self.conn.lock().map_err(|_| OutboxError::LockPoisoned)
+    }
+
+    /// Intentionally poisons the internal mutex by inducing a panic while holding the lock.
+    /// Used in tests to verify recoverable [`OutboxError::LockPoisoned`] error handling.
+    pub fn poison_lock_for_test(&self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = self.conn.lock().unwrap();
+            panic!("Intentional test panic to poison Mutex");
+        }));
+    }
+
     /// Enqueues an activity envelope under the specified scope.
     ///
     /// - Enforces configured size, cardinality, and quota limits before mutating state.
@@ -538,7 +559,7 @@ impl Outbox {
             });
         }
 
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_conn()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         // Check if an entry with this scope and client_activity_id already exists.
@@ -633,7 +654,7 @@ impl Outbox {
         scope.validate()?;
         let clamped_limit = limit.max(1).min(self.limits.max_page_limit);
 
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, account_id, workspace_id, client_activity_id, payload_json, enqueued_at, retry_count, last_error
              FROM outbox_entries
@@ -755,7 +776,7 @@ impl Outbox {
             ));
         }
 
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_conn()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         let affected = tx.execute(
@@ -804,7 +825,7 @@ impl Outbox {
             });
         }
 
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_conn()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         let affected = tx.execute(
@@ -835,7 +856,7 @@ impl Outbox {
         if let Some(s) = scope {
             s.validate()?;
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let count: u32 = match scope {
             Some(s) => conn.query_row(
                 "SELECT COUNT(*) FROM outbox_entries WHERE account_id = ?1 AND workspace_id = ?2",
@@ -1141,11 +1162,37 @@ unsafe extern "C" fn sqlite_progress_callback(arg: *mut std::ffi::c_void) -> std
     }
 }
 
-struct ProgressGuard {
+/// Safe scoped RAII wrapper for SQLite progress handler with guaranteed Drop deregistration.
+/// Encapsulates raw FFI calls to `sqlite3_progress_handler` and ensures the callback is cleanly removed.
+struct ScopedProgressHandler<'a> {
     handle: *mut rusqlite::ffi::sqlite3,
+    _marker: std::marker::PhantomData<(&'a Connection, &'a ProgressContext<'a>)>,
 }
 
-impl Drop for ProgressGuard {
+impl<'a> ScopedProgressHandler<'a> {
+    /// Installs a scoped progress handler on the SQLite connection.
+    ///
+    /// # Safety Invariant
+    /// Borrows the connection and context for lifetime `'a` to ensure
+    /// neither is dropped or relocated while the raw FFI callback is registered.
+    fn install(conn: &'a Connection, opcodes: i32, ctx: &'a ProgressContext<'a>) -> Self {
+        let handle = unsafe { conn.handle() };
+        unsafe {
+            rusqlite::ffi::sqlite3_progress_handler(
+                handle,
+                opcodes,
+                Some(sqlite_progress_callback),
+                ctx as *const ProgressContext<'a> as *mut std::ffi::c_void,
+            );
+        }
+        Self {
+            handle,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<'a> Drop for ScopedProgressHandler<'a> {
     fn drop(&mut self) {
         unsafe {
             rusqlite::ffi::sqlite3_progress_handler(self.handle, 0, None, std::ptr::null_mut());
@@ -1293,21 +1340,13 @@ pub fn inspect_outbox_status_instrumented(
     let conn = Connection::open_with_flags(db_path, flags).map_err(map_sqlite_open_error)?;
 
     // 6. Install finite execution work budget handler covering all validation and summary queries
-    let raw_handle = unsafe { conn.handle() };
     let progress_ctx = ProgressContext {
         steps_taken: AtomicU64::new(0),
         max_steps: max_work_steps,
         external_counter: step_counter,
     };
-    let _progress_guard = ProgressGuard { handle: raw_handle };
-    unsafe {
-        rusqlite::ffi::sqlite3_progress_handler(
-            raw_handle,
-            PROGRESS_OPCODES_PER_STEP,
-            Some(sqlite_progress_callback),
-            &progress_ctx as *const ProgressContext as *mut std::ffi::c_void,
-        );
-    }
+    let _progress_guard =
+        ScopedProgressHandler::install(&conn, PROGRESS_OPCODES_PER_STEP, &progress_ctx);
 
     // 7. Check schema version via PRAGMA user_version
     let user_ver: u32 = conn

@@ -189,7 +189,7 @@ export default function InstallOverviewPage() {
                 <td className="p-3">Planned: _NET_ACTIVE_WINDOW</td>
                 <td className="p-3">Planned: Secret Service D-Bus</td>
                 <td className="p-3 font-medium text-success">No (Strictly Unprivileged)</td>
-                <td className="p-3 font-medium text-amber-600 dark:text-amber-400">FOUNDATION ONLY (Sensor-Free Crate; 27 Tests Passed; Native Runtime Unverified)</td>
+                <td className="p-3 font-medium text-amber-600 dark:text-amber-400">FOUNDATION ONLY (Sensor-Free Crate; 101 Tests Passed on Host; Native Runtime Unverified)</td>
               </tr>
               <tr className="hover:bg-muted/20">
                 <td className="p-3 font-medium text-foreground">Linux (Wayland)</td>
@@ -200,7 +200,7 @@ export default function InstallOverviewPage() {
                 <td className="p-3 font-medium text-amber-600 dark:text-amber-400">UNSUPPORTED (Reported as null)</td>
                 <td className="p-3">Planned: Secret Service D-Bus</td>
                 <td className="p-3 font-medium text-success">No (Strictly Prohibited)</td>
-                <td className="p-3 font-medium text-amber-600 dark:text-amber-400">FOUNDATION ONLY (Sensor-Free Crate; 27 Tests Passed; Native Runtime Unverified)</td>
+                <td className="p-3 font-medium text-amber-600 dark:text-amber-400">FOUNDATION ONLY (Sensor-Free Crate; 101 Tests Passed on Host; Native Runtime Unverified)</td>
               </tr>
               <tr className="hover:bg-muted/20">
                 <td className="p-3 font-medium text-foreground">macOS (arm64 &amp; Intel)</td>
