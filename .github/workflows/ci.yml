@@ -236,3 +236,61 @@ jobs:
           name: dosi-tracker-macos
           path: clients/macos/.build/dist/DosiTracker-*-macos.zip
           if-no-files-found: error
+
+  linux-agent:
+    name: Linux agent (build, test, diagnostics, installer)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            clients/linux/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('clients/linux/Cargo.lock') }}
+
+      - name: Build release (locked)
+        working-directory: clients/linux
+        run: cargo build --locked --release
+
+      - name: Test release (locked)
+        working-directory: clients/linux
+        run: cargo test --locked --release
+
+      - name: Release binary doctor (--json)
+        working-directory: clients/linux
+        run: |
+          export HOME=$(mktemp -d)
+          export XDG_DATA_HOME="${HOME}/.local/share"
+          export XDG_CONFIG_HOME="${HOME}/.config"
+          ./target/release/dosi-tracker-linux doctor --json
+
+      - name: Outbox status fail-closed (missing DB)
+        working-directory: clients/linux
+        run: |
+          export HOME=$(mktemp -d)
+          export XDG_DATA_HOME="${HOME}/.local/share"
+          export XDG_CONFIG_HOME="${HOME}/.config"
+          MISSING_DB="${HOME}/missing_dosi_outbox_${RANDOM}_$$.db"
+          rm -f "${MISSING_DB}"
+          if ./target/release/dosi-tracker-linux outbox status --db "${MISSING_DB}" --account-id "00000000-0000-0000-0000-000000000001" --workspace-id "00000000-0000-0000-0000-000000000002" --json; then
+            echo "ERROR: outbox status succeeded unexpectedly on non-existent DB"
+            exit 1
+          fi
+          if [ -e "${MISSING_DB}" ]; then
+            echo "ERROR: outbox status created the database file"
+            exit 1
+          fi
+
+      - name: Installer lifecycle tests
+        working-directory: clients/linux
+        run: bash tests/test_installer_lifecycle.sh
+

@@ -2845,14 +2845,55 @@ Implemented deterministic isolated SQLite write-failure regressions in `clients/
 5. **Approval-Blocked Invariant**: The historical PM `tirith:archive_extract` check was never run, retried, or bypassed.
 6. **Mocked Execution Disclosure**: All frontend tests ran against isolated mock HTTP/fetch stubs in Vitest/JSDOM; no real network services, production databases, or external token issuers were accessed. Live browser session testing and real PostgreSQL cluster concurrency remain open verification gates.
 
+---
 
+## 35. Linux-to-Windows Parity Phase 0: CI Job Definition & Environment Provenance Baseline (`TASK linux-windows-parity-phase0-20261024`, `REQ-CLI-03`)
 
+> **Execution Date:** October 24, 2026  
+> **Phase Task ID:** `linux-windows-parity-phase0-20261024` (Phase 0 deliverable of Linux-to-Windows parity mission)  
+> **Status:** Implementation Complete; CI Workflow Validated; **PHASE 0 NOT ACCEPTED PENDING NATIVE RUN** (Native Linux execution on GitHub runner / native host pending)  
+> **Target Package:** `.github/workflows/ci.yml`, `clients/linux` (`dosi-tracker-linux` v0.1.0)
 
+### A. Context & Bounded Deliverables
+1. **GitHub Actions CI Workflow (`linux-agent` in `.github/workflows/ci.yml`)**:
+   - Added a dedicated `linux-agent` job to `.github/workflows/ci.yml` running on `ubuntu-latest`.
+   - Existing CI jobs (`backend`, `frontend`, `frontend-e2e`, `windows-agent`, `macos-agent`) remain 100% intact.
+   - Preserves repo Cargo.lock policy (`cargo build --locked --release`, `cargo test --locked --release`).
+   - Steps included:
+     * Checkout (`actions/checkout@v4`).
+     * Rust toolchain setup (`dtolnay/rust-toolchain@stable` with `clippy`).
+     * Cargo cache (`actions/cache@v4` on `~/.cargo/registry`, `~/.cargo/git`, and `clients/linux/target` keyed by `Cargo.lock` hash).
+     * Release compilation (`cargo build --locked --release`).
+     * Release tests (`cargo test --locked --release`).
+     * Release binary diagnostics verification (`doctor --json` in isolated temp `HOME` and `XDG_DATA_HOME`/`XDG_CONFIG_HOME`).
+     * Durable outbox fail-closed assertion on missing DB path (`dosi-tracker-linux outbox status --db <unique missing temp path> --account-id <id> --workspace-id <id> --json`), asserting non-zero exit and that DB file is never created.
+     * Installer lifecycle test suite execution (`bash tests/test_installer_lifecycle.sh`).
+   - PyYAML syntax validation confirmed all 6 workflow jobs present and valid.
 
+2. **Zero Inventions / Scope Boundaries**:
+   - Strictly Phase 0 only: zero capture, auth, or network delivery code implemented.
+   - Did not alter backend or Windows/macOS agent code.
+   - Did not delete, ignore, or weaken baseline tests.
 
+### B. Environment Provenance & Local Checks
+| Execution Environment | Toolchain / OS | Command Executed | Tests / Steps | Result | Exit Code | Provenance Details |
+|---|---|---|:---:|:---:|:---:|---|
+| **Local WSL Linux** | Linux 6.6.87.2-microsoft-standard-WSL2 (Ubuntu 24.04, `/usr/bin/bash`) | `bash tests/test_installer_lifecycle.sh` | 21 passed, 1 failed | BLOCKED on `cargo` | **1** | Tests 1–21 (synthetic prefixes, manifest validation, symlink traversal, rollback, uninstall) passed cleanly. Test 22 failed solely because `cargo` is not installed in the local WSL instance. Per prompt rules, OS configuration was not modified to install packages. |
+| **Local Windows Host** | Windows 11 x86_64, `rustc 1.97.1` (MSVC) | `cargo build --release --manifest-path clients/linux/Cargo.toml` | N/A | PASSED | **0** | Clean release build, 0 errors, 0 warnings. |
+| **Local Windows Host** | Windows 11 x86_64, `rustc 1.97.1` (MSVC) | `cargo test --manifest-path clients/linux/Cargo.toml` | 100 passed across 7 suites | PASSED | **0** | 28 lib unit tests, 0 main unit tests, 6 doctor CLI tests, 7 repro tests, 3 installer lifecycle tests, 15 outbox status CLI tests, 28 outbox tests, 13 sync tests. Exactly 4 tests in `consent.rs` are `#[cfg(unix)]` mode/symlink tests unexecuted on Windows (explaining 100 vs reference 104). |
+| **Local Windows Host** | Windows 11 x86_64, MSVC release binary | `dosi-tracker-linux.exe doctor --json` | Diagnostics JSON | PASSED | **0** | Emits truthful JSON diagnostics with `name: dosi-tracker-linux`, `version: 0.1.0`, `release_tier: headless-foundation`, all capture adapters reported `NOT_IMPLEMENTED`. |
+| **Local Windows Host** | Windows 11 x86_64, MSVC release binary | `dosi-tracker-linux.exe outbox status --db <missing> ...` | Fail-closed check | PASSED (Expected Fail) | **1** | Fails closed with `Error: Database file does not exist`; verified zero file creation (`Test-Path` returned `False`). |
 
+### C. Acceptance Limitations & Invariants
+1. **Phase 0 Acceptance Status**: **PHASE 0 NOT ACCEPTED PENDING NATIVE RUN**. In accordance with instructions, Windows-target cargo tests and partial WSL runs do not substitute for native Linux CI execution. Full Phase 0 acceptance requires execution on a real Linux GitHub runner or authorized native Linux host with Rust toolchain.
+2. **Push Policy**: No remote push performed (`origin/main` untouched; changes remain purely local).
+3. **Approval-Blocked Invariant**: The historical PM `tirith:archive_extract` blocked action was never run, retried, repackaged, or bypassed.
+4. **Privacy & Platform Restrictions**: No production credentials, real tracking, sensors, hooks, screenshots, or background daemons were introduced.
 
-
-
-
-
+### D. Proposed Later Roadmap (PROPOSED ONLY)
+The following roadmap is strictly **PROPOSED** and NOT authorized for execution. Implementation is halted awaiting PM's next bounded instruction:
+- **Proposed Phase 1 (Authentication & Credential Storage)**: OpenIddict password grant (`POST /connect/token`, `client_id=Tracker_App`, `scope=Tracker`, `__tenant` workspace header) and Secret Service API integration.
+- **Proposed Phase 2 (Signed Envelope Wire Transport & Sync)**: HMAC-SHA256 request signing, chronological oldest-first batching to `POST /api/app/activity` with `client_activity_id` idempotency, and 60s `POST /api/app/presence/heartbeat` daemon.
+- **Proposed Phase 3 (Platform Telemetry & Sensors)**: X11 active window (`_NET_ACTIVE_WINDOW`) and rootless input activity counters; truthful Wayland capability degradation reporting without fabricating unsupported hooks.
+- **Proposed Phase 4 (Capture & Consent Hardening)**: PipeWire / `xdg-desktop-portal` ScreenCast capture, V4L2 webcam capture, informed consent core with ABA generation ticket invalidation.
+- **Proposed Phase 5 (Packaging & Distribution)**: Rootless installer refinements, `.deb`/`.rpm` packaging, and end-to-end multi-platform integration verification.
