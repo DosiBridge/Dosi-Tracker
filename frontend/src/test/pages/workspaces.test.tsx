@@ -279,4 +279,147 @@ describe("workspace chooser", () => {
     // Still shows as archived
     expect(within(gammaLi).getByText("Archived")).toBeInTheDocument();
   });
+
+  it("archive POST succeeds but subsequent mine GET rejects: reconciles target locally as archived, clears matching context, shows refresh retry, and explicit retry reloads list", async () => {
+    localStorage.setItem("dosi-workspace", ACME);
+    let mineGetCount = 0;
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input).replace(API, "");
+      const method = init?.method ?? "GET";
+      if (url === "/api/app/workspaces/mine") {
+        mineGetCount++;
+        if (mineGetCount === 1) {
+          return json([
+            { id: ACME, name: "Acme", role: "owner", planName: "Free", isArchived: false },
+            { id: BETA, name: "Beta", role: "member", planName: "Business", isArchived: false },
+          ]);
+        }
+        if (mineGetCount === 2) {
+          // Refresh call after archive POST rejects with 500
+          return json({ error: { message: "Internal server error" } }, 500);
+        }
+        // Explicit retry (mineGetCount === 3) succeeds with updated server list
+        return json([
+          { id: ACME, name: "Acme", role: "owner", planName: "Free", isArchived: true },
+          { id: BETA, name: "Beta", role: "member", planName: "Business", isArchived: false },
+        ]);
+      }
+      if (url.endsWith(`/api/app/workspaces/${ACME}/archive`) && method === "POST") {
+        return json({});
+      }
+      return json({ items: [] });
+    });
+
+    const user = userEvent.setup();
+    renderWithProviders(<WorkspacesPage />, { route: "/workspaces" });
+    const list = await screen.findByRole("list", { name: /your workspaces/i });
+    const acmeLi = within(list).getByText("Acme").closest("li")!;
+
+    await user.click(within(acmeLi).getByRole("button", { name: /^archive$/i }));
+    const dialog = await screen.findByRole("dialog");
+    await user.click(within(dialog).getByRole("button", { name: /archive workspace/i }));
+
+    // Archive POST was sent once
+    await waitFor(() => {
+      const postCalls = fetchMock.mock.calls.filter(([u, i]) =>
+        String(u).endsWith(`/api/app/workspaces/${ACME}/archive`) && i?.method === "POST"
+      );
+      expect(postCalls).toHaveLength(1);
+    });
+
+    // Matching context was cleared
+    expect(localStorage.getItem("dosi-workspace")).toBeNull();
+
+    // Target is reconciled locally as archived even though subsequent GET rejected
+    await waitFor(() => {
+      const updatedAcmeLi = within(list).getByText("Acme").closest("li")!;
+      expect(within(updatedAcmeLi).getByText("Archived")).toBeInTheDocument();
+      // Cannot switch or archive again from stale row
+      expect(within(updatedAcmeLi).queryByRole("button", { name: /acme/i })).not.toBeInTheDocument();
+      expect(within(updatedAcmeLi).queryByRole("button", { name: /^archive$/i })).not.toBeInTheDocument();
+    });
+
+    // Other active workspace Beta remains usable
+    const betaLi = within(list).getByText("Beta").closest("li")!;
+    expect(within(betaLi).getByRole("button", { name: /beta/i })).toBeInTheDocument();
+
+    // Accessible refresh warning appears with explicit retry button
+    const retryBtn = await screen.findByRole("button", { name: /retry/i });
+    expect(screen.getByRole("alert")).toHaveTextContent(/couldn't refresh/i);
+
+    // Clicking retry sends ONLY GET /mine (no extra POST calls)
+    await user.click(retryBtn);
+
+    await waitFor(() => {
+      expect(mineGetCount).toBe(3);
+    });
+    const postCallsTotal = fetchMock.mock.calls.filter(([, i]) => i?.method === "POST");
+    expect(postCallsTotal).toHaveLength(1); // exactly the initial archive POST, zero repeats
+  });
+
+  it("restore POST succeeds but subsequent mine GET rejects: reconciles target locally as active, prevents repeated restore POST, shows retry, and explicit retry reloads list", async () => {
+    let mineGetCount = 0;
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input).replace(API, "");
+      const method = init?.method ?? "GET";
+      if (url === "/api/app/workspaces/mine") {
+        mineGetCount++;
+        if (mineGetCount === 1) {
+          // All workspaces archived
+          return json([
+            { id: GAMMA, name: "Gamma", role: "owner", planName: "Starter", isArchived: true },
+            { id: DELTA, name: "Delta", role: "member", planName: "Free", isArchived: true },
+          ]);
+        }
+        if (mineGetCount === 2) {
+          // Refresh call after restore POST rejects
+          return json({ error: { message: "Internal server error" } }, 500);
+        }
+        // Explicit retry (mineGetCount === 3) succeeds
+        return json([
+          { id: GAMMA, name: "Gamma", role: "owner", planName: "Starter", isArchived: false },
+          { id: DELTA, name: "Delta", role: "member", planName: "Free", isArchived: true },
+        ]);
+      }
+      if (url.endsWith(`/api/app/workspaces/${GAMMA}/restore`) && method === "POST") {
+        return json({});
+      }
+      return json({ items: [] });
+    });
+
+    const user = userEvent.setup();
+    renderWithProviders(<WorkspacesPage />, { route: "/workspaces" });
+    const list = await screen.findByRole("list", { name: /your workspaces/i });
+
+    const gammaLi = within(list).getByText("Gamma").closest("li")!;
+    await user.click(within(gammaLi).getByRole("button", { name: /^restore$/i }));
+
+    // Restore POST was sent once
+    await waitFor(() => {
+      const postCalls = fetchMock.mock.calls.filter(([u, i]) =>
+        String(u).endsWith(`/api/app/workspaces/${GAMMA}/restore`) && i?.method === "POST"
+      );
+      expect(postCalls).toHaveLength(1);
+    });
+
+    // Target is reconciled locally as active: no repeated Restore button, switch button is available
+    await waitFor(() => {
+      const updatedGammaLi = within(list).getByText("Gamma").closest("li")!;
+      expect(within(updatedGammaLi).queryByRole("button", { name: /^restore$/i })).not.toBeInTheDocument();
+      expect(within(updatedGammaLi).getByRole("button", { name: /gamma/i })).toBeInTheDocument();
+    });
+
+    // Accessible refresh warning appears with explicit retry button
+    const retryBtn = await screen.findByRole("button", { name: /retry/i });
+    expect(screen.getByRole("alert")).toHaveTextContent(/couldn't refresh/i);
+
+    // Clicking retry sends ONLY GET /mine (no extra POST calls)
+    await user.click(retryBtn);
+
+    await waitFor(() => {
+      expect(mineGetCount).toBe(3);
+    });
+    const postCallsTotal = fetchMock.mock.calls.filter(([, i]) => i?.method === "POST");
+    expect(postCallsTotal).toHaveLength(1); // exactly the initial restore POST, zero repeats
+  });
 });

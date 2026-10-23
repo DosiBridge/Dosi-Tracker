@@ -32,6 +32,8 @@ export default function WorkspacesPage() {
   const [busyId, setBusyId] = useState<string | null>(null);
   const [archivingWorkspace, setArchivingWorkspace] = useState<WorkspaceMembership | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [refreshError, setRefreshError] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
 
   useEffect(() => {
     let alive = true;
@@ -46,10 +48,25 @@ export default function WorkspacesPage() {
 
   const empty = mine !== null && mine.length === 0;
 
+  async function reloadMine() {
+    if (refreshing || busyId) return;
+    setRefreshing(true);
+    try {
+      const refreshed = await getMyWorkspacesApi();
+      setMine(refreshed);
+      setRefreshError(null);
+    } catch {
+      setRefreshError("Couldn't refresh your workspaces. Check your connection and try again.");
+    } finally {
+      setRefreshing(false);
+    }
+  }
+
   async function handleRestore(w: WorkspaceMembership) {
     if (busyId) return;
     setBusyId(w.id);
     setActionError(null);
+    setRefreshError(null);
     try {
       await restoreWorkspaceApi(w.id);
     } catch (err) {
@@ -60,12 +77,17 @@ export default function WorkspacesPage() {
       setBusyId(null);
       return;
     }
+    // Mutation succeeded: reconcile target locally immediately so repeated restore is prevented
+    setMine((prev) =>
+      prev ? prev.map((item) => (item.id.toLowerCase() === w.id.toLowerCase() ? { ...item, isArchived: false } : item)) : prev
+    );
+    toast({ title: "Workspace restored", description: `${w.name} is now active.`, tone: "success" });
+
     try {
       const refreshed = await getMyWorkspacesApi();
       setMine(refreshed);
-      toast({ title: "Workspace restored", description: `${w.name} is now active.`, tone: "success" });
     } catch {
-      // Keep existing list if reload fails
+      setRefreshError("Workspace was restored, but we couldn't refresh the list. Retry to update.");
     } finally {
       setBusyId(null);
     }
@@ -75,6 +97,7 @@ export default function WorkspacesPage() {
     if (busyId) return;
     setBusyId(w.id);
     setActionError(null);
+    setRefreshError(null);
     try {
       await archiveWorkspaceApi(w.id);
     } catch (err) {
@@ -85,18 +108,23 @@ export default function WorkspacesPage() {
       setBusyId(null);
       return;
     }
+    // Mutation succeeded: reconcile target locally immediately so stale ordinary selection is impossible
+    setMine((prev) =>
+      prev ? prev.map((item) => (item.id.toLowerCase() === w.id.toLowerCase() ? { ...item, isArchived: true } : item)) : prev
+    );
     if (currentWorkspaceId()?.toLowerCase() === w.id.toLowerCase()) {
       clearCurrentWorkspace();
       dropLiveDatasets();
     }
+    toast({ title: "Workspace archived", description: `${w.name} has been archived.`, tone: "info" });
+    setArchivingWorkspace(null);
+
     try {
       const refreshed = await getMyWorkspacesApi();
       setMine(refreshed);
-      toast({ title: "Workspace archived", description: `${w.name} has been archived.`, tone: "info" });
     } catch {
-      // Keep existing list if reload fails
+      setRefreshError("Workspace was archived, but we couldn't refresh the list. Retry to update.");
     } finally {
-      setArchivingWorkspace(null);
       setBusyId(null);
     }
   }
@@ -143,6 +171,23 @@ export default function WorkspacesPage() {
               <p role="alert" className="mt-3 rounded-lg bg-danger/10 px-3 py-2 text-sm font-medium text-danger-on-tint">
                 {actionError}
               </p>
+            )}
+
+            {refreshError && (
+              <div role="alert" className="mt-3 flex items-center justify-between gap-3 rounded-lg border border-warning/40 bg-warning/10 px-3 py-2 text-sm text-warning-on-tint">
+                <span className="min-w-0 flex-1 font-medium">{refreshError}</span>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={refreshing || !!busyId}
+                  onClick={() => void reloadMine()}
+                  className="shrink-0"
+                >
+                  {refreshing && <Loader2 className="h-3.5 w-3.5 animate-spin motion-reduce:animate-none mr-1" aria-hidden="true" />}
+                  {refreshing ? "Retrying…" : "Retry"}
+                </Button>
+              </div>
             )}
 
             <ul className="mt-6 space-y-2" aria-label="Your workspaces">

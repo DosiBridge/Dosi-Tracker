@@ -2686,12 +2686,12 @@ Implemented deterministic isolated SQLite write-failure regressions in `clients/
 
 ---
 
-## 33. Frontend Workspace Archival & Restoration Integration (`REQ-WS-08`, selected-workspace-archive-ui-20261023)
+## 33. Frontend Workspace Archival & Restoration Integration & Refresh Failure Correction (`REQ-WS-08`, selected-workspace-archive-ui-20261023 / selected-workspace-archive-refresh-correction-20261023)
 
-> **Execution Date:** October 23, 2026  
-> **Phase Task ID:** `selected-workspace-archive-ui-20261023` (bounded `REQ-WS-08` frontend integration)  
-> **Status:** Implementation Complete; All 115 Focused Vitest Tests Passed (Exit Code 0); Typecheck Clean (Exit Code 0); ESLint 0 Errors (Exit Code 0)  
-> **Target Package:** `frontend` (`src/app/workspaces/page.tsx`, `src/components/layout/workspace-switcher.tsx`, `src/hooks/useApi.ts`, `src/lib/api-contract.ts`, `src/lib/sign-in.ts`)  
+> **Execution Date:** October 24, 2026  
+> **Phase Task ID:** `selected-workspace-archive-ui-20261023` / `selected-workspace-archive-refresh-correction-20261023` (bounded `REQ-WS-08` frontend integration & refresh correction)  
+> **Status:** Implementation Complete; All 153 Focused Vitest Tests Across 8 Suites Passed (Exit Code 0); Typecheck Clean (Exit Code 0); ESLint 0 Errors (Exit Code 0)  
+> **Target Package:** `frontend` (`src/app/workspaces/page.tsx`, `src/components/layout/workspace-switcher.tsx`, `src/hooks/useApi.ts`, `src/lib/api-contract.ts`, `src/lib/sign-in.ts`, `src/test/pages/workspaces.test.tsx`)  
 
 ### A. Context & Bounded Source Implementation
 1. **Source Evidence & Lifecycle Gap**:
@@ -2729,25 +2729,32 @@ Implemented deterministic isolated SQLite write-failure regressions in `clients/
      * Confirming archive calls `archiveWorkspaceApi`, clears current workspace and datasets, and redirects to `/workspaces`.
      * Non-owners and demo mode do not display archive options; demo mode dispatches zero network requests.
 
+5. **Post-Mutation Refresh Failure Correction (`selected-workspace-archive-refresh-correction-20261023`)**:
+   - **Defect Addressed**: `handleArchive` and `handleRestore` previously only had `// Keep existing list if reload fails` inside `catch`. If `getMyWorkspacesApi()` failed after a successful POST mutation, `setMine` was never called: an archived row remained active/switchable with an archive button, or a restored row remained archived with repeated restore controls, with zero error feedback.
+   - **Local State Reconciliation**: Immediately upon mutation success, the known target's `isArchived` state in `mine` is reconciled locally (`true` on archive, `false` on restore). If the current workspace was archived, its context and live datasets are cleared immediately. This prevents stale ordinary selection or duplicate archive/restore actions.
+   - **Accessible Refresh Failure & Explicit Retry Path**: If the subsequent `getMyWorkspacesApi()` fails, `refreshError` state renders an accessible `role="alert"` warning banner ("Workspace was archived/restored, but we couldn't refresh the list. Retry to update.") with a "Retry" button.
+   - **Honest Feedback & Idempotent Retry**: Successful archive/restore is honestly reported via info/success toast; the mutation is never reported as failed. Clicking "Retry" calls `reloadMine()` which executes ONLY `GET /api/app/workspaces/mine` (zero repeated POST requests), applies fresh server state, and dismisses the alert.
+
 ### B. Execution Status & Quality Gates
 | Target Suite | Exact Command Line | Tests Passed | Failed | Result | Evidence Level |
 |---|---|:---:|:---:|:---:|---|
-| **Workspace Chooser Page Suite** | `npx vitest run src/test/pages/workspaces.test.tsx` | 8 | 0 | PASSED (exit 0) | **[Worker-Reported (Vitest / JSDOM)]** |
+| **Workspace Chooser Page Suite** | `npx vitest run src/test/pages/workspaces.test.tsx` | 10 | 0 | PASSED (exit 0) | **[Worker-Reported (Vitest / JSDOM)]** |
 | **Live Workspace Switcher Suite** | `npx vitest run src/components/layout/workspace-switcher.live.test.tsx` | 12 | 0 | PASSED (exit 0) | **[Worker-Reported (Vitest / JSDOM)]** |
 | **Sign-In & Resolution Unit Suite** | `npx vitest run src/lib/sign-in.test.ts` | 45 | 0 | PASSED (exit 0) | **[Worker-Reported (Vitest / JSDOM)]** |
 | **API Contract Pure Route Suite** | `npx vitest run src/lib/api-contract.test.ts` | 30 | 0 | PASSED (exit 0) | **[Worker-Reported (Vitest / JSDOM)]** |
 | **Login Flow & Landing Suite** | `npx vitest run src/test/pages/login.test.tsx` | 36 | 0 | PASSED (exit 0) | **[Worker-Reported (Vitest / JSDOM)]** |
 | **Architecture Specification** | `npx vitest run src/test/architecture.spec.ts` | 12 | 0 | PASSED (exit 0) | **[Worker-Reported (Vitest / Node)]** |
 | **Demo Switcher & Acceptance Suites** | `npx vitest run src/components/layout/workspace-switcher.test.tsx src/test/acceptance/tenant-lifecycle.test.tsx` | 8 | 0 | PASSED (exit 0) | **[Worker-Reported (Vitest / JSDOM)]** |
-| **Total Focused Vitest Execution** | `npx vitest run ...` (all 7 suites combined) | 115 | 0 | PASSED (exit 0) | **[Worker-Reported]** |
+| **Total Focused Vitest Execution** | `npx vitest run ...` (all 8 suites combined) | 153 | 0 | PASSED (exit 0) | **[Worker-Reported]** |
 | **TypeScript Typecheck** | `npm run typecheck` (`tsc --noEmit`) | N/A | 0 | PASSED (exit 0) | **[Worker-Reported]** |
 | **ESLint Static Analysis** | `npm run lint` (`eslint --max-warnings 45`) | N/A | 0 errors | PASSED (exit 0) | **[Worker-Reported]** |
 
 ### C. PM QA Boundary Limits & Acceptance Disclosures
-1. **Preserved Backend Authorization**: UI role hiding does not replace server authorization; backend `WorkspaceManager.ArchiveAsync` and `RestoreAsync` strictly enforce active owner checks.
-2. **Reversible Scope Limitation**: Hard deletion, retention grace-period enforcement, data purging, and billing subscription cancellations remain strictly deferred per `REQ-WS-08`.
-3. **Approval-Blocked Invariant**: The historical PM `tirith:archive_extract` check was never run, retried, or bypassed.
-4. **Mocked Execution Disclosure**: All frontend tests ran against isolated mock HTTP/fetch stubs in Vitest/JSDOM; no real network services, production databases, or external token issuers were accessed. Real browser cookie session validation and multi-tenant live browser end-to-end acceptance remain open verification gates.
+1. **Failing-Before Reproduction**: The two new regression tests in `workspaces.test.tsx` (archive POST succeeds then GET rejects; restore POST succeeds then GET rejects) were executed against `d22e91c` production code and failed (exit code 1) due to un-reconciled stale rows and absence of retry controls, then passed cleanly (exit code 0) after the minimal local reconciliation and retry implementation.
+2. **Preserved Backend Authorization**: UI role hiding does not replace server authorization; backend `WorkspaceManager.ArchiveAsync` and `RestoreAsync` strictly enforce active owner checks.
+3. **Reversible Scope Limitation**: Hard deletion, retention grace-period enforcement, data purging, and billing subscription cancellations remain strictly deferred per `REQ-WS-08`.
+4. **Approval-Blocked Invariant**: The historical PM `tirith:archive_extract` check was never run, retried, or bypassed.
+5. **Mocked Execution Disclosure**: All frontend tests ran against isolated mock HTTP/fetch stubs in Vitest/JSDOM; no real network services, production databases, or external token issuers were accessed. Real browser cookie session validation and multi-tenant live browser end-to-end acceptance remain open verification gates.
 
 
 
