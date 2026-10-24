@@ -16,13 +16,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use dosi_tracker_linux::{
-    CredentialError, CredentialStore, Credentials, SecretServiceStore, ZbusSecretServiceTransport,
+    CredentialError, CredentialStore, Credentials, SecretServiceStore, SecretServiceTransport,
+    ZbusSecretServiceTransport,
 };
 use tempfile::TempDir;
 use zbus::blocking::Connection;
 use zbus::interface;
 use zbus::message::Header;
-use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
+use zbus::zvariant::{OwnedObjectPath, OwnedValue, Str, Value};
 
 /// Ephemeral private session bus running isolated dbus-daemon.
 struct PrivateTestBus {
@@ -150,8 +151,8 @@ impl FakeSecretService {
                 }
             }
         }
-        unlocked.sort();
-        locked.sort();
+        unlocked.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        locked.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         (unlocked, locked)
     }
 
@@ -198,7 +199,7 @@ impl FakeSecretService {
             );
         }
 
-        let output = OwnedValue::from(Value::from(""));
+        let output = OwnedValue::from(Str::from(""));
         Ok((output, session_path))
     }
 }
@@ -247,18 +248,18 @@ impl FakeCollection {
 
         let label = properties
             .get("org.freedesktop.Secret.Item.Label")
-            .and_then(|v| match <&str>::try_from(v.as_ref()) {
-                Ok(s) => Some(s.to_string()),
-                Err(_) => None,
+            .and_then(|v| match &**v {
+                Value::Str(s) => Some(s.as_str().to_string()),
+                _ => None,
             })
             .unwrap_or_default();
 
         let mut attributes = HashMap::new();
         if let Some(attr_val) = properties.get("org.freedesktop.Secret.Item.Attributes") {
-            if let Value::Dict(dict) = attr_val.as_ref() {
+            if let Value::Dict(dict) = &**attr_val {
                 for (k, v) in dict.iter() {
-                    if let (Ok(ks), Ok(vs)) = (<&str>::try_from(k), <&str>::try_from(v)) {
-                        attributes.insert(ks.to_string(), vs.to_string());
+                    if let (Value::Str(ks), Value::Str(vs)) = (k, v) {
+                        attributes.insert(ks.as_str().to_string(), vs.as_str().to_string());
                     }
                 }
             }

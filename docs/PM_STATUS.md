@@ -3031,7 +3031,25 @@ Independent review and testing on `mh-ubuntu` verified that commit `f7fcccd` pas
      - `cargo test --manifest-path clients/linux/Cargo.toml --locked --release`: PASSED (exit 0). 149 release tests passed across 10 test binaries (64 lib [including new caller-ownership unit test], 3 main, 8 doctor, 7 identity/transport, 7 repro, 3 installer lifecycle, 15 outbox status, 29 outbox, 0 secret_service_linux_tests [Linux-gated], 13 sync).
    - Native Linux Execution: Reserved for independent native acceptance by Hermes / CI runner on `mh-ubuntu`.
 
-### F. Phase 1 Acceptance & Open Roadmap
+### F. Phase 1 Private-Bus Fixture Native Compile Correction (`TASK phase1-native-privatebus-compile-correction-20261024`)
+During independent native CI execution on `mh-ubuntu` on commit `9a5c2adc77f6a57c275bf028fbfb5ec36e7240f5`:
+- **Native CI Observation**: Release binary build exited 0, installer lifecycle 22/22 exited 0, doctor exited 0. However, `cargo test --locked --release` exited 101 due to 12 compile errors in `clients/linux/tests/secret_service_linux_tests.rs`:
+  1. Lines 153/154: `unlocked.sort()` and `locked.sort()` failed because `OwnedObjectPath` does not implement `Ord`.
+  2. Line 201: `OwnedValue::from(Value::from(""))` failed because `From<Value>` is not implemented for `OwnedValue`.
+  3. Lines 250/258: `v.as_ref()` and `attr_val.as_ref()` failed because `&OwnedValue` lacks an `as_ref()` trait implementation.
+  4. Lines 455, 466, 482, 487, 502, 508, 513: Trait methods `open_session`, `create_item`, `get_secret`, and `close_session` were not in scope on `ZbusSecretServiceTransport`.
+- **Bounded Correction**:
+  1. Updated `unlocked` and `locked` sorting to `unlocked.sort_by(|a, b| a.as_str().cmp(b.as_str()))` and `locked.sort_by(|a, b| a.as_str().cmp(b.as_str()))`, comparing `&str` paths.
+  2. Replaced `OwnedValue::from(Value::from(""))` with infallible `OwnedValue::from(Str::from(""))` using zvariant's `Str<'static>`.
+  3. Replaced `.as_ref()` calls with direct dereferencing (`&**v` and `&**attr_val`) and pattern matching against `Value::Str(s)` and `Value::Dict(dict)` with `(Value::Str(ks), Value::Str(vs))`.
+  4. Imported `SecretServiceTransport` trait into `tests/secret_service_linux_tests.rs` so all trait methods resolve in scope.
+- **Verification Evidence**:
+  - `cargo fmt --manifest-path clients/linux/Cargo.toml -- --check`: PASSED (exit 0).
+  - `cargo clippy --manifest-path clients/linux/Cargo.toml --locked --all-targets -- -D warnings`: PASSED (exit 0, 0 warnings).
+  - `cargo test --manifest-path clients/linux/Cargo.toml --locked --release`: PASSED (exit 0, 149 tests passed across 10 test binaries).
+  - Native Linux execution reserved for Hermes on authorized `mh-ubuntu` host.
+
+### G. Phase 1 Acceptance & Open Roadmap
 - **Phase 1 Status**: **DELIVERED & VERIFIED IN ISOLATED FIXTURES; NATIVE RUNNER QA PENDING**.
 - **Production Readiness Claim**: None. This delivery provides identity, transport, and signing foundation only. Capture adapters (Phase 2), capture worker loops (Phase 3), and package distribution (Phase 4) remain open.
 
