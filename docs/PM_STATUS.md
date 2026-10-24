@@ -3043,15 +3043,55 @@ During independent native CI execution on `mh-ubuntu` on commit `9a5c2adc77f6a57
   2. Replaced `OwnedValue::from(Value::from(""))` with infallible `OwnedValue::from(Str::from(""))` using zvariant's `Str<'static>`.
   3. Replaced `.as_ref()` calls with direct dereferencing (`&**v` and `&**attr_val`) and pattern matching against `Value::Str(s)` and `Value::Dict(dict)` with `(Value::Str(ks), Value::Str(vs))`.
   4. Imported `SecretServiceTransport` trait into `tests/secret_service_linux_tests.rs` so all trait methods resolve in scope.
-- **Verification Evidence**:
-  - `cargo fmt --manifest-path clients/linux/Cargo.toml -- --check`: PASSED (exit 0).
-  - `cargo clippy --manifest-path clients/linux/Cargo.toml --locked --all-targets -- -D warnings`: PASSED (exit 0, 0 warnings).
-  - `cargo test --manifest-path clients/linux/Cargo.toml --locked --release`: PASSED (exit 0, 149 tests passed across 10 test binaries).
-  - Native Linux execution reserved for Hermes on authorized `mh-ubuntu` host.
+  4. Imported `SecretServiceTransport` trait into `tests/secret_service_linux_tests.rs` so all trait methods resolve in scope.
+- **Verification Evidence & Native Verification at `a4a418f`**:
+  - Windows Host (`rustc 1.97.1`, `x86_64-pc-windows-msvc`):
+    - `cargo fmt --manifest-path clients/linux/Cargo.toml -- --check`: PASSED (exit 0).
+    - `cargo clippy --manifest-path clients/linux/Cargo.toml --locked --all-targets -- -D warnings`: PASSED (exit 0, 0 warnings).
+    - `cargo test --manifest-path clients/linux/Cargo.toml --locked --release`: PASSED (exit 0, 149 tests passed across 10 test binaries).
+  - **Independent Native QA Baseline on `mh-ubuntu` (`a4a418f35432d8ec2199aba4c440e9ced5a99538`)**:
+    - Git-blob-verified full release test suite: 156 passed, 0 failed, 0 ignored (including 3 private-bus and 7 CLI identity/transport tests).
+    - Release binary build (`cargo build --release --locked --offline`): exit 0.
+    - Rootless installer lifecycle suite: 22/22 checks passed, exit 0.
+    - Diagnostics (`doctor`): exit 0.
+    - Prior private-bus compiler, session, and stub defects: CLOSED.
 
-### G. Phase 1 Acceptance & Open Roadmap
-- **Phase 1 Status**: **DELIVERED & VERIFIED IN ISOLATED FIXTURES; NATIVE RUNNER QA PENDING**.
-- **Production Readiness Claim**: None. This delivery provides identity, transport, and signing foundation only. Capture adapters (Phase 2), capture worker loops (Phase 3), and package distribution (Phase 4) remain open.
+### G. Phase 1 Token Expiry & Persistence Correction (`TASK phase1-token-expiry-correction-20261024`)
+1. **Defect Analysis & Fail-Before Reproduction**:
+   - `clients/linux/src/api.rs`: `GrantedToken::from_response` calculated `ttl = response.expires_in.saturating_sub(60).max(60)`, inflating short grants (e.g. 5s) to at least 60s of validity. Malformed huge `expires_in` values risked `Instant::now() + Duration` overflow panic.
+   - `clients/linux/src/main.rs`: CLI `login` hardcoded `access_token_expires_at: Some(Utc::now() + chrono::Duration::seconds(3600))`, ignoring server TTL and persisting a 1-hour expiration. Upon rehydration, expired short-lived access tokens were erroneously reused.
+   - Independent native black-box fail-before: loopback in-process fake token endpoint with `expires_in = 5` resulted in CLI login exit 0, but saved credential delta was `3600.020s` (`expiry_not_extended = false`, regression probe exit 1).
+2. **Production Fixes & Security Invariants**:
+   - `clients/linux/src/api.rs`:
+     - Introduced `MAX_TOKEN_TTL_SECS = 365 * 86400` (1 year) safe upper bound preventing arithmetic overflow in `Instant` and `DateTime<Utc>`.
+     - `GrantedToken`: Distinctly models `hard_expires_at` (absolute validity ceiling) and `refresh_after` (proactive renewal threshold). Short grants use proportional renewal buffer (`renewal_buffer_secs = if safe_expires_in > 120 { 60 } else if safe_expires_in > 1 { (safe_expires_in / 5).max(1).min(safe_expires_in - 1) } else { 0 }`), ensuring a 5s grant is valid at 0..4s, enters renewal at 4s, and hard-expires at 5s without 60s lower-bound inflation.
+     - `TokenResponse`: Deserializes `expires_in: Option<u64>` (defaulting to `None`). Zero or missing expiry fails closed (`hard_expires_at = now`, `utc_expires_at = None`, `is_valid = false`) rather than inventing 3600 seconds.
+     - `TokenCell`: Added `AtomicU64` time offset (`advance_time`), injectable clock hook (`set_clock`, `TokenClockFn`), `is_valid`, `needs_refresh`, `valid_access_token_at`, and `access_token_expires_at` exposing the exact granted server timestamp.
+     - `ensure_token`: Bounded single refresh/login retry; tolerates transient refresh failures by falling back to still-valid unexpired tokens during the pre-expiry window, but fails closed once hard expiry has elapsed.
+     - `from_credentials`: Preserves exact remaining server TTL upon rehydration, failing closed on expired or missing expiry timestamps.
+   - `clients/linux/src/main.rs`:
+     - CLI `login` persists `access_token_expires_at: client.tokens().access_token_expires_at()`, preserving exact backend-granted expiration in credentials storage.
+3. **New Executable Regressions**:
+   - `test_cli_login_short_grant_stores_actual_expiry_upper_bound` (`tests/cli_identity_transport_signing_tests.rs`): Subprocess CLI login against 5s mock server asserts saved credentials expiry delta $\le 5$s (never 3600s), verifying fail-before probe condition (`expiry_not_extended = true`).
+   - `test_clock_based_pre_expiry_vs_hard_expiry_renewal` (`src/api.rs`): Injected clock verification that `ensure_token` uses cached token before renewal threshold (240s), proactively triggers refresh in pre-expiry window (245s), and strictly hard-expires at 300s.
+   - `test_short_grant_pre_expiry_and_hard_expiry_boundaries` (`src/api.rs`): Unit regression verifying 5s grant renewal window (4s), hard expiry (5s), and non-usability at 60s.
+   - `test_zero_and_missing_and_huge_grant_boundaries` (`src/api.rs`): Verifies 0-second and missing grants fail closed, and `u64::MAX` clamps safely without panic or overflow.
+   - `test_persisted_session_rehydration_expiry_boundaries` (`src/api.rs`): Verifies unexpired remaining TTL is preserved without 1-hour inflation, expired tokens are rejected, and missing expiry fails closed.
+   - `test_transient_failure_during_pre_expiry_preserves_usable_token_until_hard_expiry` (`src/api.rs`): Verifies transient refresh error during pre-expiry preserves valid token until hard expiry, then fails closed.
+4. **Verification Evidence**:
+   - Windows Host (`rustc 1.97.1`, `x86_64-pc-windows-msvc`):
+     - `cargo fmt --manifest-path clients/linux/Cargo.toml -- --check`: PASSED (exit 0).
+     - `cargo clippy --manifest-path clients/linux/Cargo.toml --locked --all-targets -- -D warnings`: PASSED (exit 0, 0 warnings).
+     - `cargo test --manifest-path clients/linux/Cargo.toml --locked --release`: PASSED (exit 0, 155 release tests passed across 10 test suites + installer lifecycle full suite 22/22 checks passed).
+   - Provenance Status:
+     - `a4a418f` (156 native tests + 22 installer checks) is historical exact-revision verified evidence.
+     - New revision is initially worker-only until independent native rerun by Hermes on `mh-ubuntu`.
+     - Expiry correction is pending native verification.
+
+### H. Phase 1 Acceptance & Open Roadmap
+- **Phase 1 Status**: **DELIVERED & VERIFIED IN ISOLATED FIXTURES; NATIVE RUNNER QA PENDING FOR REVISION WITH EXPIRY CORRECTION**.
+- **Production Readiness Claim**: None. This delivery provides identity, transport, signing foundation, and auth-lifecycle expiry correction only. Capture adapters (Phase 2), automated capture worker scheduler loops (Phase 3), and package distribution (Phase 4) remain open and unstarted.
+
 
 
 

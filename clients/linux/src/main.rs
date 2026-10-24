@@ -300,7 +300,7 @@ fn handle_login(args: &[String]) -> ExitCode {
         server_url: Some(server.clone()),
         device_signing_key: Some(signing_key.to_vec()),
         device_id: None,
-        access_token_expires_at: Some(Utc::now() + chrono::Duration::seconds(3600)),
+        access_token_expires_at: client.tokens().access_token_expires_at(),
     };
 
     if let Err(err) = store.save(&creds) {

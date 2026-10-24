@@ -11,7 +11,7 @@
 //! - Presence heartbeat follows `POST /api/app/presence/heartbeat` with 60s cadence primitive.
 //! - Zero secrets or tokens in logs, Display, or Debug representations.
 
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -451,48 +451,151 @@ pub struct HeartbeatResultDto {
     pub server_time: Option<DateTime<Utc>>,
 }
 
-#[derive(Clone)]
+/// Maximum safe token TTL (1 year) to prevent Instant arithmetic overflows on malformed responses.
+pub(crate) const MAX_TOKEN_TTL_SECS: u64 = 365 * 86400;
+
+#[derive(Clone, Debug)]
 pub(crate) struct GrantedToken {
     access_token: String,
     refresh_token: Option<String>,
-    expires_at: Instant,
+    hard_expires_at: Instant,
+    refresh_after: Instant,
+    utc_expires_at: Option<DateTime<Utc>>,
 }
 
 impl GrantedToken {
-    fn from_response(response: TokenResponse, previous_refresh: Option<String>) -> Self {
-        // Pre-expiry renewal: 60s early buffer
-        let ttl = response.expires_in.saturating_sub(60).max(60);
-        Self {
-            access_token: response.access_token,
-            refresh_token: response
-                .refresh_token
-                .filter(|t| !t.is_empty())
-                .or(previous_refresh),
-            expires_at: Instant::now() + Duration::from_secs(ttl),
+    pub(crate) fn new(
+        access_token: String,
+        refresh_token: Option<String>,
+        expires_in: Option<u64>,
+        now_instant: Instant,
+        now_utc: DateTime<Utc>,
+    ) -> Self {
+        match expires_in {
+            Some(secs) if secs > 0 => {
+                let safe_expires_in = secs.min(MAX_TOKEN_TTL_SECS);
+                let hard_expires_at = now_instant
+                    .checked_add(Duration::from_secs(safe_expires_in))
+                    .unwrap_or_else(|| now_instant + Duration::from_secs(MAX_TOKEN_TTL_SECS));
+
+                // Pre-expiry renewal buffer: up to 60s for standard tokens, proportional for short grants.
+                // Ensures a 5s grant has an immediate valid window and refreshes at 4s before hard expiry at 5s,
+                // never extending the token beyond its actual granted TTL.
+                let renewal_buffer_secs = if safe_expires_in > 120 {
+                    60
+                } else if safe_expires_in > 1 {
+                    (safe_expires_in / 5).max(1).min(safe_expires_in - 1)
+                } else {
+                    0
+                };
+
+                let refresh_after_secs = safe_expires_in.saturating_sub(renewal_buffer_secs);
+                let refresh_after = now_instant
+                    .checked_add(Duration::from_secs(refresh_after_secs))
+                    .unwrap_or(hard_expires_at);
+
+                let utc_expires_at =
+                    now_utc.checked_add_signed(chrono::Duration::seconds(safe_expires_in as i64));
+
+                Self {
+                    access_token,
+                    refresh_token,
+                    hard_expires_at,
+                    refresh_after,
+                    utc_expires_at,
+                }
+            }
+            _ => {
+                // Expired or missing expiry: fails closed, immediately invalid without inventing arbitrary duration.
+                Self {
+                    access_token: String::new(),
+                    refresh_token,
+                    hard_expires_at: now_instant,
+                    refresh_after: now_instant,
+                    utc_expires_at: None,
+                }
+            }
         }
     }
 
-    fn is_valid(&self) -> bool {
-        Instant::now() < self.expires_at
+    pub(crate) fn from_response(
+        response: TokenResponse,
+        previous_refresh: Option<String>,
+        now_instant: Instant,
+        now_utc: DateTime<Utc>,
+    ) -> Self {
+        let refresh_token = response
+            .refresh_token
+            .filter(|t| !t.is_empty())
+            .or(previous_refresh);
+        Self::new(
+            response.access_token,
+            refresh_token,
+            response.expires_in,
+            now_instant,
+            now_utc,
+        )
+    }
+
+    pub(crate) fn rehydrate(
+        access_token: String,
+        refresh_token: Option<String>,
+        remaining_secs: u64,
+        utc_expires_at: DateTime<Utc>,
+        now_instant: Instant,
+    ) -> Self {
+        let safe_remaining = remaining_secs.min(MAX_TOKEN_TTL_SECS);
+        let hard_expires_at = now_instant
+            .checked_add(Duration::from_secs(safe_remaining))
+            .unwrap_or_else(|| now_instant + Duration::from_secs(MAX_TOKEN_TTL_SECS));
+
+        let renewal_buffer_secs = if safe_remaining > 120 {
+            60
+        } else if safe_remaining > 1 {
+            (safe_remaining / 5).max(1).min(safe_remaining - 1)
+        } else {
+            0
+        };
+
+        let refresh_after_secs = safe_remaining.saturating_sub(renewal_buffer_secs);
+        let refresh_after = now_instant
+            .checked_add(Duration::from_secs(refresh_after_secs))
+            .unwrap_or(hard_expires_at);
+
+        Self {
+            access_token,
+            refresh_token,
+            hard_expires_at,
+            refresh_after,
+            utc_expires_at: Some(utc_expires_at),
+        }
+    }
+
+    pub(crate) fn is_valid_at(&self, now: Instant) -> bool {
+        !self.access_token.is_empty() && now < self.hard_expires_at
+    }
+
+    pub(crate) fn needs_refresh_at(&self, now: Instant) -> bool {
+        now >= self.refresh_after
     }
 }
 
 #[derive(Deserialize)]
-struct TokenResponse {
+pub(crate) struct TokenResponse {
     access_token: String,
     #[serde(default)]
     refresh_token: Option<String>,
-    #[serde(default = "default_expires_in")]
-    expires_in: u64,
+    #[serde(default)]
+    expires_in: Option<u64>,
 }
 
-fn default_expires_in() -> u64 {
-    3600
-}
+type TokenClockFn = Arc<dyn Fn() -> (Instant, DateTime<Utc>) + Send + Sync>;
 
 struct TokenCellInner {
     token: std::sync::Mutex<Option<GrantedToken>>,
     renewing: TokioMutex<()>,
+    time_offset_ms: AtomicU64,
+    clock_override: std::sync::Mutex<Option<TokenClockFn>>,
 }
 
 #[derive(Clone)]
@@ -503,6 +606,8 @@ impl Default for TokenCell {
         Self(Arc::new(TokenCellInner {
             token: std::sync::Mutex::new(None),
             renewing: TokioMutex::new(()),
+            time_offset_ms: AtomicU64::new(0),
+            clock_override: std::sync::Mutex::new(None),
         }))
     }
 }
@@ -511,10 +616,13 @@ impl TokenCell {
     pub fn with_refresh_token(refresh_token: Option<String>) -> Self {
         let cell = Self::default();
         if let Some(refresh_token) = refresh_token.filter(|t| !t.is_empty()) {
+            let (now_instant, _) = cell.current_time();
             cell.set(GrantedToken {
                 access_token: String::new(),
                 refresh_token: Some(refresh_token),
-                expires_at: Instant::now(),
+                hard_expires_at: now_instant,
+                refresh_after: now_instant,
+                utc_expires_at: None,
             });
         }
         cell
@@ -528,20 +636,97 @@ impl TokenCell {
         *self.lock() = Some(token);
     }
 
+    pub fn current_time(&self) -> (Instant, DateTime<Utc>) {
+        if let Ok(guard) = self.0.clock_override.lock() {
+            if let Some(ref clock) = *guard {
+                return clock();
+            }
+        }
+        let offset_ms = self.0.time_offset_ms.load(Ordering::Relaxed);
+        let base_instant = Instant::now();
+        let base_utc = Utc::now();
+        if offset_ms == 0 {
+            (base_instant, base_utc)
+        } else {
+            let dur = Duration::from_millis(offset_ms);
+            let instant = base_instant.checked_add(dur).unwrap_or(base_instant);
+            let utc = base_utc
+                .checked_add_signed(chrono::Duration::milliseconds(offset_ms as i64))
+                .unwrap_or(base_utc);
+            (instant, utc)
+        }
+    }
+
+    pub fn advance_time(&self, duration: Duration) {
+        self.0
+            .time_offset_ms
+            .fetch_add(duration.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    pub fn set_clock<F>(&self, clock: F)
+    where
+        F: Fn() -> (Instant, DateTime<Utc>) + Send + Sync + 'static,
+    {
+        if let Ok(mut guard) = self.0.clock_override.lock() {
+            *guard = Some(Arc::new(clock));
+        }
+    }
+
     pub fn refresh_token(&self) -> Option<String> {
         self.lock().as_ref().and_then(|t| t.refresh_token.clone())
     }
 
     pub fn valid_access_token(&self) -> Option<String> {
+        let (now, _) = self.current_time();
+        self.valid_access_token_at(now)
+    }
+
+    pub fn valid_access_token_at(&self, now: Instant) -> Option<String> {
         self.lock()
             .as_ref()
-            .filter(|t| !t.access_token.is_empty() && t.is_valid())
+            .filter(|t| t.is_valid_at(now))
             .map(|t| t.access_token.clone())
     }
 
+    pub fn is_valid(&self) -> bool {
+        let (now, _) = self.current_time();
+        self.lock()
+            .as_ref()
+            .map(|t| t.is_valid_at(now))
+            .unwrap_or(false)
+    }
+
+    pub fn needs_refresh(&self) -> bool {
+        let (now, _) = self.current_time();
+        self.needs_refresh_at(now)
+    }
+
+    pub fn needs_refresh_at(&self, now: Instant) -> bool {
+        self.lock()
+            .as_ref()
+            .map(|t| t.needs_refresh_at(now))
+            .unwrap_or(true)
+    }
+
+    pub fn access_token_expires_at(&self) -> Option<DateTime<Utc>> {
+        self.lock().as_ref().and_then(|t| t.utc_expires_at)
+    }
+
+    pub fn hard_expires_at(&self) -> Option<Instant> {
+        self.lock().as_ref().map(|t| t.hard_expires_at)
+    }
+
+    pub fn refresh_after(&self) -> Option<Instant> {
+        self.lock().as_ref().map(|t| t.refresh_after)
+    }
+
     pub fn invalidate(&self, current: &str) {
+        let (now_instant, _) = self.current_time();
         if let Some(token) = self.lock().as_mut().filter(|t| t.access_token == current) {
             token.access_token.clear();
+            token.hard_expires_at = now_instant;
+            token.refresh_after = now_instant;
+            token.utc_expires_at = None;
         }
     }
 }
@@ -620,15 +805,22 @@ impl ApiClient {
 
         let cell = TokenCell::with_refresh_token(creds.refresh_token.clone());
         if let Some(ref access_token) = creds.access_token {
-            if let Some(expires_at) = creds.access_token_expires_at {
-                let now = Utc::now();
-                if expires_at > now {
-                    let remaining_secs = (expires_at - now).num_seconds().max(0) as u64;
-                    cell.set(GrantedToken {
-                        access_token: access_token.clone(),
-                        refresh_token: creds.refresh_token.clone(),
-                        expires_at: Instant::now() + Duration::from_secs(remaining_secs),
-                    });
+            if !access_token.trim().is_empty() {
+                if let Some(expires_at) = creds.access_token_expires_at {
+                    let now = Utc::now();
+                    if expires_at > now {
+                        let remaining_secs = (expires_at - now).num_seconds().max(0) as u64;
+                        if remaining_secs > 0 {
+                            let (now_instant, _) = cell.current_time();
+                            cell.set(GrantedToken::rehydrate(
+                                access_token.clone(),
+                                creds.refresh_token.clone(),
+                                remaining_secs,
+                                expires_at,
+                                now_instant,
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -727,8 +919,13 @@ impl ApiClient {
         let token_resp: TokenResponse = serde_json::from_str(&body)
             .map_err(|e| AuthError::Server(format!("Failed to parse token response: {e}")))?;
 
-        self.tokens
-            .set(GrantedToken::from_response(token_resp, previous_refresh));
+        let (now_instant, now_utc) = self.tokens.current_time();
+        self.tokens.set(GrantedToken::from_response(
+            token_resp,
+            previous_refresh,
+            now_instant,
+            now_utc,
+        ));
         Ok(())
     }
 
@@ -756,15 +953,21 @@ impl ApiClient {
     }
 
     pub async fn ensure_token(&mut self) -> Result<String, AuthError> {
-        if let Some(token) = self.tokens.valid_access_token() {
-            return Ok(token);
+        let (now_instant, _) = self.tokens.current_time();
+        if let Some(token) = self.tokens.valid_access_token_at(now_instant) {
+            if !self.tokens.needs_refresh_at(now_instant) {
+                return Ok(token);
+            }
         }
 
         let slot = self.tokens.0.clone();
         let _guard = slot.renewing.lock().await;
 
-        if let Some(token) = self.tokens.valid_access_token() {
-            return Ok(token);
+        let (now_instant, _) = self.tokens.current_time();
+        if let Some(token) = self.tokens.valid_access_token_at(now_instant) {
+            if !self.tokens.needs_refresh_at(now_instant) {
+                return Ok(token);
+            }
         }
 
         if let Some(refresh_token) = self.tokens.refresh_token() {
@@ -778,7 +981,13 @@ impl ApiClient {
                 Err(AuthError::Rejected(_)) => {
                     self.login().await?;
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    let (now_instant, _) = self.tokens.current_time();
+                    if let Some(token) = self.tokens.valid_access_token_at(now_instant) {
+                        return Ok(token);
+                    }
+                    return Err(e);
+                }
             }
         } else if self.password.is_empty() {
             return Err(AuthError::Rejected(
@@ -788,9 +997,12 @@ impl ApiClient {
             self.login().await?;
         }
 
-        self.tokens.valid_access_token().ok_or_else(|| {
-            AuthError::Server("No valid access token available after authentication".into())
-        })
+        let (now_instant, _) = self.tokens.current_time();
+        self.tokens
+            .valid_access_token_at(now_instant)
+            .ok_or_else(|| {
+                AuthError::Server("No valid access token available after authentication".into())
+            })
     }
 
     /// Sends an authorized request with single-retry on HTTP 401.
@@ -1511,5 +1723,261 @@ mod tests {
         // Negative check: missing scope in store returns Err
         let missing = ApiClient::from_store(&store, "store-user@dosi.test", Some("ws-nonexistent"));
         assert!(missing.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_clock_based_pre_expiry_vs_hard_expiry_renewal() {
+        let (url, rx) = canned_server(vec![
+            http_resp(
+                "200 OK",
+                &[],
+                r#"{"access_token":"initial-300s-tok","token_type":"Bearer","expires_in":300,"refresh_token":"ref-300"}"#,
+            ),
+            http_resp(
+                "200 OK",
+                &[],
+                r#"{"access_token":"refreshed-300s-tok","token_type":"Bearer","expires_in":300,"refresh_token":"ref-300"}"#,
+            ),
+        ]);
+
+        let mut client = ApiClient::new(&url, "user@dosi.test".into(), "test-pass".into());
+        client.login().await.unwrap();
+        let _ = rx.recv().unwrap();
+
+        // 1. Initial fresh state at t=0
+        assert_eq!(
+            client.tokens().valid_access_token().as_deref(),
+            Some("initial-300s-tok")
+        );
+        assert!(!client.tokens().needs_refresh());
+        assert!(client.tokens().is_valid());
+
+        // 2. Advance time to t=100s: still well before renewal threshold (240s)
+        client.tokens().advance_time(Duration::from_secs(100));
+        assert!(!client.tokens().needs_refresh());
+        assert!(client.tokens().is_valid());
+        let tok = client.ensure_token().await.unwrap();
+        assert_eq!(tok, "initial-300s-tok");
+
+        // 3. Advance time to t=245s: passed renewal buffer (300-60=240s), but before hard expiry (300s)
+        client.tokens().advance_time(Duration::from_secs(145));
+        assert!(
+            client.tokens().is_valid(),
+            "Must be strictly valid before hard expiry"
+        );
+        assert!(
+            client.tokens().needs_refresh(),
+            "Must indicate renewal needed inside pre-expiry window"
+        );
+
+        // ensure_token proactively refreshes
+        let refreshed = client.ensure_token().await.unwrap();
+        assert_eq!(refreshed, "refreshed-300s-tok");
+        let refresh_req = rx.recv().unwrap();
+        assert!(refresh_req.contains("grant_type=refresh_token"));
+        assert!(!client.tokens().needs_refresh());
+        assert!(client.tokens().is_valid());
+
+        // 4. Advance time past the refreshed token's hard expiry (+305s) with no more canned responses
+        client.tokens().advance_time(Duration::from_secs(305));
+        assert!(
+            !client.tokens().is_valid(),
+            "Token must hard-expire at server lifetime limit"
+        );
+        assert_eq!(client.tokens().valid_access_token(), None);
+    }
+
+    #[test]
+    fn test_short_grant_pre_expiry_and_hard_expiry_boundaries() {
+        let now_inst = Instant::now();
+        let now_utc = Utc::now();
+        let token = GrantedToken::new(
+            "short-tok".into(),
+            Some("ref".into()),
+            Some(5),
+            now_inst,
+            now_utc,
+        );
+
+        // At t=0s
+        assert!(token.is_valid_at(now_inst));
+        assert!(!token.needs_refresh_at(now_inst));
+
+        // At t=3s
+        let t3 = now_inst + Duration::from_secs(3);
+        assert!(token.is_valid_at(t3));
+        assert!(!token.needs_refresh_at(t3));
+
+        // At t=4s (proportional buffer is 1s: refresh_after is at 4s, hard expiry is at 5s)
+        let t4 = now_inst + Duration::from_secs(4);
+        assert!(token.is_valid_at(t4), "5s token must still be valid at 4s");
+        assert!(
+            token.needs_refresh_at(t4),
+            "5s token must trigger proactive renewal at 4s"
+        );
+
+        // At t=5s: hard expired!
+        let t5 = now_inst + Duration::from_secs(5);
+        assert!(
+            !token.is_valid_at(t5),
+            "5s token must be invalid at 5s hard expiry"
+        );
+        assert!(token.needs_refresh_at(t5));
+
+        // At t=60s: defect regression check!
+        let t60 = now_inst + Duration::from_secs(60);
+        assert!(
+            !token.is_valid_at(t60),
+            "5s token must NEVER be extended to 60 seconds!"
+        );
+    }
+
+    #[test]
+    fn test_zero_and_missing_and_huge_grant_boundaries() {
+        let now_inst = Instant::now();
+        let now_utc = Utc::now();
+
+        // 1. Zero grant: immediately invalid, fails closed
+        let zero = GrantedToken::new(
+            "zero-tok".into(),
+            Some("ref".into()),
+            Some(0),
+            now_inst,
+            now_utc,
+        );
+        assert!(!zero.is_valid_at(now_inst));
+        assert!(zero.needs_refresh_at(now_inst));
+        assert_eq!(zero.utc_expires_at, None);
+
+        // 2. Missing expiry (None): fails closed without inventing duration
+        let missing = GrantedToken::new(
+            "miss-tok".into(),
+            Some("ref".into()),
+            None,
+            now_inst,
+            now_utc,
+        );
+        assert!(!missing.is_valid_at(now_inst));
+        assert!(missing.needs_refresh_at(now_inst));
+        assert_eq!(missing.utc_expires_at, None);
+
+        // 3. Huge grant (u64::MAX): safely clamped, zero panic, zero Instant overflow
+        let huge = GrantedToken::new(
+            "huge-tok".into(),
+            Some("ref".into()),
+            Some(u64::MAX),
+            now_inst,
+            now_utc,
+        );
+        assert!(huge.is_valid_at(now_inst));
+        assert!(!huge.needs_refresh_at(now_inst));
+        let expected_max_utc = now_utc + chrono::Duration::seconds(MAX_TOKEN_TTL_SECS as i64);
+        assert_eq!(huge.utc_expires_at, Some(expected_max_utc));
+    }
+
+    #[test]
+    fn test_persisted_session_rehydration_expiry_boundaries() {
+        // 1. Rehydrate unexpired short token (15 seconds remaining)
+        let mut creds = Credentials::new("rehydrate-user", None);
+        creds.access_token = Some("tok-15s".into());
+        creds.access_token_expires_at = Some(Utc::now() + chrono::Duration::seconds(15));
+        creds.refresh_token = Some("ref-15s".into());
+
+        let client = ApiClient::from_credentials(&creds).unwrap();
+        assert_eq!(
+            client.tokens().valid_access_token().as_deref(),
+            Some("tok-15s")
+        );
+        assert!(client.tokens().is_valid());
+
+        // Advance 16 seconds: must expire and NOT extend to 3600 seconds
+        client.tokens().advance_time(Duration::from_secs(16));
+        assert_eq!(
+            client.tokens().valid_access_token(),
+            None,
+            "Rehydrated 15s token must expire after 16s, never extended to 1 hour"
+        );
+        assert!(!client.tokens().is_valid());
+
+        // 2. Rehydrate already expired token: fails closed, access token not admitted
+        let mut expired_creds = Credentials::new("expired-user", None);
+        expired_creds.access_token = Some("tok-expired".into());
+        expired_creds.access_token_expires_at = Some(Utc::now() - chrono::Duration::seconds(10));
+        expired_creds.refresh_token = Some("ref-still-valid".into());
+
+        let exp_client = ApiClient::from_credentials(&expired_creds).unwrap();
+        assert_eq!(
+            exp_client.tokens().valid_access_token(),
+            None,
+            "Expired persisted token must not be admitted as valid"
+        );
+        assert!(!exp_client.tokens().is_valid());
+        assert_eq!(
+            exp_client.tokens().refresh_token().as_deref(),
+            Some("ref-still-valid")
+        );
+
+        // 3. Rehydrate token with missing expiry: fails closed without inventing duration
+        let mut missing_creds = Credentials::new("missing-exp-user", None);
+        missing_creds.access_token = Some("tok-no-exp".into());
+        missing_creds.access_token_expires_at = None;
+        missing_creds.refresh_token = Some("ref-backup".into());
+
+        let miss_client = ApiClient::from_credentials(&missing_creds).unwrap();
+        assert_eq!(
+            miss_client.tokens().valid_access_token(),
+            None,
+            "Missing expiry must fail closed, never inventing 1 hour"
+        );
+        assert!(!miss_client.tokens().is_valid());
+        assert_eq!(
+            miss_client.tokens().refresh_token().as_deref(),
+            Some("ref-backup")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_transient_failure_during_pre_expiry_preserves_usable_token_until_hard_expiry() {
+        let (url, rx) = canned_server(vec![
+            http_resp(
+                "200 OK",
+                &[],
+                r#"{"access_token":"token-60s","token_type":"Bearer","expires_in":60,"refresh_token":"ref-60s"}"#,
+            ),
+            // Transient 500 failure during refresh attempt
+            http_resp(
+                "500 Internal Server Error",
+                &[],
+                r#"{"error":"temporary_server_issue"}"#,
+            ),
+        ]);
+
+        let mut client = ApiClient::new(&url, "user@dosi.test".into(), "test-pass".into());
+        client.login().await.unwrap();
+        let _ = rx.recv().unwrap();
+
+        // Advance to t=50s (60s grant: buffer is 12s, refresh_after is 48s, hard expiry is 60s)
+        client.tokens().advance_time(Duration::from_secs(50));
+        assert!(client.tokens().needs_refresh());
+        assert!(client.tokens().is_valid());
+
+        // When refresh fails with transient 500, still-valid token is preserved
+        let token = client.ensure_token().await.unwrap();
+        assert_eq!(token, "token-60s");
+        let refresh_req = rx.recv().unwrap();
+        assert!(refresh_req.contains("grant_type=refresh_token"));
+
+        // Advance to t=65s: now past hard expiry (60s)
+        client.tokens().advance_time(Duration::from_secs(15));
+        assert!(
+            !client.tokens().is_valid(),
+            "Token must be hard expired at 65s"
+        );
+        // Further ensure_token must fail closed
+        let res = client.ensure_token().await;
+        assert!(
+            res.is_err(),
+            "Must fail closed once hard expiry has elapsed"
+        );
     }
 }

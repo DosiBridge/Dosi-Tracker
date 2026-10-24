@@ -824,3 +824,82 @@ fn test_failed_login_fails_closed_and_cannot_be_counted_as_delivery_evidence() {
     assert_eq!(pending[0].retry_count, 0);
     assert_eq!(pending[0].last_error, None);
 }
+
+#[test]
+fn test_cli_login_short_grant_stores_actual_expiry_upper_bound() {
+    let dir = tempdir().unwrap();
+    let cred_path = dir.path().join("credentials.json");
+
+    // Loopback in-process fake token endpoint returning short expires_in: 5
+    let short_token_response = http_resp(
+        "200 OK",
+        &[],
+        r#"{"access_token":"short-live-token-5s","token_type":"Bearer","expires_in":5,"refresh_token":"short-refresh-5s"}"#,
+    );
+    let (url, _rx) = canned_server(vec![short_token_response]);
+
+    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+
+    let login_time_before = Utc::now();
+
+    // Actual CLI login via subprocess
+    let login_out = Command::new(exe)
+        .args([
+            "login",
+            "--username",
+            "short-tester@dosi.test",
+            "--password",
+            "test-pass",
+            "--workspace-id",
+            "ws-short",
+            "--server",
+            &url,
+            "--credentials-file",
+            cred_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute login command");
+
+    assert!(
+        login_out.status.success(),
+        "Login failed with status code {:?}",
+        login_out.status.code()
+    );
+
+    let login_time_after = Utc::now();
+
+    // Inspect persisted credentials from disk
+    let store = FileCredentialStore::new(cred_path);
+    let creds = store
+        .load("short-tester@dosi.test", Some("ws-short"))
+        .expect("Store load should succeed")
+        .expect("Credentials must be saved");
+
+    assert_eq!(creds.access_token.as_deref(), Some("short-live-token-5s"));
+    assert_eq!(creds.refresh_token.as_deref(), Some("short-refresh-5s"));
+
+    let expires_at = creds
+        .access_token_expires_at
+        .expect("access_token_expires_at must be populated from server response");
+
+    // Defect regression check: Must NEVER be extended to 3600 seconds!
+    // The delta from login time must be bounded by the actual 5-second grant (e.g. <= 6s).
+    let delta_from_before = (expires_at - login_time_before).num_seconds();
+    let delta_from_after = (expires_at - login_time_after).num_seconds();
+
+    assert!(
+        delta_from_before <= 6,
+        "Persisted expiry delta ({}s) exceeded actual server grant (5s); token was extended!",
+        delta_from_before
+    );
+    assert!(
+        delta_from_after >= 3,
+        "Persisted expiry delta ({}s) too short; expected ~5s grant",
+        delta_from_after
+    );
+    let expiry_not_extended = delta_from_before <= 6;
+    assert!(
+        expiry_not_extended,
+        "Regression probe condition failed: expiry was extended beyond server lifetime"
+    );
+}
