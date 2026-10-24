@@ -1,6 +1,6 @@
 //! Executable CLI entrypoint for dosi-tracker-linux.
 //!
-//! Provides diagnostic commands (`doctor [--json]`), credential management (`login`, `logout`, `status [--json]`),
+//! Provides diagnostic commands (`doctor [--json]`), credential management (`login [--json]`, `logout [--json]`, `status [--json]`),
 //! and durable outbox inspection (`outbox status [--json]`).
 //!
 //! Invariants:
@@ -43,7 +43,7 @@ fn print_help() {
     println!("    help         Print this help message");
     println!();
     println!("OPTIONS:");
-    println!("    --json       Output diagnostics or status in structured JSON format");
+    println!("    --json       Output diagnostics, status, or login/logout results in structured JSON format");
     println!("    -h, --help   Print help information");
     println!("    -V, --version Print version information");
     println!();
@@ -74,6 +74,9 @@ fn print_login_help() {
     println!("    --server <URL>            Backend server URL (default: https://api.dosi.app)");
     println!("    --credentials-file <PATH> Explicit file store path for isolated storage");
     println!("    --fallback-file           Force owner-only private file store fallback");
+    println!(
+        "    --json                    Output authentication result in structured JSON format"
+    );
     println!("    -h, --help                Print this help message");
 }
 
@@ -90,6 +93,7 @@ fn print_logout_help() {
     println!("OPTIONS:");
     println!("    --workspace-id <WS>       Workspace identifier (clears specific workspace if provided)");
     println!("    --credentials-file <PATH> Explicit file store path");
+    println!("    --json                    Output logout result in structured JSON format");
     println!("    -h, --help                Print this help message");
 }
 
@@ -177,12 +181,107 @@ fn resolve_credential_store(
     Ok(Box::new(FileCredentialStore::new(path)))
 }
 
+fn sanitize_unknown_arg(arg: &str) -> String {
+    if arg.starts_with('-') {
+        let opt_name = arg.split('=').next().unwrap_or(arg);
+        format!("Unknown option: {}", opt_name)
+    } else {
+        "Unexpected argument provided".to_string()
+    }
+}
+
+#[derive(Serialize)]
+struct LoginJsonReport {
+    success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    account_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    store_backend: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    has_signing_key: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token_expires_in_secs: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct LogoutJsonReport {
+    success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    account_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cleared_all_workspaces: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    store_backend: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+fn emit_login_error(
+    json_mode: bool,
+    err_msg: &str,
+    account_id: Option<String>,
+    workspace_id: Option<String>,
+    server_url: Option<String>,
+) -> ExitCode {
+    if json_mode {
+        let report = LoginJsonReport {
+            success: false,
+            account_id,
+            workspace_id,
+            server_url,
+            store_backend: None,
+            has_signing_key: None,
+            token_expires_in_secs: None,
+            error: Some(err_msg.to_string()),
+        };
+        match serde_json::to_string_pretty(&report) {
+            Ok(json) => println!("{}", json),
+            Err(e) => eprintln!("Error: Failed to format login JSON: {}", e),
+        }
+    }
+    eprintln!("Error: {}", err_msg);
+    ExitCode::from(1)
+}
+
+fn emit_logout_error(
+    json_mode: bool,
+    err_msg: &str,
+    account_id: Option<String>,
+    workspace_id: Option<String>,
+) -> ExitCode {
+    if json_mode {
+        let report = LogoutJsonReport {
+            success: false,
+            account_id,
+            workspace_id,
+            cleared_all_workspaces: None,
+            store_backend: None,
+            error: Some(err_msg.to_string()),
+        };
+        match serde_json::to_string_pretty(&report) {
+            Ok(json) => println!("{}", json),
+            Err(e) => eprintln!("Error: Failed to format logout JSON: {}", e),
+        }
+    }
+    eprintln!("Error: {}", err_msg);
+    ExitCode::from(1)
+}
+
 fn handle_login(args: &[String]) -> ExitCode {
     if args.iter().any(|a| a == "--help" || a == "-h") {
         print_login_help();
         return ExitCode::SUCCESS;
     }
 
+    let mut json_mode = args.iter().any(|a| a == "--json");
     let mut username: Option<String> = None;
     let mut password: Option<String> = None;
     let mut workspace_id: Option<String> = None;
@@ -230,9 +329,11 @@ fn handle_login(args: &[String]) -> ExitCode {
             cred_file = Some(val.trim().to_string());
         } else if arg == "--fallback-file" {
             fallback_file = true;
+        } else if arg == "--json" {
+            json_mode = true;
         } else {
-            eprintln!("Error: Unknown option: {}", arg);
-            return ExitCode::from(1);
+            let err_msg = sanitize_unknown_arg(arg);
+            return emit_login_error(json_mode, &err_msg, username, workspace_id, Some(server));
         }
         i += 1;
     }
@@ -240,24 +341,39 @@ fn handle_login(args: &[String]) -> ExitCode {
     let username = match username.filter(|s| !s.is_empty()) {
         Some(u) => u,
         None => {
-            eprintln!("Error: Missing required option: --username");
-            return ExitCode::from(1);
+            return emit_login_error(
+                json_mode,
+                "Missing required option: --username",
+                None,
+                workspace_id,
+                Some(server),
+            );
         }
     };
 
     let password = match password.filter(|s| !s.is_empty()) {
         Some(p) => p,
         None => {
-            eprintln!("Error: Missing required option: --password");
-            return ExitCode::from(1);
+            return emit_login_error(
+                json_mode,
+                "Missing required option: --password",
+                Some(username),
+                workspace_id,
+                Some(server),
+            );
         }
     };
 
     let workspace_id = match workspace_id.filter(|s| !s.is_empty()) {
         Some(w) => w,
         None => {
-            eprintln!("Error: Missing required option: --workspace-id");
-            return ExitCode::from(1);
+            return emit_login_error(
+                json_mode,
+                "Missing required option: --workspace-id",
+                Some(username),
+                None,
+                Some(server),
+            );
         }
     };
 
@@ -267,8 +383,13 @@ fn handle_login(args: &[String]) -> ExitCode {
     {
         Ok(rt) => rt,
         Err(e) => {
-            eprintln!("Error: Failed to initialize runtime: {}", e);
-            return ExitCode::from(1);
+            return emit_login_error(
+                json_mode,
+                &format!("Failed to initialize runtime: {}", e),
+                Some(username),
+                Some(workspace_id),
+                Some(server),
+            );
         }
     };
 
@@ -277,19 +398,30 @@ fn handle_login(args: &[String]) -> ExitCode {
 
     let login_result = rt.block_on(client.login());
     if let Err(err) = login_result {
-        eprintln!("Error: Authentication failed: {}", err);
-        return ExitCode::from(1);
+        return emit_login_error(
+            json_mode,
+            &format!("Authentication failed: {}", err),
+            Some(username),
+            Some(workspace_id),
+            Some(server),
+        );
     }
 
     let signing_key = generate_signing_key();
     let store = match resolve_credential_store(cred_file.as_deref(), fallback_file) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("Error: Failed to resolve credential store: {}", e);
-            return ExitCode::from(1);
+            return emit_login_error(
+                json_mode,
+                &format!("Failed to resolve credential store: {}", e),
+                Some(username),
+                Some(workspace_id),
+                Some(server),
+            );
         }
     };
 
+    let store_kind = store.kind();
     let creds = Credentials {
         account_id: username.clone(),
         workspace_id: Some(workspace_id.clone()),
@@ -304,18 +436,51 @@ fn handle_login(args: &[String]) -> ExitCode {
     };
 
     if let Err(err) = store.save(&creds) {
-        eprintln!("Error: Failed to securely store credentials: {}", err);
-        return ExitCode::from(1);
+        return emit_login_error(
+            json_mode,
+            &format!("Failed to securely store credentials: {}", err),
+            Some(username),
+            Some(workspace_id),
+            Some(server),
+        );
     }
 
-    println!(
-        "Successfully authenticated as '{}' in workspace '{}' (Server: {}, Store: {:?}). Signing key initialized.",
-        username,
-        workspace_id,
-        server,
-        store.kind()
-    );
-    ExitCode::SUCCESS
+    if json_mode {
+        let now = Utc::now();
+        let token_expires_in_secs = client
+            .tokens()
+            .access_token_expires_at()
+            .map(|exp| (exp - now).num_seconds().max(0));
+        let report = LoginJsonReport {
+            success: true,
+            account_id: Some(username),
+            workspace_id: Some(workspace_id),
+            server_url: Some(server),
+            store_backend: Some(format!("{:?}", store_kind)),
+            has_signing_key: Some(true),
+            token_expires_in_secs,
+            error: None,
+        };
+        match serde_json::to_string_pretty(&report) {
+            Ok(json) => {
+                println!("{}", json);
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("Error: Failed to format login JSON: {}", e);
+                ExitCode::from(1)
+            }
+        }
+    } else {
+        println!(
+            "Successfully authenticated as '{}' in workspace '{}' (Server: {}, Store: {:?}). Signing key initialized.",
+            username,
+            workspace_id,
+            server,
+            store_kind
+        );
+        ExitCode::SUCCESS
+    }
 }
 
 fn handle_logout(args: &[String]) -> ExitCode {
@@ -324,6 +489,7 @@ fn handle_logout(args: &[String]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    let mut json_mode = args.iter().any(|a| a == "--json");
     let mut account_id: Option<String> = None;
     let mut workspace_id: Option<String> = None;
     let mut cred_file: Option<String> = None;
@@ -352,9 +518,11 @@ fn handle_logout(args: &[String]) -> ExitCode {
             }
         } else if let Some(val) = arg.strip_prefix("--credentials-file=") {
             cred_file = Some(val.trim().to_string());
+        } else if arg == "--json" {
+            json_mode = true;
         } else {
-            eprintln!("Error: Unknown option: {}", arg);
-            return ExitCode::from(1);
+            let err_msg = sanitize_unknown_arg(arg);
+            return emit_logout_error(json_mode, &err_msg, account_id, workspace_id);
         }
         i += 1;
     }
@@ -362,30 +530,66 @@ fn handle_logout(args: &[String]) -> ExitCode {
     let account_id = match account_id.filter(|s| !s.is_empty()) {
         Some(a) => a,
         None => {
-            eprintln!("Error: Missing required option: --account-id");
-            return ExitCode::from(1);
+            return emit_logout_error(
+                json_mode,
+                "Missing required option: --account-id",
+                None,
+                workspace_id,
+            );
         }
     };
 
     let store = match resolve_credential_store(cred_file.as_deref(), false) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("Error: Failed to resolve credential store: {}", e);
-            return ExitCode::from(1);
+            return emit_logout_error(
+                json_mode,
+                &format!("Failed to resolve credential store: {}", e),
+                Some(account_id),
+                workspace_id,
+            );
         }
     };
 
+    let store_kind = store.kind();
+
     if let Err(err) = store.clear(&account_id, workspace_id.as_deref()) {
-        eprintln!("Error: Failed to clear credentials: {}", err);
-        return ExitCode::from(1);
+        return emit_logout_error(
+            json_mode,
+            &format!("Failed to clear credentials: {}", err),
+            Some(account_id),
+            workspace_id,
+        );
     }
 
-    println!(
-        "Successfully logged out account '{}' (workspace: {}).",
-        account_id,
-        workspace_id.as_deref().unwrap_or("all")
-    );
-    ExitCode::SUCCESS
+    if json_mode {
+        let cleared_all = workspace_id.is_none();
+        let report = LogoutJsonReport {
+            success: true,
+            account_id: Some(account_id),
+            workspace_id,
+            cleared_all_workspaces: Some(cleared_all),
+            store_backend: Some(format!("{:?}", store_kind)),
+            error: None,
+        };
+        match serde_json::to_string_pretty(&report) {
+            Ok(json) => {
+                println!("{}", json);
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("Error: Failed to format logout JSON: {}", e);
+                ExitCode::from(1)
+            }
+        }
+    } else {
+        println!(
+            "Successfully logged out account '{}' (workspace: {}).",
+            account_id,
+            workspace_id.as_deref().unwrap_or("all")
+        );
+        ExitCode::SUCCESS
+    }
 }
 
 #[derive(Serialize)]
@@ -447,7 +651,8 @@ fn handle_status(args: &[String]) -> ExitCode {
         } else if arg == "--json" {
             json_mode = true;
         } else {
-            eprintln!("Error: Unknown option: {}", arg);
+            let err_msg = sanitize_unknown_arg(arg);
+            eprintln!("Error: {}", err_msg);
             return ExitCode::from(1);
         }
         i += 1;

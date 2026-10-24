@@ -18,7 +18,7 @@ use chrono::Utc;
 use tempfile::tempdir;
 
 use dosi_tracker_linux::api::HttpDeliveryTransport;
-use dosi_tracker_linux::credentials::{CredentialStore, FileCredentialStore};
+use dosi_tracker_linux::credentials::{CredentialStore, Credentials, FileCredentialStore};
 use dosi_tracker_linux::outbox::{ActivityEnvelope, Outbox, OutboxLimits, OutboxScope};
 use dosi_tracker_linux::signing::verify_activity_envelope;
 use dosi_tracker_linux::sync::{SyncPassConfig, SyncPassCoordinator};
@@ -902,4 +902,412 @@ fn test_cli_login_short_grant_stores_actual_expiry_upper_bound() {
         expiry_not_extended,
         "Regression probe condition failed: expiry was extended beyond server lifetime"
     );
+}
+
+#[test]
+fn test_cli_login_json_success_and_redaction() {
+    let dir = tempdir().unwrap();
+    let cred_path = dir.path().join("credentials.json");
+
+    let server_response = http_resp(
+        "200 OK",
+        &[],
+        r#"{"access_token":"canary-access-token-999","token_type":"Bearer","expires_in":3600,"refresh_token":"canary-refresh-token-888"}"#,
+    );
+    let (url, _rx) = canned_server(vec![server_response]);
+
+    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+
+    let out = Command::new(exe)
+        .args([
+            "login",
+            "--username",
+            "json-user@dosi.test",
+            "--password",
+            "canary-secret-pass-777",
+            "--workspace-id",
+            "ws-json",
+            "--server",
+            &url,
+            "--credentials-file",
+            cred_path.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("Failed to execute login --json command");
+
+    assert_eq!(out.status.code(), Some(0));
+
+    let stdout_str = String::from_utf8_lossy(&out.stdout);
+    let stderr_str = String::from_utf8_lossy(&out.stderr);
+
+    // Verify stdout is pure parseable JSON
+    let json: serde_json::Value = serde_json::from_str(&stdout_str).expect("Valid JSON on stdout");
+    assert_eq!(json["success"], true);
+    assert_eq!(json["account_id"], "json-user@dosi.test");
+    assert_eq!(json["workspace_id"], "ws-json");
+    assert_eq!(json["server_url"], url);
+    assert_eq!(json["has_signing_key"], true);
+    assert!(json["store_backend"].is_string());
+    assert!(json["token_expires_in_secs"].as_i64().unwrap_or(0) > 0);
+    assert!(json.get("error").is_none() || json["error"].is_null());
+
+    // Verify zero secret canaries leaked in stdout or stderr
+    assert!(!stdout_str.contains("canary-secret-pass-777"));
+    assert!(!stderr_str.contains("canary-secret-pass-777"));
+    assert!(!stdout_str.contains("canary-access-token-999"));
+    assert!(!stderr_str.contains("canary-access-token-999"));
+    assert!(!stdout_str.contains("canary-refresh-token-888"));
+    assert!(!stderr_str.contains("canary-refresh-token-888"));
+
+    // Verify credentials actually saved to disk
+    let store = FileCredentialStore::new(cred_path);
+    let saved = store
+        .load("json-user@dosi.test", Some("ws-json"))
+        .unwrap()
+        .expect("Credentials must be saved");
+    assert_eq!(saved.account_id, "json-user@dosi.test");
+    assert_eq!(saved.workspace_id.as_deref(), Some("ws-json"));
+    assert_eq!(
+        saved.access_token.as_deref(),
+        Some("canary-access-token-999")
+    );
+    assert_eq!(
+        saved.refresh_token.as_deref(),
+        Some("canary-refresh-token-888")
+    );
+    assert!(saved.device_signing_key.is_some());
+}
+
+#[test]
+fn test_cli_login_json_auth_rejection_and_redaction() {
+    let dir = tempdir().unwrap();
+    let cred_path = dir.path().join("credentials.json");
+
+    let server_response = http_resp(
+        "401 Unauthorized",
+        &[],
+        r#"{"error":"invalid_grant","error_description":"Bad credentials"}"#,
+    );
+    let (url, _rx) = canned_server(vec![server_response]);
+
+    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+
+    let out = Command::new(exe)
+        .args([
+            "login",
+            "--username",
+            "rejected-json@dosi.test",
+            "--password",
+            "canary-rejected-pass-555",
+            "--workspace-id",
+            "ws-rejected-json",
+            "--server",
+            &url,
+            "--credentials-file",
+            cred_path.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("Failed to execute login --json command");
+
+    assert_eq!(out.status.code(), Some(1));
+
+    let stdout_str = String::from_utf8_lossy(&out.stdout);
+    let stderr_str = String::from_utf8_lossy(&out.stderr);
+
+    // Verify stdout is pure parseable JSON with failure status
+    let json: serde_json::Value = serde_json::from_str(&stdout_str).expect("Valid JSON on stdout");
+    assert_eq!(json["success"], false);
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap()
+            .contains("Authentication failed"),
+        "Expected error message indicating auth failure, got: {:?}",
+        json["error"]
+    );
+
+    // Verify zero secret canaries leaked in stdout or stderr
+    assert!(!stdout_str.contains("canary-rejected-pass-555"));
+    assert!(!stderr_str.contains("canary-rejected-pass-555"));
+
+    // Verify store load returns None (zero credentials persisted)
+    let store = FileCredentialStore::new(cred_path);
+    assert_eq!(
+        store
+            .load("rejected-json@dosi.test", Some("ws-rejected-json"))
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn test_cli_login_json_credential_store_failure() {
+    let dir = tempdir().unwrap();
+    // Use an existing directory path as the credential file path to force store.save error
+    let cred_dir_path = dir.path().to_path_buf();
+
+    let server_response = token_ok();
+    let (url, _rx) = canned_server(vec![server_response]);
+
+    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+
+    let out = Command::new(exe)
+        .args([
+            "login",
+            "--username",
+            "store-fail@dosi.test",
+            "--password",
+            "canary-store-fail-pass-444",
+            "--workspace-id",
+            "ws-store-fail",
+            "--server",
+            &url,
+            "--credentials-file",
+            cred_dir_path.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("Failed to execute login --json command");
+
+    assert_eq!(out.status.code(), Some(1));
+
+    let stdout_str = String::from_utf8_lossy(&out.stdout);
+    let stderr_str = String::from_utf8_lossy(&out.stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&stdout_str).expect("Valid JSON on stdout");
+    assert_eq!(json["success"], false);
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap()
+            .contains("Failed to securely store credentials"),
+        "Expected store save error, got: {:?}",
+        json["error"]
+    );
+
+    assert!(!stdout_str.contains("canary-store-fail-pass-444"));
+    assert!(!stderr_str.contains("canary-store-fail-pass-444"));
+}
+
+#[test]
+fn test_cli_logout_json_scoped_success_and_idempotence() {
+    let dir = tempdir().unwrap();
+    let cred_path = dir.path().join("credentials.json");
+    let store = FileCredentialStore::new(cred_path.clone());
+
+    let mut creds = Credentials::new("logout-user@dosi.test", Some("pass123".to_string()));
+    creds.workspace_id = Some("ws-scoped".to_string());
+    creds.server_url = Some("https://api.dosi.app".to_string());
+    creds.access_token = Some("valid-token".to_string());
+    creds.device_signing_key = Some(vec![1, 2, 3]);
+    store.save(&creds).unwrap();
+
+    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+
+    // 1. Scoped logout with --json
+    let out = Command::new(exe)
+        .args([
+            "logout",
+            "--account-id",
+            "logout-user@dosi.test",
+            "--workspace-id",
+            "ws-scoped",
+            "--credentials-file",
+            cred_path.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("Failed to execute logout --json command");
+
+    assert_eq!(out.status.code(), Some(0));
+
+    let stdout_str = String::from_utf8_lossy(&out.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout_str).expect("Valid JSON on stdout");
+    assert_eq!(json["success"], true);
+    assert_eq!(json["account_id"], "logout-user@dosi.test");
+    assert_eq!(json["workspace_id"], "ws-scoped");
+    assert_eq!(json["cleared_all_workspaces"], false);
+    assert!(json["store_backend"].is_string());
+    assert!(json.get("error").is_none() || json["error"].is_null());
+
+    // Assert credentials cleared
+    assert_eq!(
+        store
+            .load("logout-user@dosi.test", Some("ws-scoped"))
+            .unwrap(),
+        None
+    );
+
+    // 2. Idempotent re-invocation: same logout --json succeeds cleanly
+    let out_again = Command::new(exe)
+        .args([
+            "logout",
+            "--account-id",
+            "logout-user@dosi.test",
+            "--workspace-id",
+            "ws-scoped",
+            "--credentials-file",
+            cred_path.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("Failed to execute idempotent logout --json command");
+
+    assert_eq!(out_again.status.code(), Some(0));
+    let stdout_again = String::from_utf8_lossy(&out_again.stdout);
+    let json_again: serde_json::Value =
+        serde_json::from_str(&stdout_again).expect("Valid JSON on idempotent logout stdout");
+    assert_eq!(json_again["success"], true);
+}
+
+#[test]
+fn test_cli_logout_json_preserves_cross_workspace_credentials() {
+    let dir = tempdir().unwrap();
+    let cred_path = dir.path().join("credentials.json");
+    let store = FileCredentialStore::new(cred_path.clone());
+
+    // Save ws-alpha
+    let mut cred_alpha = Credentials::new("multi-ws@dosi.test", Some("pass-alpha".to_string()));
+    cred_alpha.workspace_id = Some("ws-alpha".to_string());
+    cred_alpha.access_token = Some("token-alpha".to_string());
+    store.save(&cred_alpha).unwrap();
+
+    // Save ws-beta
+    let mut cred_beta = Credentials::new("multi-ws@dosi.test", Some("pass-beta".to_string()));
+    cred_beta.workspace_id = Some("ws-beta".to_string());
+    cred_beta.access_token = Some("token-beta".to_string());
+    store.save(&cred_beta).unwrap();
+
+    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+
+    // Clear ws-alpha only
+    let out = Command::new(exe)
+        .args([
+            "logout",
+            "--account-id",
+            "multi-ws@dosi.test",
+            "--workspace-id",
+            "ws-alpha",
+            "--credentials-file",
+            cred_path.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("Failed to execute logout --json");
+
+    assert_eq!(out.status.code(), Some(0));
+
+    // ws-alpha must be gone
+    assert_eq!(
+        store.load("multi-ws@dosi.test", Some("ws-alpha")).unwrap(),
+        None
+    );
+
+    // ws-beta must remain intact
+    let loaded_beta = store
+        .load("multi-ws@dosi.test", Some("ws-beta"))
+        .unwrap()
+        .expect("ws-beta credentials must remain untouched");
+    assert_eq!(loaded_beta.access_token.as_deref(), Some("token-beta"));
+}
+
+#[test]
+fn test_cli_login_and_logout_json_errors_and_canary_redaction() {
+    let dir = tempdir().unwrap();
+    let cred_path = dir.path().join("credentials.json");
+    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+
+    let canary_pos = "CANARY_SECRET_POS_VAL_12345";
+    let canary_flag_val = "CANARY_SECRET_FLAG_VAL_67890";
+
+    // 1. logout --json missing required --account-id
+    let out_missing_acc = Command::new(exe)
+        .args([
+            "logout",
+            "--workspace-id",
+            "ws-test",
+            "--credentials-file",
+            cred_path.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("Failed to execute logout --json");
+
+    assert_eq!(out_missing_acc.status.code(), Some(1));
+    let stdout_missing = String::from_utf8_lossy(&out_missing_acc.stdout);
+    let json_missing: serde_json::Value =
+        serde_json::from_str(&stdout_missing).expect("Valid JSON on stdout");
+    assert_eq!(json_missing["success"], false);
+    assert!(json_missing["error"]
+        .as_str()
+        .unwrap()
+        .contains("Missing required option: --account-id"));
+
+    // 2. logout --json with secret positional argument and secret-valued flag
+    let out_logout_canaries = Command::new(exe)
+        .args([
+            "logout",
+            "--account-id",
+            "user@dosi.test",
+            canary_pos,
+            &format!("--bogus-option={}", canary_flag_val),
+            "--json",
+        ])
+        .output()
+        .expect("Failed to execute logout --json");
+
+    assert_eq!(out_logout_canaries.status.code(), Some(1));
+    let stdout_logout_canary = String::from_utf8_lossy(&out_logout_canaries.stdout);
+    let stderr_logout_canary = String::from_utf8_lossy(&out_logout_canaries.stderr);
+    let json_logout_canary: serde_json::Value =
+        serde_json::from_str(&stdout_logout_canary).expect("Valid JSON on stdout");
+    assert_eq!(json_logout_canary["success"], false);
+
+    assert!(!stdout_logout_canary.contains(canary_pos));
+    assert!(!stderr_logout_canary.contains(canary_pos));
+    assert!(!stdout_logout_canary.contains(canary_flag_val));
+    assert!(!stderr_logout_canary.contains(canary_flag_val));
+
+    // 3. login --json missing required options
+    let out_login_missing = Command::new(exe)
+        .args(["login", "--json"])
+        .output()
+        .expect("Failed to execute login --json");
+
+    assert_eq!(out_login_missing.status.code(), Some(1));
+    let stdout_login_missing = String::from_utf8_lossy(&out_login_missing.stdout);
+    let json_login_missing: serde_json::Value =
+        serde_json::from_str(&stdout_login_missing).expect("Valid JSON on stdout");
+    assert_eq!(json_login_missing["success"], false);
+    assert!(json_login_missing["error"]
+        .as_str()
+        .unwrap()
+        .contains("Missing required option"));
+
+    // 4. login --json with secret positional argument and secret-valued flag
+    let out_login_canaries = Command::new(exe)
+        .args([
+            "login",
+            "--username",
+            "user@dosi.test",
+            canary_pos,
+            &format!("--unrecognized-flag={}", canary_flag_val),
+            "--json",
+        ])
+        .output()
+        .expect("Failed to execute login --json");
+
+    assert_eq!(out_login_canaries.status.code(), Some(1));
+    let stdout_login_canary = String::from_utf8_lossy(&out_login_canaries.stdout);
+    let stderr_login_canary = String::from_utf8_lossy(&out_login_canaries.stderr);
+    let json_login_canary: serde_json::Value =
+        serde_json::from_str(&stdout_login_canary).expect("Valid JSON on stdout");
+    assert_eq!(json_login_canary["success"], false);
+
+    assert!(!stdout_login_canary.contains(canary_pos));
+    assert!(!stderr_login_canary.contains(canary_pos));
+    assert!(!stdout_login_canary.contains(canary_flag_val));
+    assert!(!stderr_login_canary.contains(canary_flag_val));
 }

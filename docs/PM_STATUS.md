@@ -3085,13 +3085,40 @@ During independent native CI execution on `mh-ubuntu` on commit `9a5c2adc77f6a57
      - `cargo test --manifest-path clients/linux/Cargo.toml --locked --release`: PASSED (exit 0, 155 release tests passed across 10 test suites + installer lifecycle full suite 22/22 checks passed).
    - Provenance Status:
      - `a4a418f` (156 native tests + 22 installer checks) is historical exact-revision verified evidence.
-     - New revision is initially worker-only until independent native rerun by Hermes on `mh-ubuntu`.
-     - Expiry correction is pending native verification.
+     - Native Expiry Baseline @ `4558da58d7dd83932a8f5db2d62e9dad1b4423d4` independently verified on `mh-ubuntu` using exact committed blobs, isolated HOME/XDG/private bus/local fake HTTP:
+       - `cargo build --locked --release`: exit 0.
+       - `cargo test --locked --release`: 162 passed / 0 failed / 0 ignored, exit 0 across 10 suites (73 unit, 3 bin, 8 doctor, 8 identity/transport, 7 repro, 3 installer, 15 outbox status, 29 outbox, 3 secret service, 13 sync).
+       - Installer lifecycle suite: 22/22 passed, exit 0.
+       - Doctor diagnostic: exit 0.
+       - Real CLI short-TTL probe: grant 5s, persisted expiry 5.022s from pre-login timestamp (including 22ms login), owner 0600, login 0 / probe 0. Old native fail-before 3600.020s remains historical CLOSED.
 
-### H. Phase 1 Acceptance & Open Roadmap
-- **Phase 1 Status**: **DELIVERED & VERIFIED IN ISOLATED FIXTURES; NATIVE RUNNER QA PENDING FOR REVISION WITH EXPIRY CORRECTION**.
-- **Production Readiness Claim**: None. This delivery provides identity, transport, signing foundation, and auth-lifecycle expiry correction only. Capture adapters (Phase 2), automated capture worker scheduler loops (Phase 3), and package distribution (Phase 4) remain open and unstarted.
+### H. Phase 1 Login and Logout JSON Contract (`TASK phase1-login-logout-json-contract-20261024`)
+1. **Contract Remainder & Reproduction**:
+   - Agreed specification requires `login`, `logout`, and `status` to support `--json`. `status` supported JSON, but `handle_login` and `handle_logout` rejected `--json` as unknown option with exit 1 (`Error: Unknown option: --json`).
+2. **Smallest Compatible Implementation**:
+   - `clients/linux/src/main.rs`:
+     - Added `LoginJsonReport` and `LogoutJsonReport` serializable structures matching `StatusJsonReport` conventions.
+     - Pure structured JSON emitted to stdout in JSON mode on both success and error paths (`println!("{}", json)` without mixed human prose).
+     - Nonzero failure exits (exit 1) on errors.
+     - Zero sensitive data leaks: passwords, access tokens, refresh tokens, and signing key bytes are NEVER emitted to stdout, stderr, or JSON reports.
+     - Sanitized argument error handling: unrecognized options only report option name (`arg.split('=').next()`), positional unknown arguments report `"Unexpected argument provided"` without echoing raw values, preventing synthetic secret canary leakage.
+     - Existing plain text behavior and workspace isolation strictly preserved.
+3. **Deterministic Subprocess Regressions** (`tests/cli_identity_transport_signing_tests.rs`):
+   - `test_cli_login_json_success_and_redaction`: Subprocess `login --json` against loopback fake server asserting exit 0, pure JSON stdout, parsed fields (`success: true`, `account_id`, `workspace_id`, `server_url`, `has_signing_key`, `store_backend`, `token_expires_in_secs`), and strict absence of password and token canaries from stdout and stderr.
+   - `test_cli_login_json_auth_rejection_and_redaction`: Subprocess `login --json` against 401 Unauthorized server asserting exit 1, pure JSON stdout (`success: false`, `error`), and strict canary redaction.
+   - `test_cli_login_json_credential_store_failure`: Subprocess `login --json` with directory-targeted credentials path asserting exit 1, pure JSON stdout (`success: false`, store save error), and canary redaction.
+   - `test_cli_logout_json_scoped_success_and_idempotence`: Subprocess `logout --json` asserting exit 0, pure JSON stdout (`success: true`, `cleared_all_workspaces: false`), credential removal, and clean idempotent re-invocation exit 0.
+   - `test_cli_logout_json_preserves_cross_workspace_credentials`: Subprocess asserting logout of `ws-alpha` removes `ws-alpha` while `ws-beta` credentials remain intact.
+   - `test_cli_login_and_logout_json_errors_and_canary_redaction`: Subprocess tests for missing required arguments and unknown arguments containing secret positional and flag canaries, asserting exit 1, JSON failure report, and zero canary leaks.
+4. **Verification Evidence**:
+   - Windows Host (`rustc 1.97.1`, `x86_64-pc-windows-msvc`):
+     - `cargo fmt --manifest-path clients/linux/Cargo.toml -- --check`: PASSED (exit 0).
+     - `cargo clippy --manifest-path clients/linux/Cargo.toml --locked --all-targets -- -D warnings`: PASSED (exit 0, 0 warnings).
+     - `cargo test --manifest-path clients/linux/Cargo.toml --locked --release`: PASSED (exit 0, 161 release tests passed across 10 test suites + installer lifecycle full suite 22/22 checks passed).
+   - Provenance & Native QA:
+     - Worker run is Windows-only; native Linux runner QA pending on `mh-ubuntu` (expected 164 release tests across 10 suites: 161 on worker + 3 Linux-gated private bus tests).
 
-
-
+### I. Phase 1 Acceptance & Open Roadmap
+- **Phase 1 Status**: **DELIVERED & VERIFIED IN ISOLATED FIXTURES; NATIVE RUNNER QA PENDING FOR LOGIN/LOGOUT JSON CONTRACT REVISION**.
+- **Production Readiness Claim**: None. This delivery completes Phase 1 identity, transport, signing, expiry boundaries, and CLI JSON contracts. Capture adapters (Phase 2), automated capture worker scheduler loops (Phase 3), and package distribution (Phase 4) remain open and unstarted.
 
