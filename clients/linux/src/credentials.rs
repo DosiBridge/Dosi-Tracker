@@ -674,4 +674,57 @@ mod tests {
         store.clear("worker@corp.com", Some("ws-01")).unwrap();
         assert_eq!(store.load("worker@corp.com", Some("ws-01")).unwrap(), None);
     }
+
+    #[test]
+    fn test_file_credential_store_validation_and_ownership_invariants() {
+        let temp = tempfile::tempdir().unwrap();
+        let cred_file = temp.path().join("creds").join("credentials.json");
+        let store = FileCredentialStore::new(cred_file.clone());
+
+        // 1. Non-existent file validates as clean
+        assert!(FileCredentialStore::validate_target_file(&cred_file).is_ok());
+
+        // 2. Directory as target file fails closed
+        let dir_target = temp.path().join("creds_dir");
+        fs::create_dir_all(&dir_target).unwrap();
+        let err = FileCredentialStore::validate_target_file(&dir_target).unwrap_err();
+        assert!(matches!(err, CredentialError::UnsafeStorage(_)));
+        assert!(err.to_string().contains("not a regular file"));
+
+        // 3. Save valid credentials
+        let mut cred = Credentials::new("admin@corp.com", Some("secret".into()));
+        cred.workspace_id = Some("ws-test".into());
+        store.save(&cred).unwrap();
+        assert!(FileCredentialStore::validate_target_file(&cred_file).is_ok());
+
+        // 4. Unix-specific invariants: permissions and UID ownership
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            use std::os::unix::fs::PermissionsExt;
+
+            let meta = fs::symlink_metadata(&cred_file).unwrap();
+            let current_uid = unsafe { libc::geteuid() };
+            assert_eq!(
+                meta.uid(),
+                current_uid,
+                "Credentials file must be owned by current effective UID"
+            );
+            assert_eq!(
+                meta.mode() & 0o777,
+                0o600,
+                "Credentials file must have 0600 permissions"
+            );
+
+            // Widen permissions to group/world writable -> validation must fail closed
+            fs::set_permissions(&cred_file, fs::Permissions::from_mode(0o666)).unwrap();
+            let err = FileCredentialStore::validate_target_file(&cred_file).unwrap_err();
+            assert!(matches!(err, CredentialError::UnsafeStorage(_)));
+            assert!(err.to_string().contains("unsafe permissions"));
+
+            // Restore 0600 permissions -> validation succeeds again
+            fs::set_permissions(&cred_file, fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(FileCredentialStore::validate_target_file(&cred_file).is_ok());
+        }
+    }
 }
