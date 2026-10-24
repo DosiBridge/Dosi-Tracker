@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex as TokioMutex;
 
 use crate::credentials::{CredentialStore, Credentials};
-use crate::outbox::{ActivityEnvelope, OutboxEntry};
+use crate::outbox::{ActivityEnvelope, OutboxEntry, OutboxScope};
 use crate::signing::sign_activity_envelope;
 use crate::sync::{DeliveryOutcome, DeliveryTransport};
 
@@ -1176,13 +1176,28 @@ enum WorkerMsg {
 /// single-thread Tokio runtime, preventing runtime-nesting panics and guaranteeing
 /// zero SQLite lock retention during HTTP network operations.
 pub struct HttpDeliveryTransport {
+    bound_scope: OutboxScope,
     sender: std::sync::mpsc::SyncSender<WorkerMsg>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl HttpDeliveryTransport {
-    pub fn new(mut client: ApiClient) -> Self {
+    pub fn new(mut client: ApiClient) -> Result<Self, String> {
+        let account_id = client.username();
+        let raw_workspace_id = client.workspace_id().ok_or_else(|| {
+            "HttpDeliveryTransport requires a bound workspace_id; unscoped transport is forbidden"
+                .to_string()
+        })?;
+
+        let bound_scope = OutboxScope::new(account_id, raw_workspace_id)
+            .map_err(|e| format!("Invalid transport identity scope: {e}"))?;
+
+        // Ensure client fields match canonicalized bound scope
+        client.username = bound_scope.account_id.clone();
+        client.workspace_id = Some(bound_scope.workspace_id.clone());
+
         let (tx, rx) = std::sync::mpsc::sync_channel::<WorkerMsg>(32);
+        let worker_scope = bound_scope.clone();
 
         let handle = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -1193,6 +1208,20 @@ impl HttpDeliveryTransport {
             while let Ok(msg) = rx.recv() {
                 match msg {
                     WorkerMsg::Deliver { entry, reply } => {
+                        if entry.scope != worker_scope {
+                            let outcome = DeliveryOutcome::Rejected {
+                                reason: format!(
+                                    "Worker scope mismatch: transport bound to ({}, {}) rejected entry for ({}, {})",
+                                    worker_scope.account_id,
+                                    worker_scope.workspace_id,
+                                    entry.scope.account_id,
+                                    entry.scope.workspace_id,
+                                ),
+                            };
+                            let _ = reply.send(outcome);
+                            continue;
+                        }
+
                         let outcome = rt.block_on(async {
                             match client.submit_activity(&entry.envelope).await {
                                 Ok(acked_id) => DeliveryOutcome::Accepted {
@@ -1216,16 +1245,23 @@ impl HttpDeliveryTransport {
             }
         });
 
-        Self {
+        Ok(Self {
+            bound_scope,
             sender: tx,
             worker: Some(handle),
-        }
+        })
     }
 
     /// Constructs an `HttpDeliveryTransport` from persisted credentials.
     pub fn from_credentials(creds: &Credentials) -> Result<Self, String> {
+        let ws = creds.workspace_id.as_deref().ok_or_else(|| {
+            "HttpDeliveryTransport requires credentials with a bound workspace_id".to_string()
+        })?;
+        if ws.trim().is_empty() {
+            return Err("HttpDeliveryTransport requires a non-empty workspace_id".to_string());
+        }
         let client = ApiClient::from_credentials(creds)?;
-        Ok(Self::new(client))
+        Self::new(client)
     }
 
     /// Loads credentials from the specified store and constructs an `HttpDeliveryTransport`.
@@ -1234,13 +1270,56 @@ impl HttpDeliveryTransport {
         account_id: &str,
         workspace_id: Option<&str>,
     ) -> Result<Self, String> {
-        let client = ApiClient::from_store(store, account_id, workspace_id)?;
-        Ok(Self::new(client))
+        let ws = workspace_id.ok_or_else(|| {
+            "HttpDeliveryTransport requires an explicit bound workspace_id".to_string()
+        })?;
+        if ws.trim().is_empty() {
+            return Err("HttpDeliveryTransport requires a non-empty workspace_id".to_string());
+        }
+        let client = ApiClient::from_store(store, account_id, Some(ws))?;
+        Self::new(client)
+    }
+
+    /// Returns the bound [`OutboxScope`] of this transport.
+    pub fn bound_scope(&self) -> &OutboxScope {
+        &self.bound_scope
+    }
+
+    /// Returns the bound account identifier.
+    pub fn bound_account_id(&self) -> &str {
+        &self.bound_scope.account_id
+    }
+
+    /// Returns the bound workspace identifier.
+    pub fn bound_workspace_id(&self) -> &str {
+        &self.bound_scope.workspace_id
+    }
+
+    /// Checks if a candidate entry scope matches this transport's bound scope under
+    /// exact canonicalization rules.
+    pub fn matches_scope(&self, entry_scope: &OutboxScope) -> bool {
+        if entry_scope.validate().is_err() {
+            return false;
+        }
+        self.bound_scope.account_id == entry_scope.account_id.trim().to_lowercase()
+            && self.bound_scope.workspace_id == entry_scope.workspace_id.trim()
     }
 }
 
 impl DeliveryTransport for HttpDeliveryTransport {
     fn deliver(&mut self, entry: &OutboxEntry) -> DeliveryOutcome {
+        if !self.matches_scope(&entry.scope) {
+            return DeliveryOutcome::Rejected {
+                reason: format!(
+                    "Scope mismatch: transport bound to scope ({}, {}) rejected entry for ({}, {})",
+                    self.bound_scope.account_id,
+                    self.bound_scope.workspace_id,
+                    entry.scope.account_id,
+                    entry.scope.workspace_id,
+                ),
+            };
+        }
+
         let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
         if self
             .sender
@@ -1269,6 +1348,14 @@ impl Drop for HttpDeliveryTransport {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+    }
+}
+
+impl std::fmt::Debug for HttpDeliveryTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpDeliveryTransport")
+            .field("bound_scope", &self.bound_scope)
+            .finish()
     }
 }
 
@@ -1639,7 +1726,7 @@ mod tests {
         let client = ApiClient::new(&url, "user-1".into(), "test-pass".into())
             .with_workspace(Some("workspace-1".into()));
 
-        let mut transport = HttpDeliveryTransport::new(client);
+        let mut transport = HttpDeliveryTransport::new(client).unwrap();
         let coordinator = SyncPassCoordinator::new(&outbox, SyncPassConfig::default());
 
         let report = coordinator.run_pass(&scope, &mut transport).unwrap();
@@ -1673,7 +1760,7 @@ mod tests {
         let client = ApiClient::new(&url, "user-1".into(), "test-pass".into())
             .with_workspace(Some("workspace-1".into()));
 
-        let mut transport = HttpDeliveryTransport::new(client);
+        let mut transport = HttpDeliveryTransport::new(client).unwrap();
         let coordinator = SyncPassCoordinator::new(&outbox, SyncPassConfig::default());
 
         let report = coordinator.run_pass(&scope, &mut transport).unwrap();
@@ -1723,6 +1810,140 @@ mod tests {
         // Negative check: missing scope in store returns Err
         let missing = ApiClient::from_store(&store, "store-user@dosi.test", Some("ws-nonexistent"));
         assert!(missing.is_err());
+    }
+
+    #[test]
+    fn test_http_delivery_transport_scope_binding_validation() {
+        use crate::credentials::InMemoryCredentialStore;
+
+        // 1. Valid construction canonicalizes account and workspace
+        let client_ok = ApiClient::new(
+            "http://127.0.0.1:9999",
+            "  User-A@Dosi.TEST  ".into(),
+            "secret".into(),
+        )
+        .with_workspace(Some("  ws-tenant-1  ".into()));
+
+        let transport = HttpDeliveryTransport::new(client_ok).unwrap();
+        assert_eq!(transport.bound_account_id(), "user-a@dosi.test");
+        assert_eq!(transport.bound_workspace_id(), "ws-tenant-1");
+        assert_eq!(
+            transport.bound_scope(),
+            &OutboxScope::new("user-a@dosi.test", "ws-tenant-1").unwrap()
+        );
+
+        // Scope matching checks
+        let exact_scope = OutboxScope::new("user-a@dosi.test", "ws-tenant-1").unwrap();
+        assert!(transport.matches_scope(&exact_scope));
+
+        // Matching with uncanonicalized input (case insensitive account, trimmed)
+        let uncanonical_scope = OutboxScope {
+            account_id: "  USER-A@DOSI.TEST  ".to_string(),
+            workspace_id: "  ws-tenant-1  ".to_string(),
+        };
+        assert!(transport.matches_scope(&uncanonical_scope));
+
+        // Mismatch checks
+        let diff_account = OutboxScope::new("other@dosi.test", "ws-tenant-1").unwrap();
+        assert!(!transport.matches_scope(&diff_account));
+
+        let diff_workspace = OutboxScope::new("user-a@dosi.test", "ws-other").unwrap();
+        assert!(!transport.matches_scope(&diff_workspace));
+
+        let diff_both = OutboxScope::new("other@dosi.test", "ws-other").unwrap();
+        assert!(!transport.matches_scope(&diff_both));
+
+        // 2. Fail-closed: ApiClient without workspace cannot construct transport
+        let client_no_ws = ApiClient::new(
+            "http://127.0.0.1:9999",
+            "user@dosi.test".into(),
+            "secret".into(),
+        );
+        let err_no_ws = HttpDeliveryTransport::new(client_no_ws);
+        assert!(err_no_ws.is_err());
+        assert!(err_no_ws
+            .unwrap_err()
+            .contains("requires a bound workspace_id"));
+
+        // 3. Fail-closed: ApiClient with empty/whitespace workspace
+        let client_empty_ws = ApiClient::new(
+            "http://127.0.0.1:9999",
+            "user@dosi.test".into(),
+            "secret".into(),
+        )
+        .with_workspace(Some("   ".into()));
+        let err_empty_ws = HttpDeliveryTransport::new(client_empty_ws);
+        assert!(err_empty_ws.is_err());
+
+        // 4. Fail-closed: Credentials without workspace
+        let mut creds_no_ws = Credentials::new("user@dosi.test", Some("secret".into()));
+        creds_no_ws.workspace_id = None;
+        let err_creds_no_ws = HttpDeliveryTransport::from_credentials(&creds_no_ws);
+        assert!(err_creds_no_ws.is_err());
+        assert!(err_creds_no_ws.unwrap_err().contains("bound workspace_id"));
+
+        // 5. Fail-closed: Credentials with empty workspace
+        let mut creds_empty_ws = Credentials::new("user@dosi.test", Some("secret".into()));
+        creds_empty_ws.workspace_id = Some("   ".into());
+        let err_creds_empty_ws = HttpDeliveryTransport::from_credentials(&creds_empty_ws);
+        assert!(err_creds_empty_ws.is_err());
+        assert!(err_creds_empty_ws
+            .unwrap_err()
+            .contains("non-empty workspace_id"));
+
+        // 6. Fail-closed: from_store with None or empty workspace
+        let store = InMemoryCredentialStore::new();
+        let err_store_none = HttpDeliveryTransport::from_store(&store, "user@dosi.test", None);
+        assert!(err_store_none.is_err());
+        assert!(err_store_none
+            .unwrap_err()
+            .contains("explicit bound workspace_id"));
+
+        let err_store_empty =
+            HttpDeliveryTransport::from_store(&store, "user@dosi.test", Some("  "));
+        assert!(err_store_empty.is_err());
+        assert!(err_store_empty
+            .unwrap_err()
+            .contains("non-empty workspace_id"));
+    }
+
+    #[test]
+    fn test_http_delivery_transport_scope_mismatch_rejection_at_boundary() {
+        let client = ApiClient::new(
+            "http://127.0.0.1:9999",
+            "account-a@dosi.test".into(),
+            "pass-a".into(),
+        )
+        .with_workspace(Some("ws-a".into()));
+
+        let mut transport = HttpDeliveryTransport::new(client).unwrap();
+
+        // Foreign scope entry
+        let foreign_scope = OutboxScope::new("account-b@dosi.test", "ws-b").unwrap();
+        let entry = OutboxEntry {
+            id: 1,
+            scope: foreign_scope,
+            client_activity_id: "act-foreign-1".to_string(),
+            enqueued_at: Utc::now(),
+            retry_count: 0,
+            last_error: None,
+            envelope: sample_envelope("act-foreign-1"),
+        };
+
+        // deliver() must definitively reject without touching network/worker
+        let outcome = transport.deliver(&entry);
+        match outcome {
+            DeliveryOutcome::Rejected { reason } => {
+                assert!(reason.contains("Scope mismatch"));
+                assert!(reason.contains("account-a@dosi.test"));
+                assert!(reason.contains("account-b@dosi.test"));
+                assert!(reason.contains("ws-a"));
+                assert!(reason.contains("ws-b"));
+                // Invariant: no secrets in error messages
+                assert!(!reason.contains("pass-a"));
+            }
+            other => panic!("Expected DeliveryOutcome::Rejected, got {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -167,6 +167,7 @@ cargo run --bin dosi-tracker-linux -- --version
   - Pre-expiry token refresh buffer (60s early renewal) and bounded 401 retry / re-authentication.
   - Per-device 32-byte HMAC-SHA256 payload signing matching Windows byte semantics (`URL_SAFE_NO_PAD` base64url tag).
   - Concrete `HttpDeliveryTransport` implementing `DeliveryTransport` contract with exact ack deletion, transient failure retention and retry counter incrementation, auth-required halt, and mismatched ack halt.
+  - Strict transport identity binding: `HttpDeliveryTransport` is bound to its authenticated account and workspace (`OutboxScope`) under exact canonicalization rules (`account_id: trim().to_lowercase()`, `workspace_id: trim().to_string()`), failing closed if unscoped or empty across all constructors (`new`, `from_credentials`, `from_store`), and rejecting mismatched queued scopes before any authentication, token refresh, or network transmission, preserving the queued row and retry metadata in SQLite without accidental acknowledgment or cross-tenant exposure.
   - Production transport initialization from persisted credentials (`HttpDeliveryTransport::from_store` / `from_credentials`), proving production upload reuses credentials, tokens, and signing key saved by CLI `login`.
   - Heartbeat presence primitive (`POST /api/app/presence/heartbeat`) on 60s cadence.
   - Non-mutating CLI commands: `login`, `logout`, `status [--json]`.

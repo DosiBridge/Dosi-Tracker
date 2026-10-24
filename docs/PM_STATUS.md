@@ -3118,7 +3118,47 @@ During independent native CI execution on `mh-ubuntu` on commit `9a5c2adc77f6a57
    - Provenance & Native QA:
      - Worker run is Windows-only; native Linux runner QA pending on `mh-ubuntu` (expected 164 release tests across 10 suites: 161 on worker + 3 Linux-gated private bus tests).
 
-### I. Phase 1 Acceptance & Open Roadmap
-- **Phase 1 Status**: **DELIVERED & VERIFIED IN ISOLATED FIXTURES; NATIVE RUNNER QA PENDING FOR LOGIN/LOGOUT JSON CONTRACT REVISION**.
-- **Production Readiness Claim**: None. This delivery completes Phase 1 identity, transport, signing, expiry boundaries, and CLI JSON contracts. Capture adapters (Phase 2), automated capture worker scheduler loops (Phase 3), and package distribution (Phase 4) remain open and unstarted.
+### I. Phase 1 Transport Scope Binding Correction (`TASK phase1-transport-scope-binding-20261024`)
+1. **Defect Analysis & Native Fail-Before Reproduction**:
+   - `clients/linux/src/api.rs`: `HttpDeliveryTransport::from_credentials` and `from_store` selected credentials for an authenticated account and workspace, but `deliver` forwarded `entry.envelope` only, discarding `OutboxEntry.scope`. Meanwhile `SyncPassCoordinator` independently accepted a caller scope.
+   - Cross-Tenant Breach: A transport initialized for `(account-a, workspace-a)` sent `(account-b, workspace-b)`'s queued activity over HTTP using A's credentials and workspace header (`X-Workspace-Id: workspace-a`), and on HTTP 200 OK the coordinator deleted B's local SQLite row. This violated the Phase 1 scoped durable queue and zero cross-tenant exposure invariants.
+   - Independent Native Fail-Before Reproduction (`mh-ubuntu`, `phase1_scope_probe.rs`, probe exit 101):
+     ```text
+     cross_scope_activity_requests=1
+     foreign_rows_remaining=0
+     persisted_acknowledged=1
+     assertion foreign-scope row must never reach HTTP transport: left1 right0
+     PROBE_EXIT=101
+     ```
+     Evidence preserved on Hermes server: `phase1-scope-native-failbefore.log`.
+2. **Smallest Compatible Implementation & Security Invariants**:
+   - `clients/linux/src/api.rs`:
+     - `HttpDeliveryTransport`: Added `bound_scope: OutboxScope`. Canonicalized via `OutboxScope::new` (`account_id: trim().to_lowercase()`, `workspace_id: trim().to_string()`), enforcing finite length bounds (<= 256 bytes) and rejecting control characters.
+     - Constructors fail closed: `new(client: ApiClient) -> Result<Self, String>`, `from_credentials`, and `from_store` strictly require a non-empty, valid workspace ID and account ID. Missing, empty, or whitespace-only workspace inputs return explicit `Err` rather than permitting an unscoped bypass or wildcard.
+     - Synchronized client fields: `client.username` and `client.workspace_id` are canonicalized to match `bound_scope`, ensuring outbound `X-Workspace-Id` HTTP headers are strictly coherent.
+     - Public boundary rejection in `deliver(&mut self, entry: &OutboxEntry) -> DeliveryOutcome`: checks `self.matches_scope(&entry.scope)` before worker thread dispatch, token acquisition, or network byte transmission. Returns `DeliveryOutcome::Rejected { reason: ... }`.
+     - Worker thread defense-in-depth: checks `entry.scope == worker_scope` inside Tokio runtime loop.
+     - Coordinator semantics preserved: `SyncPassCoordinator` treats `DeliveryOutcome::Rejected` as definitive rejection, halts the pass, does NOT acknowledge or delete the row (`outbox.ack_delivered` is NOT called), does NOT increment `retry_count` or clobber `last_error` (`outbox.mark_attempt_failed` is NOT called), and leaves foreign/coexisting scopes completely untouched.
+     - Zero secret/payload leakage: rejection reasons report only account and workspace IDs, never passwords, tokens, signing keys, or payload data.
+     - Accessors provided: `bound_scope(&self)`, `bound_account_id(&self)`, `bound_workspace_id(&self)`, and `matches_scope(&self, entry_scope: &OutboxScope)`.
+3. **Deterministic Regressions** (`tests/cli_identity_transport_signing_tests.rs` & `src/api.rs`):
+   - `test_transport_scope_binding_account_mismatch_same_workspace`: Verifies account mismatch with identical workspace returns `DefinitiveRejection`, generates 0 HTTP requests (counter = 0), preserves row in outbox, and retains retry_count = 0.
+   - `test_transport_scope_binding_workspace_mismatch_same_account`: Verifies workspace mismatch with identical account returns `DefinitiveRejection`, generates 0 HTTP requests, preserves row, and retains retry_count = 0.
+   - `test_transport_scope_binding_both_mismatch`: Verifies simultaneous account and workspace mismatch returns `DefinitiveRejection`, generates 0 HTTP requests, and preserves row.
+   - `test_transport_scope_binding_absent_and_empty_workspace_fail_closed`: Verifies missing, empty, and whitespace-only workspace inputs fail closed across `new`, `from_credentials`, and `from_store`.
+   - `test_transport_scope_binding_same_scope_positive_delivery_and_exact_deletion`: Positive path verification: matching scope delivers activity, passes `X-Workspace-Id` header, obtains 200 OK, and exactly deletes row from SQLite outbox.
+   - `test_transport_scope_binding_scoped_queue_coexistence`: Verifies queue with interleaved rows for Scope 1 and Scope 2; pass with Transport 1 drains Scope 1 while Scope 2 remains strictly untouched with retry_count = 0; subsequent pass with Transport 2 drains Scope 2.
+   - `test_transport_scope_binding_native_failbefore_reproduction`: Exact reproduction of `phase1_scope_probe.rs` asserting `cross_scope_activity_requests == 0`, `foreign_rows_remaining == 1`, and `persisted_acknowledged == 0`.
+   - `test_http_delivery_transport_scope_binding_validation` & `test_http_delivery_transport_scope_mismatch_rejection_at_boundary` (`src/api.rs`): Unit tests verifying canonicalization, case-insensitivity, trim handling, and boundary rejection.
+4. **Verification Evidence**:
+   - Windows Host (`rustc 1.97.1`, `x86_64-pc-windows-msvc`):
+     - `cargo fmt --manifest-path clients/linux/Cargo.toml -- --check`: PASSED (exit 0).
+     - `cargo clippy --manifest-path clients/linux/Cargo.toml --locked --all-targets -- -D warnings`: PASSED (exit 0, 0 warnings).
+     - `cargo test --manifest-path clients/linux/Cargo.toml --locked --release`: PASSED (exit 0, 178 release tests passed across 10 test suites + installer lifecycle full suite 22/22 checks passed).
+   - Provenance & Native QA:
+     - Worker run is Windows-only; native Linux runner QA pending on `mh-ubuntu` (expected 181 release tests across 10 suites: 178 on worker + 3 Linux-gated private bus tests). Native regression verification of this exact revision is pending Hermes review, not already proven.
+
+### J. Phase 1 Acceptance & Open Roadmap
+- **Phase 1 Status**: **DELIVERED & VERIFIED IN ISOLATED FIXTURES; NATIVE RUNNER QA PENDING FOR TRANSPORT SCOPE BINDING REVISION**.
+- **Production Readiness Claim**: None. This delivery completes Phase 1 identity, transport scope binding, signing, expiry boundaries, and CLI JSON contracts. Capture adapters (Phase 2), automated capture worker scheduler loops (Phase 3), and package distribution (Phase 4) remain open and unstarted.
 

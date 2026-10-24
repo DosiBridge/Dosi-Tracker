@@ -12,16 +12,20 @@
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
 use tempfile::tempdir;
 
-use dosi_tracker_linux::api::HttpDeliveryTransport;
-use dosi_tracker_linux::credentials::{CredentialStore, Credentials, FileCredentialStore};
+use dosi_tracker_linux::api::{ApiClient, HttpDeliveryTransport};
+use dosi_tracker_linux::credentials::{
+    CredentialStore, Credentials, FileCredentialStore, InMemoryCredentialStore,
+};
 use dosi_tracker_linux::outbox::{ActivityEnvelope, Outbox, OutboxLimits, OutboxScope};
 use dosi_tracker_linux::signing::verify_activity_envelope;
-use dosi_tracker_linux::sync::{SyncPassConfig, SyncPassCoordinator};
+use dosi_tracker_linux::sync::{SyncPassConfig, SyncPassCoordinator, SyncStopReason};
 
 fn http_resp(status: &str, headers: &[(&str, &str)], body: &str) -> String {
     let extra: String = headers
@@ -124,6 +128,44 @@ fn interrupting_server() -> (
         }
     });
     (url, rx, handle)
+}
+
+fn counting_server_loop(
+    responses: Vec<String>,
+) -> (
+    String,
+    std::sync::mpsc::Receiver<String>,
+    Arc<AtomicUsize>,
+    std::sync::mpsc::Sender<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let _ = listener.set_nonblocking(true);
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
+    let counter = Arc::new(AtomicUsize::new(0));
+    let counter_clone = counter.clone();
+    std::thread::spawn(move || {
+        let mut resp_iter = responses.into_iter();
+        while shutdown_rx.try_recv().is_err() {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    counter_clone.fetch_add(1, Ordering::SeqCst);
+                    let _ = stream.set_nonblocking(false);
+                    let req = read_request(&mut stream);
+                    let _ = tx.send(req);
+                    let resp = resp_iter.next().unwrap_or_else(token_ok);
+                    let _ = stream.write_all(resp.as_bytes());
+                    let _ = stream.flush();
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    (url, rx, counter, shutdown_tx)
 }
 
 fn sample_envelope(client_activity_id: &str) -> ActivityEnvelope {
@@ -1310,4 +1352,450 @@ fn test_cli_login_and_logout_json_errors_and_canary_redaction() {
     assert!(!stderr_login_canary.contains(canary_pos));
     assert!(!stdout_login_canary.contains(canary_flag_val));
     assert!(!stderr_login_canary.contains(canary_flag_val));
+}
+
+#[test]
+fn test_transport_scope_binding_account_mismatch_same_workspace() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("outbox.db");
+    let outbox = Outbox::open(&db_path, OutboxLimits::default()).unwrap();
+
+    let scope_target = OutboxScope::new("account-b@dosi.test", "workspace-shared").unwrap();
+    let envelope = sample_envelope("act-mismatch-account");
+    outbox.enqueue(&scope_target, &envelope).unwrap();
+
+    let (url, _rx, counter, _shutdown) = counting_server_loop(vec![token_ok()]);
+
+    let store = InMemoryCredentialStore::new();
+    let mut creds = Credentials::new("account-a@dosi.test", Some("pw-a".into()));
+    creds.workspace_id = Some("workspace-shared".into());
+    creds.server_url = Some(url);
+    store.save(&creds).unwrap();
+
+    let mut transport =
+        HttpDeliveryTransport::from_store(&store, "account-a@dosi.test", Some("workspace-shared"))
+            .expect("Transport construction should succeed for valid credentials");
+
+    assert_eq!(transport.bound_account_id(), "account-a@dosi.test");
+    assert_eq!(transport.bound_workspace_id(), "workspace-shared");
+
+    let coordinator = SyncPassCoordinator::new(&outbox, SyncPassConfig::default());
+    let report = coordinator.run_pass(&scope_target, &mut transport).unwrap();
+
+    // Invariant: DefinitiveRejection on scope mismatch
+    match report.stop_reason {
+        Some(SyncStopReason::DefinitiveRejection {
+            ref client_activity_id,
+            ref reason,
+        }) => {
+            assert_eq!(client_activity_id, "act-mismatch-account");
+            assert!(reason.contains("Scope mismatch"));
+            assert!(reason.contains("account-a@dosi.test"));
+            assert!(reason.contains("account-b@dosi.test"));
+            // Invariant: no secrets leaked
+            assert!(!reason.contains("pw-a"));
+        }
+        other => panic!("Expected DefinitiveRejection, got {other:?}"),
+    }
+
+    assert_eq!(report.transport_accepted.len(), 0);
+    assert_eq!(report.persisted_acknowledged.len(), 0);
+
+    // Invariant: Zero network bytes/requests reach the transport HTTP backend
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        0,
+        "No HTTP requests must reach the network"
+    );
+
+    // Invariant: Row preserved and retry state intact
+    let pending = outbox.peek_pending(&scope_target, 10).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].client_activity_id, "act-mismatch-account");
+    assert_eq!(pending[0].retry_count, 0);
+    assert!(pending[0].last_error.is_none());
+}
+
+#[test]
+fn test_transport_scope_binding_workspace_mismatch_same_account() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("outbox.db");
+    let outbox = Outbox::open(&db_path, OutboxLimits::default()).unwrap();
+
+    let scope_target = OutboxScope::new("account-shared@dosi.test", "workspace-b").unwrap();
+    let envelope = sample_envelope("act-mismatch-workspace");
+    outbox.enqueue(&scope_target, &envelope).unwrap();
+
+    let (url, _rx, counter, _shutdown) = counting_server_loop(vec![token_ok()]);
+
+    let store = InMemoryCredentialStore::new();
+    let mut creds = Credentials::new("account-shared@dosi.test", Some("pw-shared".into()));
+    creds.workspace_id = Some("workspace-a".into());
+    creds.server_url = Some(url);
+    store.save(&creds).unwrap();
+
+    let mut transport =
+        HttpDeliveryTransport::from_store(&store, "account-shared@dosi.test", Some("workspace-a"))
+            .expect("Transport construction should succeed for valid credentials");
+
+    assert_eq!(transport.bound_account_id(), "account-shared@dosi.test");
+    assert_eq!(transport.bound_workspace_id(), "workspace-a");
+
+    let coordinator = SyncPassCoordinator::new(&outbox, SyncPassConfig::default());
+    let report = coordinator.run_pass(&scope_target, &mut transport).unwrap();
+
+    match report.stop_reason {
+        Some(SyncStopReason::DefinitiveRejection {
+            ref client_activity_id,
+            ref reason,
+        }) => {
+            assert_eq!(client_activity_id, "act-mismatch-workspace");
+            assert!(reason.contains("Scope mismatch"));
+            assert!(reason.contains("workspace-a"));
+            assert!(reason.contains("workspace-b"));
+            assert!(!reason.contains("pw-shared"));
+        }
+        other => panic!("Expected DefinitiveRejection, got {other:?}"),
+    }
+
+    assert_eq!(report.transport_accepted.len(), 0);
+    assert_eq!(report.persisted_acknowledged.len(), 0);
+
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        0,
+        "No HTTP requests must reach the network"
+    );
+
+    let pending = outbox.peek_pending(&scope_target, 10).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].retry_count, 0);
+    assert!(pending[0].last_error.is_none());
+}
+
+#[test]
+fn test_transport_scope_binding_both_mismatch() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("outbox.db");
+    let outbox = Outbox::open(&db_path, OutboxLimits::default()).unwrap();
+
+    let scope_target = OutboxScope::new("account-b@dosi.test", "workspace-b").unwrap();
+    let envelope = sample_envelope("act-mismatch-both");
+    outbox.enqueue(&scope_target, &envelope).unwrap();
+
+    let (url, _rx, counter, _shutdown) = counting_server_loop(vec![token_ok()]);
+
+    let store = InMemoryCredentialStore::new();
+    let mut creds = Credentials::new("account-a@dosi.test", Some("pw-a".into()));
+    creds.workspace_id = Some("workspace-a".into());
+    creds.server_url = Some(url);
+    store.save(&creds).unwrap();
+
+    let mut transport =
+        HttpDeliveryTransport::from_store(&store, "account-a@dosi.test", Some("workspace-a"))
+            .expect("Transport construction should succeed for valid credentials");
+
+    let coordinator = SyncPassCoordinator::new(&outbox, SyncPassConfig::default());
+    let report = coordinator.run_pass(&scope_target, &mut transport).unwrap();
+
+    assert!(matches!(
+        report.stop_reason,
+        Some(SyncStopReason::DefinitiveRejection { .. })
+    ));
+    assert_eq!(report.persisted_acknowledged.len(), 0);
+
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(counter.load(Ordering::SeqCst), 0);
+
+    let pending = outbox.peek_pending(&scope_target, 10).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].retry_count, 0);
+    assert!(pending[0].last_error.is_none());
+}
+
+#[test]
+fn test_transport_scope_binding_absent_and_empty_workspace_fail_closed() {
+    let store = InMemoryCredentialStore::new();
+
+    // ApiClient without workspace
+    let client_no_ws = ApiClient::new("http://127.0.0.1:9", "acc@dosi.test".into(), "pw".into());
+    let err_client_no_ws = HttpDeliveryTransport::new(client_no_ws);
+    assert!(err_client_no_ws.is_err());
+    assert!(err_client_no_ws
+        .unwrap_err()
+        .contains("requires a bound workspace_id"));
+
+    // ApiClient with empty workspace
+    let client_empty_ws = ApiClient::new("http://127.0.0.1:9", "acc@dosi.test".into(), "pw".into())
+        .with_workspace(Some("".into()));
+    assert!(HttpDeliveryTransport::new(client_empty_ws).is_err());
+
+    // ApiClient with whitespace workspace
+    let client_ws_spaces =
+        ApiClient::new("http://127.0.0.1:9", "acc@dosi.test".into(), "pw".into())
+            .with_workspace(Some("   ".into()));
+    assert!(HttpDeliveryTransport::new(client_ws_spaces).is_err());
+
+    // Credentials without workspace
+    let mut creds_no_ws = Credentials::new("acc@dosi.test", Some("pw".into()));
+    creds_no_ws.workspace_id = None;
+    let err_creds_no_ws = HttpDeliveryTransport::from_credentials(&creds_no_ws);
+    assert!(err_creds_no_ws.is_err());
+    assert!(err_creds_no_ws.unwrap_err().contains("bound workspace_id"));
+
+    // Credentials with whitespace workspace
+    let mut creds_empty_ws = Credentials::new("acc@dosi.test", Some("pw".into()));
+    creds_empty_ws.workspace_id = Some("  \t  ".into());
+    let err_creds_empty_ws = HttpDeliveryTransport::from_credentials(&creds_empty_ws);
+    assert!(err_creds_empty_ws.is_err());
+    assert!(err_creds_empty_ws
+        .unwrap_err()
+        .contains("non-empty workspace_id"));
+
+    // from_store with None
+    let err_store_none = HttpDeliveryTransport::from_store(&store, "acc@dosi.test", None);
+    assert!(err_store_none.is_err());
+    assert!(err_store_none
+        .unwrap_err()
+        .contains("explicit bound workspace_id"));
+
+    // from_store with empty / whitespace
+    let err_store_empty = HttpDeliveryTransport::from_store(&store, "acc@dosi.test", Some(""));
+    assert!(err_store_empty.is_err());
+    assert!(err_store_empty
+        .unwrap_err()
+        .contains("non-empty workspace_id"));
+
+    let err_store_whitespace =
+        HttpDeliveryTransport::from_store(&store, "acc@dosi.test", Some("   "));
+    assert!(err_store_whitespace.is_err());
+    assert!(err_store_whitespace
+        .unwrap_err()
+        .contains("non-empty workspace_id"));
+}
+
+#[test]
+fn test_transport_scope_binding_same_scope_positive_delivery_and_exact_deletion() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("outbox.db");
+    let outbox = Outbox::open(&db_path, OutboxLimits::default()).unwrap();
+
+    let scope = OutboxScope::new("account-pos@dosi.test", "workspace-pos").unwrap();
+    let envelope = sample_envelope("act-pos-match-1");
+    outbox.enqueue(&scope, &envelope).unwrap();
+
+    let (url, rx, counter, _shutdown) = counting_server_loop(vec![
+        token_ok(),
+        http_resp("200 OK", &[], r#"{"clientActivityId":"act-pos-match-1"}"#),
+    ]);
+
+    let store = InMemoryCredentialStore::new();
+    let mut creds = Credentials::new("account-pos@dosi.test", Some("pw-pos".into()));
+    creds.workspace_id = Some("workspace-pos".into());
+    creds.server_url = Some(url);
+    store.save(&creds).unwrap();
+
+    let mut transport =
+        HttpDeliveryTransport::from_store(&store, "account-pos@dosi.test", Some("workspace-pos"))
+            .expect("Transport construction should succeed");
+
+    let coordinator = SyncPassCoordinator::new(&outbox, SyncPassConfig::default());
+    let report = coordinator.run_pass(&scope, &mut transport).unwrap();
+
+    assert_eq!(
+        report.transport_accepted,
+        vec!["act-pos-match-1".to_string()]
+    );
+    assert_eq!(
+        report.persisted_acknowledged,
+        vec!["act-pos-match-1".to_string()]
+    );
+    assert_eq!(report.transient_failures.len(), 0);
+    assert_eq!(report.definitive_rejections.len(), 0);
+
+    // Invariant: Exactly deleted from outbox
+    let pending = outbox.peek_pending(&scope, 10).unwrap();
+    assert_eq!(pending.len(), 0);
+
+    // Invariant: Activity request was received with expected workspace header
+    let _token_req = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("Token request received");
+    let upload_req = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("Upload request received");
+    assert!(upload_req.contains("POST /api/app/activity"));
+    let req_lower = upload_req.to_lowercase();
+    assert!(req_lower.contains("x-workspace-id: workspace-pos"));
+    assert_eq!(counter.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn test_transport_scope_binding_scoped_queue_coexistence() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("outbox.db");
+    let outbox = Outbox::open(&db_path, OutboxLimits::default()).unwrap();
+
+    let scope_1 = OutboxScope::new("user-1@dosi.test", "ws-tenant-1").unwrap();
+    let scope_2 = OutboxScope::new("user-2@dosi.test", "ws-tenant-2").unwrap();
+
+    let env_1 = sample_envelope("act-coexist-1");
+    let env_2 = sample_envelope("act-coexist-2");
+    outbox.enqueue(&scope_1, &env_1).unwrap();
+    outbox.enqueue(&scope_2, &env_2).unwrap();
+
+    let (url, _rx, _counter, _shutdown) = counting_server_loop(vec![
+        token_ok(),
+        http_resp("200 OK", &[], r#"{"clientActivityId":"act-coexist-1"}"#),
+        token_ok(),
+        http_resp("200 OK", &[], r#"{"clientActivityId":"act-coexist-2"}"#),
+    ]);
+
+    let store = InMemoryCredentialStore::new();
+    let mut creds_1 = Credentials::new("user-1@dosi.test", Some("pw-1".into()));
+    creds_1.workspace_id = Some("ws-tenant-1".into());
+    creds_1.server_url = Some(url.clone());
+    store.save(&creds_1).unwrap();
+
+    let mut creds_2 = Credentials::new("user-2@dosi.test", Some("pw-2".into()));
+    creds_2.workspace_id = Some("ws-tenant-2".into());
+    creds_2.server_url = Some(url);
+    store.save(&creds_2).unwrap();
+
+    let coordinator = SyncPassCoordinator::new(&outbox, SyncPassConfig::default());
+
+    // Execute pass 1 with transport 1
+    let mut transport_1 =
+        HttpDeliveryTransport::from_store(&store, "user-1@dosi.test", Some("ws-tenant-1")).unwrap();
+    let report_1 = coordinator.run_pass(&scope_1, &mut transport_1).unwrap();
+    assert_eq!(
+        report_1.persisted_acknowledged,
+        vec!["act-coexist-1".to_string()]
+    );
+
+    // Verify scope_1 queue drained and scope_2 completely untouched
+    assert_eq!(outbox.count(Some(&scope_1)).unwrap(), 0);
+    assert_eq!(outbox.count(Some(&scope_2)).unwrap(), 1);
+
+    let pending_2 = outbox.peek_pending(&scope_2, 10).unwrap();
+    assert_eq!(pending_2.len(), 1);
+    assert_eq!(pending_2[0].client_activity_id, "act-coexist-2");
+    assert_eq!(pending_2[0].retry_count, 0);
+    assert!(pending_2[0].last_error.is_none());
+
+    // Execute pass 2 with transport 2
+    let mut transport_2 =
+        HttpDeliveryTransport::from_store(&store, "user-2@dosi.test", Some("ws-tenant-2")).unwrap();
+    let report_2 = coordinator.run_pass(&scope_2, &mut transport_2).unwrap();
+    assert_eq!(
+        report_2.persisted_acknowledged,
+        vec!["act-coexist-2".to_string()]
+    );
+
+    // Both queues now drained
+    assert_eq!(outbox.count(Some(&scope_1)).unwrap(), 0);
+    assert_eq!(outbox.count(Some(&scope_2)).unwrap(), 0);
+}
+
+#[test]
+fn test_transport_scope_binding_native_failbefore_reproduction() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("outbox.db");
+    let outbox = Outbox::open(&db_path, OutboxLimits::default()).unwrap();
+
+    // Foreign scope queued entry
+    let scope_foreign = OutboxScope::new("account-b@dosi.test", "workspace-b").unwrap();
+    let env_foreign = sample_envelope("act-native-failbefore-check");
+    outbox.enqueue(&scope_foreign, &env_foreign).unwrap();
+
+    // Server tracking activity requests
+    let activity_requests = Arc::new(AtomicUsize::new(0));
+    let activity_requests_clone = activity_requests.clone();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let _ = listener.set_nonblocking(true);
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
+
+    std::thread::spawn(move || {
+        while shutdown_rx.try_recv().is_err() {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let req = read_request(&mut stream);
+                    if req.contains("POST /api/app/activity") {
+                        activity_requests_clone.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let resp = if req.contains("POST /connect/token") {
+                        token_ok()
+                    } else {
+                        http_resp(
+                            "200 OK",
+                            &[],
+                            r#"{"clientActivityId":"act-native-failbefore-check"}"#,
+                        )
+                    };
+                    let _ = stream.write_all(resp.as_bytes());
+                    let _ = stream.flush();
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Transport initialized for account-a/workspace-a
+    let store = InMemoryCredentialStore::new();
+    let mut creds_a = Credentials::new("account-a@dosi.test", Some("pw-a".into()));
+    creds_a.workspace_id = Some("workspace-a".into());
+    creds_a.server_url = Some(url);
+    store.save(&creds_a).unwrap();
+
+    let mut transport_a =
+        HttpDeliveryTransport::from_store(&store, "account-a@dosi.test", Some("workspace-a"))
+            .unwrap();
+
+    // Coordinator runs pass with foreign scope
+    let coordinator = SyncPassCoordinator::new(&outbox, SyncPassConfig::default());
+    let report = coordinator
+        .run_pass(&scope_foreign, &mut transport_a)
+        .unwrap();
+
+    // Evaluate reproduction assertions
+    let cross_scope_activity_requests = activity_requests.load(Ordering::SeqCst);
+    let foreign_rows_remaining = outbox.count(Some(&scope_foreign)).unwrap();
+    let persisted_acknowledged = report.persisted_acknowledged.len();
+
+    // Native fail-before observed:
+    // cross_scope_activity_requests=1
+    // foreign_rows_remaining=0
+    // persisted_acknowledged=1
+    // PROBE_EXIT=101
+    //
+    // Fixed transport identity binding asserts:
+    assert_eq!(
+        cross_scope_activity_requests, 0,
+        "foreign-scope row must never reach HTTP transport: left{cross_scope_activity_requests} right0"
+    );
+    assert_eq!(
+        foreign_rows_remaining, 1,
+        "foreign-scope row must remain in outbox without deletion"
+    );
+    assert_eq!(
+        persisted_acknowledged, 0,
+        "foreign-scope row must never be acknowledged"
+    );
+    assert!(
+        matches!(
+            report.stop_reason,
+            Some(SyncStopReason::DefinitiveRejection { .. })
+        ),
+        "pass must halt on definitive rejection without advancing or deleting foreign rows"
+    );
+
+    let _ = shutdown_tx.send(());
 }
