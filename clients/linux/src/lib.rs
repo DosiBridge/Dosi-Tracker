@@ -28,7 +28,8 @@ pub use consent::{
 };
 pub use credentials::{
     CredentialError, CredentialStore, CredentialStoreKind, Credentials, FileCredentialStore,
-    InMemoryCredentialStore, SecretServiceStore,
+    InMemoryCredentialStore, MockSecretServiceTransport, SecretServiceStore,
+    SecretServiceTransport,
 };
 pub use diagnostics::{
     ArchitecturalSupport, CapabilityDiagnosis, DiagnosticStatus, DoctorReport, SessionEnvironment,

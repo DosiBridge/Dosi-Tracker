@@ -836,3 +836,53 @@ fn main() -> ExitCode {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dosi_tracker_linux::credentials::{CredentialStoreKind, SecretServiceStore};
+
+    #[test]
+    fn test_secret_service_store_constructor_wiring_and_all_targets_guard() {
+        // Direct constructor compilation and instantiation guard covering native binary and all-target builds
+        // (Guards against regressions of CI run40076700975 / job120821470972)
+        let store = SecretServiceStore::new("dosi-tracker");
+        assert_eq!(store.application(), "dosi-tracker");
+        assert_eq!(store.kind(), CredentialStoreKind::SecretService);
+    }
+
+    #[test]
+    fn test_resolve_credential_store_explicit_path_and_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let custom_path = temp.path().join("explicit_creds.json");
+        let custom_str = custom_path.to_str().unwrap();
+
+        // Explicit credentials file always yields FileFallback pointing to custom path
+        let store = resolve_credential_store(Some(custom_str), false).unwrap();
+        assert_eq!(store.kind(), CredentialStoreKind::FileFallback);
+
+        // Explicit fallback_file=true always yields FileFallback pointing to default path
+        let fallback_store = resolve_credential_store(None, true).unwrap();
+        assert_eq!(fallback_store.kind(), CredentialStoreKind::FileFallback);
+    }
+
+    #[test]
+    fn test_resolve_credential_store_default_routing() {
+        // Without explicit credentials file or fallback flag:
+        // On Linux with DBUS_SESSION_BUS_ADDRESS present -> SecretService
+        // Otherwise -> FileFallback
+        let resolved = resolve_credential_store(None, false).unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some() {
+                assert_eq!(resolved.kind(), CredentialStoreKind::SecretService);
+            } else {
+                assert_eq!(resolved.kind(), CredentialStoreKind::FileFallback);
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(resolved.kind(), CredentialStoreKind::FileFallback);
+        }
+    }
+}

@@ -11,7 +11,7 @@ Lightweight, privacy-first, rootless desktop agent foundation for Linux written 
 | **Telemetry Adapters** | `NOT_IMPLEMENTED` | Truthfully diagnosed via `doctor [--json]`; no synthetic or fake telemetry (Phase 2) |
 | **Privilege Model** | Strictly Rootless | Runs as normal user. Refuses `sudo`, `root`, `setuid`, `evdev`, and `uinput` |
 | **Offline Storage** | Transactional SQLite | Durable outbox queue with raw identity bounding and read-only inspection |
-| **Credential Store** | SecretService + 0600 Fallback | Scoped `(account, workspace)` store; SecretService primary, owner-only 0600 file fallback with explicit doctor warning |
+| **Credential Store** | SecretService + 0600 Fallback | Scoped `(application, account, workspace)` store; Freedesktop SecretService (`org.freedesktop.secrets` over session D-Bus) with mock transport injection seam (`SecretServiceTransport`) for deterministic protocol testing; owner-only 0600 file fallback with explicit doctor warning |
 | **Transport & Auth** | Real HTTP Delivery Transport | Reqwest rustls, OpenIddict password grant (`POST /connect/token`), pre-expiry refresh, bounded 401 retry, activity upload, heartbeat |
 | **Payload Signing** | HMAC-SHA256 (32 bytes) | URL_SAFE_NO_PAD base64url tag over canonical JSON, mirroring Windows byte semantics and test vectors |
 | **CI Gate** | Dedicated GitHub Action | `linux-agent` job in `.github/workflows/ci.yml` running on `ubuntu-latest` |
@@ -162,7 +162,7 @@ cargo run --bin dosi-tracker-linux -- --version
   - Graceful recoverable mutex poisoning handling in outbox (`OutboxError::LockPoisoned`).
   - Documentation and test count synchronization across repository.
 - **Phase 1 (Delivered Foundation: Identity, Real Transport, Signed Queue)**:
-  - Freedesktop Secret Service credential storage per account and workspace with owner-only `0600` private file fallback.
+  - Freedesktop Secret Service credential storage per account and workspace over session D-Bus (`org.freedesktop.secrets`) matching standard `SearchItems`, `OpenSession`, `Unlock`, `GetSecret`, `CreateItem`, and `Delete` interfaces with fail-closed prompt handling, accompanied by `SecretServiceTransport` injected seam and `MockSecretServiceTransport` protocol fake for deterministic testing without live keyring access; owner-only `0600` private file fallback with atomic replacement durability and explicit `doctor` diagnostic warning.
   - OpenIddict OAuth2 password grant authentication (`POST /connect/token`, `client_id=Tracker_App`, `scope=Tracker`, `__tenant` workspace parameter).
   - Pre-expiry token refresh buffer (60s early renewal) and bounded 401 retry / re-authentication.
   - Per-device 32-byte HMAC-SHA256 payload signing matching Windows byte semantics (`URL_SAFE_NO_PAD` base64url tag).

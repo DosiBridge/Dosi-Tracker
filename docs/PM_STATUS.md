@@ -2978,7 +2978,7 @@ Following supervisory code review of commit `73f6aa3`, the following targeted co
 |---|---|---|:---:|:---:|:---:|---|
 | **Local Host** | `rustc 1.97.1` (`x86_64-pc-windows-msvc`) | `cargo fmt --check --manifest-path clients/linux/Cargo.toml` | Formatting check | PASSED | **0** | Clean, 0 diffs. |
 | **Local Host** | `rustc 1.97.1` (`x86_64-pc-windows-msvc`) | `cargo clippy --manifest-path clients/linux/Cargo.toml --locked --all-targets -- -D warnings` | Clippy lint check | PASSED | **0** | Clean, 0 warnings, 0 errors. |
-| **Local Host** | `rustc 1.97.1` (`x86_64-pc-windows-msvc`) | `cargo test --manifest-path clients/linux/Cargo.toml --locked --release` | Full release test suite | PASSED | **0** | 135 tests passed across 9 suites (55 lib, 0 main, 6 doctor, 7 identity/signing/transport, 7 repro, 3 installer lifecycle, 15 outbox status, 29 outbox, 13 sync). |
+| **Local Host** | `rustc 1.97.1` (`x86_64-pc-windows-msvc`) | `cargo test --manifest-path clients/linux/Cargo.toml --locked --release` | Full release test suite | PASSED | **0** | 148 tests passed across 9 suites (63 lib, 3 main, 8 doctor, 7 identity/signing/transport, 7 repro, 3 installer lifecycle, 15 outbox status, 29 outbox, 13 sync). |
 | **Local Host** | `rustc 1.97.1` (`x86_64-pc-windows-msvc`) | `cargo test --manifest-path clients/linux/Cargo.toml --test cli_identity_transport_signing_tests` | E2E integration slice | PASSED | **0** | 7 tests passed: login->status->logout lifecycle, missing credential fail-closed non-creation, queue depth reporting, signed block delivery with ack deletion via `from_store`, mid-upload 502 error retention, mid-upload TCP socket interruption retention with bounded waits, failed login fail-closed negative path. |
 
 ### C. Phase 1 Native Linux Compile Defect Correction (`TASK linux-phase1-native-libc-correction-20261024`)
@@ -2989,12 +2989,28 @@ During independent native CI execution on GitHub Actions (`ubuntu-latest` runner
   1. Declared direct Unix dependency `[target.'cfg(unix)'.dependencies] libc = "0.2"` in `clients/linux/Cargo.toml`.
   2. Synchronized `clients/linux/Cargo.lock` by recording `libc` under `dosi-tracker-linux` dependencies, preserving existing locked `libc` version 0.2.191 and checksum without external network calls, keeping `--locked` verification fully compliant.
   3. Added regression test `test_file_credential_store_validation_and_ownership_invariants` in `src/credentials.rs`, which directly asserts `validate_target_file` path validation, and under `#[cfg(unix)]` exercises `libc::geteuid()`, `0600` permissions, and fail-closed rejection of `0666` permissions.
-- **Target OS & Verification Evidence**:
-  - Local host verification performed on target `x86_64-pc-windows-msvc` (Rust 1.97.1).
-  - All 135 release tests passed across 9 suites (55 lib, 0 main, 6 doctor, 7 identity/signing/transport, 7 repro, 3 installer lifecycle, 15 outbox status, 29 outbox, 13 sync).
-  - Native Linux runner execution gate on `mh-ubuntu` / GitHub Actions CI remains open pending execution.
 
-### D. Phase 1 Acceptance & Open Roadmap
+### D. Phase 1 SecretService Native & Protocol Seam Correction (`TASK linux-phase1-secretservice-native-correction-20261024`)
+Following clean delivery `562a92cfabb2fd2d7cef4bc403574f79e1d85ecf`, independent source review and fresh native Linux CI run `40076700975` / job `120821470972` identified two blockers within the Phase 1 credential identity lane:
+1. **Blocker 1 (Constructor Wiring Mismatch & Regression Guard)**:
+   - **Raw CI Error**: `error[E0061]: this function takes 0 arguments but 1 argument was supplied` at `src/main.rs:173:39` where `resolve_credential_store` called `SecretServiceStore::new("dosi-tracker")` while `credentials.rs:490` defined `new()` with 0 arguments. Windows host tests missed this because the call was gated behind `#[cfg(target_os = "linux")]`.
+   - **Correction**: Aligned constructor to `SecretServiceStore::new(application: impl Into<String>)` on all targets and implemented `Default` calling `Self::new("dosi-tracker")`. Added binary unit test `test_secret_service_store_constructor_wiring_and_all_targets_guard` in `main.rs` that compiles and executes on all targets, preventing constructor signature drift.
+2. **Blocker 2 (Real Freedesktop SecretService Backend & Injected Protocol Seam)**:
+   - **Defect**: `SecretServiceStore.load/save/clear` returned unconditional `SecretServiceUnavailable` errors despite comments claiming a real lookup.
+   - **Correction**:
+     - Implemented `SecretServiceTransport` trait decoupling Secret Service D-Bus calls from the high-level store.
+     - Implemented `ZbusSecretServiceTransport` under `#[cfg(target_os = "linux")]` over session D-Bus (`org.freedesktop.secrets`), matching standard Freedesktop Secret Service specifications v0.2: `SearchItems`, `OpenSession` (`"plain"`), `Unlock`, `GetSecret`, `CreateItem`, and `Delete`.
+     - Scoped persistence using exact attributes: `application`, `account_id` (normalized lowercase trimmed), and `workspace_id`.
+     - Fail-closed prompt security invariant: Evaluated object paths returned by `Unlock`, `CreateItem`, and `Delete`; if `prompt != "/"`, fails closed immediately with `SecretServiceUnavailable`, preventing unattended interactive unlock dialogs.
+     - Zero secret leaks: All errors and debug representations redact tokens, passwords, and raw keys.
+     - Deterministic testing seam: Implemented `MockSecretServiceTransport` providing protocol-shaped in-memory fake with lock, prompt-required, corrupt-payload, and daemon-unavailable injection hooks. Tests never touch real keyrings or session busses.
+     - Explicit fallback & truthful diagnostics: Maintained owner-only `0600` file fallback with explicit warning in `doctor`; never silently downgrades after SecretService errors.
+3. **Target OS & Verification Evidence**:
+   - Host verification performed on `x86_64-pc-windows-msvc` (Rust 1.97.1).
+   - 148 release tests passed across 9 suites (63 lib, 3 main, 8 doctor, 7 identity/signing/transport, 7 repro, 3 installer lifecycle, 15 outbox status, 29 outbox, 13 sync).
+   - Native Linux CI runner execution gate on `mh-ubuntu` / GitHub Actions CI remains open pending execution.
+
+### E. Phase 1 Acceptance & Open Roadmap
 - **Phase 1 Status**: **DELIVERED & VERIFIED IN ISOLATED FIXTURES; NATIVE RUNNER QA PENDING**.
 - **Production Readiness Claim**: None. This delivery provides identity, transport, and signing foundation only. Capture adapters (Phase 2), capture worker loops (Phase 3), and package distribution (Phase 4) remain open.
 

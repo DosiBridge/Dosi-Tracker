@@ -214,3 +214,68 @@ fn cli_unknown_subcommand_exits_failure() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("Unknown command or option: start-tracking"));
 }
+
+#[test]
+fn cli_doctor_reports_truthful_credential_store_fallback_and_warning() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home_dummy");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_dosi-tracker-linux"))
+        .args(["doctor", "--json"])
+        .env("HOME", &home)
+        .env_remove("DBUS_SESSION_BUS_ADDRESS")
+        .output()
+        .expect("failed to execute binary");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let report: DoctorReport = serde_json::from_str(&stdout).expect("Valid JSON");
+
+    let cred_diag = report
+        .credential_store
+        .expect("Credential store diagnosis must be present");
+    assert_eq!(cred_diag.backend, "FileFallback");
+    assert!(cred_diag.fallback_active);
+    let warning = cred_diag
+        .warning
+        .expect("FileFallback must emit an explicit warning");
+    assert!(warning.contains("WARNING: File credential store fallback active"));
+    assert!(warning.contains("Freedesktop SecretService is recommended"));
+}
+
+#[test]
+fn cli_doctor_reports_secret_service_when_dbus_present_on_linux() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home_dummy");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_dosi-tracker-linux"))
+        .args(["doctor", "--json"])
+        .env("HOME", &home)
+        .env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            "unix:path=/tmp/mock-test-session-bus",
+        )
+        .output()
+        .expect("failed to execute binary");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let report: DoctorReport = serde_json::from_str(&stdout).expect("Valid JSON");
+
+    let cred_diag = report
+        .credential_store
+        .expect("Credential store diagnosis must be present");
+
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(cred_diag.backend, "SecretService");
+        assert!(!cred_diag.fallback_active);
+        assert_eq!(cred_diag.warning, None);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        assert_eq!(cred_diag.backend, "FileFallback");
+        assert!(cred_diag.fallback_active);
+    }
+}

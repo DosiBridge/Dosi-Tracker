@@ -26,7 +26,6 @@ base64 = "0.22"
 hmac = "0.12"
 sha2 = "0.10"
 rand = { version = "0.8", features = ["getrandom"] }
-zbus = { version = "4", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = { version = "4" }
