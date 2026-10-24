@@ -148,7 +148,7 @@ cargo run --bin dosi-tracker-linux -- --version
 | **Running Applications** | Supported via `/proc` enumeration | Supported via `/proc` enumeration | Planned Phase 2 |
 | **Webcam Photo** | Supported via V4L2 (`/dev/video*`) | Supported via V4L2 / PipeWire camera portal | Planned Phase 2 |
 | **Credential Storage** | Freedesktop Secret Service (D-Bus) | Freedesktop Secret Service (D-Bus) | **Delivered in Phase 1** (owner-only 0600 file fallback with warning) |
-| **Backend Sync & Transport** | Real HTTP Delivery Transport | Real HTTP Delivery Transport | **Delivered in Phase 1** (`POST /api/app/activity`, exact ack delete) |
+| **Backend Sync & Transport** | Real HTTP Delivery Transport | Real HTTP Delivery Transport | **Delivered in Phase 1** (Library transport `HttpDeliveryTransport::from_store` / `from_credentials` reusing persisted login credentials; background daemon loop is Phase 3, CLI queue flush command is Phase 4) |
 | **Payload Signing** | HMAC-SHA256 (32 bytes) | HMAC-SHA256 (32 bytes) | **Delivered in Phase 1** (Windows byte semantics parity) |
 
 ---
@@ -161,14 +161,16 @@ cargo run --bin dosi-tracker-linux -- --version
   - Safe scoped SQLite progress handler wrapper (`ScopedProgressHandler`) with guaranteed RAII deregistration.
   - Graceful recoverable mutex poisoning handling in outbox (`OutboxError::LockPoisoned`).
   - Documentation and test count synchronization across repository.
-- **Phase 1 (Delivered: Identity, Real Transport, Signed Queue)**:
+- **Phase 1 (Delivered Foundation: Identity, Real Transport, Signed Queue)**:
   - Freedesktop Secret Service credential storage per account and workspace with owner-only `0600` private file fallback.
   - OpenIddict OAuth2 password grant authentication (`POST /connect/token`, `client_id=Tracker_App`, `scope=Tracker`, `__tenant` workspace parameter).
   - Pre-expiry token refresh buffer (60s early renewal) and bounded 401 retry / re-authentication.
   - Per-device 32-byte HMAC-SHA256 payload signing matching Windows byte semantics (`URL_SAFE_NO_PAD` base64url tag).
   - Concrete `HttpDeliveryTransport` implementing `DeliveryTransport` contract with exact ack deletion, transient failure retention and retry counter incrementation, auth-required halt, and mismatched ack halt.
+  - Production transport initialization from persisted credentials (`HttpDeliveryTransport::from_store` / `from_credentials`), proving production upload reuses credentials, tokens, and signing key saved by CLI `login`.
   - Heartbeat presence primitive (`POST /api/app/presence/heartbeat`) on 60s cadence.
   - Non-mutating CLI commands: `login`, `logout`, `status [--json]`.
+  - *Evidence & Boundaries:* Verified via persisted-session library integration (`SyncPassCoordinator` + `HttpDeliveryTransport::from_store`) using credentials saved by CLI `login`, with deterministic mid-upload HTTP 502 response and TCP socket interruption tests. Automated background daemon loop belongs to Phase 3; CLI queue flush command belongs to Phase 4. Independent native QA remains pending.
 - **Phase 2 (Native Consent-Gated Capture Adapters - OPEN)**:
   - X11 active window detection (`_NET_ACTIVE_WINDOW`) and XInput2 activity counters.
   - Wayland portal ScreenCast via PipeWire (`ashpd`) with explicit user-prompted capture sessions.

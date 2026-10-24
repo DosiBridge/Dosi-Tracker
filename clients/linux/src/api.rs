@@ -21,6 +21,7 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex as TokioMutex;
 
+use crate::credentials::{CredentialStore, Credentials};
 use crate::outbox::{ActivityEnvelope, OutboxEntry};
 use crate::signing::sign_activity_envelope;
 use crate::sync::{DeliveryOutcome, DeliveryTransport};
@@ -592,6 +593,70 @@ impl ApiClient {
         self
     }
 
+    /// Constructs an `ApiClient` directly from persisted credentials.
+    ///
+    /// Reuses persisted tokens, workspace scope, device signing key, and server URL
+    /// without requiring re-prompting for raw passwords.
+    pub fn from_credentials(creds: &Credentials) -> Result<Self, String> {
+        let base_url = creds
+            .server_url
+            .as_deref()
+            .unwrap_or("https://api.dosi-tracker.com");
+        let mut client = Self::new(
+            base_url,
+            creds.account_id.clone(),
+            creds.password.clone().unwrap_or_default(),
+        );
+        if let Some(ref ws) = creds.workspace_id {
+            client = client.with_workspace(Some(ws.clone()));
+        }
+        if let Some(ref key) = creds.device_signing_key {
+            let key_bytes: [u8; 32] = key
+                .as_slice()
+                .try_into()
+                .map_err(|_| "Invalid device signing key length: expected 32 bytes".to_string())?;
+            client = client.with_signing_key(Some(key_bytes));
+        }
+
+        let cell = TokenCell::with_refresh_token(creds.refresh_token.clone());
+        if let Some(ref access_token) = creds.access_token {
+            if let Some(expires_at) = creds.access_token_expires_at {
+                let now = Utc::now();
+                if expires_at > now {
+                    let remaining_secs = (expires_at - now).num_seconds().max(0) as u64;
+                    cell.set(GrantedToken {
+                        access_token: access_token.clone(),
+                        refresh_token: creds.refresh_token.clone(),
+                        expires_at: Instant::now() + Duration::from_secs(remaining_secs),
+                    });
+                }
+            }
+        }
+        client = client.with_tokens(cell);
+        Ok(client)
+    }
+
+    /// Loads credentials from the specified store and constructs an `ApiClient`.
+    pub fn from_store(
+        store: &dyn CredentialStore,
+        account_id: &str,
+        workspace_id: Option<&str>,
+    ) -> Result<Self, String> {
+        let creds = store
+            .load(account_id, workspace_id)
+            .map_err(|e| format!("Failed to load credentials from store: {e}"))?
+            .ok_or_else(|| {
+                "No stored credentials found for the specified account and workspace".to_string()
+            })?;
+        Self::from_credentials(&creds)
+    }
+
+    /// Overrides or sets the target API server base URL.
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = base_url.into().trim().trim_end_matches('/').to_string();
+        self
+    }
+
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
@@ -943,6 +1008,22 @@ impl HttpDeliveryTransport {
             sender: tx,
             worker: Some(handle),
         }
+    }
+
+    /// Constructs an `HttpDeliveryTransport` from persisted credentials.
+    pub fn from_credentials(creds: &Credentials) -> Result<Self, String> {
+        let client = ApiClient::from_credentials(creds)?;
+        Ok(Self::new(client))
+    }
+
+    /// Loads credentials from the specified store and constructs an `HttpDeliveryTransport`.
+    pub fn from_store(
+        store: &dyn CredentialStore,
+        account_id: &str,
+        workspace_id: Option<&str>,
+    ) -> Result<Self, String> {
+        let client = ApiClient::from_store(store, account_id, workspace_id)?;
+        Ok(Self::new(client))
     }
 }
 
@@ -1390,5 +1471,45 @@ mod tests {
         let pending = outbox.peek_pending(&scope, 1).unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].retry_count, 1);
+    }
+
+    #[test]
+    fn test_api_client_from_credentials_and_store() {
+        use crate::credentials::InMemoryCredentialStore;
+
+        let store = InMemoryCredentialStore::new();
+        let mut creds = Credentials::new("store-user@dosi.test", Some("stored-pw".into()));
+        creds.workspace_id = Some("ws-from-store".into());
+        creds.server_url = Some("http://api.stored.local".into());
+        creds.device_signing_key = Some(vec![99u8; 32]);
+        creds.access_token = Some("valid-tok-123".into());
+        creds.access_token_expires_at = Some(Utc::now() + chrono::Duration::seconds(1800));
+        creds.refresh_token = Some("ref-tok-456".into());
+        store.save(&creds).unwrap();
+
+        let client =
+            ApiClient::from_store(&store, "store-user@dosi.test", Some("ws-from-store")).unwrap();
+        assert_eq!(client.base_url(), "http://api.stored.local");
+        assert_eq!(client.username(), "store-user@dosi.test");
+        assert_eq!(client.workspace_id(), Some("ws-from-store"));
+        assert_eq!(
+            client.tokens().valid_access_token().as_deref(),
+            Some("valid-tok-123")
+        );
+        assert_eq!(
+            client.tokens().refresh_token().as_deref(),
+            Some("ref-tok-456")
+        );
+
+        let transport = HttpDeliveryTransport::from_store(
+            &store,
+            "store-user@dosi.test",
+            Some("ws-from-store"),
+        );
+        assert!(transport.is_ok());
+
+        // Negative check: missing scope in store returns Err
+        let missing = ApiClient::from_store(&store, "store-user@dosi.test", Some("ws-nonexistent"));
+        assert!(missing.is_err());
     }
 }

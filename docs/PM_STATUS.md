@@ -2955,9 +2955,10 @@ Phase 1 implements secure credential storage, OpenIddict authentication, pre-exp
    - Bounded timeouts: Connect (10s), general request (30s), upload (120s), heartbeat (10s).
    - Pre-expiry renewal: Access tokens are renewed using refresh tokens 60 seconds before expiration.
    - Bounded 401 retry: On HTTP 401, attempts token refresh once and retries the request once; halts with `AuthRequired` if re-authentication fails.
+   - Production transport initialization from persisted credentials (`HttpDeliveryTransport::from_store` / `from_credentials` and `ApiClient::from_store` / `from_credentials`): Loads persisted credentials, token, workspace ID, device signing key, and server URL from the store populated by CLI `login`, proving production upload reuses persisted login credentials without independent password reconstruction.
    - Dedicated worker transport (`HttpDeliveryTransport`): Implements `DeliveryTransport` via an isolated worker thread with a single-thread Tokio runtime. Prevents runtime-nesting panics and guarantees the SQLite connection mutex is NEVER held during network delivery.
    - Exact acknowledgement deletion: Deletes queued records from local SQLite outbox only when backend positively acknowledges the exact `client_activity_id`.
-   - Outage & failure handling: Transient failures (5xx, network drops, timeouts) retain rows and increment `retry_count`; definitive rejections (400 validation, 409 conflict, 422) halt the pass while preserving entries; mismatched acks halt immediately.
+   - Outage & failure handling: Transient failures (5xx, network drops, timeouts, socket interruption) retain rows and increment `retry_count`; definitive rejections (400 validation, 409 conflict, 422) halt the pass while preserving entries; mismatched acks halt immediately.
 
 5. **CLI Subcommands (`clients/linux/src/main.rs`)**:
    - `login`: Authenticates with backend and securely saves credentials with signing key.
@@ -2965,16 +2966,24 @@ Phase 1 implements secure credential storage, OpenIddict authentication, pre-exp
    - `status [--json]`: Read-only inspection of account, workspace, token validity, signing key status, and optional queue depth (`--db`). Pure inspection never creates files or directories.
    - `doctor [--json]`: Reports credential storage backend status and emits warning if file fallback is active.
 
-### B. Phase 1 Verification Evidence
+### B. Phase 1 Bounded Correction & Verification Evidence (`TASK linux-phase1-interruption-correction-20261024`)
+Following supervisory code review of commit `73f6aa3`, the following targeted corrections were implemented:
+1. **Socket Interruption Coverage**: Separated canned 502 error test (`test_end_to_end_mid_upload_server_502_error_retains_row_and_increments_retry`) under truthful naming, and added deterministic local-loopback TCP socket interruption test (`test_end_to_end_mid_upload_socket_interruption_retains_row_and_increments_retry`) where the server observes upload bytes and drops the connection before sending any HTTP response. Enforces bounded timeouts (5s read, 10s channel), thread join, no acknowledged deletion, original scoped row retention with identical payload/identity, exact `retry_count` increment by 1, and cross-scope sentinel row immutability.
+2. **Subprocess Invariant Assertions**: Every subprocess invocation (`login`, `status`, `logout`) in `cli_identity_transport_signing_tests.rs` explicitly asserts expected exit status codes (`assert!(out.status.success())`) with credential-redacted diagnostics.
+3. **Failed Login Negative-Path Regression**: Added `test_failed_login_fails_closed_and_cannot_be_counted_as_delivery_evidence`, proving invalid credentials yield exit code 1, zero credential writes to disk, fail-closed `status`, failure to initialize transport, and zero mutation or deletion of queued outbox activities.
+4. **Persisted-Session Transport Reuse**: Upload tests construct `HttpDeliveryTransport::from_store(&store, ...)`, proving production delivery reuses the persisted login session, access/refresh tokens, workspace scope, and signing key saved by CLI `login`.
+5. **Truthful Evidence Scope**: Formally disclosed as persisted-session library integration evidence (`SyncPassCoordinator` + `HttpDeliveryTransport::from_store`). Background daemon loop belongs to Phase 3; CLI queue flush command belongs to Phase 4.
+
 | Execution Environment | Toolchain / Target | Command Executed | Tests / Steps | Result | Exit Code | Provenance Details |
 |---|---|---|:---:|:---:|:---:|---|
 | **Local Host** | `rustc 1.97.1` (x86_64) | `cargo fmt --check --manifest-path clients/linux/Cargo.toml` | Formatting check | PASSED | **0** | Clean, 0 diffs. |
 | **Local Host** | `rustc 1.97.1` (x86_64) | `cargo clippy --manifest-path clients/linux/Cargo.toml --locked --all-targets -- -D warnings` | Clippy lint check | PASSED | **0** | Clean, 0 warnings, 0 errors. |
-| **Local Host** | `rustc 1.97.1` (x86_64) | `cargo test --manifest-path clients/linux/Cargo.toml --locked --release` | Full release test suite | PASSED | **0** | 131 tests passed across 9 suites (53 lib, 0 main, 6 doctor, 5 identity/signing/transport, 7 repro, 3 installer lifecycle, 15 outbox status, 29 outbox, 13 sync). |
-| **Local Host** | `rustc 1.97.1` (x86_64) | `cargo test --manifest-path clients/linux/Cargo.toml --test cli_identity_transport_signing_tests` | E2E integration slice | PASSED | **0** | 5 tests passed: login->status->logout lifecycle, missing credential fail-closed without file creation, status queue depth inspection, signed block upload with exact ack deletion, mid-upload outage row retention and retry increment. |
+| **Local Host** | `rustc 1.97.1` (x86_64) | `cargo test --manifest-path clients/linux/Cargo.toml --locked --release` | Full release test suite | PASSED | **0** | 134 tests passed across 9 suites (54 lib, 0 main, 6 doctor, 7 identity/signing/transport, 7 repro, 3 installer lifecycle, 15 outbox status, 29 outbox, 13 sync). |
+| **Local Host** | `rustc 1.97.1` (x86_64) | `cargo test --manifest-path clients/linux/Cargo.toml --test cli_identity_transport_signing_tests` | E2E integration slice | PASSED | **0** | 7 tests passed: login->status->logout lifecycle, missing credential fail-closed non-creation, queue depth reporting, signed block delivery with ack deletion via `from_store`, mid-upload 502 error retention, mid-upload TCP socket interruption retention with bounded waits, failed login fail-closed negative path. |
 
 ### C. Phase 1 Acceptance & Open Roadmap
-- **Phase 1 Status**: **DELIVERED & VERIFIED IN ISOLATED FIXTURES**.
+- **Phase 1 Status**: **DELIVERED & VERIFIED IN ISOLATED FIXTURES; NATIVE RUNNER QA PENDING**.
 - **Production Readiness Claim**: None. This delivery provides identity, transport, and signing foundation only. Capture adapters (Phase 2), capture worker loops (Phase 3), and package distribution (Phase 4) remain open.
+
 
 
