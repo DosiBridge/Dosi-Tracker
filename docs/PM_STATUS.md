@@ -3010,7 +3010,28 @@ Following clean delivery `562a92cfabb2fd2d7cef4bc403574f79e1d85ecf`, independent
    - 148 release tests passed across 9 suites (63 lib, 3 main, 8 doctor, 7 identity/signing/transport, 7 repro, 3 installer lifecycle, 15 outbox status, 29 outbox, 13 sync).
    - Native Linux CI runner execution gate on `mh-ubuntu` / GitHub Actions CI remains open pending execution.
 
-### E. Phase 1 Acceptance & Open Roadmap
+### E. Phase 1 SecretService Connection Lifetime & Caller-Bound Session Validation (`TASK phase1-user-renewed-final-20261024`)
+Independent review and testing on `mh-ubuntu` verified that commit `f7fcccd` passed all 152 tests. However, production SecretService session semantics had an architectural defect:
+1. **Defect (Stateless Connection Drops & Caller-Bound Session Rejection)**:
+   - In `clients/linux/src/credentials.rs`, `ZbusSecretServiceTransport` was stateless and opened a fresh `Connection::session()` per method call.
+   - Under the Freedesktop Secret Service specification, `OpenSession` returns an object path bound to the unique D-Bus connection name of the calling client (e.g. `:1.42`).
+   - When the connection dropped before subsequent `GetSecret` or `CreateItem` invocations, the next method call connected under a new unique bus name (e.g. `:1.43`), causing the Secret Service daemon to reject the request due to caller connection mismatch or expired session.
+   - Furthermore, `MockSecretServiceTransport` lacked caller ownership and disconnect simulation, allowing tests to pass without modeling real caller-connection binding.
+2. **Production Fix & Invariants**:
+   - `SecretServiceTransport` trait: Added `close_session(&self, session_path: &str) -> Result<(), CredentialError>`.
+   - `ZbusSecretServiceTransport`: Converted to retain connection and session lifetime across actual scoped operations. Added `connection: Mutex<Option<zbus::blocking::Connection>>` and optional `custom_address: Option<String>`. Reuses the active connection handle across all methods (`search_items`, `unlock`, `open_session`, `get_secret`, `create_item`, `delete_item`, `close_session`), preserving `Send + Sync`.
+   - `MockSecretServiceTransport`: Added deterministic caller-connection tracking via `sessions: Mutex<HashMap<String, MockSession>>` where `MockSession { owner_caller: String, active: bool }`, `current_caller: Mutex<String>`, `set_current_caller`, and `simulate_caller_disconnect`. Enforces session existence, active status, and matching caller ownership on `get_secret` and `create_item`.
+   - Session Lifecycle Hygiene: Updated `SecretServiceStore::load` and `SecretServiceStore::save` to always cleanly close the open session via `self.transport.close_session(&session_path)` before returning.
+   - Unit Test Regression: Added `test_secret_service_store_caller_connection_ownership_and_disconnect_rejection` in `src/credentials.rs` verifying caller disconnect rejection, closed session rejection, and prompt session closure after CRUD.
+   - Linux Real-zbus Private Bus Regression Suite: Created `clients/linux/tests/secret_service_linux_tests.rs` (`#![cfg(target_os = "linux")]`) using an ephemeral `dbus-daemon` on a private UNIX socket (`PrivateTestBus`). Serves a fake Secret Service daemon checking `#[zbus(header)] header: Header<'_>` caller unique bus names, rejecting mismatched or disconnected callers, and verifying production `SecretServiceStore` CRUD lifecycle, update, clear, and cross-scope retention.
+3. **Target OS & Verification Evidence**:
+   - Windows Host (`rustc 1.97.1`, `x86_64-pc-windows-msvc`):
+     - `cargo fmt --manifest-path clients/linux/Cargo.toml -- --check`: PASSED (exit 0).
+     - `cargo clippy --manifest-path clients/linux/Cargo.toml --locked --all-targets -- -D warnings`: PASSED (exit 0, 0 warnings).
+     - `cargo test --manifest-path clients/linux/Cargo.toml --locked --release`: PASSED (exit 0). 149 release tests passed across 10 test binaries (64 lib [including new caller-ownership unit test], 3 main, 8 doctor, 7 identity/transport, 7 repro, 3 installer lifecycle, 15 outbox status, 29 outbox, 0 secret_service_linux_tests [Linux-gated], 13 sync).
+   - Native Linux Execution: Reserved for independent native acceptance by Hermes / CI runner on `mh-ubuntu`.
+
+### F. Phase 1 Acceptance & Open Roadmap
 - **Phase 1 Status**: **DELIVERED & VERIFIED IN ISOLATED FIXTURES; NATIVE RUNNER QA PENDING**.
 - **Production Readiness Claim**: None. This delivery provides identity, transport, and signing foundation only. Capture adapters (Phase 2), capture worker loops (Phase 3), and package distribution (Phase 4) remain open.
 

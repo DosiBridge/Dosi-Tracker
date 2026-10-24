@@ -516,6 +516,9 @@ pub trait SecretServiceTransport: Send + Sync + fmt::Debug {
 
     /// Delete an item by object path.
     fn delete_item(&self, item_path: &str) -> Result<(), CredentialError>;
+
+    /// Close an open session.
+    fn close_session(&self, session_path: &str) -> Result<(), CredentialError>;
 }
 
 /// Freedesktop Secret Service backend store over D-Bus (`org.freedesktop.secrets`).
@@ -612,26 +615,30 @@ impl CredentialStore for SecretServiceStore {
 
         let session_path = self.transport.open_session()?;
 
-        for item_path in &unlocked {
-            let secret_bytes = self.transport.get_secret(item_path, &session_path)?;
-            if secret_bytes.is_empty() {
-                continue;
-            }
-            let creds: Credentials = serde_json::from_slice(&secret_bytes).map_err(|e| {
-                CredentialError::Serialization(format!(
-                    "Corrupt secret payload in Secret Service: {e}"
-                ))
-            })?;
+        let result = (|| {
+            for item_path in &unlocked {
+                let secret_bytes = self.transport.get_secret(item_path, &session_path)?;
+                if secret_bytes.is_empty() {
+                    continue;
+                }
+                let creds: Credentials = serde_json::from_slice(&secret_bytes).map_err(|e| {
+                    CredentialError::Serialization(format!(
+                        "Corrupt secret payload in Secret Service: {e}"
+                    ))
+                })?;
 
-            // Scoping validation: verify identity and workspace match query exactly
-            let cred_acc = creds.account_id.trim().to_lowercase();
-            let cred_ws = creds.workspace_id.as_ref().map(|w| w.trim().to_string());
-            if cred_acc == norm_acc && cred_ws == norm_ws {
-                return Ok(Some(creds));
+                // Scoping validation: verify identity and workspace match query exactly
+                let cred_acc = creds.account_id.trim().to_lowercase();
+                let cred_ws = creds.workspace_id.as_ref().map(|w| w.trim().to_string());
+                if cred_acc == norm_acc && cred_ws == norm_ws {
+                    return Ok(Some(creds));
+                }
             }
-        }
+            Ok(None)
+        })();
 
-        Ok(None)
+        let _ = self.transport.close_session(&session_path);
+        result
     }
 
     fn save(&self, credentials: &Credentials) -> Result<(), CredentialError> {
@@ -652,13 +659,16 @@ impl CredentialStore for SecretServiceStore {
             None => format!("Dosi-Tracker ({norm_acc})"),
         };
 
-        self.transport.create_item(
+        let create_res = self.transport.create_item(
             &label,
             &attrs,
             &session_path,
             &secret_bytes,
             true, // replace existing item with matching attributes
-        )?;
+        );
+
+        let _ = self.transport.close_session(&session_path);
+        create_res?;
 
         Ok(())
     }
@@ -745,17 +755,31 @@ impl SecretServiceTransport for UnsupportedSecretServiceTransport {
             "Freedesktop Secret Service requires Linux session D-Bus".into(),
         ))
     }
+
+    fn close_session(&self, _session_path: &str) -> Result<(), CredentialError> {
+        Err(CredentialError::SecretServiceUnavailable(
+            "Freedesktop Secret Service requires Linux session D-Bus".into(),
+        ))
+    }
 }
 
 /// In-memory, deterministic protocol-shaped fake Secret Service daemon for testing without a real session bus or keyring.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MockSecretServiceTransport {
     items: Mutex<HashMap<String, MockSecretItem>>,
+    sessions: Mutex<HashMap<String, MockSession>>,
+    current_caller: Mutex<String>,
     counter: std::sync::atomic::AtomicU64,
     pub prompt_required_on_unlock: AtomicBool,
     pub prompt_required_on_create: AtomicBool,
     pub prompt_required_on_delete: AtomicBool,
     pub daemon_available: AtomicBool,
+}
+
+#[derive(Clone, Debug)]
+struct MockSession {
+    owner_caller: String,
+    active: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -766,16 +790,40 @@ struct MockSecretItem {
     locked: bool,
 }
 
+impl Default for MockSecretServiceTransport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MockSecretServiceTransport {
     pub fn new() -> Self {
         Self {
             items: Mutex::new(HashMap::new()),
+            sessions: Mutex::new(HashMap::new()),
+            current_caller: Mutex::new(":1.1".to_string()),
             counter: std::sync::atomic::AtomicU64::new(1),
             prompt_required_on_unlock: AtomicBool::new(false),
             prompt_required_on_create: AtomicBool::new(false),
             prompt_required_on_delete: AtomicBool::new(false),
             daemon_available: AtomicBool::new(true),
         }
+    }
+
+    pub fn set_current_caller(&self, caller: impl Into<String>) {
+        let mut curr = self.current_caller.lock().unwrap();
+        *curr = caller.into();
+    }
+
+    pub fn simulate_caller_disconnect(&self) {
+        let mut curr = self.current_caller.lock().unwrap();
+        let next_id = self.counter.fetch_add(1, Ordering::Relaxed);
+        *curr = format!(":1.disconnected_{next_id}");
+    }
+
+    pub fn active_session_count(&self) -> usize {
+        let sessions = self.sessions.lock().unwrap();
+        sessions.values().filter(|s| s.active).count()
     }
 
     pub fn insert_locked_item(
@@ -877,14 +925,44 @@ impl SecretServiceTransport for MockSecretServiceTransport {
             ));
         }
         let id = self.counter.fetch_add(1, Ordering::Relaxed);
-        Ok(format!("/org/freedesktop/secrets/session/{id}"))
+        let path = format!("/org/freedesktop/secrets/session/{id}");
+        let caller = self.current_caller.lock().unwrap().clone();
+        let mut sessions = self.sessions.lock().unwrap();
+        sessions.insert(
+            path.clone(),
+            MockSession {
+                owner_caller: caller,
+                active: true,
+            },
+        );
+        Ok(path)
     }
 
-    fn get_secret(&self, item_path: &str, _session_path: &str) -> Result<Vec<u8>, CredentialError> {
+    fn get_secret(&self, item_path: &str, session_path: &str) -> Result<Vec<u8>, CredentialError> {
         if !self.daemon_available.load(Ordering::Relaxed) {
             return Err(CredentialError::SecretServiceUnavailable(
                 "org.freedesktop.secrets D-Bus daemon is unavailable".into(),
             ));
+        }
+        let caller = self.current_caller.lock().unwrap().clone();
+        {
+            let sessions = self.sessions.lock().unwrap();
+            let session = sessions.get(session_path).ok_or_else(|| {
+                CredentialError::SecretServiceUnavailable(format!(
+                    "Secret Service session {session_path} does not exist"
+                ))
+            })?;
+            if !session.active {
+                return Err(CredentialError::SecretServiceUnavailable(format!(
+                    "Secret Service session {session_path} is closed"
+                )));
+            }
+            if session.owner_caller != caller {
+                return Err(CredentialError::SecretServiceUnavailable(format!(
+                    "Secret Service session {session_path} belongs to caller {} but called by {caller}",
+                    session.owner_caller
+                )));
+            }
         }
         let map = self.items.lock().unwrap();
         let item = map.get(item_path).ok_or_else(|| {
@@ -904,7 +982,7 @@ impl SecretServiceTransport for MockSecretServiceTransport {
         &self,
         label: &str,
         attributes: &HashMap<String, String>,
-        _session_path: &str,
+        session_path: &str,
         secret: &[u8],
         replace: bool,
     ) -> Result<String, CredentialError> {
@@ -912,6 +990,26 @@ impl SecretServiceTransport for MockSecretServiceTransport {
             return Err(CredentialError::SecretServiceUnavailable(
                 "org.freedesktop.secrets D-Bus daemon is unavailable".into(),
             ));
+        }
+        let caller = self.current_caller.lock().unwrap().clone();
+        {
+            let sessions = self.sessions.lock().unwrap();
+            let session = sessions.get(session_path).ok_or_else(|| {
+                CredentialError::SecretServiceUnavailable(format!(
+                    "Secret Service session {session_path} does not exist"
+                ))
+            })?;
+            if !session.active {
+                return Err(CredentialError::SecretServiceUnavailable(format!(
+                    "Secret Service session {session_path} is closed"
+                )));
+            }
+            if session.owner_caller != caller {
+                return Err(CredentialError::SecretServiceUnavailable(format!(
+                    "Secret Service session {session_path} belongs to caller {} but called by {caller}",
+                    session.owner_caller
+                )));
+            }
         }
         if self.prompt_required_on_create.load(Ordering::Relaxed) {
             return Err(CredentialError::SecretServiceUnavailable(
@@ -966,6 +1064,19 @@ impl SecretServiceTransport for MockSecretServiceTransport {
         map.remove(item_path);
         Ok(())
     }
+
+    fn close_session(&self, session_path: &str) -> Result<(), CredentialError> {
+        if !self.daemon_available.load(Ordering::Relaxed) {
+            return Err(CredentialError::SecretServiceUnavailable(
+                "org.freedesktop.secrets D-Bus daemon is unavailable".into(),
+            ));
+        }
+        let mut sessions = self.sessions.lock().unwrap();
+        if let Some(session) = sessions.get_mut(session_path) {
+            session.active = false;
+        }
+        Ok(())
+    }
 }
 
 /// Real Freedesktop Secret Service transport connecting over session D-Bus.
@@ -973,21 +1084,70 @@ impl SecretServiceTransport for MockSecretServiceTransport {
 use zbus::zvariant;
 
 #[cfg(target_os = "linux")]
-#[derive(Debug, Default)]
-pub struct ZbusSecretServiceTransport;
+#[derive(Debug)]
+pub struct ZbusSecretServiceTransport {
+    connection: Mutex<Option<zbus::blocking::Connection>>,
+    custom_address: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+impl Default for ZbusSecretServiceTransport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[cfg(target_os = "linux")]
 impl ZbusSecretServiceTransport {
     pub fn new() -> Self {
-        Self
+        Self {
+            connection: Mutex::new(None),
+            custom_address: None,
+        }
+    }
+
+    pub fn from_address(address: impl Into<String>) -> Self {
+        Self {
+            connection: Mutex::new(None),
+            custom_address: Some(address.into()),
+        }
+    }
+
+    pub fn with_connection(conn: zbus::blocking::Connection) -> Self {
+        Self {
+            connection: Mutex::new(Some(conn)),
+            custom_address: None,
+        }
     }
 
     fn connection(&self) -> Result<zbus::blocking::Connection, CredentialError> {
-        zbus::blocking::Connection::session().map_err(|e| {
-            CredentialError::SecretServiceUnavailable(format!(
-                "Failed connecting to session D-Bus: {e}"
-            ))
-        })
+        let mut guard = self.connection.lock().map_err(|_| {
+            CredentialError::SecretServiceUnavailable("Connection lock poisoned".into())
+        })?;
+        if let Some(ref conn) = *guard {
+            return Ok(conn.clone());
+        }
+        let conn = match &self.custom_address {
+            Some(addr) => zbus::blocking::connection::Builder::address(addr.as_str())
+                .map_err(|e| {
+                    CredentialError::SecretServiceUnavailable(format!(
+                        "Failed parsing D-Bus address: {e}"
+                    ))
+                })?
+                .build()
+                .map_err(|e| {
+                    CredentialError::SecretServiceUnavailable(format!(
+                        "Failed connecting to D-Bus at {addr}: {e}"
+                    ))
+                })?,
+            None => zbus::blocking::Connection::session().map_err(|e| {
+                CredentialError::SecretServiceUnavailable(format!(
+                    "Failed connecting to session D-Bus: {e}"
+                ))
+            })?,
+        };
+        *guard = Some(conn.clone());
+        Ok(conn)
     }
 }
 
@@ -1211,6 +1371,28 @@ impl SecretServiceTransport for ZbusSecretServiceTransport {
         }
 
         Ok(())
+    }
+
+    fn close_session(&self, session_path: &str) -> Result<(), CredentialError> {
+        let conn = self.connection()?;
+        let sess_obj = zvariant::OwnedObjectPath::try_from(session_path).map_err(|e| {
+            CredentialError::SecretServiceUnavailable(format!("Invalid session object path: {e}"))
+        })?;
+
+        let reply = conn.call_method(
+            Some("org.freedesktop.secrets"),
+            sess_obj,
+            Some("org.freedesktop.Secret.Session"),
+            "Close",
+            &(),
+        );
+
+        match reply {
+            Ok(_) => Ok(()),
+            Err(e) => Err(CredentialError::SecretServiceUnavailable(format!(
+                "Secret Service Close session call failed for {session_path}: {e}"
+            ))),
+        }
     }
 }
 
@@ -1670,5 +1852,59 @@ mod tests {
                 CredentialError::SecretServiceUnavailable(_)
             ));
         }
+    }
+
+    #[test]
+    fn test_secret_service_store_caller_connection_ownership_and_disconnect_rejection() {
+        let mock = Arc::new(MockSecretServiceTransport::new());
+        let store = SecretServiceStore::with_transport("dosi-tracker", mock.clone());
+
+        // 1. Save succeeds when caller connection is retained throughout operation
+        let mut cred = Credentials::new("alice@corp.com", Some("pass123".into()));
+        cred.workspace_id = Some("ws-alpha".into());
+        cred.access_token = Some("tok-123".into());
+        store.save(&cred).expect("Save should succeed");
+
+        // Sessions must be closed after save returns
+        assert_eq!(mock.active_session_count(), 0);
+
+        // 2. Load succeeds when caller connection is retained throughout operation
+        let loaded = store
+            .load("alice@corp.com", Some("ws-alpha"))
+            .expect("Load should succeed")
+            .expect("Credential should be found");
+        assert_eq!(loaded.access_token.as_deref(), Some("tok-123"));
+
+        // Sessions must be closed after load returns
+        assert_eq!(mock.active_session_count(), 0);
+
+        // 3. Simulate caller disconnect / connection change between open_session and get_secret
+        let session_path = mock.open_session().expect("open session");
+        assert_eq!(mock.active_session_count(), 1);
+
+        // Simulate disconnect: connection drops, subsequent call arrives with different caller unique bus name
+        mock.simulate_caller_disconnect();
+
+        let search_attrs = store.build_attributes("alice@corp.com", Some("ws-alpha"));
+        let (unlocked, _) = mock.search_items(&search_attrs).expect("search");
+        assert!(!unlocked.is_empty());
+        let item_path = &unlocked[0];
+
+        // Call to get_secret with session from previous disconnected caller must fail closed
+        let err = mock.get_secret(item_path, &session_path).unwrap_err();
+        assert!(matches!(err, CredentialError::SecretServiceUnavailable(_)));
+        assert!(err.to_string().contains("belongs to caller"));
+
+        // Close session cleans up
+        mock.close_session(&session_path).expect("close");
+        assert_eq!(mock.active_session_count(), 0);
+
+        // Calling get_secret with closed session must fail closed
+        let closed_err = mock.get_secret(item_path, &session_path).unwrap_err();
+        assert!(matches!(
+            closed_err,
+            CredentialError::SecretServiceUnavailable(_)
+        ));
+        assert!(closed_err.to_string().contains("is closed"));
     }
 }

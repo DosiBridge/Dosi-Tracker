@@ -26,6 +26,8 @@ pub use consent::{
     ConsentError, ConsentManager, ConsentStorage, ConsentStore, ConsentedPermissions,
     FileConsentStore, LocalConsent, MemoryConsentStore,
 };
+#[cfg(target_os = "linux")]
+pub use credentials::ZbusSecretServiceTransport;
 pub use credentials::{
     CredentialError, CredentialStore, CredentialStoreKind, Credentials, FileCredentialStore,
     InMemoryCredentialStore, MockSecretServiceTransport, SecretServiceStore,
