@@ -21,6 +21,7 @@ fn synthetic_envelope(client_activity_id: &str, description: Option<&str>) -> Ac
         device_id: Some("dev-uuid-1".to_string()),
         platform: "linux".to_string(),
         agent_version: "0.1.0".to_string(),
+        payload_signature: None,
     }
 }
 
@@ -352,6 +353,7 @@ fn test_unmeasured_productivity_preserved_truthfully_as_none() {
         device_id: None,
         platform: "linux".to_string(),
         agent_version: "0.1.0".to_string(),
+        payload_signature: None,
     };
 
     outbox.enqueue(&scope, &env).unwrap();
@@ -383,6 +385,7 @@ fn test_measured_productivity_preserved_when_present() {
         device_id: Some("dev-uuid-99".to_string()),
         platform: "linux".to_string(),
         agent_version: "0.1.0".to_string(),
+        payload_signature: None,
     };
 
     outbox.enqueue(&scope, &env).unwrap();

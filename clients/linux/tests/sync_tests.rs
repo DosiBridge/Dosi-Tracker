@@ -41,6 +41,7 @@ fn synthetic_envelope(client_activity_id: &str, description: Option<&str>) -> Ac
         platform: "linux".to_string(),
         agent_version: "0.1.0".to_string(),
         productivity: Some(85),
+        payload_signature: None,
     }
 }
 

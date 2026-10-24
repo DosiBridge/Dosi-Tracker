@@ -8,9 +8,12 @@ Lightweight, privacy-first, rootless desktop agent foundation for Linux written 
 |---|---|---|
 | **Crate** | `dosi-tracker-linux` v0.1.0 | Located in [`clients/linux`](./) |
 | **Release Tier** | `headless-foundation` | Diagnostic foundation, default-deny consent core, durable outbox, rootless installer |
-| **Telemetry Adapters** | `NOT_IMPLEMENTED` | Truthfully diagnosed via `doctor [--json]`; no synthetic or fake telemetry |
+| **Telemetry Adapters** | `NOT_IMPLEMENTED` | Truthfully diagnosed via `doctor [--json]`; no synthetic or fake telemetry (Phase 2) |
 | **Privilege Model** | Strictly Rootless | Runs as normal user. Refuses `sudo`, `root`, `setuid`, `evdev`, and `uinput` |
 | **Offline Storage** | Transactional SQLite | Durable outbox queue with raw identity bounding and read-only inspection |
+| **Credential Store** | SecretService + 0600 Fallback | Scoped `(account, workspace)` store; SecretService primary, owner-only 0600 file fallback with explicit doctor warning |
+| **Transport & Auth** | Real HTTP Delivery Transport | Reqwest rustls, OpenIddict password grant (`POST /connect/token`), pre-expiry refresh, bounded 401 retry, activity upload, heartbeat |
+| **Payload Signing** | HMAC-SHA256 (32 bytes) | URL_SAFE_NO_PAD base64url tag over canonical JSON, mirroring Windows byte semantics and test vectors |
 | **CI Gate** | Dedicated GitHub Action | `linux-agent` job in `.github/workflows/ci.yml` running on `ubuntu-latest` |
 
 ---
@@ -23,8 +26,10 @@ Lightweight, privacy-first, rootless desktop agent foundation for Linux written 
    Only keyboard event **counts** and active time percentages are recorded. Keycodes, keystroke sequences, and text content are never captured or reconstructed.
 3. **Default-Deny Consent Core**:
    All capabilities are disabled by default. Widening requires explicit user action and successful disk persistence (`ConsentStore`). Failures during persistence immediately revoke memory permissions to prevent unauthorized collection. ABA lifecycle tickets invalidate stale authorization across permission cycles.
-4. **Truthful Diagnostics**:
-   The diagnostic CLI (`doctor`) reports unimplemented adapters honestly as `NOT_IMPLEMENTED` with architectural rationales (e.g., `NO_DISPLAY_SERVER`, `PORTAL_REQUIRED`). Missing databases, configurations, or credentials are never created by diagnostic or inspection commands.
+4. **Truthful Diagnostics & Non-Mutating Inspection**:
+   The diagnostic CLI (`doctor`) and status CLI (`status`) report capabilities and store statuses honestly. Missing databases, configurations, or credentials are never created by diagnostic or inspection commands.
+5. **Strict Secret Redaction**:
+   Passwords, bearer access tokens, refresh tokens, and raw signing key bytes are never leaked to logs, error messages, stdout, or JSON inspection outputs.
 
 ---
 
@@ -68,8 +73,42 @@ bash clients/linux/scripts/uninstall.sh --prefix "$HOME/apps/dosi-tracker"
 
 ## 4. Implemented CLI Commands
 
+### Authentication (`login` & `logout`)
+Authenticate with the backend via OpenIddict password grant and manage stored credentials:
+
+```bash
+# Login and store scoped credentials with per-device signing key
+cargo run --bin dosi-tracker-linux -- login \
+  --username "worker@example.com" \
+  --password "secret" \
+  --workspace-id "00000000-0000-0000-0000-000000000001" \
+  --server "https://api.dosi.app"
+
+# Logout and securely remove credentials
+cargo run --bin dosi-tracker-linux -- logout \
+  --account-id "worker@example.com" \
+  --workspace-id "00000000-0000-0000-0000-000000000001"
+```
+
+### Status Inspection (`status`)
+Non-mutating inspection of identity, token validity, signing key status, and optional queue depth:
+
+```bash
+# Human-readable status
+cargo run --bin dosi-tracker-linux -- status \
+  --account-id "worker@example.com" \
+  --workspace-id "00000000-0000-0000-0000-000000000001" \
+  --db ~/.local/share/dosi-tracker/outbox.db
+
+# Structured JSON status (pure inspection, zero secret leaks)
+cargo run --bin dosi-tracker-linux -- status \
+  --account-id "worker@example.com" \
+  --workspace-id "00000000-0000-0000-0000-000000000001" \
+  --json
+```
+
 ### Diagnostic Doctor (`doctor`)
-Inspects session environment, resolved non-mutating XDG paths, capability support, adapter status, and privacy invariants:
+Inspects session environment, resolved non-mutating XDG paths, capability support, adapter status, credential storage backend, and privacy invariants:
 
 ```bash
 # Human-readable diagnostic output
@@ -77,29 +116,6 @@ cargo run --bin dosi-tracker-linux -- doctor
 
 # Structured JSON diagnostic output
 cargo run --bin dosi-tracker-linux -- doctor --json
-```
-
-*Example JSON output snippet:*
-```json
-{
-  "client": {
-    "name": "dosi-tracker-linux",
-    "version": "0.1.0",
-    "release_tier": "headless-foundation"
-  },
-  "session": "x11",
-  "capabilities": {
-    "screen_capture": {
-      "adapter_status": "NOT_IMPLEMENTED",
-      "architectural_support": "SUPPORTED_X11"
-    }
-  },
-  "privacy_invariants": {
-    "unprivileged_process": true,
-    "anti_keylogger_policy": true,
-    "default_deny_consent": true
-  }
-}
 ```
 
 ### Outbox Status Inspection (`outbox status`)
@@ -123,15 +139,17 @@ cargo run --bin dosi-tracker-linux -- --version
 
 ## 5. Platform Capability & Architecture Matrix
 
-| Capability | X11 Protocol | Wayland Compositor | Implementation Plan |
+| Capability | X11 Protocol | Wayland Compositor | Implementation Status |
 |---|---|---|---|
-| **Screen Capture** | Supported via XShm / `xcap` | Supported via PipeWire / `xdg-desktop-portal` | User-consented screenshot captures; portal dialog ensures informed consent on Wayland |
-| **Keyboard Counting** | Supported via XInput2 raw ticks | **UNSUPPORTED** (reported as `null`) | Event counters only; Wayland security isolation strictly respected without `evdev`/root bypass |
-| **Mouse Counting** | Supported via XInput2 raw ticks | **UNSUPPORTED** (reported as `null`) | Click and movement activity counters; Wayland security isolation strictly respected |
-| **Active Window** | Supported via `_NET_ACTIVE_WINDOW` | **UNSUPPORTED** (reported as `null`) | Window title and application WM_CLASS sanitized under active privacy policy |
-| **Running Applications** | Supported via `/proc` enumeration | Supported via `/proc` enumeration | Scans user-owned process list for matching task programs |
-| **Webcam Photo** | Supported via V4L2 (`/dev/video*`) | Supported via V4L2 / PipeWire camera portal | Discrete capture interval; opt-in camera permission |
-| **Credential Storage** | Freedesktop Secret Service (D-Bus) | Freedesktop Secret Service (D-Bus) | Secure keyring storage with owner-only `0600` encrypted file fallback |
+| **Screen Capture** | Supported via XShm / `xcap` | Supported via PipeWire / `xdg-desktop-portal` | Planned Phase 2 |
+| **Keyboard Counting** | Supported via XInput2 raw ticks | **UNSUPPORTED** (reported as `null`) | Planned Phase 2 (X11 only; Wayland isolated) |
+| **Mouse Counting** | Supported via XInput2 raw ticks | **UNSUPPORTED** (reported as `null`) | Planned Phase 2 (X11 only; Wayland isolated) |
+| **Active Window** | Supported via `_NET_ACTIVE_WINDOW` | **UNSUPPORTED** (reported as `null`) | Planned Phase 2 (X11 only; Wayland isolated) |
+| **Running Applications** | Supported via `/proc` enumeration | Supported via `/proc` enumeration | Planned Phase 2 |
+| **Webcam Photo** | Supported via V4L2 (`/dev/video*`) | Supported via V4L2 / PipeWire camera portal | Planned Phase 2 |
+| **Credential Storage** | Freedesktop Secret Service (D-Bus) | Freedesktop Secret Service (D-Bus) | **Delivered in Phase 1** (owner-only 0600 file fallback with warning) |
+| **Backend Sync & Transport** | Real HTTP Delivery Transport | Real HTTP Delivery Transport | **Delivered in Phase 1** (`POST /api/app/activity`, exact ack delete) |
+| **Payload Signing** | HMAC-SHA256 (32 bytes) | HMAC-SHA256 (32 bytes) | **Delivered in Phase 1** (Windows byte semantics parity) |
 
 ---
 
@@ -143,25 +161,28 @@ cargo run --bin dosi-tracker-linux -- --version
   - Safe scoped SQLite progress handler wrapper (`ScopedProgressHandler`) with guaranteed RAII deregistration.
   - Graceful recoverable mutex poisoning handling in outbox (`OutboxError::LockPoisoned`).
   - Documentation and test count synchronization across repository.
-- **Phase 1 (Identity, Real Transport, Signed Queue)**:
-  - Freedesktop Secret Service credential storage per account and workspace.
-  - OpenIddict OAuth2 password grant authentication (`POST /connect/token`, `client_id=Tracker_App`, `scope=Tracker`, `__tenant` workspace header).
-  - HMAC-SHA256 request signing matching backend middleware expectations.
-  - Real `DeliveryTransport` implementation with chronological oldest-first batching to `POST /api/app/activity` with `client_activity_id` idempotency.
-  - Background heartbeat daemon (`POST /api/app/presence/heartbeat`) on a 60s cadence.
-- **Phase 2 (Native Consent-Gated Capture Adapters)**:
+- **Phase 1 (Delivered: Identity, Real Transport, Signed Queue)**:
+  - Freedesktop Secret Service credential storage per account and workspace with owner-only `0600` private file fallback.
+  - OpenIddict OAuth2 password grant authentication (`POST /connect/token`, `client_id=Tracker_App`, `scope=Tracker`, `__tenant` workspace parameter).
+  - Pre-expiry token refresh buffer (60s early renewal) and bounded 401 retry / re-authentication.
+  - Per-device 32-byte HMAC-SHA256 payload signing matching Windows byte semantics (`URL_SAFE_NO_PAD` base64url tag).
+  - Concrete `HttpDeliveryTransport` implementing `DeliveryTransport` contract with exact ack deletion, transient failure retention and retry counter incrementation, auth-required halt, and mismatched ack halt.
+  - Heartbeat presence primitive (`POST /api/app/presence/heartbeat`) on 60s cadence.
+  - Non-mutating CLI commands: `login`, `logout`, `status [--json]`.
+- **Phase 2 (Native Consent-Gated Capture Adapters - OPEN)**:
   - X11 active window detection (`_NET_ACTIVE_WINDOW`) and XInput2 activity counters.
   - Wayland portal ScreenCast via PipeWire (`ashpd`) with explicit user-prompted capture sessions.
   - V4L2 webcam capture adapter.
   - User-space `/proc` process inventory matching `AgentContextNormalizer.NormalizePlatform`.
-- **Phase 3 (Worker, Presence, Session & Configuration)**:
+- **Phase 3 (Worker, Presence, Session & Configuration - OPEN)**:
   - Interval capture worker with ABA generation tickets.
   - Decoupled background upload loop preventing UI or capture blocking.
   - `logind` lock/unlock and idle detection matching presence status transitions.
   - Single-instance enforcement via UNIX domain socket.
   - XDG `config.toml` configuration with environment variable overrides (`DOSI__API_BASE_URL`).
   - Rootless systemd user service (`dosi-tracker.service`).
-- **Phase 4 (CLI Surface Expansion & Packaging)**:
-  - Noninteractive CLI commands (`consent`, `queue`, `config`, `logout`).
+- **Phase 4 (CLI Surface Expansion & Packaging - OPEN)**:
+  - Noninteractive CLI commands (`consent`, `queue`, `config`).
   - Native packaging recipes (`.deb` via `cargo-deb`, `.rpm` via `cargo-generate-rpm`, AppImage).
   - Multi-platform packaging verification.
+

@@ -39,6 +39,7 @@ fn make_test_envelope(client_id: &str, secret_desc: Option<&str>) -> ActivityEnv
         device_id: Some("dev-node-99".to_string()),
         platform: "linux".to_string(),
         agent_version: "0.1.0".to_string(),
+        payload_signature: None,
     }
 }
 

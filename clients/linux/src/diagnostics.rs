@@ -157,6 +157,15 @@ pub struct AdapterInventory {
     pub backend_sync: DiagnosticStatus,
 }
 
+/// Diagnosis of active credential storage backend and fallback status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialStoreDiagnosis {
+    pub backend: String,
+    pub path: Option<PathBuf>,
+    pub fallback_active: bool,
+    pub warning: Option<String>,
+}
+
 /// Complete diagnostic report emitted by `dosi-tracker-linux doctor [--json]`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DoctorReport {
@@ -168,6 +177,8 @@ pub struct DoctorReport {
     pub capabilities: CapabilityMatrix,
     pub adapters: AdapterInventory,
     pub privacy_invariants: PrivacyInvariants,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_store: Option<CredentialStoreDiagnosis>,
 }
 
 /// Matrix of all telemetry capabilities.
@@ -371,6 +382,29 @@ impl DoctorReport {
                 zero_synthetic_telemetry: true,
                 default_deny_consent: true,
             },
+            credential_store: {
+                let default_cred_path = paths.config_dir.join("credentials.json");
+                let (backend, fallback_active, warning) = if cfg!(target_os = "linux")
+                    && std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some()
+                {
+                    ("SecretService".to_string(), false, None)
+                } else {
+                    (
+                        "FileFallback".to_string(),
+                        true,
+                        Some(
+                            "WARNING: File credential store fallback active. Freedesktop SecretService is recommended for production security."
+                                .to_string(),
+                        ),
+                    )
+                };
+                Some(CredentialStoreDiagnosis {
+                    backend,
+                    path: Some(default_cred_path),
+                    fallback_active,
+                    warning,
+                })
+            },
         }
     }
 
@@ -494,6 +528,17 @@ impl DoctorReport {
             "  Default-Deny Consent Core: {}\n",
             self.privacy_invariants.default_deny_consent
         ));
+
+        if let Some(ref cred) = self.credential_store {
+            out.push_str("\n[Credential Storage]\n");
+            out.push_str(&format!("  Backend: {}\n", cred.backend));
+            if let Some(ref p) = cred.path {
+                out.push_str(&format!("  Path:    {}\n", p.display()));
+            }
+            if let Some(ref warn) = cred.warning {
+                out.push_str(&format!("  {}\n", warn));
+            }
+        }
 
         out
     }

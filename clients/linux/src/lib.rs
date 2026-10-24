@@ -6,16 +6,29 @@
 //! - Default-inactive per-capability consent core with atomic persistence ([`consent`])
 //! - Lifecycle state machine with generation-based ABA ticket invalidation ([`lifecycle`])
 
+pub mod api;
 pub mod consent;
+pub mod credentials;
 pub mod diagnostics;
 pub mod lifecycle;
 pub mod outbox;
 pub mod paths;
+pub mod signing;
 pub mod sync;
+
+pub use api::{
+    classify_token_failure, classify_upload_failure, ApiClient, ApiError, AuthError,
+    CreateActivityDto, HeartbeatDto, HeartbeatResultDto, HttpDeliveryTransport, ServerClock,
+    SubmitError, TokenCell, CLIENT_ID, HEARTBEAT_CADENCE, SCOPE, WORKSPACE_HEADER,
+};
 
 pub use consent::{
     ConsentError, ConsentManager, ConsentStorage, ConsentStore, ConsentedPermissions,
     FileConsentStore, LocalConsent, MemoryConsentStore,
+};
+pub use credentials::{
+    CredentialError, CredentialStore, CredentialStoreKind, Credentials, FileCredentialStore,
+    InMemoryCredentialStore, SecretServiceStore,
 };
 pub use diagnostics::{
     ArchitecturalSupport, CapabilityDiagnosis, DiagnosticStatus, DoctorReport, SessionEnvironment,
@@ -35,6 +48,10 @@ pub use outbox::{
     MAX_WORKSPACE_ID_BYTES, OUTBOX_SCHEMA_VERSION, PROGRESS_OPCODES_PER_STEP,
 };
 pub use paths::LinuxPaths;
+pub use signing::{
+    generate_signing_key, sign_activity_envelope, sign_payload, verify_activity_envelope,
+    verify_payload,
+};
 pub use sync::{
     run_sync_pass, ActivityFailure, DeliveryOutcome, DeliveryTransport, SyncError, SyncPassConfig,
     SyncPassCoordinator, SyncPassReport, SyncStopReason, DEFAULT_BATCH_LIMIT, DEFAULT_MAX_ATTEMPTS,

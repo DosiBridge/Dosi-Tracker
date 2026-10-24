@@ -153,6 +153,10 @@ pub struct ActivityEnvelope {
     pub platform: String,
     /// Client agent version (e.g. "0.1.0").
     pub agent_version: String,
+    /// Optional HMAC-SHA256 payload signature tag (base64url, no padding).
+    /// Computed over canonical JSON bytes without this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_signature: Option<String>,
 }
 
 impl ActivityEnvelope {
@@ -208,6 +212,13 @@ impl ActivityEnvelope {
             if desc.len() > 2048 {
                 return Err(OutboxError::InvalidEnvelope(
                     "description exceeds maximum length of 2048 bytes".into(),
+                ));
+            }
+        }
+        if let Some(ref sig) = self.payload_signature {
+            if sig.len() > 128 || sig.chars().any(|c| c.is_control()) {
+                return Err(OutboxError::InvalidEnvelope(
+                    "payload_signature exceeds maximum length of 128 or contains control characters".into(),
                 ));
             }
         }

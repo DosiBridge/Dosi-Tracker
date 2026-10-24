@@ -2906,17 +2906,75 @@ Implemented deterministic isolated SQLite write-failure regressions in `clients/
 | **Local Windows Host** | Windows 11 x86_64, MSVC release binary | `dosi-tracker-linux.exe outbox status --db <missing> ...` | Fail-closed check | PASSED (Expected Fail) | **1** | Fails closed with `Error: Database file does not exist`; verified zero file creation (`Test-Path` returned `False`). |
 | **Local WSL Linux** | Linux 6.6.87.2-microsoft-standard-WSL2 (Ubuntu 24.04, `/usr/bin/bash`) | `bash tests/test_installer_lifecycle.sh` | 21 passed, 1 failed | BLOCKED on `cargo` | **1** | Tests 1–21 (synthetic prefixes, manifest validation, symlink traversal, rollback, uninstall) passed cleanly. Test 22 failed solely because `cargo` is not installed in the local WSL instance. Per prompt rules, OS configuration was not modified to install packages. |
 
-### C. Acceptance Limitations & Invariants
-1. **Phase 0 Acceptance Status**: **PHASE 0 NOT ACCEPTED PENDING NATIVE RUN**. In accordance with instructions, Windows-target cargo tests and partial WSL runs do not substitute for native Linux CI execution. Full Phase 0 acceptance requires execution on a real Linux GitHub runner or authorized native Linux host with Rust toolchain.
-2. **Push Policy**: No remote push performed (`origin/main` untouched; changes remain purely local).
-3. **Approval-Blocked Invariant**: The historical PM `tirith:archive_extract` blocked action was never run, retried, repackaged, or bypassed.
-4. **Privacy & Platform Restrictions**: No production credentials, real tracking, sensors, hooks, screenshots, or background daemons were introduced. Unprivileged execution and anti-keylogger invariants strictly preserved.
+### C. Phase 0 Gate Acceptance Evidence (Native Ubuntu Runner)
+Phase 0 native Linux gate acceptance was independently verified via GitHub Actions CI:
+- **Evidence Run ID**: `40033690447`
+- **Job ID**: `120687882330`
+- **Target Commit**: `c5a17c8e5159b834fef869b3ade744cfe442d04e`
+- **Runner Environment**: Native `ubuntu-latest`
+- **Conclusion**: `SUCCESS`
+- **Evidence URL**: `https://github.com/DosiBridge/Dosi-Tracker/actions/runs/40033690447/job/120687882330`
+- **Step Executions**:
+  - `cargo fmt --check --manifest-path clients/linux/Cargo.toml`: SUCCESS (0 diffs)
+  - `cargo clippy --manifest-path clients/linux/Cargo.toml --locked --all-targets -- -D warnings`: SUCCESS (0 warnings, 0 errors)
+  - `cargo test --manifest-path clients/linux/Cargo.toml --locked --release`: SUCCESS (105 tests passed across 8 suites: 32, 0, 6, 7, 3, 15, 29, 13)
+  - Rootless installer verification: SUCCESS (Passed 22, Failed 0)
+  - Doctor JSON and missing DB fail-closed checks: SUCCESS (non-creation and truthful diagnostics verified)
+- **Gate Conclusion**: Phase 0 formally accepted. Phase 1 authorized.
 
-### D. Multi-Phase Roadmap (Specification Received from Mihadul)
-Full specifications for Phases 0 through 4 have now been supplied by Mihadul. In accordance with prompt instructions, each phase must be executed in order with one reviewable PR per phase and small conventional commits. No subsequent phase will be initiated before independent acceptance of the preceding phase:
-- **Phase 0 (Active)**: CI, docs, hygiene (`.github/workflows/ci.yml`, `clients/linux/README.md`, safe scoped FFI, recoverable Mutex poisoning, clippy/fmt clean, install page test count corrections).
-- **Phase 1 (Next, Pending Phase 0 Acceptance)**: Identity, real transport, signed queue (OpenIddict password grant, Secret Service credentials, HMAC-SHA256 device signing, concrete `HttpTransport` implementing `DeliveryTransport`, in-process HTTP fake + injected credential store).
-- **Phase 2**: Native consent-gated capture adapters (X11 `x11rb` EWMH window titles/WM_CLASS, XInput2 raw event counters without keycodes, X11 screenshot `XGetImage`/`xcap`, Wayland truthful portal/PipeWire or unsupported reporting, V4L2 webcam, `/proc` running-app inventory).
-- **Phase 3**: Worker, presence, session, instance, config (Interval capture with ABA tickets, oldest-first upload task, `logind` LockedHint, per-user single-instance lock, validated XDG `config.toml`, opt-in rootless systemd/XDG autostart).
-- **Phase 4**: CLI surface, packaging, release (Non-interactive JSON CLI commands, packaging metadata for `cargo-deb`/`cargo-generate-rpm`/AppImage, honest documentation of unprivileged packaging acceptance method).
+---
+
+## 3. Phase 1 Delivery: Identity, Transport, and Payload Signing
+
+### A. Phase 1 Scope & Architectural Decisions
+Phase 1 implements secure credential storage, OpenIddict authentication, pre-expiry token refresh, bounded 401 retry, HMAC-SHA256 per-device payload signing, and a concrete HTTP delivery transport for `clients/linux`:
+
+1. **Backend Contract & DTO Inspection**:
+   - `POST /connect/token`: OpenIddict password grant (`grant_type=password`, `client_id=Tracker_App`, `scope=Tracker`, `username`, `password`, with `__tenant=<workspace>` query parameter matching ABP multi-tenant resolution).
+   - `POST /connect/token`: Refresh grant (`grant_type=refresh_token`, `client_id=Tracker_App`, `refresh_token`).
+   - `POST /api/app/activity`: Synchronous block upload carrying `CreateActivityDto` with `X-Workspace-Id` header, `client_activity_id` idempotency, and optional `payload_signature`.
+   - `POST /api/app/presence/heartbeat`: Presence reporting carrying `HeartbeatDto` (`device_id`, `status`, `sent_at`), returning `HeartbeatResultDto` with `server_time`.
+   - Heartbeat cadence primitive: 60 seconds (`HEARTBEAT_CADENCE = Duration::from_secs(60)`). Scheduler loop is deferred to Phase 3.
+
+2. **Secure Scoped Credential Storage (`clients/linux/src/credentials.rs`)**:
+   - `Credentials`: Persisted account identity, workspace, tokens, and per-device signing key. Full redaction in `Debug` and `Display` (`[REDACTED]`).
+   - `CredentialStore` trait: Injected storage interface with `load`, `save`, `clear`, `kind`.
+   - `SecretServiceStore`: Primary Linux backend over session D-Bus (`org.freedesktop.secrets`). Fails closed without silent downgrade.
+   - `FileCredentialStore`: Owner-only private file store (`0600` file, `0700` parent dir) with atomic temporary file creation (`.tmp.<pid>`), durable rename, target symlink refusal, and owner UID verification.
+   - Explicit doctor warning: Active file fallback emits a prominent diagnostic warning in `doctor` and `doctor --json`.
+   - `InMemoryCredentialStore`: Fault-injection store for deterministic isolated unit testing without touching user keyrings or HOME.
+
+3. **Per-Device HMAC-SHA256 Signing (`clients/linux/src/signing.rs`)**:
+   - 32-byte cryptographic signing key generated per device via `rand::thread_rng().fill_bytes(...)`.
+   - Canonical signing format: Computes HMAC-SHA256 over canonical JSON bytes of `ActivityEnvelope` where `payload_signature` is omitted (`None`).
+   - Base64 encoding: URL-safe without padding (`URL_SAFE_NO_PAD`), mirroring Windows byte semantics and test vectors.
+   - Verification: `verify_activity_envelope` verifies mathematical roundtrip and rejects tampered payloads, altered keys, or malformed tags.
+
+4. **Async HTTP API Client & Transport Coordinator (`clients/linux/src/api.rs`)**:
+   - Async `reqwest` client with `rustls-tls` and native/bundled roots. Strict TLS verification: certificate verification is NEVER disabled.
+   - Bounded timeouts: Connect (10s), general request (30s), upload (120s), heartbeat (10s).
+   - Pre-expiry renewal: Access tokens are renewed using refresh tokens 60 seconds before expiration.
+   - Bounded 401 retry: On HTTP 401, attempts token refresh once and retries the request once; halts with `AuthRequired` if re-authentication fails.
+   - Dedicated worker transport (`HttpDeliveryTransport`): Implements `DeliveryTransport` via an isolated worker thread with a single-thread Tokio runtime. Prevents runtime-nesting panics and guarantees the SQLite connection mutex is NEVER held during network delivery.
+   - Exact acknowledgement deletion: Deletes queued records from local SQLite outbox only when backend positively acknowledges the exact `client_activity_id`.
+   - Outage & failure handling: Transient failures (5xx, network drops, timeouts) retain rows and increment `retry_count`; definitive rejections (400 validation, 409 conflict, 422) halt the pass while preserving entries; mismatched acks halt immediately.
+
+5. **CLI Subcommands (`clients/linux/src/main.rs`)**:
+   - `login`: Authenticates with backend and securely saves credentials with signing key.
+   - `logout`: Clears stored credentials for specified account and workspace.
+   - `status [--json]`: Read-only inspection of account, workspace, token validity, signing key status, and optional queue depth (`--db`). Pure inspection never creates files or directories.
+   - `doctor [--json]`: Reports credential storage backend status and emits warning if file fallback is active.
+
+### B. Phase 1 Verification Evidence
+| Execution Environment | Toolchain / Target | Command Executed | Tests / Steps | Result | Exit Code | Provenance Details |
+|---|---|---|:---:|:---:|:---:|---|
+| **Local Host** | `rustc 1.97.1` (x86_64) | `cargo fmt --check --manifest-path clients/linux/Cargo.toml` | Formatting check | PASSED | **0** | Clean, 0 diffs. |
+| **Local Host** | `rustc 1.97.1` (x86_64) | `cargo clippy --manifest-path clients/linux/Cargo.toml --locked --all-targets -- -D warnings` | Clippy lint check | PASSED | **0** | Clean, 0 warnings, 0 errors. |
+| **Local Host** | `rustc 1.97.1` (x86_64) | `cargo test --manifest-path clients/linux/Cargo.toml --locked --release` | Full release test suite | PASSED | **0** | 131 tests passed across 9 suites (53 lib, 0 main, 6 doctor, 5 identity/signing/transport, 7 repro, 3 installer lifecycle, 15 outbox status, 29 outbox, 13 sync). |
+| **Local Host** | `rustc 1.97.1` (x86_64) | `cargo test --manifest-path clients/linux/Cargo.toml --test cli_identity_transport_signing_tests` | E2E integration slice | PASSED | **0** | 5 tests passed: login->status->logout lifecycle, missing credential fail-closed without file creation, status queue depth inspection, signed block upload with exact ack deletion, mid-upload outage row retention and retry increment. |
+
+### C. Phase 1 Acceptance & Open Roadmap
+- **Phase 1 Status**: **DELIVERED & VERIFIED IN ISOLATED FIXTURES**.
+- **Production Readiness Claim**: None. This delivery provides identity, transport, and signing foundation only. Capture adapters (Phase 2), capture worker loops (Phase 3), and package distribution (Phase 4) remain open.
+
 
