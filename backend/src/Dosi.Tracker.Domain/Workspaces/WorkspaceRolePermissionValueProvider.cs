@@ -25,12 +25,19 @@ public class WorkspaceRoleLookup : ITransientDependency
         _workspaceRepository = workspaceRepository;
     }
 
+    /// <summary>The user's role in the workspace, or null when they are not an active member of it — or it was deleted
+    /// (members of a deleted workspace are members of nothing).</summary>
     [UnitOfWork]
     public virtual async Task<string?> FindRoleAsync(Guid workspaceId, Guid userId)
     {
         var member = await _memberRepository.FirstOrDefaultAsync(m =>
             m.WorkspaceId == workspaceId && m.UserId == userId && m.Status == WorkspaceMemberStatus.Active);
-        return member?.Role;
+        if (member == null || (_workspaceRepository != null && !await _workspaceRepository.AnyAsync(w => w.Id == workspaceId)))
+        {
+            return null;
+        }
+
+        return member.Role;
     }
 
     [UnitOfWork]

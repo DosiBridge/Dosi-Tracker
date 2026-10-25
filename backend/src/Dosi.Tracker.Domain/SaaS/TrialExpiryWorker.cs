@@ -4,6 +4,7 @@ using System.Threading.Tasks;
 using Dosi.Tracker.Billing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using Volo.Abp.BackgroundWorkers;
 using Volo.Abp.Data;
 using Volo.Abp.DistributedLocking;
@@ -20,7 +21,8 @@ namespace Dosi.Tracker.SaaS;
 /// Hourly subscription sweep, also run once at start-up so restarts never postpone it (see
 /// <see cref="SubscriptionManager.ReviewAsync"/>): reminds owners before a trial ends, marks ended trials past_due,
 /// and marks active workspaces past_due when an invoice goes unpaid past its due date. Deleted workspaces are
-/// skipped, and sweeps do not overlap (named lock, held across replicas when a distributed lock provider is
+/// skipped, nothing is swept while billing is off (<see cref="BillingOptions"/>; the host does not even start the
+/// worker then), and sweeps do not overlap (named lock, held across replicas when a distributed lock provider is
 /// configured).
 /// </summary>
 public class TrialExpiryWorker : AsyncPeriodicBackgroundWorkerBase
@@ -45,6 +47,11 @@ public class TrialExpiryWorker : AsyncPeriodicBackgroundWorkerBase
     /// <summary>One sweep over every workspace's subscription that may need attention (the body of the hourly run).</summary>
     public virtual async Task<SubscriptionSweepResult> CheckSubscriptionsAsync(IServiceProvider serviceProvider)
     {
+        if (!serviceProvider.GetRequiredService<IOptions<BillingOptions>>().Value.Enabled)
+        {
+            return new SubscriptionSweepResult { BillingDisabled = true };
+        }
+
         var distributedLock = serviceProvider.GetService<IAbpDistributedLock>();
         await using var sweepLock = distributedLock == null ? null : await distributedLock.TryAcquireAsync(LockName);
         if (distributedLock != null && sweepLock == null)

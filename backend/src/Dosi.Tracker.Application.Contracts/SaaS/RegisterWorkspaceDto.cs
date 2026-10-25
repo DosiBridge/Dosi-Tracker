@@ -60,6 +60,9 @@ public class WorkspaceRegistrationResultDto
 
     /// <summary>The new account's user name (its email); sign in with the email.</summary>
     public string UserName { get; set; } = string.Empty;
+
+    /// <summary>Whether an email asking to confirm the address was sent (false when this server sends no email).</summary>
+    public bool EmailConfirmationSent { get; set; }
 }
 
 /// <summary>A workspace the signed-in user is an active member of (<c>GET /api/app/workspaces/mine</c>).</summary>
@@ -93,6 +96,32 @@ public class CreateWorkspaceDto
     public string Name { get; set; } = string.Empty;
 
     public Guid? PlanId { get; set; }
+}
+
+/// <summary><c>POST /api/app/workspaces/{id}/delete</c>: the workspace's name, typed by the owner to confirm.</summary>
+public class DeleteWorkspaceDto
+{
+    [Required]
+    [MaxLength(WorkspaceConsts.MaxNameLength)]
+    public string ConfirmationName { get; set; } = string.Empty;
+}
+
+/// <summary>A deleted workspace: gone at once for everyone; its data is purged after <see cref="PurgeAfter"/>.</summary>
+public class DeletedWorkspaceDto
+{
+    public Guid Id { get; set; }
+    public DateTime DeletionTime { get; set; }
+
+    /// <summary>From when the erasure sweep purges the data (the end of the grace period).</summary>
+    public DateTime PurgeAfter { get; set; }
+}
+
+/// <summary><c>GET /api/app/workspace/billing-mode</c> (anonymous): whether this deployment bills workspaces. When it
+/// does not, every workspace is active, there are no trials, seat limits or invoices, and the web app shows no plans or
+/// billing.</summary>
+public class BillingModeDto
+{
+    public bool Enabled { get; set; }
 }
 
 public class CreatedWorkspaceDto

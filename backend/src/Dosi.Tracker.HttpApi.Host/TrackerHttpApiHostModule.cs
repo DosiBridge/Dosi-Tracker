@@ -8,6 +8,9 @@ using Dosi.Tracker.Billing;
 using Dosi.Tracker.Activities.Retention;
 using Dosi.Tracker.Compatibility;
 using Dosi.Tracker.Devices;
+using Dosi.Tracker.Erasure;
+using Microsoft.AspNetCore.DataProtection;
+using Microsoft.Extensions.Logging;
 using Dosi.Tracker.Retention;
 using Dosi.Tracker.SaaS;
 using Microsoft.AspNetCore.Http;
@@ -106,7 +109,7 @@ public class TrackerHttpApiHostModule : AbpModule
 
             PreConfigure<OpenIddictServerBuilder>(serverBuilder =>
             {
-                serverBuilder.AddProductionEncryptionAndSigningCertificate("openiddict.pfx", configuration["AuthServer:CertificatePassPhrase"]!);
+                serverBuilder.AddProductionEncryptionAndSigningCertificate(CertificateFileName, configuration["AuthServer:CertificatePassPhrase"]!);
                 serverBuilder.SetIssuer(new Uri(configuration["AuthServer:Authority"]!));
             });
         }
@@ -117,8 +120,9 @@ public class TrackerHttpApiHostModule : AbpModule
         var configuration = context.Services.GetConfiguration();
         var hostingEnvironment = context.Services.GetHostingEnvironment();
 
-        // Fail fast rather than ship the template's well-known dev secrets to production.
-        if (hostingEnvironment.IsProduction())
+        // Fail fast rather than ship well-known secrets: every environment but Development (Staging and custom-named
+        // environments hold real data too).
+        if (!hostingEnvironment.IsDevelopment())
         {
             RejectDefaultDevSecrets(configuration);
         }
@@ -158,6 +162,7 @@ public class TrackerHttpApiHostModule : AbpModule
         ConfigureSwagger(context, configuration);
         ConfigureVirtualFileSystem(context);
         ConfigureCors(context, configuration);
+        ConfigureDataProtection(context, configuration);
         ConfigureBlobStoring(context, configuration);
         context.Services.AddTrackerDataRetention(configuration);
         ConfigureRequestSizeLimits(context);
@@ -338,17 +343,48 @@ public class TrackerHttpApiHostModule : AbpModule
         }
     }
 
-    /// <summary>Refuses to start in Production while a secret is still a well-known template value or is
-    /// still read from the tracked appsettings.json (see <see cref="ProductionSecretsGuard"/>).</summary>
+    /// <summary>The OpenIddict signing and encryption certificate outside Development.</summary>
+    public const string CertificateFileName = "openiddict.pfx";
+
+    /// <summary>Refuses to start outside Development while a secret is still a well-known value or is still read from
+    /// the tracked appsettings.json, or the certificate is a localhost development or expired one (see
+    /// <see cref="ProductionSecretsGuard"/>).</summary>
     private static void RejectDefaultDevSecrets(IConfiguration configuration)
     {
-        var problems = ProductionSecretsGuard.FindProblems(configuration);
+        var problems = ProductionSecretsGuard.FindProblems(configuration)
+            .Concat(ProductionSecretsGuard.FindCertificateProblems(
+                CertificateFileName, configuration[ProductionSecretsGuard.CertificatePassPhraseKey], DateTimeOffset.UtcNow))
+            .ToList();
         if (problems.Any())
         {
             throw new AbpInitializationException(
-                "Refusing to start in Production with repository/template secrets. Fix: " + string.Join("; ", problems) +
+                "Refusing to start outside Development with repository/template secrets. Fix: " + string.Join("; ", problems) +
                 ". Supply them via environment variables (e.g. ConnectionStrings__Default), appsettings.secrets.json " +
                 "or a secret store.");
+        }
+    }
+
+    /// <summary>
+    /// ASP.NET Core Data Protection keys protect sign-in cookies, antiforgery tokens and the emailed password-reset and
+    /// email-confirmation tokens. They are kept in the database (table <c>AppDataProtectionKeys</c>), so they survive
+    /// restarts and redeploys and every API instance shares them; <c>DataProtection:KeysDirectory</c> keeps them in a
+    /// directory instead (a mounted volume). Keys are scoped to <c>DataProtection:ApplicationName</c> (default
+    /// "Dosi.Tracker"), which must be the same on every instance.
+    /// </summary>
+    private static void ConfigureDataProtection(ServiceConfigurationContext context, IConfiguration configuration)
+    {
+        var applicationName = configuration["DataProtection:ApplicationName"];
+        var builder = context.Services.AddDataProtection()
+            .SetApplicationName(string.IsNullOrWhiteSpace(applicationName) ? "Dosi.Tracker" : applicationName.Trim());
+
+        var keysDirectory = configuration["DataProtection:KeysDirectory"];
+        if (!string.IsNullOrWhiteSpace(keysDirectory))
+        {
+            builder.PersistKeysToFileSystem(new DirectoryInfo(keysDirectory));
+        }
+        else
+        {
+            builder.PersistKeysToDbContext<TrackerDbContext>();
         }
     }
 
@@ -467,15 +503,12 @@ public class TrackerHttpApiHostModule : AbpModule
     {
         context.Services.AddCors(options =>
         {
+            // App:CorsOrigins, validated (no "*": the API admits credentialed requests).
+            var origins = CorsOrigins.Parse(configuration);
             options.AddDefaultPolicy(builder =>
             {
                 builder
-                    .WithOrigins(
-                        configuration["App:CorsOrigins"]?
-                            .Split(",", StringSplitOptions.RemoveEmptyEntries)
-                            .Select(o => o.Trim().RemovePostFix("/"))
-                            .ToArray() ?? Array.Empty<string>()
-                    )
+                    .WithOrigins(origins)
                     .WithAbpExposedHeaders()
                     .SetIsOriginAllowedToAllowWildcardSubdomains()
                     .AllowAnyHeader()
@@ -497,6 +530,7 @@ public class TrackerHttpApiHostModule : AbpModule
         var env = context.GetEnvironment();
 
         app.UseForwardedHeaders();
+        WarnAboutUntrustedProxies(context, env);
 
         if (env.IsDevelopment())
         {
@@ -544,13 +578,41 @@ public class TrackerHttpApiHostModule : AbpModule
         app.UseConfiguredEndpoints();
     }
 
+    /// <summary>Outside Development with HTTPS required, a deployment that trusts no proxy most likely sits behind one
+    /// it does not trust (a container network or an ingress): every token request then fails as plain HTTP.</summary>
+    private static void WarnAboutUntrustedProxies(ApplicationInitializationContext context, IWebHostEnvironment env)
+    {
+        var configuration = context.ServiceProvider.GetRequiredService<IConfiguration>();
+        if (env.IsDevelopment() ||
+            !configuration.GetValue<bool>("AuthServer:RequireHttpsMetadata") ||
+            TrustedProxies.HasConfiguredProxies(configuration))
+        {
+            return;
+        }
+
+        context.ServiceProvider.GetRequiredService<ILogger<TrackerHttpApiHostModule>>().LogWarning(
+            "HTTPS is required but no reverse proxy is trusted: X-Forwarded-For/-Proto are honoured only from loopback. " +
+            "Behind a proxy on another address set {Section}:KnownNetworks (e.g. 10.0.0.0/8) or :KnownProxies, " +
+            "otherwise sign-ins fail as plain HTTP.", TrustedProxies.SectionName);
+    }
+
     public override async Task OnApplicationInitializationAsync(ApplicationInitializationContext context)
     {
         // Runs the synchronous OnApplicationInitialization (middleware pipeline) first.
         await base.OnApplicationInitializationAsync(context);
 
-        await context.AddBackgroundWorkerAsync<TrialExpiryWorker>();
-        await context.AddBackgroundWorkerAsync<InvoiceGenerationWorker>();
+        // Trials and invoices exist only on a deployment that bills (Billing:Enabled; off by default).
+        if (context.ServiceProvider.GetRequiredService<IOptions<BillingOptions>>().Value.Enabled)
+        {
+            await context.AddBackgroundWorkerAsync<TrialExpiryWorker>();
+            await context.AddBackgroundWorkerAsync<InvoiceGenerationWorker>();
+        }
+
+        // Purges deleted workspaces after their grace period and scrubs deleted accounts (DataErasure:IsEnabled).
+        if (context.ServiceProvider.GetRequiredService<IOptions<DataErasureOptions>>().Value.IsEnabled)
+        {
+            await context.AddBackgroundWorkerAsync<DataErasureWorker>();
+        }
 
         var retentionWorkers = DataRetentionHosting.WorkerTypes(
             context.ServiceProvider.GetRequiredService<IOptions<CaptureRetentionOptions>>().Value,

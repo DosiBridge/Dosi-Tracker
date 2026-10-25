@@ -49,6 +49,7 @@ public static class WorkspaceRoles
         TrackerPermissions.Projects.Archive,
         TrackerPermissions.Activities.Default,
         TrackerPermissions.Activities.ViewAll,
+        TrackerPermissions.Activities.Delete,
         TrackerPermissions.Team.Default,
         TrackerPermissions.Team.Manage,
         TrackerPermissions.Devices.Default,
@@ -57,12 +58,13 @@ public static class WorkspaceRoles
         TrackerPermissions.Reporting.Default
     };
 
-    /// <summary>Team lead: sees everyone's activity, manages the team, its devices and projects, runs reports — but cannot delete
+    /// <summary>Team lead: sees (and may delete) everyone's activity, manages the team, its devices and projects, runs reports — but cannot delete
     /// projects, manage billing or change the workspace settings.</summary>
     public static readonly string[] ManagerPermissions =
     {
         TrackerPermissions.Activities.Default,
         TrackerPermissions.Activities.ViewAll,
+        TrackerPermissions.Activities.Delete,
         TrackerPermissions.Team.Default,
         TrackerPermissions.Team.Manage,
         TrackerPermissions.Devices.Default,

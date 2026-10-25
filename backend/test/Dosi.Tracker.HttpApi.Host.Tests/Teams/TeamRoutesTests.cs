@@ -28,6 +28,8 @@ public class TeamRoutesTests
     [InlineData(nameof(TeamAppService.InviteMemberAsync), "POST", "api/app/team/invite-member")]
     [InlineData(nameof(TeamAppService.GetMembersAsync), "GET", "api/app/team/members")]
     [InlineData(nameof(TeamAppService.GetProjectMembersAsync), "GET", "api/app/team/project-members/{projectId}")]
+    [InlineData(nameof(TeamAppService.ResendInvitationAsync), "POST", "api/app/team/{id}/resend-invitation")]
+    [InlineData(nameof(TeamAppService.SendPasswordResetAsync), "POST", "api/app/team/send-password-reset")]
     public void Team_Endpoints_Should_Have_The_Contract_Routes(string methodName, string verb, string route)
     {
         RouteOf(methodName).ShouldBe((verb, route));
@@ -37,7 +39,12 @@ public class TeamRoutesTests
     public void The_User_Id_Of_Reset_And_Removal_Should_Stay_In_The_Query_String()
     {
         // The escape hatch ABP honours: an optional parameter is never turned into a route segment.
-        foreach (var methodName in new[] { nameof(TeamAppService.UpdateWorkspaceRoleAsync), nameof(TeamAppService.RemoveFromWorkspaceAsync) })
+        foreach (var methodName in new[]
+                 {
+                     nameof(TeamAppService.UpdateWorkspaceRoleAsync),
+                     nameof(TeamAppService.RemoveFromWorkspaceAsync),
+                     nameof(TeamAppService.SendPasswordResetAsync)
+                 })
         {
             var userId = typeof(TeamAppService).GetMethod(methodName)!.GetParameters().First();
             userId.Name.ShouldBe("userId");

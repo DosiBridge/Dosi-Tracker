@@ -28,6 +28,10 @@ public static class TrackerSettings
             public const string IdleThresholdMinutes = NewProjectPrefix + ".IdleThresholdMinutes";
         }
 
+        /// <summary>Minutes after upload during which members may delete their own captures (0: never; see
+        /// <c>MemberCaptureDeletion</c>).</summary>
+        public const string MemberCaptureDeleteMinutes = WorkspacePrefix + ".MemberCaptureDeleteMinutes";
+
         /// <summary>Workspace capture retention policy (REQ-DAT-01).</summary>
         public static class CaptureRetention
         {

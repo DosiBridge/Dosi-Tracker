@@ -7,6 +7,7 @@ using System.Threading.Tasks;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.Extensions.Logging;
+using Dosi.Tracker.Emailing;
 using Dosi.Tracker.Identity;
 using Dosi.Tracker.Notifications;
 using Dosi.Tracker.Permissions;
@@ -199,13 +200,34 @@ public class TeamAppService : TrackerAppService, ITeamAppService
         await _invitationRepository.InsertAsync(invitation, autoSave: true);
         await uow.CompleteAsync();
 
+        return await PendingInvitationResultAsync(invitation, token);
+    }
+
+    /// <summary>The answer for a pending invitation — the same whether or not its address has an account — after the
+    /// invitation was emailed to it (best effort; the link is in the answer either way).</summary>
+    private async Task<InviteMemberResultDto> PendingInvitationResultAsync(WorkspaceInvitation invitation, string token)
+    {
+        var workspace = await LazyServiceProvider.LazyGetRequiredService<IRepository<Workspace, Guid>>()
+            .GetAsync(invitation.WorkspaceId);
+        var inviter = await _userRepository.FindAsync(CurrentUser.GetId());
+        var inviterName = string.Join(" ", new[] { inviter?.Name, inviter?.Surname }.Where(n => !string.IsNullOrWhiteSpace(n)));
+
+        var emailSent = await LazyServiceProvider.LazyGetRequiredService<TrackerEmailer>().QueueInvitationAsync(
+            invitation.Email,
+            workspace.Name,
+            string.IsNullOrWhiteSpace(inviterName) ? inviter?.UserName : inviterName,
+            invitation.Role,
+            token,
+            invitation.ExpiresAt);
+
         return new InviteMemberResultDto
         {
             Added = false,
             WorkspaceRole = invitation.Role,
             InvitationId = invitation.Id,
             InvitePath = "/invite/" + token,
-            ExpiresAt = invitation.ExpiresAt
+            ExpiresAt = invitation.ExpiresAt,
+            EmailSent = emailSent
         };
     }
 
@@ -280,6 +302,53 @@ public class TeamAppService : TrackerAppService, ITeamAppService
         var invitation = await _invitationRepository.FirstOrDefaultAsync(i => i.Id == id && i.WorkspaceId == workspaceId)
                          ?? throw new EntityNotFoundException(typeof(WorkspaceInvitation), id);
         await _invitationRepository.DeleteAsync(invitation);
+    }
+
+    [Authorize(TrackerPermissions.Team.Manage)]
+    public async Task<InviteMemberResultDto> ResendInvitationAsync(Guid id)
+    {
+        var workspaceId = WorkspaceId;
+        using var uow = UnitOfWorkManager.Begin(new AbpUnitOfWorkOptions(isTransactional: true), requiresNew: true);
+        var invitation = await _invitationRepository.FirstOrDefaultAsync(i =>
+                             i.Id == id && i.WorkspaceId == workspaceId && i.AcceptedAt == null)
+                         ?? throw new EntityNotFoundException(typeof(WorkspaceInvitation), id);
+
+        // The new link grants the invitation's role to whoever registers with its address: only owners hand out more
+        // than the member role, as when inviting.
+        if (invitation.Role != WorkspaceRoles.Member && !await IsOwnerAsync(CurrentUser.GetId()))
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.RoleNotAllowed).WithData("role", invitation.Role);
+        }
+
+        var token = WorkspaceInvitation.NewToken();
+        invitation.Renew(WorkspaceInvitation.HashToken(token), Clock.Now.AddDays(WorkspaceConsts.InvitationLifetimeDays));
+        await _invitationRepository.UpdateAsync(invitation, autoSave: true);
+        await uow.CompleteAsync();
+
+        return await PendingInvitationResultAsync(invitation, token);
+    }
+
+    /// <inheritdoc />
+    /// <remarks><paramref name="userId"/> is optional only so that ABP keeps it in the query string.</remarks>
+    [Authorize(TrackerPermissions.Team.Manage)]
+    public async Task<PasswordResetSentDto> SendPasswordResetAsync([Optional] Guid userId)
+    {
+        if (!await IsOwnerAsync(CurrentUser.GetId()))
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.RoleNotAllowed).WithData("userId", userId);
+        }
+
+        var user = await _userRepository.FindAsync(userId);
+        if (user == null || !user.IsActive || await _workspaceMemberships.FindActiveAsync(WorkspaceId, userId) == null)
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.InvalidUser).WithData("userId", userId);
+        }
+
+        // The link is emailed to the member's own address only; the owner never sees it.
+        var emailSent = await LazyServiceProvider.LazyGetRequiredService<AccountLinkEmails>().SendPasswordResetAsync(user);
+        Logger.LogInformation("Owner {CallerId} had a password reset link sent to member {UserId} of workspace {WorkspaceId} ({Sent}).",
+            CurrentUser.GetId(), userId, WorkspaceId, emailSent ? "sent" : "not sent");
+        return new PasswordResetSentDto { EmailSent = emailSent };
     }
 
     [Authorize(TrackerPermissions.Team.Manage)]

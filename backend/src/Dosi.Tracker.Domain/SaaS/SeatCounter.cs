@@ -2,7 +2,9 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
+using Dosi.Tracker.Billing;
 using Dosi.Tracker.Identity;
+using Microsoft.Extensions.Options;
 using Dosi.Tracker.Projects;
 using Volo.Abp;
 using Volo.Abp.Data;
@@ -104,9 +106,15 @@ public class SeatCounter : TrackerDomainService
     /// <summary>Throws <c>Tracker:SeatLimitReached</c> when giving <paramref name="userId"/> (null: a person who has no
     /// account yet) a tracked membership would take a new seat beyond the current workspace's plan limit. A user who
     /// already holds a seat can always join more projects; a workspace without a subscription (or on an unknown or
-    /// unlimited plan) has no limit. A Client membership needs no seat, so callers skip this check for it.</summary>
+    /// unlimited plan) has no limit, and neither has any workspace while billing is off (<see cref="BillingOptions"/>).
+    /// A Client membership needs no seat, so callers skip this check for it.</summary>
     public virtual async Task CheckSeatAvailableAsync(Guid? userId)
     {
+        if (!IsBillingEnabled)
+        {
+            return; // Without billing, plans set no seat limit.
+        }
+
         var plan = await FindCurrentPlanAsync();
         if (plan == null || plan.MaxSeats <= 0)
         {
@@ -127,10 +135,11 @@ public class SeatCounter : TrackerDomainService
     }
 
     /// <summary>Throws <c>Tracker:SeatLimitReached</c> when the current workspace occupies more seats than
-    /// <paramref name="plan"/> allows (a plan change must not leave the workspace over its limit).</summary>
+    /// <paramref name="plan"/> allows (a plan change must not leave the workspace over its limit). Never while billing is
+    /// off.</summary>
     public virtual async Task CheckFitsPlanAsync(Plan plan)
     {
-        if (plan.MaxSeats <= 0)
+        if (!IsBillingEnabled || plan.MaxSeats <= 0)
         {
             return;
         }
@@ -144,6 +153,10 @@ public class SeatCounter : TrackerDomainService
                 .WithData("seatsUsed", seatsUsed);
         }
     }
+
+    /// <summary>Whether this deployment bills workspaces at all (<see cref="BillingOptions"/>).</summary>
+    protected bool IsBillingEnabled =>
+        LazyServiceProvider.LazyGetRequiredService<IOptions<BillingOptions>>().Value.Enabled;
 
     private async Task<Plan?> FindCurrentPlanAsync()
     {

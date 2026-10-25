@@ -57,6 +57,18 @@ public class WorkspaceInvitation : CreationAuditedAggregateRoot<Guid>
 
     public bool IsFor(string? email) => email != null && NormalizeEmail(email) == NormalizedEmail;
 
+    /// <summary>Gives the (pending) invitation a new token and expiry: the old link stops working.</summary>
+    public void Renew(string tokenHash, DateTime expiresAt)
+    {
+        if (AcceptedAt != null)
+        {
+            throw new InvalidOperationException("An accepted invitation cannot be renewed.");
+        }
+
+        TokenHash = tokenHash;
+        ExpiresAt = expiresAt;
+    }
+
     public void MarkAccepted(Guid userId, DateTime now)
     {
         AcceptedAt = now;

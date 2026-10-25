@@ -55,4 +55,33 @@ public static class TrackerDomainErrorCodes
 
     /// <summary>An upload or heartbeat names no device: neither its token is device-bound nor its body has a deviceId.</summary>
     public const string DeviceIdRequired = "Tracker:DeviceIdRequired";
+
+    /// <summary>The uploaded block was deleted from the workspace by an owner or manager (410). An agent drops the row:
+    /// resending it can never succeed.</summary>
+    public const string ActivityDeleted = "Tracker:ActivityDeleted";
+
+    /// <summary>A member may delete their own captures only within the workspace's window after upload, and only while
+    /// the owner allows it at all.</summary>
+    public const string CaptureDeleteNotAllowed = "Tracker:CaptureDeleteNotAllowed";
+
+    /// <summary>The typed confirmation of a workspace deletion is not the workspace's name.</summary>
+    public const string WorkspaceDeleteConfirmationMismatch = "Tracker:WorkspaceDeleteConfirmationMismatch";
+
+    /// <summary>The account is the only owner of a workspace: transfer ownership or delete the workspace first.</summary>
+    public const string SoleWorkspaceOwner = "Tracker:SoleWorkspaceOwner";
+
+    /// <summary>A platform administrator's account cannot be deleted by self-service.</summary>
+    public const string AccountDeletionNotAllowed = "Tracker:AccountDeletionNotAllowed";
+
+    /// <summary>The password that confirms a sensitive change is wrong.</summary>
+    public const string InvalidPassword = "Tracker:InvalidPassword";
+
+    /// <summary>The email confirmation link is invalid or expired.</summary>
+    public const string EmailConfirmationInvalid = "Tracker:EmailConfirmationInvalid";
+
+    /// <summary>Billing is turned off on this deployment (<c>Billing:Enabled</c>): there is no plan to change or cancel.</summary>
+    public const string BillingDisabled = "Tracker:BillingDisabled";
+
+    /// <summary>Owners may only move to a free plan by themselves; paid plans are changed by the platform.</summary>
+    public const string PlanChangeNotAllowed = "Tracker:PlanChangeNotAllowed";
 }

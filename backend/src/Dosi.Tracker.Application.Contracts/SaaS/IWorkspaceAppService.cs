@@ -11,8 +11,12 @@ public interface IWorkspaceAppService : IApplicationService
     /// <summary>The current workspace's subscription; null (HTTP 204) when it has none.</summary>
     Task<SubscriptionDto?> GetCurrentSubscriptionAsync();
 
-    /// <summary>Anonymous: every plan, cheapest first (the sign-up page offers them).</summary>
+    /// <summary>Anonymous: every plan, cheapest first (the sign-up page offers them while billing is on).</summary>
     Task<ListResultDto<PlanDto>> GetAvailablePlansAsync();
+
+    /// <summary><c>GET /api/app/workspace/billing-mode</c> (anonymous): whether this deployment bills workspaces.
+    /// While it does not, sign-up ignores the plan and every workspace is active.</summary>
+    Task<BillingModeDto> GetBillingModeAsync();
 
     /// <summary>Anonymous sign-up: creates the account and a workspace it owns (or joins an invited workspace).
     /// <c>Tracker:EmailAlreadyRegistered</c> when the email has an account already.</summary>
@@ -43,6 +47,12 @@ public interface IWorkspaceAppService : IApplicationService
 
     /// <summary><c>POST /api/app/workspaces/{id}/restore</c>: Active owner of target workspace only. Idempotent.</summary>
     Task<WorkspaceDto> RestoreAsync(Guid id);
+
+    /// <summary><c>POST /api/app/workspaces/{id}/delete</c>: active owners only, confirmed by typing the workspace's
+    /// name (<c>Tracker:WorkspaceDeleteConfirmationMismatch</c>). The workspace is gone at once for everyone — members
+    /// and their agents are answered <c>Tracker:NotWorkspaceMember</c> — and its data, captures included, is purged
+    /// after the grace period.</summary>
+    Task<DeletedWorkspaceDto> DeleteAsync(Guid id, DeleteWorkspaceDto input);
 
     /// <summary><c>GET /api/app/workspaces/{id}/capture-retention</c>: Active member of target workspace only.</summary>
     Task<WorkspaceCaptureRetentionDto> GetCaptureRetentionAsync(Guid id);

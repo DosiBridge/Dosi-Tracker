@@ -310,6 +310,15 @@ public sealed class AuthRateLimitingTests : IAsyncLifetime
     [InlineData("GET", "/api/app/invitations/mine", null, AuthRateLimiting.RequestKind.None)]
     [InlineData("POST", "/api/app/team/invite-member", null, AuthRateLimiting.RequestKind.Invite)]
     [InlineData("GET", "/api/app/team/invitations", null, AuthRateLimiting.RequestKind.None)]
+    [InlineData("POST", "/api/app/team/0f8fad5b-d9cb-469f-a165-70867728950e/resend-invitation", null, AuthRateLimiting.RequestKind.Invite)]
+    [InlineData("POST", "/api/app/team/send-password-reset", null, AuthRateLimiting.RequestKind.Invite)]
+    [InlineData("POST", "/api/app/team/member", null, AuthRateLimiting.RequestKind.None)]
+    [InlineData("POST", "/api/account/send-password-reset-code", null, AuthRateLimiting.RequestKind.Account)]
+    [InlineData("POST", "/api/account/reset-password", null, AuthRateLimiting.RequestKind.Account)]
+    [InlineData("POST", "/api/app/my-account/confirm-email", null, AuthRateLimiting.RequestKind.Account)]
+    [InlineData("POST", "/api/app/my-account/send-email-confirmation", null, AuthRateLimiting.RequestKind.Account)]
+    [InlineData("POST", "/api/app/my-account/delete", null, AuthRateLimiting.RequestKind.Account)]
+    [InlineData("GET", "/api/app/my-account/deletion-check", null, AuthRateLimiting.RequestKind.None)]
     public void Requests_Should_Be_Classified_By_Endpoint_And_Grant(string method, string path, string? form, AuthRateLimiting.RequestKind expected)
     {
         var context = new DefaultHttpContext();

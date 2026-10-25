@@ -91,6 +91,17 @@ public class InviteMemberResultDto
     public string? InvitePath { get; set; }
 
     public DateTime? ExpiresAt { get; set; }
+
+    /// <summary>Whether the invitation was also emailed to the invitee. False when this server sends no email (no SMTP
+    /// configured): share the link yourself then. It never depends on whether the address has an account.</summary>
+    public bool EmailSent { get; set; }
+}
+
+/// <summary><c>POST /api/app/team/send-password-reset?userId=</c>: whether the member was emailed a link to choose a new
+/// password (false when this server sends no email). The link goes only to the member's own address.</summary>
+public class PasswordResetSentDto
+{
+    public bool EmailSent { get; set; }
 }
 
 /// <summary>A pending invitation of the current workspace.</summary>

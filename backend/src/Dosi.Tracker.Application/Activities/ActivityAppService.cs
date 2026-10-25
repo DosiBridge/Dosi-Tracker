@@ -132,6 +132,15 @@ public class ActivityAppService : TrackerAppService, IActivityAppService
             return await MapToDtoWithCapturesAsync(stored);
         }
 
+        // A block an owner or manager deleted stays deleted: its record keeps the client id, so a replay is refused
+        // (410, the agent drops the row) instead of bringing the time and its captures back.
+        if (await LazyServiceProvider.LazyGetRequiredService<Erasure.TrackedDataEraser>()
+                .IsBlockErasedAsync(userId, input.ClientActivityId))
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.ActivityDeleted)
+                .WithData("clientActivityId", input.ClientActivityId);
+        }
+
         // A revoked install is refused before persistence or blob side effects, whether it is named by the token it
         // signed in with or by the block; a block naming no device at all is refused (revocation could not apply).
         var deviceId = await _revocationManager.EnsureCanIngestAsync(

@@ -4,6 +4,7 @@ using System.Linq;
 using System.Reflection;
 using System.Security.Claims;
 using System.Threading.Tasks;
+using Dosi.Tracker.Activities;
 using Dosi.Tracker.Projects;
 using Dosi.Tracker.Settings;
 using Dosi.Tracker.Teams;
@@ -103,11 +104,13 @@ public abstract class WorkspaceAppServiceTests<TStartupModule> : TrackerApplicat
         return userId;
     }
 
-    private static WorkspaceSettingsDto Settings(string? timeZone, int intervalMinutes = 20, int idleThresholdMinutes = 10)
+    private static WorkspaceSettingsDto Settings(string? timeZone, int intervalMinutes = 20, int idleThresholdMinutes = 10,
+        int memberCaptureDeleteMinutes = MemberCaptureDeletion.DefaultWindowMinutes)
     {
         return new WorkspaceSettingsDto
         {
             DefaultTimeZone = timeZone,
+            MemberCaptureDeleteMinutes = memberCaptureDeleteMinutes,
             NewProjectDefaults = new NewProjectDefaultsDto
             {
                 IntervalMinutes = intervalMinutes,
@@ -626,6 +629,27 @@ public abstract class WorkspaceAppServiceTests<TStartupModule> : TrackerApplicat
     }
 
     [Fact]
+    public async Task The_Capture_Delete_Window_Is_Kept_When_An_Update_Leaves_It_Out_And_Read_Safely()
+    {
+        var owner = await CreateUserAsync("window@ws.test", WorkspaceRoles.Owner);
+        using (ActAs(owner))
+        {
+            (await _workspaceAppService.UpdateSettingsAsync(Settings("Asia/Dhaka", memberCaptureDeleteMinutes: 5)))
+                .MemberCaptureDeleteMinutes.ShouldBe(5);
+
+            var withoutWindow = Settings("Asia/Dhaka");
+            withoutWindow.MemberCaptureDeleteMinutes = null; // an older web app that does not know the field
+            (await _workspaceAppService.UpdateSettingsAsync(withoutWindow)).MemberCaptureDeleteMinutes.ShouldBe(5);
+
+            // A stored value out of range reads as the default.
+            await WithUnitOfWorkAsync(() => GetRequiredService<Volo.Abp.SettingManagement.ISettingManager>().SetAsync(
+                TrackerSettings.Workspace.MemberCaptureDeleteMinutes, "-3", WorkspaceSettingValueProvider.ProviderName,
+                TrackerTestConsts.WorkspaceId.ToString()));
+            (await _workspaceAppService.GetSettingsAsync()).MemberCaptureDeleteMinutes.ShouldBe(MemberCaptureDeletion.DefaultWindowMinutes);
+        }
+    }
+
+    [Fact]
     public async Task An_Unknown_Time_Zone_Should_Be_A_Validation_Error()
     {
         var owner = await CreateUserAsync("bad-tz@ws.test", WorkspaceRoles.Owner);
@@ -635,7 +659,8 @@ public abstract class WorkspaceAppServiceTests<TStartupModule> : TrackerApplicat
                 () => _workspaceAppService.UpdateSettingsAsync(Settings("Mars/Olympus_Mons")));
 
             exception.ValidationErrors.ShouldHaveSingleItem().MemberNames.ShouldContain(nameof(WorkspaceSettingsDto.DefaultTimeZone));
-            (await _workspaceAppService.GetSettingsAsync()).ShouldBeEquivalentTo(new WorkspaceSettingsDto());
+            (await _workspaceAppService.GetSettingsAsync()).ShouldBeEquivalentTo(
+                new WorkspaceSettingsDto { MemberCaptureDeleteMinutes = MemberCaptureDeletion.DefaultWindowMinutes });
         }
     }
 

@@ -5,6 +5,8 @@ using System.Linq;
 using System.Threading.Tasks;
 using Dosi.Tracker.Activities;
 using Dosi.Tracker.Activities.Retention;
+using Dosi.Tracker.Billing;
+using Dosi.Tracker.Erasure;
 using Dosi.Tracker.Identity;
 using Dosi.Tracker.Projects;
 using Dosi.Tracker.Settings;
@@ -107,6 +109,14 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
         return new ListResultDto<PlanDto>(dtos);
     }
 
+    /// <summary>Anonymous: the sign-up page and the web app hide plans and billing while this deployment does not bill.</summary>
+    [AllowAnonymous]
+    [WorkspaceNotRequired]
+    public Task<BillingModeDto> GetBillingModeAsync()
+    {
+        return Task.FromResult(new BillingModeDto { Enabled = IsBillingEnabled });
+    }
+
     [AllowAnonymous]
     [WorkspaceNotRequired]
     public async Task<WorkspaceRegistrationResultDto> RegisterAsync(RegisterWorkspaceDto input)
@@ -138,7 +148,8 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
         {
             WorkspaceId = workspace.Id,
             WorkspaceName = workspace.Name,
-            UserName = user.UserName
+            UserName = user.UserName,
+            EmailConfirmationSent = await SendEmailConfirmationAsync(user)
         };
     }
 
@@ -168,7 +179,8 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
             {
                 WorkspaceId = workspace.Id,
                 WorkspaceName = workspace.Name,
-                UserName = user.UserName
+                UserName = user.UserName,
+                EmailConfirmationSent = await SendEmailConfirmationAsync(user)
             };
         }
     }
@@ -280,6 +292,27 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
             IsArchived = workspace.IsArchived,
             ArchivedTime = workspace.ArchivedTime,
             ArchivedBy = workspace.ArchivedBy
+        };
+    }
+
+    [WorkspaceNotRequired]
+    [RemoteService(IsEnabled = false)]
+    public async Task<DeletedWorkspaceDto> DeleteAsync(Guid id, DeleteWorkspaceDto input)
+    {
+        Check.NotNull(input, nameof(input));
+        var userId = CurrentUser.GetId();
+
+        using var uow = UnitOfWorkManager.Begin(new AbpUnitOfWorkOptions(isTransactional: true), requiresNew: true);
+        var workspace = await _workspaceManager.DeleteAsync(id, userId, input.ConfirmationName);
+        await uow.CompleteAsync();
+
+        var deletionTime = workspace.DeletionTime ?? Clock.Now;
+        var graceDays = LazyServiceProvider.LazyGetRequiredService<IOptions<DataErasureOptions>>().Value.WorkspaceGraceDays;
+        return new DeletedWorkspaceDto
+        {
+            Id = workspace.Id,
+            DeletionTime = deletionTime,
+            PurgeAfter = deletionTime.AddDays(Math.Max(0, graceDays))
         };
     }
 
@@ -590,7 +623,8 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
         return new WorkspaceSettingsDto
         {
             DefaultTimeZone = await _workspaceSettings.GetDefaultTimeZoneAsync(),
-            NewProjectDefaults = ToDto(await _workspaceSettings.GetNewProjectDefaultsAsync())
+            NewProjectDefaults = ToDto(await _workspaceSettings.GetNewProjectDefaultsAsync()),
+            MemberCaptureDeleteMinutes = await _workspaceSettings.GetMemberCaptureDeleteMinutesAsync()
         };
     }
 
@@ -608,11 +642,16 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
 
         await _workspaceSettings.SetDefaultTimeZoneAsync(timeZone);
         await _workspaceSettings.SetNewProjectDefaultsAsync(defaults);
+        if (input.MemberCaptureDeleteMinutes.HasValue)
+        {
+            await _workspaceSettings.SetMemberCaptureDeleteMinutesAsync(input.MemberCaptureDeleteMinutes.Value);
+        }
 
         return new WorkspaceSettingsDto
         {
             DefaultTimeZone = timeZone,
-            NewProjectDefaults = ToDto(defaults)
+            NewProjectDefaults = ToDto(defaults),
+            MemberCaptureDeleteMinutes = await _workspaceSettings.GetMemberCaptureDeleteMinutesAsync()
         };
     }
 
@@ -634,9 +673,16 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
     }
 
     /// <summary>The plan chosen at sign-up: by id, else by name, else the default (Free). Self-service accepts free
-    /// plans and plans with a trial; a paid plan without one would start active with nothing paid.</summary>
+    /// plans and plans with a trial; a paid plan without one would start active with nothing paid. While billing is off
+    /// the choice is ignored: every new workspace gets the default plan (which then limits nothing).</summary>
     private async Task<Plan> GetSignUpPlanAsync(Guid? planId, string? planNameInput)
     {
+        if (!IsBillingEnabled)
+        {
+            planId = null;
+            planNameInput = null;
+        }
+
         Plan? plan;
         string member;
         if (planId.HasValue)
@@ -671,6 +717,14 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
         }
 
         return plan;
+    }
+
+    private bool IsBillingEnabled => LazyServiceProvider.LazyGetRequiredService<IOptions<BillingOptions>>().Value.Enabled;
+
+    /// <summary>Emails a new account the link that confirms its address (best effort).</summary>
+    private Task<bool> SendEmailConfirmationAsync(IdentityUser user)
+    {
+        return LazyServiceProvider.LazyGetRequiredService<AccountLinkEmails>().SendEmailConfirmationAsync(user);
     }
 
     private static NewProjectDefaultsDto ToDto(NewProjectDefaults defaults)

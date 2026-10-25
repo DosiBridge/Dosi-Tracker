@@ -23,6 +23,8 @@ using Dosi.Tracker.Projects;
 using Dosi.Tracker.Activities;
 using Dosi.Tracker.Devices;
 using Dosi.Tracker.Presence;
+using Dosi.Tracker.Erasure;
+using Microsoft.AspNetCore.DataProtection.EntityFrameworkCore;
 
 namespace Dosi.Tracker.EntityFrameworkCore;
 
@@ -30,7 +32,8 @@ namespace Dosi.Tracker.EntityFrameworkCore;
 [ConnectionStringName("Default")]
 public class TrackerDbContext :
     AbpDbContext<TrackerDbContext>,
-    IIdentityDbContext
+    IIdentityDbContext,
+    IDataProtectionKeyContext
 {
     /* Add DbSet properties for your Aggregate Roots / Entities here. */
     public DbSet<Project> Projects { get; set; }
@@ -41,6 +44,12 @@ public class TrackerDbContext :
     public DbSet<Screenshot> Screenshots { get; set; }
     public DbSet<AgentPresence> AgentPresences { get; set; }
     public DbSet<DeviceRevocation> DeviceRevocations { get; set; }
+    public DbSet<ActivityErasure> ActivityErasures { get; set; }
+    public DbSet<AccountErasure> AccountErasures { get; set; }
+
+    /// <summary>ASP.NET Core Data Protection keys (sign-in cookies, antiforgery and password-reset tokens), kept here so
+    /// they survive restarts and are shared by every API instance.</summary>
+    public DbSet<DataProtectionKey> DataProtectionKeys { get; set; }
 
     // New Domains
     public DbSet<Dosi.Tracker.SaaS.Plan> Plans { get; set; }
@@ -104,9 +113,16 @@ public class TrackerDbContext :
             b.Property(x => x.Name).IsRequired().HasMaxLength(WorkspaceConsts.MaxNameLength);
             b.Property(x => x.NormalizedName).IsRequired().HasMaxLength(WorkspaceConsts.MaxNameLength);
             b.Property(x => x.IsArchived).HasDefaultValue(false);
-            // The backstop for concurrent creations of the same name (Tracker:DuplicateWorkspaceName).
-            b.HasIndex(x => x.NormalizedName).IsUnique();
+            // The backstop for concurrent creations of the same name (Tracker:DuplicateWorkspaceName). Only among the
+            // workspaces that are not deleted: a deleted workspace's name can be used again.
+            var nameIndex = b.HasIndex(x => x.NormalizedName).IsUnique();
+            if (builder.IsUsingPostgreSql() || builder.IsUsingSqlite())
+            {
+                nameIndex.HasFilter("\"IsDeleted\" = false");
+            }
+
             b.HasIndex(x => x.IsArchived);
+            b.HasIndex(x => new { x.IsDeleted, x.PurgedTime }); // The erasure sweep's lookup of workspaces to purge.
         });
 
         builder.Entity<WorkspaceMember>(b =>
@@ -224,6 +240,31 @@ public class TrackerDbContext :
             b.ConfigureByConvention();
             b.Property(x => x.Reason).HasMaxLength(DeviceConsts.MaxReasonLength);
             b.HasIndex(x => new { x.WorkspaceId, x.UserId, x.DeviceId }).IsUnique();
+        });
+
+        builder.Entity<ActivityErasure>(b =>
+        {
+            b.ToTable(TrackerConsts.DbTablePrefix + "ActivityErasures", TrackerConsts.DbSchema);
+            b.ConfigureByConvention();
+            b.Property(x => x.Scope).IsRequired().HasMaxLength(ActivityErasure.MaxScopeLength);
+            b.Property(x => x.CaptureKinds).HasMaxLength(ActivityErasure.MaxCaptureKindsLength);
+            b.Property(x => x.Reason).HasMaxLength(ActivityErasure.MaxReasonLength);
+            // The tombstone lookup of an upload (is this block of the member deleted?).
+            b.HasIndex(x => new { x.WorkspaceId, x.UserId, x.ClientActivityId });
+            b.HasIndex(x => new { x.WorkspaceId, x.CreationTime }).IsDescending(false, true);
+        });
+
+        builder.Entity<AccountErasure>(b =>
+        {
+            b.ToTable(TrackerConsts.DbTablePrefix + "AccountErasures", TrackerConsts.DbSchema);
+            b.ConfigureByConvention();
+            b.HasIndex(x => x.UserId);
+            b.HasIndex(x => x.CompletedTime);
+        });
+
+        builder.Entity<DataProtectionKey>(b =>
+        {
+            b.ToTable(TrackerConsts.DbTablePrefix + "DataProtectionKeys", TrackerConsts.DbSchema);
         });
 
         // New Domains

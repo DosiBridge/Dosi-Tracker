@@ -55,6 +55,16 @@
     "Tracker:DeviceRevoked": "This computer was removed from this workspace and was signed out. Ask a workspace owner or manager to restore it to track time here again.",
     "Tracker:DeviceNotObserved": "This device has never been seen for this member in this workspace.",
     "Tracker:DeviceNotFound": "This device is not revoked in this workspace.",
-    "Tracker:DeviceIdRequired": "The request names no device: sign in with a device_id, or send the agent's deviceId."
+    "Tracker:DeviceIdRequired": "The request names no device: sign in with a device_id, or send the agent's deviceId.",
+    "Permission:Activities.Delete": "Delete tracked time and captures",
+    "Tracker:ActivityDeleted": "This time block was deleted from the workspace and cannot be uploaded again.",
+    "Tracker:CaptureDeleteNotAllowed": "You can delete your own captures only for {windowMinutes} minutes after they were uploaded. Ask a workspace owner or manager to delete it.",
+    "Tracker:WorkspaceDeleteConfirmationMismatch": "Type the workspace's name exactly to confirm its deletion.",
+    "Tracker:SoleWorkspaceOwner": "You are the only owner of {workspaces}. Make someone else an owner or delete the workspace before deleting your account.",
+    "Tracker:AccountDeletionNotAllowed": "A platform administrator's account cannot be deleted here.",
+    "Tracker:InvalidPassword": "The password is not correct.",
+    "Tracker:EmailConfirmationInvalid": "This email confirmation link is invalid or has expired. Request a new one.",
+    "Tracker:BillingDisabled": "Billing is turned off on this server: every workspace is active and has no plan to change.",
+    "Tracker:PlanChangeNotAllowed": "Owners can switch to a free plan themselves. Contact support to change to a paid plan."
   }
 }

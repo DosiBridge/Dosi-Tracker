@@ -51,6 +51,12 @@ public class WorkspacesController : TrackerController
         return _workspaceAppService.RestoreAsync(id);
     }
 
+    [HttpPost("{id}/delete")]
+    public Task<DeletedWorkspaceDto> DeleteAsync(Guid id, [FromBody] DeleteWorkspaceDto input)
+    {
+        return _workspaceAppService.DeleteAsync(id, input);
+    }
+
     [HttpGet("{id}/capture-retention")]
     public Task<WorkspaceCaptureRetentionDto> GetCaptureRetentionAsync(Guid id)
     {

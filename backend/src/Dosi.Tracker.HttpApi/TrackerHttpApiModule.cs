@@ -88,6 +88,15 @@ public class TrackerHttpApiModule : AbpModule
             options.Map(TrackerDomainErrorCodes.DeviceNotObserved, HttpStatusCode.BadRequest);
             options.Map(TrackerDomainErrorCodes.DeviceNotFound, HttpStatusCode.NotFound);
             options.Map(TrackerDomainErrorCodes.DeviceIdRequired, HttpStatusCode.BadRequest);
+            options.Map(TrackerDomainErrorCodes.ActivityDeleted, HttpStatusCode.Gone);
+            options.Map(TrackerDomainErrorCodes.CaptureDeleteNotAllowed, HttpStatusCode.Forbidden);
+            options.Map(TrackerDomainErrorCodes.WorkspaceDeleteConfirmationMismatch, HttpStatusCode.BadRequest);
+            options.Map(TrackerDomainErrorCodes.SoleWorkspaceOwner, HttpStatusCode.Conflict);
+            options.Map(TrackerDomainErrorCodes.AccountDeletionNotAllowed, HttpStatusCode.Forbidden);
+            options.Map(TrackerDomainErrorCodes.InvalidPassword, HttpStatusCode.Forbidden);
+            options.Map(TrackerDomainErrorCodes.EmailConfirmationInvalid, HttpStatusCode.BadRequest);
+            options.Map(TrackerDomainErrorCodes.BillingDisabled, HttpStatusCode.Conflict);
+            options.Map(TrackerDomainErrorCodes.PlanChangeNotAllowed, HttpStatusCode.Forbidden);
         });
     }
 }

@@ -4,6 +4,7 @@ using System.Threading.Tasks;
 using Dosi.Tracker.SaaS;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using Volo.Abp.BackgroundWorkers;
 using Volo.Abp.Data;
 using Volo.Abp.DistributedLocking;
@@ -19,10 +20,12 @@ namespace Dosi.Tracker.Billing;
 /// <summary>
 /// Generates this month's per-seat invoice for every billable subscription. Runs once at start-up and then hourly,
 /// so frequent restarts never postpone billing; the sweep is idempotent (at most one invoice per workspace and
-/// billing period). Only <c>active</c> subscriptions of existing workspaces are billable: a trial, a past_due
-/// workspace and a deleted workspace are never invoiced. Sweeps do not overlap (named lock, held across replicas
-/// when a distributed lock provider is configured), and the unique index on (workspace, billing period) settles any
-/// race that remains: the losing insert is recognized as "already invoiced", not as a failure.
+/// billing period). Only <c>active</c> subscriptions of existing, unarchived workspaces are billable: a trial, a
+/// past_due or canceled subscription and an archived or deleted workspace are never invoiced, and nothing is while
+/// billing is off (<see cref="BillingOptions"/>; the host does not even start the worker then). Sweeps do not
+/// overlap (named lock, held across replicas when a distributed lock provider is configured), and the unique index on
+/// (workspace, billing period) settles any race that remains: the losing insert is recognized as "already invoiced",
+/// not as a failure.
 /// </summary>
 public class InvoiceGenerationWorker : AsyncPeriodicBackgroundWorkerBase
 {
@@ -49,6 +52,11 @@ public class InvoiceGenerationWorker : AsyncPeriodicBackgroundWorkerBase
     /// <summary>One sweep over every workspace's billable subscription (the body of the hourly run).</summary>
     public virtual async Task<InvoiceSweepResult> GenerateInvoicesAsync(IServiceProvider serviceProvider)
     {
+        if (!serviceProvider.GetRequiredService<IOptions<BillingOptions>>().Value.Enabled)
+        {
+            return new InvoiceSweepResult { BillingDisabled = true };
+        }
+
         var distributedLock = serviceProvider.GetService<IAbpDistributedLock>();
         await using var sweepLock = distributedLock == null ? null : await distributedLock.TryAcquireAsync(LockName);
         if (distributedLock != null && sweepLock == null)
@@ -75,7 +83,7 @@ public class InvoiceGenerationWorker : AsyncPeriodicBackgroundWorkerBase
             var subscriptions = await subscriptionRepository.GetQueryableAsync();
             var workspaces = await workspaceRepository.GetQueryableAsync();
             billable = (await asyncExecuter.ToListAsync(subscriptions.Where(s =>
-                s.Status == BillableStatus && workspaces.Any(w => w.Id == s.WorkspaceId)))).ToArray();
+                s.Status == BillableStatus && workspaces.Any(w => w.Id == s.WorkspaceId && !w.IsArchived)))).ToArray();
             await readUow.CompleteAsync();
         }
 

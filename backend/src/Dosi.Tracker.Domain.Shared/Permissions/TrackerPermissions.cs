@@ -26,6 +26,11 @@ public static class TrackerPermissions
         /// <summary>See every member's activities/screenshots (owners/admins).
         /// Without it, activity queries are scoped to the caller's own data.</summary>
         public const string ViewAll = Default + ".ViewAll";
+
+        /// <summary>Delete a tracked block with its captures, or a capture alone (owners and managers; a reason is
+        /// required and every deletion is recorded). Members delete their own captures without it, within the
+        /// workspace's short window after upload.</summary>
+        public const string Delete = Default + ".Delete";
     }
 
     public static class Team

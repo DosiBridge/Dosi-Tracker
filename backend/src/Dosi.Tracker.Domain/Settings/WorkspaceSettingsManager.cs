@@ -69,6 +69,20 @@ public class WorkspaceSettingsManager : TrackerDomainService
         await SetAsync(TrackerSettings.Workspace.NewProject.IdleThresholdMinutes, SettingValueFormat.Write(defaults.IdleThresholdMinutes));
     }
 
+    /// <summary>Minutes after upload during which members may delete their own captures in the current workspace
+    /// (<see cref="MemberCaptureDeletion"/>); an unreadable or out-of-range value reads as the default.</summary>
+    public virtual async Task<int> GetMemberCaptureDeleteMinutesAsync()
+    {
+        var minutes = await GetIntAsync(TrackerSettings.Workspace.MemberCaptureDeleteMinutes, MemberCaptureDeletion.DefaultWindowMinutes);
+        return minutes is >= 0 and <= MemberCaptureDeletion.MaxWindowMinutes ? minutes : MemberCaptureDeletion.DefaultWindowMinutes;
+    }
+
+    public virtual Task SetMemberCaptureDeleteMinutesAsync(int minutes)
+    {
+        Check.Range(minutes, nameof(minutes), 0, MemberCaptureDeletion.MaxWindowMinutes);
+        return SetAsync(TrackerSettings.Workspace.MemberCaptureDeleteMinutes, SettingValueFormat.Write(minutes));
+    }
+
     /// <summary>The current user's own time zone preference (an IANA id), or null when not set.</summary>
     public virtual async Task<string?> GetUserTimeZoneAsync()
     {

@@ -452,7 +452,9 @@ public class WorkspaceArchivalMigrationTests : TrackerEntityFrameworkCoreTestBas
             reader.GetString(0).ShouldBe("Active");
         }
 
-        // 6. Verify production EF Core TrackerDbContext reads and updates upgraded entity
+        // 6. Verify production EF Core TrackerDbContext reads and updates upgraded entity. The runtime model also maps the
+        // workspace columns later migrations added, so their workspace operations are applied first.
+        await ApplyLaterWorkspaceOperationsAsync(connection, sqliteOptions);
         using (var context = new TrackerDbContext(sqliteOptions) { LazyServiceProvider = GetRequiredService<IAbpLazyServiceProvider>() })
         {
             var loadedWs = await context.Set<Workspace>().FirstOrDefaultAsync(w => w.Id == wsId);
@@ -502,6 +504,31 @@ public class WorkspaceArchivalMigrationTests : TrackerEntityFrameworkCoreTestBas
             cmd.Parameters.Add(new SqliteParameter("@wsId", wsId.ToString().ToUpperInvariant()));
             var name = (string)(await cmd.ExecuteScalarAsync())!;
             name.ShouldBe("Pre-Upgrade Workspace");
+        }
+    }
+
+    /// <summary>The workspace operations of the migrations after AddWorkspaceArchivalFields (the hand-made baseline of the
+    /// operation-level test has no other tables they touch).</summary>
+    private static async Task ApplyLaterWorkspaceOperationsAsync(SqliteConnection connection, DbContextOptions<TrackerDbContext> options)
+    {
+        var builder = new MigrationBuilder("Microsoft.EntityFrameworkCore.Sqlite");
+        typeof(ErasureAndDataProtection)
+            .GetMethod("Up", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .Invoke(new ErasureAndDataProtection(), new object[] { builder });
+        var workspaceOperations = builder.Operations.Where(o => o switch
+        {
+            AddColumnOperation add => add.Table == "AppWorkspaces",
+            DropIndexOperation drop => drop.Table == "AppWorkspaces",
+            CreateIndexOperation create => create.Table == "AppWorkspaces",
+            _ => false
+        }).ToList();
+
+        using var context = new TrackerDbContext(options);
+        foreach (var command in context.GetService<IMigrationsSqlGenerator>().Generate(workspaceOperations))
+        {
+            await using var dbCmd = connection.CreateCommand();
+            dbCmd.CommandText = command.CommandText;
+            await dbCmd.ExecuteNonQueryAsync();
         }
     }
 
@@ -578,11 +605,12 @@ public class WorkspaceArchivalMigrationTests : TrackerEntityFrameworkCoreTestBas
             await cmd.ExecuteNonQueryAsync();
         }
 
-        // 3. Execute tracked migration upgrade to current (20261020200944_AddWorkspaceArchivalFields)
+        // 3. Execute the tracked migrations up to the current one (through 20261020200944_AddWorkspaceArchivalFields and
+        // every later migration, so the runtime model below reads a current schema)
         using (var context = new TrackerDbContext(sqliteOptions))
         {
             var migrator = context.GetService<IMigrator>();
-            await migrator.MigrateAsync("20261020200944_AddWorkspaceArchivalFields");
+            await migrator.MigrateAsync();
         }
 
         // Verify history table contains the new migration

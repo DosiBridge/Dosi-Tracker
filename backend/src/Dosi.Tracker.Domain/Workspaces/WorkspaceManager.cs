@@ -5,11 +5,13 @@ using Volo.Abp;
 using Volo.Abp.Authorization;
 using Volo.Abp.DistributedLocking;
 using Volo.Abp.Domain.Repositories;
+using Microsoft.Extensions.Logging;
 using Volo.Abp.Uow;
 
 namespace Dosi.Tracker.Workspaces;
 
-/// <summary>Creates workspaces: the workspace, its owner's membership and its subscription.</summary>
+/// <summary>Creates workspaces (the workspace, its owner's membership and its subscription), archives, restores and
+/// deletes them.</summary>
 public class WorkspaceManager : TrackerDomainService
 {
     /// <summary>Prefix of the lock that serializes creations of the same workspace name.</summary>
@@ -136,6 +138,51 @@ public class WorkspaceManager : TrackerDomainService
             await _workspaceRepository.UpdateAsync(workspace, autoSave: true);
         }
 
+        return workspace;
+    }
+
+    /// <summary>
+    /// Deletes the workspace (owners only), confirmed by typing its name (<paramref name="confirmationName"/>, compared
+    /// trimmed and case-insensitively; otherwise <c>Tracker:WorkspaceDeleteConfirmationMismatch</c>). The workspace is
+    /// soft-deleted: at once nobody can open it any more (its members and agents are refused as non-members), its
+    /// pending invitations are withdrawn and its subscription is canceled, so it is never invoiced again. Its data is
+    /// purged by the erasure sweep once the grace period is over (<see cref="Erasure.DataErasureOptions"/>). Returns the
+    /// deleted workspace. Saved with the caller's unit of work.
+    /// </summary>
+    public virtual async Task<Workspace> DeleteAsync(Guid workspaceId, Guid operatorUserId, string? confirmationName)
+    {
+        var workspace = await _workspaceRepository.GetAsync(workspaceId);
+        var member = await _memberships.FindActiveAsync(workspaceId, operatorUserId);
+        if (member == null || !member.IsOwner)
+        {
+            throw new AbpAuthorizationException("Only an active owner of the workspace can delete it.");
+        }
+
+        if (!string.Equals(confirmationName?.Trim(), workspace.Name, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.WorkspaceDeleteConfirmationMismatch);
+        }
+
+        var invitationRepository = LazyServiceProvider.LazyGetRequiredService<IRepository<WorkspaceInvitation, Guid>>();
+        var pending = await invitationRepository.GetListAsync(i => i.WorkspaceId == workspaceId && i.AcceptedAt == null);
+        if (pending.Count > 0)
+        {
+            await invitationRepository.DeleteManyAsync(pending, autoSave: true);
+        }
+
+        using (CurrentWorkspace.Change(workspaceId))
+        {
+            var subscription = await _subscriptionRepository.FirstOrDefaultAsync(s => s.WorkspaceId == workspaceId);
+            if (subscription != null && subscription.Status != Subscription.CanceledStatus)
+            {
+                subscription.Cancel();
+                await _subscriptionRepository.UpdateAsync(subscription, autoSave: true);
+            }
+        }
+
+        await _workspaceRepository.DeleteAsync(workspace, autoSave: true);
+        Logger.LogInformation("Workspace {WorkspaceId} was deleted by its owner {UserId}; its data will be purged.",
+            workspaceId, operatorUserId);
         return workspace;
     }
 

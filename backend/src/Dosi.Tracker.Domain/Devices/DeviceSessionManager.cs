@@ -91,6 +91,48 @@ public class DeviceSessionManager : DomainService
         return bound.Count;
     }
 
+    /// <summary>Revokes every sign-in session of <paramref name="userId"/> — every authorization, bound to a device or
+    /// not, and every token that could still be used, including ones issued without an authorization — so no refresh
+    /// token of the account works any more (a deleted account). Returns how many authorizations were revoked.</summary>
+    public virtual async Task<int> RevokeAllAsync(Guid userId)
+    {
+        var subject = userId.ToString();
+        var authorizations = new List<(object Authorization, string Id)>();
+        await foreach (var authorization in _authorizationManager.FindBySubjectAsync(subject))
+        {
+            var id = await _authorizationManager.GetIdAsync(authorization);
+            if (!string.IsNullOrEmpty(id))
+            {
+                authorizations.Add((authorization, id));
+            }
+        }
+
+        foreach (var (authorization, id) in authorizations)
+        {
+            await RevokeUsableTokensAsync(id);
+            await _authorizationManager.TryRevokeAsync(authorization);
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        var orphans = new List<object>();
+        await foreach (var token in _tokenManager.FindBySubjectAsync(subject))
+        {
+            var expires = await _tokenManager.GetExpirationDateAsync(token);
+            if (await _tokenManager.HasStatusAsync(token, OpenIddictConstants.Statuses.Valid) &&
+                (expires == null || expires.Value > now))
+            {
+                orphans.Add(token);
+            }
+        }
+
+        foreach (var token in orphans)
+        {
+            await _tokenManager.TryRevokeAsync(token);
+        }
+
+        return authorizations.Count;
+    }
+
     /// <summary>Revokes the tokens of an authorization that could still be used: valid and not expired (a redeemed
     /// refresh token is already refused, and presenting it again makes OpenIddict revoke the whole chain). One by one
     /// through the manager rather than in bulk, because the manager also refreshes OpenIddict's entity cache, which a

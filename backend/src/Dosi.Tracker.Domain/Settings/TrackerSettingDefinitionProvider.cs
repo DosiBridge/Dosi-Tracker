@@ -18,6 +18,8 @@ public class TrackerSettingDefinitionProvider : SettingDefinitionProvider
             WorkspaceSetting(TrackerSettings.Workspace.NewProject.AllowRunningPrograms, SettingValueFormat.Write(defaults.AllowRunningPrograms)),
             WorkspaceSetting(TrackerSettings.Workspace.NewProject.BlurScreenshots, SettingValueFormat.Write(defaults.BlurScreenshots)),
             WorkspaceSetting(TrackerSettings.Workspace.NewProject.IdleThresholdMinutes, SettingValueFormat.Write(defaults.IdleThresholdMinutes)),
+            WorkspaceSetting(TrackerSettings.Workspace.MemberCaptureDeleteMinutes,
+                SettingValueFormat.Write(Activities.MemberCaptureDeletion.DefaultWindowMinutes)),
             WorkspaceSetting(TrackerSettings.Workspace.CaptureRetention.IsEnabled, defaultValue: null),
             WorkspaceSetting(TrackerSettings.Workspace.CaptureRetention.RetentionDays, defaultValue: null),
             WorkspaceSetting(TrackerSettings.Workspace.ActivityRetention.IsEnabled, defaultValue: null),
