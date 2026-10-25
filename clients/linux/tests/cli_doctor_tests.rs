@@ -1,4 +1,4 @@
-//! CLI integration tests for dosi-tracker-linux.
+//! CLI integration tests for the `dosi-tracker` binary.
 //!
 //! Enforces:
 //! - Real binary invocation via Command::new.
@@ -17,7 +17,7 @@ fn cli_help_exits_zero_with_no_filesystem_side_effects() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home_dummy");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_dosi-tracker-linux"))
+    let output = Command::new(env!("CARGO_BIN_EXE_dosi-tracker"))
         .arg("--help")
         .env("HOME", &home)
         .output()
@@ -47,14 +47,14 @@ fn cli_default_invocation_exits_zero_without_side_effects() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home_dummy");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_dosi-tracker-linux"))
+    let output = Command::new(env!("CARGO_BIN_EXE_dosi-tracker"))
         .env("HOME", &home)
         .output()
         .expect("failed to execute binary");
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("dosi-tracker-linux"));
+    assert!(stdout.contains(concat!("dosi-tracker ", env!("CARGO_PKG_VERSION"))));
     assert!(
         !home.exists(),
         "Default invocation must not create directories"
@@ -66,7 +66,7 @@ fn cli_doctor_plain_text_succeeds_without_side_effects() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home_dummy");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_dosi-tracker-linux"))
+    let output = Command::new(env!("CARGO_BIN_EXE_dosi-tracker"))
         .arg("doctor")
         .env("HOME", &home)
         .env_remove("XDG_CONFIG_HOME")
@@ -93,7 +93,7 @@ fn cli_doctor_json_injected_wayland_reports_truthful_statuses() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home_dummy");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_dosi-tracker-linux"))
+    let output = Command::new(env!("CARGO_BIN_EXE_dosi-tracker"))
         .args(["doctor", "--json"])
         .env("HOME", &home)
         .env("XDG_SESSION_TYPE", "wayland")
@@ -178,7 +178,7 @@ fn cli_doctor_json_injected_x11_reports_architectural_support_with_unimplemented
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home_dummy");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_dosi-tracker-linux"))
+    let output = Command::new(env!("CARGO_BIN_EXE_dosi-tracker"))
         .args(["doctor", "--json"])
         .env("HOME", &home)
         .env("XDG_SESSION_TYPE", "x11")
@@ -209,7 +209,7 @@ fn cli_doctor_json_injected_x11_reports_architectural_support_with_unimplemented
 
 #[test]
 fn cli_unknown_subcommand_exits_failure() {
-    let output = Command::new(env!("CARGO_BIN_EXE_dosi-tracker-linux"))
+    let output = Command::new(env!("CARGO_BIN_EXE_dosi-tracker"))
         .arg("start-tracking")
         .output()
         .expect("failed to execute binary");
@@ -225,7 +225,7 @@ fn cli_doctor_reports_truthful_credential_store_fallback_and_warning() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home_dummy");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_dosi-tracker-linux"))
+    let output = Command::new(env!("CARGO_BIN_EXE_dosi-tracker"))
         .args(["doctor", "--json"])
         .env("HOME", &home)
         .env_remove("DBUS_SESSION_BUS_ADDRESS")
@@ -253,7 +253,7 @@ fn cli_doctor_reports_secret_service_when_dbus_present_on_linux() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home_dummy");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_dosi-tracker-linux"))
+    let output = Command::new(env!("CARGO_BIN_EXE_dosi-tracker"))
         .args(["doctor", "--json"])
         .env("HOME", &home)
         .env(
@@ -282,5 +282,50 @@ fn cli_doctor_reports_secret_service_when_dbus_present_on_linux() {
     {
         assert_eq!(cred_diag.backend, "FileFallback");
         assert!(cred_diag.fallback_active);
+    }
+}
+
+#[test]
+fn cli_version_names_the_dosi_tracker_binary() {
+    for flag in ["--version", "-V", "version"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_dosi-tracker"))
+            .arg(flag)
+            .env_clear()
+            .output()
+            .expect("failed to execute binary");
+        assert!(output.status.success(), "{flag}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            stdout.trim(),
+            concat!("dosi-tracker ", env!("CARGO_PKG_VERSION")),
+            "{flag}"
+        );
+    }
+}
+
+#[cfg(feature = "gui")]
+#[test]
+fn gui_placeholder_prints_its_version_and_refuses_everything_else() {
+    let gui = env!("CARGO_BIN_EXE_dosi-tracker-gui");
+    let output = Command::new(gui)
+        .arg("--version")
+        .env_clear()
+        .output()
+        .expect("failed to execute GUI binary");
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        concat!("dosi-tracker-gui ", env!("CARGO_PKG_VERSION"))
+    );
+
+    for args in [&[][..], &["--preview", "main"][..]] {
+        let output = Command::new(gui)
+            .args(args)
+            .env_clear()
+            .output()
+            .expect("failed to execute GUI binary");
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("GUI not available in this build"));
     }
 }

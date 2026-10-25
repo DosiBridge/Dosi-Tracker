@@ -410,7 +410,7 @@ fn test_doctor_and_help_remain_strictly_nonmutating() {
 
     fs::create_dir_all(&fake_home).unwrap();
 
-    let bin_path = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+    let bin_path = env!("CARGO_BIN_EXE_dosi-tracker");
 
     // Run doctor command
     let doctor_status = Command::new(bin_path)

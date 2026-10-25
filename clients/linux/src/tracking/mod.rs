@@ -9,13 +9,30 @@
 //!   - Consent-gated acquisition (`ConsentGatedTracker`) with ticket generation invalidation (ABA protection).
 //!   - Side-effect-free fake provider (`FakeAcquisitionProvider`) matching Windows test infrastructure.
 
+pub mod build;
+pub mod capture;
+#[cfg(target_os = "linux")]
+pub mod dbus_idle;
 pub mod fake;
 pub mod gated;
+pub mod input;
 pub mod model;
+#[cfg(target_os = "linux")]
+pub mod portal_screen;
 pub mod procfs;
+#[cfg(target_os = "linux")]
+pub mod session_probe;
+#[cfg(target_os = "linux")]
+pub mod system;
+#[cfg(target_os = "linux")]
+pub mod tracker;
 pub mod traits;
+pub mod usage;
 pub mod wayland;
 pub mod x11;
+pub mod x11_idle;
+pub mod x11_input;
+pub mod x11_screen;
 
 pub use fake::FakeAcquisitionProvider;
 pub use gated::ConsentGatedTracker;

@@ -1,4 +1,4 @@
-//! Executable CLI entrypoint for dosi-tracker-linux.
+//! Executable CLI entrypoint for `dosi-tracker`.
 //!
 //! Provides diagnostic commands (`doctor [--json]`), credential management (`login [--json]`, `logout [--json]`, `status [--json]`),
 //! and durable outbox inspection (`outbox status [--json]`).
@@ -24,13 +24,13 @@ use dosi_tracker_linux::outbox::{inspect_outbox_status, OutboxScope};
 use dosi_tracker_linux::signing::generate_signing_key;
 
 fn print_help() {
-    println!("dosi-tracker-linux {}", env!("CARGO_PKG_VERSION"));
+    println!("dosi-tracker {}", env!("CARGO_PKG_VERSION"));
     println!(
         "Headless Linux client foundation, capability diagnostics, and transport for Dosi-Tracker."
     );
     println!();
     println!("USAGE:");
-    println!("    dosi-tracker-linux [COMMAND] [OPTIONS]");
+    println!("    dosi-tracker [COMMAND] [OPTIONS]");
     println!();
     println!("COMMANDS:");
     println!("    login        Authenticate with backend and securely store credentials");
@@ -55,15 +55,17 @@ fn print_help() {
 }
 
 fn print_version() {
-    println!("dosi-tracker-linux {}", env!("CARGO_PKG_VERSION"));
+    println!("dosi-tracker {}", env!("CARGO_PKG_VERSION"));
 }
 
 fn print_login_help() {
-    println!("dosi-tracker-linux login");
+    println!("dosi-tracker login");
     println!("Authenticate with backend and securely store credentials.");
     println!();
     println!("USAGE:");
-    println!("    dosi-tracker-linux login --username <USER> --password <PASS> --workspace-id <WS> [OPTIONS]");
+    println!(
+        "    dosi-tracker login --username <USER> --password <PASS> --workspace-id <WS> [OPTIONS]"
+    );
     println!();
     println!("REQUIRED OPTIONS:");
     println!("    --username <USER>         Account username / email");
@@ -81,11 +83,11 @@ fn print_login_help() {
 }
 
 fn print_logout_help() {
-    println!("dosi-tracker-linux logout");
+    println!("dosi-tracker logout");
     println!("Remove stored credentials for specified account and workspace.");
     println!();
     println!("USAGE:");
-    println!("    dosi-tracker-linux logout --account-id <ID> [OPTIONS]");
+    println!("    dosi-tracker logout --account-id <ID> [OPTIONS]");
     println!();
     println!("REQUIRED OPTIONS:");
     println!("    --account-id <ID>         Account identifier");
@@ -98,11 +100,11 @@ fn print_logout_help() {
 }
 
 fn print_status_help() {
-    println!("dosi-tracker-linux status");
+    println!("dosi-tracker status");
     println!("Inspect stored credentials, identity, token validity, and queue depth.");
     println!();
     println!("USAGE:");
-    println!("    dosi-tracker-linux status --account-id <ID> --workspace-id <WS> [OPTIONS]");
+    println!("    dosi-tracker status --account-id <ID> --workspace-id <WS> [OPTIONS]");
     println!();
     println!("REQUIRED OPTIONS:");
     println!("    --account-id <ID>         Account identifier");
@@ -121,25 +123,25 @@ fn print_status_help() {
 }
 
 fn print_outbox_help() {
-    println!("dosi-tracker-linux outbox");
+    println!("dosi-tracker outbox");
     println!("Inspect durable offline outbox storage.");
     println!();
     println!("USAGE:");
-    println!("    dosi-tracker-linux outbox <SUBCOMMAND> [OPTIONS]");
+    println!("    dosi-tracker outbox <SUBCOMMAND> [OPTIONS]");
     println!();
     println!("SUBCOMMANDS:");
     println!("    status       Read-only inspection of queued records for an exact account and workspace scope");
     println!("    help         Print this help message");
     println!();
-    println!("Run 'dosi-tracker-linux outbox status --help' for options.");
+    println!("Run 'dosi-tracker outbox status --help' for options.");
 }
 
 fn print_outbox_status_help() {
-    println!("dosi-tracker-linux outbox status");
+    println!("dosi-tracker outbox status");
     println!("Read-only inspection of durable outbox queue for a specific scope.");
     println!();
     println!("USAGE:");
-    println!("    dosi-tracker-linux outbox status --db <PATH> --account-id <ID> --workspace-id <ID> [OPTIONS]");
+    println!("    dosi-tracker outbox status --db <PATH> --account-id <ID> --workspace-id <ID> [OPTIONS]");
     println!();
     println!("REQUIRED OPTIONS:");
     println!("    --db <PATH>             Path to existing SQLite database file (must exist)");
@@ -825,7 +827,7 @@ fn handle_doctor(args: &[String]) -> ExitCode {
 fn handle_outbox(args: &[String]) -> ExitCode {
     if args.is_empty() {
         eprintln!("Error: Missing outbox subcommand. Available: status");
-        eprintln!("Run 'dosi-tracker-linux outbox --help' for usage.");
+        eprintln!("Run 'dosi-tracker outbox --help' for usage.");
         return ExitCode::from(1);
     }
 
@@ -837,7 +839,7 @@ fn handle_outbox(args: &[String]) -> ExitCode {
         }
         other => {
             eprintln!("Error: Unknown outbox subcommand: {}", other);
-            eprintln!("Run 'dosi-tracker-linux outbox --help' for available subcommands.");
+            eprintln!("Run 'dosi-tracker outbox --help' for available subcommands.");
             ExitCode::from(1)
         }
     }
@@ -1036,7 +1038,7 @@ fn main() -> ExitCode {
         }
         other => {
             eprintln!("Unknown command or option: {}", other);
-            eprintln!("Run 'dosi-tracker-linux --help' for available commands.");
+            eprintln!("Run 'dosi-tracker --help' for available commands.");
             ExitCode::from(1)
         }
     }

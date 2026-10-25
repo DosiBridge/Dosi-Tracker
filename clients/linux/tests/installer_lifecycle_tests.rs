@@ -129,7 +129,7 @@ fn installer_help_and_version_invocations_exit_zero() {
         "install.sh --version must exit 0"
     );
     let ver_str = String::from_utf8_lossy(&ver_output.stdout);
-    assert!(ver_str.contains("dosi-tracker-linux installer version 0.1.0"));
+    assert!(ver_str.contains("dosi-tracker installer version 0.1.0"));
 }
 
 #[test]

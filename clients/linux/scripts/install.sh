@@ -134,7 +134,7 @@ while [[ $# -gt 0 ]]; do
       exit 0
       ;;
     -v|--version)
-      echo "dosi-tracker-linux installer version ${CRATE_VERSION}"
+      echo "dosi-tracker installer version ${CRATE_VERSION}"
       exit 0
       ;;
     *)
@@ -335,7 +335,7 @@ if ! is_path_inside_prefix "${DATA_DIR}" "${CANONICAL_PREFIX}"; then
   exit 1
 fi
 
-TARGET_BIN_NAME="dosi-tracker-linux"
+TARGET_BIN_NAME="dosi-tracker"
 TARGET_BIN_PATH="${BIN_DIR}/${TARGET_BIN_NAME}"
 TARGET_BIN_EXE_PATH="${BIN_DIR}/${TARGET_BIN_NAME}.exe"
 MANIFEST_PATH="${DATA_DIR}/manifest.json"
@@ -785,17 +785,19 @@ resolve_source_binary() {
     exit 1
   fi
 
-  echo "==> Building dosi-tracker-linux (${CRATE_VERSION}) via cargo --release..." >&2
-  cargo build --locked --release --manifest-path "${LINUX_CRATE_DIR}/Cargo.toml" --bin dosi-tracker-linux >&2
+  echo "==> Building dosi-tracker (${CRATE_VERSION}) via cargo --release..." >&2
+  cargo build --locked --release --manifest-path "${LINUX_CRATE_DIR}/Cargo.toml" --bin dosi-tracker >&2
 
-  local cand1="${LINUX_CRATE_DIR}/target/release/dosi-tracker-linux"
-  local cand2="${LINUX_CRATE_DIR}/target/release/dosi-tracker-linux.exe"
+  # Cargo honours CARGO_TARGET_DIR (CI keeps its build in a separate volume).
+  local target_dir="${CARGO_TARGET_DIR:-${LINUX_CRATE_DIR}/target}"
+  local cand1="${target_dir}/release/dosi-tracker"
+  local cand2="${target_dir}/release/dosi-tracker.exe"
   if [ -f "${cand1}" ]; then
     echo "${cand1}"
   elif [ -f "${cand2}" ]; then
     echo "${cand2}"
   else
-    echo "Error: Built binary not found in target/release" >&2
+    echo "Error: Built binary not found in ${target_dir}/release" >&2
     exit 1
   fi
 }

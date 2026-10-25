@@ -595,7 +595,7 @@ fn test_invalid_limits_and_scope_refuse_transport_and_mutation() {
 
 #[test]
 fn test_doctor_and_help_remain_strictly_nonmutating_and_offline() {
-    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+    let exe = env!("CARGO_BIN_EXE_dosi-tracker");
 
     // 1. Help invocation
     let help_out = Command::new(exe).arg("--help").output().unwrap();

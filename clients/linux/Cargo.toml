@@ -2,34 +2,78 @@
 name = "dosi-tracker-linux"
 version = "0.1.0"
 edition = "2021"
-description = "Headless Linux client foundation, capability diagnostics, and consent lifecycle core for Dosi-Tracker"
+rust-version = "1.92"
+description = "Dosi-Tracker per-user activity agent for Linux: daemon, CLI and optional GUI"
 license = "MIT"
 authors = ["DosiBridge"]
+default-run = "dosi-tracker"
 
 [lib]
 name = "dosi_tracker_linux"
 path = "src/lib.rs"
 
+# CLI and `daemon` subcommand.
 [[bin]]
-name = "dosi-tracker-linux"
+name = "dosi-tracker"
 path = "src/main.rs"
 
+# Thin egui client of the daemon.
+[[bin]]
+name = "dosi-tracker-gui"
+path = "src/bin/dosi-tracker-gui.rs"
+required-features = ["gui"]
+
+[features]
+default = ["gui", "tray"]
+gui = ["dep:eframe", "dep:egui", "dep:winit"]
+tray = ["dep:ksni"]
+# Fakes, time-scale knob and GUI preview scenes for tests; never in release builds.
+test-support = []
+
+# Every dependency of the v1 design is declared here once, so later steps never
+# edit this file or Cargo.lock.
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
-tokio = { version = "1", features = ["rt", "macros", "time", "sync", "rt-multi-thread"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "signal", "net", "io-util"] }
+# TLS roots: the system store plus the bundled Mozilla roots. Verification is never disabled.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 base64 = "0.22"
 hmac = "0.12"
 sha2 = "0.10"
 rand = { version = "0.8", features = ["getrandom"] }
-x11rb = "0.14.0"
+# Pure-Rust X11: XI2 counts, MIT-SCREEN-SAVER idle, RandR monitors, GetImage, EWMH.
+x11rb = { version = "0.14", features = ["xinput", "screensaver", "randr"] }
+# JPEG ladder, thumbnails, blur and the portal's PNG.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+iana-time-zone = "0.1"
+clap = { version = "4.6", features = ["derive", "env", "wrap_help"] }
+clap_complete = "4.6"
+rpassword = "7.5"
+zeroize = "1.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+anyhow = "1"
+toml = "0.8"
+# GUI (feature `gui`): glow renderer; X11, xkbcommon, EGL and GL are dlopened, so
+# release binaries link nothing beyond libc/libm/libgcc_s.
+eframe = { version = "0.35", optional = true, default-features = false, features = ["glow", "default_fonts", "x11", "wayland", "accesskit"] }
+egui = { version = "0.35", optional = true }
+# Direct dependency only to dlopen libwayland (winit's `wayland` alone links it).
+winit = { version = "0.30", optional = true, default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen", "wayland-csd-adwaita"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-zbus = { version = "4" }
+# READY/STATUS/STOPPING for the Type=notify user unit.
+sd-notify = "0.4"
+# D-Bus (Secret Service, logind, ScreenSaver, Mutter, portal, Notifications) on
+# its own async-io executor plus the blocking API: no tokio reactor is needed.
+zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
+# StatusNotifierItem tray (feature `tray`), on the same zbus 5 stack.
+ksni = { version = "0.3", optional = true, default-features = false, features = ["async-io", "blocking"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -38,3 +82,8 @@ libc = "0.2"
 tempfile = "3"
 proptest = "1"
 
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

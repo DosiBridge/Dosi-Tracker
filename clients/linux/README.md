@@ -1,4 +1,4 @@
-# Dosi-Tracker Linux Desktop Agent (`dosi-tracker-linux`)
+# Dosi-Tracker Linux Desktop Agent (`dosi-tracker`)
 
 Lightweight, privacy-first, rootless desktop agent foundation for Linux written in Rust.
 
@@ -6,7 +6,7 @@ Lightweight, privacy-first, rootless desktop agent foundation for Linux written 
 
 | Attribute | State | Details |
 |---|---|---|
-| **Crate** | `dosi-tracker-linux` v0.1.0 | Located in [`clients/linux`](./) |
+| **Crate** | `dosi-tracker-linux` v0.1.0 | Located in [`clients/linux`](./); binaries `dosi-tracker` (CLI) and `dosi-tracker-gui` (feature `gui`, placeholder until the GUI lands) |
 | **Release Tier** | `headless-foundation` | Diagnostic foundation, default-deny consent core, durable outbox, rootless installer |
 | **Telemetry Adapters** | First Bounded Slice Delivered | X11 EWMH active window + `/proc` running-apps inventory wired with consent gating; Wayland honest unsupported (Phase 2 first slice) |
 | **Privilege Model** | Strictly Rootless | Runs as normal user. Refuses `sudo`, `root`, `setuid`, `evdev`, and `uinput` |
@@ -14,7 +14,7 @@ Lightweight, privacy-first, rootless desktop agent foundation for Linux written 
 | **Credential Store** | SecretService + 0600 Fallback | Scoped `(application, account, workspace)` store; Freedesktop SecretService (`org.freedesktop.secrets` over session D-Bus) with mock transport injection seam (`SecretServiceTransport`) for deterministic protocol testing; owner-only 0600 file fallback with explicit doctor warning |
 | **Transport & Auth** | Real HTTP Delivery Transport | Reqwest rustls, OpenIddict password grant (`POST /connect/token`), pre-expiry refresh, bounded 401 retry, activity upload, heartbeat |
 | **Payload Signing** | HMAC-SHA256 (32 bytes) | URL_SAFE_NO_PAD base64url tag over canonical JSON, mirroring Windows byte semantics and test vectors |
-| **CI Gate** | Dedicated GitHub Action | `linux-agent` job in `.github/workflows/ci.yml` running on `ubuntu-latest` |
+| **CI Gate** | Dedicated GitHub workflow | `.github/workflows/linux.yml` runs `ci/check.sh` inside the `ci/Dockerfile` image (ubuntu:22.04, glibc 2.35) |
 
 ---
 
@@ -37,8 +37,7 @@ Lightweight, privacy-first, rootless desktop agent foundation for Linux written 
 
 ### Prerequisites
 - Linux distribution (Ubuntu 22.04+, Fedora 38+, Arch Linux, Debian 12+)
-- Rust toolchain (1.80+ stable)
-- SQLite 3 runtime libraries
+- Rust toolchain 1.92+ (CI pins 1.97.1); SQLite is bundled, no `-dev` packages are needed
 - Standard POSIX shell (`bash`)
 
 ### Rootless Source Installation
@@ -57,7 +56,7 @@ The installer verifies prefix boundary confinement, validates manifest ownership
 ### Verification
 ```bash
 # Check installed binary status
-~/.local/opt/dosi-tracker/bin/dosi-tracker-linux doctor
+~/.local/opt/dosi-tracker/bin/dosi-tracker doctor
 ```
 
 ### Uninstallation
@@ -78,14 +77,14 @@ Authenticate with the backend via OpenIddict password grant and manage stored cr
 
 ```bash
 # Login and store scoped credentials with per-device signing key
-cargo run --bin dosi-tracker-linux -- login \
+cargo run --bin dosi-tracker -- login \
   --username "worker@example.com" \
   --password "secret" \
   --workspace-id "00000000-0000-0000-0000-000000000001" \
   --server "https://api.dosi.app"
 
 # Logout and securely remove credentials
-cargo run --bin dosi-tracker-linux -- logout \
+cargo run --bin dosi-tracker -- logout \
   --account-id "worker@example.com" \
   --workspace-id "00000000-0000-0000-0000-000000000001"
 ```
@@ -95,13 +94,13 @@ Non-mutating inspection of identity, token validity, signing key status, and opt
 
 ```bash
 # Human-readable status
-cargo run --bin dosi-tracker-linux -- status \
+cargo run --bin dosi-tracker -- status \
   --account-id "worker@example.com" \
   --workspace-id "00000000-0000-0000-0000-000000000001" \
   --db ~/.local/share/dosi-tracker/outbox.db
 
 # Structured JSON status (pure inspection, zero secret leaks)
-cargo run --bin dosi-tracker-linux -- status \
+cargo run --bin dosi-tracker -- status \
   --account-id "worker@example.com" \
   --workspace-id "00000000-0000-0000-0000-000000000001" \
   --json
@@ -112,17 +111,17 @@ Inspects session environment, resolved non-mutating XDG paths, capability suppor
 
 ```bash
 # Human-readable diagnostic output
-cargo run --bin dosi-tracker-linux -- doctor
+cargo run --bin dosi-tracker -- doctor
 
 # Structured JSON diagnostic output
-cargo run --bin dosi-tracker-linux -- doctor --json
+cargo run --bin dosi-tracker -- doctor --json
 ```
 
 ### Outbox Status Inspection (`outbox status`)
 Performs bounded, strictly read-only inspection of the offline SQLite outbox queue for an exact account and workspace scope. Opens the database with `SQLITE_OPEN_READ_ONLY`, enforces a finite execution work budget (`DEFAULT_MAX_SQLITE_WORK_STEPS = 25_000`), folds corruption checks into a bounded CTE, and fails closed without creating missing database files:
 
 ```bash
-cargo run --bin dosi-tracker-linux -- outbox status \
+cargo run --bin dosi-tracker -- outbox status \
   --db ~/.local/share/dosi-tracker/outbox.db \
   --account-id "00000000-0000-0000-0000-000000000001" \
   --workspace-id "00000000-0000-0000-0000-000000000002" \
@@ -131,9 +130,22 @@ cargo run --bin dosi-tracker-linux -- outbox status \
 
 ### Help & Version
 ```bash
-cargo run --bin dosi-tracker-linux -- --help
-cargo run --bin dosi-tracker-linux -- --version
+cargo run --bin dosi-tracker -- --help
+cargo run --bin dosi-tracker -- --version
 ```
+
+### Local CI (Docker)
+The same image and stages run locally and in `.github/workflows/linux.yml`. Builds go to named volumes, never to the checkout's `target/`:
+
+```bash
+R="$(git rev-parse --show-toplevel)"
+docker build -t dosi-linux-ci:22.04 -f "$R/clients/linux/ci/Dockerfile" "$R/clients/linux/ci"
+docker run --rm --user builder -v "$R:/repo" -v dosi-linux-target:/target \
+  -v dosi-linux-cargo:/usr/local/cargo/registry -e CARGO_TARGET_DIR=/target \
+  -w /repo/clients/linux dosi-linux-ci:22.04 bash ci/check.sh all
+```
+
+Stages: `fmt`, `clippy`, `test`, `harness` (ignored display/bus tests inside `ci/xvfb-session.sh`), `installer`, `release`, `all`. On Git Bash for Windows prefix `docker` with `MSYS_NO_PATHCONV=1`.
 
 ---
 
@@ -156,8 +168,8 @@ cargo run --bin dosi-tracker-linux -- --version
 ## 6. Implementation Roadmap
 
 - **Phase 0 (Completed Foundation & Hygiene)**:
-  - Scoped GitHub Actions CI workflow (`linux-agent` in `.github/workflows/ci.yml`).
-  - Strict formatting and clippy gates (`cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`).
+  - Scoped GitHub Actions CI workflow (`.github/workflows/linux.yml`, Docker image `ci/Dockerfile`, stages in `ci/check.sh`).
+  - Strict formatting and clippy gates (`cargo fmt --check`; `cargo clippy --locked --all-targets -- -D warnings` for the default, `--no-default-features` and `--all-features` sets).
   - Safe scoped SQLite progress handler wrapper (`ScopedProgressHandler`) with guaranteed RAII deregistration.
   - Graceful recoverable mutex poisoning handling in outbox (`OutboxError::LockPoisoned`).
   - Documentation and test count synchronization across repository.

@@ -194,7 +194,7 @@ fn test_cli_login_status_logout_lifecycle() {
 
     let (url, rx) = canned_server(vec![token_ok()]);
 
-    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+    let exe = env!("CARGO_BIN_EXE_dosi-tracker");
 
     // 1. Login via CLI
     let login_out = Command::new(exe)
@@ -304,7 +304,7 @@ fn test_cli_status_fails_closed_and_never_creates_files() {
     let dir = tempdir().unwrap();
     let nonexistent_file = dir.path().join("subdir").join("creds.json");
 
-    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+    let exe = env!("CARGO_BIN_EXE_dosi-tracker");
 
     let output = Command::new(exe)
         .args([
@@ -332,7 +332,7 @@ fn test_cli_status_with_db_reports_queue_depth() {
 
     let (url, rx) = canned_server(vec![token_ok()]);
 
-    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+    let exe = env!("CARGO_BIN_EXE_dosi-tracker");
 
     // Login via CLI and assert exit status
     let login_out = Command::new(exe)
@@ -404,7 +404,7 @@ fn test_end_to_end_signed_block_delivery_and_ack_deletion() {
         token_ok(),
         http_resp("200 OK", &[], r#"{"clientActivityId":"act-signed-slice"}"#),
     ]);
-    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+    let exe = env!("CARGO_BIN_EXE_dosi-tracker");
 
     // 1. Login via CLI and assert successful status
     let login_out = Command::new(exe)
@@ -526,7 +526,7 @@ fn test_end_to_end_mid_upload_server_502_error_retains_row_and_increments_retry(
         token_ok(),
         http_resp("502 Bad Gateway", &[], r#"{"error":"gateway timeout"}"#),
     ]);
-    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+    let exe = env!("CARGO_BIN_EXE_dosi-tracker");
 
     // Login via CLI and assert successful status
     let login_out = Command::new(exe)
@@ -632,7 +632,7 @@ fn test_end_to_end_mid_upload_socket_interruption_retains_row_and_increments_ret
     let cred_path = dir.path().join("credentials.json");
 
     let (server_url, rx, server_handle) = interrupting_server();
-    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+    let exe = env!("CARGO_BIN_EXE_dosi-tracker");
 
     // 1. CLI Login against server
     let login_out = Command::new(exe)
@@ -780,7 +780,7 @@ fn test_failed_login_fails_closed_and_cannot_be_counted_as_delivery_evidence() {
         r#"{"error":"invalid_grant","error_description":"Incorrect username or password."}"#,
     )]);
 
-    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+    let exe = env!("CARGO_BIN_EXE_dosi-tracker");
 
     // 1. Attempt login with wrong password
     let login_out = Command::new(exe)
@@ -880,7 +880,7 @@ fn test_cli_login_short_grant_stores_actual_expiry_upper_bound() {
     );
     let (url, _rx) = canned_server(vec![short_token_response]);
 
-    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+    let exe = env!("CARGO_BIN_EXE_dosi-tracker");
 
     let login_time_before = Utc::now();
 
@@ -958,7 +958,7 @@ fn test_cli_login_json_success_and_redaction() {
     );
     let (url, _rx) = canned_server(vec![server_response]);
 
-    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+    let exe = env!("CARGO_BIN_EXE_dosi-tracker");
 
     let out = Command::new(exe)
         .args([
@@ -1033,7 +1033,7 @@ fn test_cli_login_json_auth_rejection_and_redaction() {
     );
     let (url, _rx) = canned_server(vec![server_response]);
 
-    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+    let exe = env!("CARGO_BIN_EXE_dosi-tracker");
 
     let out = Command::new(exe)
         .args([
@@ -1093,7 +1093,7 @@ fn test_cli_login_json_credential_store_failure() {
     let server_response = token_ok();
     let (url, _rx) = canned_server(vec![server_response]);
 
-    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+    let exe = env!("CARGO_BIN_EXE_dosi-tracker");
 
     let out = Command::new(exe)
         .args([
@@ -1146,7 +1146,7 @@ fn test_cli_logout_json_scoped_success_and_idempotence() {
     creds.device_signing_key = Some(vec![1, 2, 3]);
     store.save(&creds).unwrap();
 
-    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+    let exe = env!("CARGO_BIN_EXE_dosi-tracker");
 
     // 1. Scoped logout with --json
     let out = Command::new(exe)
@@ -1222,7 +1222,7 @@ fn test_cli_logout_json_preserves_cross_workspace_credentials() {
     cred_beta.access_token = Some("token-beta".to_string());
     store.save(&cred_beta).unwrap();
 
-    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+    let exe = env!("CARGO_BIN_EXE_dosi-tracker");
 
     // Clear ws-alpha only
     let out = Command::new(exe)
@@ -1259,7 +1259,7 @@ fn test_cli_logout_json_preserves_cross_workspace_credentials() {
 fn test_cli_login_and_logout_json_errors_and_canary_redaction() {
     let dir = tempdir().unwrap();
     let cred_path = dir.path().join("credentials.json");
-    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+    let exe = env!("CARGO_BIN_EXE_dosi-tracker");
 
     let canary_pos = "CANARY_SECRET_POS_VAL_12345";
     let canary_flag_val = "CANARY_SECRET_FLAG_VAL_67890";

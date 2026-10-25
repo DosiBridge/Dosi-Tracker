@@ -8,10 +8,9 @@
 //! mismatched or disconnected callers), and verifies the production `SecretServiceStore` save/load/update/clear
 //! lifecycle and cross-scope isolation.
 
+mod support;
+
 use std::collections::HashMap;
-use std::fs;
-use std::io::{BufRead, BufReader};
-use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -19,84 +18,11 @@ use dosi_tracker_linux::{
     CredentialError, CredentialStore, Credentials, SecretServiceStore, SecretServiceTransport,
     ZbusSecretServiceTransport,
 };
-use tempfile::TempDir;
+use support::private_bus::PrivateTestBus;
 use zbus::blocking::Connection;
 use zbus::interface;
 use zbus::message::Header;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Str, Value};
-
-/// Ephemeral private session bus running isolated dbus-daemon.
-struct PrivateTestBus {
-    child: Child,
-    address: String,
-    _temp_dir: TempDir,
-}
-
-impl PrivateTestBus {
-    fn new() -> Self {
-        let temp_dir = tempfile::Builder::new()
-            .prefix("dosi-test-dbus-")
-            .tempdir()
-            .expect("Failed creating tempdir for private dbus socket");
-
-        let config_path = temp_dir.path().join("session.conf");
-        let socket_dir = temp_dir.path().to_str().unwrap();
-        let config_content = format!(
-            r#"<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
- "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
-<busconfig>
-  <type>session</type>
-  <listen>unix:tmpdir={socket_dir}</listen>
-  <auth>EXTERNAL</auth>
-  <policy context="default">
-    <allow send_destination="*" eavesdrop="true"/>
-    <allow eavesdrop="true"/>
-    <allow own="*"/>
-  </policy>
-</busconfig>
-"#
-        );
-        fs::write(&config_path, config_content).expect("Failed writing private dbus config");
-
-        let mut child = Command::new("dbus-daemon")
-            .arg(format!("--config-file={}", config_path.display()))
-            .arg("--print-address=1")
-            .arg("--nofork")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("Failed to spawn private dbus-daemon (is dbus-daemon installed?)");
-
-        let stdout = child.stdout.take().expect("Child must have stdout");
-        let mut reader = BufReader::new(stdout);
-        let mut address = String::new();
-        reader
-            .read_line(&mut address)
-            .expect("Failed reading private bus address from dbus-daemon stdout");
-        let address = address.trim().to_string();
-        assert!(
-            !address.is_empty(),
-            "Empty address returned by private dbus-daemon"
-        );
-
-        Self {
-            child,
-            address,
-            _temp_dir: temp_dir,
-        }
-    }
-
-    fn address(&self) -> &str {
-        &self.address
-    }
-}
-
-impl Drop for PrivateTestBus {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
 
 #[derive(Clone, Debug)]
 struct StoredItem {

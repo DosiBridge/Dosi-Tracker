@@ -45,7 +45,7 @@ fn make_test_envelope(client_id: &str, secret_desc: Option<&str>) -> ActivityEnv
 
 #[test]
 fn test_cli_outbox_missing_subcommand_and_unknown_subcommand() {
-    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+    let exe = env!("CARGO_BIN_EXE_dosi-tracker");
 
     // 1. Missing subcommand
     let output = Command::new(exe).arg("outbox").output().unwrap();
@@ -90,7 +90,7 @@ fn test_cli_outbox_missing_subcommand_and_unknown_subcommand() {
 
 #[test]
 fn test_cli_outbox_status_invalid_and_missing_arguments() {
-    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+    let exe = env!("CARGO_BIN_EXE_dosi-tracker");
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("dummy.db");
     fs::write(&db_path, b"").unwrap();
@@ -284,7 +284,7 @@ fn test_cli_outbox_status_invalid_and_missing_arguments() {
 
 #[test]
 fn test_cli_outbox_status_nonexistent_db_never_creates_file_or_directory() {
-    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+    let exe = env!("CARGO_BIN_EXE_dosi-tracker");
     let temp = tempfile::tempdir().unwrap();
     let nested_dir = temp.path().join("ghost_dir");
     let non_existent_db = nested_dir.join("nonexistent_outbox.db");
@@ -318,7 +318,7 @@ fn test_cli_outbox_status_nonexistent_db_never_creates_file_or_directory() {
 
 #[test]
 fn test_cli_outbox_status_corrupt_and_unsupported_version_refusal() {
-    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+    let exe = env!("CARGO_BIN_EXE_dosi-tracker");
     let temp = tempfile::tempdir().unwrap();
 
     // 1. Directory instead of file
@@ -438,7 +438,7 @@ fn test_cli_outbox_status_corrupt_and_unsupported_version_refusal() {
 
 #[test]
 fn test_cli_outbox_status_nonempty_a_and_b_fixtures_exact_counts_and_zero_scope_control() {
-    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+    let exe = env!("CARGO_BIN_EXE_dosi-tracker");
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("outbox_fixture.db");
 
@@ -660,7 +660,7 @@ fn test_cli_outbox_status_nonempty_a_and_b_fixtures_exact_counts_and_zero_scope_
 
 #[test]
 fn test_cli_outbox_status_no_payload_or_activity_id_leakage() {
-    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+    let exe = env!("CARGO_BIN_EXE_dosi-tracker");
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("leak_test.db");
 
@@ -735,7 +735,7 @@ fn test_cli_outbox_status_no_payload_or_activity_id_leakage() {
 
 #[test]
 fn test_cli_outbox_status_wal_mode_uncheckpointed_data() {
-    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+    let exe = env!("CARGO_BIN_EXE_dosi-tracker");
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("wal_test.db");
 
@@ -816,7 +816,7 @@ fn test_module_inspect_outbox_status_direct_api() {
 
 #[test]
 fn test_cli_outbox_status_bounded_workload_exhaustion_refusal() {
-    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+    let exe = env!("CARGO_BIN_EXE_dosi-tracker");
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("workload_overflow.db");
 
@@ -909,7 +909,7 @@ fn test_cli_outbox_status_bounded_workload_exhaustion_refusal() {
 
 #[test]
 fn test_cli_outbox_status_retry_overflow_and_negative_counts_fail_closed() {
-    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+    let exe = env!("CARGO_BIN_EXE_dosi-tracker");
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("retry_overflow.db");
 
@@ -1012,7 +1012,7 @@ fn test_cli_outbox_status_retry_overflow_and_negative_counts_fail_closed() {
 
 #[test]
 fn test_cli_outbox_status_sanitized_errors_and_malformed_schema_sentinels() {
-    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+    let exe = env!("CARGO_BIN_EXE_dosi-tracker");
     let temp = tempfile::tempdir().unwrap();
     let secret_path_canary = "classified-vault-alpha";
     let canary_dir = temp.path().join(secret_path_canary);
@@ -1145,7 +1145,7 @@ fn test_cli_outbox_status_sanitized_errors_and_malformed_schema_sentinels() {
 
 #[test]
 fn test_cli_outbox_status_persisted_fixtures_and_wal_remain_strictly_unchanged() {
-    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+    let exe = env!("CARGO_BIN_EXE_dosi-tracker");
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("fixtures_unchanged.db");
 
@@ -1326,7 +1326,7 @@ fn test_outbox_status_sqlite_work_budget_exhaustion_on_foreign_scope_scan() {
     );
 
     // 3. Positive control via real CLI with default budget succeeds on the same fixture
-    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+    let exe = env!("CARGO_BIN_EXE_dosi-tracker");
     let out = Command::new(exe)
         .args([
             "outbox",

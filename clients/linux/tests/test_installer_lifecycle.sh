@@ -48,14 +48,14 @@ create_fake_executable() {
   cat > "${target_path}" <<EOF
 #!/usr/bin/env bash
 if [ "\$1" = "--version" ]; then
-  echo "dosi-tracker-linux ${version}"
+  echo "dosi-tracker ${version}"
   exit 0
 elif [ "\$1" = "--help" ]; then
-  echo "dosi-tracker-linux help: diagnostic foundation"
+  echo "dosi-tracker help: diagnostic foundation"
   exit 0
 elif [ "\$1" = "doctor" ]; then
   if [ "\$2" = "--json" ]; then
-    echo '{"component":"dosi-tracker-linux","version":"${version}","status":"ok"}'
+    echo '{"component":"dosi-tracker","version":"${version}","status":"ok"}'
   else
     echo "Dosi-Tracker Linux Diagnostic: OK (${version})"
   fi
@@ -80,9 +80,9 @@ test_fresh_install_to_isolated_temp_prefix() {
   bash "${INSTALLER}" install --prefix "${prefix}" --source-bin "${fake_src}" >/dev/null
 
   # Verify executable exists
-  local bin_path="${prefix}/bin/dosi-tracker-linux"
-  if [ ! -f "${bin_path}" ] && [ -f "${prefix}/bin/dosi-tracker-linux.exe" ]; then
-    bin_path="${prefix}/bin/dosi-tracker-linux.exe"
+  local bin_path="${prefix}/bin/dosi-tracker"
+  if [ ! -f "${bin_path}" ] && [ -f "${prefix}/bin/dosi-tracker.exe" ]; then
+    bin_path="${prefix}/bin/dosi-tracker.exe"
   fi
   [ -f "${bin_path}" ]
 
@@ -108,7 +108,7 @@ test_foreign_file_conflict_refusal() {
   mkdir -p "${prefix}/bin"
 
   # Place unmanaged foreign file without manifest
-  echo "foreign proprietary payload" > "${prefix}/bin/dosi-tracker-linux"
+  echo "foreign proprietary payload" > "${prefix}/bin/dosi-tracker"
 
   local fake_src="${temp_dir}/fake_bin"
   create_fake_executable "${fake_src}" "0.1.0"
@@ -121,7 +121,7 @@ test_foreign_file_conflict_refusal() {
 
   # Verify foreign content is completely preserved
   local content
-  content="$(cat "${prefix}/bin/dosi-tracker-linux")"
+  content="$(cat "${prefix}/bin/dosi-tracker")"
 
   rm -rf "${temp_dir}"
 
@@ -135,7 +135,7 @@ test_malformed_manifest_refusal() {
 
   local prefix="${temp_dir}/opt/dosi"
   mkdir -p "${prefix}/bin" "${prefix}/share/dosi-tracker"
-  echo "existing payload" > "${prefix}/bin/dosi-tracker-linux"
+  echo "existing payload" > "${prefix}/bin/dosi-tracker"
 
   local fake_src="${temp_dir}/fake_bin"
   create_fake_executable "${fake_src}" "0.1.0"
@@ -152,9 +152,9 @@ test_malformed_manifest_refusal() {
   "prefix": "${prefix}",
   "bin_dir": "${prefix}/bin",
   "data_dir": "${prefix}/share/dosi-tracker",
-  "binary_path": "${prefix}/bin/dosi-tracker-linux",
+  "binary_path": "${prefix}/bin/dosi-tracker",
   "owned_files": [
-    "${prefix}/bin/dosi-tracker-linux"
+    "${prefix}/bin/dosi-tracker"
   ]
 }
 EOF
@@ -172,9 +172,9 @@ EOF
   "prefix": "${prefix}",
   "bin_dir": "${prefix}/bin",
   "data_dir": "${prefix}/share/dosi-tracker",
-  "binary_path": "${prefix}/bin/dosi-tracker-linux",
+  "binary_path": "${prefix}/bin/dosi-tracker",
   "owned_files": [
-    "${prefix}/bin/dosi-tracker-linux"
+    "${prefix}/bin/dosi-tracker"
   ]
 } TRAILING_GARBAGE_BYTES
 EOF
@@ -183,7 +183,7 @@ EOF
   fi
 
   local content
-  content="$(cat "${prefix}/bin/dosi-tracker-linux")"
+  content="$(cat "${prefix}/bin/dosi-tracker")"
   rm -rf "${temp_dir}"
 
   [ "${failed}" = "0" ] && [ "${content}" = "existing payload" ]
@@ -196,7 +196,7 @@ test_duplicate_keys_manifest_refusal() {
 
   local prefix="${temp_dir}/opt/dosi"
   mkdir -p "${prefix}/bin" "${prefix}/share/dosi-tracker"
-  echo "existing payload" > "${prefix}/bin/dosi-tracker-linux"
+  echo "existing payload" > "${prefix}/bin/dosi-tracker"
 
   # Manifest with duplicate version key
   cat > "${prefix}/share/dosi-tracker/manifest.json" <<EOF
@@ -209,9 +209,9 @@ test_duplicate_keys_manifest_refusal() {
   "prefix": "${prefix}",
   "bin_dir": "${prefix}/bin",
   "data_dir": "${prefix}/share/dosi-tracker",
-  "binary_path": "${prefix}/bin/dosi-tracker-linux",
+  "binary_path": "${prefix}/bin/dosi-tracker",
   "owned_files": [
-    "${prefix}/bin/dosi-tracker-linux"
+    "${prefix}/bin/dosi-tracker"
   ]
 }
 EOF
@@ -225,7 +225,7 @@ EOF
   fi
 
   local content
-  content="$(cat "${prefix}/bin/dosi-tracker-linux")"
+  content="$(cat "${prefix}/bin/dosi-tracker")"
   rm -rf "${temp_dir}"
 
   [ "${failed}" = "0" ] && [ "${content}" = "existing payload" ]
@@ -238,7 +238,7 @@ test_invalid_owned_files_refusal() {
 
   local prefix="${temp_dir}/opt/dosi"
   mkdir -p "${prefix}/bin" "${prefix}/share/dosi-tracker"
-  echo "existing payload" > "${prefix}/bin/dosi-tracker-linux"
+  echo "existing payload" > "${prefix}/bin/dosi-tracker"
 
   local fake_src="${temp_dir}/fake_bin"
   create_fake_executable "${fake_src}" "0.1.0"
@@ -255,7 +255,7 @@ test_invalid_owned_files_refusal() {
   "prefix": "${prefix}",
   "bin_dir": "${prefix}/bin",
   "data_dir": "${prefix}/share/dosi-tracker",
-  "binary_path": "${prefix}/bin/dosi-tracker-linux",
+  "binary_path": "${prefix}/bin/dosi-tracker",
   "owned_files": []
 }
 EOF
@@ -273,7 +273,7 @@ EOF
   "prefix": "${prefix}",
   "bin_dir": "${prefix}/bin",
   "data_dir": "${prefix}/share/dosi-tracker",
-  "binary_path": "${prefix}/bin/dosi-tracker-linux",
+  "binary_path": "${prefix}/bin/dosi-tracker",
   "owned_files": "not_an_array"
 }
 EOF
@@ -291,7 +291,7 @@ EOF
   "prefix": "${prefix}",
   "bin_dir": "${prefix}/bin",
   "data_dir": "${prefix}/share/dosi-tracker",
-  "binary_path": "${prefix}/bin/dosi-tracker-linux",
+  "binary_path": "${prefix}/bin/dosi-tracker",
   "owned_files": [
     "${prefix}/share/dosi-tracker/other_file"
   ]
@@ -302,7 +302,7 @@ EOF
   fi
 
   local content
-  content="$(cat "${prefix}/bin/dosi-tracker-linux")"
+  content="$(cat "${prefix}/bin/dosi-tracker")"
   rm -rf "${temp_dir}"
 
   [ "${failed}" = "0" ] && [ "${content}" = "existing payload" ]
@@ -315,7 +315,7 @@ test_mismatched_prefix_manifest_refusal() {
 
   local prefix="${temp_dir}/opt/dosi"
   mkdir -p "${prefix}/bin" "${prefix}/share/dosi-tracker"
-  echo "protected foreign binary" > "${prefix}/bin/dosi-tracker-linux"
+  echo "protected foreign binary" > "${prefix}/bin/dosi-tracker"
 
   # Valid JSON, but prefix points to completely different directory
   cat > "${prefix}/share/dosi-tracker/manifest.json" <<EOF
@@ -327,9 +327,9 @@ test_mismatched_prefix_manifest_refusal() {
   "prefix": "/another/unrelated/prefix",
   "bin_dir": "/another/unrelated/prefix/bin",
   "data_dir": "/another/unrelated/prefix/share/dosi-tracker",
-  "binary_path": "/another/unrelated/prefix/bin/dosi-tracker-linux",
+  "binary_path": "/another/unrelated/prefix/bin/dosi-tracker",
   "owned_files": [
-    "/another/unrelated/prefix/bin/dosi-tracker-linux"
+    "/another/unrelated/prefix/bin/dosi-tracker"
   ],
   "previous_version": null
 }
@@ -344,7 +344,7 @@ EOF
   fi
 
   local content
-  content="$(cat "${prefix}/bin/dosi-tracker-linux")"
+  content="$(cat "${prefix}/bin/dosi-tracker")"
   rm -rf "${temp_dir}"
 
   [ "${failed}" = "0" ] && [ "${content}" = "protected foreign binary" ]
@@ -420,9 +420,9 @@ test_rollback_refuses_to_overwrite_unmanaged_foreign_destination() {
   bash "${INSTALLER}" update --prefix "${prefix}" --source-bin "${fake_src_v2}" >/dev/null
 
   # Place unmanaged foreign binary at destination and delete manifest
-  local bin_path="${prefix}/bin/dosi-tracker-linux"
-  if [ ! -f "${bin_path}" ] && [ -f "${prefix}/bin/dosi-tracker-linux.exe" ]; then
-    bin_path="${prefix}/bin/dosi-tracker-linux.exe"
+  local bin_path="${prefix}/bin/dosi-tracker"
+  if [ ! -f "${bin_path}" ] && [ -f "${prefix}/bin/dosi-tracker.exe" ]; then
+    bin_path="${prefix}/bin/dosi-tracker.exe"
   fi
   echo "foreign protected file" > "${bin_path}"
   rm -f "${prefix}/share/dosi-tracker/manifest.json"
@@ -463,7 +463,7 @@ test_rollback_refuses_foreign_prefix_or_mismatched_backup() {
   # Now craft a backup manifest with a foreign prefix
   local backup_dir="${prefix}/share/dosi-tracker/backup"
   mkdir -p "${backup_dir}"
-  local backup_bin="${backup_dir}/dosi-tracker-linux.prev"
+  local backup_bin="${backup_dir}/dosi-tracker.prev"
   create_fake_executable "${backup_bin}" "0.9.0"
 
   # Backup manifest is valid JSON, but has prefix /foreign/opt/dosi
@@ -476,9 +476,9 @@ test_rollback_refuses_foreign_prefix_or_mismatched_backup() {
   "prefix": "/foreign/opt/dosi",
   "bin_dir": "/foreign/opt/dosi/bin",
   "data_dir": "/foreign/opt/dosi/share/dosi-tracker",
-  "binary_path": "/foreign/opt/dosi/bin/dosi-tracker-linux",
+  "binary_path": "/foreign/opt/dosi/bin/dosi-tracker",
   "owned_files": [
-    "/foreign/opt/dosi/bin/dosi-tracker-linux"
+    "/foreign/opt/dosi/bin/dosi-tracker"
   ],
   "previous_version": null
 }
@@ -486,9 +486,9 @@ EOF
   echo "0.9.0" > "${backup_dir}/current_version.prev"
 
   # Record current state before rollback attempt
-  local bin_path="${prefix}/bin/dosi-tracker-linux"
-  if [ ! -f "${bin_path}" ] && [ -f "${prefix}/bin/dosi-tracker-linux.exe" ]; then
-    bin_path="${prefix}/bin/dosi-tracker-linux.exe"
+  local bin_path="${prefix}/bin/dosi-tracker"
+  if [ ! -f "${bin_path}" ] && [ -f "${prefix}/bin/dosi-tracker.exe" ]; then
+    bin_path="${prefix}/bin/dosi-tracker.exe"
   fi
 
   local cur_bin_content cur_manifest_content cur_version_content
@@ -540,9 +540,9 @@ test_rollback_restores_complete_managed_state() {
   # Execute rollback
   bash "${INSTALLER}" rollback --prefix "${prefix}" >/dev/null
 
-  local bin_path="${prefix}/bin/dosi-tracker-linux"
-  if [ ! -f "${bin_path}" ] && [ -f "${prefix}/bin/dosi-tracker-linux.exe" ]; then
-    bin_path="${prefix}/bin/dosi-tracker-linux.exe"
+  local bin_path="${prefix}/bin/dosi-tracker"
+  if [ ! -f "${bin_path}" ] && [ -f "${prefix}/bin/dosi-tracker.exe" ]; then
+    bin_path="${prefix}/bin/dosi-tracker.exe"
   fi
 
   local active_ver manifest_ver version_file_ver
@@ -574,9 +574,9 @@ test_metadata_write_failure_fully_rolls_back() {
     failed="1"
   fi
 
-  local bin_path="${prefix}/bin/dosi-tracker-linux"
-  if [ ! -f "${bin_path}" ] && [ -f "${prefix}/bin/dosi-tracker-linux.exe" ]; then
-    bin_path="${prefix}/bin/dosi-tracker-linux.exe"
+  local bin_path="${prefix}/bin/dosi-tracker"
+  if [ ! -f "${bin_path}" ] && [ -f "${prefix}/bin/dosi-tracker.exe" ]; then
+    bin_path="${prefix}/bin/dosi-tracker.exe"
   fi
 
   # Assert prior binary, manifest, and version are completely restored
@@ -609,9 +609,9 @@ test_smoke_check_failure_fully_rolls_back() {
     failed="1"
   fi
 
-  local bin_path="${prefix}/bin/dosi-tracker-linux"
-  if [ ! -f "${bin_path}" ] && [ -f "${prefix}/bin/dosi-tracker-linux.exe" ]; then
-    bin_path="${prefix}/bin/dosi-tracker-linux.exe"
+  local bin_path="${prefix}/bin/dosi-tracker"
+  if [ ! -f "${bin_path}" ] && [ -f "${prefix}/bin/dosi-tracker.exe" ]; then
+    bin_path="${prefix}/bin/dosi-tracker.exe"
   fi
 
   local active_ver manifest_ver version_file_ver
@@ -631,7 +631,7 @@ test_uninstall_refuses_on_corrupted_manifest() {
 
   local prefix="${temp_dir}/opt/dosi"
   mkdir -p "${prefix}/bin" "${prefix}/share/dosi-tracker"
-  echo "precious user script" > "${prefix}/bin/dosi-tracker-linux"
+  echo "precious user script" > "${prefix}/bin/dosi-tracker"
   echo "corrupted metadata" > "${prefix}/share/dosi-tracker/manifest.json"
 
   local failed="0"
@@ -640,7 +640,7 @@ test_uninstall_refuses_on_corrupted_manifest() {
   fi
 
   local content
-  content="$(cat "${prefix}/bin/dosi-tracker-linux")"
+  content="$(cat "${prefix}/bin/dosi-tracker")"
   rm -rf "${temp_dir}"
 
   [ "${failed}" = "0" ] && [ "${content}" = "precious user script" ]
@@ -672,7 +672,7 @@ test_uninstall_preserves_user_config_and_unrelated_sentinels() {
 
   # Verify Dosi-Tracker binary and manifest are removed
   local bin_removed=1
-  if [ -f "${prefix}/bin/dosi-tracker-linux" ] || [ -f "${prefix}/bin/dosi-tracker-linux.exe" ]; then
+  if [ -f "${prefix}/bin/dosi-tracker" ] || [ -f "${prefix}/bin/dosi-tracker.exe" ]; then
     bin_removed=0
   fi
   local manifest_removed=1
@@ -719,9 +719,9 @@ test_real_compiled_binary_install_smoke() {
   # Perform real install from source crate using cargo
   bash "${INSTALLER}" install --prefix "${prefix}" >/dev/null
 
-  local bin_path="${prefix}/bin/dosi-tracker-linux"
-  if [ ! -f "${bin_path}" ] && [ -f "${prefix}/bin/dosi-tracker-linux.exe" ]; then
-    bin_path="${prefix}/bin/dosi-tracker-linux.exe"
+  local bin_path="${prefix}/bin/dosi-tracker"
+  if [ ! -f "${bin_path}" ] && [ -f "${prefix}/bin/dosi-tracker.exe" ]; then
+    bin_path="${prefix}/bin/dosi-tracker.exe"
   fi
   [ -f "${bin_path}" ]
 
@@ -758,9 +758,9 @@ test_uninstall_refuses_extra_in_prefix_sentinel() {
   echo '{"user_consent": true}' > "${mock_home}/.config/dosi-tracker/config.json"
 
   # Inject unauthorized in-prefix file into manifest owned_files alongside legitimate binary
-  local bin_path="${prefix}/bin/dosi-tracker-linux"
-  if [ -f "${prefix}/bin/dosi-tracker-linux.exe" ]; then
-    bin_path="${prefix}/bin/dosi-tracker-linux.exe"
+  local bin_path="${prefix}/bin/dosi-tracker"
+  if [ -f "${prefix}/bin/dosi-tracker.exe" ]; then
+    bin_path="${prefix}/bin/dosi-tracker.exe"
   fi
 
   cat > "${prefix}/share/dosi-tracker/manifest.json" <<EOF
@@ -823,9 +823,9 @@ test_uninstall_refuses_traversal_foreign_sentinel() {
   local foreign_sentinel="${temp_dir}/foreign_sentinel.txt"
   echo "foreign payload" > "${foreign_sentinel}"
 
-  local bin_path="${prefix}/bin/dosi-tracker-linux"
-  if [ -f "${prefix}/bin/dosi-tracker-linux.exe" ]; then
-    bin_path="${prefix}/bin/dosi-tracker-linux.exe"
+  local bin_path="${prefix}/bin/dosi-tracker"
+  if [ -f "${prefix}/bin/dosi-tracker.exe" ]; then
+    bin_path="${prefix}/bin/dosi-tracker.exe"
   fi
 
   # Inject ../ traversal entry into owned_files alongside legitimate binary
@@ -882,9 +882,9 @@ test_uninstall_refuses_symlink_parent_escape() {
 
   ln -s "${outside_dir}" "${prefix}/link_dir" 2>/dev/null || true
 
-  local bin_path="${prefix}/bin/dosi-tracker-linux"
-  if [ -f "${prefix}/bin/dosi-tracker-linux.exe" ]; then
-    bin_path="${prefix}/bin/dosi-tracker-linux.exe"
+  local bin_path="${prefix}/bin/dosi-tracker"
+  if [ -f "${prefix}/bin/dosi-tracker.exe" ]; then
+    bin_path="${prefix}/bin/dosi-tracker.exe"
   fi
 
   cat > "${prefix}/share/dosi-tracker/manifest.json" <<EOF
@@ -936,9 +936,9 @@ test_uninstall_refuses_embedded_newline_and_whitespace_confusion() {
   local secret_file="${prefix}/target_secret.txt"
   echo "target secret payload" > "${secret_file}"
 
-  local bin_path="${prefix}/bin/dosi-tracker-linux"
-  if [ -f "${prefix}/bin/dosi-tracker-linux.exe" ]; then
-    bin_path="${prefix}/bin/dosi-tracker-linux.exe"
+  local bin_path="${prefix}/bin/dosi-tracker"
+  if [ -f "${prefix}/bin/dosi-tracker.exe" ]; then
+    bin_path="${prefix}/bin/dosi-tracker.exe"
   fi
 
   # Case A: Embedded newline path confusion
@@ -1016,9 +1016,9 @@ test_update_and_rollback_refuse_unauthorized_owned_files() {
   local unrelated_file="${prefix}/unrelated_sentinel.txt"
   echo "preserve unrelated" > "${unrelated_file}"
 
-  local bin_path="${prefix}/bin/dosi-tracker-linux"
-  if [ -f "${prefix}/bin/dosi-tracker-linux.exe" ]; then
-    bin_path="${prefix}/bin/dosi-tracker-linux.exe"
+  local bin_path="${prefix}/bin/dosi-tracker"
+  if [ -f "${prefix}/bin/dosi-tracker.exe" ]; then
+    bin_path="${prefix}/bin/dosi-tracker.exe"
   fi
 
   # Inject unauthorized file into existing live manifest

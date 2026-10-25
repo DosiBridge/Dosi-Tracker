@@ -1,18 +1,34 @@
-//! Dosi-Tracker Linux Client Foundation.
+//! Dosi-Tracker Linux agent library: shared by the `dosi-tracker` CLI/daemon
+//! and the `dosi-tracker-gui` client.
 //!
-//! Reusable library providing:
-//! - Non-mutating XDG storage path resolution ([`paths`])
+//! Foundation modules:
+//! - Non-mutating XDG storage path resolution and private file writes ([`paths`])
 //! - Truthful environment and capability diagnostics ([`diagnostics`])
 //! - Default-inactive per-capability consent core with atomic persistence ([`consent`])
 //! - Lifecycle state machine with generation-based ABA ticket invalidation ([`lifecycle`])
+//! - Scoped durable outbox, sync passes, API client, credentials and signing
+//!
+//! Agent modules (design section 17): [`agent`] (worker, control, uploader,
+//! session, tray, daemon), [`ipc`], `cli`, `service` and `gui`. Modules that
+//! use D-Bus or libc are Linux-only; the GUI also needs the `gui` feature.
+//! New items are reached through their module paths: this file only declares
+//! modules and keeps the foundation re-exports below.
 
+pub mod agent;
 pub mod api;
+#[cfg(target_os = "linux")]
+pub mod cli;
 pub mod consent;
 pub mod credentials;
 pub mod diagnostics;
+#[cfg(all(feature = "gui", target_os = "linux"))]
+pub mod gui;
+pub mod ipc;
 pub mod lifecycle;
 pub mod outbox;
 pub mod paths;
+#[cfg(target_os = "linux")]
+pub mod service;
 pub mod signing;
 pub mod sync;
 pub mod tracking;
