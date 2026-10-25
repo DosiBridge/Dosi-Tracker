@@ -83,7 +83,7 @@ final class UploadLoopTests: XCTestCase {
         func issues(of owner: String) -> [UploadIssue?] {
             lock.lock()
             defer { lock.unlock() }
-            return items.compactMap { event in
+            return items.compactMap { event -> UploadIssue?? in
                 guard case .finished(let passOwner, _, let issue, _) = event, passOwner == owner else { return nil }
                 return .some(issue)
             }
