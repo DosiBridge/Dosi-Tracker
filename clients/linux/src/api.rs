@@ -863,6 +863,11 @@ impl TokenCell {
         }
     }
 
+    /// Is `other` this very cell (a clone of it), not just an equal token?
+    pub fn same_cell(&self, other: &TokenCell) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     pub fn with_refresh_token(refresh_token: Option<String>) -> Self {
         let cell = Self::default();
         if let Some(refresh_token) = refresh_token.filter(|t| !t.is_empty()) {

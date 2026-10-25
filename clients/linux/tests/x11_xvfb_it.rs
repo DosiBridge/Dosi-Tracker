@@ -348,6 +348,154 @@ fn the_usage_sampler_records_the_active_window_and_stops_within_one_second() {
 }
 
 #[test]
+#[ignore = "needs the Xvfb harness (ci/xvfb-session.sh)"]
+fn the_x11_tracker_runs_its_native_sensors_only_while_tracking() {
+    use dosi_tracker_linux::agent::model::EndReason;
+    use dosi_tracker_linux::agent::state::SessionKind;
+    use dosi_tracker_linux::agent::worker::Machine;
+    use dosi_tracker_linux::consent::{ConsentManager, ConsentedPermissions, LocalConsent};
+    use dosi_tracker_linux::lifecycle::{TrackerLifecycle, TrackerState};
+    use dosi_tracker_linux::tracking::build::BlockSpec;
+    use dosi_tracker_linux::tracking::dbus_idle::IdleBuses;
+    use dosi_tracker_linux::tracking::session_probe::{ProbeSource, SessionInfo};
+    use dosi_tracker_linux::tracking::system::DeviceInfo;
+    use dosi_tracker_linux::tracking::tracker::Tracker;
+    use std::sync::Mutex;
+
+    let Some(h) = require_harness() else { return };
+    let _xterm = Xterm::start(&h, "Tracked", 100, 100);
+    wait_active(&h, "Tracked");
+    let everything = ConsentedPermissions {
+        screenshot: true,
+        webcam: false,
+        keyboard: true,
+        mouse: true,
+        active_window: true,
+        running_programs: true,
+        blur_screenshots: false,
+    };
+    let lifecycle = Arc::new(Mutex::new(TrackerLifecycle::new(ConsentManager::new(
+        LocalConsent::Granted(everything),
+        None,
+    ))));
+    let session = SessionInfo {
+        kind: SessionKind::X11,
+        source: ProbeSource::Environment,
+        desktop: Some("openbox".into()),
+        session_path: None,
+        session_id: None,
+        display: Some(h.display.clone()),
+        wayland_display: None,
+        xauthority: None,
+        reason: None,
+    };
+    let device = DeviceInfo {
+        device_id: "5b0c1b9e-8f2c-4a43-9a51-0c7f6f2d9b11".into(),
+        device_name: Some("harness".into()),
+        os_version: "Ubuntu 22.04 (Linux)".into(),
+        agent_version: "0.0.0".into(),
+        platform: "linux".into(),
+        time_zone: Some("UTC".into()),
+    };
+    let tracker = Tracker::for_session(
+        &session,
+        &IdleBuses::default(),
+        None,
+        lifecycle.clone(),
+        device,
+    );
+    let driver = tracker.driver();
+    assert!(
+        !driver.is_input_running() && !driver.is_usage_running(),
+        "nothing runs before tracking"
+    );
+    // Not tracking: idle comes from MIT-SCREEN-SAVER.
+    assert_eq!(
+        tracker.session_summary().idle_source.as_deref(),
+        Some("x11-screensaver")
+    );
+
+    tracker.apply_sensor_policy(true, Some(&everything));
+    assert!(driver.is_input_running() && driver.is_usage_running());
+    assert_eq!(lifecycle.lock().unwrap().state(), TrackerState::Tracking);
+    assert_eq!(
+        tracker.session_summary().idle_source.as_deref(),
+        Some("xi2")
+    );
+    let started = Utc::now();
+
+    // XTEST input is counted as injected only, never as the user's.
+    run(&h, "xdotool", &["type", "--delay", "20", "abc"]);
+    let log = tracker.input();
+    wait_for("injected key presses", || {
+        let m = log.measurements(started, Utc::now() + chrono::Duration::seconds(1));
+        (m.injected >= 3).then_some(())
+    });
+    assert_eq!(tracker.current_app().as_deref(), Some("xterm"));
+    let shot = tracker
+        .capture_screen(false)
+        .expect("GetImage at the block's end");
+
+    std::thread::sleep(Duration::from_millis(3_500));
+    let ended = Utc::now() + chrono::Duration::seconds(1);
+    let block = BlockSpec {
+        project_id: "3f2a9c1e-6b7d-4e8f-9a0b-1c2d3e4f5a6b",
+        perms: &everything,
+        started_at: started,
+        ended_at: ended,
+        end_reason: Some(EndReason::Interval),
+        description: None,
+    };
+    let built = tracker.snapshot(&block, Some(shot));
+    let activity = &built.activity;
+    assert_eq!(
+        activity.keyboard_hits,
+        Some(0),
+        "measured, and none of it was physical"
+    );
+    assert!(
+        activity.injected_input_events.unwrap_or(0) >= 3,
+        "{activity:?}"
+    );
+    assert!(activity.timeline.len() == 1 && activity.productivity.is_some());
+    assert!(
+        activity
+            .active_windows
+            .iter()
+            .any(|w| w.window_title == "Tracked"),
+        "{:?}",
+        activity.active_windows
+    );
+    assert!(
+        activity
+            .running_programs
+            .iter()
+            .any(|p| p.app_name == "xterm"),
+        "{:?}",
+        activity.running_programs
+    );
+    assert!(
+        built.screen.is_some(),
+        "the capture of this generation is attached"
+    );
+
+    let stopping = Instant::now();
+    tracker.apply_sensor_policy(false, None);
+    assert!(
+        stopping.elapsed() < STOP_TIMEOUT * 2,
+        "{:?}",
+        stopping.elapsed()
+    );
+    assert!(!driver.is_input_running() && !driver.is_usage_running());
+    assert!(!log.is_healthy(), "input is not measured once stopped");
+    assert_eq!(lifecycle.lock().unwrap().state(), TrackerState::Stopped);
+    assert!(
+        tracker.capture_screen(false).is_none(),
+        "no capture while not tracking"
+    );
+}
+
+#[test]
 fn outside_the_harness_display_tests_skip() {
     // Run by the plain `cargo test`: the harness variables are absent there,
     // so every display test above returns early without touching a display.

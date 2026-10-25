@@ -295,6 +295,20 @@ pub enum NoticeKind {
     /// Linux: the workspace removed this device; its unsent blocks are kept
     /// but not uploaded.
     DeviceRevoked { workspace: String },
+    /// Linux: the project asks to record more than this computer's consent
+    /// allows; nothing more is captured (design 6).
+    PolicyRequestsConsent {
+        project_title: String,
+        capabilities: Vec<String>,
+    },
+    /// Linux: manual mode (no idle source) paused tracking after the
+    /// configured maximum (design 5.2).
+    ManualModePaused { hours: u32 },
+    /// Queued blocks the server will never accept were parked (kept 14 days).
+    BlocksNotAccepted { count: u32 },
+    /// The server refused the screenshots of queued blocks; the blocks were
+    /// sent without them.
+    ScreenshotsRemoved { count: u32 },
 }
 
 impl Notice {
@@ -335,6 +349,22 @@ impl Notice {
             }
             NoticeKind::DeviceRevoked { workspace } => format!(
                 "This computer was removed from {workspace}. Tracking stopped there; choose another workspace or sign out."
+            ),
+            NoticeKind::PolicyRequestsConsent {
+                project_title,
+                capabilities,
+            } => format!(
+                "{project_title} asks to record {} - review in Settings.",
+                capabilities.join(", ")
+            ),
+            NoticeKind::ManualModePaused { hours } => format!(
+                "Tracking paused after {hours} hours: this desktop cannot tell whether you are still there. Resume when you are back."
+            ),
+            NoticeKind::BlocksNotAccepted { count } => format!(
+                "{count} queued blocks were not accepted by the server; they are kept on this computer for 14 days."
+            ),
+            NoticeKind::ScreenshotsRemoved { count } => format!(
+                "The server refused the screenshots of {count} blocks; the blocks were sent without them."
             ),
         }
     }
@@ -943,6 +973,11 @@ pub enum Command {
     Shutdown { at: DateTime<Utc> },
     /// Update affirmative local user consent (grant, decline, revoke, modify).
     UpdateConsent { consent: LocalConsent },
+    /// Linux: the keyring was unlocked (after its own prompt): read the
+    /// saved sign-in's secrets again.
+    ReloadCredentials,
+    /// Linux: ask the screenshot portal again after the user refused it.
+    RetryCapture,
 }
 
 /// Requests from outside the clients (a second GUI launch, the installer,

@@ -15,6 +15,7 @@
 //!   - `x11_idle`, `dbus_idle`: idle sources for away detection (local only).
 //!   - `procfs`: running programs limited to the own user and to window owners / app scopes.
 
+#[cfg(target_os = "linux")]
 pub mod build;
 pub mod capture;
 #[cfg(target_os = "linux")]
