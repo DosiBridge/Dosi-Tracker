@@ -62,6 +62,11 @@ TestResult.xml
 
 # Secrets & Configs
 appsettings.secrets.json
+# Environment files hold real secrets (API keys, DB passwords); only templates are committed.
+.env
+.env.*
+!.env.example
+!**/.env.example
 **/appsettings.Development.json
 backend/**/wwwroot/libs/
 *.db
