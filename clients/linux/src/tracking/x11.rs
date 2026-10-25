@@ -455,7 +455,7 @@ impl X11PropertyTransport for SysX11Transport {
             None => AtomEnum::ANY.into(),
         };
 
-        let long_length = (max_bytes + 3) / 4;
+        let long_length = max_bytes.div_ceil(4);
         let cookie = session
             .conn
             .get_property(false, window, prop_atom, type_atom, 0, long_length)
