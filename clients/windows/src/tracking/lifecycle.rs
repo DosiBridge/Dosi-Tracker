@@ -6,7 +6,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::input::InputCounter;
 use super::usage::UsageRecorder;
@@ -361,12 +361,49 @@ impl<D: SamplerLifecycleDelegate> Drop for UsageLifecycleController<D> {
     }
 }
 
+/// Spaces out attempts at hooks that failed to attach (security software
+/// blocking them, a desktop without input): the worker asks for them on every
+/// event and every 2-second tick, and each attempt spawns a thread and logs
+/// two errors. A failed attempt waits 30 s, doubling up to 5 min — unless
+/// different hooks are asked for.
+#[derive(Debug, Default)]
+pub struct HookRetryGate {
+    /// The hooks that failed (keyboard, mouse), when to try again, the wait.
+    failed: Option<((bool, bool), Instant, Duration)>,
+}
+
+impl HookRetryGate {
+    pub const FIRST: Duration = Duration::from_secs(30);
+    pub const MAX: Duration = Duration::from_secs(5 * 60);
+
+    /// May hooks for `wanted` be attempted at `now`?
+    pub fn may_try(&self, wanted: (bool, bool), now: Instant) -> bool {
+        self.failed.is_none_or(|(failed, at, _)| failed != wanted || now >= at)
+    }
+
+    /// Attaching the hooks for `wanted` failed at `now`.
+    pub fn failed(&mut self, wanted: (bool, bool), now: Instant) {
+        let wait = match self.failed {
+            Some((failed, _, wait)) if failed == wanted => (wait * 2).min(Self::MAX),
+            _ => Self::FIRST,
+        };
+        self.failed = Some((wanted, now + wait, wait));
+    }
+
+    /// They attached.
+    pub fn succeeded(&mut self) {
+        self.failed = None;
+    }
+}
+
 // ---- Native Production Implementations --------------------------------------
 
 #[cfg(windows)]
 pub struct NativeSensorDriver {
     input_lock: Mutex<Option<ActiveInputThread>>,
     usage_lock: Mutex<Option<ActiveUsageThread>>,
+    /// Guarded by `input_lock` (only touched while it is held).
+    input_retry: Mutex<HookRetryGate>,
 }
 
 #[cfg(windows)]
@@ -375,6 +412,7 @@ impl Default for NativeSensorDriver {
         Self {
             input_lock: Mutex::new(None),
             usage_lock: Mutex::new(None),
+            input_retry: Mutex::new(HookRetryGate::default()),
         }
     }
 }
@@ -428,6 +466,10 @@ impl SensorDriver for NativeSensorDriver {
         if !keyboard && !mouse {
             return;
         }
+        let mut retry = self.input_retry.lock().unwrap_or_else(|e| e.into_inner());
+        if !retry.may_try((keyboard, mouse), Instant::now()) {
+            return;
+        }
 
         let (tx, rx) = std::sync::mpsc::channel();
         let counter_clone = counter.clone();
@@ -440,6 +482,7 @@ impl SensorDriver for NativeSensorDriver {
         match spawned {
             Ok(join_handle) => match rx.recv_timeout(Duration::from_secs(3)) {
                 Ok(handshake) if handshake.success => {
+                    retry.succeeded();
                     *guard = Some(ActiveInputThread {
                         thread_id: handshake.thread_id,
                         join_handle,
@@ -449,15 +492,18 @@ impl SensorDriver for NativeSensorDriver {
                 }
                 Ok(handshake) => {
                     tracing::error!(?handshake, "hook attachment failed during handshake");
+                    retry.failed((keyboard, mouse), Instant::now());
                     let _ = join_handle.join();
                 }
                 Err(e) => {
                     tracing::error!(?e, "handshake timeout waiting for hook thread");
+                    retry.failed((keyboard, mouse), Instant::now());
                     let _ = join_handle.join();
                 }
             },
             Err(e) => {
                 tracing::error!(?e, "could not start input hook thread");
+                retry.failed((keyboard, mouse), Instant::now());
             }
         }
     }
@@ -559,6 +605,30 @@ impl SensorDriver for NativeSensorDriver {
 #[cfg(test)]
 pub mod tests {
     use super::*;
+
+    #[test]
+    fn hooks_that_failed_to_attach_are_tried_again_ever_more_slowly() {
+        let start = Instant::now();
+        let mut gate = HookRetryGate::default();
+        let both = (true, true);
+        assert!(gate.may_try(both, start));
+        gate.failed(both, start);
+        assert!(!gate.may_try(both, start + Duration::from_secs(29)), "not on every tick");
+        assert!(gate.may_try((true, false), start), "other hooks are tried at once");
+        assert!(gate.may_try(both, start + HookRetryGate::FIRST));
+
+        let mut at = start;
+        let mut waits = Vec::new();
+        for _ in 0..6 {
+            gate.failed(both, at);
+            let next = (1..=600).map(|s| at + Duration::from_secs(s)).find(|t| gate.may_try(both, *t)).unwrap();
+            waits.push((next - at).as_secs());
+            at = next;
+        }
+        assert_eq!(waits, [60, 120, 240, 300, 300, 300]);
+        gate.succeeded();
+        assert!(gate.may_try(both, at));
+    }
 
     #[test]
     fn fake_driver_default_state_is_never_started() {

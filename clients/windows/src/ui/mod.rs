@@ -22,7 +22,7 @@ mod settings;
 mod timer;
 mod widgets;
 
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -56,6 +56,35 @@ const TABS_H: f32 = 56.0;
 const FOOTER_H: f32 = 30.0;
 /// Below this (either way) the window is not really on screen; nothing is laid out.
 const MIN_LAYOUT_SIZE: f32 = 200.0;
+
+/// A tray icon that could not be created (Explorer not ready at autostart)
+/// is tried again after this, doubling…
+const TRAY_RETRY_FIRST: Duration = Duration::from_secs(15);
+/// …up to this.
+const TRAY_RETRY_MAX: Duration = Duration::from_secs(5 * 60);
+
+/// The wait before the next attempt at the tray icon, after `wait`.
+fn next_tray_retry(wait: Duration) -> Duration {
+    (wait * 2).clamp(TRAY_RETRY_FIRST, TRAY_RETRY_MAX)
+}
+
+/// What the window's close button (X) does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseAction {
+    /// Hide to the tray: tracking goes on, the icon brings it back.
+    HideToTray,
+    /// No tray icon to come back from: minimize to the taskbar instead, so the
+    /// agent never becomes invisible (and unquittable) while it tracks.
+    Minimize,
+}
+
+fn close_action(has_tray: bool) -> CloseAction {
+    if has_tray {
+        CloseAction::HideToTray
+    } else {
+        CloseAction::Minimize
+    }
+}
 
 /// How long a message at the top of the window stays once seen.
 const TOAST_FOR: Duration = Duration::from_secs(8);
@@ -113,6 +142,10 @@ pub struct TrackerApp {
 
     tray: Option<Tray>,
     tray_events: Receiver<TrayEvent>,
+    /// For building the tray icon again when it could not be created.
+    tray_sender: Sender<TrayEvent>,
+    /// Without a tray icon: when to try again, and the wait after that.
+    tray_retry: Option<(Instant, Duration)>,
     /// Requests from another launch or the installer (show the window, quit).
     signals: Receiver<AppSignal>,
 
@@ -176,13 +209,14 @@ impl TrackerApp {
         // The tray must be built on the UI thread (it needs the message loop).
         let (sender, tray_events) = std::sync::mpsc::channel();
         crate::tray::spawn_event_forwarders(ctx.clone(), sender.clone());
-        let tray = match Tray::build(sender, ctx.clone()) {
+        let tray = match Tray::build(sender.clone(), ctx.clone()) {
             Ok(tray) => Some(tray),
             Err(e) => {
-                tracing::error!(?e, "failed to create the tray icon");
+                tracing::error!(?e, "failed to create the tray icon; trying again shortly");
                 None
             }
         };
+        let tray_retry = tray.is_none().then(|| (Instant::now() + TRAY_RETRY_FIRST, TRAY_RETRY_FIRST));
 
         // Starting hidden needs somewhere to come back to: without a tray
         // icon the window must show.
@@ -215,6 +249,8 @@ impl TrackerApp {
             view,
             tray,
             tray_events,
+            tray_sender: sender,
+            tray_retry,
             signals,
             login,
             task: timer::TaskField::default(),
@@ -397,6 +433,28 @@ impl TrackerApp {
         // Paint straight away: a window shown from the tray must never sit
         // blank until the mouse happens to move over it.
         ctx.request_repaint();
+    }
+
+    /// Without a tray icon (Explorer was not ready when the app started at
+    /// sign-in, or it restarted), try to create it again now and then.
+    fn retry_tray(&mut self, ctx: &egui::Context) {
+        let Some((at, wait)) = self.tray_retry else { return };
+        if Instant::now() < at {
+            ctx.request_repaint_after(at - Instant::now());
+            return;
+        }
+        match Tray::build(self.tray_sender.clone(), ctx.clone()) {
+            Ok(tray) => {
+                tracing::info!("the tray icon is up");
+                self.tray = Some(tray);
+                self.tray_retry = None;
+            }
+            Err(e) => {
+                let wait = next_tray_retry(wait);
+                tracing::warn!(?e, retry_in_secs = wait.as_secs(), "the tray icon still cannot be created");
+                self.tray_retry = Some((Instant::now() + wait, wait));
+            }
+        }
     }
 
     fn hide_window(&mut self, ctx: &egui::Context) {
@@ -764,6 +822,7 @@ impl eframe::App for TrackerApp {
             self.hide_window(ctx);
         }
 
+        self.retry_tray(ctx);
         while let Ok(event) = self.tray_events.try_recv() {
             self.on_tray_event(ctx, event, &snapshot);
         }
@@ -781,9 +840,13 @@ impl eframe::App for TrackerApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         } else if ctx.input(|i| i.viewport().close_requested()) {
             // Closing the window hides to tray instead of exiting — this is a
-            // background agent, so the X button must not stop tracking.
+            // background agent, so the X button must not stop tracking. With
+            // no tray icon to come back from, it only minimizes.
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.hide_window(ctx);
+            match close_action(self.tray.is_some()) {
+                CloseAction::HideToTray => self.hide_window(ctx),
+                CloseAction::Minimize => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+            }
         } else if minimized && self.prefs.minimize_to_tray && !self.window.hidden && self.tray.is_some() {
             self.hide_window(ctx);
         }
@@ -893,6 +956,17 @@ fn metric(ui: &mut egui::Ui, label: &str, value: &str, color: Color32) {
 mod tests {
     use super::*;
     use crate::state::Notice;
+
+    #[test]
+    fn without_a_tray_icon_closing_minimizes_and_the_icon_is_tried_again() {
+        assert_eq!(close_action(true), CloseAction::HideToTray);
+        assert_eq!(close_action(false), CloseAction::Minimize, "never an invisible, unquittable agent");
+        let waits: Vec<u64> = std::iter::successors(Some(TRAY_RETRY_FIRST), |w| Some(next_tray_retry(*w)))
+            .take(7)
+            .map(|w| w.as_secs())
+            .collect();
+        assert_eq!(waits, [15, 30, 60, 120, 240, 300, 300]);
+    }
 
     #[test]
     fn footer_reports_the_most_important_upload_state() {

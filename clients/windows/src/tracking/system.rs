@@ -87,13 +87,9 @@ pub fn load_or_create_device_id(path: &Path) -> std::io::Result<String> {
         return Ok(id.to_string());
     }
     let id = uuid::Uuid::new_v4().to_string();
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
     // Write-then-rename, so a crash never leaves a half-written id behind.
-    let temp = path.with_extension("json.tmp");
-    std::fs::write(&temp, serde_json::to_vec(&DeviceFile { device_id: id.clone() })?)?;
-    std::fs::rename(&temp, path)?;
+    crate::fsutil::write_atomically(path, &serde_json::to_vec(&DeviceFile { device_id: id.clone() })?)
+        .map_err(std::io::Error::other)?;
     Ok(id)
 }
 

@@ -63,7 +63,7 @@ pub(super) enum SignInProblem {
     Throttled,
     /// The server failed, or answered with something that is not a sign-in.
     ServerError,
-    /// The saved password stopped working (the worker's own message).
+    /// The saved sign-in stopped working (the worker's own message).
     Expired,
     /// A workspace admin removed this computer; it was signed out.
     DeviceRemoved,
@@ -381,8 +381,8 @@ impl TrackerApp {
         }
     }
 
-    /// The saved password stopped working: ask for it again, for the same
-    /// account — or let someone else sign in.
+    /// The saved sign-in stopped working: ask for the password again, for the
+    /// same account — or let someone else sign in.
     fn expired_form(&mut self, ui: &mut egui::Ui, snapshot: &SharedState) {
         ui.vertical_centered(|ui| {
             theme::logo_mark(ui, 52.0);

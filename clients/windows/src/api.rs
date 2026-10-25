@@ -517,6 +517,10 @@ struct TokenSlot {
     token: std::sync::Mutex<Option<GrantedToken>>,
     /// Held while renewing, so concurrent clients renew once.
     renewing: tokio::sync::Mutex<()>,
+    /// The server granted a token to this sign-in at least once. From then
+    /// on the password is never sent again: without a refresh token the
+    /// sign-in simply expires.
+    granted: std::sync::atomic::AtomicBool,
 }
 
 impl TokenCell {
@@ -537,7 +541,35 @@ impl TokenCell {
         *self.lock() = Some(token);
     }
 
-    /// The latest refresh token, to save with the sign-in.
+    /// The server answered a grant with `token`.
+    fn granted(&self, token: GrantedToken) {
+        self.set(token);
+        self.0.granted.store(true, Ordering::Relaxed);
+    }
+
+    /// Has the server granted a token to this sign-in yet?
+    fn was_granted(&self) -> bool {
+        self.0.granted.load(Ordering::Relaxed)
+    }
+
+    /// Forget every token (signed out): nothing is sent with them again.
+    fn clear(&self) {
+        *self.lock() = None;
+    }
+
+    /// The server granted `refresh_token` (or none) with a fresh access
+    /// token, as a renewal by another task of the sign-in would.
+    #[cfg(test)]
+    pub fn grant_for_test(&self, refresh_token: Option<&str>) {
+        self.granted(GrantedToken {
+            access_token: "t0k3n".into(),
+            refresh_token: refresh_token.map(str::to_owned),
+            expires_at: Instant::now() + Duration::from_secs(3600),
+        });
+    }
+
+    /// The latest refresh token, to save with the sign-in. The server rotates
+    /// it on every renewal; the worker saves each new one at once.
     pub fn refresh_token(&self) -> Option<String> {
         self.lock().as_ref().and_then(|t| t.refresh_token.clone())
     }
@@ -579,8 +611,11 @@ impl std::fmt::Debug for TokenCell {
 /// The token is renewed with the refresh token shortly before it expires and
 /// once when a request answers 401. A refused refresh token means "sign-in
 /// expired": the password is never sent again behind the user's back. The
-/// password is only used while there is no refresh token at all (the sign-in
-/// itself). Workspace-scoped requests carry [`WORKSPACE_HEADER`].
+/// password is sent once, for the sign-in itself, and forgotten as soon as
+/// the server granted a token ([`TokenCell`] remembers that for every client
+/// of the sign-in). Signing out revokes the refresh token
+/// ([`ApiClient::revoke_refresh_token`]). Workspace-scoped requests carry
+/// [`WORKSPACE_HEADER`].
 ///
 /// Nothing is sent to a plain `http://` server other than this computer
 /// unless the admin opted in ([`ApiClient::with_insecure_http`]); see
@@ -756,11 +791,15 @@ impl ApiClient {
         }
         let token: TokenResponse = serde_json::from_str(&body)
             .map_err(|e| AuthError::Server(format!("The server sent an unexpected sign-in response ({e}).")))?;
-        self.tokens.set(GrantedToken::of(token, previous_refresh));
+        if token.refresh_token.as_deref().is_none_or(str::is_empty) && previous_refresh.is_none() {
+            tracing::warn!("the server granted no refresh token: the sign-in ends when this access token expires");
+        }
+        self.tokens.granted(GrantedToken::of(token, previous_refresh));
         Ok(())
     }
 
-    /// Sign in with the email (or user name) and password.
+    /// Sign in with the email (or user name) and password. The password is
+    /// forgotten once the server accepted it.
     pub async fn login(&mut self) -> Result<(), AuthError> {
         let params = [
             ("grant_type", "password"),
@@ -769,7 +808,88 @@ impl ApiClient {
             ("password", self.password.as_str()),
             ("scope", SCOPE),
         ];
-        self.token_request(&params, None).await
+        self.token_request(&params, None).await?;
+        self.password.clear();
+        Ok(())
+    }
+
+    /// Revoke this sign-in's refresh token at the server (signing out), then
+    /// forget every token of it. Best effort, bounded by `timeout`: the
+    /// sign-in is forgotten locally whatever the answer.
+    ///
+    /// The endpoint is the one the server's discovery document advertises
+    /// (`/.well-known/openid-configuration`, `revocation_endpoint`) when it is
+    /// on this server; otherwise ABP's default `/connect/revocat`. A server
+    /// without revocation answers 404 (or `unsupported_token_type`):
+    /// [`Revocation::Unsupported`].
+    pub async fn revoke_refresh_token(&self, timeout: Duration) -> Revocation {
+        let Some(refresh_token) = self.tokens.refresh_token() else {
+            self.tokens.clear();
+            return Revocation::NothingToRevoke;
+        };
+        let outcome = match tokio::time::timeout(timeout, self.revoke(&refresh_token)).await {
+            Ok(outcome) => outcome,
+            Err(_) => Revocation::Failed(format!("no answer within {} ms", timeout.as_millis())),
+        };
+        self.tokens.clear();
+        outcome
+    }
+
+    async fn revoke(&self, refresh_token: &str) -> Revocation {
+        if let Err(e) = self.check_transport() {
+            return Revocation::Failed(e.to_string());
+        }
+        let url = self.revocation_endpoint().await;
+        let params = [("token", refresh_token), ("token_type_hint", "refresh_token"), ("client_id", CLIENT_ID)];
+        let response = match self.execute(self.http.post(&url).header(ACCEPT, "application/json").form(&params)).await {
+            Ok(response) => response,
+            Err(e) => return Revocation::Failed(describe(&e)),
+        };
+        let status = response.status();
+        if status.is_success() {
+            return Revocation::Revoked;
+        }
+        let body = response.text().await.unwrap_or_default();
+        let oauth: OAuthError = serde_json::from_str(&body).unwrap_or_default();
+        let unsupported = matches!(status.as_u16(), 404 | 405 | 501)
+            || matches!(oauth.error.as_deref(), Some("unsupported_token_type" | "unauthorized_client"));
+        let reason = oauth.error_description.or(oauth.error).unwrap_or_else(|| format!("HTTP {status}"));
+        if unsupported {
+            Revocation::Unsupported(reason)
+        } else {
+            Revocation::Failed(reason)
+        }
+    }
+
+    /// Where to revoke tokens: the discovery document's endpoint when it is
+    /// on this same server (a token is never sent to another host), else
+    /// ABP's default path.
+    async fn revocation_endpoint(&self) -> String {
+        #[derive(Deserialize)]
+        struct Discovery {
+            #[serde(default)]
+            revocation_endpoint: Option<String>,
+        }
+        let fallback = format!("{}/connect/revocat", self.base_url);
+        let url = format!("{}/.well-known/openid-configuration", self.base_url);
+        let response = match self.execute(self.http.get(url).header(ACCEPT, "application/json")).await {
+            Ok(response) if response.status().is_success() => response,
+            _ => return fallback,
+        };
+        let advertised = response
+            .text()
+            .await
+            .ok()
+            .and_then(|body| serde_json::from_str::<Discovery>(&body).ok())
+            .and_then(|discovery| discovery.revocation_endpoint);
+        match advertised {
+            Some(endpoint) if same_origin(&endpoint, &self.base_url) => endpoint,
+            Some(endpoint) => {
+                tracing::warn!(%endpoint, "the advertised revocation endpoint is on another server; using this server's");
+                fallback
+            }
+            None => fallback,
+        }
     }
 
     async fn refresh(&self, refresh_token: &str) -> Result<(), AuthError> {
@@ -791,7 +911,9 @@ impl ApiClient {
             // password changed) means "sign-in expired" — never a silent
             // sign-in with a password behind the user's back.
             self.refresh(&refresh_token).await?;
-        } else if self.password.is_empty() {
+        } else if self.password.is_empty() || self.tokens.was_granted() {
+            // No refresh token: the sign-in was never kept, or the server
+            // granted none and the access token ran out.
             return Err(AuthError::Rejected("Please sign in again.".to_owned()));
         } else {
             self.login().await?;
@@ -934,6 +1056,32 @@ impl ApiClient {
         let retry_after = retry_after_of(response.headers());
         let body = response.text().await.unwrap_or_default();
         Err(classify_upload_failure(status.as_u16(), &body, retry_after))
+    }
+}
+
+/// How revoking the refresh token at sign-out went (it is forgotten locally
+/// either way).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Revocation {
+    /// The server confirmed it (RFC 7009: also for a token already invalid).
+    Revoked,
+    /// This sign-in held no refresh token.
+    NothingToRevoke,
+    /// The server has no revocation endpoint (or refuses this client one).
+    Unsupported(String),
+    /// Unreachable, too slow, or another error: the token expires by itself.
+    Failed(String),
+}
+
+/// Do `url` and `base` name the same scheme, host and port?
+fn same_origin(url: &str, base: &str) -> bool {
+    match (reqwest::Url::parse(url), reqwest::Url::parse(base)) {
+        (Ok(a), Ok(b)) => {
+            a.scheme() == b.scheme()
+                && a.host_str().map(str::to_ascii_lowercase) == b.host_str().map(str::to_ascii_lowercase)
+                && a.port_or_known_default() == b.port_or_known_default()
+        }
+        _ => false,
     }
 }
 
@@ -1250,9 +1398,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_401_upload_signs_in_again_and_resends_with_sent_at() {
+    async fn a_401_upload_renews_the_token_and_resends_with_sent_at() {
+        let granted = http("200 OK", &[], r#"{"access_token":"t0k3n","refresh_token":"r1","expires_in":3600}"#);
         let (url, requests) = canned_server(vec![
-            token_ok(),
+            granted,
             http("401 Unauthorized", &[], ""),
             token_ok(),
             http("200 OK", &[("Date", "Mon, 05 Oct 2026 10:00:00 GMT")], "{}"),
@@ -1265,6 +1414,7 @@ mod tests {
         assert!(requests[0].starts_with("POST /connect/token "), "{}", requests[0]);
         assert!(requests[1].starts_with("POST /api/app/activity "), "no double slash: {}", requests[1]);
         assert!(requests[2].starts_with("POST /connect/token"));
+        assert!(body_of(&requests[2]).contains("grant_type=refresh_token"), "renewed, never the password again");
         let upload = &requests[3];
         assert!(upload.contains("authorization: Bearer t0k3n") || upload.contains("Authorization: Bearer t0k3n"));
         let body = &upload[upload.find("\r\n\r\n").unwrap() + 4..];
@@ -1278,12 +1428,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_refused_sign_in_on_any_call_means_sign_in_expired() {
-        // The cached token expired server-side (401) and the saved password
-        // no longer works.
+        // The cached token expired server-side (401) and the refresh token
+        // is refused.
+        let granted = http("200 OK", &[], r#"{"access_token":"t0k3n","refresh_token":"r1","expires_in":3600}"#);
         let (url, _requests) = canned_server(vec![
-            token_ok(),
+            granted,
             http("401 Unauthorized", &[], ""),
-            http("400 Bad Request", &[], r#"{"error":"invalid_grant","error_description":"Invalid username or password!"}"#),
+            http("400 Bad Request", &[], r#"{"error":"invalid_grant","error_description":"The token is no longer valid."}"#),
         ]);
         let error = client(&url).my_projects().await.unwrap_err();
         assert!(error.is_auth_rejected(), "{error}");
@@ -1553,10 +1704,98 @@ mod tests {
         assert!(!body_of(&requests[0]).contains("grant_type=password"));
         assert!(!body_of(&requests[0]).contains("password=pw"));
 
-        // Without a saved password it is the same.
+        // Without a password at hand it is the same.
         let (url, _requests) = canned_server(vec![refused]);
         let mut api = ApiClient::new(url, "alice@acme.com".into(), String::new()).with_tokens(TokenCell::with_refresh_token(Some("r1".into())));
         assert!(api.workspaces_mine().await.unwrap_err().is_auth_rejected());
+    }
+
+    #[tokio::test]
+    async fn the_password_is_sent_once_even_when_the_server_grants_no_refresh_token() {
+        // A token without a refresh token, that then expires (401).
+        let (url, requests) = canned_server(vec![token_ok(), http("401 Unauthorized", &[], ""), token_ok()]);
+        let tokens = TokenCell::default();
+        let mut api = client(&url).with_tokens(tokens.clone());
+        api.login().await.unwrap();
+        assert!(api.password.is_empty(), "forgotten once accepted");
+        // Another client of the same sign-in that still holds the password.
+        let mut other = client(&url).with_tokens(tokens);
+        let error = other.my_projects().await.unwrap_err();
+        assert!(error.is_auth_rejected(), "sign-in expired, not a silent password sign-in: {error}");
+        let requests: Vec<String> = requests.try_iter().collect();
+        assert_eq!(requests.len(), 2, "the sign-in and the refused request only: {requests:?}");
+        assert!(body_of(&requests[0]).contains("grant_type=password"));
+    }
+
+    #[tokio::test]
+    async fn signing_out_revokes_the_refresh_token() {
+        // No discovery document: ABP's default endpoint.
+        let (url, requests) = canned_server(vec![http("404 Not Found", &[], ""), http("200 OK", &[], "")]);
+        let tokens = TokenCell::with_refresh_token(Some("r1".into()));
+        let api = client(&url).with_tokens(tokens.clone()).with_device_id(Some("d1".into()));
+        assert_eq!(api.revoke_refresh_token(Duration::from_secs(5)).await, Revocation::Revoked);
+        let requests: Vec<String> = requests.try_iter().collect();
+        assert!(requests[0].starts_with("GET /.well-known/openid-configuration "), "{}", requests[0]);
+        assert!(requests[1].starts_with("POST /connect/revocat "), "no discovery: ABP's default path: {}", requests[1]);
+        let form = body_of(&requests[1]);
+        for part in ["token=r1", "token_type_hint=refresh_token", "client_id=Tracker_App"] {
+            assert!(form.contains(part), "{form}");
+        }
+        assert!(tokens.refresh_token().is_none(), "forgotten locally");
+        assert_eq!(api.revoke_refresh_token(Duration::from_secs(5)).await, Revocation::NothingToRevoke);
+    }
+
+    #[tokio::test]
+    async fn the_revocation_endpoint_is_taken_from_discovery_only_on_this_server() {
+        // A listener whose address the discovery document can name.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let discovery = format!(r#"{{"revocation_endpoint":"{url}/oauth/revoke"}}"#);
+        let (tx, requests) = std::sync::mpsc::channel();
+        let responses = vec![http("200 OK", &[], &discovery), http("200 OK", &[], "")];
+        std::thread::spawn(move || {
+            for response in responses {
+                let Ok((mut stream, _)) = listener.accept() else { return };
+                let _ = tx.send(read_request(&mut stream));
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        let api = client(&url).with_tokens(TokenCell::with_refresh_token(Some("r1".into())));
+        assert_eq!(api.revoke_refresh_token(Duration::from_secs(5)).await, Revocation::Revoked);
+        let requests: Vec<String> = requests.try_iter().collect();
+        assert!(requests[1].starts_with("POST /oauth/revoke "), "{}", requests[1]);
+
+        // Another host is never sent the token: this server's default path.
+        let elsewhere = http("200 OK", &[], r#"{"revocation_endpoint":"https://evil.example.com/revoke"}"#);
+        let (url, requests) = canned_server(vec![elsewhere, http("200 OK", &[], "")]);
+        let api = client(&url).with_tokens(TokenCell::with_refresh_token(Some("r1".into())));
+        assert_eq!(api.revoke_refresh_token(Duration::from_secs(5)).await, Revocation::Revoked);
+        let requests: Vec<String> = requests.try_iter().collect();
+        assert!(requests[1].starts_with("POST /connect/revocat "), "{}", requests[1]);
+    }
+
+    #[tokio::test]
+    async fn a_server_without_revocation_or_out_of_reach_still_forgets_the_token() {
+        let (url, _requests) = canned_server(vec![http("404 Not Found", &[], ""), http("404 Not Found", &[], "")]);
+        let tokens = TokenCell::with_refresh_token(Some("r1".into()));
+        let api = client(&url).with_tokens(tokens.clone());
+        assert!(matches!(api.revoke_refresh_token(Duration::from_secs(5)).await, Revocation::Unsupported(_)));
+        assert!(tokens.refresh_token().is_none());
+
+        let unsupported = http("400 Bad Request", &[], r#"{"error":"unsupported_token_type"}"#);
+        let (url, _requests) = canned_server(vec![http("404 Not Found", &[], ""), unsupported]);
+        let api = client(&url).with_tokens(TokenCell::with_refresh_token(Some("r1".into())));
+        assert!(matches!(api.revoke_refresh_token(Duration::from_secs(5)).await, Revocation::Unsupported(_)));
+
+        let tokens = TokenCell::with_refresh_token(Some("r1".into()));
+        let api = client("http://127.0.0.1:9").with_tokens(tokens.clone());
+        assert!(matches!(api.revoke_refresh_token(Duration::from_secs(5)).await, Revocation::Failed(_)));
+        assert!(tokens.refresh_token().is_none());
+
+        // Never over plain http:// to another computer.
+        let api = ApiClient::new("http://10.0.0.5:6006", "alice@acme.com".into(), String::new())
+            .with_tokens(TokenCell::with_refresh_token(Some("r1".into())));
+        assert!(matches!(api.revoke_refresh_token(Duration::from_secs(5)).await, Revocation::Failed(_)));
     }
 
     #[tokio::test]

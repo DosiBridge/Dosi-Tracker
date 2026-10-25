@@ -195,7 +195,7 @@ impl LocalConsent {
 
     pub fn save_to(&self, path: &Path) -> anyhow::Result<()> {
         let data = serde_json::to_vec_pretty(self)?;
-        atomic_write_file(path, &data)
+        crate::fsutil::write_atomically(path, &data)
     }
 
     pub fn is_granted(&self) -> bool {
@@ -226,46 +226,6 @@ impl LocalConsent {
             },
         }
     }
-}
-
-/// Write data to an ephemeral temporary sibling file and atomically replace `path`.
-///
-/// On Windows, `std::fs::rename` uses `MoveFileExW(..., MOVEFILE_REPLACE_EXISTING)`,
-/// ensuring atomic replacement on the same volume without truncating or leaving
-/// partial bytes in `path` if writing or syncing fails.
-///
-/// If an error occurs during write, sync, or rename, the temporary file is deleted
-/// and the original file at `path` is preserved without modification.
-pub fn atomic_write_file(path: &Path, data: &[u8]) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let temp_name = format!(".tmp-consent-{}.tmp", uuid::Uuid::new_v4());
-    let temp_path = parent.join(temp_name);
-
-    let write_res = (|| -> std::io::Result<()> {
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)?;
-        file.write_all(data)?;
-        file.sync_all()?;
-        Ok(())
-    })();
-
-    if let Err(e) = write_res {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(anyhow::anyhow!("failed writing temp consent file: {e}"));
-    }
-
-    if let Err(e) = std::fs::rename(&temp_path, path) {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(anyhow::anyhow!("failed atomically replacing consent file: {e}"));
-    }
-
-    Ok(())
 }
 
 /// Abstract storage boundary for LocalConsent persistence.

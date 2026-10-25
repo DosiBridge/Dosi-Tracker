@@ -378,8 +378,8 @@ impl TrackerApp {
             let mut active_win = self.consent_vm.draft.active_window;
             if setting_row(
                 ui,
-                "Active window & application",
-                "Record the foreground window title and active application name during tracked time",
+                "Apps and windows",
+                "Record the app in front and its window title, and the names of the programs running (names only), during tracked time",
                 &mut active_win,
             ) {
                 self.consent_vm.toggle_active_window(active_win);

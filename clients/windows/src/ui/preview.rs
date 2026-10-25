@@ -105,7 +105,7 @@ fn scene(state: &StateHandle, name: &str) -> Scene {
                     .into(),
             );
         }
-        // The saved password stopped working.
+        // The saved sign-in stopped working.
         "expired" => {
             s.status = TrackerStatus::SignInExpired;
             s.display_name = "ayesha@acme.com".into();

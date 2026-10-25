@@ -23,6 +23,10 @@
 //! whichever workspace is tracked now, and only ever to the server it was
 //! recorded for (the queue's owner names the server). `sentAt` is stamped by
 //! the API client on every attempt.
+//!
+//! Signing out, the uploader is the last to use the account's token: after
+//! its final bounded drain it revokes the refresh token at the server (best
+//! effort) and lets the account go.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -32,7 +36,7 @@ use chrono::Utc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::Instant;
 
-use crate::api::{ApiClient, ServerClock, SubmitError, WorkspaceRefusal};
+use crate::api::{ApiClient, Revocation, ServerClock, SubmitError, WorkspaceRefusal};
 use crate::model::Project;
 use crate::state::{StateHandle, UploadIssue, UploadState};
 use crate::storage::Storage;
@@ -44,6 +48,9 @@ pub const SUBSCRIPTION_RETRY: Duration = Duration::from_secs(60 * 60);
 
 /// Retried after a 425 (the block ends in the server's future).
 pub const CLOCK_AHEAD_RETRY: Duration = Duration::from_secs(5 * 60);
+
+/// Budget for revoking the refresh token when signing out.
+const REVOKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How often opening (or reading) the queue is retried after it failed.
 const STORE_RETRY: Duration = Duration::from_secs(60);
@@ -95,8 +102,9 @@ pub enum UploadCommand {
     RowsQueued,
     /// Upload now, whatever the back-off ("Sync now", the server is back).
     Now,
-    /// Signing out: upload what fits before `deadline`, then stop.
-    SignOut { deadline: std::time::Instant },
+    /// Signing out: upload what fits before `deadline`, then (with `revoke`)
+    /// revoke the refresh token at the server, and stop.
+    SignOut { deadline: std::time::Instant, revoke: bool },
     /// Quitting: upload what fits before `deadline`, then end the thread.
     Shutdown { deadline: std::time::Instant },
 }
@@ -105,7 +113,7 @@ impl UploadCommand {
     /// A command that must cut a running pass short: by when.
     fn deadline(&self) -> Option<std::time::Instant> {
         match self {
-            UploadCommand::SignOut { deadline } | UploadCommand::Shutdown { deadline } => Some(*deadline),
+            UploadCommand::SignOut { deadline, .. } | UploadCommand::Shutdown { deadline } => Some(*deadline),
             // Another account: the current pass (of the previous one) stops now.
             UploadCommand::Account(_) => Some(std::time::Instant::now()),
             UploadCommand::RowsQueued | UploadCommand::Now => None,
@@ -120,7 +128,7 @@ impl UploadCommand {
 /// account (a sign-out's final drain) can still report after another account
 /// signed in, and must not be applied to it.
 pub enum UploadEvent {
-    /// The server no longer accepts the saved password of `owner`.
+    /// The server no longer accepts the saved sign-in of `owner`.
     SignInExpired { owner: String, reason: String },
     /// The project list of `owner`, fetched after a 403/409.
     Projects { owner: String, projects: Vec<Project> },
@@ -396,8 +404,11 @@ impl Uploader {
             UploadCommand::Account(None) => self.drop_account(),
             UploadCommand::RowsQueued => {}
             UploadCommand::Now => self.not_before = None,
-            UploadCommand::SignOut { deadline } => {
+            UploadCommand::SignOut { deadline, revoke } => {
                 self.final_drain(deadline).await;
+                if revoke {
+                    self.revoke().await;
+                }
                 self.drop_account();
             }
             UploadCommand::Shutdown { deadline } => {
@@ -425,6 +436,23 @@ impl Uploader {
         self.not_before = None;
         self.backoff.reset();
         self.state.update(|s| s.upload_issue = None);
+    }
+
+    /// Signed out: revoke the account's refresh token at the server, so the
+    /// sign-in cannot be used again from a copy of it (best effort: a server
+    /// out of reach or without revocation lets it expire by itself).
+    async fn revoke(&mut self) {
+        let Some(current) = self.current.as_ref() else { return };
+        match current.client.revoke_refresh_token(REVOKE_TIMEOUT).await {
+            Revocation::Revoked => tracing::info!("signed out; the server revoked the refresh token"),
+            Revocation::NothingToRevoke => {}
+            Revocation::Unsupported(reason) => {
+                tracing::info!(%reason, "signed out; the server does not revoke tokens, it expires by itself")
+            }
+            Revocation::Failed(reason) => {
+                tracing::warn!(%reason, "signed out, but the refresh token could not be revoked; it expires by itself")
+            }
+        }
     }
 
     /// One last bounded pass (quitting, signing out), whatever the back-off.
@@ -1094,6 +1122,35 @@ mod tests {
         let events: Vec<UploadEvent> = std::iter::from_fn(|| h.events.try_recv().ok()).collect();
         assert!(events.iter().any(|e| matches!(e, UploadEvent::WorkspaceLost { refusal: WorkspaceRefusal::Archived, .. })), "{events:?}");
         assert!(!h.uploader.ready());
+    }
+
+    #[tokio::test]
+    async fn signing_out_uploads_what_it_can_then_revokes_the_refresh_token() {
+        let granted = http("200 OK", &[], r#"{"access_token":"t0k3n","refresh_token":"r1","expires_in":3600}"#);
+        let (url, requests) = canned_server(vec![
+            granted,
+            http("200 OK", &[], "{}"),
+            http("404 Not Found", &[], ""),
+            http("200 OK", &[], ""),
+        ]);
+        let mut h = harness(&url);
+        h.queue("p1", false);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        assert!(matches!(h.uploader.apply(UploadCommand::SignOut { deadline, revoke: true }).await, Flow::Continue));
+
+        let requests: Vec<String> = requests.try_iter().collect();
+        let lines: Vec<&str> = requests.iter().map(|r| r.lines().next().unwrap_or_default()).collect();
+        assert!(lines[1].starts_with("POST /api/app/activity "), "the block first: {lines:?}");
+        assert!(lines[3].starts_with("POST /connect/revocat "), "then the revocation: {lines:?}");
+        assert!(requests[3].contains("token=r1"));
+        assert!(h.uploader.current.is_none(), "the account is let go");
+        assert!(h.rows().iter().all(|r| r.status != RowStatus::Queued), "uploaded before letting go");
+
+        // Without `revoke` (an expired sign-in), nothing is sent for it.
+        let (url, requests) = canned_server(vec![]);
+        let mut h = harness(&url);
+        assert!(matches!(h.uploader.apply(UploadCommand::SignOut { deadline, revoke: false }).await, Flow::Continue));
+        assert_eq!(requests.try_iter().count(), 0);
     }
 
     #[tokio::test]

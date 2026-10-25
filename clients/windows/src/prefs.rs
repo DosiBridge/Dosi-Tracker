@@ -65,12 +65,10 @@ impl Preferences {
             .normalized()
     }
 
+    /// Write-then-rename: a crash mid-save never leaves a truncated file
+    /// (which would silently reset every preference).
     fn save_to(&self, path: &Path) -> anyhow::Result<()> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(path, serde_json::to_vec_pretty(&self.clone().normalized())?)?;
-        Ok(())
+        crate::fsutil::write_atomically(path, &serde_json::to_vec_pretty(&self.clone().normalized())?)
     }
 
     /// Clamp values a hand-edited file could put out of range: the goal to

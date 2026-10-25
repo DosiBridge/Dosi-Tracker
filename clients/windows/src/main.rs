@@ -31,6 +31,8 @@ mod autostart;
 #[allow(unfulfilled_lint_expectations)]
 mod config;
 mod credentials;
+mod dpapi;
+mod fsutil;
 #[allow(unfulfilled_lint_expectations)]
 mod model;
 mod power;
@@ -91,6 +93,7 @@ fn main() -> Result<()> {
     let migration = shell::migrate_to_local();
     // Keep the log guard alive for the whole process, or buffered lines are lost.
     let _log_guard = init_logging();
+    install_panic_hook();
     log_migration(&migration);
 
     // Two agents would each capture and upload with their own idempotency keys,
@@ -255,6 +258,32 @@ fn quit_running_instance() -> Result<()> {
     } else {
         Err(anyhow::anyhow!("Dosi Tracker did not quit within {} s", QUIT_WAIT.as_secs()))
     }
+}
+
+/// Log every panic — what it said, where, on which thread, and a backtrace —
+/// before it unwinds. A release build has no console, so the default hook's
+/// output is lost, and the threads that catch a panic only know that one
+/// happened: without this, a crash in the field leaves nothing to go on.
+fn install_panic_hook() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        let thread = thread.name().unwrap_or("unnamed");
+        let message = panic_message(info.payload());
+        let location = info.location().map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column())).unwrap_or_default();
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        tracing::error!(%thread, %location, %message, %backtrace, "panicked");
+        default(info);
+    }));
+}
+
+/// The text a panic carries (`panic!("…")`), if it is text.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "(not a text message)".to_owned())
 }
 
 /// Report what the move to Local AppData did (once the logger exists).
@@ -430,5 +459,18 @@ fn debug_auto_signin(commands: &tokio::sync::mpsc::UnboundedSender<Command>) {
     if std::env::var("DOSI_AUTO_SYNC").is_ok() {
         // Queued behind SignIn; the worker processes commands in order.
         let _ = commands.send(Command::SyncNow { at: chrono::Utc::now() });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_panic_message_is_read_whatever_its_kind() {
+        let text = std::panic::catch_unwind(|| panic!("static text")).unwrap_err();
+        assert_eq!(super::panic_message(text.as_ref()), "static text");
+        let formatted = std::panic::catch_unwind(|| panic!("row {}", 7)).unwrap_err();
+        assert_eq!(super::panic_message(formatted.as_ref()), "row 7");
+        let other = std::panic::catch_unwind(|| std::panic::panic_any(42_u8)).unwrap_err();
+        assert_eq!(super::panic_message(other.as_ref()), "(not a text message)");
     }
 }

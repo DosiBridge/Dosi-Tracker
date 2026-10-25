@@ -603,7 +603,7 @@ fn project_allowing_all(id: &str, idle_minutes: u32) -> Project {
 
 /// A saved sign-in whose project list was resolved an hour ago.
 fn saved(projects: Vec<Project>, remembered: Option<&str>) -> Credentials {
-    let mut saved = Credentials::new("alice@acme.com".into(), "pw".into(), None);
+    let mut saved = Credentials::new("alice@acme.com".into(), None);
     saved.workspace_id = Some("w1".into());
     saved.workspace_name = "Acme".into();
     saved.project_id = remembered.map(str::to_owned);
@@ -1249,7 +1249,8 @@ fn a_refused_password_stops_tracking_keeps_the_queue_and_asks_for_it_again() {
     h.worker.publish();
     assert_eq!(h.status(), TrackerStatus::Tracking);
     assert_eq!(h.tracking_since(), Some(at("10:10:00")));
-    assert_eq!(h.worker.saved.as_ref().unwrap().password, "new");
+    assert!(h.worker.account.as_ref().unwrap().password.is_empty(), "the password is let go once accepted");
+    assert!(h.worker.saved.as_ref().unwrap().legacy_password.is_empty());
     assert_eq!(h.queued().len(), 1, "the earlier block is still queued for this account");
 }
 
@@ -1878,6 +1879,30 @@ async fn sensor_lifecycle_stops_on_quit_before_upload_grace() {
 
     let h = quit_task.await.unwrap();
     assert!(!h.machine.is_tracking_active());
+}
+
+#[tokio::test]
+async fn quitting_keeps_what_the_last_block_captured_and_takes_no_new_photo() {
+    let mut h = harness_with_consent(
+        at("10:00:00"),
+        Some(saved(vec![project_allowing_all("p1", 5)], None)),
+        LocalConsent::Granted(CapturePermissions { webcam: true, ..CapturePermissions::default() }.into()),
+    );
+    // The block's screenshot moment (50%: 10:05) passes.
+    h.machine.input_at(at("10:05:00"));
+    h.tick(at("10:05:01"));
+    assert_eq!(h.machine.captures(), 1);
+    h.machine.input_at(at("10:06:00"));
+    h.machine.set(at("10:06:30"));
+    h.worker.quit(at("10:06:30")).await;
+
+    let queued = h.queued();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].screenshot_captured_at, Some(at("10:05:01")), "taken with consent: kept");
+    assert!(!queued[0].running_programs.is_empty(), "the running programs too");
+    assert!(queued[0].webcam_jpg_base64.is_none(), "no webcam photo on the way out");
+    assert_eq!(h.machine.webcam_captures(), 0);
+    assert!(!h.machine.is_tracking_active(), "the sensors stop once it is saved");
 }
 
 #[test]
@@ -3069,7 +3094,7 @@ fn a_plain_http_server_is_refused_unless_the_admin_allows_it() {
 }
 
 #[test]
-fn every_sign_in_names_this_device_and_never_keeps_the_password_once_refreshable() {
+fn every_sign_in_names_this_device_and_never_keeps_the_password() {
     let file = std::env::temp_dir().join(format!("dosi-worker-{}.bin", uuid::Uuid::new_v4()));
     let mut h = harness_at(at("10:00:00"), None, false, Some(file.clone()));
     let account = typed_sign_in(&mut h, None);
@@ -3081,18 +3106,127 @@ fn every_sign_in_names_this_device_and_never_keeps_the_password_once_refreshable
     assert_eq!(used.password, "", "the password is let go");
     assert_eq!(used.device_id.as_deref(), Some("5b0c1b9e-8f2c-4a43-9a51-0c7f6f2d9b11"));
     let saved = credentials::load_from(&file).expect("saved");
-    assert_eq!((saved.password.as_str(), saved.refresh_token.as_deref()), ("", Some("r3fr3sh")));
+    assert_eq!((saved.legacy_password.as_str(), saved.refresh_token.as_deref()), ("", Some("r3fr3sh")));
+    assert!(!saved.outdated_format);
 
-    // A sign-in saved by an older build with its password: dropped on the
-    // next save once a refresh token is there.
+    // A server that granted no refresh token: the password is not kept
+    // either — the sign-in ends with its access token.
+    let mut h = harness_at(at("10:00:00"), None, false, Some(file.clone()));
+    let account = typed_sign_in(&mut h, None);
+    h.worker.on_control(ControlEvent::SignedIn { account, workspaces: Ok(vec![workspace("w1", "Acme")]) });
+    assert_eq!(used_account(&mut h).password, "");
+    assert!(credentials::load_from(&file).unwrap().refresh_token.is_none());
+
+    // A sign-in saved by an older build with its password and a refresh
+    // token: the password is never used, and is gone from the file at start.
     let mut older = self::saved(vec![project("p1", 5)], None);
     older.refresh_token = Some("r1".into());
-    credentials::save_at(&file, &older).unwrap();
+    older.legacy_password = "old-pw".into();
+    save_legacy(&file, &older);
     let mut h = harness_at(at("10:00:00"), credentials::load_from(&file), false, Some(file.clone()));
     assert_eq!(used_account(&mut h).password, "", "a refresh token never falls back to the password");
-    h.command(at("10:01:00"), Command::Pause { resume_after: None, at: at("10:01:00") });
-    assert_eq!(credentials::load_from(&file).unwrap().password, "");
+    let rewritten = std::fs::read(&file).unwrap();
+    assert!(crate::dpapi::unprotect(&rewritten, None).is_err(), "rewritten with the app's entropy");
+    let reloaded = credentials::load_from(&file).unwrap();
+    assert_eq!((reloaded.legacy_password.as_str(), reloaded.outdated_format), ("", false));
+    assert_eq!(reloaded.refresh_token.as_deref(), Some("r1"));
     let _ = std::fs::remove_file(&file);
+}
+
+/// Save `saved` as builds before this one did: the password in the JSON,
+/// and DPAPI without the app's entropy.
+fn save_legacy(file: &std::path::Path, saved: &Credentials) {
+    let mut json = serde_json::to_value(saved).unwrap();
+    json["password"] = serde_json::Value::String(saved.legacy_password.clone());
+    std::fs::write(file, crate::dpapi::protect(&serde_json::to_vec(&json).unwrap(), None).unwrap()).unwrap();
+}
+
+#[test]
+fn an_older_password_only_sign_in_is_exchanged_once_for_a_refresh_token() {
+    let file = std::env::temp_dir().join(format!("dosi-worker-{}.bin", uuid::Uuid::new_v4()));
+    let mut older = saved(vec![project("p1", 5)], None);
+    older.legacy_password = "old-pw".into();
+    save_legacy(&file, &older);
+    let mut h = harness_at(at("10:00:00"), credentials::load_from(&file), false, Some(file.clone()));
+
+    // Off the disk at once; in memory only for the one exchange.
+    let on_disk = credentials::load_from(&file).unwrap();
+    assert_eq!((on_disk.legacy_password.as_str(), on_disk.refresh_token.as_deref()), ("", None));
+    let used = used_account(&mut h);
+    assert_eq!(used.password, "old-pw");
+
+    // The server granted a refresh token for it: saved, and the password
+    // is dropped from memory too.
+    used.tokens.grant_for_test(Some("r1"));
+    h.tick(at("10:00:02"));
+    let on_disk = credentials::load_from(&file).unwrap();
+    assert_eq!(on_disk.refresh_token.as_deref(), Some("r1"));
+    assert!(h.worker.account.as_ref().unwrap().password.is_empty());
+    assert!(h.worker.saved.as_ref().unwrap().legacy_password.is_empty());
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn blocks_that_cannot_be_saved_turn_the_status_red_until_saving_works_again() {
+    let mut h = tracking();
+    h.worker.store.break_writes_for_test(true);
+    h.machine.input_at(at("10:04:00"));
+    h.command(at("10:04:00"), Command::Pause { resume_after: None, at: at("10:04:00") });
+    assert_eq!(h.status(), TrackerStatus::Paused, "one failure may be passing");
+    assert!(h.state.snapshot().last_error.unwrap().starts_with("Could not save locally"));
+
+    h.command(at("10:05:00"), Command::Resume { at: at("10:05:00") });
+    h.machine.input_at(at("10:08:00"));
+    h.command(at("10:08:00"), Command::Pause { resume_after: None, at: at("10:08:00") });
+    assert_eq!(h.status(), TrackerStatus::Stopped, "saving keeps failing: not a green pill");
+
+    h.worker.store.break_writes_for_test(false);
+    h.command(at("10:09:00"), Command::Resume { at: at("10:09:00") });
+    h.machine.input_at(at("10:12:00"));
+    h.command(at("10:12:00"), Command::Pause { resume_after: None, at: at("10:12:00") });
+    assert_eq!(h.status(), TrackerStatus::Paused);
+    assert!(h.state.snapshot().last_error.is_none(), "the error clears once a block is saved");
+    assert_eq!(h.spans(), [(at("10:09:00"), at("10:12:00"), Some(EndReason::Pause))]);
+}
+
+#[test]
+fn a_rotated_refresh_token_is_saved_at_once() {
+    let file = std::env::temp_dir().join(format!("dosi-worker-{}.bin", uuid::Uuid::new_v4()));
+    let mut signed_in = saved(vec![project("p1", 5)], None);
+    signed_in.refresh_token = Some("r1".into());
+    credentials::save_at(&file, &signed_in).unwrap();
+    let mut h = harness_at(at("10:00:00"), credentials::load_from(&file), false, Some(file.clone()));
+    let tokens = used_account(&mut h).tokens;
+
+    // The uploader renewed the token: the server rotated the refresh token.
+    tokens.grant_for_test(Some("r2"));
+    h.tick(at("10:00:02"));
+    assert_eq!(credentials::load_from(&file).unwrap().refresh_token.as_deref(), Some("r2"), "on the next tick, not the next pause");
+
+    // Nothing changed: nothing written.
+    let written = std::fs::metadata(&file).unwrap().modified().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    h.tick(at("10:00:04"));
+    assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), written);
+
+    // An expired sign-in's tokens are not saved over the file.
+    h.worker.on_control(ControlEvent::SignInExpired("The token is no longer valid.".into()));
+    tokens.grant_for_test(Some("r3"));
+    h.tick(at("10:00:06"));
+    assert_eq!(credentials::load_from(&file).unwrap().refresh_token.as_deref(), Some("r2"));
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn signing_out_revokes_the_refresh_token_unless_the_sign_in_had_expired() {
+    let mut h = tracking();
+    h.command(at("10:04:00"), Command::SignOut { at: at("10:04:00") });
+    assert!(h.upload_commands().iter().any(|c| matches!(c, UploadCommand::SignOut { revoke: true, .. })));
+
+    let mut h = tracking();
+    h.worker.on_control(ControlEvent::SignInExpired("The token is no longer valid.".into()));
+    h.command(at("10:04:00"), Command::SignOut { at: at("10:04:00") });
+    assert!(h.upload_commands().iter().any(|c| matches!(c, UploadCommand::SignOut { revoke: false, .. })));
 }
 
 #[test]

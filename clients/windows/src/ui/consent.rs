@@ -84,6 +84,8 @@ impl ConsentViewModel {
         self.draft.mouse = enabled;
     }
 
+    /// One consent covers the app in front (with its title) and the names of
+    /// the programs running; both labels say so.
     pub fn toggle_active_window(&mut self, enabled: bool) {
         self.draft.active_window = enabled;
         self.draft.running_programs = enabled;
@@ -195,7 +197,7 @@ pub fn render_consent_card(
             }
 
             let mut window_titles = model.draft.active_window && model.draft.running_programs;
-            if ui.checkbox(&mut window_titles, "Active window context (foreground app name and window title)").changed() {
+            if ui.checkbox(&mut window_titles, "Apps and windows (the app in front and its window title, plus the names of programs running)").changed() {
                 model.toggle_active_window(window_titles);
             }
 

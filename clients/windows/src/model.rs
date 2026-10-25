@@ -222,10 +222,11 @@ pub struct Activity {
     /// activity %.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub injected_input_events: Option<u32>,
-    /// HMAC-SHA256 of the payload bytes as queued locally (base64url, no pad).
-    /// Set at enqueue time; the server verifies before accepting the block.
-    /// Absent on rows queued before signing was introduced or in tests that
-    /// construct Activity values directly.
+    /// HMAC-SHA256 of the payload bytes as queued locally (base64url, no pad),
+    /// with a key that never leaves this computer ([`crate::signing`]). The
+    /// server does **not** verify it (it has no copy of the key), so it
+    /// proves nothing about the block. Absent on rows queued before signing
+    /// was introduced or in tests that construct Activity values directly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload_signature: Option<String>,
 }

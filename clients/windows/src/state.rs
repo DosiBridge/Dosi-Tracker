@@ -38,9 +38,10 @@ pub enum TrackerStatus {
     /// Signed in, but no project is chosen: there are several and none was
     /// remembered, the remembered one is gone, or there are none at all.
     ChooseProject,
-    /// The server no longer accepts the saved password (changed, reset or the
-    /// account deactivated). Tracking stopped; the queue is kept and uploads
-    /// once the password is entered again (workspace and email prefilled).
+    /// The server no longer accepts the saved sign-in (the refresh token was
+    /// revoked or expired, the password changed, the account deactivated).
+    /// Tracking stopped; the queue is kept and uploads once the password is
+    /// entered again (workspace and email prefilled).
     SignInExpired,
     /// Affirmative local consent has not been granted, or was revoked.
     ConsentRequired,

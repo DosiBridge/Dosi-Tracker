@@ -102,6 +102,10 @@ const CAPTURE_SLACK: TimeDelta = TimeDelta::seconds(10);
 /// inactive) gets no webcam photo: one taken now would not show that block.
 const LATE: TimeDelta = TimeDelta::seconds(30);
 
+/// After this many blocks in a row could not be saved locally (a full disk,
+/// a locked queue file), the status turns red: recording is not working.
+const ENQUEUE_FAILURES_SHOWN: u32 = 2;
+
 /// How many queue rows the window lists.
 const QUEUE_ROWS_SHOWN: u32 = 20;
 
@@ -123,8 +127,8 @@ pub struct Account {
     /// The API address, normalized.
     pub server: String,
     pub username: String,
-    /// Only until the server has granted a refresh token (signing in, or a
-    /// sign-in saved by an older build): it is never sent again after that.
+    /// Only until the server has accepted it (signing in, or a sign-in saved
+    /// by an older build): never saved, and never sent again after that.
     pub password: String,
     /// `None` until a workspace is chosen (or after access to it was lost).
     pub workspace_id: Option<String>,
@@ -171,7 +175,9 @@ impl Account {
             server: cfg.effective_api_base_url(saved.server.as_deref()),
             username: saved.username.clone(),
             // A sign-in with a refresh token never falls back to a password.
-            password: if refresh_token.is_some() { String::new() } else { saved.password.clone() },
+            // One saved by an older build with the password only exchanges it
+            // once for a refresh token (the file no longer holds it).
+            password: if refresh_token.is_some() { String::new() } else { saved.legacy_password.clone() },
             workspace_id: saved.workspace_id.clone(),
             workspace_name: saved.workspace_name.clone(),
             tokens: TokenCell::with_refresh_token(refresh_token),
@@ -631,7 +637,7 @@ struct Worker {
     preselect: Option<String>,
     /// Workspaces offered to choose from.
     choices: Vec<Workspace>,
-    /// The server refused the saved password.
+    /// The server refused the saved sign-in.
     expired: bool,
     /// A sign-in the user typed is being checked.
     signing_in: bool,
@@ -658,6 +664,8 @@ struct Worker {
     awake_since: Option<DateTime<Utc>>,
 
     blocks: Blocks,
+    /// Blocks in a row the local queue refused to save.
+    enqueue_failures: u32,
     /// Screenshots taken for blocks not finished yet.
     screens: Vec<(BlockId, ProvenanceScreenCapture)>,
     sleep: SleepDetector,
@@ -728,6 +736,7 @@ impl Worker {
             shutting_down: None,
             awake_since: None,
             blocks: Blocks::new(),
+            enqueue_failures: 0,
             screens: Vec::new(),
             sleep: SleepDetector::new(),
             announce_autostart: false,
@@ -791,8 +800,12 @@ impl Worker {
             s.workspace = workspace;
             s.set_server(server);
         });
+        // A file in an older format (one that held the password, or without
+        // this app's DPAPI entropy) is rewritten at once, without it; the
+        // password stays in memory only for its one-time exchange.
+        let rewrite = pause_changed || saved.outdated_format;
         self.saved = Some(saved);
-        if pause_changed {
+        if rewrite {
             self.persist();
         }
 
@@ -1037,11 +1050,20 @@ impl Worker {
         let id = match self.store.enqueue(activity, owner, workspace) {
             Ok(id) => id,
             Err(e) => {
-                tracing::error!(?e, "failed to queue activity");
+                self.enqueue_failures = self.enqueue_failures.saturating_add(1);
+                tracing::error!(?e, failures = self.enqueue_failures, "failed to queue activity");
                 self.state.update(|s| s.last_error = Some(format!("Could not save locally: {e}")));
                 return false;
             }
         };
+        if std::mem::take(&mut self.enqueue_failures) > 0 {
+            tracing::info!("blocks are saved locally again");
+            self.state.update(|s| {
+                if s.last_error.as_deref().is_some_and(|e| e.starts_with("Could not save locally")) {
+                    s.last_error = None;
+                }
+            });
+        }
         tracing::debug!(id, end_reason = ?activity.end_reason, "activity queued");
         let (today_start, week_start) = local_day_and_week_start(now, &Local);
         let project = self
@@ -1122,6 +1144,7 @@ impl Worker {
         if let Some(id) = self.blocks.capture_due(now) {
             self.capture(id);
         }
+        self.save_rotated_token();
         let last_input = self.machine.last_input(now);
         let machine = self.machine.clone();
         let outcome = self.blocks.tick(now, last_input, &mut || machine.random_fraction());
@@ -1785,19 +1808,17 @@ impl Worker {
         if !same && self.account.is_some() {
             self.forget_account(now);
         }
-        // With a refresh token the password is never needed again: it is
-        // neither kept nor saved (a refused refresh means "sign in again").
-        if account.tokens.refresh_token().is_some() {
-            account.password.clear();
-        }
+        // The server accepted the password: it is neither kept nor saved
+        // (a refused or missing refresh token means "sign in again").
+        account.password.clear();
         let mut saved = match self.saved.take() {
             Some(saved) if same => saved,
-            _ => Credentials::new(String::new(), String::new(), None),
+            _ => Credentials::new(String::new(), None),
         };
         saved.workspace_id = account.workspace_id.clone();
         saved.workspace_name = account.workspace_name.clone();
         saved.username = account.username.clone();
-        saved.password = account.password.clone();
+        saved.legacy_password.clear();
         saved.refresh_token = account.tokens.refresh_token();
         saved.server = (account.server != self.cfg.api_base_url).then(|| account.server.clone());
         if !same {
@@ -1850,9 +1871,10 @@ impl Worker {
         });
     }
 
-    /// The server refused the saved password (changed, reset, the account
-    /// deactivated): tracking stops, the queue is kept for when it is entered
-    /// again (CONTRACT §1).
+    /// The server refused the saved sign-in (its refresh token revoked or
+    /// expired, the password changed, the account deactivated): tracking
+    /// stops, the queue is kept for when the password is entered again
+    /// (CONTRACT §1).
     fn expire(&mut self, reason: &str) {
         if self.account.is_none() || self.expired {
             return;
@@ -1884,7 +1906,13 @@ impl Worker {
             self.record(finished, Speed::Normal);
             let heartbeat = if self.expired { None } else { self.heartbeat(PresenceStatus::SignedOut, now, now) };
             self.control.farewell_later(heartbeat);
-            self.uploader.send(UploadCommand::SignOut { deadline: std::time::Instant::now() + SIGN_OUT_UPLOAD_GRACE });
+            // The uploader is the last to use the token: once its final
+            // drain is over it revokes the refresh token at the server (an
+            // expired sign-in has nothing left to revoke).
+            self.uploader.send(UploadCommand::SignOut {
+                deadline: std::time::Instant::now() + SIGN_OUT_UPLOAD_GRACE,
+                revoke: !self.expired,
+            });
         }
         if let Some(path) = &self.credentials_file {
             if let Err(e) = credentials::clear_at(path) {
@@ -2057,12 +2085,17 @@ impl Worker {
     /// Quit: save the block in progress first — so whatever happens next it
     /// goes up on the next launch — then say "stopped" and upload what fits.
     async fn quit(&mut self, at: DateTime<Utc>) {
-        // Immediately halt all OS sensors before farewell heartbeats and upload draining
-        self.machine.apply_sensor_policy(false, None);
         let started = std::time::Instant::now();
         let now = self.now();
         let finished = self.blocks.end(at, now, EndReason::Quit);
-        self.record(finished, Speed::Normal);
+        // The last block keeps what was captured for it with consent (its
+        // screenshot, the running programs): the sensors stop only once it is
+        // queued. Fast: no new capture (no webcam photo) on the way out; the
+        // uploader's final drain below sends it.
+        self.record(finished, Speed::Fast);
+        // Then all OS sensors halt, before the farewell heartbeat and the
+        // upload drain.
+        self.machine.apply_sensor_policy(false, None);
         // An unanswered question about time away: no answer means discard.
         self.prompt = None;
         let heartbeat = if self.account.is_some() && !self.expired {
@@ -2074,6 +2107,8 @@ impl Worker {
         let deadline = started + QUIT_UPLOAD_GRACE;
         self.uploader.send(UploadCommand::Shutdown { deadline });
         self.uploader.finish(deadline + Duration::from_secs(1)).await;
+        // The final uploads may have renewed (and so rotated) the refresh token.
+        self.save_rotated_token();
     }
 
     // ---- What the other parts report ------------------------------------------------------------
@@ -2156,7 +2191,7 @@ impl Worker {
 
     fn facts(&self) -> Facts {
         Facts {
-            storage_failed: false,
+            storage_failed: self.enqueue_failures >= ENQUEUE_FAILURES_SHOWN,
             signed_in: self.account.is_some(),
             sign_in_expired: self.expired,
             paused: self.pause.is_some(),
@@ -2298,22 +2333,37 @@ impl Worker {
 
     // ---- Persistence ----------------------------------------------------------------------------------
 
-    fn persist(&self) {
-        let (Some(path), Some(saved)) = (&self.credentials_file, &self.saved) else {
-            return;
-        };
-        let mut saved = saved.clone();
-        if let Some(refresh_token) = self.account.as_ref().and_then(|a| a.tokens.refresh_token()) {
+    /// Save the sign-in (never with a password), with the latest refresh
+    /// token.
+    fn persist(&mut self) {
+        let live = self.account.as_ref().filter(|_| !self.expired).and_then(|a| a.tokens.refresh_token());
+        let Some(saved) = self.saved.as_mut() else { return };
+        if let Some(refresh_token) = live {
             saved.refresh_token = Some(refresh_token);
         }
-        // A sign-in saved by an older build carried the password: once there
-        // is a refresh token it is dropped from the file.
-        if saved.refresh_token.as_deref().is_some_and(|t| !t.is_empty()) {
-            saved.password.clear();
+        let Some(path) = &self.credentials_file else { return };
+        match credentials::save_at(path, saved) {
+            Ok(()) => saved.outdated_format = false,
+            Err(e) => tracing::warn!(?e, "could not save the sign-in"),
         }
-        if let Err(e) = credentials::save_at(path, &saved) {
-            tracing::warn!(?e, "could not save the sign-in");
+    }
+
+    /// The server rotates the refresh token on every renewal (whichever task
+    /// renewed): save the new one at once, so a crash or a power cut never
+    /// leaves only the spent one on disk (which the server would refuse:
+    /// "sign-in expired"). Once a refresh token exists, a password still in
+    /// memory (the one-time exchange of an older build's sign-in) is dropped.
+    fn save_rotated_token(&mut self) {
+        let Some(account) = self.account.as_mut().filter(|_| !self.expired) else { return };
+        let Some(live) = account.tokens.refresh_token() else { return };
+        account.password.clear();
+        let Some(saved) = self.saved.as_mut() else { return };
+        if saved.refresh_token.as_deref() == Some(live.as_str()) {
+            return;
         }
+        saved.legacy_password.clear();
+        tracing::debug!("the refresh token was renewed; saving it");
+        self.persist();
     }
 
     /// A pause survives a restart (CONTRACT §4).

@@ -64,7 +64,7 @@ pub enum ControlEvent {
     DeviceRevoked(String),
     Projects(Vec<Project>),
     ProjectsFailed(ApiError),
-    /// The server no longer accepts the saved password.
+    /// The server no longer accepts the saved sign-in (its refresh token).
     SignInExpired(String),
     /// Whether the server answered.
     Reachable(bool),

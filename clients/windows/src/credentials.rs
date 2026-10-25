@@ -1,13 +1,20 @@
 //! Persisted sign-in, encrypted at rest with Windows DPAPI.
 //!
-//! DPAPI (`CryptProtectData`) keys the ciphertext to the current **user account**,
-//! so the file is unreadable by other users on the machine and unusable if copied
-//! elsewhere. This is the same mechanism Windows itself uses for stored browser
-//! credentials — the password never touches disk (or the environment) in clear text.
+//! DPAPI (`CryptProtectData`) keys the ciphertext to the current **user
+//! account**, so the file is unreadable by other users on the machine and
+//! unusable if copied elsewhere, and this app's own entropy
+//! ([`ENTROPY`]) means a generic sweep of the user's DPAPI blobs does not open
+//! it either (see [`crate::dpapi`]).
 //!
-//! Besides the credentials, the sign-in carries what must outlive a restart
-//! for that account: the project last chosen, the project list last resolved
-//! (so tracking can start offline), a pause, and the task note.
+//! The password is **never** saved: only the refresh token the server granted
+//! for it. A refused refresh token means "sign-in expired" and the user types
+//! the password again (CONTRACT, agent sign-in). Sign-ins saved by older
+//! builds carried the password; it is read once (to exchange it for a refresh
+//! token) and the file is rewritten without it at start.
+//!
+//! Besides the token, the sign-in carries what must outlive a restart for
+//! that account: the project last chosen, the project list last resolved (so
+//! tracking can start offline), a pause, and the task note.
 
 use std::path::{Path, PathBuf};
 
@@ -36,10 +43,11 @@ pub struct Credentials {
     pub workspace_name: String,
     /// The email (or user name) typed at sign-in.
     pub username: String,
-    /// Only in sign-ins saved by older builds: once a refresh token is
-    /// saved the password is not kept (an expired sign-in asks for it).
-    #[serde(default)]
-    pub password: String,
+    /// Only read, from a sign-in saved by an older build that kept the
+    /// password: it is used once to obtain a refresh token, and never written
+    /// back (the field is not serialized).
+    #[serde(default, rename = "password", skip_serializing)]
+    pub legacy_password: String,
     /// Renews the access token without the password.
     #[serde(default)]
     pub refresh_token: Option<String>,
@@ -60,22 +68,27 @@ pub struct Credentials {
     /// "What are you working on?"
     #[serde(default)]
     pub task_note: Option<String>,
+    /// Loaded from a file in an older format (no entropy, or with the
+    /// password): it is saved again at once, in the current one.
+    #[serde(skip)]
+    pub outdated_format: bool,
 }
 
 impl Credentials {
     /// A fresh sign-in, with nothing remembered yet.
-    pub fn new(username: String, password: String, server: Option<String>) -> Self {
+    pub fn new(username: String, server: Option<String>) -> Self {
         Self {
             workspace_id: None,
             workspace_name: String::new(),
             username,
-            password,
+            legacy_password: String::new(),
             refresh_token: None,
             project_id: None,
             server,
             projects: None,
             pause: None,
             task_note: None,
+            outdated_format: false,
         }
     }
 
@@ -135,8 +148,13 @@ pub fn default_path() -> Result<PathBuf> {
     Ok(dir.join("credentials.bin"))
 }
 
+/// The application entropy the sign-in is encrypted with (no secret: it
+/// keeps the blob from being opened by code that does not know it).
+const ENTROPY: &[u8] = b"DosiTracker/credentials/v2";
+
 /// Load and decrypt the saved sign-in, if any. A corrupt/foreign blob is treated
 /// as "no credentials" rather than a hard error, so the app falls back to login.
+/// Never writes: an outdated file is saved again by the worker.
 pub fn load() -> Option<Credentials> {
     load_from(&default_path().ok()?)
 }
@@ -144,24 +162,26 @@ pub fn load() -> Option<Credentials> {
 /// [`load`] from `path`.
 pub fn load_from(path: &Path) -> Option<Credentials> {
     let encrypted = std::fs::read(path).ok()?;
-    let plaintext = dpapi::unprotect(&encrypted).ok()?;
-    serde_json::from_slice(&plaintext).ok()
+    let (plaintext, outdated) = match crate::dpapi::unprotect(&encrypted, Some(ENTROPY)) {
+        Ok(plaintext) => (plaintext, false),
+        // Saved by an older build, without the entropy.
+        Err(_) => (crate::dpapi::unprotect(&encrypted, None).ok()?, true),
+    };
+    let mut credentials: Credentials = serde_json::from_slice(&plaintext).ok()?;
+    credentials.outdated_format = outdated || !credentials.legacy_password.is_empty();
+    Some(credentials)
 }
 
-/// Encrypt and persist the sign-in for this Windows user at `path`.
+/// Encrypt and persist the sign-in for this Windows user at `path` (never
+/// with a password: [`Credentials::legacy_password`] is not serialized).
 ///
-/// Write-then-rename: the sign-in is saved on every pause, project change
-/// and project refresh, and a crash halfway through a plain write would
-/// leave a blob that no longer decrypts — signing the user out.
+/// Write-then-rename: the sign-in is saved on every pause, project change,
+/// project refresh and token rotation, and a crash halfway through a plain
+/// write would leave a blob that no longer decrypts — signing the user out.
 pub fn save_at(path: &Path, credentials: &Credentials) -> Result<()> {
     let plaintext = serde_json::to_vec(credentials)?;
-    let encrypted = dpapi::protect(&plaintext)?;
-    let mut temp = path.as_os_str().to_os_string();
-    temp.push(".tmp");
-    let temp = PathBuf::from(temp);
-    std::fs::write(&temp, encrypted)?;
-    std::fs::rename(&temp, path)?;
-    Ok(())
+    let encrypted = crate::dpapi::protect(&plaintext, Some(ENTROPY))?;
+    crate::fsutil::write_atomically(path, &encrypted)
 }
 
 /// Forget the sign-in saved at `path` (sign out).
@@ -172,103 +192,63 @@ pub fn clear_at(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(windows)]
-mod dpapi {
-    use anyhow::{anyhow, Result};
-    use windows::Win32::Foundation::LocalFree;
-    use windows::Win32::Security::Cryptography::{
-        CryptProtectData, CryptUnprotectData, CRYPT_INTEGER_BLOB,
-    };
-
-    /// Copy a DPAPI output blob into a Vec and release the OS allocation.
-    unsafe fn take_blob(blob: &CRYPT_INTEGER_BLOB) -> Vec<u8> {
-        let out = if blob.pbData.is_null() {
-            Vec::new()
-        } else {
-            unsafe { std::slice::from_raw_parts(blob.pbData, blob.cbData as usize) }.to_vec()
-        };
-        if !blob.pbData.is_null() {
-            let _ = unsafe {
-                LocalFree(windows::Win32::Foundation::HLOCAL(
-                    blob.pbData as *mut core::ffi::c_void,
-                ))
-            };
-        }
-        out
-    }
-
-    pub fn protect(plaintext: &[u8]) -> Result<Vec<u8>> {
-        let input = CRYPT_INTEGER_BLOB {
-            cbData: plaintext.len() as u32,
-            pbData: plaintext.as_ptr() as *mut u8,
-        };
-        let mut output = CRYPT_INTEGER_BLOB::default();
-
-        unsafe {
-            CryptProtectData(
-                &input,
-                None,
-                None,
-                None,
-                None,
-                windows::Win32::Security::Cryptography::CRYPTPROTECT_UI_FORBIDDEN,
-                &mut output,
-            )
-            .map_err(|e| anyhow!("CryptProtectData failed: {e}"))?;
-            Ok(take_blob(&output))
-        }
-    }
-
-    pub fn unprotect(ciphertext: &[u8]) -> Result<Vec<u8>> {
-        let input = CRYPT_INTEGER_BLOB {
-            cbData: ciphertext.len() as u32,
-            pbData: ciphertext.as_ptr() as *mut u8,
-        };
-        let mut output = CRYPT_INTEGER_BLOB::default();
-
-        unsafe {
-            CryptUnprotectData(
-                &input,
-                None,
-                None,
-                None,
-                None,
-                windows::Win32::Security::Cryptography::CRYPTPROTECT_UI_FORBIDDEN,
-                &mut output,
-            )
-            .map_err(|e| anyhow!("CryptUnprotectData failed: {e}"))?;
-            Ok(take_blob(&output))
-        }
-    }
-}
-
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
 
-    #[test]
-    fn dpapi_roundtrips_credentials() {
-        let secret = br#"{"username":"you@example.com","password":"s3cr3t"}"#;
-        let encrypted = dpapi::protect(secret).expect("CryptProtectData should succeed");
-
-        // The ciphertext must not contain the plaintext password.
-        assert!(!encrypted.windows(6).any(|w| w == b"s3cr3t"));
-        assert_ne!(encrypted.as_slice(), secret.as_slice());
-
-        let decrypted = dpapi::unprotect(&encrypted).expect("CryptUnprotectData should succeed");
-        assert_eq!(decrypted, secret);
+    fn temp_path() -> PathBuf {
+        std::env::temp_dir().join(format!("dosi-credentials-{}.bin", uuid::Uuid::new_v4()))
     }
 
     #[test]
-    fn dpapi_rejects_garbage() {
-        assert!(dpapi::unprotect(b"not a dpapi blob").is_err());
+    fn the_saved_sign_in_never_holds_a_password_and_needs_the_app_entropy() {
+        let path = temp_path();
+        let mut saved = Credentials::new("alice@acme.com".into(), None);
+        saved.legacy_password = "s3cr3t-pw".into();
+        saved.refresh_token = Some("r3fr3sh".into());
+        save_at(&path, &saved).unwrap();
+
+        let raw = std::fs::read(&path).unwrap();
+        let plaintext = crate::dpapi::unprotect(&raw, Some(ENTROPY)).expect("encrypted with the app entropy");
+        let json = String::from_utf8(plaintext).unwrap();
+        assert!(!json.contains("s3cr3t-pw") && !json.contains("password"), "{json}");
+        assert!(crate::dpapi::unprotect(&raw, None).is_err(), "a blind DPAPI sweep (no entropy) does not open it");
+        let back = load_from(&path).unwrap();
+        assert_eq!((back.legacy_password.as_str(), back.outdated_format), ("", false));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_sign_in_saved_by_an_older_build_is_read_once_and_marked_for_rewriting() {
+        // No entropy, with the password, as builds before this one saved it.
+        let path = temp_path();
+        let old = br#"{"workspace_id":"w1","username":"a","password":"old-pw","refresh_token":null}"#;
+        std::fs::write(&path, crate::dpapi::protect(old, None).unwrap()).unwrap();
+        let loaded = load_from(&path).expect("still readable");
+        assert_eq!(loaded.legacy_password, "old-pw", "kept in memory for its one-time exchange");
+        assert!(loaded.outdated_format);
+        // Read-only: loading never rewrites (the worker does, once).
+        assert_eq!(crate::dpapi::unprotect(&std::fs::read(&path).unwrap(), None).unwrap(), old);
+
+        // Without entropy but no password: still rewritten (to gain the entropy).
+        let newer = br#"{"workspace_id":"w1","username":"a","refresh_token":"r"}"#;
+        std::fs::write(&path, crate::dpapi::protect(newer, None).unwrap()).unwrap();
+        assert!(load_from(&path).unwrap().outdated_format);
+
+        // With the entropy, but still carrying a password field.
+        std::fs::write(&path, crate::dpapi::protect(old, Some(ENTROPY)).unwrap()).unwrap();
+        assert!(load_from(&path).unwrap().outdated_format);
+
+        std::fs::write(&path, b"not a dpapi blob").unwrap();
+        assert!(load_from(&path).is_none(), "a corrupt file means signed out");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn credentials_serialize_with_optional_project() {
         let json = br#"{"workspace":"acme","username":"a","password":"b"}"#; // saved by an older build
         let parsed: Credentials = serde_json::from_slice(json).expect("project_id is optional");
-        assert_eq!(parsed.username, "a");
+        assert_eq!((parsed.username.as_str(), parsed.legacy_password.as_str()), ("a", "b"));
         assert!(parsed.workspace_id.is_none() && parsed.refresh_token.is_none(), "must sign in again");
         assert!(parsed.project_id.is_none());
         // Nothing the newer builds remember is required either.
@@ -286,9 +266,9 @@ mod tests {
 
     #[test]
     fn everything_remembered_survives_an_encrypted_round_trip() {
-        let path = std::env::temp_dir().join(format!("dosi-credentials-{}.bin", uuid::Uuid::new_v4()));
+        let path = temp_path();
         let at = DateTime::parse_from_rfc3339("2026-10-05T09:00:00Z").unwrap().with_timezone(&Utc);
-        let mut saved = Credentials::new("alice@acme.com".into(), "pw".into(), Some("https://tracker.acme.com".into()));
+        let mut saved = Credentials::new("alice@acme.com".into(), Some("https://tracker.acme.com".into()));
         saved.workspace_id = Some("w1".into());
         saved.workspace_name = "Acme".into();
         saved.refresh_token = Some("r3fr3sh".into());
@@ -310,7 +290,6 @@ mod tests {
         assert_eq!(cache.projects[1].idle_threshold_minutes, 15);
         assert_eq!(back.pause, saved.pause);
         assert_eq!(back.task_note.as_deref(), Some("Invoice export"));
-        assert!(!path.with_extension("bin.tmp").exists(), "the temporary file was renamed into place");
 
         // Saving again replaces the file.
         saved.pause = None;
@@ -322,7 +301,7 @@ mod tests {
     #[test]
     fn the_project_list_is_usable_offline_for_seven_days() {
         let at = DateTime::parse_from_rfc3339("2026-10-05T09:00:00Z").unwrap().with_timezone(&Utc);
-        let mut saved = Credentials::new("a".into(), "b".into(), None);
+        let mut saved = Credentials::new("a".into(), None);
         assert!(saved.usable_projects(at).is_none(), "nothing saved yet");
         saved.projects = Some(ProjectCache { resolved_at: at, projects: vec![project("p1")] });
         assert_eq!(saved.usable_projects(at + TimeDelta::days(6)).map(<[Project]>::len), Some(1));
@@ -333,7 +312,7 @@ mod tests {
 
     #[test]
     fn accounts_compare_like_the_server() {
-        let saved = Credentials::new("Alice@Acme.com".into(), "pw".into(), None);
+        let saved = Credentials::new("Alice@Acme.com".into(), None);
         assert!(saved.same_user(" alice@acme.com "));
         assert!(!saved.same_user("bob@acme.com"));
         let server = "https://tracker.acme.com";
@@ -345,22 +324,7 @@ mod tests {
     fn a_sign_in_saved_without_a_password_still_loads() {
         let json = br#"{"workspace_id":"w1","username":"a","refresh_token":"r"}"#;
         let parsed: Credentials = serde_json::from_slice(json).expect("the password is optional");
-        assert_eq!(parsed.password, "");
+        assert_eq!(parsed.legacy_password, "");
         assert_eq!(parsed.refresh_token.as_deref(), Some("r"));
-    }
-}
-
-// Non-Windows builds (CI lint, dev on other platforms) keep the API but do not
-// pretend to encrypt — the agent only ships on Windows.
-#[cfg(not(windows))]
-mod dpapi {
-    use anyhow::Result;
-
-    pub fn protect(plaintext: &[u8]) -> Result<Vec<u8>> {
-        Ok(plaintext.to_vec())
-    }
-
-    pub fn unprotect(ciphertext: &[u8]) -> Result<Vec<u8>> {
-        Ok(ciphertext.to_vec())
     }
 }

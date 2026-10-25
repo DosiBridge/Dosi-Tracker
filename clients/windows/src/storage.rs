@@ -310,9 +310,10 @@ impl Storage {
 
     /// Queue an activity for upload on behalf of `owner`, in `workspace_id`.
     pub fn enqueue(&self, activity: &Activity, owner: &str, workspace_id: &str) -> Result<i64> {
-        // Sign the payload before writing it so the server can detect tampering.
-        // The signature is computed over the canonical JSON (without the
-        // `payloadSignature` field itself, which is always None at this point).
+        // Tag the payload before writing it (a local HMAC the server does not
+        // verify; see `crate::signing`). The tag is computed over the canonical
+        // JSON (without the `payloadSignature` field itself, which is always
+        // None at this point).
         let payload = serde_json::to_string(activity)?;
         let sig: Option<String> = self
             .signing_key
@@ -345,6 +346,14 @@ impl Storage {
     /// offset means a row that fails to leave the queue can never be handed
     /// back in the same pass. A row whose payload no longer parses is parked as
     /// rejected instead of silently sitting in the queue forever.
+    /// Make every later write fail (`broken`), as a full disk or a locked
+    /// file would — or work again.
+    #[cfg(test)]
+    pub fn break_writes_for_test(&self, broken: bool) {
+        let pragma = if broken { "PRAGMA query_only = ON;" } else { "PRAGMA query_only = OFF;" };
+        self.conn.execute_batch(pragma).unwrap();
+    }
+
     #[cfg(test)]
     pub fn pending_batch(&self, owner: &str, after_id: i64, limit: u32) -> Result<Vec<(i64, Activity)>> {
         Ok(self.pending_rows(owner, after_id, limit)?.into_iter().map(|row| (row.id, row.activity)).collect())
@@ -370,8 +379,8 @@ impl Storage {
         for (id, payload, sig, workspace_id, attempts) in rows {
             match serde_json::from_str::<Activity>(&payload) {
                 Ok(mut activity) => {
-                    // Propagate the stored signature into the Activity so the
-                    // upload includes it for server-side verification.
+                    // Propagate the stored tag into the Activity (the server
+                    // accepts the field but does not verify it).
                     if activity.payload_signature.is_none() {
                         activity.payload_signature = sig;
                     }
