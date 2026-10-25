@@ -1,0 +1,89 @@
+name: Linux agent
+
+# Every stage runs in the clients/linux/ci/Dockerfile image (ubuntu:22.04,
+# glibc 2.35, pinned Rust), exactly as `bash ci/check.sh <stage>` does locally.
+
+on:
+  push:
+    branches: [main, master, develop]
+    paths:
+      - "clients/linux/**"
+      - ".github/workflows/linux.yml"
+  pull_request:
+    paths:
+      - "clients/linux/**"
+      - ".github/workflows/linux.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CI_IMAGE: dosi-linux-ci:22.04
+
+jobs:
+  check:
+    name: Linux agent (fmt, clippy, tests, installer, release)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Cache cargo registry
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/cargo-registry
+          key: linux-cargo-registry-${{ hashFiles('clients/linux/Cargo.lock') }}
+          restore-keys: linux-cargo-registry-
+
+      # The builder user takes the runner's uid so it can read the checkout and
+      # write the mounted build directories.
+      - name: Build CI image
+        run: >
+          docker build --build-arg BUILDER_UID="$(id -u)"
+          -t "$CI_IMAGE" -f clients/linux/ci/Dockerfile clients/linux/ci
+
+      - name: ci/check.sh fmt clippy test installer release
+        run: |
+          mkdir -p "$RUNNER_TEMP/cargo-registry" "$RUNNER_TEMP/linux-target"
+          docker run --rm --user builder \
+            -v "$GITHUB_WORKSPACE:/repo" \
+            -v "$RUNNER_TEMP/linux-target:/target" \
+            -v "$RUNNER_TEMP/cargo-registry:/usr/local/cargo/registry" \
+            -e CARGO_TARGET_DIR=/target \
+            -w /repo/clients/linux \
+            "$CI_IMAGE" bash ci/check.sh fmt clippy test installer release
+
+  harness:
+    name: Linux agent harness (Xvfb + private buses)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Cache cargo registry
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/cargo-registry
+          key: linux-cargo-registry-${{ hashFiles('clients/linux/Cargo.lock') }}
+          restore-keys: linux-cargo-registry-
+
+      - name: Build CI image
+        run: >
+          docker build --build-arg BUILDER_UID="$(id -u)"
+          -t "$CI_IMAGE" -f clients/linux/ci/Dockerfile clients/linux/ci
+
+      - name: ci/check.sh harness
+        run: |
+          mkdir -p "$RUNNER_TEMP/cargo-registry" "$RUNNER_TEMP/linux-target"
+          docker run --rm --user builder \
+            -v "$GITHUB_WORKSPACE:/repo" \
+            -v "$RUNNER_TEMP/linux-target:/target" \
+            -v "$RUNNER_TEMP/cargo-registry:/usr/local/cargo/registry" \
+            -e CARGO_TARGET_DIR=/target \
+            -w /repo/clients/linux \
+            "$CI_IMAGE" bash ci/check.sh harness
