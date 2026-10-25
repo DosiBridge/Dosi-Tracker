@@ -11,9 +11,10 @@
 mod support;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use dosi_tracker_linux::credentials::secret_service_available;
 use dosi_tracker_linux::{
     CredentialError, CredentialStore, Credentials, SecretServiceStore, SecretServiceTransport,
     ZbusSecretServiceTransport,
@@ -22,6 +23,7 @@ use support::private_bus::PrivateTestBus;
 use zbus::blocking::Connection;
 use zbus::interface;
 use zbus::message::Header;
+use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Str, Value};
 
 #[derive(Clone, Debug)]
@@ -44,7 +46,16 @@ struct ServerState {
     items: Arc<Mutex<HashMap<String, StoredItem>>>,
     session_counter: Arc<AtomicU64>,
     item_counter: Arc<AtomicU64>,
+    /// The collection is locked: Unlock answers with a prompt.
+    require_prompt: Arc<AtomicBool>,
+    /// The user dismisses the prompt.
+    dismiss_prompt: Arc<AtomicBool>,
+    prompts_shown: Arc<AtomicU64>,
+    prompt_window_ids: Arc<Mutex<Vec<String>>>,
 }
+
+/// The prompt object the fake hands out for a locked collection.
+const FAKE_PROMPT_PATH: &str = "/org/freedesktop/secrets/prompt/1";
 
 struct FakeSecretService {
     state: ServerState,
@@ -83,6 +94,12 @@ impl FakeSecretService {
     }
 
     fn unlock(&self, objects: Vec<OwnedObjectPath>) -> (Vec<OwnedObjectPath>, OwnedObjectPath) {
+        if self.state.require_prompt.load(Ordering::SeqCst) {
+            return (
+                Vec::new(),
+                OwnedObjectPath::try_from(FAKE_PROMPT_PATH).unwrap(),
+            );
+        }
         let mut items = self.state.items.lock().unwrap();
         let mut unlocked = Vec::new();
         for obj in objects {
@@ -324,7 +341,49 @@ impl FakeSession {
     }
 }
 
+/// `org.freedesktop.Secret.Prompt`: completing it unlocks every item.
+struct FakePrompt {
+    state: ServerState,
+}
+
+#[interface(name = "org.freedesktop.Secret.Prompt")]
+impl FakePrompt {
+    async fn prompt(
+        &self,
+        window_id: &str,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<()> {
+        self.state
+            .prompt_window_ids
+            .lock()
+            .unwrap()
+            .push(window_id.to_string());
+        self.state.prompts_shown.fetch_add(1, Ordering::SeqCst);
+        let dismissed = self.state.dismiss_prompt.load(Ordering::SeqCst);
+        if !dismissed {
+            self.state.require_prompt.store(false, Ordering::SeqCst);
+            for item in self.state.items.lock().unwrap().values_mut() {
+                item.locked = false;
+            }
+        }
+        Self::completed(&emitter, dismissed, Value::from(""))
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+    }
+
+    #[zbus(signal)]
+    async fn completed(
+        emitter: &SignalEmitter<'_>,
+        dismissed: bool,
+        result: Value<'_>,
+    ) -> zbus::Result<()>;
+}
+
 fn start_fake_secret_service(address: &str) -> Connection {
+    start_fake_secret_service_with_state(address).0
+}
+
+fn start_fake_secret_service_with_state(address: &str) -> (Connection, ServerState) {
     let state = ServerState::default();
 
     let fake_service = FakeSecretService {
@@ -342,6 +401,13 @@ fn start_fake_secret_service(address: &str) -> Connection {
         .expect("Valid service path")
         .serve_at("/org/freedesktop/secrets/aliases/default", fake_collection)
         .expect("Valid collection path")
+        .serve_at(
+            FAKE_PROMPT_PATH,
+            FakePrompt {
+                state: state.clone(),
+            },
+        )
+        .expect("Valid prompt path")
         .build()
         .expect("Fake SecretService connection built successfully");
 
@@ -368,7 +434,7 @@ fn start_fake_secret_service(address: &str) -> Connection {
             .expect("Register FakeSession");
     }
 
-    conn
+    (conn, state)
 }
 
 #[test]
@@ -602,4 +668,127 @@ fn test_linux_secret_service_store_default_new_with_env_session_bus() {
             .expect("load"),
         None
     );
+}
+
+#[test]
+fn test_linux_secret_service_account_level_item_is_one_item_per_account() {
+    let bus = PrivateTestBus::new();
+    let (_server, state) = start_fake_secret_service_with_state(bus.address());
+    let transport = Arc::new(ZbusSecretServiceTransport::from_address(bus.address()));
+    let store = SecretServiceStore::with_transport("dosi-tracker", transport);
+
+    let mut creds = Credentials::new("Erin@Corp.com", Some("erin-pass".into()));
+    creds.workspace_id = Some("ignored-for-account-items".into());
+    creds.refresh_token = Some("refresh-1".into());
+    store.save_account(&creds).expect("save account item");
+    creds.refresh_token = Some("refresh-2".into());
+    store.save_account(&creds).expect("replace account item");
+
+    {
+        let items = state.items.lock().unwrap();
+        let mine: Vec<_> = items
+            .values()
+            .filter(|i| i.attributes.get("account_id").map(String::as_str) == Some("erin@corp.com"))
+            .collect();
+        assert_eq!(mine.len(), 1, "one item per account");
+        assert_eq!(mine[0].attributes["workspace_id"], "");
+        assert_eq!(mine[0].attributes["application"], "dosi-tracker");
+    }
+    let loaded = store.load_account("erin@corp.com").unwrap().unwrap();
+    assert_eq!(
+        loaded.refresh_token.as_deref(),
+        Some("refresh-2"),
+        "the rotated token"
+    );
+    assert_eq!(loaded.workspace_id, None);
+    assert_eq!(loaded.password.as_deref(), Some("erin-pass"));
+
+    // remember_password = false keeps the password out of the keyring.
+    let forgetful = SecretServiceStore::with_transport(
+        "dosi-tracker",
+        Arc::new(ZbusSecretServiceTransport::from_address(bus.address())),
+    )
+    .with_remember_password(false);
+    forgetful.save_account(&creds).unwrap();
+    assert_eq!(
+        forgetful
+            .load_account("erin@corp.com")
+            .unwrap()
+            .unwrap()
+            .password,
+        None
+    );
+    let stored = state
+        .items
+        .lock()
+        .unwrap()
+        .values()
+        .map(|i| String::from_utf8_lossy(&i.secret).into_owned())
+        .collect::<String>();
+    assert!(!stored.contains("erin-pass"));
+
+    store.clear_account("erin@corp.com").unwrap();
+    assert_eq!(store.load_account("erin@corp.com").unwrap(), None);
+}
+
+#[test]
+fn test_linux_secret_service_locked_collection_needs_an_explicit_prompt() {
+    let bus = PrivateTestBus::new();
+    let (_server, state) = start_fake_secret_service_with_state(bus.address());
+    let transport = Arc::new(ZbusSecretServiceTransport::from_address(bus.address()));
+    let store = SecretServiceStore::with_transport("dosi-tracker", transport);
+    let mut creds = Credentials::new("frank@corp.com", None);
+    creds.refresh_token = Some("refresh".into());
+    store.save_account(&creds).unwrap();
+
+    // The keyring locks (screen lock, login without auto-unlock).
+    for item in state.items.lock().unwrap().values_mut() {
+        item.locked = true;
+    }
+    state.require_prompt.store(true, Ordering::SeqCst);
+
+    match store.load_account("frank@corp.com") {
+        Err(CredentialError::Locked { prompt }) => assert_eq!(prompt, FAKE_PROMPT_PATH),
+        other => panic!("expected Locked, got {other:?}"),
+    }
+    assert_eq!(
+        state.prompts_shown.load(Ordering::SeqCst),
+        0,
+        "loading never shows a prompt"
+    );
+
+    // The user dismisses the prompt: still locked.
+    state.dismiss_prompt.store(true, Ordering::SeqCst);
+    assert!(!store.unlock("frank@corp.com").expect("prompt completes"));
+    assert!(matches!(
+        store.load_account("frank@corp.com"),
+        Err(CredentialError::Locked { .. })
+    ));
+
+    // The user unlocks: the item loads.
+    state.dismiss_prompt.store(false, Ordering::SeqCst);
+    assert!(store.unlock("frank@corp.com").unwrap());
+    assert_eq!(state.prompts_shown.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        *state.prompt_window_ids.lock().unwrap(),
+        vec![String::new(), String::new()],
+        "no parent window id"
+    );
+    let loaded = store.load_account("frank@corp.com").unwrap().unwrap();
+    assert_eq!(loaded.refresh_token.as_deref(), Some("refresh"));
+}
+
+#[test]
+fn test_linux_secret_service_availability_is_probed_on_the_bus() {
+    let bus = PrivateTestBus::new();
+    let conn = zbus::blocking::connection::Builder::address(bus.address())
+        .unwrap()
+        .build()
+        .unwrap();
+    assert!(
+        !secret_service_available(&conn).unwrap(),
+        "nobody owns the name yet"
+    );
+    let _server = start_fake_secret_service(bus.address());
+    assert!(secret_service_available(&conn).unwrap());
 }

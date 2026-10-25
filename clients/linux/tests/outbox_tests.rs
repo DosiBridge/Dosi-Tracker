@@ -1132,3 +1132,63 @@ fn test_outbox_lock_poisoning_returns_recoverable_error() {
     let err_count = outbox.count(Some(&scope)).unwrap_err();
     assert!(matches!(err_count, OutboxError::LockPoisoned));
 }
+
+#[test]
+fn test_parked_v1_rows_leave_the_queue_without_being_deleted() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("outbox.db");
+    let outbox = Outbox::open(&db_path, OutboxLimits::default()).unwrap();
+    let scope = OutboxScope::new("user-1", "workspace-1").unwrap();
+    outbox
+        .enqueue(&scope, &synthetic_envelope("act-refused", Some("Refused")))
+        .unwrap();
+    outbox
+        .enqueue(&scope, &synthetic_envelope("act-next", Some("Next")))
+        .unwrap();
+
+    outbox
+        .park(&scope, "act-refused", "Overlaps another block.")
+        .unwrap();
+
+    let pending = outbox.peek_pending(&scope, 10).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].client_activity_id, "act-next");
+    assert_eq!(outbox.pending_count(&scope).unwrap(), 1);
+    assert_eq!(
+        outbox.count(Some(&scope)).unwrap(),
+        2,
+        "parked rows are kept"
+    );
+
+    // A parked row takes no more attempts and cannot be acknowledged twice.
+    assert!(matches!(
+        outbox.mark_attempt_failed(&scope, "act-refused", "again"),
+        Err(OutboxError::RecordNotFound { .. })
+    ));
+    // Parking another scope's row is refused.
+    let other = OutboxScope::new("user-2", "workspace-1").unwrap();
+    assert!(matches!(
+        outbox.park(&other, "act-next", "x"),
+        Err(OutboxError::RecordNotFound { .. })
+    ));
+
+    // The state survives a reopen.
+    drop(outbox);
+    let reopened = Outbox::open(&db_path, OutboxLimits::default()).unwrap();
+    assert_eq!(reopened.peek_pending(&scope, 10).unwrap().len(), 1);
+    let summary = reopened.queue_summary("user-1").unwrap();
+    assert_eq!((summary.pending, summary.parked), (1, 1));
+}
+
+#[test]
+fn test_garbage_files_are_refused_as_corrupt_and_left_untouched() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("outbox.db");
+    fs::write(&db_path, b"\x00\x01garbage that is not SQLite").unwrap();
+    let err = Outbox::open(&db_path, OutboxLimits::default()).unwrap_err();
+    assert!(matches!(err, OutboxError::CorruptDatabase(_)), "{err}");
+    assert_eq!(
+        fs::read(&db_path).unwrap(),
+        b"\x00\x01garbage that is not SQLite"
+    );
+}

@@ -11,8 +11,8 @@ Lightweight, privacy-first, rootless desktop agent foundation for Linux written 
 | **Telemetry Adapters** | First Bounded Slice Delivered | X11 EWMH active window + `/proc` running-apps inventory wired with consent gating; Wayland honest unsupported (Phase 2 first slice) |
 | **Privilege Model** | Strictly Rootless | Runs as normal user. Refuses `sudo`, `root`, `setuid`, `evdev`, and `uinput` |
 | **Offline Storage** | Transactional SQLite | Durable outbox queue with raw identity bounding and read-only inspection |
-| **Credential Store** | SecretService + 0600 Fallback | Scoped `(application, account, workspace)` store; Freedesktop SecretService (`org.freedesktop.secrets` over session D-Bus) with mock transport injection seam (`SecretServiceTransport`) for deterministic protocol testing; owner-only 0600 file fallback with explicit doctor warning |
-| **Transport & Auth** | Real HTTP Delivery Transport | Reqwest rustls, OpenIddict password grant (`POST /connect/token`), pre-expiry refresh, bounded 401 retry, activity upload, heartbeat |
+| **Credential Store** | SecretService + opt-in 0600 file | One Freedesktop SecretService item per account (`org.freedesktop.secrets` over session D-Bus, `workspace_id` attribute empty); the password only in the keyring and only when remembered; a locked keyring is reported (`Locked`) and only unlocked on an explicit prompt; mock transport injection seam (`SecretServiceTransport`) for deterministic protocol testing; the owner-only 0600 file store never holds a password; `credentials::resolve_store` (`auto`) never falls back to it, while the foundation `login` still uses it without a session bus, with the explicit doctor warning |
+| **Transport & Auth** | Real HTTP Delivery Transport | Reqwest rustls, OpenIddict password grant (`POST /connect/token` with the install's `device_id`, no tenant parameter, no workspace header), workspace discovery (`GET /api/app/workspaces/mine`), `X-Workspace-Id` on workspace-scoped calls, pre-expiry refresh with rotation listener, bounded 401 retry, Windows upload-outcome table plus DeviceRevoked/WorkspaceArchived/WorkspaceRequired, park-and-continue, 413 strip-and-resend, heartbeat; no default server, `http://` only to loopback unless `allow_insecure_http`, redirects never followed |
 | **Payload Signing** | HMAC-SHA256 (32 bytes) | URL_SAFE_NO_PAD base64url tag over canonical JSON, mirroring Windows byte semantics and test vectors |
 | **CI Gate** | Dedicated GitHub workflow | `.github/workflows/linux.yml` runs `ci/check.sh` inside the `ci/Dockerfile` image (ubuntu:22.04, glibc 2.35) |
 
@@ -81,7 +81,7 @@ cargo run --bin dosi-tracker -- login \
   --username "worker@example.com" \
   --password "secret" \
   --workspace-id "00000000-0000-0000-0000-000000000001" \
-  --server "https://api.dosi.app"
+  --server "https://tracker.example.com"   # required: there is no default server
 
 # Logout and securely remove credentials
 cargo run --bin dosi-tracker -- logout \
@@ -159,7 +159,7 @@ Stages: `fmt`, `clippy`, `test`, `harness` (ignored display/bus tests inside `ci
 | **Keyboard Counting** | Supported via XInput2 raw ticks | **UNSUPPORTED** (reported as `null`) | Planned Phase 2 Backlog (X11 only; Wayland isolated) |
 | **Mouse Counting** | Supported via XInput2 raw ticks | **UNSUPPORTED** (reported as `null`) | Planned Phase 2 Backlog (X11 only; Wayland isolated) |
 | **Webcam Photo** | Supported via V4L2 (`/dev/video*`) | Supported via V4L2 / PipeWire camera portal | Planned Phase 2 Backlog |
-| **Credential Storage** | Freedesktop Secret Service (D-Bus) | Freedesktop Secret Service (D-Bus) | **Delivered in Phase 1** (owner-only 0600 file fallback with warning) |
+| **Credential Storage** | Freedesktop Secret Service (D-Bus) | Freedesktop Secret Service (D-Bus) | **Delivered** (account-level items; opt-in owner-only 0600 file store without the password, with a doctor warning) |
 | **Backend Sync & Transport** | Real HTTP Delivery Transport | Real HTTP Delivery Transport | **Delivered in Phase 1** (Library transport `HttpDeliveryTransport::from_store` / `from_credentials` reusing persisted login credentials; background daemon loop is Phase 3, CLI queue flush command is Phase 4) |
 | **Payload Signing** | HMAC-SHA256 (32 bytes) | HMAC-SHA256 (32 bytes) | **Delivered in Phase 1** (Windows byte semantics parity) |
 
@@ -175,7 +175,8 @@ Stages: `fmt`, `clippy`, `test`, `harness` (ignored display/bus tests inside `ci
   - Documentation and test count synchronization across repository.
 - **Phase 1 (Delivered Foundation: Identity, Real Transport, Signed Queue)**:
   - Freedesktop Secret Service credential storage per account and workspace over session D-Bus (`org.freedesktop.secrets`) matching standard `SearchItems`, `OpenSession`, `Unlock`, `GetSecret`, `CreateItem`, and `Delete` interfaces with fail-closed prompt handling, accompanied by `SecretServiceTransport` injected seam and `MockSecretServiceTransport` protocol fake for deterministic testing without live keyring access; owner-only `0600` private file fallback with atomic replacement durability and explicit `doctor` diagnostic warning.
-  - OpenIddict OAuth2 password grant authentication (`POST /connect/token`, `client_id=Tracker_App`, `scope=Tracker`, `__tenant` workspace parameter).
+  - OpenIddict OAuth2 password grant authentication (`POST /connect/token`, `client_id=Tracker_App`, scope `Tracker offline_access`, the install's `device_id`; no tenant parameter and no workspace header).
+  - Outbox store v2 (migrated from v1 in one transaction): captures in their own table, signed rows (HMAC over the payload and capture digests) verified before upload, parking of refused rows with park-and-continue sync, Windows queue limits, `open_or_recover`, 0700/0600 files; the read-only inspector reads v1 and v2 stores and reports `parked_count` and `capture_bytes`.
   - Pre-expiry token refresh buffer (60s early renewal) and bounded 401 retry / re-authentication.
   - Per-device 32-byte HMAC-SHA256 payload signing matching Windows byte semantics (`URL_SAFE_NO_PAD` base64url tag).
   - Concrete `HttpDeliveryTransport` implementing `DeliveryTransport` contract with exact ack deletion, transient failure retention and retry counter incrementation, auth-required halt, and mismatched ack halt.

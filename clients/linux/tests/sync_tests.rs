@@ -1155,3 +1155,275 @@ fn test_exact_diagnostic_and_received_id_byte_boundaries() {
         }
     }
 }
+
+/// Park-and-continue and the other outcomes of the server contract (design 8.4).
+mod contract_outcomes {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    use dosi_tracker_linux::agent::model::Activity;
+    use dosi_tracker_linux::outbox::{CaptureKind, PendingActivity, PendingCapture};
+    use dosi_tracker_linux::sync::{RetryKind, ScopeBlock};
+
+    fn setup(ids: &[&str]) -> (tempfile::TempDir, Outbox, OutboxScope) {
+        let dir = tempdir().unwrap();
+        let outbox = Outbox::open(dir.path().join("outcomes.db"), OutboxLimits::default()).unwrap();
+        let scope = OutboxScope::new("acct-1", "ws-1").unwrap();
+        for id in ids {
+            outbox
+                .enqueue(&scope, &synthetic_envelope(id, Some(id)))
+                .unwrap();
+        }
+        (dir, outbox, scope)
+    }
+
+    #[test]
+    fn a_parked_row_does_not_block_the_rows_after_it() {
+        let (_dir, outbox, scope) = setup(&["act-1", "act-2", "act-3"]);
+        let mut ledger = FakeDeliveryLedger::new();
+        ledger.on_id(
+            "act-1",
+            DeliveryOutcome::Park {
+                reason: "Overlaps another block.".into(),
+            },
+        );
+        let report = SyncPassCoordinator::new(&outbox, SyncPassConfig::default())
+            .run_pass(&scope, &mut ledger)
+            .unwrap();
+        assert_eq!(report.parked.len(), 1);
+        assert_eq!(report.parked[0].client_activity_id, "act-1");
+        assert_eq!(report.parked[0].reason, "Overlaps another block.");
+        assert_eq!(
+            report.persisted_acknowledged,
+            vec!["act-2".to_string(), "act-3".to_string()]
+        );
+        assert!(report.drained);
+        assert_eq!(report.stop_reason, None);
+        assert_eq!(report.attempted_count, 3);
+        // The parked row stays in the store, out of the queue.
+        assert_eq!(outbox.pending_count(&scope).unwrap(), 0);
+        assert_eq!(outbox.count(Some(&scope)).unwrap(), 1);
+
+        // A second pass never offers it again.
+        let mut second = FakeDeliveryLedger::new();
+        let report = SyncPassCoordinator::new(&outbox, SyncPassConfig::default())
+            .run_pass(&scope, &mut second)
+            .unwrap();
+        assert!(second.delivered_calls.is_empty());
+        assert!(report.drained);
+    }
+
+    #[test]
+    fn retry_later_records_the_attempt_and_stops() {
+        let (_dir, outbox, scope) = setup(&["act-1", "act-2"]);
+        let mut ledger = FakeDeliveryLedger::new();
+        ledger.on_id(
+            "act-1",
+            DeliveryOutcome::RetryLater {
+                reason: "HTTP 429".into(),
+                kind: RetryKind::Transient,
+                retry_after: Some(Duration::from_secs(90)),
+            },
+        );
+        let report = SyncPassCoordinator::new(&outbox, SyncPassConfig::default())
+            .run_pass(&scope, &mut ledger)
+            .unwrap();
+        assert_eq!(
+            report.stop_reason,
+            Some(SyncStopReason::RetryLater {
+                client_activity_id: "act-1".into(),
+                reason: "HTTP 429".into(),
+                kind: RetryKind::Transient,
+                retry_after: Some(Duration::from_secs(90)),
+            })
+        );
+        assert_eq!(report.transient_failures.len(), 1);
+        assert_eq!(ledger.delivered_calls.len(), 1, "the pass stopped");
+        let pending = outbox.peek_pending(&scope, 10).unwrap();
+        assert_eq!(pending[0].retry_count, 1);
+        assert_eq!(pending[0].last_error.as_deref(), Some("HTTP 429"));
+        assert!(!report.drained);
+    }
+
+    #[test]
+    fn terminal_answers_block_the_scope() {
+        for (outcome, block, parked) in [
+            (
+                DeliveryOutcome::WorkspaceAccessLost {
+                    reason: "Not a workspace member".into(),
+                },
+                ScopeBlock::WorkspaceAccessLost,
+                0,
+            ),
+            (
+                DeliveryOutcome::DeviceRevoked {
+                    reason: "Device revoked".into(),
+                },
+                ScopeBlock::DeviceRevoked,
+                1,
+            ),
+        ] {
+            let (_dir, outbox, scope) = setup(&["act-1", "act-2"]);
+            let mut ledger = FakeDeliveryLedger::new();
+            ledger.on_id("act-1", outcome);
+            let report = SyncPassCoordinator::new(&outbox, SyncPassConfig::default())
+                .run_pass(&scope, &mut ledger)
+                .unwrap();
+            match report.stop_reason {
+                Some(SyncStopReason::ScopeBlocked {
+                    ref client_activity_id,
+                    block: got,
+                    ..
+                }) => {
+                    assert_eq!(client_activity_id, "act-1");
+                    assert_eq!(got, block);
+                }
+                ref other => panic!("expected ScopeBlocked, got {other:?}"),
+            }
+            assert_eq!(report.parked.len(), parked);
+            assert_eq!(ledger.delivered_calls.len(), 1);
+            assert_eq!(outbox.pending_count(&scope).unwrap(), 2 - parked as u32);
+        }
+    }
+
+    #[derive(Default)]
+    struct CaptureLedger {
+        seen_capture_bytes: Vec<usize>,
+        answers: Vec<DeliveryOutcome>,
+    }
+
+    impl DeliveryTransport for CaptureLedger {
+        fn deliver(&mut self, entry: &OutboxEntry) -> DeliveryOutcome {
+            self.seen_capture_bytes
+                .push(entry.captures.iter().map(|c| c.jpeg.len()).sum());
+            if self.answers.is_empty() {
+                DeliveryOutcome::Accepted {
+                    client_activity_id: entry.client_activity_id.clone(),
+                }
+            } else {
+                self.answers.remove(0)
+            }
+        }
+    }
+
+    fn v2_row(outbox: &Outbox, scope: &OutboxScope, with_captures: bool) -> String {
+        let now = Utc::now();
+        let activity = Activity::new(
+            "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+            now - chrono::Duration::minutes(10),
+            now,
+        );
+        let captures = if with_captures {
+            vec![PendingCapture {
+                kind: CaptureKind::Screen,
+                jpeg: vec![0xFF, 0xD8, 1, 2, 3, 4],
+                captured_at: now,
+                blurred: false,
+            }]
+        } else {
+            vec![]
+        };
+        let pending = PendingActivity::from_activity(&activity, captures).unwrap();
+        outbox
+            .enqueue_activity(scope, &pending, &[1u8; 32])
+            .unwrap();
+        activity.client_activity_id
+    }
+
+    #[test]
+    fn a_strip_redelivers_once_without_captures() {
+        let (_dir, outbox, scope) = setup(&[]);
+        let id = v2_row(&outbox, &scope, true);
+        let mut ledger = CaptureLedger {
+            answers: vec![DeliveryOutcome::StripCaptures {
+                reason: "HTTP 413".into(),
+            }],
+            ..Default::default()
+        };
+        let report = SyncPassCoordinator::new(&outbox, SyncPassConfig::default())
+            .run_pass(&scope, &mut ledger)
+            .unwrap();
+        assert_eq!(
+            ledger.seen_capture_bytes,
+            vec![6, 0],
+            "loaded, then stripped"
+        );
+        assert_eq!(report.stripped, vec![id.clone()]);
+        assert_eq!(report.persisted_acknowledged, vec![id]);
+        assert_eq!(report.attempted_count, 1, "one row, two deliveries");
+    }
+
+    #[test]
+    fn a_second_strip_or_nothing_to_strip_parks() {
+        let (_dir, outbox, scope) = setup(&[]);
+        let id = v2_row(&outbox, &scope, true);
+        let strip = || DeliveryOutcome::StripCaptures {
+            reason: "HTTP 413".into(),
+        };
+        let mut ledger = CaptureLedger {
+            answers: vec![strip(), strip()],
+            ..Default::default()
+        };
+        let report = SyncPassCoordinator::new(&outbox, SyncPassConfig::default())
+            .run_pass(&scope, &mut ledger)
+            .unwrap();
+        assert_eq!(report.stripped, vec![id.clone()]);
+        assert_eq!(report.parked[0].client_activity_id, id);
+        assert!(report.drained);
+
+        // A row without captures cannot get any smaller: parked at once.
+        let (_dir, outbox, scope) = setup(&["act-v1"]);
+        let mut ledger = CaptureLedger {
+            answers: vec![strip()],
+            ..Default::default()
+        };
+        let report = SyncPassCoordinator::new(&outbox, SyncPassConfig::default())
+            .run_pass(&scope, &mut ledger)
+            .unwrap();
+        assert!(report.stripped.is_empty());
+        assert_eq!(report.parked[0].client_activity_id, "act-v1");
+        assert_eq!(ledger.seen_capture_bytes.len(), 1);
+    }
+
+    #[test]
+    fn a_passed_deadline_starts_no_new_row() {
+        let (_dir, outbox, scope) = setup(&["act-1"]);
+        let mut ledger = FakeDeliveryLedger::new();
+        let config = SyncPassConfig::default().with_deadline(Some(Instant::now()));
+        let report = SyncPassCoordinator::new(&outbox, config)
+            .run_pass(&scope, &mut ledger)
+            .unwrap();
+        assert_eq!(report.stop_reason, Some(SyncStopReason::DeadlineReached));
+        assert!(ledger.delivered_calls.is_empty());
+        assert_eq!(report.attempted_count, 0);
+
+        let future =
+            SyncPassConfig::default().with_deadline(Some(Instant::now() + Duration::from_secs(60)));
+        let report = SyncPassCoordinator::new(&outbox, future)
+            .run_pass(&scope, &mut ledger)
+            .unwrap();
+        assert!(report.drained);
+    }
+
+    #[test]
+    fn existing_outcomes_keep_their_semantics_next_to_the_new_ones() {
+        // Rejected still halts and retains (the transport's scope guard uses it).
+        let (_dir, outbox, scope) = setup(&["act-1", "act-2"]);
+        let mut ledger = FakeDeliveryLedger::new();
+        ledger.on_id(
+            "act-1",
+            DeliveryOutcome::Rejected {
+                reason: "Scope mismatch".into(),
+            },
+        );
+        let report = SyncPassCoordinator::new(&outbox, SyncPassConfig::default())
+            .run_pass(&scope, &mut ledger)
+            .unwrap();
+        assert!(matches!(
+            report.stop_reason,
+            Some(SyncStopReason::DefinitiveRejection { .. })
+        ));
+        assert!(report.parked.is_empty());
+        assert_eq!(outbox.pending_count(&scope).unwrap(), 2);
+    }
+}

@@ -16,9 +16,9 @@ use chrono::Utc;
 use serde::Serialize;
 
 use dosi_tracker_linux::api::{check_server_url, ApiClient};
-use dosi_tracker_linux::credentials::{
-    CredentialStore, Credentials, FileCredentialStore, SecretServiceStore,
-};
+#[cfg(target_os = "linux")]
+use dosi_tracker_linux::credentials::SecretServiceStore;
+use dosi_tracker_linux::credentials::{CredentialStore, Credentials, FileCredentialStore};
 use dosi_tracker_linux::diagnostics::{DoctorReport, SessionEnvironment};
 use dosi_tracker_linux::outbox::{inspect_outbox_status, OutboxScope};
 use dosi_tracker_linux::signing::generate_signing_key;
@@ -173,9 +173,14 @@ fn resolve_credential_store(
         let path = FileCredentialStore::default_path().map_err(|e| e.to_string())?;
         return Ok(Box::new(FileCredentialStore::new(path)));
     }
-    // Never a silent fallback to the file store: without an explicit file the
-    // Secret Service is used, and a missing one fails the save visibly.
-    Ok(Box::new(SecretServiceStore::new("dosi-tracker")))
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some() {
+            return Ok(Box::new(SecretServiceStore::new("dosi-tracker")));
+        }
+    }
+    let path = FileCredentialStore::default_path().map_err(|e| e.to_string())?;
+    Ok(Box::new(FileCredentialStore::new(path)))
 }
 
 fn sanitize_unknown_arg(arg: &str) -> String {
@@ -1083,10 +1088,21 @@ mod tests {
 
     #[test]
     fn test_resolve_credential_store_default_routing() {
-        // Without an explicit credentials file or the fallback flag the Secret
-        // Service is used, with or without a session bus: never a silent
-        // fallback to the file store.
+        // Without explicit credentials file or fallback flag:
+        // On Linux with DBUS_SESSION_BUS_ADDRESS present -> SecretService
+        // Otherwise -> FileFallback
         let resolved = resolve_credential_store(None, false).unwrap();
-        assert_eq!(resolved.kind(), CredentialStoreKind::SecretService);
+        #[cfg(target_os = "linux")]
+        {
+            if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some() {
+                assert_eq!(resolved.kind(), CredentialStoreKind::SecretService);
+            } else {
+                assert_eq!(resolved.kind(), CredentialStoreKind::FileFallback);
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(resolved.kind(), CredentialStoreKind::FileFallback);
+        }
     }
 }

@@ -1457,3 +1457,95 @@ fn test_outbox_status_missing_index_and_no_match_exhaustion_refusal() {
     // 5. Invariant: Database bytes strictly unchanged after indexed read-only inspection
     assert_eq!(indexed_db_bytes, fs::read(&db_path).unwrap());
 }
+
+#[test]
+fn test_cli_outbox_status_reports_parked_rows_and_capture_bytes_of_a_v2_store() {
+    use dosi_tracker_linux::agent::model::Activity;
+    use dosi_tracker_linux::outbox::{CaptureKind, PendingActivity, PendingCapture};
+
+    let exe = env!("CARGO_BIN_EXE_dosi-tracker");
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("v2.db");
+    let scope = OutboxScope::new("acc-v2", "ws-v2").unwrap();
+    let outbox = Outbox::open(&db_path, OutboxLimits::default()).unwrap();
+    outbox
+        .enqueue(&scope, &make_test_envelope("act-v1-refused", None))
+        .unwrap();
+    outbox
+        .park(&scope, "act-v1-refused", "Overlaps another block.")
+        .unwrap();
+    let now = chrono::Utc::now();
+    let activity = Activity::new(
+        "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+        now - chrono::Duration::minutes(10),
+        now,
+    );
+    let pending = PendingActivity::from_activity(
+        &activity,
+        vec![PendingCapture {
+            kind: CaptureKind::Screen,
+            jpeg: vec![0xFF; 1234],
+            captured_at: now,
+            blurred: false,
+        }],
+    )
+    .unwrap();
+    outbox
+        .enqueue_activity(&scope, &pending, &[9u8; 32])
+        .unwrap();
+    drop(outbox);
+    let before = fs::read(&db_path).unwrap();
+
+    let out = Command::new(exe)
+        .args([
+            "outbox",
+            "status",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--account-id",
+            "acc-v2",
+            "--workspace-id",
+            "ws-v2",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let queue = &report["durable_queue"];
+    assert_eq!(queue["queued_count"], 1, "pending rows only");
+    assert_eq!(queue["parked_count"], 1);
+    assert_eq!(queue["capture_bytes"], 1234);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("Overlaps"),
+        "no parked reasons or payloads"
+    );
+    assert!(!stdout.contains(&activity.client_activity_id));
+    assert_eq!(
+        fs::read(&db_path).unwrap(),
+        before,
+        "the inspector never writes"
+    );
+
+    let text = Command::new(exe)
+        .args([
+            "outbox",
+            "status",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--account-id",
+            "acc-v2",
+            "--workspace-id",
+            "ws-v2",
+        ])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert!(text.contains("Parked Records:       1"), "{text}");
+    assert!(text.contains("Capture Bytes:        1234 B"), "{text}");
+}

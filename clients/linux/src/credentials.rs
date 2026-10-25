@@ -118,7 +118,7 @@ pub struct Credentials {
     /// Human-readable workspace name for display.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_name: Option<String>,
-    /// Target API server URL (e.g. `https://api.dosi-tracker.com`).
+    /// Target API server URL (e.g. `https://tracker.example.com`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_url: Option<String>,
     /// OpenIddict refresh token.
@@ -1836,7 +1836,7 @@ mod tests {
 
         let mut cred = Credentials::new("worker@corp.com", Some("p4ssw0rd".into()));
         cred.workspace_id = Some("ws-01".into());
-        cred.server_url = Some("https://api.dosi.local".into());
+        cred.server_url = Some("https://tracker.example.local".into());
         cred.device_signing_key = Some(vec![1, 2, 3, 4]);
 
         store.save(&cred).unwrap();
@@ -1853,7 +1853,10 @@ mod tests {
         assert!(!String::from_utf8(fs::read(&cred_file).unwrap())
             .unwrap()
             .contains("p4ssw0rd"));
-        assert_eq!(loaded.server_url.as_deref(), Some("https://api.dosi.local"));
+        assert_eq!(
+            loaded.server_url.as_deref(),
+            Some("https://tracker.example.local")
+        );
         assert_eq!(
             loaded.device_signing_key.as_deref(),
             Some(&[1, 2, 3, 4][..])
@@ -1929,7 +1932,7 @@ mod tests {
         let mut alice_alpha = Credentials::new("alice@corp.com", Some("pass-alpha".into()));
         alice_alpha.workspace_id = Some("ws-alpha".into());
         alice_alpha.access_token = Some("tok-alpha-123".into());
-        alice_alpha.server_url = Some("https://api.dosi.local".into());
+        alice_alpha.server_url = Some("https://tracker.example.local".into());
         alice_alpha.device_signing_key = Some(vec![10, 20, 30]);
         store
             .save(&alice_alpha)

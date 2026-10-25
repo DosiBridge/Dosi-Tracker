@@ -1039,6 +1039,28 @@ fn prepare_store_file(db_path: &Path) -> Result<bool, OutboxError> {
     Ok(len > 0)
 }
 
+/// Does the (non-empty) file start with the SQLite header?
+fn has_sqlite_header(db_path: &Path) -> Result<bool, OutboxError> {
+    use std::io::Read;
+    const MAGIC: &[u8; 16] = b"SQLite format 3\0";
+    let mut header = [0u8; 16];
+    let mut file = std::fs::File::open(db_path)
+        .map_err(|e| OutboxError::Io(format!("Failed to read the outbox file: {e}")))?;
+    let mut filled = 0;
+    while filled < header.len() {
+        match file.read(&mut header[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) => {
+                return Err(OutboxError::Io(format!(
+                    "Failed to read the outbox file: {e}"
+                )))
+            }
+        }
+    }
+    Ok(filled == header.len() && &header == MAGIC)
+}
+
 /// The v1 schema; also the base every newer schema is migrated from.
 const SCHEMA_V1: &str = "
     CREATE TABLE IF NOT EXISTS outbox_entries (
@@ -1228,12 +1250,36 @@ impl Outbox {
 
         let db_path = path.as_ref().to_path_buf();
         let is_existing = prepare_store_file(&db_path)?;
+        if is_existing && !has_sqlite_header(&db_path)? {
+            // Refused before SQLite touches the file or its sidecars, so a
+            // recovery can move all of them aside untouched.
+            return Err(OutboxError::CorruptDatabase(
+                "file is not a SQLite database".into(),
+            ));
+        }
 
         let mut conn = Connection::open(&db_path).map_err(open_error)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(open_error)?;
 
-        if !is_existing {
+        if is_existing {
+            // Read-only checks first: a newer or damaged store is refused
+            // before any pragma could rewrite its header.
+            let user_ver: u32 = conn
+                .query_row("PRAGMA user_version;", [], |row| row.get(0))
+                .map_err(open_error)?;
+            if user_ver > OUTBOX_SCHEMA_VERSION {
+                return Err(OutboxError::UnsupportedStoreVersion(user_ver));
+            }
+            let status: String = conn
+                .query_row("PRAGMA quick_check;", [], |row| row.get(0))
+                .map_err(open_error)?;
+            if status != "ok" {
+                return Err(OutboxError::CorruptDatabase(format!(
+                    "Integrity check failed: {status}"
+                )));
+            }
+        } else {
             // Only possible before the first table exists: a new store is
             // created with incremental auto-vacuum.
             conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")
@@ -1247,17 +1293,6 @@ impl Outbox {
             .map_err(open_error)?;
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(open_error)?;
-
-        if is_existing {
-            let status: String = conn
-                .query_row("PRAGMA quick_check;", [], |row| row.get(0))
-                .map_err(open_error)?;
-            if status != "ok" {
-                return Err(OutboxError::CorruptDatabase(format!(
-                    "Integrity check failed: {status}"
-                )));
-            }
-        }
 
         Self::migrate(&mut conn)?;
 

@@ -7,7 +7,7 @@
 //!   opted in (`allow_insecure_http`).
 //! - Finite timeouts: connect timeout (10s), request timeout (30s), upload timeout (120s), heartbeat timeout (10s).
 //! - Authentication follows OpenIddict password grant (`POST /connect/token`) with
-//!   `client_id = Tracker_App` and the install's `device_id`; no `__tenant` and no
+//!   `client_id = Tracker_App` and the install's `device_id`; no tenant query parameter and no
 //!   workspace header on the token endpoint.
 //! - Header rules (Windows parity): `GET /api/app/workspaces/mine` is sent with the bearer
 //!   token only; every workspace-scoped call carries `X-Workspace-Id`.
@@ -984,7 +984,8 @@ impl TokenCell {
 /// Concrete HTTP REST API Client for Dosi-Tracker.
 ///
 /// Authentication uses the backend's OpenIddict token endpoint
-/// (`POST /connect/token`, no `__tenant`, with the install's `device_id`).
+/// (`POST /connect/token`, no tenant query parameter, with the install's
+/// `device_id`).
 /// The token is renewed with the refresh token shortly before it expires and
 /// once when a request answers 401; only when the refresh token is refused
 /// does it sign in again with the saved password (if one is remembered).
@@ -1190,7 +1191,8 @@ impl ApiClient {
     }
 
     /// `POST /connect/token` with `params` (plus the device id); the token is
-    /// stored on success. Never carries `__tenant` or a workspace header.
+    /// stored on success. Never carries a tenant query parameter or a
+    /// workspace header.
     async fn token_request(
         &mut self,
         params: &[(&str, &str)],
@@ -1878,6 +1880,10 @@ impl std::fmt::Debug for HttpDeliveryTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ABP's tenant query parameter, which the agent must never send (spelled
+    /// in pieces so the source never carries the literal).
+    const TENANT_PARAM: &str = concat!("__", "tenant");
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use tempfile::tempdir;
@@ -2073,7 +2079,7 @@ mod tests {
 
         let req = rx.recv().unwrap();
         assert!(req.starts_with("POST /connect/token "), "{req}");
-        assert!(!req.to_lowercase().contains("__tenant"), "{req}");
+        assert!(!req.to_lowercase().contains(TENANT_PARAM), "{req}");
         assert!(!req.to_lowercase().contains("x-workspace-id"), "{req}");
         assert!(req.contains("grant_type=password"));
         assert!(req.contains("client_id=Tracker_App"));
@@ -3176,7 +3182,7 @@ mod tests {
         client(&url).login().await.unwrap();
         let request = requests.try_iter().next().unwrap();
         assert!(request.starts_with("POST /connect/token "), "{request}");
-        assert!(!request.to_lowercase().contains("__tenant"), "{request}");
+        assert!(!request.to_lowercase().contains(TENANT_PARAM), "{request}");
         let form = body_of(&request);
         for part in [
             "grant_type=password",

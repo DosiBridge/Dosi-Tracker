@@ -1,0 +1,23 @@
+{
+  "clientActivityId": "1c8b6d44-3e26-4e3f-96d4-4b7e0e5a1c22",
+  "projectId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "startedAt": "2026-10-05T10:00:00Z",
+  "endedAt": "2026-10-05T10:10:00Z",
+  "mouseClicks": null,
+  "keyboardHits": null,
+  "activeWindows": [],
+  "runningPrograms": [
+    { "appName": "gnome-text-editor", "windowTitle": "" },
+    { "appName": "firefox", "windowTitle": "" }
+  ],
+  "platform": "linux",
+  "osVersion": "Fedora Linux 43 (Workstation Edition) (Linux 6.17.1-300.fc43.x86_64)",
+  "agentVersion": "0.1.0",
+  "deviceId": "5b0c1b9e-8f2c-4a43-9a51-0c7f6f2d9b11",
+  "deviceName": "workstation-1",
+  "timeZone": "Europe/Berlin",
+  "utcOffsetMinutes": 120,
+  "endReason": "lock",
+  "sentAt": "2026-10-05T10:10:01Z",
+  "payloadSignature": "c2lnbmF0dXJl"
+}
