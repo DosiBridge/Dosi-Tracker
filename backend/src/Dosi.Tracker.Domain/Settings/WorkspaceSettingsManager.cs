@@ -1,5 +1,6 @@
 using System;
 using System.Threading.Tasks;
+using Dosi.Tracker.Activities;
 using Volo.Abp;
 using Dosi.Tracker.Workspaces;
 using Volo.Abp.SettingManagement;
@@ -145,6 +146,51 @@ public class WorkspaceSettingsManager : TrackerDomainService
 
         await _settingManager.SetAsync(
             TrackerSettings.Workspace.CaptureRetention.RetentionDays,
+            SettingValueFormat.Write(retentionDays),
+            WorkspaceSettingValueProvider.ProviderName,
+            workspaceId.ToString());
+    }
+
+    /// <summary>
+    /// The activity (time block) retention policy of the workspace. Only the workspace's own value counts (never a
+    /// platform-wide one), and an unset or malformed policy, or days outside <see cref="ActivityRetentionLimits"/>,
+    /// read as off: deleting tracked time is never the result of a default.
+    /// </summary>
+    public virtual async Task<(bool IsEnabled, int RetentionDays)> GetActivityRetentionPolicyAsync(Guid workspaceId)
+    {
+        var isEnabled = await _settingManager.GetOrNullAsync(
+            TrackerSettings.Workspace.ActivityRetention.IsEnabled,
+            WorkspaceSettingValueProvider.ProviderName,
+            workspaceId.ToString(),
+            fallback: false);
+        var days = await _settingManager.GetOrNullAsync(
+            TrackerSettings.Workspace.ActivityRetention.RetentionDays,
+            WorkspaceSettingValueProvider.ProviderName,
+            workspaceId.ToString(),
+            fallback: false);
+
+        if (!bool.TryParse(isEnabled, out var enabled) ||
+            !int.TryParse(days, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var retentionDays) ||
+            retentionDays < ActivityRetentionLimits.MinDays || retentionDays > ActivityRetentionLimits.MaxDays)
+        {
+            return (false, ActivityRetentionLimits.DefaultDays);
+        }
+
+        return (enabled, retentionDays);
+    }
+
+    public virtual async Task SetActivityRetentionPolicyAsync(Guid workspaceId, bool isEnabled, int retentionDays)
+    {
+        Check.Range(retentionDays, nameof(retentionDays), ActivityRetentionLimits.MinDays, ActivityRetentionLimits.MaxDays);
+
+        await _settingManager.SetAsync(
+            TrackerSettings.Workspace.ActivityRetention.IsEnabled,
+            SettingValueFormat.Write(isEnabled),
+            WorkspaceSettingValueProvider.ProviderName,
+            workspaceId.ToString());
+
+        await _settingManager.SetAsync(
+            TrackerSettings.Workspace.ActivityRetention.RetentionDays,
             SettingValueFormat.Write(retentionDays),
             WorkspaceSettingValueProvider.ProviderName,
             workspaceId.ToString());

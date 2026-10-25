@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
 using System.Linq;
 using System.Threading.Tasks;
+using Dosi.Tracker.Activities;
 using Dosi.Tracker.Activities.Retention;
 using Dosi.Tracker.Identity;
 using Dosi.Tracker.Projects;
@@ -10,6 +11,7 @@ using Dosi.Tracker.Settings;
 using Dosi.Tracker.Teams;
 using Dosi.Tracker.Workspaces;
 using Microsoft.AspNetCore.Authorization;
+using Microsoft.Extensions.Options;
 using Volo.Abp;
 using Volo.Abp.Application.Dtos;
 using Volo.Abp.Authorization;
@@ -40,6 +42,8 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
     private readonly ProjectMembershipManager _projectMemberships;
     private readonly SeatCounter _seatCounter;
     private readonly IdentityUserManager _userManager;
+    private readonly IOptions<CaptureRetentionOptions> _captureRetentionOptions;
+    private readonly IOptions<ActivityRetentionOptions> _activityRetentionOptions;
 
     public WorkspaceAppService(
         IRepository<Subscription, Guid> subscriptionRepository,
@@ -54,7 +58,9 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
         WorkspaceJoiner joiner,
         ProjectMembershipManager projectMemberships,
         SeatCounter seatCounter,
-        IdentityUserManager userManager)
+        IdentityUserManager userManager,
+        IOptions<CaptureRetentionOptions> captureRetentionOptions,
+        IOptions<ActivityRetentionOptions> activityRetentionOptions)
     {
         _subscriptionRepository = subscriptionRepository;
         _planRepository = planRepository;
@@ -69,6 +75,8 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
         _projectMemberships = projectMemberships;
         _seatCounter = seatCounter;
         _userManager = userManager;
+        _captureRetentionOptions = captureRetentionOptions;
+        _activityRetentionOptions = activityRetentionOptions;
     }
 
     public async Task<SubscriptionDto?> GetCurrentSubscriptionAsync()
@@ -290,7 +298,8 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
         return new WorkspaceCaptureRetentionDto
         {
             IsEnabled = isEnabled,
-            RetentionDays = days
+            RetentionDays = days,
+            IsEnforced = _captureRetentionOptions.Value.IsEnabled
         };
     }
 
@@ -325,7 +334,58 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
         return new WorkspaceCaptureRetentionDto
         {
             IsEnabled = input.IsEnabled,
-            RetentionDays = input.RetentionDays
+            RetentionDays = input.RetentionDays,
+            IsEnforced = _captureRetentionOptions.Value.IsEnabled
+        };
+    }
+
+    [WorkspaceNotRequired]
+    [RemoteService(IsEnabled = false)]
+    public async Task<WorkspaceActivityRetentionDto> GetActivityRetentionAsync(Guid id)
+    {
+        if (await _memberships.FindActiveAsync(id, CurrentUser.GetId()) == null)
+        {
+            throw new AbpAuthorizationException("Only an active member of the workspace can view its activity retention policy.");
+        }
+
+        var (isEnabled, days) = await _workspaceSettings.GetActivityRetentionPolicyAsync(id);
+        return new WorkspaceActivityRetentionDto
+        {
+            IsEnabled = isEnabled,
+            RetentionDays = days,
+            IsEnforced = _activityRetentionOptions.Value.IsEnabled
+        };
+    }
+
+    [WorkspaceNotRequired]
+    [RemoteService(IsEnabled = false)]
+    public async Task<WorkspaceActivityRetentionDto> UpdateActivityRetentionAsync(Guid id, WorkspaceActivityRetentionDto input)
+    {
+        Check.NotNull(input, nameof(input));
+
+        if (input.RetentionDays < ActivityRetentionLimits.MinDays || input.RetentionDays > ActivityRetentionLimits.MaxDays)
+        {
+            throw new AbpValidationException(new List<ValidationResult>
+            {
+                new($"Retention days must be between {ActivityRetentionLimits.MinDays} and {ActivityRetentionLimits.MaxDays}.",
+                    new[] { nameof(WorkspaceActivityRetentionDto.RetentionDays) })
+            });
+        }
+
+        var member = await _memberships.FindActiveAsync(id, CurrentUser.GetId());
+        if (member is not { IsOwner: true })
+        {
+            throw new AbpAuthorizationException("Only an active owner of the workspace can change its activity retention policy.");
+        }
+
+        await _workspaceSettings.SetActivityRetentionPolicyAsync(id, input.IsEnabled, input.RetentionDays);
+        ActivityRetentionWorker.ResetCursor(id);
+
+        return new WorkspaceActivityRetentionDto
+        {
+            IsEnabled = input.IsEnabled,
+            RetentionDays = input.RetentionDays,
+            IsEnforced = _activityRetentionOptions.Value.IsEnabled
         };
     }
 

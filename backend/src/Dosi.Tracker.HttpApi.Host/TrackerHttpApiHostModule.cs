@@ -7,6 +7,7 @@ using System.Threading.Tasks;
 using Dosi.Tracker.Billing;
 using Dosi.Tracker.Activities.Retention;
 using Dosi.Tracker.Compatibility;
+using Dosi.Tracker.Retention;
 using Dosi.Tracker.SaaS;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
@@ -145,6 +146,7 @@ public class TrackerHttpApiHostModule : AbpModule
         ConfigureVirtualFileSystem(context);
         ConfigureCors(context, configuration);
         ConfigureBlobStoring(context, configuration);
+        context.Services.AddTrackerDataRetention(configuration);
         ConfigureRequestSizeLimits(context);
         ConfigureAuditing();
         ConfigureLegacyAgentCompatibility();
@@ -251,8 +253,6 @@ public class TrackerHttpApiHostModule : AbpModule
                 serviceProvider.GetRequiredService<Volo.Abp.Security.Encryption.IStringEncryptionService>(),
                 forcePathStyle.Value));
         }
-
-        Configure<CaptureRetentionOptions>(configuration.GetSection("CaptureRetention"));
     }
 
     /// <summary>ABP's S3 client factory, with path-style addressing as configured by <c>S3:ForcePathStyle</c>.</summary>
@@ -539,10 +539,12 @@ public class TrackerHttpApiHostModule : AbpModule
         await context.AddBackgroundWorkerAsync<TrialExpiryWorker>();
         await context.AddBackgroundWorkerAsync<InvoiceGenerationWorker>();
 
-        var retentionOptions = context.ServiceProvider.GetRequiredService<IOptions<CaptureRetentionOptions>>().Value;
-        if (retentionOptions.IsEnabled)
+        var retentionWorkers = DataRetentionHosting.WorkerTypes(
+            context.ServiceProvider.GetRequiredService<IOptions<CaptureRetentionOptions>>().Value,
+            context.ServiceProvider.GetRequiredService<IOptions<ActivityRetentionOptions>>().Value);
+        foreach (var worker in retentionWorkers)
         {
-            await context.AddBackgroundWorkerAsync<CaptureRetentionWorker>();
+            await context.AddBackgroundWorkerAsync(worker);
         }
     }
 }

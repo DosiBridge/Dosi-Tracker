@@ -20,6 +20,8 @@ public class TrackerSettingDefinitionProvider : SettingDefinitionProvider
             WorkspaceSetting(TrackerSettings.Workspace.NewProject.IdleThresholdMinutes, SettingValueFormat.Write(defaults.IdleThresholdMinutes)),
             WorkspaceSetting(TrackerSettings.Workspace.CaptureRetention.IsEnabled, defaultValue: null),
             WorkspaceSetting(TrackerSettings.Workspace.CaptureRetention.RetentionDays, defaultValue: null),
+            WorkspaceSetting(TrackerSettings.Workspace.ActivityRetention.IsEnabled, defaultValue: null),
+            WorkspaceSetting(TrackerSettings.Workspace.ActivityRetention.RetentionDays, defaultValue: null),
             new SettingDefinition(TrackerSettings.User.TimeZone)
                 .WithProviders(DefaultValueSettingValueProvider.ProviderName, UserSettingValueProvider.ProviderName));
     }

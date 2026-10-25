@@ -39,6 +39,18 @@ public static class TrackerSettings
             /// <summary>Retention duration in days for the workspace (positive integer, 1 to 730).</summary>
             public const string RetentionDays = RetentionPrefix + ".RetentionDays";
         }
+
+        /// <summary>Workspace activity (tracked time block) retention policy: opt-in, like capture retention.</summary>
+        public static class ActivityRetention
+        {
+            private const string RetentionPrefix = WorkspacePrefix + ".ActivityRetention";
+
+            /// <summary>Whether old time blocks are deleted for the workspace (defaults to false).</summary>
+            public const string IsEnabled = RetentionPrefix + ".IsEnabled";
+
+            /// <summary>Retention duration in days (see <c>ActivityRetentionLimits</c>).</summary>
+            public const string RetentionDays = RetentionPrefix + ".RetentionDays";
+        }
     }
 
     /// <summary>Personal preferences (user-level values).</summary>

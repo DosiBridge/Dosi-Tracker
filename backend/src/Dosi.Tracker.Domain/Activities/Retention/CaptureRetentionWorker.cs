@@ -21,12 +21,15 @@ namespace Dosi.Tracker.Activities.Retention;
 
 /// <summary>
 /// Periodic background worker adapter for capture retention (REQ-DAT-01).
-/// DISABLED BY DEFAULT: Requires explicit configuration (CaptureRetention:IsEnabled = true).
-/// Never runs automatically on application startup (Timer.RunOnStart = false).
+/// Runs by default (CaptureRetention:IsEnabled, see <see cref="CaptureRetentionOptions"/>) but deletes captures only of
+/// workspaces whose owner opted in to a retention window. The first sweep runs at start-up and then every
+/// <see cref="CaptureRetentionOptions.PeriodHours"/>, so a service restarted daily (deploys, scaling, crashes) still
+/// sweeps; the sweep lock keeps concurrent instances from sweeping at once.
 /// Executes sweeps across active workspaces under a distributed lock, delegating actual
 /// workspace-isolated cleanup to ICaptureRetentionService.
 /// Maintains workspace-scoped continuation cursors across sweeps to ensure forward progress
-/// past preserved poison/failing rows, with bounded pages per sweep and deterministic wrap-around.
+/// past preserved poison/failing rows, with bounded pages per sweep and deterministic wrap-around. The cursors live in
+/// memory: after a restart a sweep starts again from a workspace's oldest expired capture.
 /// </summary>
 public class CaptureRetentionWorker : AsyncPeriodicBackgroundWorkerBase
 {
@@ -66,7 +69,7 @@ public class CaptureRetentionWorker : AsyncPeriodicBackgroundWorkerBase
         _logger = logger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<CaptureRetentionWorker>.Instance;
         var periodHours = options.Value.PeriodHours > 0 ? options.Value.PeriodHours : 24;
         Timer.Period = (int)TimeSpan.FromHours(periodHours).TotalMilliseconds;
-        Timer.RunOnStart = false; // Disabled on startup
+        Timer.RunOnStart = true; // A restart must never postpone the sweep by a whole period.
     }
 
     protected override Task DoWorkAsync(PeriodicBackgroundWorkerContext workerContext)

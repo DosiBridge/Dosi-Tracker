@@ -649,7 +649,6 @@ public class WorkspaceCaptureRetentionTests : TrackerEntityFrameworkCoreTestBase
         var enabledOptions = Options.Create(new CaptureRetentionOptions
         {
             IsEnabled = true,
-            DefaultRetentionDays = 30,
             BatchSize = 100
         });
 
@@ -902,7 +901,6 @@ public class WorkspaceCaptureRetentionTests : TrackerEntityFrameworkCoreTestBase
         var enabledOptions = Options.Create(new CaptureRetentionOptions
         {
             IsEnabled = true,
-            DefaultRetentionDays = 30,
             BatchSize = 2
         });
 
@@ -961,7 +959,6 @@ public class WorkspaceCaptureRetentionTests : TrackerEntityFrameworkCoreTestBase
         var enabledOptions = Options.Create(new CaptureRetentionOptions
         {
             IsEnabled = true,
-            DefaultRetentionDays = 30,
             BatchSize = 2
         });
 
@@ -1038,7 +1035,6 @@ public class WorkspaceCaptureRetentionTests : TrackerEntityFrameworkCoreTestBase
         var options = Options.Create(new CaptureRetentionOptions
         {
             IsEnabled = true,
-            DefaultRetentionDays = 30,
             BatchSize = 2,
             MaxPagesPerWorkspace = 2
         });
@@ -1127,7 +1123,6 @@ public class WorkspaceCaptureRetentionTests : TrackerEntityFrameworkCoreTestBase
         var options = Options.Create(new CaptureRetentionOptions
         {
             IsEnabled = true,
-            DefaultRetentionDays = 30,
             BatchSize = 1,
             MaxPagesPerWorkspace = 5
         });

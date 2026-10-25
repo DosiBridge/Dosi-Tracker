@@ -24,6 +24,7 @@
     <Compile Include="..\..\src\Dosi.Tracker.HttpApi.Host\Security\DiagnosticsExposure.cs" Link="Security\Host\DiagnosticsExposure.cs" />
     <Compile Include="..\..\src\Dosi.Tracker.HttpApi.Host\Compatibility\LegacyAgentCompatibility.cs" Link="Compatibility\Host\LegacyAgentCompatibility.cs" />
     <Compile Include="..\..\src\Dosi.Tracker.HttpApi.Host\Workspaces\WorkspaceResolution.cs" Link="Workspaces\Host\WorkspaceResolution.cs" />
+    <Compile Include="..\..\src\Dosi.Tracker.HttpApi.Host\Retention\DataRetentionHosting.cs" Link="Retention\Host\DataRetentionHosting.cs" />
   </ItemGroup>
 
   <ItemGroup>

@@ -62,6 +62,18 @@ public class WorkspacesController : TrackerController
     {
         return _workspaceAppService.UpdateCaptureRetentionAsync(id, input);
     }
+
+    [HttpGet("{id}/activity-retention")]
+    public Task<WorkspaceActivityRetentionDto> GetActivityRetentionAsync(Guid id)
+    {
+        return _workspaceAppService.GetActivityRetentionAsync(id);
+    }
+
+    [HttpPut("{id}/activity-retention")]
+    public Task<WorkspaceActivityRetentionDto> UpdateActivityRetentionAsync(Guid id, [FromBody] WorkspaceActivityRetentionDto input)
+    {
+        return _workspaceAppService.UpdateActivityRetentionAsync(id, input);
+    }
 }
 
 /// <summary>Workspace invitations, addressed by their token — or, under <c>mine</c>, the signed-in user's own by id.</summary>

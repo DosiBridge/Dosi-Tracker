@@ -17,7 +17,7 @@ namespace Dosi.Tracker.Activities.Retention;
 
 /// <summary>
 /// Production domain service implementing workspace-scoped activity and time summary age retention (REQ-DAT-01).
-/// Dormant unless explicitly invoked.
+/// Run by <see cref="ActivityRetentionWorker"/> for the workspaces whose owner opted in.
 /// Guarantees:
 /// 1. Explicit workspace scoping with explicit WorkspaceId predicates in selection and mutation.
 /// 2. Bounded batch pagination with deterministic ordering (StartedAt, Id) and exact-cutoff preservation.

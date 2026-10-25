@@ -498,7 +498,6 @@ public class WorkspaceCaptureRetentionPolicyHttpTests : WorkspaceHttpTestBase<Tr
         var enabledOptions = Options.Create(new CaptureRetentionOptions
         {
             IsEnabled = true,
-            DefaultRetentionDays = 30,
             BatchSize = 100
         });
         var timer = GetRequiredService<AbpAsyncTimer>();
@@ -551,7 +550,6 @@ public class WorkspaceCaptureRetentionPolicyHttpTests : WorkspaceHttpTestBase<Tr
         var enabledOptions = Options.Create(new CaptureRetentionOptions
         {
             IsEnabled = true,
-            DefaultRetentionDays = 30, // Global option is 30, but A's 60 days MUST control!
             BatchSize = 100
         });
         var timer = GetRequiredService<AbpAsyncTimer>();
@@ -623,7 +621,6 @@ public class WorkspaceCaptureRetentionPolicyHttpTests : WorkspaceHttpTestBase<Tr
         var enabledOptions = Options.Create(new CaptureRetentionOptions
         {
             IsEnabled = true,
-            DefaultRetentionDays = 30,
             BatchSize = 100
         });
         var timer = GetRequiredService<AbpAsyncTimer>();
@@ -788,7 +785,6 @@ public class WorkspaceCaptureRetentionPolicyHttpTests : WorkspaceHttpTestBase<Tr
         var enabledOptions = Options.Create(new CaptureRetentionOptions
         {
             IsEnabled = true,
-            DefaultRetentionDays = 30,
             BatchSize = 100
         });
         var timer = GetRequiredService<AbpAsyncTimer>();
