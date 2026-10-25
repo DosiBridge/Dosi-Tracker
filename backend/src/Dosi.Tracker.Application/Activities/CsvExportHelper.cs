@@ -82,8 +82,8 @@ public static class CsvExportHelper
             sb.Append(EscapeCsvCell(a.Description)).Append(',');
             sb.Append(a.Productivity.HasValue ? a.Productivity.Value.ToString(CultureInfo.InvariantCulture) : string.Empty).Append(',');
             sb.Append(a.IdleSeconds.HasValue ? a.IdleSeconds.Value.ToString(CultureInfo.InvariantCulture) : string.Empty).Append(',');
-            sb.Append(a.MouseClicks.ToString(CultureInfo.InvariantCulture)).Append(',');
-            sb.Append(a.KeyboardHits.ToString(CultureInfo.InvariantCulture));
+            sb.Append(a.MouseClicks.HasValue ? a.MouseClicks.Value.ToString(CultureInfo.InvariantCulture) : string.Empty).Append(',');
+            sb.Append(a.KeyboardHits.HasValue ? a.KeyboardHits.Value.ToString(CultureInfo.InvariantCulture) : string.Empty);
             sb.AppendLine();
         }
 

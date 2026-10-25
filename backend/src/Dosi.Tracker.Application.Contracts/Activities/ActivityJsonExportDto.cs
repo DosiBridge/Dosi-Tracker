@@ -9,7 +9,8 @@ namespace Dosi.Tracker.Activities;
 /// </summary>
 public class ActivityJsonExportDocumentDto
 {
-    public string Version { get; set; } = "1.0";
+    /// <summary>"1.1": MouseClicks and KeyboardHits became nullable (null = not measured).</summary>
+    public string Version { get; set; } = "1.1";
     public Guid WorkspaceId { get; set; }
     public DateTime ExportedAtUtc { get; set; }
     public int TotalCount { get; set; }
@@ -34,6 +35,6 @@ public class ActivityJsonExportItemDto
     public string? Description { get; set; }
     public int? Productivity { get; set; }
     public int? IdleSeconds { get; set; }
-    public int MouseClicks { get; set; }
-    public int KeyboardHits { get; set; }
+    public int? MouseClicks { get; set; }
+    public int? KeyboardHits { get; set; }
 }

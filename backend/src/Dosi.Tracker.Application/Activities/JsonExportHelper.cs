@@ -13,7 +13,7 @@ namespace Dosi.Tracker.Activities;
 /// </summary>
 public static class JsonExportHelper
 {
-    public const string SchemaVersion = "1.0";
+    public const string SchemaVersion = "1.1";
 
     public static readonly JsonSerializerOptions JsonOptions = new()
     {

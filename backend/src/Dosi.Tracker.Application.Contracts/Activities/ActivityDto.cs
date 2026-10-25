@@ -14,8 +14,12 @@ public class ActivityDto : CreationAuditedEntityDto<Guid>
 
     /// <summary>Activity % of the block; null when it was not measured.</summary>
     public int? Productivity { get; set; }
-    public int MouseClicks { get; set; }
-    public int KeyboardHits { get; set; }
+
+    /// <summary>Mouse clicks of the block; null when they were not measured (never a fabricated 0).</summary>
+    public int? MouseClicks { get; set; }
+
+    /// <summary>Keystrokes of the block; null when they were not measured.</summary>
+    public int? KeyboardHits { get; set; }
     public string? Description { get; set; }
     public string ActiveWindowsJson { get; set; } = "[]";
     public string RunningProgramsJson { get; set; } = "[]";

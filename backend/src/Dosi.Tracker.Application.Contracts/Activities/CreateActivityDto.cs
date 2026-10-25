@@ -36,11 +36,16 @@ public class CreateActivityDto
     [Range(0, 100)]
     public int? Productivity { get; set; }
 
+    /// <summary>Mouse clicks during the block; null (or absent) = not measured — input counting is off, not consented
+    /// or unsupported in the session (e.g. Wayland). Send 0 only for a measured block without clicks. Older agents
+    /// always send a number.</summary>
     [Range(0, int.MaxValue)]
-    public int MouseClicks { get; set; }
+    public int? MouseClicks { get; set; }
 
+    /// <summary>Keystrokes during the block (a count only); null (or absent) = not measured, as for
+    /// <see cref="MouseClicks"/>.</summary>
     [Range(0, int.MaxValue)]
-    public int KeyboardHits { get; set; }
+    public int? KeyboardHits { get; set; }
 
     [MaxLength(2048)]
     public string? Description { get; set; }
@@ -153,16 +158,20 @@ public class WindowInfoDto
 
 /// <summary>
 /// One minute of a block's timeline. Also the shape persisted in <c>Activity.TimelineJson</c>
-/// (<see cref="AppName"/> is omitted from the stored JSON when absent).
+/// (<see cref="AppName"/> and unmeasured counts are omitted from the stored JSON when absent).
 /// </summary>
 public class ActivityMinuteDto
 {
     /// <summary>0-based minute bucket index, counted from the block's StartedAt.</summary>
     public int Minute { get; set; }
 
-    public int KeyboardHits { get; set; }
+    /// <summary>Keystrokes of this minute; null = not measured (omitted from the stored JSON then).</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? KeyboardHits { get; set; }
 
-    public int MouseClicks { get; set; }
+    /// <summary>Mouse clicks of this minute; null = not measured (omitted from the stored JSON then).</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? MouseClicks { get; set; }
 
     /// <summary>Whether the member was active (not idle) during this minute.</summary>
     public bool Active { get; set; }

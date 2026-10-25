@@ -105,6 +105,8 @@ public class ReportingAppService : TrackerAppService, IReportingAppService
             AverageProductivity = total.AverageProductivity,
             TotalMouseClicks = total.MouseClicks,
             TotalKeyboardHits = total.KeyboardHits,
+            MouseMeasuredActivities = total.MouseMeasuredCount,
+            KeyboardMeasuredActivities = total.KeyboardMeasuredCount,
             PerUser = perUser
                 .Select(entry => new UserReportRowDto
                 {
@@ -173,7 +175,9 @@ public class ReportingAppService : TrackerAppService, IReportingAppService
                     IdleMinutes = totals.RoundedIdleMinutes,
                     AverageProductivity = totals.AverageProductivity,
                     MouseClicks = totals.MouseClicks,
-                    KeyboardHits = totals.KeyboardHits
+                    KeyboardHits = totals.KeyboardHits,
+                    MouseMeasuredActivities = totals.MouseMeasuredCount,
+                    KeyboardMeasuredActivities = totals.KeyboardMeasuredCount
                 }
                 : new DailyReportRowDto { Date = day })
             .ToList();
@@ -702,8 +706,8 @@ public class ReportingAppService : TrackerAppService, IReportingAppService
         public DateTime StartedAt { get; set; }
         public DateTime EndedAt { get; set; }
         public int? Productivity { get; set; }
-        public int MouseClicks { get; set; }
-        public int KeyboardHits { get; set; }
+        public int? MouseClicks { get; set; }
+        public int? KeyboardHits { get; set; }
         public int? IdleSeconds { get; set; }
         public string? TimeZone { get; set; }
         public int? UtcOffsetMinutes { get; set; }

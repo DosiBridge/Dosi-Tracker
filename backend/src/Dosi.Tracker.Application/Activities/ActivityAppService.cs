@@ -49,6 +49,12 @@ public class ActivityAppService : TrackerAppService, IActivityAppService
     /// <summary>Back-to-back blocks may overlap by up to this much (clock jitter); more is double-counting.</summary>
     public static readonly TimeSpan AllowedOverlap = TimeSpan.FromSeconds(60);
 
+    /// <summary>Two blocks may also overlap by at most this share of the shorter one. Without it, blocks of at most
+    /// <see cref="AllowedOverlap"/> could never clash (identical one-minute blocks stack without limit) and two-minute
+    /// blocks overlapping by a minute would count the same time twice. A quarter bounds what overlapping blocks can
+    /// add to a member's tracked time, and keeps far more than real clock jitter between real blocks.</summary>
+    public const double MaxOverlapShare = 0.25;
+
     /// <summary>A screen capture time reported by the agent is kept while it lies at most this far outside the block.</summary>
     public static readonly TimeSpan CaptureTimeTolerance = TimeSpan.FromSeconds(60);
 
@@ -288,8 +294,9 @@ public class ActivityAppService : TrackerAppService, IActivityAppService
     /// <summary>
     /// The time rules of shared contract §1, in its order: a valid range, a project not archived before the block
     /// started, at most <see cref="MaxBlockLength"/> long, ending no later than <see cref="MaxFutureSkew"/> after the
-    /// server's clock, starting within <see cref="ActivityIngestOptions.MaxBlockAge"/>, and no overlap of more than
-    /// <see cref="AllowedOverlap"/> with the member's other blocks. Times are compared as UTC.
+    /// server's clock, starting within <see cref="ActivityIngestOptions.MaxBlockAge"/>, and neither starting at the
+    /// very instant another block of the member starts nor overlapping one by more than <see cref="ToleratedOverlap"/>.
+    /// Times are compared as UTC.
     /// </summary>
     private async Task ValidateBlockAsync(Guid userId, Project project, CreateActivityDto input)
     {
@@ -333,20 +340,19 @@ public class ActivityAppService : TrackerAppService, IActivityAppService
                 .WithData("maxAgeDays", Math.Round(_ingestOptions.MaxBlockAge.TotalDays, 1));
         }
 
-        // Coarse DB filter, then the exact check. An overlap longer than AllowedOverlap implies both range bounds,
-        // and a stored block (at most MaxBlockLength long) that reaches past this one's start began at most
-        // MaxBlockLength earlier, which keeps the scan to a few rows of the (WorkspaceId, UserId, StartedAt) index.
+        // Coarse DB filter (every block of the member touching this one), then the exact check. A stored block (at most
+        // MaxBlockLength long) that reaches past this one's start began at most MaxBlockLength earlier, which keeps the
+        // scan to a few rows of the (WorkspaceId, UserId, StartedAt) index.
         var earliestStart = start - MaxBlockLength;
-        var overlapFrom = start + AllowedOverlap;
-        var overlapTo = end - AllowedOverlap;
         var candidates = await _activityRepository.GetListAsync(a =>
-            a.UserId == userId && a.StartedAt >= earliestStart && a.StartedAt < overlapTo && a.EndedAt > overlapFrom);
+            a.UserId == userId && a.StartedAt >= earliestStart && a.StartedAt < end && a.EndedAt > start);
 
         var clash = candidates.FirstOrDefault(a =>
         {
             var otherStart = AgentContextNormalizer.AsUtc(a.StartedAt);
             var otherEnd = AgentContextNormalizer.AsUtc(a.EndedAt);
-            return (otherEnd < end ? otherEnd : end) - (otherStart > start ? otherStart : start) > AllowedOverlap;
+            var overlap = (otherEnd < end ? otherEnd : end) - (otherStart > start ? otherStart : start);
+            return otherStart == start || overlap > ToleratedOverlap(end - start, otherEnd - otherStart);
         });
         if (clash != null)
         {
@@ -354,6 +360,15 @@ public class ActivityAppService : TrackerAppService, IActivityAppService
                 .WithData("startedAt", input.StartedAt)
                 .WithData("endedAt", input.EndedAt);
         }
+    }
+
+    /// <summary>How much two blocks of a member may overlap: <see cref="AllowedOverlap"/>, but never more than
+    /// <see cref="MaxOverlapShare"/> of the shorter one.</summary>
+    public static TimeSpan ToleratedOverlap(TimeSpan blockLength, TimeSpan otherLength)
+    {
+        var shorter = blockLength < otherLength ? blockLength : otherLength;
+        var share = shorter * MaxOverlapShare;
+        return share < AllowedOverlap ? share : AllowedOverlap;
     }
 
     /// <summary>The block as stored. The capture policy is enforced server-side too: data the project does not
@@ -378,8 +393,8 @@ public class ActivityAppService : TrackerAppService, IActivityAppService
         )
         {
             Productivity = measuresInput ? input.Productivity : null,
-            MouseClicks = project.AllowMouse ? Math.Max(0, input.MouseClicks) : 0,
-            KeyboardHits = project.AllowKeyboard ? Math.Max(0, input.KeyboardHits) : 0,
+            MouseClicks = MeasuredCount(project.AllowMouse, input.MouseClicks),
+            KeyboardHits = MeasuredCount(project.AllowKeyboard, input.KeyboardHits),
             Description = AgentContextNormalizer.CleanNote(input.Description, UpdateActivityNoteDto.MaxDescriptionLength),
             ActiveWindowsJson = project.AllowActiveWindow ? SerializeWindows(input.ActiveWindows, project, blockLength) : "[]",
             RunningProgramsJson = project.AllowRunningPrograms ? SerializeRunningPrograms(input.RunningPrograms) : "[]",
@@ -397,6 +412,11 @@ public class ActivityAppService : TrackerAppService, IActivityAppService
             InjectedInputEvents = measuresInput && input.InjectedInputEvents >= 0 ? input.InjectedInputEvents : null
         };
     }
+
+    /// <summary>A reported input count as stored: null when it was not measured (the agent sent none) or the project
+    /// does not allow that input — never a fabricated 0 — and a negative count is no measurement either.</summary>
+    private static int? MeasuredCount(bool allowed, int? reported) =>
+        allowed && reported is >= 0 ? reported : null;
 
     /// <summary>The reported idle seconds clamped to the block's length (a negative count is not a measurement);
     /// when the agent sent none, derived from the timeline's inactive buckets. Without input measurement (the
@@ -467,9 +487,10 @@ public class ActivityAppService : TrackerAppService, IActivityAppService
 
     /// <summary>The per-minute timeline as stored: buckets outside the block (minute &lt; 0, or past its last
     /// minute plus one bucket of slack for a partial trailing minute) are dropped, duplicates keep the first
-    /// entry, counts are clamped to non-negative, and data the project does not allow is blanked (counts
-    /// zeroed, app name removed). The minute, its active flag and its active seconds are time data and always
-    /// kept; active seconds outside 0..90 are not a measurement and are dropped.</summary>
+    /// entry, and counts that are negative, missing or not allowed by the project are stored as not measured
+    /// (null), never as 0; an app name the project does not allow is removed. The minute, its active flag and its
+    /// active seconds are time data and always kept; active seconds outside 0..90 are not a measurement and are
+    /// dropped.</summary>
     private static List<ActivityMinuteDto> SanitizeTimeline(
         List<ActivityMinuteDto>? timeline, Project project, TimeSpan blockLength)
     {
@@ -488,8 +509,8 @@ public class ActivityAppService : TrackerAppService, IActivityAppService
             .Select(m => new ActivityMinuteDto
             {
                 Minute = m.Minute,
-                KeyboardHits = project.AllowKeyboard ? Math.Max(0, m.KeyboardHits) : 0,
-                MouseClicks = project.AllowMouse ? Math.Max(0, m.MouseClicks) : 0,
+                KeyboardHits = MeasuredCount(project.AllowKeyboard, m.KeyboardHits),
+                MouseClicks = MeasuredCount(project.AllowMouse, m.MouseClicks),
                 Active = m.Active,
                 AppName = project.AllowActiveWindow ? AgentContextNormalizer.Truncate(m.AppName, MaxAppNameLength) : null,
                 ActiveSeconds = m.ActiveSeconds is >= 0 and <= ActivityConsts.MaxMinuteActiveSeconds ? m.ActiveSeconds : null
