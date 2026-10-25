@@ -317,6 +317,13 @@ impl Tracker {
         self.driver.is_input_running()
     }
 
+    /// Did the latest attempt to attach the input hooks fail (security
+    /// software blocking them, a hook thread that would not start)? They
+    /// are tried again later, but until then they see nothing.
+    pub fn input_hooks_failed(&self) -> bool {
+        self.driver.input_attach_failed()
+    }
+
     /// Do the input hooks see all of the user's input right now: attached,
     /// working, and allowed to see both keys and the mouse? Only then is
     /// their view of "the last input" complete — anything less and Windows'

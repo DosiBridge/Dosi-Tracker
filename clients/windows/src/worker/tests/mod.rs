@@ -19,6 +19,7 @@ use chrono::{FixedOffset, Local};
 
 use super::account::{friendly_login_error, is_auth_rejection};
 use super::control::{ControlEvent, Farewell};
+use super::presence::HOOKS_ATTACH_WAIT;
 use super::queue::push_recent_block;
 use super::session::session_for;
 use super::uploader::UploadEvent;
@@ -59,6 +60,12 @@ struct FakeMachine {
     injected: Mutex<Vec<DateTime<Utc>>>,
     /// Since when the input hooks are attached (`None`: they are not).
     hooks_since: Mutex<Option<DateTime<Utc>>>,
+    /// The input hooks cannot attach (security software blocking them).
+    hooks_blocked: std::sync::atomic::AtomicBool,
+    /// …and the failure goes unreported (`input_hooks_failed` stays false).
+    hooks_fail_silently: std::sync::atomic::AtomicBool,
+    /// The latest attempt to attach them failed.
+    hooks_failed: std::sync::atomic::AtomicBool,
     captures: Mutex<u32>,
     fraction: Mutex<f64>,
     device: DeviceInfo,
@@ -89,6 +96,9 @@ impl FakeMachine {
             inputs: Mutex::new(Vec::new()),
             injected: Mutex::new(Vec::new()),
             hooks_since: Mutex::new(None),
+            hooks_blocked: std::sync::atomic::AtomicBool::new(false),
+            hooks_fail_silently: std::sync::atomic::AtomicBool::new(false),
+            hooks_failed: std::sync::atomic::AtomicBool::new(false),
             captures: Mutex::new(0),
             fraction: Mutex::new(0.5),
             device: DeviceInfo {
@@ -139,6 +149,13 @@ impl FakeMachine {
     /// sees it.
     fn injected_at(&self, when: DateTime<Utc>) {
         self.injected.lock().unwrap().push(when);
+    }
+
+    /// From now on the input hooks cannot attach: every attempt fails, and
+    /// says so unless `silently`.
+    fn block_hooks(&self, silently: bool) {
+        self.hooks_blocked.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.hooks_fail_silently.store(silently, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// What Windows' idle clock says: the latest input of any kind.
@@ -245,6 +262,10 @@ impl Machine for FakeMachine {
 
     fn input_hooks_running(&self) -> bool {
         self.is_input_running()
+    }
+
+    fn input_hooks_failed(&self) -> bool {
+        self.hooks_failed.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn capture_screen(&self, blur: bool) -> Option<crate::tracking::ProvenanceScreenCapture> {
@@ -423,9 +444,17 @@ impl Machine for FakeMachine {
         self.last_webcam.store(webcam, std::sync::atomic::Ordering::SeqCst);
 
         if keyboard || mouse {
-            if !self.input_running.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                self.input_starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                *self.hooks_since.lock().unwrap() = Some(self.now());
+            // Hooks already attached stay; new ones fail while blocked.
+            if !self.is_input_running() {
+                if self.hooks_blocked.load(std::sync::atomic::Ordering::SeqCst) {
+                    let silent = self.hooks_fail_silently.load(std::sync::atomic::Ordering::SeqCst);
+                    self.hooks_failed.store(!silent, std::sync::atomic::Ordering::SeqCst);
+                } else {
+                    self.hooks_failed.store(false, std::sync::atomic::Ordering::SeqCst);
+                    self.input_running.store(true, std::sync::atomic::Ordering::SeqCst);
+                    self.input_starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    *self.hooks_since.lock().unwrap() = Some(self.now());
+                }
             }
         } else if self.input_running.swap(false, std::sync::atomic::Ordering::SeqCst) {
             self.input_stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);

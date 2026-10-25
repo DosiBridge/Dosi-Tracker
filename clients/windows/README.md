@@ -171,10 +171,12 @@ is noticed through Windows' own idle clock (`GetLastInputInfo`: when the last
 input happened, nothing else). That clock also moves for software-injected
 input such as a mouse jiggler, so when the project records keyboard and mouse
 counts the agent attaches its input hooks — counting only, nothing else runs —
-and the time away ends at your own next input. A timed break that ends while
-nobody is at the computer resumes the same way. When keyboard and mouse counts
-are not allowed, idle detection relies on Windows' idle clock alone, so time is
-still recorded and still ends when you leave.
+and the time away ends at your own next input (time a jiggler ran before it is
+time away, never work). A timed break that ends while nobody is at the computer
+resumes the same way. When keyboard and mouse counts are not allowed — or the
+hooks cannot attach, for example because security software blocks them — idle
+detection relies on Windows' idle clock alone, so time is still recorded and
+still ends when you leave.
 
 ### Locking, sleep and shutdown
 

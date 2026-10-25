@@ -346,7 +346,8 @@ struct Away {
     session: Option<Session>,
     /// When Windows' idle clock first showed input again, while the input
     /// hooks confirm it was the user's own (a mouse jiggler moves that clock
-    /// too). The time away ends here once they do.
+    /// too). The time away ends here when they do so right after; later, it
+    /// ends at the input they saw.
     noticed: Option<DateTime<Utc>>,
 }
 

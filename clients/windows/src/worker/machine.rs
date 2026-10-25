@@ -32,6 +32,9 @@ pub trait Machine: Send + Sync {
     /// Are the input hooks attached (so the two above see only the user's
     /// own input)?
     fn input_hooks_running(&self) -> bool;
+    /// Did the latest attempt to attach the input hooks fail? Then nothing
+    /// they could confirm is coming soon.
+    fn input_hooks_failed(&self) -> bool;
     fn capture_screen(&self, blur: bool) -> Option<crate::tracking::ProvenanceScreenCapture>;
     /// Build the block's upload payload.
     fn snapshot(&self, block: &BlockSpec<'_>, screen: Option<crate::tracking::ProvenanceScreenCapture>) -> Activity;
@@ -94,6 +97,10 @@ impl Machine for Tracker {
 
     fn input_hooks_running(&self) -> bool {
         Tracker::input_hooks_running(self)
+    }
+
+    fn input_hooks_failed(&self) -> bool {
+        Tracker::input_hooks_failed(self)
     }
 
     fn capture_screen(&self, blur: bool) -> Option<crate::tracking::ProvenanceScreenCapture> {

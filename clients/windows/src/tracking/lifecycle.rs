@@ -22,6 +22,11 @@ pub trait SensorDriver: Send + Sync {
     /// Whether input hooks are currently attached and running.
     fn is_input_running(&self) -> bool;
 
+    /// Did the latest attempt to attach the input hooks fail (they are
+    /// waiting to be tried again)? Until it does, asking for them again
+    /// is pointless.
+    fn input_attach_failed(&self) -> bool;
+
     /// Seconds since Windows last saw keyboard or mouse input
     /// (`GetLastInputInfo`), hooks or not; `None` when it will not say.
     fn system_idle_seconds(&self) -> Option<u64>;
@@ -48,6 +53,11 @@ pub struct FakeSensorDriver {
     pub usage_running: AtomicBool,
     pub last_keyboard_allowed: AtomicBool,
     pub last_mouse_allowed: AtomicBool,
+    /// Simulate hooks that cannot attach (security software): starting
+    /// them fails.
+    pub fail_attach: AtomicBool,
+    /// The latest attempt to attach failed.
+    pub attach_failed: AtomicBool,
     /// The simulated Windows idle clock: seconds since the last input, or
     /// `None` while it says nothing.
     pub system_idle: Mutex<Option<u64>>,
@@ -87,6 +97,11 @@ impl FakeSensorDriver {
     pub fn last_mouse_allowed(&self) -> bool {
         self.last_mouse_allowed.load(Ordering::SeqCst)
     }
+
+    /// From now on, attaching the input hooks fails (or works again).
+    pub fn set_fail_attach(&self, fail: bool) {
+        self.fail_attach.store(fail, Ordering::SeqCst);
+    }
 }
 
 impl SensorDriver for FakeSensorDriver {
@@ -94,6 +109,11 @@ impl SensorDriver for FakeSensorDriver {
         counter.set_policy(keyboard || mouse, keyboard, mouse);
         self.last_keyboard_allowed.store(keyboard, Ordering::SeqCst);
         self.last_mouse_allowed.store(mouse, Ordering::SeqCst);
+        let fail = self.fail_attach.load(Ordering::SeqCst);
+        self.attach_failed.store(fail, Ordering::SeqCst);
+        if fail {
+            return;
+        }
         if !self.input_running.swap(true, Ordering::SeqCst) {
             self.input_started.fetch_add(1, Ordering::SeqCst);
         }
@@ -107,6 +127,10 @@ impl SensorDriver for FakeSensorDriver {
 
     fn is_input_running(&self) -> bool {
         self.input_running.load(Ordering::SeqCst)
+    }
+
+    fn input_attach_failed(&self) -> bool {
+        self.attach_failed.load(Ordering::SeqCst)
     }
 
     fn system_idle_seconds(&self) -> Option<u64> {
@@ -394,6 +418,11 @@ impl HookRetryGate {
     pub fn succeeded(&mut self) {
         self.failed = None;
     }
+
+    /// Did the latest attempt fail (and has nothing attached since)?
+    pub fn failing(&self) -> bool {
+        self.failed.is_some()
+    }
 }
 
 // ---- Native Production Implementations --------------------------------------
@@ -518,6 +547,10 @@ impl SensorDriver for NativeSensorDriver {
         guard.is_some()
     }
 
+    fn input_attach_failed(&self) -> bool {
+        self.input_retry.lock().unwrap_or_else(|e| e.into_inner()).failing()
+    }
+
     fn system_idle_seconds(&self) -> Option<u64> {
         super::input::idle_seconds()
     }
@@ -596,6 +629,7 @@ impl SensorDriver for NativeSensorDriver {
     fn start_input(&self, _counter: Arc<InputCounter>, _keyboard: bool, _mouse: bool) {}
     fn stop_input(&self) {}
     fn is_input_running(&self) -> bool { false }
+    fn input_attach_failed(&self) -> bool { false }
     fn system_idle_seconds(&self) -> Option<u64> { None }
     fn start_usage(&self, _recorder: Arc<UsageRecorder>) {}
     fn stop_usage(&self) {}
@@ -612,7 +646,9 @@ pub mod tests {
         let mut gate = HookRetryGate::default();
         let both = (true, true);
         assert!(gate.may_try(both, start));
+        assert!(!gate.failing());
         gate.failed(both, start);
+        assert!(gate.failing());
         assert!(!gate.may_try(both, start + Duration::from_secs(29)), "not on every tick");
         assert!(gate.may_try((true, false), start), "other hooks are tried at once");
         assert!(gate.may_try(both, start + HookRetryGate::FIRST));
@@ -628,6 +664,7 @@ pub mod tests {
         assert_eq!(waits, [60, 120, 240, 300, 300, 300]);
         gate.succeeded();
         assert!(gate.may_try(both, at));
+        assert!(!gate.failing());
     }
 
     #[test]
@@ -661,6 +698,24 @@ pub mod tests {
 
         driver.stop_input();
         assert_eq!(driver.input_stopped_count(), 1, "idempotent stop does not double count");
+    }
+
+    #[test]
+    fn fake_driver_hooks_that_cannot_attach_say_so() {
+        let driver = FakeSensorDriver::new();
+        let counter = Arc::new(InputCounter::new());
+        assert!(!driver.input_attach_failed(), "nothing tried yet");
+
+        driver.set_fail_attach(true);
+        driver.start_input(counter.clone(), true, true);
+        assert!(!driver.is_input_running());
+        assert!(driver.input_attach_failed());
+        assert_eq!(driver.input_started_count(), 0);
+
+        driver.set_fail_attach(false);
+        driver.start_input(counter, true, true);
+        assert!(driver.is_input_running());
+        assert!(!driver.input_attach_failed(), "attached: no longer failing");
     }
 
     #[test]

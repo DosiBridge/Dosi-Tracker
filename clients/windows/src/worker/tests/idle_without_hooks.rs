@@ -61,11 +61,92 @@ fn a_mouse_jiggler_never_ends_the_time_away() {
     assert!(!h.heartbeats().contains(&PresenceStatus::Tracking), "presence never claims tracking");
     assert_eq!(h.spans().len(), 1, "nothing recorded while away");
 
-    // The user is really back.
+    // The user is really back: the hooks see it at once. The jiggler's 50
+    // seconds before it are not work.
     h.machine.input_at(at("10:11:00"));
     h.tick(at("10:11:01"));
     assert_eq!(h.status(), TrackerStatus::Tracking);
-    assert_eq!(h.tracking_since(), Some(at("10:10:10")), "from when the idle clock first moved");
+    assert_eq!(h.tracking_since(), Some(at("10:11:00")), "from the user's own input, not the jiggler's");
+    let prompt = h.state.snapshot().away_prompt.expect("asked about the time away");
+    assert_eq!((prompt.from, prompt.to), (at("10:02:00"), at("10:11:00")));
+}
+
+#[test]
+fn an_hour_of_mouse_jiggling_before_the_user_returns_is_never_work() {
+    let mut h = tracking();
+    h.machine.input_at(at("10:02:00"));
+    h.tick(at("10:07:00"));
+    assert_eq!(h.status(), TrackerStatus::Away);
+
+    // A jiggler from 10:05 until noon, a tick every 2 seconds.
+    let mut when = at("10:05:00");
+    while when < at("12:00:00") {
+        h.machine.injected_at(when);
+        when += TimeDelta::seconds(2);
+        h.tick(when);
+        assert_eq!(h.status(), TrackerStatus::Away, "at {when}");
+    }
+    assert_eq!(h.spans().len(), 1, "nothing recorded while away");
+
+    h.come_back(at("12:00:30"));
+    assert_eq!(h.status(), TrackerStatus::Tracking);
+    assert_eq!(h.tracking_since(), Some(at("12:00:30")), "the user's own input, not the jiggler's 10:05");
+    let prompt = h.state.snapshot().away_prompt.expect("asked about the time away");
+    assert_eq!((prompt.from, prompt.to), (at("10:02:00"), at("12:00:30")), "the jiggling is time away, kept only if they say so");
+
+    // Ten minutes on, the first block is the user's own.
+    for minute in 1..=12 {
+        let when = at("12:00:30") + TimeDelta::minutes(minute);
+        h.machine.input_at(when - TimeDelta::seconds(5));
+        h.tick(when);
+    }
+    let spans = h.spans();
+    assert_eq!(spans.len(), 2, "{spans:?}");
+    assert_eq!(spans[1].0, at("12:00:30"), "nothing before the real return");
+}
+
+#[test]
+fn a_return_the_hooks_confirm_at_once_starts_where_the_idle_clock_saw_it() {
+    let mut h = tracking();
+    h.machine.input_at(at("10:02:00"));
+    h.tick(at("10:07:00"));
+    assert_eq!(h.status(), TrackerStatus::Away);
+    // Windows' idle clock sees the user at 10:20:00; the hooks, attached to
+    // check, see them still at it two seconds later.
+    h.come_back(at("10:20:00"));
+    assert_eq!(h.status(), TrackerStatus::Tracking);
+    assert_eq!(h.tracking_since(), Some(at("10:20:00")));
+}
+
+#[test]
+fn a_return_is_noticed_when_the_input_hooks_cannot_attach() {
+    for silently in [false, true] {
+        let mut h = tracking();
+        h.machine.input_at(at("10:02:00"));
+        h.tick(at("10:07:00"));
+        assert_eq!(h.status(), TrackerStatus::Away);
+        // Security software blocks the hooks from now on.
+        h.machine.block_hooks(silently);
+
+        h.machine.input_at(at("10:20:00"));
+        h.tick(at("10:20:01"));
+        assert_eq!(h.status(), TrackerStatus::Away, "silently {silently}: the hooks are asked for first");
+        assert!(!h.machine.is_input_running(), "silently {silently}: and do not attach");
+        // The user keeps working; the hooks never come. Windows' idle clock
+        // decides, as it does without input permission.
+        let mut when = at("10:20:01");
+        while h.status() == TrackerStatus::Away && when < at("10:21:00") {
+            when += TimeDelta::seconds(2);
+            h.machine.input_at(when - TimeDelta::seconds(1));
+            h.tick(when);
+        }
+        assert_eq!(h.status(), TrackerStatus::Tracking, "silently {silently}: not stuck away");
+        assert!(when <= at("10:20:01") + HOOKS_ATTACH_WAIT + TimeDelta::seconds(2), "silently {silently}: within {when}");
+        assert_eq!(h.tracking_since(), Some(at("10:20:00")), "silently {silently}: from when the idle clock first saw them");
+        if !silently {
+            assert_eq!(when, at("10:20:03"), "a reported failure: on the next tick");
+        }
+    }
 }
 
 #[test]
@@ -132,4 +213,35 @@ fn without_input_counts_time_is_still_recorded_and_idle_detection_works() {
         assert_eq!(h.tracking_since(), Some(at("10:30:00")));
         assert!(!h.machine.is_input_running());
     }
+}
+
+#[test]
+fn jiggling_the_hooks_rejected_is_not_work_once_input_counts_are_turned_off() {
+    let mut h = tracking();
+    h.machine.input_at(at("10:02:00"));
+    h.tick(at("10:07:00"));
+    assert_eq!(h.status(), TrackerStatus::Away);
+    let mut when = at("10:10:00");
+    while when < at("11:00:00") {
+        h.machine.injected_at(when);
+        when += TimeDelta::seconds(2);
+        h.tick(when);
+    }
+    assert_eq!(h.status(), TrackerStatus::Away);
+
+    // The admin stops recording keyboard and mouse: nothing can tell the
+    // jiggler apart any more, and the idle clock decides — from now, not
+    // from the jiggling the hooks saw through.
+    let no_input: Project = serde_json::from_value(serde_json::json!({
+        "id": "p1", "title": "Project p1", "intervalMinutes": 10,
+        "allowScreenshot": true, "allowWebcam": false, "allowKeyboard": false, "allowMouse": false,
+        "allowActiveWindow": true, "allowRunningPrograms": true, "idleThresholdMinutes": 5
+    }))
+    .unwrap();
+    h.worker.on_control(ControlEvent::Projects(vec![no_input]));
+    h.worker.publish();
+    h.machine.injected_at(when);
+    h.tick(when + TimeDelta::seconds(1));
+    assert_eq!(h.status(), TrackerStatus::Tracking);
+    assert_eq!(h.tracking_since(), Some(when), "not from 10:10, when the jiggling began");
 }

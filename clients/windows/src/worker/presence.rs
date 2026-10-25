@@ -3,7 +3,7 @@
 //! the screen lock, sleep and shutdown, and the clock tick that notices
 //! them.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use tokio::time::Instant;
 
 use crate::config::CapturePermissions;
@@ -20,6 +20,17 @@ use super::uploader::UploadCommand;
 use super::{
     Away, PendingPrompt, Worker, MAINTENANCE_EVERY, PROJECTS_REFRESH, RECONNECT_EVERY, TOTALS_EVERY, TOTALS_SPACING,
 };
+
+/// The input hooks confirm a return when they see the user's own input
+/// within this long of Windows' idle clock first moving: a tick (2 s) to
+/// notice it, up to 3 s to attach, a tick to look. Input the clock saw
+/// earlier than that was not confirmed (a jiggler, say) and is not work.
+pub(super) const CONFIRMED_WITHIN: TimeDelta = TimeDelta::seconds(10);
+
+/// Hooks asked for to confirm a return that are still not attached this
+/// long after the idle clock moved will not be soon (they back off for up
+/// to 5 minutes): the idle clock decides, as it does without them.
+pub(super) const HOOKS_ATTACH_WAIT: TimeDelta = TimeDelta::seconds(10);
 
 impl Worker {
     // ---- Tracking on or off ------------------------------------------------------
@@ -139,9 +150,12 @@ impl Worker {
     /// idle clock says first. It is also moved by mouse jigglers and remote
     /// tools, so when the project records input the hooks confirm it: they
     /// are attached (counting only, nothing else runs) and the user's own
-    /// next input ends the time away — where the idle clock first saw it.
-    /// Without input permission nothing can confirm it, and the idle clock
-    /// decides alone.
+    /// next input ends the time away. It ends where the idle clock first saw
+    /// input only when the hooks confirm it right after ([`CONFIRMED_WITHIN`]);
+    /// a jiggler that moved the clock long before the user came back gives
+    /// none of that time. Without input permission nothing can confirm it,
+    /// and the idle clock decides alone — as it does when the hooks cannot
+    /// attach ([`HOOKS_ATTACH_WAIT`]), or the user would stay away for good.
     pub(super) fn check_return(&mut self, now: DateTime<Utc>) {
         let Some((since, noticed)) = self.away.as_ref().map(|away| (away.since, away.noticed)) else {
             return;
@@ -152,16 +166,30 @@ impl Worker {
         let Some(seen) = self.machine.first_input_after(since, now) else {
             return;
         };
-        if self.hooks_confirm_return() && !self.machine.input_hooks_running() {
-            if noticed.is_none() {
+        // Where the idle clock first moved, if it was just now: earlier, the
+        // hooks were checking and the user was not back yet.
+        let first = noticed.filter(|noticed| seen - *noticed <= CONFIRMED_WITHIN);
+        if !self.hooks_confirm_return() {
+            self.come_back(first.map_or(seen, |noticed| noticed.min(seen)));
+            return;
+        }
+        if !self.machine.input_hooks_running() {
+            // `seen` is the idle clock's: the hooks are asked for to confirm it.
+            let Some(noticed) = noticed else {
                 tracing::debug!(%seen, "input while away; confirming it with the input hooks");
-            }
-            if let Some(away) = self.away.as_mut() {
-                away.noticed.get_or_insert(seen);
+                if let Some(away) = self.away.as_mut() {
+                    away.noticed = Some(seen);
+                }
+                return;
+            };
+            if self.machine.input_hooks_failed() || now - noticed >= HOOKS_ATTACH_WAIT {
+                tracing::warn!(%noticed, "the input hooks cannot attach to confirm the return; Windows' idle clock decides");
+                self.come_back(noticed.min(seen));
             }
             return;
         }
-        self.come_back(noticed.map_or(seen, |noticed| noticed.min(seen)));
+        // The hooks saw the user's own input at `seen`.
+        self.come_back(first.map_or(seen, |noticed| noticed.min(seen)));
     }
 
     /// Can the input hooks tell the user's own input from injected input on
