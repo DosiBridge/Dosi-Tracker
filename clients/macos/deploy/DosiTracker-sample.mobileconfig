@@ -1,0 +1,152 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  SAMPLE configuration profile for rolling Dosi Tracker out with an MDM
+  (Jamf, Intune, Kandji, Mosyle...). See clients/macos/README.md, "Deploying
+  with an MDM". Before using it:
+
+  * replace every TEAMID1234 with the Team ID of the Developer ID certificate
+    the app is signed with (build-app.sh prints the app's designated
+    requirement), and the example.com addresses with your own;
+  * give each payload a fresh PayloadUUID (uuidgen) and your own identifiers;
+  * deliver it through the MDM: privacy (PPPC) and managed login item payloads
+    take effect only from a user-approved or supervised MDM enrolment.
+
+  What it does:
+
+  * com.dosibridge.tracker: the server and dashboard addresses, as managed
+    preferences — the sign-in form then cannot change the server;
+  * PPPC: Accessibility (window titles) pre-approved; Screen Recording and
+    Input Monitoring cannot be pre-approved by Apple's rules, so standard users
+    are allowed to approve them themselves (no admin password). The camera
+    cannot be pre-approved at all;
+  * a managed login item, so "start at login" survives and cannot be switched
+    off in System Settings.
+
+  None of this replaces the user's own consent in the app: nothing is captured
+  until the user chooses what may be recorded on their Mac.
+-->
+<plist version="1.0">
+<dict>
+	<key>PayloadDisplayName</key>
+	<string>Dosi Tracker</string>
+	<key>PayloadDescription</key>
+	<string>Server address, privacy permissions and login item for Dosi Tracker.</string>
+	<key>PayloadIdentifier</key>
+	<string>com.example.dositracker</string>
+	<key>PayloadOrganization</key>
+	<string>Example Ltd</string>
+	<key>PayloadScope</key>
+	<string>System</string>
+	<key>PayloadType</key>
+	<string>Configuration</string>
+	<key>PayloadUUID</key>
+	<string>61D32A45-AF73-43D6-8577-1E85B49A22E4</string>
+	<key>PayloadVersion</key>
+	<integer>1</integer>
+	<key>PayloadContent</key>
+	<array>
+		<dict>
+			<key>PayloadDisplayName</key>
+			<string>Dosi Tracker settings</string>
+			<key>PayloadIdentifier</key>
+			<string>com.example.dositracker.preferences</string>
+			<key>PayloadType</key>
+			<string>com.dosibridge.tracker</string>
+			<key>PayloadUUID</key>
+			<string>8C9F91E9-EC4C-46DB-9BB0-C8BA3A77765C</string>
+			<key>PayloadVersion</key>
+			<integer>1</integer>
+			<key>DosiApiBaseURL</key>
+			<string>https://tracker-api.example.com</string>
+			<key>DosiDashboardURL</key>
+			<string>https://tracker.example.com</string>
+		</dict>
+		<dict>
+			<key>PayloadDisplayName</key>
+			<string>Dosi Tracker privacy permissions</string>
+			<key>PayloadIdentifier</key>
+			<string>com.example.dositracker.pppc</string>
+			<key>PayloadType</key>
+			<string>com.apple.TCC.configuration-profile-policy</string>
+			<key>PayloadUUID</key>
+			<string>D61C1067-525C-4D23-87E6-6E9A3FA68CC5</string>
+			<key>PayloadVersion</key>
+			<integer>1</integer>
+			<key>Services</key>
+			<dict>
+				<key>Accessibility</key>
+				<array>
+					<dict>
+						<key>Identifier</key>
+						<string>com.dosibridge.tracker</string>
+						<key>IdentifierType</key>
+						<string>bundleID</string>
+						<key>CodeRequirement</key>
+						<string>identifier "com.dosibridge.tracker" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = TEAMID1234</string>
+						<key>Authorization</key>
+						<string>Allow</string>
+						<key>Comment</key>
+						<string>Window titles of the app in front, when the project records them and the user consents.</string>
+					</dict>
+				</array>
+				<key>ScreenCapture</key>
+				<array>
+					<dict>
+						<key>Identifier</key>
+						<string>com.dosibridge.tracker</string>
+						<key>IdentifierType</key>
+						<string>bundleID</string>
+						<key>CodeRequirement</key>
+						<string>identifier "com.dosibridge.tracker" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = TEAMID1234</string>
+						<key>Authorization</key>
+						<string>AllowStandardUserToSetSystemService</string>
+						<key>Comment</key>
+						<string>One screenshot per block, when the project records them and the user consents.</string>
+					</dict>
+				</array>
+				<key>ListenEvent</key>
+				<array>
+					<dict>
+						<key>Identifier</key>
+						<string>com.dosibridge.tracker</string>
+						<key>IdentifierType</key>
+						<string>bundleID</string>
+						<key>CodeRequirement</key>
+						<string>identifier "com.dosibridge.tracker" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = TEAMID1234</string>
+						<key>Authorization</key>
+						<string>AllowStandardUserToSetSystemService</string>
+						<key>Comment</key>
+						<string>Keyboard and mouse counts (never what is typed), when the project records them and the user consents.</string>
+					</dict>
+				</array>
+			</dict>
+		</dict>
+		<dict>
+			<key>PayloadDisplayName</key>
+			<string>Dosi Tracker login item</string>
+			<key>PayloadIdentifier</key>
+			<string>com.example.dositracker.loginitem</string>
+			<key>PayloadType</key>
+			<string>com.apple.servicemanagement</string>
+			<key>PayloadUUID</key>
+			<string>073B36AE-DFFB-441B-9CBF-C66CB58BFBFF</string>
+			<key>PayloadVersion</key>
+			<integer>1</integer>
+			<key>Rules</key>
+			<array>
+				<dict>
+					<key>RuleType</key>
+					<string>BundleIdentifier</string>
+					<key>RuleValue</key>
+					<string>com.dosibridge.tracker</string>
+					<key>TeamIdentifier</key>
+					<string>TEAMID1234</string>
+					<key>Comment</key>
+					<string>Dosi Tracker starts at login.</string>
+				</dict>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>

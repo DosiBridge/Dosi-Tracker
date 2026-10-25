@@ -55,3 +55,23 @@ jobs:
         env:
           BUILD_NUMBER: '0'
         run: bash scripts/build-app.sh
+
+      - name: Release outputs
+        run: |
+          set -euo pipefail
+          test -f .build/dist/DosiTracker-macos.zip
+          (cd .build/dist && shasum -a 256 -c SHA256SUMS)
+          plist=".build/dist/Dosi Tracker.app/Contents/Info.plist"
+          if /usr/libexec/PlistBuddy -c 'Print :DosiApiBaseURL' "$plist" 2>/dev/null; then
+            echo "::error::a server address was baked into the bundle"; exit 1
+          fi
+          plan="$(GITHUB_REF=refs/tags/v9.8.7 bash scripts/build-app.sh --plan)"
+          [[ "$plan" == *"version        9.8.7 (build"* ]] || { echo "::error::the tag does not set the version"; exit 1; }
+          if DEVELOPER_ID_P12_BASE64=x bash scripts/build-app.sh --plan; then
+            echo "::error::half-configured signing must fail"; exit 1
+          fi
+          if CODESIGN_IDENTITY='Developer ID Application: X (T)' DOSI_API_BASE_URL=https://localhost:6006 \
+            bash scripts/build-app.sh --plan; then
+            echo "::error::a Developer ID build must refuse a local server"; exit 1
+          fi
+          plutil -lint deploy/DosiTracker-sample.mobileconfig
