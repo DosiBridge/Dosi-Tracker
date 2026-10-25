@@ -7,9 +7,20 @@
 ;     so a machine-wide service would not work anyway.
 ;
 ; Build:  makensis /DVERSION=0.1.0 dosi-tracker.nsi
-;         (CI passes the version from Cargo.toml; VERSION_NUMERIC is the same
-;         without a pre-release suffix, for the Windows version resource.)
+;         (CI passes the agent's version; VERSION_NUMERIC is the same without
+;         a pre-release suffix, for the Windows version resource, and
+;         BUILD_NUMBER its fourth number.) Without them the version comes from
+;         the program's own version resource (build.rs), and given ones must
+;         match it.
+;         /DOUTFILE=<name> names the setup file (default
+;         dosi-tracker-setup-<VERSION>.exe).
 ; Expects the release binary at ..\target\release\dosi-tracker.exe
+;
+; Code signing: when a signing certificate is configured in the environment
+; (DOSI_SIGN_PFX, DOSI_SIGN_CERT_SHA1 or DOSI_SIGN_DLIB; see sign.ps1), the
+; program (in place, before it is packed), the uninstaller and the setup file
+; are Authenticode-signed with a timestamp, and the build fails if signing
+; fails. Without one, nothing is signed (and PowerShell is not needed).
 ;
 ; Command line (also with /S for a silent install):
 ;   /SERVER=<url>      the server address the agent signs in to; written to
@@ -34,11 +45,24 @@
 ; so tracked time not uploaded yet is never lost by accident. /KEEPDATA wins
 ; over /PURGE.
 
+; The program's version resource: MAJOR.MINOR.PATCH.BUILD as EXE_V_1..4.
+!getdllversion "${__FILEDIR__}\..\target\release\dosi-tracker.exe" EXE_V_
 !ifndef VERSION
-  !define VERSION "0.1.0"
+  !define VERSION "${EXE_V_1}.${EXE_V_2}.${EXE_V_3}"
 !endif
 !ifndef VERSION_NUMERIC
   !define VERSION_NUMERIC "${VERSION}"
+!endif
+!ifndef BUILD_NUMBER
+  !define BUILD_NUMBER "${EXE_V_4}"
+!endif
+; A setup labelled with another version than the program it carries would
+; mislead support and the upgrade logic.
+!if "${VERSION_NUMERIC}.${BUILD_NUMBER}" != "${EXE_V_1}.${EXE_V_2}.${EXE_V_3}.${EXE_V_4}"
+  !error "VERSION ${VERSION_NUMERIC}.${BUILD_NUMBER} does not match dosi-tracker.exe's ${EXE_V_1}.${EXE_V_2}.${EXE_V_3}.${EXE_V_4}: build both with the same DOSI_VERSION and DOSI_BUILD_NUMBER"
+!endif
+!ifndef OUTFILE
+  !define OUTFILE "dosi-tracker-setup-${VERSION}.exe"
 !endif
 
 !define APP_NAME    "Dosi Tracker"
@@ -52,7 +76,7 @@
 !define MUTEX_NAME  "Local\DosiTracker.SingleInstance"
 
 Name "${APP_NAME}"
-OutFile "dosi-tracker-setup-${VERSION}.exe"
+OutFile "${OUTFILE}"
 Unicode True
 RequestExecutionLevel user               ; per-user: never prompts for UAC
 InstallDir "$LOCALAPPDATA\Programs\DosiTracker"
@@ -60,13 +84,35 @@ InstallDirRegKey HKCU "Software\DosiTracker" "InstallDir"
 ShowInstDetails show
 ShowUnInstDetails show
 
-VIProductVersion "${VERSION_NUMERIC}.0"
+VIProductVersion "${VERSION_NUMERIC}.${BUILD_NUMBER}"
 VIAddVersionKey "ProductName"    "${APP_NAME}"
 VIAddVersionKey "CompanyName"    "${COMPANY}"
 VIAddVersionKey "FileDescription" "${APP_NAME} activity agent"
 VIAddVersionKey "FileVersion"    "${VERSION}"
 VIAddVersionKey "ProductVersion" "${VERSION}"
 VIAddVersionKey "LegalCopyright" "MIT"
+
+; Authenticode signing, only with a certificate in the environment (an unset
+; variable stays as the literal "$%NAME%" here).
+!macro _SignWhenSet NAME
+  !searchparse /noerrors "$%${NAME}%" "$%" _UNSET_${NAME}
+  !ifndef _UNSET_${NAME}
+    !if "$%${NAME}%" != ""
+      !define /ifndef SIGN
+    !endif
+  !endif
+!macroend
+!insertmacro _SignWhenSet DOSI_SIGN_PFX
+!insertmacro _SignWhenSet DOSI_SIGN_CERT_SHA1
+!insertmacro _SignWhenSet DOSI_SIGN_DLIB
+!ifdef SIGN
+  !define SIGN_CMD 'powershell -NoProfile -ExecutionPolicy Bypass -File "${__FILEDIR__}\sign.ps1"'
+  ; The program first, before File packs it.
+  !system '${SIGN_CMD} "${__FILEDIR__}\..\target\release\${EXE_NAME}"' = 0
+  ; The uninstaller as it is written into the setup, and the setup itself.
+  !uninstfinalize '${SIGN_CMD} "%1"' = 0
+  !finalize '${SIGN_CMD} "%1"' = 0
+!endif
 
 !include "MUI2.nsh"
 !include "FileFunc.nsh"
