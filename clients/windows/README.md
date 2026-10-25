@@ -16,8 +16,11 @@ shows the timer, what was recorded, and what your workspace captures.
 1. Download `dosi-tracker-setup-<version>.exe` (CI builds it on every push).
 2. Run it. It installs **for your Windows user only** — no administrator rights —
    to `%LOCALAPPDATA%\Programs\DosiTracker`, adds a Start menu shortcut, and
-   (on a first install) starts Dosi Tracker when you sign in to Windows. If SmartScreen says
-   *Windows protected your PC*, choose **More info → Run anyway**.
+   (on a first install) starts Dosi Tracker when you sign in to Windows. Builds
+   are code-signed only where a signing certificate is configured (see
+   [The installer](#the-installer)); for an unsigned build SmartScreen may say
+   *Windows protected your PC* — check where the file came from, then choose
+   **More info → Run anyway**.
 3. Sign in (below).
 
 Admins can deploy it silently and point it at their server, so nobody has to
@@ -413,9 +416,12 @@ signs in. Another account's blocks are kept 14 days for it.
 
 ### Prerequisites
 
-- **Rust** — `winget install Rustlang.Rustup` (or https://rustup.rs)
+- **Rust** — `winget install Rustlang.Rustup` (or https://rustup.rs). The
+  toolchain is pinned in `rust-toolchain.toml` (rustc 1.97.1 with clippy);
+  rustup installs and uses it by itself inside `clients/windows`.
 - **MSVC C++ build tools + Windows SDK** — needed by the `windows`, `rusqlite`
-  (bundled SQLite) and `nokhwa` crates:
+  (bundled SQLite) and `nokhwa` crates, and the SDK's `rc.exe` by `build.rs`
+  (set `RC_PATH` if it is somewhere unusual):
   ```powershell
   winget install --id Microsoft.VisualStudio.2022.BuildTools `
     --override "--quiet --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
@@ -428,21 +434,65 @@ signs in. Another account's blocks are kept 14 days for it.
 cd clients/windows
 copy config.example.toml config.toml   # optional: point it at your server
 cargo run                              # or cargo run --release
-cargo test
-cargo clippy --all-targets -- -D warnings   # CI enforces this
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings   # CI enforces this
 ```
+
+### Versions
+
+`build.rs` stamps the version into the program: the `agentVersion` every block
+and heartbeat carries (also shown in the window's footer and *Help & support*,
+and sent in the HTTP user agent), and a Windows **version resource** (Explorer's
+*Properties → Details*) with an **application manifest** (`asInvoker`, Windows
+10/11, per-monitor DPI awareness, Common Controls 6;
+`build-support/dosi-tracker.exe.manifest`). The rules are in
+`build-support/version.rs` and tested with the crate:
+
+| Variable | Effect |
+|---|---|
+| — | The version is `Cargo.toml`'s (`0.1.0`). |
+| `DOSI_VERSION` | The release version instead, e.g. from a tag (`v1.2.3` → `1.2.3`; a pre-release such as `1.2.3-rc.1` is fine). |
+| `DOSI_GIT_SHA` (else `GITHUB_SHA`) | The commit, appended as build metadata: `1.2.3+0123456789ab` (cut to 7 digits if the whole would pass the server's 32 characters). |
+| `DOSI_BUILD_NUMBER` | The resource's fourth number (`1.2.3.417`), e.g. CI's run number; 0 by default. |
+
+A version that a version resource cannot hold (not `MAJOR.MINOR.PATCH`, a part
+above 65535) or a commit that is not hex fails the build rather than ship a
+wrong label.
 
 ### The installer
 
 ```powershell
-cargo build --release
+cargo build --locked --release
 cd installer
 makensis /DVERSION=0.1.0 dosi-tracker.nsi   # -> dosi-tracker-setup-0.1.0.exe
 ```
 
-CI takes the version from `Cargo.toml`, builds the installer on every push and
-uploads it as a workflow artifact. Without Windows, `makensis` from the Linux
-`nsis` package builds the same installer (CI uses the Windows build of NSIS).
+Without `/DVERSION` the installer takes the version from the program's version
+resource; with it (CI passes the release version, `VERSION_NUMERIC` without a
+pre-release suffix, and `BUILD_NUMBER`) the numbers must match the program's or
+the build stops. `/DOUTFILE=dosi-tracker-setup.exe` writes the setup under
+another name (the version-less release asset). CI builds the installer on every
+push and uploads it as a workflow artifact. Without Windows, `makensis` from the
+Linux `nsis` package builds the same unsigned installer (CI uses the Windows
+build of NSIS).
+
+**Code signing.** When a certificate is configured in the environment, the
+installer build Authenticode-signs (SHA-256, RFC 3161 timestamp) the program —
+in `target\release`, before packing it — the uninstaller and the setup file,
+with `installer\sign.ps1` and the Windows SDK's `signtool`. Any one of these
+turns it on; a configuration that is set but does not work fails the build:
+
+| Variable | Certificate |
+|---|---|
+| `DOSI_SIGN_PFX` (+ `DOSI_SIGN_PFX_PASSWORD`) | a `.pfx` file |
+| `DOSI_SIGN_CERT_SHA1` | the thumbprint of a certificate in the Windows certificate store (a hardware token, a cloud HSM) |
+| `DOSI_SIGN_DLIB` + `DOSI_SIGN_DMDF` | a signtool dlib and its metadata file, e.g. Azure Trusted Signing |
+| `DOSI_SIGN_TIMESTAMP_URL` | the timestamp server (default `http://timestamp.digicert.com`) |
+| `DOSI_SIGNTOOL` | `signtool.exe` (default: on `PATH`, else the newest Windows SDK's) |
+
+Without any of them nothing is signed. Keep the certificate and its password
+in CI secrets, never in the repository. `sign.ps1 <file>` also signs a single
+file by hand.
 
 Things to check by hand on a test machine after changing it (they need a real
 Windows session): a first install turns *Start with Windows* on; turning it off
@@ -478,48 +528,98 @@ A debug build can also sign in by itself for end-to-end runs:
 | Part | Owns |
 |------|------|
 | UI thread | the egui window and the tray icon; renders a cheap state snapshot (`state::SharedState`) and sends commands (`state::Command`) |
-| Worker thread (`worker.rs`) | when blocks start and end — from commands, session and power events, input and the clocks — and queues them locally; never waits on the network |
+| Worker thread (`worker.rs` + `worker/`) | when blocks start and end — from commands, session and power events, input and the clocks — and queues them locally; never waits on the network |
 | Control task (`worker/control.rs`) | sign-in, the project list, presence, totals |
 | Uploader thread (`worker/uploader.rs`) | drains the queue with its own connection to it |
 | Session events (`session_events.rs`) | a hidden window hearing lock/unlock, sleep/resume and shutdown |
 | Input hooks (`tracking/input.rs`) | low-level keyboard/mouse hooks that only timestamp events, with a watchdog |
 
+Large modules are a folder: the parent file keeps the type and its core, and
+each concern is a file beside it (methods of the same type, `pub(super)` to its
+siblings). Tests live in a `tests.rs` (or `tests/`) next to the code they test.
+
 ```
+build.rs                 # version (agentVersion), version resource + manifest
+build-support/
+├── version.rs           # the version rules (shared with the crate's tests)
+└── dosi-tracker.exe.manifest
+rust-toolchain.toml      # the pinned toolchain
+installer/
+├── dosi-tracker.nsi     # the per-user NSIS installer
+└── sign.ps1             # Authenticode signing, when a certificate is configured
 src/
 ├── main.rs              # entry: window options, wiring, --quit, UI preview seed
 ├── ui/
-│   ├── mod.rs           # TrackerApp: window behaviour, tray events, notices, layout
+│   ├── mod.rs           # TrackerApp: state, the frame loop (logic / ui)
+│   ├── window.rs        # show / hide / quit, tray events and retry, notices
+│   ├── layout.rs        # header, tabs, footer; shared layout pieces
 │   ├── login.rs         # sign-in, server address (Advanced), sign-in expired
 │   ├── timer.rs         # Timer tab, project chooser, task note, time-away question
 │   ├── activity.rs      # Activity tab (blocks, upload status, server reasons)
 │   ├── settings.rs      # Settings tab (privacy, this device, account)
 │   ├── alerts.rs        # what needs attention (banners), decided from the state
 │   ├── preview.rs       # debug-only preview scenes
+│   ├── consent.rs       # the local consent card
 │   ├── widgets.rs       # painted icons, buttons, toggles, callouts, charts
-│   └── format.rs        # shared formatting (clock, durations, app names)
+│   ├── format.rs        # shared formatting (clock, durations, app names)
+│   └── tests.rs
 ├── tray.rs              # tray icon: badge, tooltip, menu, notifications
 ├── theme.rs             # palette (web design tokens) + Segoe UI fonts
 ├── prefs.rs             # local preferences
-├── worker.rs            # the worker loop (+ worker/: blocks, session, control, uploader)
+├── worker.rs            # the worker loop, the Worker state and its start
+├── worker/
+│   ├── machine.rs       # Machine: what the worker asks of the computer
+│   ├── account.rs       # Account; sign in / out, expired, removed computer, saved sign-in
+│   ├── workspaces.rs    # choosing, switching and losing the workspace
+│   ├── projects.rs      # the tracked project and its policy
+│   ├── presence.rs      # tracking on/off, idle and return, breaks, lock, sleep, the tick
+│   ├── recording.rs     # finished blocks built and queued
+│   ├── queue.rs         # queue upkeep and the window's queue lists
+│   ├── consent.rs       # local consent changes
+│   ├── commands.rs      # the window's commands (pause, sync, task note, quit)
+│   ├── events.rs        # what the control task and the uploader report
+│   ├── publish.rs       # the window's view, presence heartbeats
+│   ├── calendar.rs      # local days and weeks for the totals
+│   ├── blocks.rs        # the block clock: interval cuts, idle cuts, capture moment
+│   ├── session.rs       # project choice, policy, status rules
+│   ├── control.rs       # control task: sign-in, projects, presence, totals
+│   ├── uploader.rs      # uploader thread
+│   └── tests/           # fake machine + harness (mod.rs), tests by concern
 ├── state.rs             # shared snapshot + commands
 ├── session_events.rs    # lock / sleep / shutdown events
 ├── power.rs             # awake-time clock (missed-suspend detection)
 ├── single_instance.rs   # one agent per user; --quit and "show" signals
 ├── shell.rs             # folders, opening URLs, work area, window visibility
-├── credentials.rs       # DPAPI-encrypted sign-in
+├── credentials.rs       # DPAPI-encrypted sign-in (refresh token only)
+├── dpapi.rs             # DPAPI protect / unprotect
+├── fsutil.rs            # write-then-rename for every saved file
+├── signing.rs           # the device key for the local payload tag
 ├── autostart.rs         # "Start with Windows" (HKCU Run key, --autostart)
 ├── config.rs            # config.toml + DOSI__* env vars, server address rules
 ├── model.rs             # wire types (Project, Activity, Heartbeat, …)
-├── api.rs               # REST client: token, projects, upload, presence, totals
-├── storage.rs           # the offline SQLite queue
+├── api.rs               # REST client: projects, upload, presence, totals
+├── api/
+│   ├── tokens.rs        # token grants, the shared token, revocation
+│   ├── errors.rs        # error types; how failed answers are classified
+│   ├── clock.rs         # server clock (Date header), Retry-After
+│   └── tests.rs
+├── storage.rs           # the offline SQLite queue: rows
+├── storage/
+│   ├── open.rs          # schema, migrations, vacuum, a damaged queue moved aside
+│   ├── limits.rs        # image / row bounds, purges, space reclaimed
+│   └── tests.rs
 └── tracking/
-    ├── mod.rs           # Tracker: builds a block's upload
+    ├── mod.rs           # Tracker: sensors, capability generations, snapshots
+    ├── acquisition.rs   # screen / webcam / window / programs boundary (+ test fake)
+    ├── payload.rs       # a block's upload payload, kept idle blocks
+    ├── lifecycle.rs     # sensor drivers (native + fake)
     ├── input.rs         # input hooks, activity %, idle
     ├── usage.rs         # foreground-window usage, per-minute timeline
     ├── screenshot.rs    # foreground-monitor JPEG capture, thumbnail, blur
     ├── webcam.rs        # one webcam photo, with warm-up and timeout
     ├── active_window.rs # foreground window, running programs
-    └── system.rs        # device id, computer name, Windows version, time zone
+    ├── system.rs        # device id, computer name, Windows version, time zone
+    └── tests.rs
 ```
 
 ## Known gaps
@@ -531,8 +631,14 @@ src/
 - Sign-in is the OpenIddict password grant: an account that requires
   single sign-on or multi-factor sign-in cannot sign in from the agent yet
   (that needs the browser-based authorization-code flow).
-- Builds are not code-signed yet, and the per-block `payloadSignature` is a
-  local tag the server does not verify (no tamper protection).
+- Builds are code-signed only where a signing certificate is configured
+  ([The installer](#the-installer)); without one, Defender SmartScreen and
+  managed-fleet policies (WDAC, AppLocker) may warn about or block the agent.
+  The per-block `payloadSignature` is a local tag the server does not verify
+  (no tamper protection).
+- The window and tray icons are drawn at run time; the `.exe` file itself has
+  no icon resource yet, so Explorer, the Start menu shortcut and *Installed
+  apps* show Windows' default program icon.
 - Autostart uses the per-user Run key, not a Windows service: capture needs the
   user's interactive session, which a session-0 service cannot reach.
 - Input to apps running as administrator is not counted (see Troubleshooting).
