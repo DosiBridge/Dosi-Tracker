@@ -16,7 +16,9 @@ import Foundation
 // user's rows go up workspace by workspace — the current one first, then any
 // left from workspaces tracked in before — each with its own `X-Workspace-Id`.
 // A workspace the server no longer lets this user (or this Mac) into is left
-// alone for the rest of the sign-in: its rows wait.
+// alone for the rest of the sign-in: its rows wait. Waits are kept per
+// workspace: one whose subscription lapsed, or whose answers back off, never
+// holds back the rows of another.
 
 /// A workspace whose rows are uploaded: the queue owner and the workspace
 /// GUID its rows go to.
@@ -82,11 +84,13 @@ actor UploadLoop {
     private var user: UploadUser?
     /// Workspaces the server refused for good during this sign-in.
     private var blocked: Set<String> = []
-    /// Consecutive failed passes that back off (a success resets it).
-    private var backoffFailures = 0
-    /// No pass before this (a back-off, an inactive subscription, a clock
-    /// ahead of the server's).
-    private var notBefore: Date?
+    /// Per queue owner: consecutive failed passes that back off (a success
+    /// resets it).
+    private var backoffFailures: [String: Int] = [:]
+    /// Per queue owner: no pass before this (a back-off, an inactive
+    /// subscription, a clock ahead of the server's). The other workspaces
+    /// carry on meanwhile.
+    private var notBefore: [String: Date] = [:]
     private var passTask: Task<Void, Never>?
     private var wakeTask: Task<Void, Never>?
     /// A running pass stops before its next upload once this has passed.
@@ -126,7 +130,7 @@ actor UploadLoop {
         stopped = true
         wakeTask?.cancel()
         wakeTask = nil
-        notBefore = nil
+        notBefore = [:]
         passDeadline = min(passDeadline ?? limit, limit)
         if let running = passTask {
             await running.value
@@ -161,7 +165,7 @@ actor UploadLoop {
         case .rowsQueued:
             kick()
         case .now:
-            notBefore = nil
+            notBefore = [:]
             kick()
         case .signOut(let leaving, let until):
             beginSignOut(leaving, until: until)
@@ -176,7 +180,7 @@ actor UploadLoop {
         }
         if changed {
             signingOutUser = nil
-            backoffFailures = 0
+            backoffFailures = [:]
             blocked = []
         }
         if let current = newUser?.current {
@@ -185,7 +189,7 @@ actor UploadLoop {
         }
         client = newClient
         user = newUser
-        notBefore = nil
+        notBefore = [:]
         kick()
     }
 
@@ -193,7 +197,7 @@ actor UploadLoop {
         guard let current = user, current.username == leaving, client != nil else { return }
         signingOutUser = leaving
         // The last pass ignores the back-off.
-        notBefore = nil
+        notBefore = [:]
         passDeadline = until
         if passTask != nil {
             again = true
@@ -212,11 +216,11 @@ actor UploadLoop {
             again = true
             return
         }
-        if let waitUntil = notBefore, waitUntil > now() {
-            scheduleWake(at: waitUntil)
+        guard readyCount() > 0 else {
+            // Every workspace with rows waits: come back for the first.
+            scheduleNextWake()
             return
         }
-        guard pendingCount() > 0 else { return }
         startPasses()
     }
 
@@ -249,21 +253,22 @@ actor UploadLoop {
         }
         signingOutUser = nil
         passDeadline = nil
-        if let waitUntil = notBefore, pendingCount() > 0 {
-            scheduleWake(at: waitUntil)
-        }
+        scheduleNextWake()
     }
 
     /// One `SyncPass` per workspace of the current user, the current one
-    /// first. Returns whether another pass should follow at once (a pass
-    /// reached its upload limit with rows left and nothing to wait for).
+    /// first; a workspace still waiting out its own back-off is skipped.
+    /// Returns whether another pass should follow at once (a pass reached its
+    /// upload limit with rows left and nothing to wait for).
     private func runOnePass() async -> Bool {
         guard let passClient = client, let passUser = user else { return false }
         var more = false
-        for scope in uploadScopes() {
+        for scope in uploadScopes() where !isWaiting(scope.owner) {
             switch await runPass(scope, client: passClient, user: passUser) {
             case .next(let unfinished):
                 more = more || unfinished
+            case .wait:
+                break
             case .stop:
                 return false
             }
@@ -280,8 +285,10 @@ actor UploadLoop {
         /// Go on with the next workspace (`unfinished`: rows are left that
         /// the next pass can take at once).
         case next(unfinished: Bool)
-        /// Nothing more in this round (a back-off, an expired sign-in, the
-        /// account gone).
+        /// This workspace waits out its own back-off; the others go on.
+        case wait
+        /// Nothing more in this round (the deadline passed, an expired
+        /// sign-in, the account gone).
         case stop
     }
 
@@ -327,7 +334,7 @@ actor UploadLoop {
             return .stop
         }
         if !report.uploaded.isEmpty {
-            backoffFailures = 0
+            backoffFailures[scope.owner] = nil
         }
         let cutShort = isPastDeadline()
         var issue: UploadIssue?
@@ -341,16 +348,18 @@ actor UploadLoop {
                 // same rows back to back. Back off instead.
                 CoreLog.warning("upload", "the pass removed no rows from the queue; backing off")
                 unfinished = false
-                issue = schedule(RetryPlan(reason: .unexpectedResponse(status: 0)))
-                end = .stop
+                issue = schedule(RetryPlan(reason: .unexpectedResponse(status: 0)), for: scope.owner)
+                end = .wait
             } else {
                 end = .next(unfinished: unfinished)
             }
         case .some(.retry(let plan)):
-            if !cutShort {
-                issue = schedule(plan)
+            if cutShort {
+                end = .stop
+            } else {
+                issue = schedule(plan, for: scope.owner)
+                end = .wait
             }
-            end = .stop
         case .some(.signInExpired(let rejection)):
             dropAccount()
             await sink(.signInExpired(owner: scope.owner, rejection))
@@ -358,9 +367,9 @@ actor UploadLoop {
         case .some(.queueError(let message)):
             CoreLog.error("upload", "could not read the local queue: \(message)")
             let next = now().addingTimeInterval(UploadLoop.queueRetry)
-            notBefore = next
+            notBefore[scope.owner] = next
             issue = .queueUnreadable(nextAttemptAt: next)
-            end = .stop
+            end = .wait
         case .some(.accessLost(let loss)):
             CoreLog.warning("upload", "the server refused this workspace's uploads (\(loss.kind.rawValue)); its rows wait")
             blocked.insert(scope.owner)
@@ -375,8 +384,9 @@ actor UploadLoop {
         return end
     }
 
-    /// Keep the rest queued and come back after the plan's wait (CONTRACT §1).
-    private func schedule(_ plan: RetryPlan) -> UploadIssue {
+    /// Keep the rest of `owner`'s rows queued and come back for them after
+    /// the plan's wait (CONTRACT §1). The other workspaces do not wait.
+    private func schedule(_ plan: RetryPlan, for owner: String) -> UploadIssue {
         let delay: TimeInterval
         let issue: (Date) -> UploadIssue
         switch plan.reason {
@@ -387,16 +397,17 @@ actor UploadLoop {
             delay = plan.after ?? UploadPolicy.clockAheadRetry
             issue = { .clockAhead(nextAttemptAt: $0) }
         default:
-            backoffFailures += 1
-            let step = UploadBackoff.delay(afterConsecutiveFailures: backoffFailures)
+            let failures = (backoffFailures[owner] ?? 0) + 1
+            backoffFailures[owner] = failures
+            let step = UploadBackoff.delay(afterConsecutiveFailures: failures)
             // Never sooner than the server asked, even beyond the cap.
             delay = max(step, plan.after ?? 0)
             let reason = plan.reason.userMessage
             issue = { .retrying(nextAttemptAt: $0, reason: reason) }
         }
         let next = now().addingTimeInterval(delay)
-        notBefore = next
-        CoreLog.warning("upload", "uploads wait \(Int(delay)) s: \(plan.reason.userMessage)")
+        notBefore[owner] = next
+        CoreLog.warning("upload", "a workspace's uploads wait \(Int(delay)) s: \(plan.reason.userMessage)")
         return issue(next)
     }
 
@@ -426,15 +437,36 @@ actor UploadLoop {
 
     private func isReady() -> Bool {
         guard !stopped, client != nil, user != nil, !isPastDeadline() else { return false }
-        if let waitUntil = notBefore, waitUntil > now() {
-            return false
-        }
-        return pendingCount() > 0
+        return readyCount() > 0
+    }
+
+    /// Whether `owner`'s rows still wait out a back-off.
+    private func isWaiting(_ owner: String) -> Bool {
+        guard let waitUntil = notBefore[owner] else { return false }
+        return waitUntil > now()
     }
 
     /// Rows waiting in every workspace that takes uploads now.
     private func pendingCount() -> Int {
         uploadScopes().reduce(0) { $0 + pendingCount($1.owner) }
+    }
+
+    /// Rows that can go up at once: those of the workspaces not waiting.
+    private func readyCount() -> Int {
+        uploadScopes().filter { !isWaiting($0.owner) }.reduce(0) { $0 + pendingCount($1.owner) }
+    }
+
+    /// Wake up when the first waiting workspace with rows may upload again
+    /// (none waits with rows: no wake).
+    private func scheduleNextWake() {
+        guard !stopped, client != nil, user != nil else { return }
+        let deadlines = uploadScopes().compactMap { scope -> Date? in
+            guard isWaiting(scope.owner), pendingCount(scope.owner) > 0 else { return nil }
+            return notBefore[scope.owner]
+        }
+        if let first = deadlines.min() {
+            scheduleWake(at: first)
+        }
     }
 
     private func pendingCount(_ owner: String) -> Int {
@@ -444,8 +476,8 @@ actor UploadLoop {
     private func dropAccount() {
         client = nil
         user = nil
-        notBefore = nil
-        backoffFailures = 0
+        notBefore = [:]
+        backoffFailures = [:]
         blocked = []
         wakeTask?.cancel()
         wakeTask = nil

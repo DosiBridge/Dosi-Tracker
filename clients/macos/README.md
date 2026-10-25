@@ -84,7 +84,9 @@ The server can also end tracking on this Mac for good:
   once, the saved sign-in is forgotten, and signing in again works only once
   the administrator restores the device.
 - **No longer a member / workspace archived** — tracking (and the presence
-  heartbeat) stops in that workspace and you are asked to choose another one.
+  heartbeat) stops in that workspace and you are asked to choose another one —
+  even when only one is left, the agent never moves you there by itself, and a
+  relaunch or signing in again asks as well until you have chosen.
 
 Either way the blocks already recorded stay in the local queue; they upload if
 access comes back, and expire after 14 days otherwise.
@@ -450,7 +452,9 @@ It talks to the backend as every agent does (the cross-agent contract):
   subscription retries hourly; a clock ahead of the server retries every 5 min;
   oversized captures are stripped and the block resent; a project you left or
   that was archived is checked against the project list; definitive refusals are
-  kept as *rejected* with the server's reason.
+  kept as *rejected* with the server's reason. Each workspace waits on its own:
+  blocks left from a workspace whose subscription lapsed never delay the
+  current workspace's uploads (and only the current workspace's wait is shown).
 - **Presence** — `POST /api/app/presence/heartbeat` every minute and on every
   change (tracking, paused, break, idle, locked, choosing, signed out, stopped).
 - **Totals** — `GET /api/app/reporting/summary` per local day, in your time zone.
