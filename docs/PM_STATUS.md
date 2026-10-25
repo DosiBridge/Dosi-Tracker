@@ -3162,3 +3162,78 @@ During independent native CI execution on `mh-ubuntu` on commit `9a5c2adc77f6a57
 - **Phase 1 Status**: **DELIVERED & VERIFIED IN ISOLATED FIXTURES; NATIVE RUNNER QA PENDING FOR TRANSPORT SCOPE BINDING REVISION**.
 - **Production Readiness Claim**: None. This delivery completes Phase 1 identity, transport scope binding, signing, expiry boundaries, and CLI JSON contracts. Capture adapters (Phase 2), automated capture worker scheduler loops (Phase 3), and package distribution (Phase 4) remain open and unstarted.
 
+---
+
+## 36. Linux Desktop Agent Phase 2: Native Consent-Gated Capture Adapters First Bounded Slice (TASK phase2-native-adapters-20261025)
+
+> **Execution Date:** October 25, 2026  
+> **Phase Task ID:** `TASK phase2-native-adapters-20261025`  
+> **Status:** First Bounded Slice Delivered; Verified in Isolated Fixtures on Windows Worker; Native Linux QA Pending on `mh-ubuntu`  
+> **Target Package:** `clients/linux` (Crate: `dosi-tracker-linux` v0.1.0)  
+
+### A. Context & Bounded Implementation Scope
+Under direct user instruction ("start phase 2 quick"), implementation sequencing shifted to Phase 2 native capture adapters while strictly preserving Phase 1 identity, transport scope binding, token expiry, signing, and CLI JSON contracts. The first bounded production slice delivers native consent-gated Linux capture adapters with fakeable traits and providers matching Windows architecture, scoped strictly to:
+1. **X11 Active Window Detection via EWMH & WM_CLASS** (`tracking/x11.rs`):
+   - Reads `_NET_ACTIVE_WINDOW` on the root window; handles unfocused state (`_NET_ACTIVE_WINDOW = 0` or `None`) truthfully without synthetic telemetry.
+   - Extracts UTF-8 window titles via `_NET_WM_NAME`, falling back to `WM_NAME`.
+   - Resolves owning process ID via `_NET_WM_PID`, mapped through `/proc/[pid]/exe` to executable name, falling back to `WM_CLASS` class name or instance name.
+   - Injectable `X11PropertyReader` abstraction seam with `SysX11PropertyReader` (system display reader) and `MockX11PropertyReader` (in-memory property simulator for deterministic testing).
+2. **User-Space `/proc` Running-Apps Inventory Provider** (`tracking/procfs.rs`):
+   - Enumerates user-space processes via `/proc/[pid]` without requiring `root` or `sudo` escalation.
+   - Resolves executable binary paths prioritizing `/proc/[pid]/exe` symlinks, falling back to `/proc/[pid]/cmdline` `argv[0]` and `/proc/[pid]/comm`.
+   - Resilient error handling: processes exiting mid-enumeration (`ENOENT`) are gracefully ignored rather than aborting the scan.
+   - Injectable `ProcFsReader` seam with `SysProcFsReader` and `MockProcFsReader` enabling deterministic cross-platform unit testing.
+3. **Backend-Compatible Context Mapping & Pure Filename Aggregation** (`tracking/model.rs`):
+   - Data model `WindowInfo` matching Windows and backend `WindowInfoDto` (`appName`, `windowTitle`, optional `seconds`, `keyboardHits`, `mouseClicks`).
+   - Pure executable filename extraction (`file_name`) normalizing `/usr/bin/code` → `code`.
+   - Dedicated Linux kernel thread detection (`is_kernel_thread`) filtering bracketed worker threads (`[kworker/...]`, `[migration/...]`).
+   - First-seen order case-insensitive deduplication via `program_list`, capped at server boundary `MAX_RUNNING_PROGRAMS = 200`.
+   - Privacy invariant: running programs emit empty window titles and `None` usage metrics.
+4. **Honest Wayland Unsupported Behavior** (`tracking/wayland.rs`):
+   - `WaylandActiveWindowProvider` honestly reports `TrackingError::UnsupportedSession` reflecting Wayland unprivileged surface isolation.
+   - Refuses root/evdev keylogger escalation; returns `None` for block payload windows without fabricating fake telemetry.
+5. **Consent-Gated Lifecycle & In-Flight ABA Protection** (`tracking/gated.rs`):
+   - `ConsentGatedTracker` wraps active window and running apps providers with `TrackerLifecycle`.
+   - Enforces default-deny: unconfigured, stopped, or paused state returns `TrackingError::ConsentRequired` without invoking underlying providers.
+   - Enforces capability-specific consent: granting `ActiveWindow` fails closed on `RunningPrograms` (`TrackingError::CapabilityDenied`), and vice-versa.
+   - Decoupled concurrency: lifecycle mutex lock is released during underlying I/O queries.
+   - Validates acquisition tickets post-acquisition before returning data; in-flight revocation or pause increments generation and invalidates ticket (`TrackingError::GenerationMismatch`), cleanly discarding acquired telemetry.
+6. **Fakeable Providers Matching Windows** (`tracking/fake.rs`):
+   - `FakeAcquisitionProvider` with atomic counters (`window_calls`, `process_calls`), canned responses, and callback hooks for deterministic testing.
+7. **Capability Architecture & Doctor Support Reporting** (`diagnostics.rs`):
+   - Added `DiagnosticStatus::Supported`.
+   - Doctor reports `active_window` as `Supported` under X11 and `Unsupported` under Wayland (`ArchitecturalSupport::UnsupportedOnWayland`).
+   - Doctor reports `running_programs` as `Supported` (`ArchitecturalSupport::SupportedProcFs`).
+   - Real providers wired into capability architecture without starting background sensors or probing displays during doctor generation.
+
+### B. Delivered vs Remaining Phase 2 Scope
+| Capability / Feature | Phase 2 First Bounded Slice | Status | Architecture / Implementation Details |
+|---|---|:---:|---|
+| **X11 Active Window** | In Scope | **DELIVERED** | `X11ActiveWindowProvider`, `_NET_ACTIVE_WINDOW`, `_NET_WM_NAME`, `WM_CLASS`, `_NET_WM_PID` |
+| **`/proc` Running Apps** | In Scope | **DELIVERED** | `ProcFsRunningAppsProvider`, `file_name`, deduplication, 200 cap, kernel thread filtering |
+| **Wayland Active Window** | In Scope | **DELIVERED** | `WaylandActiveWindowProvider`, honest `TrackingError::UnsupportedSession`, zero synthetic data |
+| **Consent Gating & ABA** | In Scope | **DELIVERED** | `ConsentGatedTracker`, `TrackerLifecycle` ticket acquisition and post-acquisition validation |
+| **Fakeable Test Infrastructure** | In Scope | **DELIVERED** | `FakeAcquisitionProvider`, `MockX11PropertyReader`, `MockProcFsReader` matching Windows seams |
+| **Doctor Support Reporting** | In Scope | **DELIVERED** | `DiagnosticStatus::Supported` wired for X11 active_window and procfs running_programs |
+| **XInput2 Activity Counters** | Out of Scope (Backlog) | **OPEN** | Remaining Phase 2 backlog: XInput2 raw ticks only; Wayland unsupported (null) |
+| **X11 Screenshot & Blur** | Out of Scope (Backlog) | **OPEN** | Remaining Phase 2 backlog: XShm / xcap screen capture and text blur policy |
+| **Wayland Portal ScreenCast** | Out of Scope (Backlog) | **OPEN** | Remaining Phase 2 backlog: `ashpd` / PipeWire user-consented dialog |
+| **V4L2 Webcam Capture** | Out of Scope (Backlog) | **OPEN** | Remaining Phase 2 backlog: Separate opt-in V4L2 device capture |
+| **Phase 3 Worker / Autostart**| Out of Scope | **OPEN** | Background scheduler loop, logind idle/lock, single-instance lock, systemd service |
+| **Phase 4 Packaging** | Out of Scope | **OPEN** | Packaging recipes (`.deb`, `.rpm`, AppImage) |
+
+### C. Verification Evidence
+| Execution Environment | Toolchain / Target | Command Executed | Tests / Steps | Result | Exit Code | Provenance Details |
+|---|---|---|:---:|:---:|:---:|---|
+| **Local Host** | `rustc 1.97.1` (x86_64 MSVC) | `cargo fmt --manifest-path clients/linux/Cargo.toml -- --check` | Formatting check | PASSED | **0** | Clean, 0 diffs. |
+| **Local Host** | `rustc 1.97.1` (x86_64 MSVC) | `cargo clippy --manifest-path clients/linux/Cargo.toml --locked --all-targets -- -D warnings` | Clippy lint check | PASSED | **0** | Clean, 0 warnings, 0 errors. |
+| **Local Host** | `rustc 1.97.1` (x86_64 MSVC) | `cargo test --manifest-path clients/linux/Cargo.toml --test tracking_native_adapter_tests` | New Phase 2 integration test suite | PASSED | **0** | 11 tests passed: default deny, capability-specific consent, in-flight ABA invalidation, Wayland unsupported, procfs parsing/filtering/resilience, X11 EWMH properties, doctor reporting, DTO compatibility. |
+| **Local Host** | `rustc 1.97.1` (x86_64 MSVC) | `cargo test --manifest-path clients/linux/Cargo.toml --lib` | Library unit test suite | PASSED | **0** | 87 tests passed across all modules (including 14 unit tests in `tracking::model`, `tracking::procfs`, `tracking::x11`, `tracking::wayland`, `tracking::gated`). |
+| **Local Host** | `rustc 1.97.1` (x86_64 MSVC) | `cargo test --manifest-path clients/linux/Cargo.toml --locked --release` | Full release test suite | PASSED | **0** | 197 release tests passed across 11 test suites (87 lib, 3 main, 8 doctor, 21 identity/transport/signing, 7 failing-before repro, 3 installer lifecycle [22 inner checks], 15 outbox status CLI, 29 outbox, 13 sync, 11 tracking native adapters; 0 in Linux-gated private bus; installer lifecycle 22/22 checks passed). |
+
+### D. Acceptance & Open Gates
+1. **Delivered Bounded Slice**: X11 active window, `/proc` running programs, honest Wayland unsupported behavior, consent gating, and doctor reporting are complete and verified with deterministic injected-provider tests.
+2. **Open Phase 1 Native Gates**: Native Linux runner verification on `mh-ubuntu` (cargo fmt, clippy --all-targets, private bus tests, login/logout JSON contract, and transport scope binding) remains an open gate.
+3. **Open Phase 2 Backlog**: Input counting (XInput2), screenshot acquisition, portal PipeWire capture, and V4L2 webcam remain open.
+4. **No Real Hardware Probing**: All tests run through deterministic injected fakes; no live X11 displays, input listeners, or camera devices were probed on host.
+

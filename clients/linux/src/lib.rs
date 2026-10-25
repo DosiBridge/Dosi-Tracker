@@ -15,6 +15,7 @@ pub mod outbox;
 pub mod paths;
 pub mod signing;
 pub mod sync;
+pub mod tracking;
 
 pub use api::{
     classify_token_failure, classify_upload_failure, ApiClient, ApiError, AuthError,
@@ -60,4 +61,12 @@ pub use sync::{
     SyncPassCoordinator, SyncPassReport, SyncStopReason, DEFAULT_BATCH_LIMIT, DEFAULT_MAX_ATTEMPTS,
     MAX_ALLOWED_ATTEMPTS, MAX_ALLOWED_BATCH_LIMIT, MAX_RECEIVED_ID_BYTES,
     MAX_REPORT_DIAGNOSTIC_BYTES,
+};
+pub use tracking::{
+    file_name, is_kernel_thread, program_list, AcquisitionProvider, AcquisitionProviderExt,
+    ActiveWindowProvider, ConsentGatedTracker, FakeAcquisitionProvider, MockProcFsReader,
+    MockProcessEntry, MockX11PropertyReader, ProcFsReader, ProcFsRunningAppsProvider,
+    RunningAppsProvider, SysProcFsReader, SysX11PropertyReader, TrackingError,
+    WaylandActiveWindowProvider, WindowInfo, X11ActiveWindowProvider, X11PropertyReader,
+    MAX_RUNNING_PROGRAMS,
 };

@@ -8,7 +8,7 @@ Lightweight, privacy-first, rootless desktop agent foundation for Linux written 
 |---|---|---|
 | **Crate** | `dosi-tracker-linux` v0.1.0 | Located in [`clients/linux`](./) |
 | **Release Tier** | `headless-foundation` | Diagnostic foundation, default-deny consent core, durable outbox, rootless installer |
-| **Telemetry Adapters** | `NOT_IMPLEMENTED` | Truthfully diagnosed via `doctor [--json]`; no synthetic or fake telemetry (Phase 2) |
+| **Telemetry Adapters** | First Bounded Slice Delivered | X11 EWMH active window + `/proc` running-apps inventory wired with consent gating; Wayland honest unsupported (Phase 2 first slice) |
 | **Privilege Model** | Strictly Rootless | Runs as normal user. Refuses `sudo`, `root`, `setuid`, `evdev`, and `uinput` |
 | **Offline Storage** | Transactional SQLite | Durable outbox queue with raw identity bounding and read-only inspection |
 | **Credential Store** | SecretService + 0600 Fallback | Scoped `(application, account, workspace)` store; Freedesktop SecretService (`org.freedesktop.secrets` over session D-Bus) with mock transport injection seam (`SecretServiceTransport`) for deterministic protocol testing; owner-only 0600 file fallback with explicit doctor warning |
@@ -144,9 +144,12 @@ cargo run --bin dosi-tracker-linux -- --version
 | **Screen Capture** | Supported via XShm / `xcap` | Supported via PipeWire / `xdg-desktop-portal` | Planned Phase 2 |
 | **Keyboard Counting** | Supported via XInput2 raw ticks | **UNSUPPORTED** (reported as `null`) | Planned Phase 2 (X11 only; Wayland isolated) |
 | **Mouse Counting** | Supported via XInput2 raw ticks | **UNSUPPORTED** (reported as `null`) | Planned Phase 2 (X11 only; Wayland isolated) |
-| **Active Window** | Supported via `_NET_ACTIVE_WINDOW` | **UNSUPPORTED** (reported as `null`) | Planned Phase 2 (X11 only; Wayland isolated) |
-| **Running Applications** | Supported via `/proc` enumeration | Supported via `/proc` enumeration | Planned Phase 2 |
-| **Webcam Photo** | Supported via V4L2 (`/dev/video*`) | Supported via V4L2 / PipeWire camera portal | Planned Phase 2 |
+| **Active Window** | Supported via `_NET_ACTIVE_WINDOW` & `WM_CLASS` | **UNSUPPORTED** (reported as `null` / unsupported) | **Delivered in Phase 2 First Slice** (`X11ActiveWindowProvider`, `WaylandActiveWindowProvider`) |
+| **Running Applications** | Supported via `/proc` enumeration | Supported via `/proc` enumeration | **Delivered in Phase 2 First Slice** (`ProcFsRunningAppsProvider`, 200 cap, deduplication) |
+| **Screen Capture** | Supported via XShm / `xcap` | Supported via PipeWire / `xdg-desktop-portal` | Planned Phase 2 Backlog |
+| **Keyboard Counting** | Supported via XInput2 raw ticks | **UNSUPPORTED** (reported as `null`) | Planned Phase 2 Backlog (X11 only; Wayland isolated) |
+| **Mouse Counting** | Supported via XInput2 raw ticks | **UNSUPPORTED** (reported as `null`) | Planned Phase 2 Backlog (X11 only; Wayland isolated) |
+| **Webcam Photo** | Supported via V4L2 (`/dev/video*`) | Supported via V4L2 / PipeWire camera portal | Planned Phase 2 Backlog |
 | **Credential Storage** | Freedesktop Secret Service (D-Bus) | Freedesktop Secret Service (D-Bus) | **Delivered in Phase 1** (owner-only 0600 file fallback with warning) |
 | **Backend Sync & Transport** | Real HTTP Delivery Transport | Real HTTP Delivery Transport | **Delivered in Phase 1** (Library transport `HttpDeliveryTransport::from_store` / `from_credentials` reusing persisted login credentials; background daemon loop is Phase 3, CLI queue flush command is Phase 4) |
 | **Payload Signing** | HMAC-SHA256 (32 bytes) | HMAC-SHA256 (32 bytes) | **Delivered in Phase 1** (Windows byte semantics parity) |
@@ -172,11 +175,19 @@ cargo run --bin dosi-tracker-linux -- --version
   - Heartbeat presence primitive (`POST /api/app/presence/heartbeat`) on 60s cadence.
   - Non-mutating CLI commands: `login`, `logout`, `status [--json]`.
   - *Evidence & Boundaries:* Verified via persisted-session library integration (`SyncPassCoordinator` + `HttpDeliveryTransport::from_store`) using credentials saved by CLI `login`, with deterministic mid-upload HTTP 502 response and TCP socket interruption tests. Automated background daemon loop belongs to Phase 3; CLI queue flush command belongs to Phase 4. Independent native QA remains pending.
-- **Phase 2 (Native Consent-Gated Capture Adapters - OPEN)**:
-  - X11 active window detection (`_NET_ACTIVE_WINDOW`) and XInput2 activity counters.
-  - Wayland portal ScreenCast via PipeWire (`ashpd`) with explicit user-prompted capture sessions.
-  - V4L2 webcam capture adapter.
-  - User-space `/proc` process inventory matching `AgentContextNormalizer.NormalizePlatform`.
+- **Phase 2 (Native Consent-Gated Capture Adapters - FIRST BOUNDED SLICE DELIVERED)**:
+  - **Delivered Bounded Slice**:
+    - Native consent-gated capture adapters with fakeable traits matching Windows (`AcquisitionProvider`, `ActiveWindowProvider`, `RunningAppsProvider`, `ConsentGatedTracker`, `FakeAcquisitionProvider`).
+    - X11 active window EWMH detection (`_NET_ACTIVE_WINDOW`), UTF-8 title (`_NET_WM_NAME` / `WM_NAME`), application name resolution via `_NET_WM_PID` mapped to `/proc/[pid]/exe` and `WM_CLASS` class/instance fallback, and graceful unfocused handling (`_NET_ACTIVE_WINDOW = 0` / None).
+    - User-space `/proc` process inventory scanner (`ProcFsRunningAppsProvider`) with injectable `ProcFsReader` seam, resilient to vanished PIDs (ENOENT), extracting pure executable filenames (`file_name`), filtering Linux kernel worker threads (`[kworker/...]`), deduplicating case-insensitively, and bounding to server cap `MAX_RUNNING_PROGRAMS = 200` with empty titles and null usage metrics.
+    - Truthful, honest Wayland unsupported behavior (`WaylandActiveWindowProvider`) reporting architectural unprivileged limits (`TrackingError::UnsupportedSession`) without synthetic or fabricated telemetry.
+    - Wired into capability architecture and `doctor` support reporting (`DiagnosticStatus::Supported` under X11/procfs; `DiagnosticStatus::Unsupported` under Wayland).
+    - Deterministic test harness (`tracking_native_adapter_tests`): default deny, capability-specific consent, in-flight revoke/pause ABA ticket invalidation, unsupported sessions, parsing/aggregation, and error paths.
+  - **Remaining Phase 2 Backlog (OPEN)**:
+    - XInput2 counts-only interval activity.
+    - X11 screenshot policy/blur.
+    - Wayland visible portal ScreenCast/PipeWire user consent.
+    - Separate opt-in V4L2 webcam.
 - **Phase 3 (Worker, Presence, Session & Configuration - OPEN)**:
   - Interval capture worker with ABA generation tickets.
   - Decoupled background upload loop preventing UI or capture blocking.

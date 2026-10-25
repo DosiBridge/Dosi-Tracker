@@ -100,6 +100,8 @@ pub enum DiagnosticStatus {
     /// Operating system or display server architecture fundamentally prohibits
     /// unprivileged background access without security compromise.
     Unsupported,
+    /// Native adapter is implemented and supported in this environment.
+    Supported,
     /// Permission not checked in headless diagnostic mode.
     NotChecked,
 }
@@ -314,11 +316,11 @@ impl DoctorReport {
                     .to_string(),
             },
             SessionType::X11 => CapabilityDiagnosis {
-                adapter_status: DiagnosticStatus::NotImplemented,
+                adapter_status: DiagnosticStatus::Supported,
                 architectural_support: ArchitecturalSupport::SupportedUnconfined,
                 architectural_notes: "EWMH _NET_ACTIVE_WINDOW and _NET_WM_NAME architecturally permitted under X11."
                     .to_string(),
-                adapter_notes: "Native X11 window sampler not implemented in this foundation slice."
+                adapter_notes: "Native X11 active window adapter wired via EWMH and WM_CLASS."
                     .to_string(),
             },
             SessionType::Headless | SessionType::Unknown(_) => CapabilityDiagnosis {
@@ -326,19 +328,18 @@ impl DoctorReport {
                 architectural_support: ArchitecturalSupport::NoDisplayServer,
                 architectural_notes: "No display server detected in environment."
                     .to_string(),
-                adapter_notes: "Native window sampler not implemented in this foundation slice."
+                adapter_notes: "Native window sampler requires a graphical display server."
                     .to_string(),
             },
         };
 
         let running_programs = CapabilityDiagnosis {
-            adapter_status: DiagnosticStatus::NotImplemented,
+            adapter_status: DiagnosticStatus::Supported,
             architectural_support: ArchitecturalSupport::SupportedProcFs,
             architectural_notes:
                 "User-owned process enumeration architecturally permitted via /proc scanning."
                     .to_string(),
-            adapter_notes: "Process enumeration sampler not implemented in this foundation slice."
-                .to_string(),
+            adapter_notes: "Native /proc running-apps inventory adapter wired.".to_string(),
         };
 
         let webcam_photo = CapabilityDiagnosis {
