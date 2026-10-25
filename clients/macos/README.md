@@ -44,22 +44,43 @@ uploaded yet stays in the local queue and goes up after the update.
 
 The sign-in window asks for:
 
-- **Workspace** — your workspace (tenant) name, e.g. `acme`. Leave it empty only
-  for a host account.
 - **Email** and **Password** — the ones you use on the web dashboard. Enter
   submits; the eye button shows the password.
 - **Advanced → Server address** — the API address of your Dosi Tracker server,
   e.g. `https://tracker-api.example.com`. The web dashboard's **Download** page
   shows the exact address to paste. Your organisation may have set it already
-  (the field is then locked), or built it into the app.
+  (the field is then locked), or built it into the app. It must start with
+  `https://`; `http://` works only for a server on this Mac, unless your
+  administrator allows it (`DosiAllowInsecureHTTP`).
 
-The sign-in is kept in your **login Keychain** (item *Dosi Tracker sign-in*,
-service `com.dosibridge.tracker`, this Mac only); the password is never written
-anywhere else. When the server refuses it later — you changed or reset your
-password, or the account was deactivated — the agent stops tracking, keeps
-everything it recorded, and asks for the password again (*Sign-in expired*).
-If the server cannot be reached, the sign-in is kept and the agent retries
-every 30 seconds. When the server demands a new password, the form asks for one.
+Then the **workspace**: with one workspace, tracking starts there by itself;
+with several, a window lists them with your role in each (Owner, Manager,
+Member) — archived workspaces are never offered. Signing in again later goes
+back to the workspace you tracked in. **Switch workspace…** in the menu (or in
+Settings → Account) moves to another one at any time: the block so far is saved
+in the workspace it was recorded in, and its blocks still upload there.
+
+The Keychain keeps the sign-in — your email, the workspace and the server's
+refresh token — in your **login Keychain** (item *Dosi Tracker sign-in*,
+service `com.dosibridge.tracker`, this Mac only). **Your password is never
+stored**: it is sent once, at sign-in. When the server refuses the sign-in
+later — you changed or reset your password, the account was deactivated, or the
+session ran out — the agent stops tracking, keeps everything it recorded, and
+asks for the password again (*Sign-in expired*); it never retries a password
+behind your back. If the server cannot be reached, the sign-in is kept and the
+agent retries every 30 seconds. When the server demands a new password, the
+form asks for one.
+
+The server can also end tracking on this Mac for good:
+
+- **This Mac was removed** — an administrator revoked it. Tracking stops at
+  once, the saved sign-in is forgotten, and signing in again works only once
+  the administrator restores the device.
+- **No longer a member / workspace archived** — tracking (and the presence
+  heartbeat) stops in that workspace and you are asked to choose another one.
+
+Either way the blocks already recorded stay in the local queue; they upload if
+access comes back, and expire after 14 days otherwise.
 
 With several projects, choose the one you work on (the window asks, and the
 menu's **Switch project** changes it at any time). With one project, tracking
@@ -102,7 +123,9 @@ read-only in **Settings → What is recorded**. The agent records:
   (pointer movement and scrolling count), counts of key presses and clicks, and
   how many seconds of each minute had input. Keys you type are never recorded,
   and input posted by software (mouse jigglers, remote tools) is counted aside,
-  never as yours.
+  never as yours. Input that is not measured — you did not consent to it, the
+  project leaves it out, or Input Monitoring is off — is sent as *not measured*
+  (null), never as a 0 that would read as idleness.
 - **Apps** — the app in front and, if allowed, its window title, with the time
   spent; the names of other open apps (never their windows).
 - **One screenshot per block**, at a random moment, of the display holding the
@@ -140,6 +163,7 @@ Settings are read in this order, each overriding the one before:
 | `DosiIntervalMinutes` | integer | Interval shown before a project is known (5–60) |
 | `DosiCaptureScreenshot`, `DosiCaptureWebcam`, `DosiCaptureKeyboard`, `DosiCaptureMouse`, `DosiCaptureActiveWindow`, `DosiCaptureRunningPrograms` | boolean | Switch a capture **off** on this Mac (they can never switch on what the project does not allow) |
 | `DosiBlurScreenshots` | boolean | Always blur screenshots on this Mac (can add blur, never remove it) |
+| `DosiAllowInsecureHTTP` | boolean | Accept an `http://` server that is not this Mac (off by default: the password and every block would cross the network in clear text; App Transport Security still allows cleartext only to local-network hosts) |
 | `DosiLogDebug` | boolean | Also write debug lines to the log file |
 
 For example:
@@ -174,6 +198,13 @@ Login Items); an MDM profile can manage it like any other login item.
   `https://localhost:6006` uses the ASP.NET development certificate: trust it in
   Keychain Access, or put the API behind a real certificate.
 - **Sign-in expired** — enter your password again; nothing recorded is lost.
+- **"This Mac was removed from tracking"** — your administrator revoked this
+  device; ask them to restore it, then sign in again.
+- **"The server address must use https://"** — `http://` is refused except for
+  a server on this Mac; use the `https://` address (or, for a test server on
+  the local network, have an administrator set `DosiAllowInsecureHTTP`).
+- **"The server answered with a redirect"** — the agent never follows
+  redirects; enter the API server's own address, not one that forwards to it.
 - **"Keyboard and mouse activity is not being measured"** — allow Dosi Tracker
   in *Input Monitoring*. If it is listed and on but still not measured, remove
   it with **−**, then quit and open the app again.
@@ -281,11 +312,24 @@ Two targets (see `Package.swift`):
     SIGTERM, saving the block before quitting), logging, configuration, the
     login item and notifications.
 
-It talks to the backend exactly as the Windows agent does (the shared contract):
+It talks to the backend as every agent does (the cross-agent contract):
 
-- **Sign-in** — OpenIddict password grant on `POST /connect/token?__tenant=<workspace>`
-  (client `Tracker_App`, scopes `Tracker offline_access`); the refresh token
-  renews the access token, the saved password is the fallback.
+- **Sign-in** — OpenIddict password grant on `POST /connect/token` (client
+  `Tracker_App`, scopes `Tracker offline_access`, plus `device_id`, this
+  install's random v4 UUID); no workspace travels with it. The refresh token
+  (sent with the same `device_id`) renews the access token and is saved rotated;
+  once it is refused (`invalid_grant`) the state is *Sign-in expired* — the
+  password is never stored nor re-sent silently.
+- **Workspaces** — `GET /api/app/workspaces/mine` (no workspace header): the
+  workspaces you belong to, with your role. The chosen workspace's GUID goes in
+  `X-Workspace-Id` on every workspace-scoped call (projects, blocks, presence,
+  totals); queued rows remember theirs.
+- **Terminal answers** — 403 `Tracker:DeviceRevoked` (also forgets the saved
+  sign-in), `Tracker:NotWorkspaceMember`, `Tracker:WorkspaceArchived` and 400
+  `Tracker:WorkspaceRequired` stop capture and heartbeats for that workspace;
+  its queued rows wait.
+- **Transport** — `https://` only (`http://` only to this Mac, unless
+  `DosiAllowInsecureHTTP`), and redirects are never followed.
 - **Projects** — `GET /api/app/project/my-projects`: the projects you track, with
   their capture policy, interval, idle threshold and blur.
 - **Blocks** — `POST /api/app/activity` with a client-generated id (re-sending is
