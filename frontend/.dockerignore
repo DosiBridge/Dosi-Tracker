@@ -1,0 +1,30 @@
+# Build context for frontend/Dockerfile. Dependencies are installed from package-lock.json inside the image, so the
+# host's node_modules (Windows/macOS native binaries) and build output never leak in, and neither do local env files.
+node_modules/
+.next/
+out/
+build/
+coverage/
+reports/
+.stryker-tmp/
+playwright-report/
+test-results/
+blob-report/
+e2e/
+*.tsbuildinfo
+next-env.d.ts
+
+# Local configuration and secrets
+.env
+.env.*
+*.pem
+
+# Not needed in the image
+Dockerfile*
+.dockerignore
+.git
+.vscode/
+.idea/
+.cursor/
+*.md
+npm-debug.log*
