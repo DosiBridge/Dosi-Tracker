@@ -54,6 +54,16 @@ module.exports = {
       to: { path: "^src/lib/(demo-tenants|mock-data)\\.ts$", dependencyTypesNot: ["dynamic-import"] },
     },
     {
+      name: "demo-ai-loaded-on-demand",
+      severity: "error",
+      comment:
+        "The demo's sample AI output (lib/ai-demo) is only for demo sessions: the app may reach it through a dynamic import() alone, " +
+        "so a live deployment never downloads the generators (type-only imports are erased, so they are fine). " +
+        "The demo's AI status, which every session may read, is lib/ai-demo-status.",
+      from: { path: "^src/(app|components|hooks|lib)", pathNot: ["\\.(test|spec)\\.tsx?$"] },
+      to: { path: "^src/lib/ai-demo\\.ts$", dependencyTypesNot: ["dynamic-import", "type-only"] },
+    },
+    {
       name: "no-orphans",
       severity: "warn",
       comment: "Unreferenced modules are dead weight — delete or wire them up.",

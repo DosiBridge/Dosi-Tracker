@@ -476,6 +476,11 @@ describe("architecture spec: secret scanning", () => {
       // replace its password (lib/sign-in.ts recognises them): reason codes.
       "ShouldChangePasswordOnNextLogin",
       "PeriodicallyChangePassword",
+      // A provider-state VALUE of the host console's AI overview
+      // (lib/ai-contract PlatformAiProviderState, AI assist spec §5.6): the
+      // server says its AI provider connection is incomplete. A wire enum,
+      // never a credential; the console's copy says "AI provider connection".
+      "missing-api-key",
     ]);
     const violations: string[] = [];
     let hitsSeen = 0;

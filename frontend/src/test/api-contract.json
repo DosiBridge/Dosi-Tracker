@@ -48,6 +48,8 @@
     "/api/app/team/invitations",
     "/api/app/team/{id}/invitation",
     "/api/app/platform/change-workspace-plan",
-    "/api/app/platform/workspace-subscriptions"
+    "/api/app/platform/workspace-subscriptions",
+    "/api/app/ai-assist",
+    "/api/app/platform-ai"
   ]
 }
