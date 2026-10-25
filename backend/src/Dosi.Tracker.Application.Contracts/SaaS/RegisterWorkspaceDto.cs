@@ -120,3 +120,30 @@ public class AcceptInvitationResultDto
     public string WorkspaceName { get; set; } = string.Empty;
     public string Role { get; set; } = string.Empty;
 }
+
+/// <summary><c>GET /api/app/invitations/mine</c>: the signed-in user's pending invitations. They are matched by the
+/// account's email, so they are listed only once that email is verified (<see cref="EmailConfirmed"/>); until then the
+/// list is empty and an invitation can be opened only with its link.</summary>
+public class MyInvitationsDto
+{
+    /// <summary>Whether the account's email is verified. False: <see cref="Items"/> is empty.</summary>
+    public bool EmailConfirmed { get; set; }
+
+    /// <summary>Usable invitations to workspaces that are not archived, newest first.</summary>
+    public List<MyInvitationDto> Items { get; set; } = new();
+}
+
+/// <summary>A pending invitation addressed to the signed-in user's email; accept or decline it by its
+/// <see cref="Id"/> (<c>POST /api/app/invitations/mine/{id}/accept|decline</c>).</summary>
+public class MyInvitationDto
+{
+    public Guid Id { get; set; }
+    public Guid WorkspaceId { get; set; }
+    public string WorkspaceName { get; set; } = string.Empty;
+
+    /// <summary>The workspace role the invitation grants.</summary>
+    public string Role { get; set; } = string.Empty;
+
+    public DateTime ExpiresAt { get; set; }
+    public DateTime CreationTime { get; set; }
+}

@@ -163,43 +163,20 @@ public class TeamAppService : TrackerAppService, ITeamAppService
 
         var email = input.Email.Trim();
         var user = await _userManager.FindByEmailAsync(email);
-        if (user != null)
+        var existing = user == null ? null : await _workspaceMemberships.FindActiveAsync(workspaceId, user.Id);
+        if (user != null && existing != null)
         {
-            if (!user.IsActive)
-            {
-                throw new BusinessException(TrackerDomainErrorCodes.InvalidUser).WithData("email", email);
-            }
-
-            var existing = await _workspaceMemberships.FindActiveAsync(workspaceId, user.Id);
-            if (existing != null && project == null)
-            {
-                throw new BusinessException(TrackerDomainErrorCodes.AlreadyWorkspaceMember).WithData("email", email);
-            }
-
-            if (existing is { IsOwner: true } && !callerIsOwner)
-            {
-                throw new BusinessException(TrackerDomainErrorCodes.RoleNotAllowed).WithData("userId", user.Id);
-            }
-
-            var hourlyRate = 0m;
-            if (project != null)
-            {
-                await EnsureNotMemberAsync(project.Id, user.Id);
-                hourlyRate = await EnsureMayAssignAsync(project.Id, user.Id, role, input.HourlyRate);
-            }
-
-            var (member, projectMember) = await _joiner.JoinAsync(user.Id, workspaceRole, project?.Id, role, hourlyRate);
-            await uow.CompleteAsync();
-
-            return new InviteMemberResultDto
-            {
-                Added = true,
-                WorkspaceRole = member.Role,
-                Member = projectMember == null ? null : ToDto(projectMember, user, includePrivateData: true)
-            };
+            // Already in this workspace (the inviter sees the team anyway): the invitation can only add a project,
+            // exactly as AddMemberAsync would.
+            return await AddExistingMemberToProjectAsync(uow, user, existing, project, workspaceRole, role, input.HourlyRate,
+                callerIsOwner);
         }
 
-        var rate = project == null ? 0m : await EnsureMayAssignAsync(project.Id, null, role, input.HourlyRate);
+        // Everyone else — no account, or an account that is not an active member here — gets a pending invitation that
+        // only the invitee can accept (by its token, or signed in with the verified invited email). The answer is the
+        // same whether or not the email has an account, so it reveals nothing about people outside the workspace.
+        // A recorded rate of a returning member on the project is kept, as it would be when they are added directly.
+        var rate = project == null ? 0m : await EnsureMayAssignAsync(project.Id, user?.Id, role, input.HourlyRate);
         var normalizedEmail = WorkspaceInvitation.NormalizeEmail(email);
         var stale = await _invitationRepository.GetListAsync(i =>
             i.WorkspaceId == workspaceId && i.NormalizedEmail == normalizedEmail && i.AcceptedAt == null);
@@ -229,6 +206,47 @@ public class TeamAppService : TrackerAppService, ITeamAppService
             InvitationId = invitation.Id,
             InvitePath = "/invite/" + token,
             ExpiresAt = invitation.ExpiresAt
+        };
+    }
+
+    /// <summary>An invitation of someone who is already an active member of this workspace: they join the project at
+    /// once (no new workspace access is granted, so no acceptance is needed). Without a project there is nothing to do.</summary>
+    private async Task<InviteMemberResultDto> AddExistingMemberToProjectAsync(
+        IUnitOfWork uow,
+        IdentityUser user,
+        WorkspaceMember existing,
+        Project? project,
+        string workspaceRole,
+        string role,
+        decimal requestedRate,
+        bool callerIsOwner)
+    {
+        if (project == null)
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.AlreadyWorkspaceMember).WithData("email", user.Email);
+        }
+
+        if (!user.IsActive)
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.InvalidUser).WithData("email", user.Email);
+        }
+
+        if (existing.IsOwner && !callerIsOwner)
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.RoleNotAllowed).WithData("userId", user.Id);
+        }
+
+        await EnsureNotMemberAsync(project.Id, user.Id);
+        var hourlyRate = await EnsureMayAssignAsync(project.Id, user.Id, role, requestedRate);
+
+        var (member, projectMember) = await _joiner.JoinAsync(user.Id, workspaceRole, project.Id, role, hourlyRate);
+        await uow.CompleteAsync();
+
+        return new InviteMemberResultDto
+        {
+            Added = true,
+            WorkspaceRole = member.Role,
+            Member = projectMember == null ? null : ToDto(projectMember, user, includePrivateData: true)
         };
     }
 

@@ -17,7 +17,8 @@ namespace Dosi.Tracker.Security;
 
 /// <summary>
 /// Brute-force protection for the anonymous entry points: the OpenIddict token endpoint, ABP's account endpoints
-/// (cookie login, password checks and resets), invitation acceptance, sign-up and workspace creation. Every limit is per real client IP —
+/// (cookie login, password checks and resets), invitation acceptance, sign-up and workspace creation — plus team
+/// invitations, so nobody can probe email addresses or flood people with invitations. Every limit is per real client IP —
 /// which requires <see cref="TrustedProxies"/> behind a proxy — so one abusive address cannot block everyone else:
 /// <list type="bullet">
 /// <item>password (and other non-refresh) token grants: <see cref="AuthRateLimitOptions.TokenPermitLimit"/> per
@@ -27,7 +28,9 @@ namespace Dosi.Tracker.Security;
 /// <item>refresh-token grants: <see cref="AuthRateLimitOptions.RefreshPermitLimit"/> per client (agents renew their
 /// sessions this way, and a refresh token cannot be guessed);</item>
 /// <item>account endpoints (and invitation acceptance), and sign-up / workspace creation: <see cref="AuthRateLimitOptions.AccountPermitLimit"/> /
-/// <see cref="AuthRateLimitOptions.SignUpPermitLimit"/> per client.</item>
+/// <see cref="AuthRateLimitOptions.SignUpPermitLimit"/> per client;</item>
+/// <item>team invitations (<c>POST /api/app/team/invite-member</c>): <see cref="AuthRateLimitOptions.InvitePermitLimit"/>
+/// per client.</item>
 /// </list>
 /// A request refused by the per-account limit still uses up permits of its client's budget, so hammering one account
 /// also slows the attacker down overall. A rejection is a 429 with <c>Retry-After</c>. The limiter must run after the
@@ -40,6 +43,7 @@ public static class AuthRateLimiting
     public static readonly PathString WorkspaceRegisterPath = new("/api/app/workspace/register");
     public static readonly PathString WorkspacesPath = new("/api/app/workspaces");
     public static readonly PathString InvitationsPath = new("/api/app/invitations");
+    public static readonly PathString InviteMemberPath = new("/api/app/team/invite-member");
 
     /// <summary>Endpoints that take a password, issue a session or start a password reset (ABP account API and pages).</summary>
     public static readonly PathString[] AccountPaths =
@@ -77,7 +81,10 @@ public static class AuthRateLimiting
         Account,
 
         /// <summary>Sign-up and workspace creation.</summary>
-        SignUp
+        SignUp,
+
+        /// <summary>A team invitation.</summary>
+        Invite
     }
 
     /// <summary>Registers the rate limiter with the limits of <see cref="AuthRateLimitOptions.SectionName"/>.</summary>
@@ -135,6 +142,11 @@ public static class AuthRateLimiting
             return RequestKind.Account;
         }
 
+        if (request.Path.StartsWithSegments(InviteMemberPath, StringComparison.OrdinalIgnoreCase))
+        {
+            return RequestKind.Invite;
+        }
+
         return AccountPaths.Any(path => request.Path.StartsWithSegments(path, StringComparison.OrdinalIgnoreCase))
             ? RequestKind.Account
             : RequestKind.None;
@@ -147,7 +159,7 @@ public static class AuthRateLimiting
                (!rest.HasValue || rest.Value == "/");
     }
 
-    /// <summary><c>POST /api/app/invitations/{token}/accept</c>.</summary>
+    /// <summary><c>POST /api/app/invitations/{token}/accept</c> and <c>/api/app/invitations/mine/{id}/accept</c>.</summary>
     private static bool IsInvitationAcceptance(PathString path)
     {
         return path.StartsWithSegments(InvitationsPath, StringComparison.OrdinalIgnoreCase, out var rest) &&
@@ -170,6 +182,7 @@ public static class AuthRateLimiting
             RequestKind.RefreshGrant => limits.RefreshPermitLimit,
             RequestKind.Account => limits.AccountPermitLimit,
             RequestKind.SignUp => limits.SignUpPermitLimit,
+            RequestKind.Invite => limits.InvitePermitLimit,
             _ => 0
         };
 
@@ -280,6 +293,9 @@ public class AuthRateLimitOptions
 
     /// <summary>Sign-ups and workspace creations per client IP and window.</summary>
     public int SignUpPermitLimit { get; set; } = 10;
+
+    /// <summary>Team invitations per client IP and window (an owner onboarding a team pastes a few dozen at most).</summary>
+    public int InvitePermitLimit { get; set; } = 30;
 
     /// <summary>Length of the fixed window, in seconds.</summary>
     public int WindowSeconds { get; set; } = 60;

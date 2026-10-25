@@ -48,6 +48,7 @@
     "Tracker:InvitationExpired": "This invitation has expired or was already used.",
     "Tracker:InvitationEmailMismatch": "This invitation was sent to a different email address.",
     "Tracker:AlreadyWorkspaceMember": "This person is already a member of the workspace.",
+    "Tracker:EmailNotConfirmed": "Verify your email address first, or open the invitation link you were sent.",
     "Tracker:ExportExceedsLimit": "The requested export exceeds the maximum limit of {limit} records (found {totalCount}). Please narrow your date range or filters."
   }
 }

@@ -39,6 +39,10 @@ public static class TrackerDomainErrorCodes
     public const string InvitationExpired = "Tracker:InvitationExpired";
     public const string InvitationEmailMismatch = "Tracker:InvitationEmailMismatch";
     public const string AlreadyWorkspaceMember = "Tracker:AlreadyWorkspaceMember";
+
+    /// <summary>The action matches the caller by their account's email, which is not verified yet.</summary>
+    public const string EmailNotConfirmed = "Tracker:EmailNotConfirmed";
+
     public const string ExportExceedsLimit = "Tracker:ExportExceedsLimit";
     public const string DeviceRevoked = "Tracker:DeviceRevoked";
     public const string DeviceNotObserved = "Tracker:DeviceNotObserved";

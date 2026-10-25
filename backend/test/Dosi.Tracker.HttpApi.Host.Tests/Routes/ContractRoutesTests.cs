@@ -70,6 +70,9 @@ public class ContractRoutesTests
     [InlineData(nameof(WorkspaceAppService.GetInvitationAsync))]
     [InlineData(nameof(WorkspaceAppService.AcceptInvitationAsync))]
     [InlineData(nameof(WorkspaceAppService.DeclineInvitationAsync))]
+    [InlineData(nameof(WorkspaceAppService.GetMyInvitationsAsync))]
+    [InlineData(nameof(WorkspaceAppService.AcceptMyInvitationAsync))]
+    [InlineData(nameof(WorkspaceAppService.DeclineMyInvitationAsync))]
     public void Workspace_And_Invitation_Endpoints_Should_Be_Served_By_Controllers_Only(string methodName)
     {
         typeof(WorkspaceAppService).GetMethod(methodName)!
@@ -87,6 +90,9 @@ public class ContractRoutesTests
     [InlineData(typeof(Dosi.Tracker.Controllers.InvitationsController), "GetAsync", "GET", "{token}")]
     [InlineData(typeof(Dosi.Tracker.Controllers.InvitationsController), "AcceptAsync", "POST", "{token}/accept")]
     [InlineData(typeof(Dosi.Tracker.Controllers.InvitationsController), "DeclineAsync", "POST", "{token}/decline")]
+    [InlineData(typeof(Dosi.Tracker.Controllers.InvitationsController), "GetMineAsync", "GET", "mine")]
+    [InlineData(typeof(Dosi.Tracker.Controllers.InvitationsController), "AcceptMineAsync", "POST", "mine/{id:guid}/accept")]
+    [InlineData(typeof(Dosi.Tracker.Controllers.InvitationsController), "DeclineMineAsync", "POST", "mine/{id:guid}/decline")]
     public void Workspace_And_Invitation_Controllers_Should_Have_The_Contract_Routes(Type controller, string methodName, string verb, string template)
     {
         var prefix = controller == typeof(Dosi.Tracker.Controllers.WorkspacesController) ? "api/app/workspaces" : "api/app/invitations";

@@ -58,4 +58,15 @@ public interface IWorkspaceAppService : IApplicationService
 
     /// <summary><c>POST /api/app/invitations/{token}/decline</c>: the authenticated caller's email must match the invited one.</summary>
     Task DeclineInvitationAsync(string token);
+
+    /// <summary><c>GET /api/app/invitations/mine</c>: the caller's pending invitations, matched by the account's email
+    /// only once it is verified (an empty list otherwise).</summary>
+    Task<MyInvitationsDto> GetMyInvitationsAsync();
+
+    /// <summary><c>POST /api/app/invitations/mine/{id}/accept</c>: accepts one of <see cref="GetMyInvitationsAsync"/>
+    /// without its token; 403 <c>Tracker:EmailNotConfirmed</c> while the account's email is unverified.</summary>
+    Task<AcceptInvitationResultDto> AcceptMyInvitationAsync(Guid id);
+
+    /// <summary><c>POST /api/app/invitations/mine/{id}/decline</c>: same rules as <see cref="AcceptMyInvitationAsync"/>.</summary>
+    Task DeclineMyInvitationAsync(Guid id);
 }

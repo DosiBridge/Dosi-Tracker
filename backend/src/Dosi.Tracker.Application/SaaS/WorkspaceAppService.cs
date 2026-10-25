@@ -385,6 +385,91 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
         await _invitationRepository.DeleteAsync(invitation);
     }
 
+    [WorkspaceNotRequired]
+    [RemoteService(IsEnabled = false)]
+    public async Task<MyInvitationsDto> GetMyInvitationsAsync()
+    {
+        var user = await _userManager.GetByIdAsync(CurrentUser.GetId());
+        if (!IsVerifiedEmail(user))
+        {
+            return new MyInvitationsDto { EmailConfirmed = false };
+        }
+
+        var normalizedEmail = WorkspaceInvitation.NormalizeEmail(user.Email);
+        var now = Clock.Now;
+        var invitations = await _invitationRepository.GetQueryableAsync();
+        var workspaces = await _workspaceRepository.GetQueryableAsync();
+        var rows = await AsyncExecuter.ToListAsync(
+            from i in invitations
+            join w in workspaces on i.WorkspaceId equals w.Id
+            where i.NormalizedEmail == normalizedEmail && i.AcceptedAt == null && i.ExpiresAt > now && !w.IsArchived
+            orderby i.CreationTime descending
+            select new MyInvitationDto
+            {
+                Id = i.Id,
+                WorkspaceId = w.Id,
+                WorkspaceName = w.Name,
+                Role = i.Role,
+                ExpiresAt = i.ExpiresAt,
+                CreationTime = i.CreationTime
+            });
+
+        return new MyInvitationsDto { EmailConfirmed = true, Items = rows };
+    }
+
+    [WorkspaceNotRequired]
+    [RemoteService(IsEnabled = false)]
+    public async Task<AcceptInvitationResultDto> AcceptMyInvitationAsync(Guid id)
+    {
+        var (invitation, user) = await GetMyUsableInvitationAsync(id);
+
+        using (CurrentWorkspace.Change(invitation.WorkspaceId))
+        {
+            await using var seatLock = await _seatCounter.LockAsync();
+            using var uow = UnitOfWorkManager.Begin(requiresNew: true, isTransactional: true);
+            var workspace = await AcceptAsync(invitation, user.Id);
+            var role = (await _memberships.FindActiveAsync(workspace.Id, user.Id))!.Role;
+            await uow.CompleteAsync();
+
+            return new AcceptInvitationResultDto { WorkspaceId = workspace.Id, WorkspaceName = workspace.Name, Role = role };
+        }
+    }
+
+    [WorkspaceNotRequired]
+    [RemoteService(IsEnabled = false)]
+    public async Task DeclineMyInvitationAsync(Guid id)
+    {
+        var (invitation, _) = await GetMyUsableInvitationAsync(id);
+        await _invitationRepository.DeleteAsync(invitation);
+    }
+
+    /// <summary>An invitation the caller may answer without its token: it is usable and addressed to the caller's
+    /// verified email. Any other invitation is reported as not found, so ids reveal nothing.</summary>
+    private async Task<(WorkspaceInvitation Invitation, IdentityUser User)> GetMyUsableInvitationAsync(Guid id)
+    {
+        var user = await _userManager.GetByIdAsync(CurrentUser.GetId());
+        if (!IsVerifiedEmail(user))
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.EmailNotConfirmed);
+        }
+
+        var invitation = await _invitationRepository.FindAsync(id);
+        if (invitation == null || !invitation.IsFor(user.Email))
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.InvitationNotFound);
+        }
+
+        if (!invitation.IsUsable(Clock.Now))
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.InvitationExpired);
+        }
+
+        return (invitation, user);
+    }
+
+    /// <summary>Only a verified email may stand in for an invitation's token: anyone can sign up with any address.</summary>
+    private static bool IsVerifiedEmail(IdentityUser user) => user.EmailConfirmed && !user.Email.IsNullOrWhiteSpace();
+
     /// <summary>Joins the invitation's workspace (the current one) and uses the invitation up.</summary>
     private async Task<Workspace> AcceptAsync(WorkspaceInvitation invitation, Guid userId)
     {

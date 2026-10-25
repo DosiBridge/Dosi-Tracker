@@ -1,14 +1,17 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Security.Claims;
 using System.Threading.Tasks;
 using Dosi.Tracker.Identity;
 using Dosi.Tracker.Projects;
+using Dosi.Tracker.SaaS;
 using Shouldly;
 using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Guids;
 using Volo.Abp.Identity;
 using Volo.Abp.Modularity;
+using Volo.Abp.Security.Claims;
 using Dosi.Tracker.Workspaces;
 using Xunit;
 
@@ -125,6 +128,25 @@ public abstract class TeamTestBase<TStartupModule> : TrackerApplicationTestBase<
     {
         return WithUnitOfWorkAsync(() =>
             GetRequiredService<IRepository<ProjectMember, Guid>>().GetListAsync(m => m.UserId == userId));
+    }
+
+    /// <summary>Runs <paramref name="action"/> as the signed-in <paramref name="userId"/>, outside any workspace (as the
+    /// invitation endpoints run).</summary>
+    protected async Task<T> AsUserAsync<T>(Guid userId, Func<IWorkspaceAppService, Task<T>> action)
+    {
+        var claims = new List<Claim> { new(AbpClaimTypes.UserId, userId.ToString()) };
+        using (GetRequiredService<ICurrentPrincipalAccessor>().Change(new ClaimsPrincipal(new ClaimsIdentity(claims, "TestAuth"))))
+        using (GetRequiredService<ICurrentWorkspace>().Change(null))
+        {
+            return await action(GetRequiredService<IWorkspaceAppService>());
+        }
+    }
+
+    /// <summary>The invitee accepts the invitation of <paramref name="result"/> with its token.</summary>
+    protected Task<AcceptInvitationResultDto> AcceptAsync(Guid userId, InviteMemberResultDto result)
+    {
+        var token = result.InvitePath.ShouldNotBeNull()["/invite/".Length..];
+        return AsUserAsync(userId, service => service.AcceptInvitationAsync(token));
     }
 
     protected Task<ProjectMemberDto> AddAsync(Guid projectId, Guid userId, string role = ProjectMemberRoles.Worker, decimal hourlyRate = 0m)
