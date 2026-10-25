@@ -132,6 +132,52 @@ pub fn decode_active_window(reply: &RawPropertyReply) -> Result<Option<u64>, Tra
     }
 }
 
+/// Decode raw UTF-8 window title property (e.g. `_NET_WM_NAME`).
+pub fn decode_utf8_title(reply: &RawPropertyReply) -> Option<String> {
+    if reply.format == 8 && !reply.value.is_empty() {
+        let slice = if reply.value.len() > MAX_WINDOW_TITLE_BYTES {
+            &reply.value[..MAX_WINDOW_TITLE_BYTES]
+        } else {
+            &reply.value[..]
+        };
+        let trimmed = trim_null_bytes(slice);
+        if !trimmed.is_empty() {
+            let title = String::from_utf8_lossy(trimmed).trim().to_string();
+            if !title.is_empty() {
+                return Some(title);
+            }
+        }
+    }
+    None
+}
+
+/// Decode legacy STRING window title property (e.g. `WM_NAME` in Latin-1 or ASCII/UTF-8).
+pub fn decode_legacy_title(reply: &RawPropertyReply) -> Option<String> {
+    if reply.format == 8 && !reply.value.is_empty() {
+        let slice = if reply.value.len() > MAX_WINDOW_TITLE_BYTES {
+            &reply.value[..MAX_WINDOW_TITLE_BYTES]
+        } else {
+            &reply.value[..]
+        };
+        let trimmed = trim_null_bytes(slice);
+        if !trimmed.is_empty() {
+            let title = match std::str::from_utf8(trimmed) {
+                Ok(valid) => valid.trim().to_string(),
+                Err(_) => trimmed
+                    .iter()
+                    .map(|&b| b as char)
+                    .collect::<String>()
+                    .trim()
+                    .to_string(),
+            };
+            if !title.is_empty() {
+                return Some(title);
+            }
+        }
+    }
+    None
+}
+
 /// Decode raw window title from `_NET_WM_NAME` (UTF-8) with fallback to `WM_NAME` (STRING).
 pub fn decode_window_title(
     net_wm_name: Option<&RawPropertyReply>,
@@ -139,45 +185,15 @@ pub fn decode_window_title(
 ) -> Result<Option<String>, TrackingError> {
     // Priority 1: _NET_WM_NAME (UTF8_STRING)
     if let Some(reply) = net_wm_name {
-        if reply.format == 8 && !reply.value.is_empty() {
-            let slice = if reply.value.len() > MAX_WINDOW_TITLE_BYTES {
-                &reply.value[..MAX_WINDOW_TITLE_BYTES]
-            } else {
-                &reply.value[..]
-            };
-            let trimmed = trim_null_bytes(slice);
-            if !trimmed.is_empty() {
-                let title = String::from_utf8_lossy(trimmed).trim().to_string();
-                if !title.is_empty() {
-                    return Ok(Some(title));
-                }
-            }
+        if let Some(title) = decode_utf8_title(reply) {
+            return Ok(Some(title));
         }
     }
 
     // Priority 2: Fallback to WM_NAME (STRING: Latin-1 or ASCII/UTF-8)
     if let Some(reply) = wm_name {
-        if reply.format == 8 && !reply.value.is_empty() {
-            let slice = if reply.value.len() > MAX_WINDOW_TITLE_BYTES {
-                &reply.value[..MAX_WINDOW_TITLE_BYTES]
-            } else {
-                &reply.value[..]
-            };
-            let trimmed = trim_null_bytes(slice);
-            if !trimmed.is_empty() {
-                let title = match std::str::from_utf8(trimmed) {
-                    Ok(valid) => valid.trim().to_string(),
-                    Err(_) => trimmed
-                        .iter()
-                        .map(|&b| b as char)
-                        .collect::<String>()
-                        .trim()
-                        .to_string(),
-                };
-                if !title.is_empty() {
-                    return Ok(Some(title));
-                }
-            }
+        if let Some(title) = decode_legacy_title(reply) {
+            return Ok(Some(title));
         }
     }
 
@@ -385,13 +401,15 @@ impl SysX11Transport {
                 ))
             })?;
 
+            use x11rb::connection::Connection;
+
             let root_window = conn
                 .setup()
                 .roots
                 .get(screen_num)
                 .map(|s| s.root)
                 .ok_or_else(|| {
-                    TrackingError::SystemError(format!(
+                    TrackingError::DisplayUnavailable(format!(
                         "Invalid screen index {} returned by X11 server",
                         screen_num
                     ))
@@ -442,14 +460,14 @@ impl X11PropertyTransport for SysX11Transport {
             .conn
             .get_property(false, window, prop_atom, type_atom, 0, long_length)
             .map_err(|e| {
-                TrackingError::SystemError(format!(
+                TrackingError::ProtocolError(format!(
                     "Failed to send GetProperty for {}: {}",
                     property_name, e
                 ))
             })?;
 
         let reply = cookie.reply().map_err(|e| {
-            TrackingError::SystemError(format!(
+            TrackingError::ProtocolError(format!(
                 "Failed to receive GetProperty reply for {}: {}",
                 property_name, e
             ))
@@ -489,11 +507,11 @@ fn get_or_intern_atom(
     }
 
     let cookie = conn.intern_atom(false, name.as_bytes()).map_err(|e| {
-        TrackingError::SystemError(format!("Failed to send InternAtom for {}: {}", name, e))
+        TrackingError::ProtocolError(format!("Failed to send InternAtom for {}: {}", name, e))
     })?;
 
     let reply = cookie.reply().map_err(|e| {
-        TrackingError::SystemError(format!(
+        TrackingError::ProtocolError(format!(
             "Failed to receive InternAtom reply for {}: {}",
             name, e
         ))
@@ -590,7 +608,13 @@ impl X11PropertyReader for SysX11PropertyReader {
             .transport
             .get_raw_property(root, "_NET_ACTIVE_WINDOW", Some("WINDOW"), 4)?;
         match raw {
-            Some(reply) => decode_active_window(&reply),
+            Some(reply) => {
+                let win = decode_active_window(&reply)?;
+                match win {
+                    Some(id) if id == root as u64 => Ok(None),
+                    other => Ok(other),
+                }
+            }
             None => Ok(None),
         }
     }
@@ -608,23 +632,27 @@ impl X11PropertyReader for SysX11PropertyReader {
             MAX_WINDOW_TITLE_BYTES as u32,
         )?;
 
-        // Priority 2: Fallback to WM_NAME (STRING) if _NET_WM_NAME missing or empty
-        let wm_name = if net_wm_name
-            .as_ref()
-            .map(|r| r.value.is_empty())
-            .unwrap_or(true)
-        {
-            self.transport.get_raw_property(
-                win,
-                "WM_NAME",
-                Some("STRING"),
-                MAX_WINDOW_TITLE_BYTES as u32,
-            )?
-        } else {
-            None
-        };
+        if let Some(reply) = net_wm_name.as_ref() {
+            if let Some(title) = decode_utf8_title(reply) {
+                return Ok(Some(title));
+            }
+        }
 
-        decode_window_title(net_wm_name.as_ref(), wm_name.as_ref())
+        // Priority 2: Fallback to WM_NAME (STRING) if preferred is missing or decoded to None
+        let wm_name = self.transport.get_raw_property(
+            win,
+            "WM_NAME",
+            Some("STRING"),
+            MAX_WINDOW_TITLE_BYTES as u32,
+        )?;
+
+        if let Some(reply) = wm_name.as_ref() {
+            if let Some(title) = decode_legacy_title(reply) {
+                return Ok(Some(title));
+            }
+        }
+
+        Ok(None)
     }
 
     fn get_window_class(&self, window_id: u64) -> Result<Option<(String, String)>, TrackingError> {
@@ -1009,5 +1037,244 @@ mod tests {
         // Corrupted wire bytes
         let malformed_wire = [0u8; 10];
         assert!(RawPropertyReply::from_wire_bytes(&malformed_wire).is_err());
+    }
+
+    #[test]
+    fn root_window_as_active_window_normalizes_to_none_and_avoids_further_queries() {
+        let transport = Box::new(SyntheticX11Transport::new());
+        let root = 0x0100;
+        transport.set_root_window(root);
+
+        // Root window is reported as active window (e.g. desktop/background clicked)
+        transport.set_property(
+            root,
+            "_NET_ACTIVE_WINDOW",
+            RawPropertyReply::new_u32(33, root),
+        );
+        // Properties configured on root that should NOT be queried
+        transport.set_property(
+            root,
+            "_NET_WM_NAME",
+            RawPropertyReply::new_bytes(100, b"Desktop\0"),
+        );
+        transport.set_property(
+            root,
+            "WM_CLASS",
+            RawPropertyReply::new_bytes(31, b"desktop\0Desktop\0"),
+        );
+        transport.set_property(root, "_NET_WM_PID", RawPropertyReply::new_u32(6, 1));
+
+        let reader = Arc::new(SysX11PropertyReader::with_transport(transport));
+        assert_eq!(reader.get_active_window().unwrap(), None);
+
+        let provider = X11ActiveWindowProvider::new(reader, None);
+        assert_eq!(provider.current_active_window().unwrap(), None);
+    }
+
+    #[test]
+    fn synthetic_transport_root_window_normalization_call_log_assert() {
+        let transport = Arc::new(SyntheticX11Transport::new());
+        let root = 0x0100;
+        transport.set_root_window(root);
+        transport.set_property(
+            root,
+            "_NET_ACTIVE_WINDOW",
+            RawPropertyReply::new_u32(33, root),
+        );
+
+        struct SharedTransport(Arc<SyntheticX11Transport>);
+        impl X11PropertyTransport for SharedTransport {
+            fn root_window(&self) -> Result<u32, TrackingError> {
+                self.0.root_window()
+            }
+            fn get_raw_property(
+                &self,
+                window: u32,
+                property_name: &str,
+                expected_type: Option<&str>,
+                max_bytes: u32,
+            ) -> Result<Option<RawPropertyReply>, TrackingError> {
+                self.0
+                    .get_raw_property(window, property_name, expected_type, max_bytes)
+            }
+        }
+
+        let reader = Arc::new(SysX11PropertyReader::with_transport(Box::new(
+            SharedTransport(transport.clone()),
+        )));
+        let provider = X11ActiveWindowProvider::new(reader.clone(), None);
+
+        assert_eq!(reader.get_active_window().unwrap(), None);
+        assert_eq!(provider.current_active_window().unwrap(), None);
+
+        let calls = transport.call_log();
+        assert_eq!(calls.len(), 2); // 1 for reader.get_active_window, 1 for provider.current_active_window
+        for (win, prop) in calls {
+            assert_eq!(win, root);
+            assert_eq!(prop, "_NET_ACTIVE_WINDOW");
+        }
+    }
+
+    #[test]
+    fn preferred_title_nul_only_falls_back_to_wm_name() {
+        let transport = Arc::new(SyntheticX11Transport::new());
+        let win = 0x0200;
+        transport.set_property(
+            win,
+            "_NET_WM_NAME",
+            RawPropertyReply::new_bytes(100, b"\0\0\0"),
+        );
+        transport.set_property(
+            win,
+            "WM_NAME",
+            RawPropertyReply::new_bytes(31, b"Fallback App\0"),
+        );
+
+        struct SharedTransport(Arc<SyntheticX11Transport>);
+        impl X11PropertyTransport for SharedTransport {
+            fn root_window(&self) -> Result<u32, TrackingError> {
+                self.0.root_window()
+            }
+            fn get_raw_property(
+                &self,
+                window: u32,
+                property_name: &str,
+                expected_type: Option<&str>,
+                max_bytes: u32,
+            ) -> Result<Option<RawPropertyReply>, TrackingError> {
+                self.0
+                    .get_raw_property(window, property_name, expected_type, max_bytes)
+            }
+        }
+
+        let reader =
+            SysX11PropertyReader::with_transport(Box::new(SharedTransport(transport.clone())));
+        let title = reader.get_window_title(win as u64).unwrap();
+        assert_eq!(title, Some("Fallback App".to_string()));
+
+        let calls = transport.call_log();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], (win, "_NET_WM_NAME".to_string()));
+        assert_eq!(calls[1], (win, "WM_NAME".to_string()));
+    }
+
+    #[test]
+    fn preferred_title_whitespace_only_falls_back_to_wm_name() {
+        let transport = Arc::new(SyntheticX11Transport::new());
+        let win = 0x0200;
+        transport.set_property(
+            win,
+            "_NET_WM_NAME",
+            RawPropertyReply::new_bytes(100, b"   \t\r\n\0"),
+        );
+        transport.set_property(
+            win,
+            "WM_NAME",
+            RawPropertyReply::new_bytes(31, b"Fallback App\0"),
+        );
+
+        struct SharedTransport(Arc<SyntheticX11Transport>);
+        impl X11PropertyTransport for SharedTransport {
+            fn root_window(&self) -> Result<u32, TrackingError> {
+                self.0.root_window()
+            }
+            fn get_raw_property(
+                &self,
+                window: u32,
+                property_name: &str,
+                expected_type: Option<&str>,
+                max_bytes: u32,
+            ) -> Result<Option<RawPropertyReply>, TrackingError> {
+                self.0
+                    .get_raw_property(window, property_name, expected_type, max_bytes)
+            }
+        }
+
+        let reader =
+            SysX11PropertyReader::with_transport(Box::new(SharedTransport(transport.clone())));
+        let title = reader.get_window_title(win as u64).unwrap();
+        assert_eq!(title, Some("Fallback App".to_string()));
+
+        let calls = transport.call_log();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], (win, "_NET_WM_NAME".to_string()));
+        assert_eq!(calls[1], (win, "WM_NAME".to_string()));
+    }
+
+    #[test]
+    fn valid_preferred_title_avoids_legacy_fallback_query() {
+        let transport = Arc::new(SyntheticX11Transport::new());
+        let win = 0x0200;
+        transport.set_property(
+            win,
+            "_NET_WM_NAME",
+            RawPropertyReply::new_bytes(100, b"Modern Editor\0"),
+        );
+        transport.set_property(
+            win,
+            "WM_NAME",
+            RawPropertyReply::new_bytes(31, b"Legacy Editor\0"),
+        );
+
+        struct SharedTransport(Arc<SyntheticX11Transport>);
+        impl X11PropertyTransport for SharedTransport {
+            fn root_window(&self) -> Result<u32, TrackingError> {
+                self.0.root_window()
+            }
+            fn get_raw_property(
+                &self,
+                window: u32,
+                property_name: &str,
+                expected_type: Option<&str>,
+                max_bytes: u32,
+            ) -> Result<Option<RawPropertyReply>, TrackingError> {
+                self.0
+                    .get_raw_property(window, property_name, expected_type, max_bytes)
+            }
+        }
+
+        let reader =
+            SysX11PropertyReader::with_transport(Box::new(SharedTransport(transport.clone())));
+        let title = reader.get_window_title(win as u64).unwrap();
+        assert_eq!(title, Some("Modern Editor".to_string()));
+
+        // Crucial test: WM_NAME was never queried because preferred decoded successfully!
+        let calls = transport.call_log();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0], (win, "_NET_WM_NAME".to_string()));
+    }
+
+    #[test]
+    fn legacy_latin1_string_wm_name_fallback() {
+        let transport = Arc::new(SyntheticX11Transport::new());
+        let win = 0x0200;
+        // _NET_WM_NAME is missing
+        transport.set_property(
+            win,
+            "WM_NAME",
+            RawPropertyReply::new_bytes(31, b"Caf\xe9\0"),
+        );
+
+        struct SharedTransport(Arc<SyntheticX11Transport>);
+        impl X11PropertyTransport for SharedTransport {
+            fn root_window(&self) -> Result<u32, TrackingError> {
+                self.0.root_window()
+            }
+            fn get_raw_property(
+                &self,
+                window: u32,
+                property_name: &str,
+                expected_type: Option<&str>,
+                max_bytes: u32,
+            ) -> Result<Option<RawPropertyReply>, TrackingError> {
+                self.0
+                    .get_raw_property(window, property_name, expected_type, max_bytes)
+            }
+        }
+
+        let reader =
+            SysX11PropertyReader::with_transport(Box::new(SharedTransport(transport.clone())));
+        let title = reader.get_window_title(win as u64).unwrap();
+        assert_eq!(title, Some("Café".to_string()));
     }
 }

@@ -141,11 +141,8 @@ cargo run --bin dosi-tracker-linux -- --version
 
 | Capability | X11 Protocol | Wayland Compositor | Implementation Status |
 |---|---|---|---|
-| **Screen Capture** | Supported via XShm / `xcap` | Supported via PipeWire / `xdg-desktop-portal` | Planned Phase 2 |
-| **Keyboard Counting** | Supported via XInput2 raw ticks | **UNSUPPORTED** (reported as `null`) | Planned Phase 2 (X11 only; Wayland isolated) |
-| **Mouse Counting** | Supported via XInput2 raw ticks | **UNSUPPORTED** (reported as `null`) | Planned Phase 2 (X11 only; Wayland isolated) |
-| **Active Window** | Supported via `_NET_ACTIVE_WINDOW` & `WM_CLASS` | **UNSUPPORTED** (reported as `null` / unsupported) | **Delivered in Phase 2 First Slice** (`X11ActiveWindowProvider`, `WaylandActiveWindowProvider`) |
-| **Running Applications** | Supported via `/proc` enumeration | Supported via `/proc` enumeration | **Delivered in Phase 2 First Slice** (`ProcFsRunningAppsProvider`, 200 cap, deduplication) |
+| **Active Window** | Supported via `_NET_ACTIVE_WINDOW` & `WM_CLASS` | **UNSUPPORTED** (reported as `null` / unsupported) | **Delivered in Phase 2** (`X11ActiveWindowProvider`, `WaylandActiveWindowProvider`, root normalization, priority title fallback) |
+| **Running Applications** | Supported via `/proc` enumeration | Supported via `/proc` enumeration | **Delivered in Phase 2** (`ProcFsRunningAppsProvider`, 200 cap, deduplication, `PF_KTHREAD` filtering) |
 | **Screen Capture** | Supported via XShm / `xcap` | Supported via PipeWire / `xdg-desktop-portal` | Planned Phase 2 Backlog |
 | **Keyboard Counting** | Supported via XInput2 raw ticks | **UNSUPPORTED** (reported as `null`) | Planned Phase 2 Backlog (X11 only; Wayland isolated) |
 | **Mouse Counting** | Supported via XInput2 raw ticks | **UNSUPPORTED** (reported as `null`) | Planned Phase 2 Backlog (X11 only; Wayland isolated) |
@@ -175,14 +172,14 @@ cargo run --bin dosi-tracker-linux -- --version
   - Heartbeat presence primitive (`POST /api/app/presence/heartbeat`) on 60s cadence.
   - Non-mutating CLI commands: `login`, `logout`, `status [--json]`.
   - *Evidence & Boundaries:* Verified via persisted-session library integration (`SyncPassCoordinator` + `HttpDeliveryTransport::from_store`) using credentials saved by CLI `login`, with deterministic mid-upload HTTP 502 response and TCP socket interruption tests. Automated background daemon loop belongs to Phase 3; CLI queue flush command belongs to Phase 4. Independent native QA remains pending.
-- **Phase 2 (Native Consent-Gated Capture Adapters - FIRST BOUNDED SLICE DELIVERED)**:
-  - **Delivered Bounded Slice**:
+- **Phase 2 (Native Consent-Gated Capture Adapters - FIRST BOUNDED SLICE & DEEP CORRECTIONS DELIVERED)**:
+  - **Delivered Bounded Slice & Deep Corrections**:
     - Native consent-gated capture adapters with fakeable traits matching Windows (`AcquisitionProvider`, `ActiveWindowProvider`, `RunningAppsProvider`, `ConsentGatedTracker`, `FakeAcquisitionProvider`).
-    - Real unprivileged X11 property transport via pure-Rust `x11rb v0.14.0` (`SysX11Transport`, `SysX11PropertyReader`), lazy connection behind affirmative consent gate (zero display socket or window queries during provider construction or `doctor` diagnostics), wire-level reply parsing (`GetPropertyReply::try_parse`), bounded decoding of `_NET_ACTIVE_WINDOW`, UTF-8 `_NET_WM_NAME` with `WM_NAME` fallback, `WM_CLASS`, and `_NET_WM_PID` mapped to `/proc/[pid]/exe`, with graceful unfocused handling (`_NET_ACTIVE_WINDOW = 0` / None).
-    - User-space `/proc` process inventory scanner (`ProcFsRunningAppsProvider`) with injectable `ProcFsReader` seam, resilient to vanished PIDs (ENOENT), extracting pure executable filenames (`file_name`), filtering Linux kernel worker threads (`[kworker/...]`), deduplicating case-insensitively, and bounding to server cap `MAX_RUNNING_PROGRAMS = 200` with empty titles and null usage metrics.
+    - Real unprivileged X11 property transport via pure-Rust `x11rb v0.14.0` (`SysX11Transport`, `SysX11PropertyReader`), lazy connection behind affirmative consent gate (zero display socket or window queries during provider construction or `doctor` diagnostics), wire-level reply parsing (`GetPropertyReply::try_parse`), bounded decoding of `_NET_ACTIVE_WINDOW` (normalizing root window focus `id == root` to `None` with zero subsequent property queries), UTF-8 `_NET_WM_NAME` priority decoding with `WM_NAME` fallback queried only if preferred is absent, empty, NUL-only, or whitespace-only, `WM_CLASS`, and `_NET_WM_PID` mapped to `/proc/[pid]/exe`, with graceful unfocused handling (`_NET_ACTIVE_WINDOW = 0` / None).
+    - User-space `/proc` process inventory scanner (`ProcFsRunningAppsProvider`) with injectable `ProcFsReader` seam, resilient to vanished PIDs (ENOENT), extracting pure executable filenames (`file_name`), native unbracketed kernel-thread detection via `/proc/[pid]/stat` `PF_KTHREAD` (`0x0020_0000`) robustly indexing fields after `stat_line.rfind(')')`, preserving `comm` fallback for user processes without `exe` (zombies/unprivileged), deduplicating case-insensitively, and bounding to server cap `MAX_RUNNING_PROGRAMS = 200` with empty titles and null usage metrics.
     - Truthful, honest Wayland unsupported behavior (`WaylandActiveWindowProvider`) reporting architectural unprivileged limits (`TrackingError::UnsupportedSession`) without synthetic or fabricated telemetry.
-    - Wired into capability architecture and `doctor` support reporting (`DiagnosticStatus::Supported` under X11/procfs; `DiagnosticStatus::Unsupported` under Wayland).
-    - Deterministic test harness (`tracking_native_adapter_tests`): default deny, capability-specific consent, in-flight revoke/pause ABA ticket invalidation, unsupported sessions, parsing/aggregation, and error paths.
+    - Wired into capability architecture and `doctor` support reporting (`DiagnosticStatus::Supported` under X11/procfs; `DiagnosticStatus::Unsupported` under Wayland; `adapters.window_sampler` derived directly from `active_window.adapter_status`).
+    - Deterministic test harness (`tracking_native_adapter_tests`): default deny, capability-specific consent, wrapper-level in-flight pause->resume and revoke->regrant ABA generation mismatch invalidation, unsupported sessions, parsing/aggregation, and error paths.
   - **Remaining Phase 2 Backlog (OPEN)**:
     - XInput2 counts-only interval activity.
     - X11 screenshot policy/blur.

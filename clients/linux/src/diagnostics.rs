@@ -351,6 +351,8 @@ impl DoctorReport {
                 .to_string(),
         };
 
+        let window_sampler_status = active_window.adapter_status.clone();
+
         Self {
             client: ClientMetadata {
                 name: "dosi-tracker-linux".to_string(),
@@ -372,7 +374,7 @@ impl DoctorReport {
             adapters: AdapterInventory {
                 screen_capture: DiagnosticStatus::NotImplemented,
                 input_counter: DiagnosticStatus::NotImplemented,
-                window_sampler: DiagnosticStatus::NotImplemented,
+                window_sampler: window_sampler_status,
                 webcam_capture: DiagnosticStatus::NotImplemented,
                 offline_queue: DiagnosticStatus::NotImplemented,
                 backend_sync: DiagnosticStatus::NotImplemented,
@@ -667,5 +669,70 @@ mod tests {
 
         let deserialized: DoctorReport = serde_json::from_str(&json).expect("must deserialize");
         assert_eq!(deserialized.session, SessionType::Wayland);
+    }
+
+    #[test]
+    fn x11_session_reports_window_sampler_supported_in_json_and_text() {
+        let env = SessionEnvironment {
+            xdg_session_type: Some("x11".into()),
+            display: Some(":0".into()),
+            ..Default::default()
+        };
+        let report = DoctorReport::generate(&env);
+        assert_eq!(
+            report.capabilities.active_window.adapter_status,
+            DiagnosticStatus::Supported
+        );
+        assert_eq!(report.adapters.window_sampler, DiagnosticStatus::Supported);
+
+        let text = report.to_pretty_text();
+        assert!(text.contains("Window Sampler: Supported"));
+
+        let json = report.to_json().expect("serialize");
+        assert!(json.contains("\"window_sampler\": \"SUPPORTED\""));
+    }
+
+    #[test]
+    fn wayland_session_reports_window_sampler_unsupported_in_json_and_text() {
+        let env = SessionEnvironment {
+            xdg_session_type: Some("wayland".into()),
+            wayland_display: Some("wayland-0".into()),
+            ..Default::default()
+        };
+        let report = DoctorReport::generate(&env);
+        assert_eq!(
+            report.capabilities.active_window.adapter_status,
+            DiagnosticStatus::Unsupported
+        );
+        assert_eq!(
+            report.adapters.window_sampler,
+            DiagnosticStatus::Unsupported
+        );
+
+        let text = report.to_pretty_text();
+        assert!(text.contains("Window Sampler: Unsupported"));
+
+        let json = report.to_json().expect("serialize");
+        assert!(json.contains("\"window_sampler\": \"UNSUPPORTED\""));
+    }
+
+    #[test]
+    fn headless_session_reports_window_sampler_not_implemented() {
+        let env = SessionEnvironment::default();
+        let report = DoctorReport::generate(&env);
+        assert_eq!(
+            report.capabilities.active_window.adapter_status,
+            DiagnosticStatus::NotImplemented
+        );
+        assert_eq!(
+            report.adapters.window_sampler,
+            DiagnosticStatus::NotImplemented
+        );
+
+        let text = report.to_pretty_text();
+        assert!(text.contains("Window Sampler: NotImplemented"));
+
+        let json = report.to_json().expect("serialize");
+        assert!(json.contains("\"window_sampler\": \"NOT_IMPLEMENTED\""));
     }
 }

@@ -145,7 +145,7 @@ fn cli_doctor_json_injected_wayland_reports_truthful_statuses() {
         ArchitecturalSupport::SupportedViaPortal
     );
 
-    // All native adapters unimplemented
+    // Adapter statuses: window sampler is Unsupported on Wayland, other unbuilt adapters NotImplemented
     assert_eq!(
         report.adapters.screen_capture,
         DiagnosticStatus::NotImplemented
@@ -156,7 +156,7 @@ fn cli_doctor_json_injected_wayland_reports_truthful_statuses() {
     );
     assert_eq!(
         report.adapters.window_sampler,
-        DiagnosticStatus::NotImplemented
+        DiagnosticStatus::Unsupported
     );
     assert_eq!(
         report.adapters.webcam_capture,
@@ -200,6 +200,11 @@ fn cli_doctor_json_injected_x11_reports_architectural_support_with_unimplemented
         report.capabilities.keyboard_counting.adapter_status,
         DiagnosticStatus::NotImplemented
     );
+    assert_eq!(
+        report.capabilities.active_window.adapter_status,
+        DiagnosticStatus::Supported
+    );
+    assert_eq!(report.adapters.window_sampler, DiagnosticStatus::Supported);
 }
 
 #[test]

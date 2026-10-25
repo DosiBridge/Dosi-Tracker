@@ -37,8 +37,9 @@ pub fn file_name(path: &str) -> &str {
     trimmed.rsplit(['\\', '/']).next().unwrap_or(trimmed)
 }
 
-/// Is this a Linux kernel worker or internal system thread rather than a user application?
-/// In Linux `/proc`, kernel threads have no cmdline and their `comm` or `stat` is enclosed in brackets `[...]`.
+/// Check for bracketed thread names (e.g. synthetic or legacy `[kworker]`).
+/// Note: Native Linux `/proc/[pid]/comm` values are unbracketed; kernel threads
+/// are positively detected via the `PF_KTHREAD` stat flag in `/proc/[pid]/stat`.
 pub fn is_kernel_thread(name: &str) -> bool {
     let trimmed = name.trim();
     trimmed.starts_with('[') && trimmed.ends_with(']')

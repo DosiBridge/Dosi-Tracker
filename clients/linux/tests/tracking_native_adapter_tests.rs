@@ -208,6 +208,182 @@ fn test_revocation_and_in_flight_aba_invalidation() {
 }
 
 #[test]
+fn test_wrapper_level_in_flight_pause_resume_and_revoke_regrant_aba_generation_mismatch() {
+    let policy = ConsentedPermissions {
+        active_window: true,
+        running_programs: true,
+        ..ConsentedPermissions::all_disabled()
+    };
+    let local = ConsentedPermissions {
+        active_window: true,
+        running_programs: true,
+        ..ConsentedPermissions::all_disabled()
+    };
+
+    // Sub-case 1: Active Window - pause -> resume inside blocked acquisition
+    {
+        let lifecycle = create_test_lifecycle();
+        {
+            let mut lc = lifecycle.lock().unwrap();
+            lc.configure(policy);
+            lc.update_consent(LocalConsent::Granted(local)).unwrap();
+            lc.start().unwrap();
+        }
+
+        let fake = Arc::new(FakeAcquisitionProvider::new());
+        let lc_hook = lifecycle.clone();
+        fake.set_on_current_window(Box::new(move || {
+            let mut lc = lc_hook.lock().unwrap();
+            lc.pause(PauseReason::User).unwrap();
+            lc.resume().unwrap();
+        }));
+
+        let tracker = ConsentGatedTracker::new(fake.clone(), fake.clone(), lifecycle.clone());
+        let res = tracker.current_active_window();
+        match res {
+            Err(TrackingError::GenerationMismatch {
+                ticket_gen,
+                current_gen,
+            }) => {
+                assert!(
+                    current_gen > ticket_gen,
+                    "Expected current_gen ({}) > ticket_gen ({})",
+                    current_gen,
+                    ticket_gen
+                );
+            }
+            other => panic!(
+                "Active window pause->resume must fail with GenerationMismatch, got {:?}",
+                other
+            ),
+        }
+    }
+
+    // Sub-case 2: Active Window - revoke -> regrant/start inside blocked acquisition
+    {
+        let lifecycle = create_test_lifecycle();
+        {
+            let mut lc = lifecycle.lock().unwrap();
+            lc.configure(policy);
+            lc.update_consent(LocalConsent::Granted(local)).unwrap();
+            lc.start().unwrap();
+        }
+
+        let fake = Arc::new(FakeAcquisitionProvider::new());
+        let lc_hook = lifecycle.clone();
+        let local_regrant = local;
+        fake.set_on_current_window(Box::new(move || {
+            let mut lc = lc_hook.lock().unwrap();
+            lc.update_consent(LocalConsent::Revoked).unwrap();
+            lc.update_consent(LocalConsent::Granted(local_regrant))
+                .unwrap();
+            lc.start().unwrap();
+        }));
+
+        let tracker = ConsentGatedTracker::new(fake.clone(), fake.clone(), lifecycle.clone());
+        let res = tracker.current_active_window();
+        match res {
+            Err(TrackingError::GenerationMismatch {
+                ticket_gen,
+                current_gen,
+            }) => {
+                assert!(
+                    current_gen > ticket_gen,
+                    "Expected current_gen ({}) > ticket_gen ({})",
+                    current_gen,
+                    ticket_gen
+                );
+            }
+            other => panic!(
+                "Active window revoke->regrant must fail with GenerationMismatch, got {:?}",
+                other
+            ),
+        }
+    }
+
+    // Sub-case 3: Running Apps - pause -> resume inside blocked acquisition
+    {
+        let lifecycle = create_test_lifecycle();
+        {
+            let mut lc = lifecycle.lock().unwrap();
+            lc.configure(policy);
+            lc.update_consent(LocalConsent::Granted(local)).unwrap();
+            lc.start().unwrap();
+        }
+
+        let fake = Arc::new(FakeAcquisitionProvider::new());
+        let lc_hook = lifecycle.clone();
+        fake.set_on_running_programs(Box::new(move || {
+            let mut lc = lc_hook.lock().unwrap();
+            lc.pause(PauseReason::User).unwrap();
+            lc.resume().unwrap();
+        }));
+
+        let tracker = ConsentGatedTracker::new(fake.clone(), fake.clone(), lifecycle.clone());
+        let res = tracker.running_programs();
+        match res {
+            Err(TrackingError::GenerationMismatch {
+                ticket_gen,
+                current_gen,
+            }) => {
+                assert!(
+                    current_gen > ticket_gen,
+                    "Expected current_gen ({}) > ticket_gen ({})",
+                    current_gen,
+                    ticket_gen
+                );
+            }
+            other => panic!(
+                "Running programs pause->resume must fail with GenerationMismatch, got {:?}",
+                other
+            ),
+        }
+    }
+
+    // Sub-case 4: Running Apps - revoke -> regrant/start inside blocked acquisition
+    {
+        let lifecycle = create_test_lifecycle();
+        {
+            let mut lc = lifecycle.lock().unwrap();
+            lc.configure(policy);
+            lc.update_consent(LocalConsent::Granted(local)).unwrap();
+            lc.start().unwrap();
+        }
+
+        let fake = Arc::new(FakeAcquisitionProvider::new());
+        let lc_hook = lifecycle.clone();
+        let local_regrant = local;
+        fake.set_on_running_programs(Box::new(move || {
+            let mut lc = lc_hook.lock().unwrap();
+            lc.update_consent(LocalConsent::Revoked).unwrap();
+            lc.update_consent(LocalConsent::Granted(local_regrant))
+                .unwrap();
+            lc.start().unwrap();
+        }));
+
+        let tracker = ConsentGatedTracker::new(fake.clone(), fake.clone(), lifecycle.clone());
+        let res = tracker.running_programs();
+        match res {
+            Err(TrackingError::GenerationMismatch {
+                ticket_gen,
+                current_gen,
+            }) => {
+                assert!(
+                    current_gen > ticket_gen,
+                    "Expected current_gen ({}) > ticket_gen ({})",
+                    current_gen,
+                    ticket_gen
+                );
+            }
+            other => panic!(
+                "Running programs revoke->regrant must fail with GenerationMismatch, got {:?}",
+                other
+            ),
+        }
+    }
+}
+
+#[test]
 fn test_wayland_active_window_honest_unsupported_behavior() {
     let wayland = WaylandActiveWindowProvider::new();
     let res = wayland.current_active_window();

@@ -3276,4 +3276,62 @@ Independent read-only QA identified a material placeholder in the delivered Phas
 2. **Open Phase 1 & Phase 2 Native Gates**: Full Linux target verification on `mh-ubuntu` (native private D-Bus SecretService tests, live X11 display session validation) remains open.
 3. **Remaining Phase 2 Scope**: XInput2 input counting, screenshot capture & blur policy, Wayland PipeWire portal ScreenCast, and V4L2 webcam capture remain deferred.
 
+---
+
+## 38. Linux Desktop Agent Phase 2: Production Deep Corrections (TASK phase2-deep-correction-20261025)
+
+> **Execution Date:** October 25, 2026  
+> **Phase Task ID:** `TASK phase2-deep-correction-20261025`  
+> **Status:** Deep Corrections Delivered; Source-Confirmed Defects Resolved; Synthetic & Integration Test Suites Passing (217/217 Tests Passed, Exit 0); Native Linux QA Lane Kept Open  
+> **Target Package:** `clients/linux` (Crate: `dosi-tracker-linux` v0.1.0)  
+
+### A. Defect Identification & Source-Confirmed Corrections
+Following independent source review of clean archive files at `60aaaccffd1b5f0f75e56a08cf1046f8f70507ee`, Hermes identified six bounded production defects across the existing X11 and procfs first slice:
+
+1. **BLOCKING Native Linux `#[cfg]` Compilation Fixed (`tracking/x11.rs`)**:
+   - *Defect:* `SysX11Transport` and `get_or_intern_atom` constructed `TrackingError::SystemError` at lines 410, 461, 468, 508, and 512, but `TrackingError` in `tracking/traits.rs` has no such variant. Additionally, `conn.setup()` at line 405 was missing the required `use x11rb::connection::Connection;` trait import.
+   - *Correction:* Imported `x11rb::connection::Connection` for `conn.setup()`. Replaced invalid `SystemError` with `TrackingError::DisplayUnavailable` for display screen enumeration errors, and `TrackingError::ProtocolError` for property and atom request/reply wire operations. All Linux `#[cfg]` bodies verified clean of non-existent error variants.
+
+2. **Root Window Focus Normalization (`tracking/x11.rs`)**:
+   - *Defect:* In `SysX11PropertyReader::get_active_window`, when the user focused the root desktop/background, `_NET_ACTIVE_WINDOW` returned the root window ID, causing unnecessary property queries and fabricating an "Unknown" application name with an empty title.
+   - *Correction:* Normalized active window XIDs equal to the root window (`xid == root as u64`) to `None`. Added lower-level synthetic transport test asserting that when root window focus is reported, `SysX11PropertyReader` and `X11ActiveWindowProvider` return `None`, and zero subsequent title, class, or PID property queries are dispatched to transport.
+
+3. **Title Preferred vs Fallback Decode Priority (`tracking/x11.rs`)**:
+   - *Defect:* In `SysX11PropertyReader::get_window_title`, when `_NET_WM_NAME` contained nonempty raw NUL or whitespace bytes (`[0, 0, 0]` or `b"   \0"`), the raw buffer was non-empty, which suppressed querying the legacy `WM_NAME` fallback, yet decoded empty and returned `None`.
+   - *Correction:* Refactored `get_window_title` to decode the preferred `_NET_WM_NAME` property first using `decode_utf8_title`. If preferred decodes to `Some(title)`, it returns immediately and skips querying `WM_NAME`. If preferred is absent or decodes to `None` (empty, NUL-only, or whitespace-only), `WM_NAME` is queried and decoded via `decode_legacy_title`. Synthetic tests added for NUL-only, whitespace-only, valid preferred avoiding fallback query, and Latin-1 legacy fallback.
+
+4. **Truthful Diagnostics & Adapter Inventory Consistency (`diagnostics.rs`)**:
+   - *Defect:* `DoctorReport::generate` reported `capabilities.active_window` as `Supported` under X11, but contradicted itself by hardcoding `adapters.window_sampler` to `DiagnosticStatus::NotImplemented` across all sessions.
+   - *Correction:* Derived `adapters.window_sampler` directly and consistently from `active_window.adapter_status` without native probing (`Supported` under X11, `Unsupported` under Wayland, `NotImplemented` under Headless). Preserved doctor non-mutating passivity invariants. Updated CLI doctor tests and unit tests for injected X11, Wayland, and Headless sessions in both JSON and pretty text.
+
+5. **Procfs Unbracketed Kernel Thread Detection via `PF_KTHREAD` (`tracking/procfs.rs`, `model.rs`)**:
+   - *Defect:* Previous code assumed native `/proc/[pid]/comm` wrapped thread names in brackets `[...]`. In reality, native `/proc/[pid]/comm` values are unbracketed (`kthreadd`, `kworker/...`). The brackets in `ps` are purely user-space synthetic formatting. Filtering only bracketed names caused unbracketed kernel threads to leak into running application lists. Furthermore, user processes with missing `exe` or `cmdline` (e.g. zombies or unprivileged access) were at risk of being discarded.
+   - *Correction:* Added `pub const PF_KTHREAD: u64 = 0x0020_0000;` and a robust bounded parser `parse_stat_is_kernel_thread(&str) -> bool` that robustly handles comm containing arbitrary spaces and nested parentheses by indexing fields after `stat_line.rfind(')')`. Added `is_kernel_thread(&self, pid: u32) -> Result<bool, TrackingError>` to `ProcFsReader` trait, implemented in `SysProcFsReader` (reading `/proc/[pid]/stat`) and `MockProcFsReader`. Updated `resolve_app_name_for_pid` to skip only positively identified kernel threads, preserving `read_comm` fallback for user processes even when `exe` and `cmdline` are absent. Added fake-proc-root integration tests using `SysProcFsReader::with_root` verifying exclusion of unbracketed `kthreadd` and `kworker`, preservation of user process fallback, and zero host `/proc` collection.
+
+6. **Strengthened Wrapper-Level ABA Invalidation Tests (`tracking_native_adapter_tests.rs`)**:
+   - *Defect:* Existing ticket-level ABA tests did not prove wrapper-level invalidation through `ConsentGatedTracker`. Previous test called `lc.pause` without resuming, asserting either `GenerationMismatch` or `ConsentRequired`.
+   - *Correction:* Added `test_wrapper_level_in_flight_pause_resume_and_revoke_regrant_aba_generation_mismatch` exercising full A -> B -> A state transitions during blocked acquisition for both `active_window` and `running_programs`:
+     - Active window in-flight pause -> resume asserts `Err(TrackingError::GenerationMismatch { ticket_gen, current_gen })` with `current_gen > ticket_gen`.
+     - Active window in-flight revoke -> regrant/start asserts `Err(TrackingError::GenerationMismatch { ticket_gen, current_gen })` with `current_gen > ticket_gen`.
+     - Running programs in-flight pause -> resume asserts `Err(TrackingError::GenerationMismatch { ticket_gen, current_gen })` with `current_gen > ticket_gen`.
+     - Running programs in-flight revoke -> regrant/start asserts `Err(TrackingError::GenerationMismatch { ticket_gen, current_gen })` with `current_gen > ticket_gen`.
+     - Preserved all pre-existing tests and assertions.
+
+### B. Verification Evidence
+| Execution Environment | Toolchain / Target | Command Executed | Tests / Steps | Result | Exit Code | Provenance Details |
+|---|---|---|:---:|:---:|:---:|---|
+| **Local Host** | `rustc 1.97.1` (x86_64 MSVC) | `cargo fmt --manifest-path clients/linux/Cargo.toml -- --check` | Formatting check | PASSED | **0** | Clean, 0 diffs. |
+| **Local Host** | `rustc 1.97.1` (x86_64 MSVC) | `cargo clippy --manifest-path clients/linux/Cargo.toml --locked --all-targets -- -D warnings` | Clippy lint check | PASSED | **0** | Clean, 0 warnings, 0 errors across all targets. |
+| **Local Host** | `rustc 1.97.1` (x86_64 MSVC) | `cargo test --manifest-path clients/linux/Cargo.toml --lib tracking::x11` | In-crate X11 unit tests | PASSED | **0** | 14 tests passed (+6 new tests: root window normalization, preferred title NUL/whitespace fallback, preferred valid avoiding fallback, legacy Latin-1 fallback). |
+| **Local Host** | `rustc 1.97.1` (x86_64 MSVC) | `cargo test --manifest-path clients/linux/Cargo.toml --lib tracking::procfs` | In-crate procfs unit tests | PASSED | **0** | 5 tests passed (+2 new tests: stat parser with spaces/parens, fake-proc-root SysProcFsReader unbracketed kthread exclusion & user fallback). |
+| **Local Host** | `rustc 1.97.1` (x86_64 MSVC) | `cargo test --manifest-path clients/linux/Cargo.toml --test cli_doctor_tests` | CLI doctor integration tests | PASSED | **0** | 8 tests passed: X11 window_sampler Supported, Wayland window_sampler Unsupported, Headless window_sampler NotImplemented. |
+| **Local Host** | `rustc 1.97.1` (x86_64 MSVC) | `cargo test --manifest-path clients/linux/Cargo.toml --test tracking_native_adapter_tests` | Tracking native adapter integration tests | PASSED | **0** | 17 tests passed (+1 new test covering 4 wrapper-level in-flight pause->resume and revoke->regrant ABA scenarios asserting GenerationMismatch). |
+| **Local Host** | `rustc 1.97.1` (x86_64 MSVC) | `cargo test --manifest-path clients/linux/Cargo.toml --locked --release` | Full release test suite | PASSED | **0** | 217 release tests passed across 11 test suites (101 lib, 3 main, 8 doctor, 21 identity/transport/signing, 7 failing-before repro, 3 installer lifecycle [22 inner checks], 15 outbox status CLI, 29 outbox, 13 sync, 17 tracking native adapters; 0 in Linux-gated private bus; exit 0). |
+
+### C. Synthetic vs Native Boundaries & Next Steps
+1. **Worker Evidence Only**: All tests executed on the Windows host use deterministic synthetic wire-level protocol packets, fake proc roots, and in-memory mock transports. Windows execution is worker evidence only; native Linux QA on `mh-ubuntu` remains an open gate.
+2. **Open Phase 1 & Phase 2 Native Gates**: Full Linux target verification on `mh-ubuntu` (native private D-Bus SecretService tests, live X11 display session validation) remains open.
+3. **Phase 2 Backlog Remainder**: Input counting (XInput2), screenshot acquisition, portal PipeWire capture, and V4L2 webcam remain deferred in the Phase 2 backlog.
+
+
 
