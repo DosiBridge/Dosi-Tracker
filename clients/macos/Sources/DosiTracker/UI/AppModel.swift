@@ -128,9 +128,10 @@ final class AppModel: ObservableObject {
     func startRefreshing() {
         refreshTimer?.invalidate()
         let timer = Timer(timeInterval: AppModel.refreshInterval, repeats: true) { [weak self] _ in
-            // The timer's block is @Sendable: the hop re-captures `self`
-            // weakly instead of reaching into the outer closure's capture.
-            Task { @MainActor [weak self] in
+            // The timer is scheduled on the main run loop, so it fires on the
+            // main thread: refresh in place instead of re-capturing the weak
+            // `self` in a task (Swift 5.10 rejects that capture).
+            MainActor.assumeIsolated {
                 self?.refreshSystemState()
             }
         }
