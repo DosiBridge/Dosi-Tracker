@@ -42,21 +42,17 @@ pub struct AppConfig {
 ///
 /// Until a reviewed consent UI slice is completed, production runtime defaults
 /// to `LocalConsent::Absent`, causing all sensor collection to fail closed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LocalConsent {
     /// No affirmative consent has been granted by the local user yet.
+    /// The default: absent consent fails closed.
+    #[default]
     Absent,
     /// Explicit affirmative consent granted per capability by the user.
     /// Invariant: ConsentedPermissions uses strict default-deny schema (omitted fields default to false).
     Granted(ConsentedPermissions),
     /// Explicitly revoked by the user.
     Revoked,
-}
-
-impl Default for LocalConsent {
-    fn default() -> Self {
-        LocalConsent::Absent
-    }
 }
 
 /// Granular permissions consented to by the interactive user on this device.

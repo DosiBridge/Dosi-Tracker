@@ -28,8 +28,6 @@ import { blockSeconds, groupWindowsByApp, type SessionDetails } from "./activity
 
 const MINUTES_PER_DAY = 24 * 60;
 const MS_PER_MIN = 60_000;
-/** Axis ticks are drawn every two hours, so a widened axis snaps to them. */
-const AXIS_SNAP_MIN = 120;
 
 /** The page size of a day request (the backend's page-size ceiling). */
 export const DAY_ACTIVITY_LIMIT = 1000;

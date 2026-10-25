@@ -246,10 +246,11 @@ mod tests {
 
     #[test]
     fn the_session_combines_server_and_local_policy() {
-        let mut cfg = AppConfig::default();
-        cfg.consent = crate::config::LocalConsent::Granted(CapturePermissions::default().into());
-        cfg.capture.webcam = false;
-        cfg.capture.blur_screenshots = true;
+        let cfg = AppConfig {
+            consent: crate::config::LocalConsent::Granted(CapturePermissions::default().into()),
+            capture: CapturePermissions { webcam: false, blur_screenshots: true, ..CapturePermissions::default() },
+            ..AppConfig::default()
+        };
         let mut source = project("p1");
         source.interval_minutes = 90;
         source.idle_threshold_minutes = 0;
@@ -264,8 +265,10 @@ mod tests {
         assert_eq!(session.interval_minutes(), 60);
         assert!(session.capture_flags().blur_screenshots);
 
-        let mut cfg_p2 = AppConfig::default();
-        cfg_p2.consent = crate::config::LocalConsent::Granted(CapturePermissions::default().into());
+        let cfg_p2 = AppConfig {
+            consent: crate::config::LocalConsent::Granted(CapturePermissions::default().into()),
+            ..AppConfig::default()
+        };
         let session = session_for(&project("p2"), &cfg_p2);
         assert_eq!(session.idle_threshold_minutes(), Some(5), "the server's default");
     }
@@ -286,8 +289,7 @@ mod tests {
 
     #[test]
     fn session_for_fails_closed_when_consent_is_revoked() {
-        let mut cfg = AppConfig::default();
-        cfg.consent = crate::config::LocalConsent::Revoked;
+        let cfg = AppConfig { consent: crate::config::LocalConsent::Revoked, ..AppConfig::default() };
         let session = session_for(&project("p1"), &cfg);
         let perms = &session.policy.perms;
         assert!(!perms.screenshot);
@@ -298,13 +300,14 @@ mod tests {
 
     #[test]
     fn session_for_respects_granular_consent_toggles() {
-        let mut cfg = AppConfig::default();
-        let mut consent = CapturePermissions::default();
-        consent.keyboard = true;
-        consent.mouse = false;
-        consent.active_window = false;
-        consent.screenshot = false;
-        cfg.consent = crate::config::LocalConsent::Granted(consent.into());
+        let consent = CapturePermissions {
+            keyboard: true,
+            mouse: false,
+            active_window: false,
+            screenshot: false,
+            ..CapturePermissions::default()
+        };
+        let cfg = AppConfig { consent: crate::config::LocalConsent::Granted(consent.into()), ..AppConfig::default() };
 
         let session = session_for(&project("p1"), &cfg);
         let perms = &session.policy.perms;

@@ -1,7 +1,7 @@
 // Shared E2E fixtures.
 //
 // `test` puts every page into DEMO MODE:
-//  - the `dosi-token` session cookie is set (the middleware gate passes),
+//  - the `dosi-token` session cookie is set (the route gate, src/proxy.ts, passes),
 //  - NO localStorage JWT exists (the live-backend hydration path is skipped),
 //  - every request to the real API origin is aborted, so a locally running
 //    backend can never leak nondeterminism into the suite.

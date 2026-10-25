@@ -209,7 +209,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         showObserver = DistributedNotificationCenter.default().addObserver(
             forName: SingleInstance.showWindowNotification, object: nil, queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in
+            // The observer's block is @Sendable: the hop re-captures `self`
+            // weakly instead of reaching into the outer closure's capture.
+            Task { @MainActor [weak self] in
                 self?.windows?.showPrimary()
             }
         }

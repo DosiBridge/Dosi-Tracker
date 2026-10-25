@@ -203,7 +203,7 @@ const keep = (key: string, value: string) => {
 
 /** Renew this long before the access token expires. */
 const RENEW_AHEAD_MS = 60_000;
-/** How long the middleware's session flag lasts while a refresh token can renew the session (OpenIddict's default refresh-token lifetime). */
+/** How long the route gate's (src/proxy.ts) session flag lasts while a refresh token can renew the session (OpenIddict's default refresh-token lifetime). */
 const RENEWABLE_SESSION_SECONDS = 14 * 24 * 60 * 60;
 
 interface TokenResponse {
@@ -215,7 +215,7 @@ interface TokenResponse {
 /**
  * Keep a token response: the access token and when it expires, the refresh
  * token (a renewal that brings none keeps the current one), and the session
- * flag the middleware reads. Throws when the browser won't store anything.
+ * flag the route gate (src/proxy.ts) reads. Throws when the browser won't store anything.
  */
 const storeTokens = (json: TokenResponse & { access_token: string }, renewal: boolean) => {
   const lifetime = typeof json.expires_in === 'number' && json.expires_in > 0 ? json.expires_in : 3600;
@@ -367,6 +367,7 @@ const handleUnauthorized = (res: Response) => {
     if (keptInPlace) return;
     logoutApi();
     if (!window.location.pathname.startsWith('/login')) {
+      // eslint-disable-next-line @next/next/no-location-assign-relative-destination -- a full navigation drops every in-memory copy of the ended session's data
       window.location.href = '/login';
     }
   }
@@ -562,8 +563,8 @@ export const putApi = async (endpoint: string, body: unknown) => {
  * OpenIddict resource-owner password flow. Accounts are global: the token
  * names no workspace; requests choose one with X-Workspace-Id.
  *
- * The token is mirrored into a cookie so the Next.js middleware can gate
- * routes server-side (localStorage is invisible to middleware). With
+ * The token is mirrored into a cookie so the Next.js proxy (src/proxy.ts) can
+ * gate routes server-side (localStorage is invisible to it). With
  * `offline_access` the response also carries a refresh token, which renews
  * the one-hour access token as it runs out (see `send`).
  *

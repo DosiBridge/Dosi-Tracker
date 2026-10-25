@@ -471,7 +471,7 @@ actor TrackerWorker {
                 result = .failure(.invalidResponse(error.localizedDescription))
             }
             let clock = await client.lastClockReading()
-            await self.projectsLoaded(result, owner: owner, clock: clock)
+            self.projectsLoaded(result, owner: owner, clock: clock)
         }
     }
 
@@ -758,7 +758,7 @@ actor TrackerWorker {
             } catch {
                 CoreLog.warning("worker", "screen capture failed: \(error)")
             }
-            await self.captureFinished(id, shot, acquisitionId: acqId, generation: gen)
+            self.captureFinished(id, shot, acquisitionId: acqId, generation: gen)
         }
         inFlightCaptureTasks[id] = InFlightCapture(acquisitionId: acqId, generation: gen, task: task)
     }
@@ -1683,7 +1683,7 @@ actor TrackerWorker {
                 totals.failure = .invalidResponse(error.localizedDescription)
             }
             totals.clock = await client.lastClockReading()
-            await self.totalsLoaded(totals, owner: owner, dayStart: starts.today, fetchedAt: now)
+            self.totalsLoaded(totals, owner: owner, dayStart: starts.today, fetchedAt: now)
         }
     }
 
@@ -1768,7 +1768,7 @@ actor TrackerWorker {
                 failure = .transport(TransportFailure(code: -1, description: error.localizedDescription))
             }
             let clock = await client.lastClockReading()
-            await self.heartbeatFinished(owner: owner, failure: failure, clock: clock)
+            self.heartbeatFinished(owner: owner, failure: failure, clock: clock)
         }
     }
 
@@ -1896,7 +1896,8 @@ actor TrackerWorker {
         shared.queueRows = (try? queue.recentRows(owner: owner, limit: TrackerWorker.queueRowsShown)) ?? []
     }
 
-    private func facts() -> StatusFacts {
+    /// What the status is decided from, now (internal for the lifecycle tests).
+    func facts() -> StatusFacts {
         var facts = StatusFacts()
         if queue == nil {
             facts.storageFailure = storageFailure ?? "The local queue is not open yet."

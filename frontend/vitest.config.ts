@@ -3,9 +3,9 @@ import react from "@vitejs/plugin-react";
 import { fileURLToPath } from "node:url";
 
 // Test runner config. Coverage is scoped to the business-LOGIC layer: src/lib logic + the route
-// middleware. UI components and pages are deliberately NOT in the denominator — they are covered
-// behaviorally by component/integration/e2e suites, and chasing a global percentage over JSX
-// rewards volume over meaning.
+// gate (src/proxy.ts, formerly middleware.ts). UI components and pages are deliberately NOT in the
+// denominator — they are covered behaviorally by component/integration/e2e suites, and chasing a
+// global percentage over JSX rewards volume over meaning.
 //
 // `saas-data.ts`, `tenant-data.ts` and `reports-data.ts` ARE included despite the *-data suffix:
 // they hold real derivation logic (plan/usage/invoice math, tenant lifecycle + persistence, report
@@ -34,7 +34,7 @@ export default defineConfig({
       provider: "v8",
       reporter: ["text-summary", "cobertura", "html"],
       reportsDirectory: "./coverage",
-      include: ["src/lib/**/*.ts", "src/middleware.ts"],
+      include: ["src/lib/**/*.ts", "src/proxy.ts"],
       exclude: [
         "src/lib/types.ts",
         "**/*.d.ts",
@@ -43,9 +43,12 @@ export default defineConfig({
         "src/lib/monitor-data.ts",
         "src/lib/host-data.ts",
       ],
-      // Measured baseline on this denominator: lines/statements 96.4%, functions 89.7%,
-      // branches 96.3%. Floors sit just below so the gate is green today but any regression fails.
-      // Ratcheted up after the metrics-consistency work; raise, never lower.
+      // Measured baseline on this denominator (2026-10, Vitest 4): lines 99.2%, statements 99.0%,
+      // functions 98.7%, branches 97.7%. Vitest 4's v8 provider remaps through the AST (its only
+      // mode), counting branches the way istanbul does — every `??`, `||`/`&&` operand, ternary and
+      // default argument — so the same tests read lower than Vitest 3's count did (branches fell
+      // to 92.6% on the upgrade; the *.boundaries.test.ts suites and the edge cases added beside
+      // them brought it back). Ratcheted up after the metrics-consistency work; raise, never lower.
       thresholds: {
         lines: 95,
         functions: 88,

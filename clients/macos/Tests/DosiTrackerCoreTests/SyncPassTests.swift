@@ -2,6 +2,11 @@ import XCTest
 import SQLite3
 @testable import DosiTrackerCore
 
+/// `SQLITE_CONSTRAINT_TRIGGER` (`SQLITE_CONSTRAINT | (7<<8)`), what a trigger's
+/// `RAISE(ABORT, …)` fails a statement with. Swift does not import SQLite's
+/// composite extended-result-code macros, only the primary codes.
+private let sqliteConstraintTrigger: Int32 = SQLITE_CONSTRAINT | (7 << 8)
+
 /// One upload pass (port of the Windows worker's `sync_pending`, with the
 /// CONTRACT §1 handling of each answer), against a real queue file.
 final class SyncPassTests: XCTestCase {
@@ -220,7 +225,7 @@ final class SyncPassTests: XCTestCase {
         XCTAssertTrue(report.uploaded.isEmpty, "Row that failed local queue removal must not be reported as uploaded")
         XCTAssertFalse(report.drained, "Pass must not report drained when queue removal fails")
         if case .some(.queueError(let message)) = report.stop {
-            XCTAssertEqual(message, "queue_remove_failed (sqlite code \(SQLITE_CONSTRAINT_TRIGGER))", "Stop reason must match finite sanitized category and code")
+            XCTAssertEqual(message, "queue_remove_failed (sqlite code \(sqliteConstraintTrigger))", "Stop reason must match finite sanitized category and code")
             XCTAssertLessThanOrEqual(message.count, 64, "Error message must be short and bounded")
             XCTAssertFalse(message.contains("CONFIDENTIAL_DB_PATH"), "Raw SQL/trigger text must never leak into report")
             XCTAssertFalse(message.contains("/Users/victim"), "Database paths must never leak into report")
@@ -279,7 +284,7 @@ final class SyncPassTests: XCTestCase {
     func testRejectionParkFailureHaltsPassRetainsQueuedRowWithoutReportingParkedAndRecovers() async throws {
         let otherOwner = "acme\u{1F}bob@acme.com"
         let ids = try enqueue(["p1", "p2"])
-        let bobSentinel = try queue.enqueue(payload("bob-project"), owner: otherOwner)
+        _ = try queue.enqueue(payload("bob-project"), owner: otherOwner)
 
         var recent = RecentBlocks()
         for (id, project) in zip(ids, ["p1", "p2"]) {
@@ -300,7 +305,7 @@ final class SyncPassTests: XCTestCase {
         XCTAssertTrue(report.uploaded.isEmpty)
         XCTAssertFalse(report.drained)
         if case .some(.queueError(let message)) = report.stop {
-            XCTAssertEqual(message, "queue_park_failed (sqlite code \(SQLITE_CONSTRAINT_TRIGGER))", "Stop reason must match finite sanitized category and code")
+            XCTAssertEqual(message, "queue_park_failed (sqlite code \(sqliteConstraintTrigger))", "Stop reason must match finite sanitized category and code")
             XCTAssertLessThanOrEqual(message.count, 64)
             XCTAssertFalse(message.contains("SECRET_PARK_LEAK"), "Raw trigger text must never leak into report")
             XCTAssertFalse(message.contains("secret_jwt_xyz"), "Secrets must never leak into report")
@@ -371,7 +376,7 @@ final class SyncPassTests: XCTestCase {
         XCTAssertTrue(report.uploaded.isEmpty)
         XCTAssertFalse(report.drained)
         if case .some(.queueError(let message)) = report.stop {
-            XCTAssertEqual(message, "queue_strip_failed (sqlite code \(SQLITE_CONSTRAINT_TRIGGER))", "Stop reason must match finite sanitized category and code")
+            XCTAssertEqual(message, "queue_strip_failed (sqlite code \(sqliteConstraintTrigger))", "Stop reason must match finite sanitized category and code")
             XCTAssertLessThanOrEqual(message.count, 64)
             XCTAssertFalse(message.contains("SECRET_STRIP_LEAK"), "Raw trigger text must never leak into report")
             XCTAssertFalse(message.contains("capture_token_abc"), "Payload keys must never leak into report")
@@ -437,7 +442,7 @@ final class SyncPassTests: XCTestCase {
         XCTAssertTrue(report.parked.isEmpty, "Parking write failed, so row must not be reported as parked")
         XCTAssertTrue(report.uploaded.isEmpty, "Subsequent row must not be uploaded after local mutation failure")
         if case .some(.queueError(let message)) = report.stop {
-            XCTAssertEqual(message, "queue_park_failed (sqlite code \(SQLITE_CONSTRAINT_TRIGGER))", "Stop reason must match finite sanitized category and code")
+            XCTAssertEqual(message, "queue_park_failed (sqlite code \(sqliteConstraintTrigger))", "Stop reason must match finite sanitized category and code")
             XCTAssertLessThanOrEqual(message.count, 64)
             XCTAssertFalse(message.contains("SECRET_GONE_LEAK"))
             XCTAssertFalse(message.contains("GONE_TOKEN"))

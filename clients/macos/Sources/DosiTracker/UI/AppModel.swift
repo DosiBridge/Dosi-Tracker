@@ -128,7 +128,9 @@ final class AppModel: ObservableObject {
     func startRefreshing() {
         refreshTimer?.invalidate()
         let timer = Timer(timeInterval: AppModel.refreshInterval, repeats: true) { [weak self] _ in
-            Task { @MainActor in
+            // The timer's block is @Sendable: the hop re-captures `self`
+            // weakly instead of reaching into the outer closure's capture.
+            Task { @MainActor [weak self] in
                 self?.refreshSystemState()
             }
         }

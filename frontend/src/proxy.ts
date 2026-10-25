@@ -8,11 +8,12 @@ function safeNext(raw: string | null | undefined): string | null {
 }
 
 /**
- * Server-side route gate. `loginApi` mirrors a session flag into the
- * `dosi-token` cookie (the JWT itself stays in localStorage only); without it,
- * every app route redirects to /login. Invitation links open for everyone.
+ * Server-side route gate (Next.js 16 renamed the `middleware` file convention
+ * to `proxy`). `loginApi` mirrors a session flag into the `dosi-token` cookie
+ * (the JWT itself stays in localStorage only); without it, every app route
+ * redirects to /login. Invitation links open for everyone.
  */
-export function middleware(request: NextRequest) {
+export function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl;
   const hasSession = request.cookies.has("dosi-token");
 

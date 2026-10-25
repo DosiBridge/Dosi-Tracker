@@ -11,7 +11,7 @@ expect.extend(toHaveNoViolations);
 // jsdom does not implement layout/media APIs that the theme provider, charts
 // and palette components touch. Stub the minimal surface — tests that care
 // about media queries can override per-test. Guarded so node-environment test
-// files (e.g. middleware.test.ts) can share this setup without a window.
+// files (e.g. proxy.test.ts) can share this setup without a window.
 if (typeof window !== "undefined" && !window.matchMedia) {
   window.matchMedia = (query: string): MediaQueryList =>
     ({

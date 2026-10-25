@@ -949,7 +949,7 @@ impl Worker {
             } else {
                 None
             };
-            let mut perms = block.policy.perms.clone();
+            let mut perms = block.policy.perms;
             if speed == Speed::Fast || late || !current_perms.webcam {
                 perms.webcam = false;
             }
@@ -1327,7 +1327,7 @@ impl Worker {
         }
 
         // Quiesce active capture path: clear any pending screenshots if screenshot permission was withdrawn
-        let screenshot_permitted = self.session.as_ref().map_or(false, |s| s.policy.perms.screenshot);
+        let screenshot_permitted = self.session.as_ref().is_some_and(|s| s.policy.perms.screenshot);
         if !screenshot_permitted {
             self.screens.clear();
         }
@@ -2011,7 +2011,7 @@ impl Worker {
             away: self.away.is_some(),
             suspended: self.suspended.is_some() || self.shutting_down.is_some(),
             tracking: self.blocks.is_open(),
-            consent: self.cfg.consent.clone(),
+            consent: self.cfg.consent,
         }
     }
 
@@ -2037,7 +2037,7 @@ impl Worker {
             task_note: self.task_note.clone().unwrap_or_default(),
             server_reachable: self.reachable,
             clock_skew_minutes: self.clock.skew_minutes(),
-            consent: self.cfg.consent.clone(),
+            consent: self.cfg.consent,
             consent_error: self.consent_error.clone(),
             consent_unsynced: self.consent_unsynced,
         }

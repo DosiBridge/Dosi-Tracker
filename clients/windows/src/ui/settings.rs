@@ -319,7 +319,7 @@ impl TrackerApp {
         section(ui, "Privacy & Permissions", Some(&project), |ui| {
             // Keep VM synchronized if snapshot changed externally
             if self.consent_vm.current != snapshot.consent {
-                self.consent_vm = crate::ui::consent::ConsentViewModel::new(snapshot.consent.clone());
+                self.consent_vm = crate::ui::consent::ConsentViewModel::new(snapshot.consent);
             }
 
             // Consent status pill

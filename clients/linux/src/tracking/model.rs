@@ -72,6 +72,37 @@ where
         .collect()
 }
 
+/// Aggregates already-resolved application names from a provenance-verified source
+/// (such as `/proc` inspection where kernel threads have already been identified via
+/// `PF_KTHREAD` status) into [`WindowInfo`] records.
+///
+/// Preserves canonical executable filenames, case-insensitive first-seen deduplication,
+/// ordering, and caps output at [`MAX_RUNNING_PROGRAMS`] with empty titles and null usage metrics.
+///
+/// Unlike [`program_list`], this provenance-aware aggregation does not discard bracketed
+/// user application names (e.g. `[editor]` or `[worker]`) because native kernel thread
+/// identity is determined by kernel flags in `/proc/[pid]/stat`, not by bracket heuristics.
+pub fn aggregate_running_programs<I>(app_names: I) -> Vec<WindowInfo>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut seen = std::collections::HashSet::new();
+    app_names
+        .into_iter()
+        .map(|name| file_name(&name).trim().to_string())
+        .filter(|name| !name.is_empty())
+        .filter(|name| seen.insert(name.to_lowercase()))
+        .take(MAX_RUNNING_PROGRAMS)
+        .map(|app_name| WindowInfo {
+            app_name,
+            window_title: String::new(),
+            seconds: None,
+            keyboard_hits: None,
+            mouse_clicks: None,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

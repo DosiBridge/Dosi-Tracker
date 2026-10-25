@@ -140,10 +140,9 @@ public final class ActiveAppMonitor: ForegroundWindowSource, @unchecked Sendable
 
     /// The app and window in front now, read on the sampler queue.
     public func currentWindow() async -> ForegroundWindow? {
-        lock.lock()
-        let running = timer != nil
-        lock.unlock()
-        guard running else { return nil }
+        // Through the synchronous accessor: NSLock may not be taken directly
+        // in an async context.
+        guard isRunning else { return nil }
 
         return await withCheckedContinuation { continuation in
             queue.async { [weak self] in

@@ -40,7 +40,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         // The title is a clock: refreshed every second (only changes touch
         // the menu bar).
         let ticker = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
-            Task { @MainActor in
+            // The timer's block is @Sendable: the hop re-captures `self`
+            // weakly instead of reaching into the outer closure's capture.
+            Task { @MainActor [weak self] in
                 self?.refresh()
             }
         }

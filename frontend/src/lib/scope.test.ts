@@ -1,6 +1,8 @@
-import { describe, it, expect } from "vitest";
+import { afterAll, beforeEach, describe, it, expect } from "vitest";
 import { scopeActivities, scopeProjects, canViewProject } from "./scope";
+import { hydrateLiveBackendData } from "./tenant-data";
 import type { Activity, Project, Role, User } from "./types";
+import { resetPrototypeState } from "@/test/harness";
 
 function user(role: Role, id = "u1"): User {
   return {
@@ -106,5 +108,40 @@ describe("canViewProject", () => {
   it("a non-privileged user may open a project only if they are a member", () => {
     expect(canViewProject(user("worker", "u1"), project("p1", ["u1"]))).toBe(true);
     expect(canViewProject(user("client", "u1"), project("p1", ["u2"]))).toBe(false);
+  });
+});
+
+/** A project whose payload carried no member list at all. */
+const withoutMembers = (id: string): Project => ({ ...project(id, []), memberIds: undefined as unknown as string[] });
+
+describe("scopeActivities — a client sees only their projects' work", () => {
+  // A client's scope is read from the active workspace's projects (tenant-data), re-pointed here
+  // through the real hydration entry point.
+  beforeEach(() => {
+    resetPrototypeState();
+  });
+  afterAll(() => {
+    resetPrototypeState();
+  });
+
+  const list = [activity("u1", "p1"), activity("u3", "p2"), activity("u2", "p3"), activity("c1", "p1")];
+
+  it("keeps the activities of the projects the client is a member of — everyone's on those, nobody's elsewhere", () => {
+    hydrateLiveBackendData([project("p1", ["c1", "u1"]), project("p2", ["u3"]), withoutMembers("p3")], []);
+    expect(scopeActivities(user("client", "c1"), list).map((a) => a.id)).toEqual(["u1p1", "c1p1"]);
+  });
+
+  it("a client of no project sees nothing, and a project without a member list counts for no one", () => {
+    hydrateLiveBackendData([project("p1", ["u1"]), withoutMembers("p3")], []);
+    expect(scopeActivities(user("client", "c1"), list)).toEqual([]);
+  });
+});
+
+describe("projects without a member list", () => {
+  it("are listed and opened for owners and admins only", () => {
+    const bare = withoutMembers("p9");
+    expect(scopeProjects(user("worker", "u1"), [bare])).toEqual([]);
+    expect(canViewProject(user("worker", "u1"), bare)).toBe(false);
+    expect(canViewProject(user("admin"), bare)).toBe(true);
   });
 });

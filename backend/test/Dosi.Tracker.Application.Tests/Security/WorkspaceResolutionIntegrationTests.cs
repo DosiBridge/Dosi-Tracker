@@ -146,14 +146,19 @@ public abstract class WorkspaceResolutionIntegrationTests<TStartupModule> : Trac
             return Task.CompletedTask;
         });
 
-        await middleware.InvokeAsync(context);
+        // A request arrives in no workspace, as in production; outside a change the test harness works in
+        // TrackerTestConsts.WorkspaceId (TestCurrentWorkspace), which the null assertion would mistake for a bound one.
+        using (_currentWorkspace.Change(null))
+        {
+            await middleware.InvokeAsync(context);
 
-        nextCalled.ShouldBeFalse("Downstream pipeline must NOT be invoked when caller is not a member of the target workspace");
-        var (status, code, message) = await ReadResponseErrorAsync(context);
-        status.ShouldBe(StatusCodes.Status403Forbidden);
-        code.ShouldBe(TrackerDomainErrorCodes.NotWorkspaceMember);
-        message.ShouldBe("You are not a member of this workspace.");
-        _currentWorkspace.Id.ShouldBeNull("Ambient workspace must not be populated upon admission denial");
+            nextCalled.ShouldBeFalse("Downstream pipeline must NOT be invoked when caller is not a member of the target workspace");
+            var (status, code, message) = await ReadResponseErrorAsync(context);
+            status.ShouldBe(StatusCodes.Status403Forbidden);
+            code.ShouldBe(TrackerDomainErrorCodes.NotWorkspaceMember);
+            message.ShouldBe("You are not a member of this workspace.");
+            _currentWorkspace.Id.ShouldBeNull("Ambient workspace must not be populated upon admission denial");
+        }
     }
 
     [Fact]
@@ -257,7 +262,11 @@ public abstract class WorkspaceResolutionIntegrationTests<TStartupModule> : Trac
             return Task.CompletedTask;
         });
 
-        await middleware.InvokeAsync(context);
+        // In no workspace, as in production (see A_Only_Caller_Spoofing_Workspace_B_Is_Rejected_With_403_Before_Downstream).
+        using (_currentWorkspace.Change(null))
+        {
+            await middleware.InvokeAsync(context);
+        }
 
         nextCalled.ShouldBeTrue();
     }

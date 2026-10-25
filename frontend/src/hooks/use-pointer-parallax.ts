@@ -29,7 +29,9 @@ export function usePointerParallax(strength = 1) {
   const raf = useRef(0);
   const active = useRef(false);
 
-  const tick = useCallback(() => {
+  // A named function expression, so each frame schedules the next by its own name
+  // rather than reading `tick` before its declaration completes.
+  const tick = useCallback(function step() {
     const c = current.current;
     const t = target.current;
     c.x += (t.x - c.x) * 0.08;
@@ -37,7 +39,7 @@ export function usePointerParallax(strength = 1) {
     setOffset({ x: c.x, y: c.y });
     const settled = Math.abs(t.x - c.x) < 0.001 && Math.abs(t.y - c.y) < 0.001;
     if (!settled || active.current) {
-      raf.current = requestAnimationFrame(tick);
+      raf.current = requestAnimationFrame(step);
     } else {
       raf.current = 0;
     }

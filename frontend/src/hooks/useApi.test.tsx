@@ -538,7 +538,7 @@ describe("workspaces and X-Workspace-Id", () => {
 });
 
 describe("loginApi", () => {
-  it("stores the token (no workspace in it) and sets the middleware cookie; sign-out keeps the last workspace", async () => {
+  it("stores the token (no workspace in it) and sets the route gate's cookie; sign-out keeps the last workspace", async () => {
     localStorage.setItem("dosi-workspace", "3f2504e0-4f89-11d3-9a0c-0305e82c3301");
     fetchMock.mockResolvedValue(res({ access_token: "tok", expires_in: 120 }));
     expect(await loginApi("ana@acme.test", "pw")).toBe("tok");

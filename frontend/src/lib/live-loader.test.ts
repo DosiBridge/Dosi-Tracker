@@ -137,6 +137,8 @@ describe("describeWarnings", () => {
     expect(describeWarnings(["team"])).toMatch(/workspace's team data/);
     expect(describeWarnings(["projects", "activity", "team"])).toMatch(/projects, activity and team data/);
     expect(describeWarnings(["plan"])).toMatch(/workspace's plan data/);
+    // A part this version has no label for is named as it was reported.
+    expect(describeWarnings(["team", "billing"])).toMatch(/team and billing data/);
   });
 });
 
@@ -452,6 +454,67 @@ describe("clients", () => {
     await loadLiveSession(get, NOW, { getPage: activityServer([]).getPage, browserZone: "UTC" });
     expect(get.mock.calls.some(([e]) => String(e).includes("/project-members/"))).toBe(false);
   });
+
+  it("reads a roster sent as an { items } envelope: each teammate once, by their project role; rows without a member are skipped", async () => {
+    const LEA = "55555555-5555-5555-5555-555555555555";
+    const KIM = "66666666-6666-6666-6666-666666666666";
+    const data = await loadLiveSession(
+      backend({
+        config: clientConfig,
+        members: [
+          { userId: CLIENT, userName: "nora", projectIds: [P1] },
+          { userId: WORKER, userName: "sam", projectIds: [P1] }, // on the roster too: listed once
+        ],
+        projects: [{ id: P1, title: "Brand refresh" }],
+        ...plan,
+        projectMembers: {
+          [P1]: {
+            items: [
+              { projectId: P1, userId: CLIENT, role: "Client" },
+              { projectId: P1, userId: WORKER, role: "Worker" },
+              { userId: OWNER, role: "Admin", userName: "mira" }, // no project id: the roster's own project
+              { projectId: P1, userId: LEA, role: "Client", userName: "lea" },
+              { projectId: P1, userId: KIM, userName: "kim" }, // no project role
+              { projectId: P1, role: "Worker", userName: "ghost" }, // no member id
+            ],
+          },
+        },
+      }),
+      NOW,
+      { getPage: activityServer([]).getPage, browserZone: "UTC" },
+    );
+    expect(data.user.role).toBe("client");
+    expect(data.users.map((u) => [u.name, u.role])).toEqual([
+      ["nora", "client"],
+      ["sam", "worker"],
+      ["mira", "admin"],
+      ["lea", "client"],
+      ["kim", "worker"],
+    ]);
+    expect([...data.projects[0].memberIds].sort()).toEqual([CLIENT, WORKER, OWNER, LEA, KIM].sort());
+  });
+
+  it("reads no roster when the member's project list holds only blanks — and they stay a member", async () => {
+    const get = backend({ config: clientConfig, members: [{ userId: CLIENT, projectIds: ["", ""] }], projects: [], ...plan });
+    const data = await loadLiveSession(get, NOW, { getPage: activityServer([]).getPage, browserZone: "UTC" });
+    expect(data.user.role).toBe("worker");
+    expect(get.mock.calls.some(([e]) => String(e).includes("/project-members/"))).toBe(false);
+  });
+
+  it("a roster that is neither a list nor an { items } envelope lists nobody — so the member stays a member", async () => {
+    const data = await loadLiveSession(
+      backend({
+        config: clientConfig,
+        members: [{ userId: CLIENT, projectIds: [P1, "p2"] }],
+        projects: [],
+        ...plan,
+        projectMembers: { [P1]: "not a roster", p2: { totalCount: 0 } },
+      }),
+      NOW,
+      { getPage: activityServer([]).getPage, browserZone: "UTC" },
+    );
+    expect(data.user.role).toBe("worker");
+  });
 });
 
 describe("pulses (silent refresh)", () => {
@@ -594,6 +657,24 @@ describe("loadLiveSession — the workspace chosen with X-Workspace-Id", () => {
     const data = await loadLiveSession(get, NOW, { workspaceId: null });
     expect(data.user.role).toBe("host");
     expect(get).toHaveBeenCalledTimes(1);
+  });
+
+  it("a workspace listed without a name or role reads as 'Workspace', with the member's role", async () => {
+    const data = await loadLiveSession(
+      getter({ ...empty, "/api/abp/application-configuration": globalUser(), "/api/app/workspaces/mine": [{ id: WS }] }),
+      NOW,
+      { workspaceId: WS },
+    );
+    expect(data.workspace.name).toBe("Workspace");
+    expect(data.user.role).toBe("worker");
+  });
+
+  it("an answer from workspaces/mine that isn't a list holds no workspace: WorkspaceRequiredError", async () => {
+    const get = getter({
+      "/api/abp/application-configuration": globalUser(),
+      "/api/app/workspaces/mine": { items: [{ id: WS, name: "A", role: "owner" }] },
+    });
+    await expect(loadLiveSession(get, NOW, { workspaceId: WS })).rejects.toBeInstanceOf(WorkspaceRequiredError);
   });
 
   it("fetchLiveIdentity carries the chosen workspace, so a renewal is the same identity", async () => {

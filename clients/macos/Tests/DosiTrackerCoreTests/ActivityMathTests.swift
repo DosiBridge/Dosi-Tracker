@@ -9,7 +9,9 @@ final class ActivityMathTests: XCTestCase {
         ActivityMath.activityPercent(activeSeconds: seconds, start: start, end: end)
     }
 
-    private func slice(_ app: String, _ title: String = "", _ from: Int64, _ to: Int64) -> UsageSlice {
+    // `title` comes last and labelled: an unlabelled defaulted parameter in
+    // the middle would swallow the start of `slice("a.exe", 0, 60)`.
+    private func slice(_ app: String, _ from: Int64, _ to: Int64, title: String = "") -> UsageSlice {
         UsageSlice(app: app, title: title, startMs: t0Ms + from * 1000, endMs: t0Ms + to * 1000)
     }
 

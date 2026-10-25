@@ -204,7 +204,7 @@ dependencies; SQLite is the system library.
 ```bash
 cd clients/macos
 swift build                    # the core library and the app executable
-swift test                     # the core's tests (no permissions or UI needed)
+swift test                     # the core's and the worker's tests (no permissions or UI needed)
 bash scripts/build-app.sh      # "Dosi Tracker.app" + zip, in .build/dist
 ```
 

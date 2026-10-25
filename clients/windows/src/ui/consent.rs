@@ -104,7 +104,7 @@ impl ConsentViewModel {
     /// Grant consent using current draft toggles.
     pub fn grant(&mut self) -> LocalConsent {
         let consent = LocalConsent::Granted(self.draft);
-        self.current = consent.clone();
+        self.current = consent;
         consent
     }
 

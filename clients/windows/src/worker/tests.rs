@@ -343,7 +343,7 @@ impl Machine for FakeMachine {
     }
 
     fn capture_screen(&self, blur: bool) -> Option<crate::tracking::ProvenanceScreenCapture> {
-        let last_perms = self.last_perms.lock().unwrap().clone();
+        let last_perms = *self.last_perms.lock().unwrap();
         let (authorized, effective_blur) = if self.is_tracking_active() {
             let perms = last_perms.unwrap_or_else(CapturePermissions::all_disabled);
             (perms.screenshot, blur || perms.blur_screenshots)
@@ -371,7 +371,7 @@ impl Machine for FakeMachine {
             hook();
         }
         let current_perms = if self.is_tracking_active() {
-            self.last_perms.lock().unwrap().clone().unwrap_or_else(CapturePermissions::all_disabled)
+            (*self.last_perms.lock().unwrap()).unwrap_or_else(CapturePermissions::all_disabled)
         } else {
             CapturePermissions::all_disabled()
         };
@@ -481,7 +481,7 @@ impl Machine for FakeMachine {
     }
 
     fn current_app(&self) -> Option<String> {
-        let last_perms = self.last_perms.lock().unwrap().clone();
+        let last_perms = *self.last_perms.lock().unwrap();
         if self.is_tracking_active() && last_perms.is_some_and(|p| p.active_window) {
             Some("code.exe".into())
         } else {
@@ -583,8 +583,7 @@ fn harness_at(start: DateTime<Utc>, saved: Option<Credentials>, autostart: bool,
     let store = Storage::open(":memory:", None).unwrap();
     let consent = crate::config::LocalConsent::Granted(CapturePermissions::default().into());
     let consent_store = Arc::new(MemoryConsentStore::new(consent));
-    let mut cfg = AppConfig::default();
-    cfg.consent = consent;
+    let cfg = AppConfig { consent, ..AppConfig::default() };
     let mut worker = Worker::new(
         state.clone(),
         cfg,
@@ -610,9 +609,11 @@ fn harness_with_consent(start: DateTime<Utc>, saved: Option<Credentials>, consen
     let (uploader, uploads) = UploaderHandle::detached();
     let store = Storage::open(":memory:", None).unwrap();
     let consent_store = Arc::new(MemoryConsentStore::new(consent));
-    let mut cfg = AppConfig::default();
-    cfg.consent = consent;
-    cfg.capture.webcam = true;
+    let cfg = AppConfig {
+        consent,
+        capture: CapturePermissions { webcam: true, ..CapturePermissions::default() },
+        ..AppConfig::default()
+    };
     let mut worker = Worker::new(
         state.clone(),
         cfg,

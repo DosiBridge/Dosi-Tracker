@@ -203,7 +203,11 @@ final class ConsentLifecycleTests: XCTestCase {
         )
 
         // Set barrier on save: assert in-memory state during save callback
-        var verifiedDuringSave = false
+        // (the barrier is @Sendable, so what it records lives in a box).
+        final class Box: @unchecked Sendable {
+            var verified = false
+        }
+        let verifiedDuringSave = Box()
         memStore.saveBarrier = { [weak manager] _ in
             guard let manager = manager else { return }
             // Conservative intersection must already be applied in memory!
@@ -214,7 +218,7 @@ final class ConsentLifecycleTests: XCTestCase {
                 XCTAssertFalse(p.mouse, "Mouse must be withdrawn in-memory before save")
                 XCTAssertFalse(p.activeWindow, "ActiveWindow expansion must NOT be admitted before save succeeds")
                 XCTAssertTrue(p.blurScreenshots, "Blur tightening must be applied immediately as defense-in-depth")
-                verifiedDuringSave = true
+                verifiedDuringSave.verified = true
             } else {
                 XCTFail("Expected granted interim state")
             }
@@ -223,7 +227,7 @@ final class ConsentLifecycleTests: XCTestCase {
         }
 
         XCTAssertThrowsError(try manager.update(.granted(mixedPerms)))
-        XCTAssertTrue(verifiedDuringSave)
+        XCTAssertTrue(verifiedDuringSave.verified)
 
         // After failure: conservative interim state must NOT be reverted to the old permissive grant!
         if case .granted(let pFinal) = manager.current {
@@ -847,5 +851,24 @@ final class ConsentLifecycleTests: XCTestCase {
         // Note: Foreign UID enforcement (st.st_uid != geteuid()) is implemented in
         // validateParentDirectory and validateTargetFile, but cannot be executed in this unprivileged
         // test harness without multi-user root escalation; marked unexecuted in tests.
+    }
+}
+
+/// The admission-gating test's window queries, in Unix milliseconds, over the
+/// public `InputLog` API.
+private extension InputLog {
+    /// Key presses and clicks in `[startMs, endMs)`.
+    func counts(fromMs startMs: Int64, toMs endMs: Int64) -> InputCounts {
+        InputCounts(keyPresses: keyPresses(fromMs: startMs, toMs: endMs).count,
+                    clicks: clicks(fromMs: startMs, toMs: endMs).count)
+    }
+
+    /// How many distinct seconds of `[startMs, endMs)` had keyboard activity,
+    /// and how many had mouse activity.
+    func activitySeconds(fromMs startMs: Int64, toMs endMs: Int64) -> (keyboard: Int, mouse: Int) {
+        let first = EpochTime.floorDiv(startMs, 1000)
+        let last = EpochTime.floorDiv(endMs - 1, 1000)
+        return (activeSeconds(fromSecond: first, toSecond: last, keyboard: true, mouse: false).count,
+                activeSeconds(fromSecond: first, toSecond: last, keyboard: false, mouse: true).count)
     }
 }

@@ -47,7 +47,7 @@ module.exports = {
       name: "no-orphans",
       severity: "warn",
       comment: "Unreferenced modules are dead weight — delete or wire them up.",
-      from: { orphan: true, pathNot: ["\\.(test|spec)\\.tsx?$", "\\.d\\.ts$", "^src/test", "^src/middleware\\.ts$", "^src/app"] },
+      from: { orphan: true, pathNot: ["\\.(test|spec)\\.tsx?$", "\\.d\\.ts$", "^src/test", "^src/proxy\\.ts$", "^src/app"] },
       to: {},
     },
   ],

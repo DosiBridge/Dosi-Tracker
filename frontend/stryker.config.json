@@ -1,6 +1,7 @@
 {
   "$schema": "./node_modules/@stryker-mutator/core/schema/stryker-schema.json",
-  "_comment": "Mutation testing for the web DECISION logic (docs/QUALITY.md §4, docs/testing/TEST_STRATEGY.md): permissions, plan/money math, filtering, scoping, export escaping, report aggregation, route gating. saas-data.ts and reports-data.ts are in scope because they hold real derivation logic. tenant-data.ts is deliberately OUT: ~400 of its 650 lines are seeded-data GENERATORS, whose mutants are both low-signal and enormously expensive (a full run exceeded 50 minutes and did not finish) — it stays in the coverage denominator instead, where it measures cheaply. Fixture blobs (mock-data, monitor-data, host-data) and type-only modules are excluded outright. UI/pages are guarded behaviorally by the component and e2e suites. 'break' is the ratcheting floor — raise it as the score improves, never lower.",
+  "_comment": "Mutation testing for the web DECISION logic (docs/QUALITY.md §4, docs/testing/TEST_STRATEGY.md): permissions, plan/money math, filtering, scoping, export escaping, report aggregation, route gating. saas-data.ts and reports-data.ts are in scope because they hold real derivation logic. tenant-data.ts is deliberately OUT: ~400 of its 650 lines are seeded-data GENERATORS, whose mutants are both low-signal and enormously expensive (a full run exceeded 50 minutes and did not finish) — it stays in the coverage denominator instead, where it measures cheaply. Fixture blobs (mock-data, monitor-data, host-data) and type-only modules are excluded outright. UI/pages are guarded behaviorally by the component and e2e suites. 'break' is the ratcheting floor — raise it as the score improves, never lower. dryRunTimeoutMinutes: the vitest runner forces ONE worker, so the initial run executes the whole related suite serially (~2,100 tests: 4 min 59 s measured 2026-10 under Vitest 4) — right at Stryker's 5-minute default, which a busy runner overshoots. The allowance only lets the run start; it changes no threshold.",
+  "dryRunTimeoutMinutes": 20,
   "testRunner": "vitest",
   "vitest": {
     "configFile": "vitest.config.ts"
@@ -8,7 +9,7 @@
   "coverageAnalysis": "perTest",
   "mutate": [
     "src/lib/**/*.ts",
-    "src/middleware.ts",
+    "src/proxy.ts",
     "!src/lib/mock-data.ts",
     "!src/lib/monitor-data.ts",
     "!src/lib/host-data.ts",

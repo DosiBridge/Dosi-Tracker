@@ -12,8 +12,11 @@
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </Content>
+    <!-- Git-ignored, developer-local overrides (e.g. real client credentials). Optional, like the
+         AddJsonFile("appsettings.secrets.json", optional: true) in Program.cs: a clean clone (CI)
+         has no copy, and an unconditional item fails the build with MSB3030. -->
     <None Remove="appsettings.secrets.json" />
-    <Content Include="appsettings.secrets.json">
+    <Content Include="appsettings.secrets.json" Condition="Exists('appsettings.secrets.json')">
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </Content>

@@ -12,6 +12,7 @@ import {
   defaultActivityFilters,
   type ActivityFilters,
 } from "./activity-filters";
+import { browserTimeZone } from "./time-zone";
 import type { Activity } from "./types";
 
 function act(over: Partial<Activity> & Pick<Activity, "id">): Activity {
@@ -277,6 +278,27 @@ describe("applyActivityFilters — time-of-day window (start time, in the zone)"
   });
   it("drops a row after the upper bound", () => {
     expect(applyActivityFilters([a1], { ...wide, endTime: "08:58" }, utc)).toHaveLength(0);
+  });
+  it("ignores a bound it can't read (a malformed saved filter) instead of dropping every row", () => {
+    expect(ids(applyActivityFilters(all, { ...wide, startTime: "--:--", endTime: "late" }, utc))).toEqual(ids(applyActivityFilters(all, wide, utc)));
+  });
+});
+
+describe("applyActivityFilters — unmeasured blocks wherever they start in the list", () => {
+  const n1 = act({ id: "n1", startedAt: "2024-06-04T09:00:00Z", endedAt: "2024-06-04T10:00:00Z", productivity: 0 });
+  const n2 = act({ id: "n2", startedAt: "2024-06-05T09:00:00Z", endedAt: "2024-06-05T10:00:00Z", productivity: 0 });
+  const ctx = { isMeasured: (a: Activity) => !a.id.startsWith("n") };
+
+  it("sort after every measured block, keeping their own order among themselves", () => {
+    expect(ids(applyActivityFilters([n1, a1, n2, a2], { ...wide, sort: "prod-high" }, ctx))).toEqual(["a1", "a2", "n1", "n2"]);
+    expect(ids(applyActivityFilters([n2, a2, n1, a1], { ...wide, sort: "prod-low" }, ctx))).toEqual(["a2", "a1", "n2", "n1"]);
+  });
+});
+
+describe("activityDateRange — the zone", () => {
+  it("without a zone, reads whole days in the browser's zone", () => {
+    const f = { rangeKey: "custom" as const, customFrom: "2024-06-01", customTo: "2024-06-02" };
+    expect(activityDateRange(f)).toEqual(activityDateRange(f, { timeZone: browserTimeZone() }));
   });
 });
 

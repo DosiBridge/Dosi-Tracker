@@ -147,6 +147,7 @@ export function clearCurrentWorkspace(): void {
 export function redirectToLogin(): void {
   if (typeof window === "undefined") return;
   try {
+    // eslint-disable-next-line @next/next/no-location-assign-relative-destination -- the full document unload is the point (see above): router.push would keep the signed-out tenant's data in memory
     window.location.assign("/login");
   } catch {
     // A navigation the environment refuses leaves the neutral signed-out screen up.
@@ -165,6 +166,7 @@ export function redirectToWorkspaceChooser(): void {
   if (typeof window === "undefined") return;
   try {
     if (isWorkspaceFreePath(window.location.pathname)) return;
+    // eslint-disable-next-line @next/next/no-location-assign-relative-destination -- a full navigation, so nothing of the refused workspace stays loaded
     window.location.assign(WORKSPACE_CHOOSER_PATH);
   } catch {
     // Keep the current screen.

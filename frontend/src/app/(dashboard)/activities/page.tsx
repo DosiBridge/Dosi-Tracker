@@ -131,7 +131,16 @@ function ActivitiesPageInner() {
   const [viewerIndex, setViewerIndex] = useState<number | null>(null);
   // Set when the viewer was opened from a session's report, so closing it goes back there.
   const [viewerReturnTo, setViewerReturnTo] = useState<Activity | null>(null);
-  const [view, setView] = useState<ViewMode>(searchParams.get("view") === "screens" ? "screens" : "sessions");
+  // The URL's view wins whenever it changes (back/forward, a link to ?view=screens); the
+  // toggle sets the state at once and the URL follows. Adjusted while rendering, as React
+  // recommends for state that tracks an input — not in an effect, which would render twice.
+  const urlView: ViewMode = searchParams.get("view") === "screens" ? "screens" : "sessions";
+  const [view, setView] = useState<ViewMode>(urlView);
+  const [syncedView, setSyncedView] = useState<ViewMode>(urlView);
+  if (syncedView !== urlView) {
+    setSyncedView(urlView);
+    setView(urlView);
+  }
 
   // Every day, date preset and clock time on the page reads in the reporting zone.
   const zone = useReportingZone(isLive);
@@ -208,10 +217,6 @@ function ActivitiesPageInner() {
 
   // Notes edited on this page, by block: they win over what the list was loaded with.
   const [notes, setNotes] = useState<ReadonlyMap<string, string | null>>(() => new Map());
-
-  useEffect(() => {
-    setView(searchParams.get("view") === "screens" ? "screens" : "sessions");
-  }, [searchParams]);
 
   // Project names/colors: the session's dataset holds the tenant's REAL
   // projects in a live session and the seeded ones in demo mode.

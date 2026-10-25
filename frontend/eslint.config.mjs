@@ -27,8 +27,9 @@ const eslintConfig = defineConfig([
   // synchronously set state (react-hooks/set-state-in-effect). Refactoring untested effects is
   // deferred until component tests exist (Phase 3), so we do it safely rather than blind. Until
   // then they are WARNINGS, and `npm run lint` caps the total with `--max-warnings` so the count
-  // can only DECREASE: any NEW violation breaks the build. Ratchet the cap down to 0, then delete
-  // this block and let the rules return to their default `error` severity.
+  // can only DECREASE: any NEW violation breaks the build. The cap has reached 0 (every remaining
+  // case was fixed or carries a line-scoped disable with its reason); next, delete this block and
+  // let the rules return to their default `error` severity.
   {
     // Scoped to src: the react-hooks plugin is only registered for app sources, and applying
     // these overrides to config files (.dependency-cruiser.cjs) crashes eslint with an

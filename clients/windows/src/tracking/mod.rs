@@ -110,6 +110,13 @@ impl AcquisitionProvider for NativeAcquisitionProvider {
     }
 }
 
+/// A callback the fake runs inside an acquisition, so a test can interleave
+/// e.g. a revocation with an in-flight query.
+pub type AcquisitionHook = Box<dyn Fn() + Send + Sync>;
+
+/// The screen-capture callback; it receives the requested blur.
+pub type ScreenCaptureHook = Box<dyn Fn(bool) + Send + Sync>;
+
 /// In-memory fake acquisition provider with atomic counters and canned responses.
 /// Completely side-effect-free: never calls native camera, window, input, or screen APIs.
 pub struct FakeAcquisitionProvider {
@@ -122,10 +129,10 @@ pub struct FakeAcquisitionProvider {
     canned_webcam: Mutex<Option<String>>,
     canned_window: Mutex<Option<WindowInfo>>,
     canned_processes: Mutex<Option<Vec<WindowInfo>>>,
-    on_current_window: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
-    on_capture_screen: Mutex<Option<Box<dyn Fn(bool) + Send + Sync>>>,
-    on_capture_webcam: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
-    on_running_programs: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    on_current_window: Mutex<Option<AcquisitionHook>>,
+    on_capture_screen: Mutex<Option<ScreenCaptureHook>>,
+    on_capture_webcam: Mutex<Option<AcquisitionHook>>,
+    on_running_programs: Mutex<Option<AcquisitionHook>>,
 }
 
 #[allow(dead_code)]

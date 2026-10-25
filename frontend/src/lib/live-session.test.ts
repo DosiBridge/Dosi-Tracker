@@ -14,6 +14,7 @@ import {
   isStorageAvailable,
   readStorage,
   referenceNow,
+  reloadPage,
   removeStorage,
   tokenExpiresAt,
   writeStorage,
@@ -175,5 +176,26 @@ describe("agoLabel", () => {
 
   it("defaults to the reference clock", () => {
     expect(agoLabel(new Date(NOW.getTime() - 2 * 60_000).toISOString())).toBe("2m ago");
+  });
+});
+
+describe("reloadPage — another tab switched the browser to a different account", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("reloads the page", () => {
+    const reload = vi.fn();
+    vi.stubGlobal("location", { ...window.location, reload });
+    reloadPage();
+    expect(reload).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the current screen when the browser refuses to reload", () => {
+    vi.stubGlobal("location", {
+      ...window.location,
+      reload: () => {
+        throw new DOMException("Navigation blocked", "SecurityError");
+      },
+    });
+    expect(() => reloadPage()).not.toThrow();
   });
 });

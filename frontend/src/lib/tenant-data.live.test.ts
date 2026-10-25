@@ -187,6 +187,12 @@ describe("installing a live dataset", () => {
     expect(activityCoverage()).toBeNull();
   });
 
+  it("a live dataset installed without a coverage report claims none", () => {
+    installLiveDataset({ workspaceId: "live-tenant-t2", users: [], projects: [], activities: [], now: NOW });
+    expect(isLiveDataset()).toBe(true);
+    expect(activityCoverage()).toBeNull();
+  });
+
   it("dropLiveDatasets forgets the tenant and returns to the primary demo workspace", () => {
     const { owner, project, rows } = sample();
     installLiveDataset({ workspaceId: "live-tenant-t1", users: [owner], projects: [project], activities: rows, now: NOW });
@@ -224,5 +230,23 @@ describe("createTenantProject — storage robustness", () => {
     expect(() => createTenantProject("w1", p)).not.toThrow();
     const saved: unknown = JSON.parse(localStorage.getItem("dosi-projects-created-w1") ?? "null");
     expect(Array.isArray(saved) && saved.some((x) => (x as { id: string }).id === "t-new")).toBe(true);
+  });
+});
+
+describe("createTenantProject — once per project, and only in its own workspace", () => {
+  it("creating the same project twice (a double submit) lists and remembers it once", () => {
+    const p = buildProject({ id: "t-once", title: "Only once" });
+    createTenantProject("w1", p);
+    createTenantProject("w1", p);
+    expect(datasetFor("w1").projects.filter((x) => x.id === "t-once")).toHaveLength(1);
+    expect(projects.filter((x) => x.id === "t-once")).toHaveLength(1); // the active workspace's bindings
+    const saved = JSON.parse(localStorage.getItem("dosi-projects-created-w1") ?? "[]") as { id: string }[];
+    expect(saved.filter((x) => x.id === "t-once")).toHaveLength(1);
+  });
+
+  it("a project created in another workspace never shows up in the active one", () => {
+    createTenantProject("w2", buildProject({ id: "t-elsewhere", title: "Acme only" }));
+    expect(datasetFor("w2").projects.some((x) => x.id === "t-elsewhere")).toBe(true);
+    expect(projects.some((x) => x.id === "t-elsewhere")).toBe(false);
   });
 });

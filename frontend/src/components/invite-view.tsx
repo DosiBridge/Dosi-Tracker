@@ -75,6 +75,7 @@ export function InviteView({ token }: { token: string }) {
 
   function signOut() {
     logoutApi();
+    // eslint-disable-next-line @next/next/no-location-assign-relative-destination -- reload the invitation signed out: a full navigation drops the previous account's in-memory session
     window.location.assign(`/invite/${encodeURIComponent(token)}`);
   }
 

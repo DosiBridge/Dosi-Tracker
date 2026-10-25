@@ -364,11 +364,16 @@ public final class InputFilter: @unchecked Sendable {
 
         log.sawEvent(atMs: ms)
         if injected {
-            // Seen, reported, never counted as the user's input.
-            if isKb {
+            // Seen, reported, never counted as the user's input. A release is
+            // not an event of its own (as on Windows): a posted key press or
+            // click counts once, not twice.
+            switch input {
+            case .keyDown, .keyRepeat:
                 log.recordInjected(keyboard: true, atMs: ms)
-            } else {
+            case .buttonDown, .move, .wheel:
                 log.recordInjected(keyboard: false, atMs: ms)
+            case .keyUp, .buttonUp:
+                break
             }
             return
         }

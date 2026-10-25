@@ -194,6 +194,25 @@ describe("changePasswordAtSignIn — ABP's change-at-sign-in exchange", () => {
     const dropped = vi.fn().mockResolvedValueOnce(challenge).mockRejectedValueOnce(new TypeError("Failed to fetch"));
     expect(await changePasswordAtSignIn(request(dropped))).toEqual({ ok: false, failure: { kind: "unreachable" }, message: null });
   });
+
+  it("reads a refusal whose body is empty or not an object as the refusal it is (no token to continue with)", async () => {
+    const bodyOf = (status: number, text: string): Response =>
+      ({ ok: false, status, headers: { get: () => null }, text: async () => text }) as unknown as Response;
+    for (const text of ["", "null", '"denied"']) {
+      const fetch = vi.fn().mockResolvedValueOnce(bodyOf(400, text));
+      expect(await changePasswordAtSignIn(request(fetch))).toEqual({ ok: false, failure: { kind: "invalid", status: 400 }, message: null });
+      expect(fetch).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it("a rate limit without a Retry-After header waits the default window", async () => {
+    const limited = vi.fn().mockResolvedValueOnce(response(429, {}));
+    expect(await changePasswordAtSignIn(request(limited))).toEqual({
+      ok: false,
+      failure: { kind: "rate-limited", retryAfterSeconds: SIGN_IN_RETRY_DEFAULT_SECONDS },
+      message: null,
+    });
+  });
 });
 
 describe("workspace choices", () => {
@@ -240,5 +259,7 @@ describe("workspace choices", () => {
     expect(workspaceRoleLabel("MANAGER")).toBe("Manager");
     expect(workspaceRoleLabel(null)).toBe("Member");
     expect(workspaceInitial(a)).toBe("A");
+    expect(workspaceInitial({ name: " nimbus" })).toBe("N");
+    expect(workspaceInitial({ name: "   " })).toBe("?");
   });
 });

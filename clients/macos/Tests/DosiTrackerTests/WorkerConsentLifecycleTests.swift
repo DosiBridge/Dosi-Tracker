@@ -11,7 +11,7 @@ final class WorkerConsentLifecycleTests: XCTestCase {
     // MARK: - Test Doubles & Protocol Stubs
 
     /// Isolated URLProtocol preventing any network traffic from executing during tests.
-    private final class OfflineTestURLProtocol: URLProtocol, @unchecked Sendable {
+    private final class OfflineTestURLProtocol: URLProtocol {
         override class func canInit(with request: URLRequest) -> Bool { true }
         override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
         override func startLoading() {
@@ -20,33 +20,36 @@ final class WorkerConsentLifecycleTests: XCTestCase {
         override func stopLoading() {}
     }
 
-    /// Blockable fake URLProtocol enabling deterministic in-flight transport pass testing.
-    private final class BlockableURLProtocol: URLProtocol, @unchecked Sendable {
+    /// Blockable fake transport for the in-flight upload regression: the first sign-in
+    /// succeeds, every upload is refused with 401 so the upload pass signs in again, and
+    /// that second sign-in blocks in transport until released (then fails offline).
+    /// Everything else fails offline at once.
+    ///
+    /// The upload pass waits for that sign-in in the client's token renewal, which a
+    /// cancelled shutdown still joins. The test queues its block only once the start-up
+    /// project fetch has been answered, so no other request can be waiting on it.
+    private final class BlockableURLProtocol: URLProtocol {
         private static let lock = NSLock()
-        private static var isBlocked = false
         private static let requestEnteredSemaphore = DispatchSemaphore(value: 0)
         private static let requestReleaseSemaphore = DispatchSemaphore(value: 0)
-        private static var requestCount = 0
-        private(set) static var timedOut = false
+        private static let projectsAnsweredSemaphore = DispatchSemaphore(value: 0)
+        private static var tokenRequests = 0
+        private static var _timedOut = false
+
+        static var timedOut: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return _timedOut
+        }
 
         static func reset() {
             lock.lock()
-            isBlocked = false
-            requestCount = 0
-            timedOut = false
-            lock.unlock()
-        }
-
-        static func blockNextRequest() {
-            lock.lock()
-            isBlocked = true
+            tokenRequests = 0
+            _timedOut = false
             lock.unlock()
         }
 
         static func unblock() {
-            lock.lock()
-            isBlocked = false
-            lock.unlock()
             requestReleaseSemaphore.signal()
         }
 
@@ -54,29 +57,63 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             requestEnteredSemaphore.wait(timeout: .now() + timeout) == .success
         }
 
+        /// The project list the worker fetches when it starts has been answered.
+        static func waitForProjectsAnswered(timeout: TimeInterval = 3.0) -> Bool {
+            projectsAnsweredSemaphore.wait(timeout: .now() + timeout) == .success
+        }
+
         override class func canInit(with request: URLRequest) -> Bool { true }
         override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
         override func startLoading() {
-            Self.lock.lock()
-            let blocked = Self.isBlocked
-            Self.requestCount += 1
-            Self.lock.unlock()
-
-            if blocked {
+            guard let url = request.url else {
+                client?.urlProtocol(self, didFailWithError: URLError(.badURL))
+                return
+            }
+            switch url.path {
+            case "/connect/token":
+                Self.lock.lock()
+                Self.tokenRequests += 1
+                let attempt = Self.tokenRequests
+                Self.lock.unlock()
+                if attempt == 1 {
+                    respond(200, body: "{\"access_token\":\"t0k3n\",\"token_type\":\"Bearer\",\"expires_in\":3600}")
+                    return
+                }
+                // The upload pass signing in again after its 401: blocked in transport.
                 Self.requestEnteredSemaphore.signal()
-                let waitResult = Self.requestReleaseSemaphore.wait(timeout: .now() + 5.0)
-                if waitResult == .timedOut {
+                if Self.requestReleaseSemaphore.wait(timeout: .now() + 5.0) == .timedOut {
                     Self.lock.lock()
-                    Self.timedOut = true
+                    Self._timedOut = true
                     Self.lock.unlock()
                 }
+                client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))
+            case "/api/app/activity":
+                respond(401, body: "")
+            case "/api/app/project/my-projects":
+                client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))
+                Self.projectsAnsweredSemaphore.signal()
+            default:
+                client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))
             }
-
-            client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))
         }
 
         override func stopLoading() {}
+
+        private func respond(_ status: Int, body: String) {
+            guard let url = request.url,
+                  let response = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1",
+                                                 headerFields: ["Content-Type": "application/json"])
+            else {
+                client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+                return
+            }
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            if !body.isEmpty {
+                client?.urlProtocol(self, didLoad: Data(body.utf8))
+            }
+            client?.urlProtocolDidFinishLoading(self)
+        }
     }
 
     private struct TestCaptureError: Error, LocalizedError {
@@ -193,8 +230,15 @@ final class WorkerConsentLifecycleTests: XCTestCase {
 
             if blocked {
                 captureEnteredSemaphore.signal()
-                let waitResult = captureReleaseSemaphore.wait(timeout: .now() + 5.0)
-                if waitResult == .timedOut {
+                // Waited out on a GCD thread rather than a cooperative one, so the
+                // worker and the test keep the Swift thread pool (a CI Mac has 3 cores).
+                // Cancellation does not release it: only `unblock()` (or the timeout) does.
+                let released = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+                    DispatchQueue.global().async {
+                        continuation.resume(returning: self.captureReleaseSemaphore.wait(timeout: .now() + 5.0) == .success)
+                    }
+                }
+                if !released {
                     lock.lock()
                     timedOut = true
                     lock.unlock()
@@ -203,13 +247,7 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             }
 
             let data = customData ?? Data([UInt8(count & 0xFF), UInt8(count & 0xFF)])
-            return ScreenCapture(
-                displayID: CGDirectDisplayID(count),
-                fullJpeg: data,
-                thumbnailJpeg: data,
-                capturedAt: Date(),
-                blurred: blur
-            )
+            return ScreenCapture(image: data, thumbnail: data, capturedAt: Date(), blurred: blur)
         }
     }
 
@@ -219,8 +257,8 @@ final class WorkerConsentLifecycleTests: XCTestCase {
         func capture(blur: Bool) async throws -> ScreenCapture {
             captureCount += 1
             lastBlur = blur
-            return ScreenCapture(displayID: 1, fullJpeg: Data([0xFF, 0xD8]), thumbnailJpeg: Data([0xFF, 0xD8]),
-                                 capturedAt: Date(), blurred: blur)
+            return ScreenCapture(image: Data([0xFF, 0xD8]), thumbnail: Data([0xFF, 0xD8]), capturedAt: Date(),
+                                 blurred: blur)
         }
     }
 
@@ -237,7 +275,7 @@ final class WorkerConsentLifecycleTests: XCTestCase {
         var frontmostAppName: String? = "Xcode"
         func currentWindow() async -> ForegroundWindow? {
             queryCount += 1
-            return ForegroundWindow(app: "Xcode", title: "Project.swift", processID: 123)
+            return ForegroundWindow(appName: "Xcode", windowTitle: "Project.swift")
         }
     }
 
@@ -342,7 +380,7 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             observers.append(observerTask)
             lock.unlock()
 
-            return await XCTWaiter.fulfillment(of: [exp], timeout: timeout)
+            return await XCTWaiter().fulfillment(of: [exp], timeout: timeout)
         }
 
         func joinAll() async {
@@ -358,6 +396,29 @@ final class WorkerConsentLifecycleTests: XCTestCase {
 
     // MARK: - Harness Setup
 
+    /// The queue owner key of the signed-in test account (workspace `test-ws`,
+    /// user `user@example.com`): its project cache and its queued rows.
+    private static let owner = Queue.ownerKey(workspace: "test-ws", username: "user@example.com")
+
+    /// One worker wired to fakes, and what to clean up after it.
+    private struct Harness {
+        let worker: TrackerWorker
+        let consentManager: ConsentManager
+        let driverRecorder: DriverPolicyRecorder
+        let snapshots: Box<[TrackerSnapshot]>
+        let paths: AppPaths
+        let session: URLSession
+        let suiteName: String
+        /// The temporary folder holding `paths`.
+        let root: URL
+    }
+
+    /// The snapshot the worker published last: what the window and the menu show now.
+    private func latest(_ snapshots: Box<[TrackerSnapshot]>, file: StaticString = #filePath,
+                        line: UInt = #line) throws -> TrackerSnapshot {
+        try XCTUnwrap(snapshots.value.last, "The worker must have published a snapshot", file: file, line: line)
+    }
+
     private func makeHarness(
         initialConsent: LocalConsent = .absent,
         customStorage: (any ConsentStorage)? = nil,
@@ -367,7 +428,7 @@ final class WorkerConsentLifecycleTests: XCTestCase {
         onShutdownJoining: (@Sendable () -> Void)? = nil,
         onCaptureCompleted: (@Sendable (Int, UInt64) -> Void)? = nil,
         urlProtocolClass: AnyClass? = nil
-    ) throws -> (TrackerWorker, ConsentManager, DriverPolicyRecorder, Box<[TrackerSnapshot]>, AppPaths, URLSession, String) {
+    ) throws -> Harness {
         let tempDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("worker-consent-\(UUID().uuidString.lowercased())", isDirectory: true)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
@@ -386,7 +447,8 @@ final class WorkerConsentLifecycleTests: XCTestCase {
         let preferences = Preferences(defaults: userDefaults)
         preferences.rememberedProjectId = project?.id ?? "p-test"
 
-        let projectCache = ProjectCacheStore(paths: paths)
+        // The saved list lets tracking start offline (every request here fails).
+        let projectCache = ProjectCacheStore(defaults: userDefaults)
         let sampleProject = project ?? MyProject(
             id: "p-test",
             title: "Test Project",
@@ -400,7 +462,7 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             idleThresholdMinutes: 5,
             blurScreenshots: false
         )
-        projectCache.save(ProjectCache(owner: "test-ws:user@example.com", resolvedAt: Date(), projects: [sampleProject]))
+        projectCache.save(ProjectCache(owner: Self.owner, resolvedAt: Date(), projects: [sampleProject]))
 
         let driverRecorder = DriverPolicyRecorder()
         let snapshotsBox = Box<[TrackerSnapshot]>([])
@@ -442,7 +504,9 @@ final class WorkerConsentLifecycleTests: XCTestCase {
         )
 
         let worker = TrackerWorker(dependencies: deps)
-        return (worker, consentManager, driverRecorder, snapshotsBox, paths, offlineSession, suiteName)
+        return Harness(worker: worker, consentManager: consentManager, driverRecorder: driverRecorder,
+                       snapshots: snapshotsBox, paths: paths, session: offlineSession, suiteName: suiteName,
+                       root: tempDir)
     }
 
     private func withHarness(
@@ -457,7 +521,7 @@ final class WorkerConsentLifecycleTests: XCTestCase {
         releaseBarriers: (@Sendable () -> Void)? = nil,
         _ body: (TrackerWorker, ConsentManager, DriverPolicyRecorder, Box<[TrackerSnapshot]>, AppPaths) async throws -> Void
     ) async throws {
-        let (worker, consentManager, driverRecorder, snapshotsBox, paths, session, suiteName) = try makeHarness(
+        let harness = try makeHarness(
             initialConsent: initialConsent,
             customStorage: customStorage,
             screenCapturer: screenCapturer,
@@ -468,12 +532,13 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             urlProtocolClass: urlProtocolClass
         )
         defer {
-            session.invalidateAndCancel()
-            UserDefaults.standard.removePersistentDomain(forName: suiteName)
-            try? FileManager.default.removeItem(at: paths.root)
+            harness.session.invalidateAndCancel()
+            UserDefaults.standard.removePersistentDomain(forName: harness.suiteName)
+            try? FileManager.default.removeItem(at: harness.root)
         }
+        let worker = harness.worker
         do {
-            try await body(worker, consentManager, driverRecorder, snapshotsBox, paths)
+            try await body(worker, harness.consentManager, harness.driverRecorder, harness.snapshots, harness.paths)
         } catch {
             releaseBarriers?()
             await worker.shutdown()
@@ -495,29 +560,35 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             runningPrograms: true,
             blurScreenshots: false
         )
-        try await withHarness(initialConsent: .granted(allLocalGranted)) { worker, _, driverRecorder, _, _ in
+        try await withHarness(initialConsent: .granted(allLocalGranted)) { worker, _, driverRecorder, snapshots, _ in
             await worker.start(launchedAtLogin: false, startPeriodicTicks: false)
 
             guard let lastDrivers = driverRecorder.last else {
                 return XCTFail("Driver policy recording must not be nil after start")
             }
             XCTAssertEqual(lastDrivers, allLocalGranted, "Positive control: active tracking must be established with fake drivers started")
-            let snapshot = await worker.snapshot()
-            XCTAssertTrue(snapshot.facts.consentGranted)
+            let facts = await worker.facts()
+            XCTAssertTrue(facts.consentGranted)
+            XCTAssertTrue(facts.tracking)
+            let snapshot = try self.latest(snapshots)
+            XCTAssertEqual(snapshot.status, .tracking)
             XCTAssertEqual(snapshot.localConsent, .granted(allLocalGranted))
         }
     }
 
     func testAbsentConsentPreventsStartAndKeepsDriversStopped() async throws {
-        try await withHarness(initialConsent: .absent) { worker, _, driverRecorder, _, _ in
+        try await withHarness(initialConsent: .absent) { worker, _, driverRecorder, snapshots, _ in
             await worker.start(launchedAtLogin: false, startPeriodicTicks: false)
 
             guard let lastDrivers = driverRecorder.last else {
                 return XCTFail("Driver policy recording must not be nil after start")
             }
             XCTAssertEqual(lastDrivers, ConsentedPermissions.allDisabled)
-            let snapshot = await worker.snapshot()
-            XCTAssertFalse(snapshot.facts.consentGranted)
+            let facts = await worker.facts()
+            XCTAssertFalse(facts.consentGranted)
+            XCTAssertFalse(facts.tracking, "Nothing is tracked without consent")
+            let snapshot = try self.latest(snapshots)
+            XCTAssertEqual(snapshot.status, .stopped("Consent required"))
             XCTAssertEqual(snapshot.localConsent, .absent)
         }
     }
@@ -597,28 +668,28 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             XCTAssertEqual(resumed, allLocalGranted, "Resume restores active drivers")
 
             // 2. Lock
-            await worker.handleSystemEvent(SystemEvent(at: Date(), kind: .screenLocked))
+            await worker.handleSystemEvent(SystemEvent(kind: .screenLocked, at: Date()))
             guard let locked = driverRecorder.last else {
                 return XCTFail("Driver policy recording must not be nil after lock")
             }
             XCTAssertEqual(locked, ConsentedPermissions.allDisabled, "Screen lock must immediately stop drivers")
 
             // Unlock
-            await worker.handleSystemEvent(SystemEvent(at: Date(), kind: .screenUnlocked))
+            await worker.handleSystemEvent(SystemEvent(kind: .screenUnlocked, at: Date()))
             guard let unlocked = driverRecorder.last else {
                 return XCTFail("Driver policy recording must not be nil after unlock")
             }
             XCTAssertEqual(unlocked, allLocalGranted, "Unlock restores active drivers")
 
             // 3. Sleep
-            await worker.handleSystemEvent(SystemEvent(at: Date(), kind: .willSleep))
+            await worker.handleSystemEvent(SystemEvent(kind: .willSleep, at: Date()))
             guard let sleeping = driverRecorder.last else {
                 return XCTFail("Driver policy recording must not be nil after sleep")
             }
             XCTAssertEqual(sleeping, ConsentedPermissions.allDisabled, "Sleep must immediately stop drivers")
 
             // Wake
-            await worker.handleSystemEvent(SystemEvent(at: Date(), kind: .didWake))
+            await worker.handleSystemEvent(SystemEvent(kind: .didWake, at: Date()))
             guard let awake = driverRecorder.last else {
                 return XCTFail("Driver policy recording must not be nil after wake")
             }
@@ -663,7 +734,7 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             driverRecorder.clear()
 
             // Multiple subsequent system event ticks / wakeups must NOT reattach
-            await worker.handleSystemEvent(SystemEvent(at: Date(), kind: .screensDidWake))
+            await worker.handleSystemEvent(SystemEvent(kind: .screensDidWake, at: Date()))
             XCTAssertTrue(driverRecorder.all.allSatisfy { $0 == ConsentedPermissions.allDisabled } || driverRecorder.all.isEmpty)
         }
     }
@@ -914,7 +985,7 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             initialConsent: .granted(allLocalGranted),
             customStorage: store,
             releaseBarriers: { store.unblock(fail: false) }
-        ) { worker, _, driverRecorder, _, _ in
+        ) { worker, _, driverRecorder, snapshots, _ in
             defer { store.unblock(fail: false) }
             await worker.start(launchedAtLogin: false, startPeriodicTicks: false)
             guard let initial = driverRecorder.last else {
@@ -928,7 +999,7 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             // Update #1 attempts to withdraw screenshot
             var update1Perms = allLocalGranted
             update1Perms.screenshot = false
-            let updateTask1 = Task {
+            let updateTask1 = Task { [update1Perms] in
                 try await worker.updateConsent(.granted(update1Perms))
             }
 
@@ -980,9 +1051,11 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             }
             XCTAssertEqual(finalDrivers, ConsentedPermissions.allDisabled, "Older save cannot resurrect permissions superseded by revocation")
 
-            // Assert in-memory policy
-            let finalSnapshot = await worker.snapshot()
+            // Assert in-memory policy, as published
+            let finalSnapshot = try self.latest(snapshots)
             XCTAssertEqual(finalSnapshot.localConsent, .revoked)
+            let finalFacts = await worker.facts()
+            XCTAssertFalse(finalFacts.consentGranted, "A superseded save must not resurrect consent")
 
             // Assert final persisted consent in store
             let persistedConsent = try store.load()
@@ -1023,15 +1096,15 @@ final class WorkerConsentLifecycleTests: XCTestCase {
                 captureCompletedSemaphore.signal()
             },
             releaseBarriers: { capturer.unblock() }
-        ) { worker, _, driverRecorder, _, paths in
+        ) { worker, _, driverRecorder, snapshots, paths in
             defer { capturer.unblock() }
             await worker.start(launchedAtLogin: false, startPeriodicTicks: false)
             guard let initialDrivers = driverRecorder.last else {
                 return XCTFail("Driver policy recording must not be nil after start")
             }
             XCTAssertEqual(initialDrivers, initialPerms, "Positive control: keyboard and screenshot active")
-            let startSnapshot = await worker.snapshot()
-            XCTAssertTrue(startSnapshot.facts.trackingActive, "Lifecycle must be actively tracking")
+            let startFacts = await worker.facts()
+            XCTAssertTrue(startFacts.tracking, "Lifecycle must be actively tracking")
 
             // Block next screen capture in fake provider and assign distinguishable stale bytes
             capturer.nextCaptureData = staleData
@@ -1053,8 +1126,8 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             }
             XCTAssertFalse(narrowedDrivers.screenshot, "Screenshot driver must be detached upon withdrawal")
             XCTAssertTrue(narrowedDrivers.keyboard, "Unrelated keyboard capability must stay controlled and active")
-            let narrowedSnapshot = await worker.snapshot()
-            XCTAssertTrue(narrowedSnapshot.facts.trackingActive, "Worker lifecycle must remain actively tracking")
+            let narrowedFacts = await worker.facts()
+            XCTAssertTrue(narrowedFacts.tracking, "Worker lifecycle must remain actively tracking")
 
             // 2. Regrant screenshot consent (keyboard still authorized, lifecycle still active)
             try await worker.updateConsent(.granted(initialPerms))
@@ -1064,8 +1137,8 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             }
             XCTAssertTrue(regrantedDrivers.screenshot, "Screenshot driver reattached upon regrant")
             XCTAssertTrue(regrantedDrivers.keyboard, "Keyboard capability remains controlled")
-            let regrantedSnapshot = await worker.snapshot()
-            XCTAssertTrue(regrantedSnapshot.facts.trackingActive, "Worker lifecycle remains actively tracking")
+            let regrantedFacts = await worker.facts()
+            XCTAssertTrue(regrantedFacts.tracking, "Worker lifecycle remains actively tracking")
 
             // Now release Capture #1 (which was initiated under older Gen 1)
             capturer.unblock()
@@ -1075,14 +1148,13 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             XCTAssertTrue(oldCompleted, "Old capture task must finish executing captureFinished before checking publication absence")
 
             // Discard of stale first publication: assert stale bytes/identity are absent from publication & queue
-            let interimSnapshot = await worker.snapshot()
+            let interimSnapshot = try self.latest(snapshots)
             XCTAssertNil(interimSnapshot.lastScreenshot, "Stale first capture must not be published to lastScreenshot")
-            XCTAssertTrue(interimSnapshot.recentBlocks.allSatisfy {
-                $0.payload.screenshotThumbJpgBase64 != staleBase64
-            }, "Stale first capture bytes must be absent from recentBlocks")
+            XCTAssertFalse(interimSnapshot.recentBlocks.contains { $0.hasScreenshot },
+                           "No recorded block may carry the stale first capture")
 
             let queue = try Queue.open(at: paths.database, legacyOwner: nil, now: clock.value)
-            let interimQueueBatch = try queue.pendingBatch(owner: "test-ws:user@example.com", afterId: 0, limit: 10)
+            let interimQueueBatch = try queue.pendingBatch(owner: Self.owner, afterId: 0, limit: 10)
             XCTAssertTrue(interimQueueBatch.allSatisfy {
                 $0.payload.screenshotThumbJpgBase64 != staleBase64
             }, "Stale first capture bytes must be absent from SQLite queue payload")
@@ -1100,19 +1172,19 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             await worker.flushRecorder()
 
             // Assert fresh identity reaches its intended publication / queue boundary
-            let freshSnapshot = await worker.snapshot()
+            let freshSnapshot = try self.latest(snapshots)
             guard let lastScreenshot = freshSnapshot.lastScreenshot else {
                 return XCTFail("Fresh screenshot must reach publication")
             }
             XCTAssertEqual(lastScreenshot.jpeg, freshData, "Fresh screenshot must reach lastScreenshot")
+            XCTAssertNotEqual(lastScreenshot.jpeg, staleData, "The stale capture must never be the published one")
 
             guard let lastRecent = freshSnapshot.recentBlocks.first else {
                 return XCTFail("Recent block must exist after syncNow")
             }
-            XCTAssertEqual(lastRecent.payload.screenshotThumbJpgBase64, freshBase64)
-            XCTAssertNotEqual(lastRecent.payload.screenshotThumbJpgBase64, staleBase64)
+            XCTAssertTrue(lastRecent.hasScreenshot, "The recorded block carries the fresh capture")
 
-            let freshQueueBatch = try queue.pendingBatch(owner: "test-ws:user@example.com", afterId: 0, limit: 10)
+            let freshQueueBatch = try queue.pendingBatch(owner: Self.owner, afterId: 0, limit: 10)
             XCTAssertTrue(freshQueueBatch.contains {
                 $0.payload.screenshotThumbJpgBase64 == freshBase64
             }, "Fresh capture must reach SQLite queue")
@@ -1152,7 +1224,7 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             screenCapturer: capturer,
             onShutdownJoining: { joiningSemaphore.signal() },
             releaseBarriers: { capturer.unblock() }
-        ) { worker, _, driverRecorder, _, paths in
+        ) { worker, _, driverRecorder, snapshots, paths in
             defer { capturer.unblock() }
 
             await worker.start(launchedAtLogin: false, startPeriodicTicks: false)
@@ -1203,12 +1275,12 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             await observerTracker.joinAll()
 
             // 5. Prove no further queue / publication after cleanup
-            let finalSnapshot = await worker.snapshot()
+            let finalSnapshot = try self.latest(snapshots)
             XCTAssertNil(finalSnapshot.lastScreenshot, "No screenshot must be published after shutdown cleanup")
             XCTAssertTrue(finalSnapshot.recentBlocks.isEmpty, "No recent blocks must be published after shutdown cleanup")
 
             let queue = try Queue.open(at: paths.database, legacyOwner: nil, now: Date())
-            let pendingBatch = try queue.pendingBatch(owner: "test-ws:user@example.com", afterId: 0, limit: 10)
+            let pendingBatch = try queue.pendingBatch(owner: Self.owner, afterId: 0, limit: 10)
             XCTAssertTrue(pendingBatch.isEmpty, "No queue rows must be created after shutdown cleanup")
 
             // 6. Drivers stopped
@@ -1239,7 +1311,7 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             screenCapturer: capturer,
             onShutdownJoining: { joiningSemaphore.signal() },
             releaseBarriers: { capturer.unblock() }
-        ) { worker, _, driverRecorder, _, paths in
+        ) { worker, _, driverRecorder, snapshots, paths in
             defer { capturer.unblock() }
 
             await worker.start(launchedAtLogin: false, startPeriodicTicks: false)
@@ -1302,12 +1374,12 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             await observerTracker.joinAll()
 
             // 5. Prove no further queue / publication after cleanup
-            let finalSnapshot = await worker.snapshot()
+            let finalSnapshot = try self.latest(snapshots)
             XCTAssertNil(finalSnapshot.lastScreenshot, "No screenshot must be published after shutdown cleanup")
             XCTAssertTrue(finalSnapshot.recentBlocks.isEmpty, "No recent blocks must be published after shutdown cleanup")
 
             let queue = try Queue.open(at: paths.database, legacyOwner: nil, now: Date())
-            let pendingBatch = try queue.pendingBatch(owner: "test-ws:user@example.com", afterId: 0, limit: 10)
+            let pendingBatch = try queue.pendingBatch(owner: Self.owner, afterId: 0, limit: 10)
             XCTAssertTrue(pendingBatch.isEmpty, "No queue rows must be created after shutdown cleanup")
 
             // 6. Drivers stopped
@@ -1321,7 +1393,6 @@ final class WorkerConsentLifecycleTests: XCTestCase {
 
     func testBlockedTransportUploadShutdownWaitsAtJoiningBoundaryUntilRelease() async throws {
         BlockableURLProtocol.reset()
-        BlockableURLProtocol.blockNextRequest()
 
         let initialPerms = ConsentedPermissions(
             screenshot: true,
@@ -1343,7 +1414,20 @@ final class WorkerConsentLifecycleTests: XCTestCase {
         ) { worker, _, driverRecorder, _, paths in
             defer { BlockableURLProtocol.unblock() }
 
-            // Seed one pending activity in the SQLite queue before starting worker so UploadLoop has immediate work
+            await worker.start(launchedAtLogin: false, startPeriodicTicks: false)
+            guard let initialDrivers = driverRecorder.last else {
+                return XCTFail("Driver policy recording must not be nil after start")
+            }
+            XCTAssertEqual(initialDrivers, initialPerms, "Positive control: drivers active")
+
+            // The start-up project fetch signs in (the first sign-in succeeds) and fails offline.
+            // Only then is a block queued, so no request but the upload pass's can wait on the
+            // blocked sign-in. (No other request follows: no ticks, and no heartbeat without a
+            // UUID device id.)
+            XCTAssertTrue(BlockableURLProtocol.waitForProjectsAnswered(timeout: 3.0),
+                          "The start-up project fetch must have been answered")
+
+            // Seed one pending activity in the SQLite queue
             let queue = try Queue.open(at: paths.database, legacyOwner: nil, now: Date())
             let payload = ActivityPayload(
                 projectId: "p-test",
@@ -1356,16 +1440,12 @@ final class WorkerConsentLifecycleTests: XCTestCase {
                 runningPrograms: [],
                 timeline: []
             )
-            _ = try queue.enqueue(payload, owner: "test-ws:user@example.com")
+            _ = try queue.enqueue(payload, owner: Self.owner)
 
-            await worker.start(launchedAtLogin: false, startPeriodicTicks: false)
-            guard let initialDrivers = driverRecorder.last else {
-                return XCTFail("Driver policy recording must not be nil after start")
-            }
-            XCTAssertEqual(initialDrivers, initialPerms, "Positive control: drivers active")
-
-            // Kick an immediate upload pass (actor call properly awaited)
-            await worker.reconnect()
+            // After a wake the worker has the uploader check the queue again: its pass sends the
+            // block, is refused with 401, signs in again, and that sign-in blocks in transport.
+            await worker.handleSystemEvent(SystemEvent(kind: .willSleep, at: Date()))
+            await worker.handleSystemEvent(SystemEvent(kind: .didWake, at: Date()))
 
             // Establish that the upload pass reached transport and blocked in BlockableURLProtocol
             let transportEntered = BlockableURLProtocol.waitForRequestEntered(timeout: 3.0)
@@ -1405,9 +1485,9 @@ final class WorkerConsentLifecycleTests: XCTestCase {
 
             // 5. Prove completion/cleanup and no queue corruption or unintended mutation
             let finalQueue = try Queue.open(at: paths.database, legacyOwner: nil, now: Date())
-            let pendingCount = try finalQueue.pendingCount(owner: "test-ws:user@example.com")
+            let pendingCount = try finalQueue.pendingCount(owner: Self.owner)
             XCTAssertEqual(pendingCount, 1, "The queued block must remain intact in local storage; failed transport does not drop rows")
-            let rejectedCount = try finalQueue.rejectedCount(owner: "test-ws:user@example.com")
+            let rejectedCount = try finalQueue.rejectedCount(owner: Self.owner)
             XCTAssertEqual(rejectedCount, 0, "No blocks must be parked as rejected")
 
             // 6. Drivers stopped & transport wait did not expire
@@ -1459,7 +1539,7 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             timeout: 1.0
         )
         XCTAssertEqual(completionResult, .completed, "Negative oracle: task must complete promptly after barrier release")
-        let operationSuccess = await task.result
+        let operationSuccess = await task.value
         XCTAssertEqual(operationSuccess, true, "Synthetic operation must finish with explicit barrier release rather than timeout")
         await observerTracker.joinAll()
     }

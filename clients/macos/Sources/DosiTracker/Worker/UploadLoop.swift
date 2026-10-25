@@ -238,7 +238,7 @@ actor UploadLoop {
             // flat however long the backlog.
             batchSize: 1,
             upload: { payload in
-                if await self.isPastDeadline() {
+                if self.isPastDeadline() {
                     return .failed(.transport(.cancelled))
                 }
                 let response = await passClient.uploadActivity(payload)
@@ -365,7 +365,7 @@ actor UploadLoop {
             // At most a day at a time: keeps the nanosecond count far from overflow.
             try? await Task.sleep(nanoseconds: UInt64(min(seconds, 86_400) * 1_000_000_000) + 1_000_000)
             if Task.isCancelled { return }
-            await self.wake()
+            self.wake()
         }
     }
 
