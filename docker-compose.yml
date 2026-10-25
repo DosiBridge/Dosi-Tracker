@@ -1,79 +1,228 @@
-# Local/self-hosted stack: PostgreSQL + DB migrator + API host + web dashboard.
+# Dosi-Tracker self-hosted stack: PostgreSQL + database migrator + API + web dashboard (+ optional TLS proxy).
 #
-# 1) Publish the backend first (the Dockerfiles copy the publish output):
-#      dotnet publish backend/src/Dosi.Tracker.DbMigrator -c Release
-#      dotnet publish backend/src/Dosi.Tracker.HttpApi.Host -c Release
-# 2) docker compose up --build
+# Production-like by default: every service runs in Production mode as a non-root user, every secret comes from the
+# git-ignored .env file (template: .env.example; compose refuses to start while a required value is missing), the
+# images are built from source, and nothing listens on a public interface unless you enable the proxy. The full
+# walkthrough, upgrades, backups and certificate rotation are in docs/SELF_HOSTING.md. In short:
 #
-# Override every secret below in production (env file / secret store) —
-# the defaults exist only so the stack boots for local evaluation.
+#   cp .env.example .env                                  # then fill in every required value
+#   docker compose --profile init run --rm certgen        # once: creates ./certs/openiddict.pfx
+#   docker compose up -d --build                          # migrator runs first, then api + web start
+#   docker compose --profile proxy up -d                  # optional: Caddy terminates TLS for both public URLs
+#
+# The API only issues tokens over HTTPS (RequireHttpsMetadata): put the bundled proxy, or your own TLS-terminating
+# reverse proxy, in front of it. Proxies on the "edge" network (TRACKER_EDGE_SUBNET) are trusted to send
+# X-Forwarded-For / X-Forwarded-Proto; nothing else is.
+
+name: dosi-tracker
 
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:f4610795587492cd4fb887c2dc3de301b813278bb6f616992061141b5f15ac36
+    restart: unless-stopped
     environment:
-      POSTGRES_DB: Tracker
-      POSTGRES_USER: ${TRACKER_DB_USER:-root}
-      POSTGRES_PASSWORD: ${TRACKER_DB_PASSWORD:-myPassword}
+      POSTGRES_DB: ${TRACKER_DB_NAME:-Tracker}
+      POSTGRES_USER: ${TRACKER_DB_USER:-tracker}
+      POSTGRES_PASSWORD: ${TRACKER_DB_PASSWORD:?set TRACKER_DB_PASSWORD in .env (see .env.example)}
     volumes:
       - tracker-pgdata:/var/lib/postgresql/data
+    networks:
+      - data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      # Over TCP: during first-time initialisation the server listens on the unix socket only.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
       interval: 5s
       timeout: 3s
-      retries: 10
+      retries: 20
+      start_period: 10s
 
+  # One-shot: applies the migrations and seeds plans, OpenIddict clients and (on an empty database) the first platform
+  # administrator. `api` starts only after it exited successfully; re-run it on every upgrade (`docker compose up`
+  # does so automatically).
   migrator:
     build:
-      context: backend/src/Dosi.Tracker.DbMigrator
-      dockerfile: Dockerfile.local
+      context: backend
+      dockerfile: src/Dosi.Tracker.DbMigrator/Dockerfile
+    image: ${TRACKER_MIGRATOR_IMAGE:-dosi-tracker-migrator:local}
+    restart: "no"
     environment:
-      ConnectionStrings__Default: "Host=postgres;Port=5432;Database=Tracker;User ID=${TRACKER_DB_USER:-root};Password=${TRACKER_DB_PASSWORD:-myPassword};"
+      DOTNET_ENVIRONMENT: Production
+      ConnectionStrings__Default: "Host=postgres;Port=5432;Database=${TRACKER_DB_NAME:-Tracker};User ID=${TRACKER_DB_USER:-tracker};Password=${TRACKER_DB_PASSWORD:?set TRACKER_DB_PASSWORD in .env};GSS Encryption Mode=Disable;"
+      App__HostAdminEmail: ${TRACKER_ADMIN_EMAIL:?set TRACKER_ADMIN_EMAIL in .env (the first platform administrator)}
+      App__HostAdminPassword: ${TRACKER_ADMIN_PASSWORD:?set TRACKER_ADMIN_PASSWORD in .env (the first platform administrator)}
+      OpenIddict__Applications__Tracker_App__RootUrl: ${TRACKER_WEB_URL:?set TRACKER_WEB_URL in .env}
+      OpenIddict__Applications__Tracker_Swagger__RootUrl: ${TRACKER_API_URL:?set TRACKER_API_URL in .env}
+    networks:
+      - data
     depends_on:
       postgres:
         condition: service_healthy
-    restart: "no"
 
   api:
     build:
-      context: backend/src/Dosi.Tracker.HttpApi.Host
-      dockerfile: Dockerfile.local
-      args:
-        # Baked into openiddict.pfx at build time; must equal AuthServer__CertificatePassPhrase below.
-        TRACKER_CERT_PASSPHRASE: ${TRACKER_CERT_PASSPHRASE:-3f027835-7c52-4bf7-bc1f-77582ca37aef}
+      context: backend
+      dockerfile: src/Dosi.Tracker.HttpApi.Host/Dockerfile
+    image: ${TRACKER_API_IMAGE:-dosi-tracker-api:local}
+    restart: unless-stopped
+    # Fail with an actionable message instead of a stack trace when the signing certificate was never created.
+    entrypoint:
+      - bash
+      - -c
+      - >-
+        if [ ! -f /app/openiddict.pfx ] || [ ! -r /app/openiddict.pfx ]; then
+        echo 'FATAL: /app/openiddict.pfx is missing or unreadable. Run: docker compose --profile init run --rm certgen (docs/SELF_HOSTING.md).' >&2;
+        exit 64; fi;
+        exec dotnet Dosi.Tracker.HttpApi.Host.dll
     environment:
-      # This compose file is a local evaluation stack: Development skips the Production start-up
-      # guard that (correctly) refuses template secrets, and uses OpenIddict development certificates.
-      ASPNETCORE_ENVIRONMENT: Development
-      ASPNETCORE_URLS: "http://+:8080"
-      App__SelfUrl: ${TRACKER_SELF_URL:-http://localhost:6006}
-      App__CorsOrigins: ${TRACKER_CORS_ORIGINS:-http://localhost:6005}
-      App__DisablePII: "true"
-      AuthServer__Authority: ${TRACKER_SELF_URL:-http://localhost:6006}
-      AuthServer__RequireHttpsMetadata: "false"
-      AuthServer__CertificatePassPhrase: ${TRACKER_CERT_PASSPHRASE:-3f027835-7c52-4bf7-bc1f-77582ca37aef}
-      StringEncryption__DefaultPassPhrase: ${TRACKER_ENCRYPTION_PASSPHRASE:-5pGzpfXjidNXJVDa}
-      ConnectionStrings__Default: "Host=postgres;Port=5432;Database=Tracker;User ID=${TRACKER_DB_USER:-root};Password=${TRACKER_DB_PASSWORD:-myPassword};"
+      - ASPNETCORE_ENVIRONMENT=Production
+      - ConnectionStrings__Default=Host=postgres;Port=5432;Database=${TRACKER_DB_NAME:-Tracker};User ID=${TRACKER_DB_USER:-tracker};Password=${TRACKER_DB_PASSWORD:?set TRACKER_DB_PASSWORD in .env};GSS Encryption Mode=Disable;
+      - App__SelfUrl=${TRACKER_API_URL:?set TRACKER_API_URL in .env}
+      - AuthServer__Authority=${TRACKER_API_URL:?set TRACKER_API_URL in .env}
+      - App__CorsOrigins=${TRACKER_WEB_URL:?set TRACKER_WEB_URL in .env}
+      - App__RedirectAllowedUrls=${TRACKER_WEB_URL:?set TRACKER_WEB_URL in .env}
+      - AuthServer__CertificatePassPhrase=${TRACKER_CERT_PASSPHRASE:?set TRACKER_CERT_PASSPHRASE in .env}
+      - StringEncryption__DefaultPassPhrase=${TRACKER_ENCRYPTION_PASSPHRASE:?set TRACKER_ENCRYPTION_PASSPHRASE in .env}
+      # The reverse proxies allowed to report the caller's address and scheme (loopback is always trusted).
+      - App__ForwardedHeaders__KnownNetworks=${TRACKER_EDGE_SUBNET:-172.30.250.0/24}
+      # Optional settings, passed through only when .env defines them (an undefined name is not set at all, so the
+      # built-in default applies). See .env.example for what each one does.
+      - AI__Enabled
+      - AI__Provider
+      - AI__OpenAI__ApiKey
+      - AI__OpenAI__Model
+      - AI__OpenAI__BaseUrl
+      - Billing__Enabled
+      - Settings__Abp.Mailing.Smtp.Host
+      - Settings__Abp.Mailing.Smtp.Port
+      - Settings__Abp.Mailing.Smtp.UserName
+      - Settings__Abp.Mailing.Smtp.Password
+      - Settings__Abp.Mailing.Smtp.EnableSsl
+      - Settings__Abp.Mailing.Smtp.UseDefaultCredentials
+      - Settings__Abp.Mailing.DefaultFromAddress
+      - Settings__Abp.Mailing.DefaultFromDisplayName
+      - S3__AccessKeyId
+      - S3__SecretAccessKey
+      - S3__ContainerName
+      - S3__Region
+      - S3__ServiceUrl
+    volumes:
+      # The OpenIddict signing/encryption certificate, read-only, never part of an image.
+      - type: bind
+        source: ${TRACKER_OPENIDDICT_PFX:-./certs/openiddict.pfx}
+        target: /app/openiddict.pfx
+        read_only: true
+        bind:
+          create_host_path: false
+      - api-dataprotection:/home/app/.aspnet/DataProtection-Keys
     ports:
-      - "6006:8080"
+      # Loopback only by default: reach it through the proxy (or set TRACKER_BIND_ADDRESS for your own proxy host).
+      - "${TRACKER_BIND_ADDRESS:-127.0.0.1}:${TRACKER_API_PORT:-6006}:8080"
+    networks:
+      - data
+      - edge
     depends_on:
       postgres:
         condition: service_healthy
       migrator:
         condition: service_completed_successfully
+    # The image's HEALTHCHECK probes /health-status (200 = Healthy, database reachable).
 
   web:
-    image: node:22-alpine
-    working_dir: /app
-    volumes:
-      - ./frontend:/app
+    build:
+      context: frontend
+    image: ${TRACKER_WEB_IMAGE:-dosi-tracker-web:local}
+    restart: unless-stopped
     environment:
-      NEXT_PUBLIC_API_URL: ${TRACKER_SELF_URL:-http://localhost:6006}
-    command: sh -c "npm ci && npm run build && npm run start"
+      # Read per request by the server (one image for every environment; nothing is baked in at build time).
+      DOSI_API_URL: ${TRACKER_API_URL:?set TRACKER_API_URL in .env}
+      DOSI_DOWNLOAD_BASE_URL: ${TRACKER_DOWNLOAD_BASE_URL:-https://github.com/DosiBridge/Dosi-Tracker/releases/latest/download}
+      DOSI_DEMO_MODE: "false"
+      DOSI_ALLOW_INSECURE_HTTP: ${TRACKER_ALLOW_INSECURE_HTTP:-false}
     ports:
-      - "6005:6005"
+      - "${TRACKER_BIND_ADDRESS:-127.0.0.1}:${TRACKER_WEB_PORT:-6005}:3000"
+    networks:
+      - edge
     depends_on:
-      - api
+      api:
+        condition: service_started
+    # The image's HEALTHCHECK probes /healthz (200 = configuration can serve sign-ins, 503 = misconfigured).
+
+  # Optional TLS-terminating reverse proxy: `docker compose --profile proxy up -d`. Serves TRACKER_API_URL and
+  # TRACKER_WEB_URL (their host names must resolve to this machine) with certificates from Let's Encrypt/ZeroSSL, or
+  # from Caddy's local CA when TRACKER_PROXY_TLS=internal.
+  proxy:
+    profiles: ["proxy"]
+    image: caddy:2-alpine@sha256:eb4d35b7452d1ab6171fbdbe8d9275b2301dad6dad92115d91e19fb9b24d510f
+    restart: unless-stopped
+    environment:
+      TRACKER_API_URL: ${TRACKER_API_URL:?set TRACKER_API_URL in .env}
+      TRACKER_WEB_URL: ${TRACKER_WEB_URL:?set TRACKER_WEB_URL in .env}
+      TRACKER_PROXY_TLS: ${TRACKER_PROXY_TLS:-internal}
+    volumes:
+      - ./docs/self-hosting/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    ports:
+      - "${TRACKER_PROXY_BIND_ADDRESS:-0.0.0.0}:${TRACKER_PROXY_HTTP_PORT:-80}:80"
+      - "${TRACKER_PROXY_BIND_ADDRESS:-0.0.0.0}:${TRACKER_PROXY_HTTPS_PORT:-443}:443"
+      - "${TRACKER_PROXY_BIND_ADDRESS:-0.0.0.0}:${TRACKER_PROXY_HTTPS_PORT:-443}:443/udp"
+    networks:
+      - edge
+    depends_on:
+      api:
+        condition: service_healthy
+      web:
+        condition: service_healthy
+
+  # One-time setup: `docker compose --profile init run --rm certgen` writes ./certs/openiddict.pfx (RSA 3072, one key
+  # for token signing and encryption, protected with TRACKER_CERT_PASSPHRASE). It never overwrites an existing file;
+  # delete it first to rotate (that signs every user and agent out — see docs/SELF_HOSTING.md).
+  certgen:
+    profiles: ["init"]
+    image: alpine:3.22@sha256:2e0b81d60597f449baa56dc25d355367869d2dca4cd57e866f1e2b52af3eb55f
+    restart: "no"
+    network_mode: bridge
+    environment:
+      TRACKER_CERT_PASSPHRASE: ${TRACKER_CERT_PASSPHRASE:?set TRACKER_CERT_PASSPHRASE in .env}
+      TRACKER_CERT_DAYS: ${TRACKER_CERT_DAYS:-730}
+    volumes:
+      - ./certs:/certs
+    command:
+      - sh
+      - -euc
+      - |
+        out=/certs/openiddict.pfx
+        # A directory here is the empty mount point Docker creates when `up` ran before this step.
+        if [ -d "$$out" ]; then rmdir "$$out"; fi
+        if [ -s "$$out" ]; then echo "$$out already exists; delete it first to rotate the key." >&2; exit 0; fi
+        apk add --no-cache openssl >/dev/null
+        umask 077
+        work=$$(mktemp -d)
+        openssl req -x509 -newkey rsa:3072 -sha256 -days "$$TRACKER_CERT_DAYS" -nodes \
+          -subj "/CN=Dosi Tracker OpenIddict" \
+          -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
+          -keyout "$$work/key.pem" -out "$$work/cert.pem" 2>/dev/null
+        openssl pkcs12 -export -inkey "$$work/key.pem" -in "$$work/cert.pem" \
+          -out "$$out" -passout env:TRACKER_CERT_PASSPHRASE
+        rm -rf "$$work"
+        # Readable by the API's non-root user (uid/gid 1654, $$APP_UID in the .NET images) and nobody else.
+        chown 0:1654 "$$out" && chmod 0640 "$$out"
+        echo "Created $$out (valid $$TRACKER_CERT_DAYS days):"
+        openssl pkcs12 -in "$$out" -passin env:TRACKER_CERT_PASSPHRASE -nokeys 2>/dev/null | openssl x509 -noout -subject -enddate
+
+networks:
+  # PostgreSQL is reachable only from the migrator and the API.
+  data:
+    internal: true
+  # Where the web app, the API and the proxy meet. Its subnet is what the API trusts for forwarded headers, so it is
+  # fixed (change TRACKER_EDGE_SUBNET if it collides with a network on your host).
+  edge:
+    ipam:
+      config:
+        - subnet: ${TRACKER_EDGE_SUBNET:-172.30.250.0/24}
 
 volumes:
   tracker-pgdata:
+  api-dataprotection:
+  caddy-data:
+  caddy-config:

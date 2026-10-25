@@ -1,7 +1,7 @@
 # অধ্যায় ১৯: DevOps, Docker & CI/CD
 
 > **Status:** Target design.  
-> **As-built:** Dockerfiles exist; **no** docker-compose, **no** `.github/workflows` — [`../AS_BUILT.md`](../AS_BUILT.md) | [`../RUNBOOK.md`](../RUNBOOK.md).
+> **As-built:** সোর্স থেকে বিল্ড হওয়া মাল্টি-স্টেজ Dockerfile (non-root, কোনো secret ছাড়া), প্রোডাকশন-ধাঁচের `docker-compose.yml` এবং `.github/workflows` CI আছে — [`../SELF_HOSTING.md`](../SELF_HOSTING.md) | [`../AS_BUILT.md`](../AS_BUILT.md) | [`../RUNBOOK.md`](../RUNBOOK.md)।
 
 > **Canonical:** containerize, CI pipelines, secrets, zero-downtime, rollback imaging।  
 > IIS/DNS/SSL go-live ধাপ → [২১](./21-deployment.md) (এখানে পুনরাবৃত্তি নেই)।  

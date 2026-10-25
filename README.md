@@ -15,6 +15,7 @@ This is a **monorepo** containing every part of the product.
 | [`docs/AS_BUILT.md`](./docs/AS_BUILT.md) | English | **What the code actually has today** |
 | [`docs/PRODUCTION_READINESS.md`](./docs/PRODUCTION_READINESS.md) | English | Production gap scorecard + build order |
 | [`docs/RUNBOOK.md`](./docs/RUNBOOK.md) | English | How to run, health-check, recover (local → future prod) |
+| [`docs/SELF_HOSTING.md`](./docs/SELF_HOSTING.md) | English | Docker self-hosting: setup, TLS proxy, certificates, upgrades, backups |
 | [`docs/SECURITY.md`](./docs/SECURITY.md) | English | Threats, as-built controls, hard rules |
 | [`docs/bn/`](./docs/bn/README.md) | **বাংলা** | Full engineering **course** (chs **1–23**) — product + implementation |
 | [`ENGINEERING_BLUEPRINT.md`](./ENGINEERING_BLUEPRINT.md) | English | Short index → course + production pack |
@@ -35,7 +36,9 @@ Dosi-Tracker/
 │   ├── AS_BUILT.md     # Code reality
 │   ├── PRODUCTION_READINESS.md
 │   ├── RUNBOOK.md
+│   ├── SELF_HOSTING.md
 │   └── SECURITY.md
+├── docker-compose.yml  # Self-hosted stack (see docs/SELF_HOSTING.md); settings template: .env.example
 ├── DOCUMENTATION.md
 ├── ENGINEERING_BLUEPRINT.md
 └── ENGINEERING_BLUEPRINT.bn.md
@@ -92,13 +95,16 @@ Each component has its own README with setup details:
 - [`clients/windows/`](./clients/windows/README.md) — install Rust, then `cargo run --release`
 - [`clients/macos/`](./clients/macos/README.md) — build on a Mac with `swift run`
 
-### One-command stack (Docker)
+### Self-hosted stack (Docker)
+
+PostgreSQL, migrator, API and dashboard, built from source and run in Production mode as non-root containers, with an
+optional TLS reverse proxy. The full guide is [`docs/SELF_HOSTING.md`](./docs/SELF_HOSTING.md).
 
 ```bash
-dotnet publish backend/src/Dosi.Tracker.DbMigrator -c Release
-dotnet publish backend/src/Dosi.Tracker.HttpApi.Host -c Release
-docker compose up --build
-# API on http://localhost:6006 · dashboard on http://localhost:6005
+cp .env.example .env                             # fill in the URLs and every secret
+docker compose --profile init run --rm certgen   # once: token-signing certificate
+docker compose up -d --build --wait              # migrate, then start api + web
+docker compose --profile proxy up -d             # optional: HTTPS for both URLs
 ```
 
 ### Tests & CI

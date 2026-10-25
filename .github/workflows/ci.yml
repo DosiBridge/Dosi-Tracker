@@ -227,6 +227,21 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # docker-compose.yml must render with a complete .env, and must refuse to start from the bare template (every
+      # required secret is empty there), so a self-host can never come up with missing or default secrets.
+      - name: Validate docker-compose.yml against .env.example
+        run: |
+          set -euo pipefail
+          if docker compose --env-file .env.example config --quiet 2>"${RUNNER_TEMP}/compose-template.err"; then
+            echo "::error::docker compose accepted .env.example, whose required secrets are empty"; exit 1
+          fi
+          grep -q "required variable" "${RUNNER_TEMP}/compose-template.err"
+          env_file="$(mktemp)"
+          sed -e 's#^\(TRACKER_DB_PASSWORD\|TRACKER_ADMIN_PASSWORD\|TRACKER_CERT_PASSPHRASE\|TRACKER_ENCRYPTION_PASSPHRASE\)=$#\1=ci-placeholder-not-a-secret#' \
+            .env.example > "${env_file}"
+          docker compose --env-file "${env_file}" --profile proxy --profile init config --quiet
+          echo "docker-compose.yml renders with a complete .env and refuses the bare template"
+
       - uses: docker/setup-buildx-action@v4
 
       - name: Build DbMigrator image
@@ -269,7 +284,10 @@ jobs:
           SMOKE_DB_USER: tracker
           SMOKE_DB_PASSWORD: smoke-ci-only
           SMOKE_DB_NAME: Tracker
+          # The dashboard reads its API base URL at run time (frontend/src/lib/runtime-config.ts).
+          SMOKE_WEB_API_URL_VAR: DOSI_API_URL
         run: bash .github/scripts/deploy-smoke.sh
+
 
   windows-agent:
     name: Windows agent (build, lint, installer)

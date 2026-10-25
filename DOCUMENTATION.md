@@ -755,7 +755,8 @@ Rust/rustup (Windows agent), macOS 14+/Xcode 15+ (macOS agent).
 | Backend (ABP) | 🟡 Scaffolded: Identity/OpenIddict/PostgreSQL; **no** product Activity/Project APIs |
 | Desktop agents (Rust/Swift) | 🟡 Capture + SQLite + HTTP client; sync calls APIs that **do not exist yet** |
 | Real auth, payments, storage | 🔴 Planned (frontend uses `localStorage` demo session) |
-| CI / docker-compose / prod monitoring | 🔴 Not in repo |
+| CI / docker-compose | ✅ In repo: `.github/workflows/`, `docker-compose.yml` ([`docs/SELF_HOSTING.md`](./docs/SELF_HOSTING.md)) |
+| Production monitoring | 🔴 Not in repo |
 
 The web app is intentionally **backend-optional** so it can be explored end-to-end
 today; every mock shape mirrors the intended API so swapping in real data is

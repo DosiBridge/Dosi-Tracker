@@ -111,7 +111,7 @@ CI runs, in order, and **blocks merge** on any failure:
 5. **Acceptance (BDD)** — `.feature` suites (Phase 2+).
 6. **Mutation** — scheduled (nightly) not per-PR to keep PRs fast; PR fails only if the mutation score for *changed files* regresses (Phase 3+).
 7. **Security scans** — gitleaks over every commit (`.github/gitleaks.toml`), `npm audit --audit-level=high`, and NuGet packages with a high or critical advisory (`dotnet list package --vulnerable --include-transitive`). Dependabot (`.github/dependabot.yml`) proposes updates for every ecosystem.
-8. **Deploy smoke** — the container images built from a clean checkout, migrations against PostgreSQL, the API booted in Production with a throwaway signing certificate, and the agent sign-in contract end to end (`.github/scripts/deploy-smoke.sh`, runnable locally).
+8. **Deploy smoke** — the container images built from a clean checkout, migrations against PostgreSQL, the API booted in Production with a throwaway signing certificate, and the agent sign-in contract end to end (`.github/scripts/deploy-smoke.sh`, runnable locally). The same job checks that `docker-compose.yml` renders with a complete `.env` and refuses to start from the bare `.env.example` (empty required secrets).
 
 **Metrics surface:** the coverage gate writes a per-assembly table to the GitHub Actions run
 summary each build (`backend/scripts/coverage-gate.sh` → `$GITHUB_STEP_SUMMARY`); vitest prints the

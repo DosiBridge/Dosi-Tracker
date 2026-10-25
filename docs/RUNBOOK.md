@@ -2,7 +2,9 @@
 
 > **Today:** local demo + ABP Host scaffold.  
 > **Not yet:** production IIS/K8s cutover (see target [`bn/21-deployment.md`](./bn/21-deployment.md)).  
-> As-built: [`AS_BUILT.md`](./AS_BUILT.md).
+> As-built: [`AS_BUILT.md`](./AS_BUILT.md).  
+> **Docker self-hosting** (production-like stack, TLS proxy, certificates, upgrades, backups):
+> [`SELF_HOSTING.md`](./SELF_HOSTING.md). This runbook covers running the parts from source for development.
 
 ---
 
@@ -21,7 +23,7 @@
 
 1. Create a DB and point `ConnectionStrings:Default` at it. The tracked `appsettings.json` files only carry the
    template placeholder (`root` / `myPassword`); put your real local credentials in the **git-ignored**
-   `appsettings.secrets.json` next to them (loaded automatically, never published):
+   `appsettings.secrets.json` next to them (loaded automatically, never copied into a container image):
    - `backend/src/Dosi.Tracker.HttpApi.Host/appsettings.secrets.json`
    - `backend/src/Dosi.Tracker.DbMigrator/appsettings.secrets.json`
 

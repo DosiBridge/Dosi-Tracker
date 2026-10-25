@@ -58,7 +58,7 @@ Agents and the web app **do not** form a working production pipeline yet.
 | Initial migration (`Abp*`, `OpenIddict*`) | Implemented | `.../Migrations/20260714093733_Initial.cs` |
 | Health checks | Implemented | `/health-status`, HealthChecks UI |
 | Serilog (console + file) | Implemented | Host `Program.cs` / `appsettings.json` |
-| Dockerfiles (Host, DbMigrator) | Implemented | under `HttpApi.Host/`, `DbMigrator/` |
+| Dockerfiles (Host, DbMigrator, web) | Implemented: multi-stage from source, non-root, no baked secrets | `HttpApi.Host/Dockerfile`, `DbMigrator/Dockerfile`, `frontend/Dockerfile` |
 | Product entities (Activity, Project, …) | **Not present** | `TrackerDbContext` has Identity/Tenant DbSets only |
 | Product app services / Auto API | **Scaffold** | `TrackerAppService`, empty `TrackerPermissions` |
 | Hangfire / Redis / SignalR | **Not present** | — |
@@ -137,8 +137,8 @@ Account / Identity / Tenant Management / Permission / Setting / Feature manageme
 
 | Item | Status |
 |------|--------|
-| `docker-compose` | **Not present** |
-| `.github/workflows` CI | **Not present** |
+| `docker-compose` | Implemented: production-like self-host stack ([`SELF_HOSTING.md`](./SELF_HOSTING.md)) |
+| `.github/workflows` CI | Implemented (`ci.yml` incl. image build + deploy smoke, `linux.yml`) |
 | Production deploy automation | **Not present** |
 | ABP Studio migrate scripts | Present — `backend/etc/scripts/` |
 | Monitoring beyond Serilog + health | **Not present** (no Grafana/Prometheus stack in repo) |
