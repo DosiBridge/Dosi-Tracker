@@ -2,7 +2,7 @@
 //! notification parts, ported from the Windows agent with Linux deltas.
 //!
 //! Modules that talk D-Bus or use libc are Linux-only; the tray also needs the
-//! `tray` feature.
+//! `tray` feature. `session_store` is portable; its file I/O is Unix-only.
 
 pub mod blocks;
 pub mod config;
@@ -16,7 +16,6 @@ pub mod power;
 pub mod session;
 #[cfg(target_os = "linux")]
 pub mod session_events;
-#[cfg(target_os = "linux")]
 pub mod session_store;
 pub mod state;
 #[cfg(all(feature = "tray", target_os = "linux"))]
