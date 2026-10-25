@@ -6,15 +6,69 @@
 //! - Encoded as base64url without padding (`URL_SAFE_NO_PAD`).
 //! - Computed before the `payloadSignature` field is added so verifying the signature matches
 //!   the exact bytes originally committed.
+//!
+//! Outbox v2 rows ([`sign_v2`]) bind the payload bytes as stored and the SHA-256 digests of
+//! the row's captures, so neither the payload nor a capture can be swapped without the row
+//! failing its local integrity check. The tag is local tamper evidence only: the server
+//! does not read `payloadSignature`.
 
 use base64::Engine as _;
 use hmac::{Hmac, Mac};
 use rand::RngCore;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 
 use crate::outbox::ActivityEnvelope;
 
 type HmacSha256 = Hmac<Sha256>;
+
+/// SHA-256 digests of the captures queued with a v2 row, by kind. A kind the
+/// row never had is `None`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CaptureDigests {
+    pub screen: Option<[u8; 32]>,
+    pub thumb: Option<[u8; 32]>,
+}
+
+/// SHA-256 of `bytes`.
+pub fn sha256(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
+/// The v2 signing input: the payload bytes, a `0x00` separator (JSON text
+/// never contains a raw NUL), then one slot per capture kind in a fixed
+/// order (screen, thumb): `0x01` followed by the 32-byte digest, or `0x00`
+/// when the row has no capture of that kind. The slots keep "screen only"
+/// and "thumb only" apart.
+fn v2_mac(key: &[u8], payload: &[u8], digests: &CaptureDigests) -> HmacSha256 {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key size");
+    mac.update(payload);
+    mac.update(&[0x00]);
+    for slot in [digests.screen, digests.thumb] {
+        match slot {
+            Some(digest) => {
+                mac.update(&[0x01]);
+                mac.update(&digest);
+            }
+            None => mac.update(&[0x00]),
+        }
+    }
+    mac
+}
+
+/// Sign a v2 outbox row: HMAC-SHA256 over the payload bytes as stored and
+/// the digests of its captures, base64url without padding.
+pub fn sign_v2(key: &[u8], payload: &[u8], digests: &CaptureDigests) -> String {
+    let tag = v2_mac(key, payload, digests).finalize().into_bytes();
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(tag)
+}
+
+/// Verify a v2 row's tag in constant time. A malformed tag never verifies.
+pub fn verify_v2(key: &[u8], payload: &[u8], digests: &CaptureDigests, sig: &str) -> bool {
+    let Ok(tag) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(sig) else {
+        return false;
+    };
+    v2_mac(key, payload, digests).verify_slice(&tag).is_ok()
+}
 
 /// Generates a cryptographically secure 32-byte device signing key.
 pub fn generate_signing_key() -> [u8; 32] {
@@ -152,7 +206,86 @@ mod tests {
         assert!(!verify_activity_envelope(&key, &envelope));
     }
 
+    #[test]
+    fn v2_signatures_bind_the_payload_and_each_capture_slot() {
+        let key = test_key();
+        let payload = br#"{"clientActivityId":"abc","projectId":"p1"}"#;
+        let screen = sha256(b"screen-jpeg");
+        let thumb = sha256(b"thumb-jpeg");
+        let both = CaptureDigests {
+            screen: Some(screen),
+            thumb: Some(thumb),
+        };
+        let sig = sign_v2(&key, payload, &both);
+        assert!(verify_v2(&key, payload, &both, &sig));
+
+        // Another key, another payload, or any change to the captures fails.
+        let other_key: Vec<u8> = (1u8..33).collect();
+        assert!(!verify_v2(&other_key, payload, &both, &sig));
+        assert!(!verify_v2(
+            &key,
+            br#"{"clientActivityId":"abd"}"#,
+            &both,
+            &sig
+        ));
+        let swapped = CaptureDigests {
+            screen: Some(thumb),
+            thumb: Some(screen),
+        };
+        assert!(!verify_v2(&key, payload, &swapped, &sig));
+        let dropped = CaptureDigests {
+            screen: Some(screen),
+            thumb: None,
+        };
+        assert!(!verify_v2(&key, payload, &dropped, &sig));
+
+        // "Screen only" and "thumb only" with the same digest are different inputs.
+        let screen_only = CaptureDigests {
+            screen: Some(screen),
+            thumb: None,
+        };
+        let thumb_only = CaptureDigests {
+            screen: None,
+            thumb: Some(screen),
+        };
+        assert_ne!(
+            sign_v2(&key, payload, &screen_only),
+            sign_v2(&key, payload, &thumb_only)
+        );
+
+        // Without captures the tag differs from the v1 tag of the same bytes.
+        let none = CaptureDigests::default();
+        assert_ne!(sign_v2(&key, payload, &none), sign_payload(&key, payload));
+        assert!(!verify_v2(&key, payload, &none, "not base64!"));
+        assert!(!verify_v2(&key, payload, &none, ""));
+    }
+
+    #[test]
+    fn sha256_matches_the_known_vector() {
+        let digest = sha256(b"abc");
+        assert_eq!(
+            digest[..4],
+            [0xba, 0x78, 0x16, 0xbf],
+            "SHA-256(\"abc\") starts with ba7816bf"
+        );
+    }
+
     proptest! {
+        #[test]
+        fn prop_v2_sign_verify_arbitrary_payloads(
+            key_bytes in prop::collection::vec(any::<u8>(), 16..64),
+            payload in prop::collection::vec(any::<u8>(), 1..1024),
+            screen in prop::option::of(any::<[u8; 32]>()),
+            thumb in prop::option::of(any::<[u8; 32]>()),
+        ) {
+            let digests = CaptureDigests { screen, thumb };
+            let sig = sign_v2(&key_bytes, &payload, &digests);
+            prop_assert!(verify_v2(&key_bytes, &payload, &digests, &sig));
+            let mut mutated = payload.clone();
+            mutated[0] ^= 0xFF;
+            prop_assert!(!verify_v2(&key_bytes, &mutated, &digests, &sig));
+        }
+
         #[test]
         fn prop_sign_verify_arbitrary_payloads(
             key_bytes in prop::collection::vec(any::<u8>(), 16..64),

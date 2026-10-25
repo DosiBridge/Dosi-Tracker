@@ -15,10 +15,10 @@ use std::process::ExitCode;
 use chrono::Utc;
 use serde::Serialize;
 
-use dosi_tracker_linux::api::ApiClient;
-#[cfg(target_os = "linux")]
-use dosi_tracker_linux::credentials::SecretServiceStore;
-use dosi_tracker_linux::credentials::{CredentialStore, Credentials, FileCredentialStore};
+use dosi_tracker_linux::api::{check_server_url, ApiClient};
+use dosi_tracker_linux::credentials::{
+    CredentialStore, Credentials, FileCredentialStore, SecretServiceStore,
+};
 use dosi_tracker_linux::diagnostics::{DoctorReport, SessionEnvironment};
 use dosi_tracker_linux::outbox::{inspect_outbox_status, OutboxScope};
 use dosi_tracker_linux::signing::generate_signing_key;
@@ -71,9 +71,9 @@ fn print_login_help() {
     println!("    --username <USER>         Account username / email");
     println!("    --password <PASS>         Account password");
     println!("    --workspace-id <WS>       Workspace identifier");
+    println!("    --server <URL>            Backend server URL (https://, or http:// to loopback; no default)");
     println!();
     println!("OPTIONS:");
-    println!("    --server <URL>            Backend server URL (default: https://api.dosi.app)");
     println!("    --credentials-file <PATH> Explicit file store path for isolated storage");
     println!("    --fallback-file           Force owner-only private file store fallback");
     println!(
@@ -173,14 +173,9 @@ fn resolve_credential_store(
         let path = FileCredentialStore::default_path().map_err(|e| e.to_string())?;
         return Ok(Box::new(FileCredentialStore::new(path)));
     }
-    #[cfg(target_os = "linux")]
-    {
-        if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some() {
-            return Ok(Box::new(SecretServiceStore::new("dosi-tracker")));
-        }
-    }
-    let path = FileCredentialStore::default_path().map_err(|e| e.to_string())?;
-    Ok(Box::new(FileCredentialStore::new(path)))
+    // Never a silent fallback to the file store: without an explicit file the
+    // Secret Service is used, and a missing one fails the save visibly.
+    Ok(Box::new(SecretServiceStore::new("dosi-tracker")))
 }
 
 fn sanitize_unknown_arg(arg: &str) -> String {
@@ -287,7 +282,7 @@ fn handle_login(args: &[String]) -> ExitCode {
     let mut username: Option<String> = None;
     let mut password: Option<String> = None;
     let mut workspace_id: Option<String> = None;
-    let mut server: String = "https://api.dosi.app".to_string();
+    let mut server = String::new();
     let mut cred_file: Option<String> = None;
     let mut fallback_file = false;
 
@@ -338,6 +333,19 @@ fn handle_login(args: &[String]) -> ExitCode {
             return emit_login_error(json_mode, &err_msg, username, workspace_id, Some(server));
         }
         i += 1;
+    }
+
+    if server.is_empty() {
+        return emit_login_error(
+            json_mode,
+            "Missing required option: --server (there is no default server)",
+            username,
+            workspace_id,
+            None,
+        );
+    }
+    if let Err(err) = check_server_url(&server, false) {
+        return emit_login_error(json_mode, &err, username, workspace_id, Some(server));
     }
 
     let username = match username.filter(|s| !s.is_empty()) {
@@ -1075,21 +1083,10 @@ mod tests {
 
     #[test]
     fn test_resolve_credential_store_default_routing() {
-        // Without explicit credentials file or fallback flag:
-        // On Linux with DBUS_SESSION_BUS_ADDRESS present -> SecretService
-        // Otherwise -> FileFallback
+        // Without an explicit credentials file or the fallback flag the Secret
+        // Service is used, with or without a session bus: never a silent
+        // fallback to the file store.
         let resolved = resolve_credential_store(None, false).unwrap();
-        #[cfg(target_os = "linux")]
-        {
-            if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some() {
-                assert_eq!(resolved.kind(), CredentialStoreKind::SecretService);
-            } else {
-                assert_eq!(resolved.kind(), CredentialStoreKind::FileFallback);
-            }
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            assert_eq!(resolved.kind(), CredentialStoreKind::FileFallback);
-        }
+        assert_eq!(resolved.kind(), CredentialStoreKind::SecretService);
     }
 }

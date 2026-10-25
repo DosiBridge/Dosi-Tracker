@@ -4,6 +4,7 @@ use std::process::Command;
 use chrono::{Duration, Utc};
 use dosi_tracker_linux::outbox::{
     ActivityEnvelope, EnqueueResult, Outbox, OutboxError, OutboxLimits, OutboxScope,
+    OUTBOX_SCHEMA_VERSION,
 };
 use tempfile::tempdir;
 
@@ -739,15 +740,16 @@ fn test_future_store_version_fails_closed_without_downgrade() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("future.db");
 
-    // Manually create SQLite file stamped with future user_version = 2
+    // Manually create SQLite file stamped with future user_version = 3 (this
+    // build writes store version 2)
     {
         let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.pragma_update(None, "user_version", 2).unwrap();
+        conn.pragma_update(None, "user_version", 3).unwrap();
     }
 
     let res = Outbox::open(&db_path, OutboxLimits::default());
     assert!(
-        matches!(res.unwrap_err(), OutboxError::UnsupportedStoreVersion(2)),
+        matches!(res.unwrap_err(), OutboxError::UnsupportedStoreVersion(3)),
         "Expected UnsupportedStoreVersion for future store"
     );
 
@@ -756,11 +758,11 @@ fn test_future_store_version_fails_closed_without_downgrade() {
     let ver: u32 = conn
         .query_row("PRAGMA user_version;", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(ver, 2, "Future version must not be downgraded");
+    assert_eq!(ver, 3, "Future version must not be downgraded");
 }
 
 #[test]
-fn test_store_version_1_persisted_and_reopened_cleanly() {
+fn test_current_store_version_persisted_and_reopened_cleanly() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("version1.db");
     let scope = OutboxScope::new("user-1", "workspace-1").unwrap();
@@ -777,7 +779,11 @@ fn test_store_version_1_persisted_and_reopened_cleanly() {
     let ver: u32 = conn
         .query_row("PRAGMA user_version;", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(ver, 1, "Store version 1 must be stamped on database");
+    assert_eq!(
+        ver, OUTBOX_SCHEMA_VERSION,
+        "The current store version (2) must be stamped on database"
+    );
+    assert_eq!(OUTBOX_SCHEMA_VERSION, 2);
 
     // Reopen via Outbox
     let reopened = Outbox::open(&db_path, OutboxLimits::default()).unwrap();

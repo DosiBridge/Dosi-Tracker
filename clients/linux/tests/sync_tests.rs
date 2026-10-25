@@ -535,6 +535,7 @@ fn test_invalid_limits_and_scope_refuse_transport_and_mutation() {
     let cfg_zero_attempts = SyncPassConfig {
         max_attempts: 0,
         batch_limit: 10,
+        deadline: None,
     };
     assert!(matches!(
         run_sync_pass(&outbox, &valid_scope, cfg_zero_attempts, &mut ledger).unwrap_err(),
@@ -545,6 +546,7 @@ fn test_invalid_limits_and_scope_refuse_transport_and_mutation() {
     let cfg_zero_batch = SyncPassConfig {
         max_attempts: 10,
         batch_limit: 0,
+        deadline: None,
     };
     assert!(matches!(
         run_sync_pass(&outbox, &valid_scope, cfg_zero_batch, &mut ledger).unwrap_err(),
@@ -555,6 +557,7 @@ fn test_invalid_limits_and_scope_refuse_transport_and_mutation() {
     let cfg_overflow_attempts = SyncPassConfig {
         max_attempts: MAX_ALLOWED_ATTEMPTS + 1,
         batch_limit: 10,
+        deadline: None,
     };
     assert!(matches!(
         run_sync_pass(&outbox, &valid_scope, cfg_overflow_attempts, &mut ledger).unwrap_err(),
@@ -565,6 +568,7 @@ fn test_invalid_limits_and_scope_refuse_transport_and_mutation() {
     let cfg_overflow_batch = SyncPassConfig {
         max_attempts: 10,
         batch_limit: MAX_ALLOWED_BATCH_LIMIT + 1,
+        deadline: None,
     };
     assert!(matches!(
         run_sync_pass(&outbox, &valid_scope, cfg_overflow_batch, &mut ledger).unwrap_err(),

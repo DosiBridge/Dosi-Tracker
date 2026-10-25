@@ -173,8 +173,9 @@ fn lenient_end_reason<'de, D: Deserializer<'de>>(
 ///
 /// Every optional context field is left out of the JSON when unset, so an
 /// older server (which does not know it) keeps accepting the block, and
-/// defaulted on load, so rows queued by older builds still parse. The two
-/// counts are the exception: they are always sent, as `null` when unmeasured.
+/// defaulted on load, so rows queued by older builds still parse; an empty
+/// timeline (not measured) is left out too. The two counts are the
+/// exception: they are always sent, as `null` when unmeasured.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Activity {
@@ -204,9 +205,10 @@ pub struct Activity {
     /// Programs with a window open, by name only (never their titles).
     #[serde(default)]
     pub running_programs: Vec<WindowInfo>,
-    /// Per-minute breakdown of the block. Defaulted so rows queued by older
-    /// builds still load.
-    #[serde(default)]
+    /// Per-minute breakdown of the block; empty (and left out of the JSON)
+    /// when input was not measured. Defaulted so rows queued by older builds
+    /// still load.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub timeline: Vec<ActivityMinute>,
     /// The screen capture, base64. JPEG; the server detects the format, the
     /// name is kept for compatibility.
@@ -615,6 +617,7 @@ mod tests {
             "screenshotBlurred",
             "injectedInputEvents",
             "payloadSignature",
+            "timeline",
         ] {
             assert!(json.get(absent).is_none(), "{absent} should be left out");
         }
@@ -628,7 +631,6 @@ mod tests {
             "keyboardHits",
             "activeWindows",
             "runningPrograms",
-            "timeline",
         ] {
             assert!(json.get(present).is_some(), "{present} should be sent");
         }
