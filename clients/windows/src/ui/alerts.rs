@@ -65,6 +65,20 @@ pub fn alerts(s: &SharedState, input_healthy: bool) -> Vec<Alert> {
         }
     }
 
+    // An admin allowed plain http:// to another computer: said as long as it
+    // is used, never hidden.
+    if s.unencrypted_connection {
+        list.push(Alert {
+            tone: Tone::Danger,
+            title: "Connection not encrypted".to_owned(),
+            body: "This computer talks to the server over plain http://, so your sign-in, screenshots and window titles \
+                   can be read on the network. Ask your admin for the server's https:// address."
+                .to_owned(),
+            detail: Some(s.server_url.clone()),
+            action: None,
+        });
+    }
+
     let measures_input = s.capture.keyboard || s.capture.mouse;
     if !input_healthy && measures_input && s.status == TrackerStatus::Tracking {
         list.push(Alert {
@@ -275,6 +289,20 @@ mod tests {
             ..no_projects
         };
         assert_eq!(alerts(&with_projects, true).len(), 1);
+    }
+
+    #[test]
+    fn an_unencrypted_connection_is_always_called_out() {
+        let mut s = tracking();
+        s.set_server("http://10.0.0.5:6006".into());
+        let list = alerts(&s, true);
+        assert_eq!((list[0].tone, list[0].title.as_str()), (Tone::Danger, "Connection not encrypted"));
+        assert_eq!(list[0].detail.as_deref(), Some("http://10.0.0.5:6006"));
+        // This computer, or https: nothing to say.
+        s.set_server("http://localhost:6006".into());
+        assert!(alerts(&s, true).is_empty());
+        s.set_server("https://tracker.example.com".into());
+        assert!(alerts(&s, true).is_empty());
     }
 
     #[test]

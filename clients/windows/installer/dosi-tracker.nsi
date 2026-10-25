@@ -13,7 +13,8 @@
 ;
 ; Command line (also with /S for a silent install):
 ;   /SERVER=<url>      the server address the agent signs in to; written to
-;                      config.toml next to the program (api_base_url)
+;                      config.toml next to the program (api_base_url). Must
+;                      be https:// (http:// only to this computer)
 ;   /DASHBOARD=<url>   the web dashboard opened from the app (dashboard_url)
 ; Other settings already in that config.toml are kept.
 ;
@@ -201,6 +202,77 @@ Function ValidateUrl
   Exch $0
 FunctionEnd
 
+; Is this a plain http:// address of another computer? The agent refuses
+; those (the password and screenshots would cross the network unencrypted)
+; unless an admin sets allow_insecure_http = true in config.toml by hand;
+; http:// to this computer (localhost, 127.x.x.x, [::1]) is fine.
+; In: the address on the stack. Out: "1" (insecure) or "0" on the stack.
+Function IsInsecureRemote
+  Exch $0
+  Push $1
+  Push $2
+  Push $3
+  Push $4
+  StrCpy $1 0
+  StrCpy $2 $0 7
+  ${If} $2 == "http://"
+    StrCpy $0 $0 "" 7
+    ; The host runs to the first "/" or ":" (outside an [IPv6] literal).
+    StrCpy $2 0
+    StrCpy $4 0
+    host_scan:
+      StrCpy $3 $0 1 $2
+      StrCmp $3 "" host_done
+      StrCmp $3 "/" host_done
+      ${If} $3 == ":"
+      ${AndIf} $4 == 0
+        Goto host_done
+      ${EndIf}
+      ${If} $3 == "["
+        StrCpy $4 1
+      ${ElseIf} $3 == "]"
+        StrCpy $4 0
+      ${EndIf}
+      IntOp $2 $2 + 1
+      Goto host_scan
+    host_done:
+    StrCpy $0 $0 $2
+    StrCpy $1 1
+    StrCpy $3 $0 "" -10
+    ; String comparisons are case-insensitive.
+    ${If} $0 == "localhost"
+    ${OrIf} $0 == "[::1]"
+    ${OrIf} $3 == ".localhost"
+      StrCpy $1 0
+    ${EndIf}
+    ; 127.x.x.x: "127." followed by digits and dots only (not 127.example.com).
+    StrCpy $2 $0 4
+    ${If} $2 == "127."
+      StrCpy $1 0
+      StrCpy $2 4
+      ip_scan:
+        StrCpy $3 $0 1 $2
+        StrCmp $3 "" ip_done
+        ; A digit is "0", or a character IntOp reads as 1..9.
+        IntOp $4 $3 + 0
+        ${If} $3 != "."
+        ${AndIf} $3 != "0"
+        ${AndIf} $4 == 0
+          StrCpy $1 1
+        ${EndIf}
+        IntOp $2 $2 + 1
+        Goto ip_scan
+      ip_done:
+    ${EndIf}
+  ${EndIf}
+  StrCpy $0 $1
+  Pop $4
+  Pop $3
+  Pop $2
+  Pop $1
+  Exch $0
+FunctionEnd
+
 ; Strip leading spaces and tabs. In and out on the stack.
 Function TrimLeadingBlanks
   Exch $0
@@ -371,6 +443,14 @@ Function .onInit
     Pop $R1
     ${If} $R1 != 1
       MessageBox MB_ICONSTOP "/SERVER must be a full address such as https://tracker.example.com (got: $ServerUrl)." /SD IDOK
+      SetErrorLevel 2
+      Abort
+    ${EndIf}
+    Push $ServerUrl
+    Call IsInsecureRemote
+    Pop $R1
+    ${If} $R1 == 1
+      MessageBox MB_ICONSTOP "/SERVER must use https:// (got: $ServerUrl). Plain http:// would send passwords and screenshots unencrypted; only http://localhost is accepted. On a network you trust, set allow_insecure_http = true in config.toml yourself." /SD IDOK
       SetErrorLevel 2
       Abort
     ${EndIf}

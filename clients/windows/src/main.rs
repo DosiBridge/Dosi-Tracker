@@ -118,6 +118,7 @@ fn main() -> Result<()> {
     let links = ui::Links {
         dashboard_url: cfg.dashboard_url.clone(),
         api_base_url: cfg.api_base_url.clone(),
+        allow_insecure_http: cfg.allow_insecure_http,
     };
 
     let state = StateHandle::new();

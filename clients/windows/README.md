@@ -44,34 +44,54 @@ does not know `--quit`.
 
 ## Sign in
 
-Enter your **workspace**, **email** and **password** (Enter submits). The
+Enter your **email** and **password** (Enter submits). The
 server address is under **Advanced**: it is filled in from the installer's
 `/SERVER` (or `config.toml`), and opens by itself when no server was ever set on
 this computer or when the server cannot be reached. Paste the address shown on
 the web dashboard's **Download** page; a bare host (`tracker.example.com`)
 becomes `https://tracker.example.com`. The address you sign in with is saved
-with your sign-in.
+with your sign-in. A plain `http://` address is refused unless it is this
+computer (`localhost`, `127.x.x.x`, `[::1]`) — or an admin set
+`allow_insecure_http = true` in `config.toml`, in which case the window warns
+that the connection is not encrypted.
 
-The sign-in is stored **encrypted with Windows DPAPI**, keyed to your Windows
-user — the password is never stored in clear text or in environment variables.
+After signing in the agent lists your workspaces and uses the only one, or
+asks; **archived workspaces are never offered**. The sign-in is stored
+**encrypted with Windows DPAPI**, keyed to your Windows user. Only the refresh
+token the server grants is kept — **not the password**: it is sent once, when
+you sign in.
 
 When signing in fails, the form says why:
 
 | Message | Meaning |
 |---|---|
 | **Can't reach the server** | No answer: wrong address, no network or VPN, a firewall, or a certificate Windows does not trust. Check the address under Advanced. |
-| **Check the server address** | What was typed is not a usable `http(s)://` address. |
-| **Workspace not found** | The server has no such workspace (or it is inactive). |
-| **Sign-in refused** | The server's own words: wrong email or password (also when the account is in another workspace), a locked-out or deactivated account. |
+| **Check the server address** | What was typed is not a usable address, or it is plain `http://` to another computer. |
+| **No workspace yet** | The account is in no workspace, or all of its workspaces are archived. |
+| **Sign-in refused** | The server's own words: wrong email or password, a locked-out or deactivated account. |
 | **Too many sign-in attempts** | Wait a minute and try again. |
-| **The server couldn't sign you in** | The server failed (5xx), or the address is not a Dosi Tracker server (e.g. HTTP 404). |
+| **The server couldn't sign you in** | The server failed (5xx), answered with a redirect (never followed), or the address is not a Dosi Tracker server (e.g. HTTP 404). |
+| **This computer was removed** | A workspace admin removed this computer: tracking stopped and the saved sign-in was forgotten. |
 
-**Sign-in expired.** If the server stops accepting the saved password (changed,
-reset, account deactivated), tracking stops and the window asks for the
-**password only** — workspace and email are kept. Everything recorded so far
-stays queued and uploads once you are back. *Use a different account* signs out
-instead; that account's unsent blocks stay on the computer and upload if it
-signs in again within 14 days.
+**Sign-in expired.** When the server refuses the saved sign-in (the refresh
+token was revoked or expired, the password changed, the account was
+deactivated), tracking stops and the window asks for the **password only** —
+the email is kept. The agent never signs in again with a password behind your
+back. Everything recorded so far stays queued and uploads once you are back.
+*Use a different account* signs out instead; that account's unsent blocks stay
+on the computer and upload if it signs in again (on the same server) within 14
+days.
+
+**Workspace removed or archived.** When the server says you are no longer a
+member of the workspace you track in, or that it was archived, tracking and
+presence stop there and the window asks for another workspace. The blocks
+recorded there are **held** — not sent again — until you track in that
+workspace again; held blocks are deleted after 14 days.
+
+**Computer removed.** When a workspace admin removes this computer, tracking,
+presence and uploads stop at once and the saved sign-in is forgotten. The
+blocks recorded so far stay on the computer (and upload if the computer is
+restored and you sign in again).
 
 ## Using the app
 
@@ -121,6 +141,16 @@ and the window — and a tray notification, if the window is closed — asks:
 *Keep as work* records that time on the project you were on, as blocks with
 no activity (each at most one interval long), with your task note.
 *Discard* — or no answer — records nothing.
+
+While you are away (or paused, or locked) the input hooks are off. Your return
+is noticed through Windows' own idle clock (`GetLastInputInfo`: when the last
+input happened, nothing else). That clock also moves for software-injected
+input such as a mouse jiggler, so when the project records keyboard and mouse
+counts the agent attaches its input hooks — counting only, nothing else runs —
+and the time away ends at your own next input. A timed break that ends while
+nobody is at the computer resumes the same way. When keyboard and mouse counts
+are not allowed, idle detection relies on Windows' idle clock alone, so time is
+still recorded and still ends when you leave.
 
 ### Locking, sleep and shutdown
 
@@ -197,8 +227,8 @@ carries:
 | Data | When | Details |
 |---|---|---|
 | Start and end, project, task note | always | UTC times; the reason the block ended (interval, pause, break, idle, lock, sleep, project, task, sign-out, quit, shutdown). |
-| Keyboard activity | if allowed | **How many** key presses, per minute — never which keys or what you type. A held key counts once. |
-| Mouse activity | if allowed | Click counts; movement and scrolling mark a minute as active. |
+| Keyboard activity | if allowed | **How many** key presses, per minute — never which keys or what you type. A held key counts once. Sent as *not measured* (`null`, never 0) when not allowed or when input capture was unavailable during the block. |
+| Mouse activity | if allowed | Click counts; movement and scrolling mark a minute as active. *Not measured* (`null`) like the keyboard. |
 | Activity % and idle time | keyboard or mouse allowed | The share of the block's minutes with input, and the seconds without it. Software-injected input (mouse jigglers, remote tools) is counted aside, never as activity. *Not measured* when input capture is unavailable. |
 | Apps and window titles | if allowed | The app in front, its window title, how long, and the input while it was in front; per minute, the app mostly in front. |
 | Running programs | if allowed | **Names only** (e.g. `chrome.exe`) — never the titles of background windows. |
@@ -227,7 +257,8 @@ audio, files, or the window titles of programs in the background.
   decide whether the tray notifications appear; the window shows them anyway.
 - **Network**: HTTPS to your server. Certificates are always verified, against
   the Windows certificate store (so a company CA deployed to Windows works) and
-  the bundled Mozilla roots.
+  the bundled Mozilla roots. Plain `http://` only to this computer, unless an
+  admin sets `allow_insecure_http`; redirects are never followed.
 
 ## Files and uninstall
 
@@ -258,6 +289,7 @@ directory — handy for `cargo run`); every key is optional. See
 | Key | Default | |
 |---|---|---|
 | `api_base_url` | `https://localhost:6006` | the server; an address typed at sign-in wins |
+| `allow_insecure_http` | `false` | allow plain `http://` to a server on another computer (the window warns); `http://localhost` is always allowed |
 | `dashboard_url` | `http://localhost:6005` | the web dashboard; greyed out in the app when left at this local default while the server is elsewhere |
 | `interval_minutes` | `10` | until the project's interval is known (5–60) |
 | `[capture]` | all on but `webcam` and `blur_screenshots` | can only turn captures off (or blur on) |
@@ -269,7 +301,7 @@ Any key can also be set as an environment variable, e.g. `DOSI__API_BASE_URL`,
 
 | | |
 |---|---|
-| Sign-in | OpenIddict password flow, `POST /connect/token` (`client_id=Tracker_App`, `scope=Tracker`), workspace as `__tenant`. The token is renewed before it expires; a 401 signs in again once. |
+| Sign-in | OpenIddict password grant, `POST /connect/token` (`client_id=Tracker_App`, scope `openid profile email roles offline_access Tracker`, no `__tenant`), with `device_id` (this install's UUID) on the password and every refresh grant. Then `GET /api/app/workspaces/mine`; every workspace-scoped call carries `X-Workspace-Id`. The token is renewed with the refresh token before it expires and once after a 401; a refused refresh token means *sign-in expired*. |
 | Projects | `GET /api/app/project/my-projects` every 5 minutes and after a 403/409 from an upload: interval, capture permissions, idle threshold, blur. |
 | Upload | `POST /api/app/activity`, one block at a time, oldest first, on a thread of its own (so pausing, locking or quitting never waits for a slow upload). |
 | Presence | `POST /api/app/presence/heartbeat` every 60 s and on every status change; "stopped" / "signed out" when quitting or signing out. |
@@ -281,20 +313,25 @@ What an upload's answer does (the blocks are always saved locally first):
 | Answer | What happens |
 |---|---|
 | 2xx | uploaded; removed from the queue |
-| network error, timeout, 5xx, 404/405/408/429, a 4xx without an error code | kept; retried after 30 s, doubling up to 30 min (`Retry-After` honoured) |
+| network error, timeout, a redirect, 5xx, 404/405/408/429, a 4xx without an error code | kept; retried after 30 s, doubling up to 30 min (`Retry-After` honoured) |
 | sign-in refused | kept; uploads stop and the window asks for the password |
 | 402 subscription inactive | kept; retried hourly |
+| 403 device revoked | kept; uploads, tracking and presence stop and the saved sign-in is forgotten |
+| 403 not a workspace member / workspace archived, 400 workspace required | kept and **held** with the rest of that workspace's blocks (not sent again until the workspace is used again); the other blocks go on; the window asks for another workspace |
 | 403 not a project member / 409 project archived | the project list is fetched again; not accepted only if the project is really gone |
 | 425 in the future | kept; retried in 5 minutes (your clock is ahead) |
 | 413, capture too large or invalid | sent again at once without its images |
+| an error code this agent does not know, or still too large without images | kept; **that block alone** is retried later (5 min, doubling up to 6 h) while the others go on; not accepted after 10 tries |
 | overlap, id conflict, too long, too old, invalid range, validation errors | **not accepted**: kept 14 days with the server's reason, never retried |
 
 **Offline**: tracking goes on with the project list saved in the last 7 days;
 blocks upload when the server answers again (*Sync now* retries at once). The
 queue keeps every block's time data; screenshots are dropped first — beyond the
 newest 500 blocks, 300 MB of images, or 30 days — and beyond 10,000 waiting
-blocks the oldest are dropped. Each account's blocks upload only under that
-account; another account's are kept 14 days for it.
+blocks the oldest are dropped. Each block belongs to the account — the user
+**on the server** — that recorded it: it uploads only under that account's
+token and only to that server, never to another server where the same email
+signs in. Another account's blocks are kept 14 days for it.
 
 ## Troubleshooting
 
@@ -304,11 +341,12 @@ account; another account's are kept 14 days for it.
   so will the agent — install your company's CA in Windows, or for local
   development run `dotnet dev-certs https --trust` as the same Windows user and
   restart the agent.
-- **"Sign-in refused" with the right password** — check the workspace name: an
-  account belongs to one workspace, and the server answers the same way for a
-  wrong workspace.
+- **"Sign-in refused" with the right password** — check the server address
+  under *Advanced*: the same email can have another password on another
+  server.
 - **Nothing is tracked** — the status pill says why: *Choose a project*, *Paused*
-  (a pause survives restarts — press Resume), *Away* (move the mouse),
+  (a pause survives restarts — press Resume), *Away* (type or click: a mouse
+  jiggler alone does not end it),
   *Locked*, *Sign-in expired*, or *Offline* (no server and no saved project
   list yet).
 - **The time-away question keeps appearing in meetings** — idle detection ends

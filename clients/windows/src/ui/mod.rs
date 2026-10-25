@@ -80,6 +80,9 @@ enum View {
 pub struct Links {
     pub dashboard_url: String,
     pub api_base_url: String,
+    /// `config.toml`'s `allow_insecure_http`: whether the sign-in form may
+    /// accept a plain `http://` server on another computer.
+    pub allow_insecure_http: bool,
 }
 
 /// How the window was asked to start.
