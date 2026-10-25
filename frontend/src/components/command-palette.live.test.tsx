@@ -6,7 +6,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 import { ThemeProvider } from "@/components/theme-provider";
-import { resetTenantDataForTests, users } from "@/lib/tenant-data";
+import { users } from "@/lib/tenant-data";
+import { resetTenantDataForTests } from "@/lib/demo-tenants";
 
 const session = vi.hoisted(() => ({
   isLive: true,

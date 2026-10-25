@@ -19,7 +19,8 @@ import {
   hourlyBuckets,
   type DaySegment,
 } from "./monitor-data";
-import { installLiveDataset, projects, resetTenantDataForTests } from "./tenant-data";
+import { installLiveDataset, projects } from "./tenant-data";
+import { resetTenantDataForTests } from "./demo-tenants";
 import type { Project, Role } from "./types";
 import { appColor } from "./apps";
 

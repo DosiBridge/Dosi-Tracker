@@ -44,6 +44,16 @@ module.exports = {
       to: { path: "^src/test" },
     },
     {
+      name: "demo-data-loaded-on-demand",
+      severity: "error",
+      comment:
+        "The demo dataset (lib/demo-tenants and its fixtures in lib/mock-data) is only for deployments with demo mode on: " +
+        "the app may reach it through a dynamic import() alone, so a live deployment never downloads or generates it. " +
+        "Live code that needs the demo's frozen clock imports lib/demo-clock.",
+      from: { path: "^src/(app|components|hooks|lib)", pathNot: ["\\.(test|spec)\\.tsx?$", "^src/lib/demo-tenants\\.ts$"] },
+      to: { path: "^src/lib/(demo-tenants|mock-data)\\.ts$", dependencyTypesNot: ["dynamic-import"] },
+    },
+    {
       name: "no-orphans",
       severity: "warn",
       comment: "Unreferenced modules are dead weight — delete or wire them up.",

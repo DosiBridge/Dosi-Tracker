@@ -5,8 +5,13 @@ import "@testing-library/jest-dom/vitest";
 import { afterEach, expect } from "vitest";
 import { cleanup } from "@testing-library/react";
 import { toHaveNoViolations } from "jest-axe";
+import { installDemoTenants } from "@/lib/demo-tenants";
 
 expect.extend(toHaveNoViolations);
+
+// The app loads the demo tenants on demand (a dynamic import, demo mode only);
+// tests render demo pages synchronously, so they are installed up front.
+installDemoTenants();
 
 // jsdom does not implement layout/media APIs that the theme provider, charts
 // and palette components touch. Stub the minimal surface — tests that care

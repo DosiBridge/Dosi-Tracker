@@ -6,7 +6,8 @@ vi.mock("next/navigation", () => import("@/test/next-navigation-stub"));
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { screen, within, fireEvent } from "@testing-library/react";
 import { WorkspaceSwitcher } from "@/components/layout/workspace-switcher";
-import { workspaces, planById, statusLabel } from "@/lib/saas-data";
+import { planById, statusLabel } from "@/lib/saas-data";
+import { workspaces } from "@/lib/demo-tenants";
 import { renderWithProviders, resetPrototypeState } from "@/test/harness";
 
 beforeEach(() => {

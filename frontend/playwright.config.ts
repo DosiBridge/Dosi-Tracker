@@ -2,6 +2,9 @@ import { defineConfig, devices } from "@playwright/test";
 
 // E2E runs against a production build in DEMO MODE (session cookie set, no
 // backend): deterministic mock data with a frozen clock (NOW = 2026-07-14).
+// Demo mode is a runtime switch the server reads per request (DOSI_DEMO_MODE,
+// lib/runtime-config), off by default: the web server below turns it on, so
+// the same build a deployment ships is the one under test.
 // Build first: `npm run build` — then `npm run test:e2e`.
 //
 // Projects:
@@ -40,6 +43,7 @@ export default defineConfig({
     command: `npx next start -p ${PORT}`,
     port: PORT,
     reuseExistingServer: !process.env.CI,
+    env: { DOSI_DEMO_MODE: "1" },
     timeout: 60_000,
   },
 });

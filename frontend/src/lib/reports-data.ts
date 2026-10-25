@@ -1,4 +1,4 @@
-import { NOW } from "./mock-data";
+import { NOW } from "./demo-clock";
 import { inRange } from "./metrics";
 import type { Activity } from "./types";
 

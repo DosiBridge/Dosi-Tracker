@@ -1,15 +1,14 @@
-import type { Activity, ActivityCoverage, Project, ScreenMock, User, WindowInfo } from "./types";
+import type { Activity, ActivityCoverage, Project, User } from "./types";
 import type {
   AppUsage,
   AttendanceRecord,
-  AttendanceStatus,
   BillingRow,
   AppNotification,
   Insight,
   ProductivitySplit,
 } from "./reports-data";
-import { trackedMembers, countSeats } from "./roles";
-import { activitiesOnDay, activitiesOnZonedDay, averageProductivity, minutesByUser, minutesOnDay, totalMinutes } from "./metrics";
+import { countSeats } from "./roles";
+import { activitiesOnDay, activitiesOnZonedDay, averageProductivity, minutesByUser, totalMinutes } from "./metrics";
 import {
   applyProjectTotals,
   deriveAppCatalog,
@@ -20,31 +19,16 @@ import {
   type SummaryTotals,
 } from "./live-dataset";
 import { readStorage, writeStorage } from "./live-session";
-import { appCategory, appColor } from "./apps";
 import { zonedDayKey } from "./time-zone";
-import {
-  DAY_MS,
-  NOW,
-  TODAY,
-  TRACKED_DAY_SPAN,
-  assignDemoEndReasons,
-  demoAgentFields,
-  planDaySessions,
-  syncProjectTotals,
-  users as primaryUsers,
-  projects as primaryProjects,
-  activities as primaryActivities,
-  weeklyTrend as primaryWeekly,
-  hourlyToday as primaryHourly,
-  topApps as primaryTopApps,
-  summary as primarySummary,
-  projectDistribution as primaryProjectDistribution,
-} from "./mock-data";
+import { DAY_MS, NOW } from "./demo-clock";
 
 export { NOW };
 
 /* ============================================================================
- * A Dataset is the full, tenant-isolated demo data for a single workspace.
+ * A Dataset is the full, tenant-isolated data for a single workspace: a live
+ * tenant's, built from the backend, or (only in a deployment that turns demo
+ * mode on) a demo tenant's, built by lib/demo-tenants, which is loaded on
+ * demand so a live deployment never downloads or generates the demo data.
  * Switching workspaces swaps the active dataset (see setActiveWorkspace).
  * ========================================================================== */
 
@@ -86,427 +70,12 @@ export interface Dataset {
   timeZone?: string;
 }
 
-/* ----------------------------- Seeded RNG ----------------------------- */
 
-function mulberry32(seed: number) {
-  return function () {
-    seed |= 0;
-    seed = (seed + 0x6d2b79f5) | 0;
-    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-function hashStr(s: string): number {
-  let h = 2166136261;
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 16777619);
-  }
-  return h >>> 0;
-}
-
-/* ----------------------------- Shared app metadata (generation) ----------------------------- */
-
-const screenTemplates: ScreenMock[] = [
-  { app: "Visual Studio Code", kind: "editor", accent: "#3b82f6" },
-  { app: "Google Chrome", kind: "browser", accent: "#f97316" },
-  { app: "Figma", kind: "design", accent: "#ec4899" },
-  { app: "Slack", kind: "chat", accent: "#a855f7" },
-  { app: "Terminal", kind: "terminal", accent: "#22c55e" },
-  { app: "Notion", kind: "docs", accent: "#64748b" },
-];
-const genericTitles: Record<string, string[]> = {
-  "Visual Studio Code": ["index.ts", "app.tsx", "service.cs", "main.py", "styles.css"],
-  "Google Chrome": ["Docs", "localhost:3000", "Stack Overflow", "Dashboard"],
-  Figma: ["Design v2", "Components", "Flows", "Hero"],
-  Slack: ["#general", "#standup", "Direct messages", "#design"],
-  Terminal: ["npm run dev", "git status", "docker compose up", "build"],
-  Notion: ["Planning", "RFC", "Checklist", "Notes"],
-};
-const otherApps = ["Postman", "Docker Desktop", "Spotify", "1Password", "Zoom", "Linear"];
-/** Task notes members type into the agent ("What are you working on?"). */
-const descriptions = [
-  "Checkout flow – PR review",
-  "Bug triage – login timeout",
-  "Payments module – refactor",
-  "Component library – buttons",
-  "Release 2.3 – code review",
-  "Landing page – new hero",
-  "API client – unit tests",
-  "Image pipeline – performance",
-  "Partner API – integration",
-  "Settings screen – UI polish",
-];
-
-function makeWindows(primary: ScreenMock, rand: () => number): { active: WindowInfo[]; running: WindowInfo[] } {
-  const pick = <T>(arr: T[]) => arr[Math.floor(rand() * arr.length)];
-  const between = (min: number, max: number) => Math.floor(rand() * (max - min + 1)) + min;
-  const active: WindowInfo[] = [
-    { appName: primary.app, windowTitle: pick(genericTitles[primary.app] ?? ["—"]), seconds: between(180, 520) },
-    { appName: pick(screenTemplates).app, windowTitle: "—", seconds: between(40, 160) },
-  ];
-  const running: WindowInfo[] = [
-    { appName: primary.app, windowTitle: pick(genericTitles[primary.app] ?? ["—"]), seconds: 0 },
-    { appName: pick(otherApps), windowTitle: "—", seconds: 0 },
-    { appName: pick(otherApps), windowTitle: "—", seconds: 0 },
-  ];
-  return { active, running };
-}
-
-/* ----------------------------- Generators ----------------------------- */
-
-/**
- * Same contract as the primary tenant's generator (and the same session
- * planner): every member's rows for today sum to exactly their intended
- * `trackedToday`, so `syncTrackedToday` below can derive the roster from them.
- */
-function genActivities(users: User[], projects: Project[], seedNum: number): Activity[] {
-  const rand = mulberry32(seedNum);
-  const pick = <T>(arr: T[]) => arr[Math.floor(rand() * arr.length)];
-  const between = (min: number, max: number) => Math.floor(rand() * (max - min + 1)) + min;
-  const list: Activity[] = [];
-  const trackingUsers = trackedMembers(users);
-  if (!projects.length || !trackingUsers.length) return list;
-  let id = 0;
-
-  for (let day = 0; day < TRACKED_DAY_SPAN; day++) {
-    const anchor = new Date(NOW.getTime() - day * DAY_MS);
-    for (const user of trackingUsers) {
-      const target =
-        day === 0 ? user.trackedToday : Math.round(user.trackedToday * (0.55 + rand() * 0.6));
-
-      planDaySessions(target, anchor, rand).forEach((session, index) => {
-        const template = pick(screenTemplates);
-        const mine = projects.filter((p) => !p.archived && p.memberIds.includes(user.id));
-        const project = mine.length ? pick(mine) : projects[0];
-        const { active, running } = makeWindows(template, rand);
-        id++;
-        const row: Activity = {
-          id: `${user.id}-a${id}`,
-          userId: user.id,
-          projectId: project.id,
-          startedAt: session.startedAt.toISOString(),
-          endedAt: session.endedAt.toISOString(),
-          description: pick(descriptions),
-          productivity: Math.min(99, Math.max(30, user.productivity + between(-10, 8))),
-          mouseClicks: Math.round(session.minutes * between(3, 11)),
-          keyboardHits: Math.round(session.minutes * between(12, 60)),
-          activeWindows: active,
-          runningPrograms: running,
-          screen: template,
-          hasWebcam: project.permissions.webcam && rand() > 0.5,
-          online: day === 0 && index === 0 ? true : rand() > 0.25,
-        };
-        // Device, idle time and task note: derived, so the seeded sequence above is unchanged.
-        list.push(Object.assign(row, demoAgentFields(user, row, day)));
-      });
-    }
-  }
-  assignDemoEndReasons(list, TODAY);
-  return list.sort((a, b) => +new Date(b.endedAt) - +new Date(a.endedAt));
-}
-
-/**
- * Rewrite each member's `trackedToday` from their own activity rows. The
- * authored roster value is the generator's target; the rows are the truth.
- */
-function syncTrackedToday(users: User[], activities: Activity[]): void {
-  const today = minutesByUser(activitiesOnDay(activities, TODAY));
-  for (const user of users) {
-    user.trackedToday = today.get(user.id) ?? 0;
-  }
-}
-
-function genWeekly(users: User[], seedNum: number) {
-  const rand = mulberry32(seedNum ^ 0x51ed);
-  const team = countSeats(users) || 1;
-  const days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-  const factor = [1, 1.08, 0.96, 1.14, 1.24, 0.45, 0.23];
-  return days.map((day, i) => {
-    const tracked = Math.round(team * (55 + rand() * 20) * factor[i]);
-    const productive = Math.round(tracked * (0.72 + rand() * 0.12));
-    return { day, tracked, productive };
-  });
-}
-
-function genHourly(seedNum: number) {
-  const rand = mulberry32(seedNum ^ 0x2b1c);
-  const shape = [20, 42, 55, 48, 30, 12, 38, 52, 58, 46, 33, 18];
-  return Array.from({ length: 12 }, (_, i) => ({
-    hour: `${8 + i}:00`,
-    minutes: Math.max(4, Math.round(shape[i] * (0.7 + rand() * 0.6))),
-  }));
-}
-
-/** The apps a generated demo team uses; name, colour and category come from lib/apps like every live screen's. */
-const DEMO_APPS = [
-  "Visual Studio Code",
-  "Terminal",
-  "Figma",
-  "Postman",
-  "Linear",
-  "Google Chrome",
-  "Slack",
-  "Notion",
-  "Zoom",
-  "YouTube",
-  "Spotify",
-];
-
-function genAppCatalog(users: User[], seedNum: number): AppUsage[] {
-  const rand = mulberry32(seedNum ^ 0x9a3f);
-  const team = Math.max(1, countSeats(users));
-  return DEMO_APPS.map((app) => ({
-    app,
-    category: appCategory(app),
-    color: appColor(app),
-    minutes: Math.round((120 + rand() * 380) * team * 0.5),
-    activeUsers: Math.max(1, Math.min(team, Math.round(1 + rand() * team))),
-  })).sort((a, b) => b.minutes - a.minutes);
-}
-
-function genTopApps(catalog: AppUsage[]) {
-  return [...catalog]
-    .sort((a, b) => b.minutes - a.minutes)
-    .slice(0, 6)
-    .map((a) => ({ app: a.app, minutes: a.minutes, color: a.color }));
-}
-
-/* ----------------------------- Derived (shared logic; matches original) ----------------------------- */
-
-function deriveSplit(users: User[]): ProductivitySplit[] {
-  return trackedMembers(users)
-    .map((u) => {
-      const total = u.trackedToday;
-      const productive = Math.round((total * u.productivity) / 100);
-      const remaining = total - productive;
-      const unproductive = Math.round(remaining * 0.35);
-      const neutral = remaining - unproductive;
-      const idle = Math.round(total * 0.08);
-      return { userId: u.id, productive, neutral, unproductive, idle };
-    });
-}
-
-const DAY = 24 * 60 * 60 * 1000;
-
-function deriveAttendance(users: User[], seedNum: number): AttendanceRecord[] {
-  const rand = mulberry32(seedNum);
-  const tracking = trackedMembers(users);
-  const rows: AttendanceRecord[] = [];
-  for (let d = 6; d >= 0; d--) {
-    const date = new Date(NOW.getTime() - d * DAY);
-    const iso = date.toISOString().slice(0, 10);
-    const weekend = date.getDay() === 0 || date.getDay() === 6;
-    for (const u of tracking) {
-      const roll = rand();
-      let status: AttendanceStatus;
-      if (weekend) status = roll > 0.75 ? "remote" : "absent";
-      else if (roll > 0.9) status = "absent";
-      else if (roll > 0.75) status = "late";
-      else if (roll > 0.55) status = "remote";
-      else status = "present";
-
-      if (status === "absent") {
-        rows.push({ userId: u.id, date: iso, status, clockIn: null, clockOut: null, worked: 0 });
-        continue;
-      }
-      const inHour = status === "late" ? 10 + Math.floor(rand() * 2) : 9;
-      const inMin = Math.floor(rand() * 55);
-      const workedH = weekend ? 2 + rand() * 3 : 6 + rand() * 3;
-      const clockIn = `${String(inHour).padStart(2, "0")}:${String(inMin).padStart(2, "0")}`;
-      const outTotal = inHour * 60 + inMin + Math.round(workedH * 60);
-      const clockOut = `${String(Math.floor(outTotal / 60) % 24).padStart(2, "0")}:${String(outTotal % 60).padStart(2, "0")}`;
-      rows.push({ userId: u.id, date: iso, status, clockIn, clockOut, worked: Math.round(workedH * 60) });
-    }
-  }
-  return rows;
-}
-
-function deriveBilling(users: User[], rates: Record<string, number>, seedNum: number): BillingRow[] {
-  const rand = mulberry32(seedNum ^ 0x1234);
-  return trackedMembers(users)
-    .map((u) => ({
-      userId: u.id,
-      rate: rates[u.id] ?? 38 + Math.round(rand() * 5) * 4,
-      billable: true,
-    }));
-}
-
-function genNotifications(users: User[], projects: Project[]): AppNotification[] {
-  const workers = users.filter((u) => u.role === "worker");
-  const owner = users.find((u) => u.role === "owner");
-  const proj = projects[0];
-  const out: AppNotification[] = [];
-  out.push({ id: "n1", type: "report", title: "Weekly report ready", body: "Your team's weekly productivity report is available.", at: new Date(NOW.getTime() - 8 * 60000).toISOString(), read: false });
-  if (workers[0]) out.push({ id: "n2", type: "alert", title: "Low activity detected", body: `${workers[0].name} was below 40% activity for 2h.`, at: new Date(NOW.getTime() - 46 * 60000).toISOString(), read: false });
-  if (workers[1] && proj) out.push({ id: "n3", type: "member", title: "New member joined", body: `${workers[1].name} accepted the invite to ${proj.title}.`, at: new Date(NOW.getTime() - 3 * 3600000).toISOString(), read: false });
-  if (owner) out.push({ id: "n5", type: "alert", title: "Overtime warning", body: `${owner.name} exceeded 9h tracked today.`, at: new Date(NOW.getTime() - 9 * 3600000).toISOString(), read: true });
-  out.push({ id: "n6", type: "system", title: "Agent updated", body: "Desktop tracker updated to the latest version.", at: new Date(NOW.getTime() - 26 * 3600000).toISOString(), read: true });
-  return out;
-}
-
-/** Time figures come off the activity rows via metrics.ts — same as every report. */
-function computeSummary(users: User[], projects: Project[], activities: Activity[]): Summary {
-  return {
-    totalTrackedToday: minutesOnDay(activities, TODAY),
-    activeMembers: users.filter((u) => u.status === "active").length,
-    totalMembers: countSeats(users),
-    activeProjects: projects.filter((p) => !p.archived).length,
-    avgProductivity: averageProductivity(activitiesOnDay(activities, TODAY)),
-    screenshotsToday: countSeats(users) * 40,
-  };
-}
-
-function computeProjectDistribution(projects: Project[]) {
+export function computeProjectDistribution(projects: Project[]) {
   return projects
     .filter((p) => !p.archived)
     .map((p) => ({ name: p.title, value: p.loggedThisWeek, color: p.color }))
     .sort((a, b) => b.value - a.value);
-}
-
-/* ----------------------------- Primary (w1) — exact original values ----------------------------- */
-
-const PRIMARY_APP_CATALOG: AppUsage[] = (
-  [
-    ["Visual Studio Code", 1840, 6],
-    ["Terminal", 430, 5],
-    ["Figma", 760, 3],
-    ["Postman", 210, 3],
-    ["Linear", 180, 4],
-    ["Docker Desktop", 160, 2],
-    ["Google Chrome", 1120, 7],
-    ["Slack", 540, 7],
-    ["Notion", 260, 5],
-    ["Zoom", 190, 4],
-    ["YouTube", 220, 4],
-    ["Spotify", 150, 3],
-    ["X (Twitter)", 95, 3],
-  ] as const
-).map(([app, minutes, activeUsers]) => ({ app, category: appCategory(app), minutes, color: appColor(app), activeUsers }));
-const PRIMARY_RATES: Record<string, number> = { u1: 60, u2: 45, u3: 45, u4: 38, u5: 42, u6: 55, u8: 50 };
-const PRIMARY_NOTIFICATIONS: AppNotification[] = [
-  { id: "n1", type: "report", title: "Weekly report ready", body: "Your team's weekly productivity report is available.", at: new Date(NOW.getTime() - 8 * 60000).toISOString(), read: false },
-  { id: "n2", type: "alert", title: "Low activity detected", body: "Sadia Akter was below 40% activity for 2h.", at: new Date(NOW.getTime() - 46 * 60000).toISOString(), read: false },
-  { id: "n3", type: "member", title: "New member joined", body: "Imran Kabir accepted the invite to Dosi Web Platform.", at: new Date(NOW.getTime() - 3 * 3600000).toISOString(), read: false },
-  { id: "n4", type: "mention", title: "You were mentioned", body: "Tanvir mentioned you in Sprint 24 planning.", at: new Date(NOW.getTime() - 6 * 3600000).toISOString(), read: true },
-  { id: "n5", type: "alert", title: "Overtime warning", body: "Ayesha Rahman exceeded 9h tracked today.", at: new Date(NOW.getTime() - 9 * 3600000).toISOString(), read: true },
-  { id: "n6", type: "system", title: "Agent updated", body: "Windows tracker updated to v0.1.0 on 4 machines.", at: new Date(NOW.getTime() - 26 * 3600000).toISOString(), read: true },
-];
-
-function buildPrimary(): Dataset {
-  return {
-    workspaceId: "w1",
-    users: primaryUsers,
-    projects: primaryProjects,
-    activities: primaryActivities,
-    weeklyTrend: primaryWeekly,
-    hourlyToday: primaryHourly,
-    topApps: primaryTopApps,
-    summary: primarySummary,
-    projectDistribution: primaryProjectDistribution(),
-    appCatalog: PRIMARY_APP_CATALOG,
-    productivitySplit: deriveSplit(primaryUsers),
-    attendance: deriveAttendance(primaryUsers, 99887766),
-    billing: deriveBilling(primaryUsers, PRIMARY_RATES, 1),
-    notifications: PRIMARY_NOTIFICATIONS,
-  };
-}
-
-/* ----------------------------- Other seed tenants ----------------------------- */
-
-interface Roster {
-  id: string;
-  users: User[];
-  projects: Project[];
-}
-
-function buildGenerated(roster: Roster): Dataset {
-  const seed = hashStr(roster.id);
-  const activities = genActivities(roster.users, roster.projects, seed);
-  // Derive the roster and the project totals from the rows before anything
-  // else reads `trackedToday` / `loggedThisWeek`.
-  syncTrackedToday(roster.users, activities);
-  syncProjectTotals(roster.projects, activities);
-  const appCatalog = genAppCatalog(roster.users, seed);
-  return {
-    workspaceId: roster.id,
-    users: roster.users,
-    projects: roster.projects,
-    activities,
-    weeklyTrend: genWeekly(roster.users, seed),
-    hourlyToday: genHourly(seed),
-    topApps: genTopApps(appCatalog),
-    summary: computeSummary(roster.users, roster.projects, activities),
-    projectDistribution: computeProjectDistribution(roster.projects),
-    appCatalog,
-    productivitySplit: deriveSplit(roster.users),
-    attendance: deriveAttendance(roster.users, seed),
-    billing: deriveBilling(roster.users, {}, seed),
-    notifications: genNotifications(roster.users, roster.projects),
-  };
-}
-
-const perms = { screenshot: true, webcam: false, keyboard: true, mouse: true, activeWindow: true, runningPrograms: true };
-
-// --- Acme Studio (w2): a design agency ---
-const acmeUsers: User[] = [
-  { id: "w2-u1", name: "Diego Alvarez", email: "diego@acmestudio.com", role: "owner", designation: "Creative Director", status: "active", timezone: "Europe/Madrid", trackedToday: 356, productivity: 84, joinedAt: "2026-06-28" },
-  { id: "w2-u2", name: "Lucia Romero", email: "lucia@acmestudio.com", role: "worker", designation: "UI/UX Designer", status: "active", timezone: "Europe/Madrid", trackedToday: 322, productivity: 81, joinedAt: "2026-06-29" },
-  { id: "w2-u3", name: "Marc Dubois", email: "marc@acmestudio.com", role: "worker", designation: "Frontend Developer", status: "idle", timezone: "Europe/Paris", trackedToday: 290, productivity: 76, joinedAt: "2026-07-01" },
-  { id: "w2-u4", name: "Sofia Rossi", email: "sofia@acmestudio.com", role: "worker", designation: "UI/UX Designer", status: "offline", timezone: "Europe/Rome", trackedToday: 214, productivity: 69, joinedAt: "2026-07-02" },
-  { id: "w2-u5", name: "Nora Klein", email: "nora@brandhaus.de", role: "client", designation: "Client · Brandhaus", status: "offline", timezone: "Europe/Berlin", trackedToday: 0, productivity: 0, joinedAt: "2026-07-03" },
-];
-const acmeProjects: Project[] = [
-  { id: "w2-p1", title: "Brand Refresh 2026", description: "Full identity refresh for Brandhaus.", color: "#ec4899", archived: false, intervalMinutes: 10, permissions: { ...perms, webcam: true }, memberIds: ["w2-u1", "w2-u2", "w2-u4", "w2-u5"], createdAt: "2026-06-29", loggedThisWeek: 1260, loggedThisMonth: 3120, loggedTotal: 3120 },
-  { id: "w2-p2", title: "Ad Campaign — Q3", description: "Social + display campaign assets.", color: "#f59e0b", archived: false, intervalMinutes: 15, permissions: perms, memberIds: ["w2-u2", "w2-u3"], createdAt: "2026-07-01", loggedThisWeek: 820, loggedThisMonth: 1980, loggedTotal: 1980 },
-  { id: "w2-p3", title: "Packaging System", description: "Reusable packaging design system.", color: "#8b5cf6", archived: false, intervalMinutes: 10, permissions: perms, memberIds: ["w2-u1", "w2-u3", "w2-u4"], createdAt: "2026-07-02", loggedThisWeek: 540, loggedThisMonth: 1240, loggedTotal: 1240 },
-];
-
-// --- Nimbus Co (w3): a small dev shop ---
-const nimbusUsers: User[] = [
-  { id: "w3-u1", name: "Kwame Mensah", email: "kwame@nimbus.co", role: "owner", designation: "Founder / Engineer", status: "active", timezone: "Africa/Accra", trackedToday: 301, productivity: 80, joinedAt: "2026-05-15" },
-  { id: "w3-u2", name: "Aisha Bello", email: "aisha@nimbus.co", role: "worker", designation: "Backend Developer", status: "active", timezone: "Africa/Lagos", trackedToday: 268, productivity: 77, joinedAt: "2026-05-18" },
-  { id: "w3-u3", name: "Liang Wei", email: "liang@nimbus.co", role: "worker", designation: "Data Engineer", status: "idle", timezone: "Asia/Shanghai", trackedToday: 233, productivity: 72, joinedAt: "2026-05-20" },
-];
-const nimbusProjects: Project[] = [
-  { id: "w3-p1", title: "Weather API", description: "Public weather data REST API.", color: "#0ea5e9", archived: false, intervalMinutes: 10, permissions: perms, memberIds: ["w3-u1", "w3-u2", "w3-u3"], createdAt: "2026-05-16", loggedThisWeek: 940, loggedThisMonth: 4200, loggedTotal: 8600 },
-  { id: "w3-p2", title: "Nimbus Mobile", description: "Cross-platform mobile client.", color: "#22c55e", archived: false, intervalMinutes: 15, permissions: perms, memberIds: ["w3-u1", "w3-u2"], createdAt: "2026-05-22", loggedThisWeek: 610, loggedThisMonth: 2680, loggedTotal: 5100 },
-];
-
-/* ----------------------------- Empty (freshly created) tenants ----------------------------- */
-
-function buildEmpty(id: string): Dataset {
-  const owner: User = {
-    id: `${id}-owner`,
-    name: "You",
-    email: "you@workspace.app",
-    role: "owner",
-    designation: "Workspace Owner",
-    status: "active",
-    timezone: "UTC",
-    trackedToday: 0,
-    productivity: 0,
-    joinedAt: NOW.toISOString().slice(0, 10),
-  };
-  return {
-    workspaceId: id,
-    users: [owner],
-    projects: [],
-    activities: [],
-    weeklyTrend: genWeekly([owner], hashStr(id)).map((d) => ({ ...d, tracked: 0, productive: 0 })),
-    hourlyToday: genHourly(hashStr(id)).map((h) => ({ ...h, minutes: 0 })),
-    topApps: [],
-    summary: { totalTrackedToday: 0, activeMembers: 1, totalMembers: 1, activeProjects: 0, avgProductivity: 0, screenshotsToday: 0 },
-    projectDistribution: [],
-    appCatalog: [],
-    productivitySplit: [],
-    attendance: [],
-    billing: [],
-    notifications: [
-      { id: "n1", type: "system", title: "Welcome to your workspace", body: "Invite members and create your first project to get started.", at: NOW.toISOString(), read: false },
-    ],
-  };
 }
 
 /* ----------------------------- Registry ----------------------------- */
@@ -515,6 +84,55 @@ const cache = new Map<string, Dataset>();
 
 /** Live workspace ids (see live-identity.ts) all start with this prefix. */
 const LIVE_ID_PREFIX = "live-";
+
+/** How demo mode plugs its tenants in (lib/demo-tenants registers one). */
+export interface DemoDatasets {
+  /** The dataset of a demo workspace id (an unknown id: an empty, freshly created demo workspace). */
+  build: (workspaceId: string) => Dataset;
+  /** The workspace a demo visitor lands in (and returns to after a sign-out). */
+  primaryWorkspaceId: string;
+}
+
+let demo: DemoDatasets | null = null;
+
+/**
+ * Plug the demo tenants in. Only lib/demo-tenants calls this, and only a
+ * deployment with demo mode on loads that module. Datasets read before
+ * (empty ones) are forgotten so the demo's replace them, and unless a live
+ * tenant is active the primary demo workspace becomes the active one.
+ */
+export function registerDemoDatasets(datasets: DemoDatasets): void {
+  demo = datasets;
+  for (const [id, ds] of cache) {
+    if (!ds.live) cache.delete(id);
+  }
+  if (!active.live) applyActive(datasetFor(datasets.primaryWorkspaceId));
+}
+
+/** Whether the demo tenants are loaded (demo mode, once lib/demo-tenants has run). */
+export function demoDatasetsInstalled(): boolean {
+  return demo !== null;
+}
+
+/** A dataset with nothing in it: what any non-live workspace reads outside demo mode. Never demo rows. */
+function blankDataset(workspaceId: string): Dataset {
+  return {
+    workspaceId,
+    users: [],
+    projects: [],
+    activities: [],
+    weeklyTrend: [],
+    hourlyToday: [],
+    topApps: [],
+    summary: { totalTrackedToday: 0, activeMembers: 0, totalMembers: 0, activeProjects: 0, avgProductivity: 0, screenshotsToday: 0 },
+    projectDistribution: [],
+    appCatalog: [],
+    productivitySplit: [],
+    attendance: [],
+    billing: [],
+    notifications: [],
+  };
+}
 
 /** Demo projects created in this browser, per workspace. */
 const createdProjectsKey = (workspaceId: string) => `dosi-projects-created-${workspaceId}`;
@@ -536,19 +154,17 @@ export function datasetFor(workspaceId: string): Dataset {
   if (cached) return cached;
 
   let ds: Dataset;
-  if (workspaceId === "w1") ds = buildPrimary();
-  else if (workspaceId === "w2") ds = buildGenerated({ id: "w2", users: acmeUsers, projects: acmeProjects });
-  else if (workspaceId === "w3") ds = buildGenerated({ id: "w3", users: nimbusUsers, projects: nimbusProjects });
   // A live workspace not hydrated yet reads as EMPTY — never as a demo tenant.
-  else if (workspaceId.startsWith(LIVE_ID_PREFIX)) {
+  if (workspaceId.startsWith(LIVE_ID_PREFIX)) {
     ds = buildLiveDataset({ workspaceId, users: [], projects: [], activities: [], now: new Date() });
-    cache.set(workspaceId, ds);
-    return ds;
-  } else ds = buildEmpty(workspaceId);
-
-  const localProjects = readCreatedProjects(workspaceId);
-  if (localProjects.length > 0) {
-    ds.projects = [...localProjects, ...ds.projects];
+  } else if (demo) {
+    ds = demo.build(workspaceId);
+    const localProjects = readCreatedProjects(workspaceId);
+    if (localProjects.length > 0) {
+      ds.projects = [...localProjects, ...ds.projects];
+    }
+  } else {
+    ds = blankDataset(workspaceId);
   }
 
   cache.set(workspaceId, ds);
@@ -579,7 +195,8 @@ export function createTenantProject(workspaceId: string, project: Project): void
  * component re-reads the new tenant's data.
  * ========================================================================== */
 
-let active: Dataset = datasetFor("w1");
+// Nothing until the session decides: a live tenant's data, or (demo mode) a demo tenant's.
+let active: Dataset = blankDataset("");
 
 export let users: User[] = active.users;
 export let projects: Project[] = active.projects;
@@ -720,12 +337,12 @@ export function isLiveDataset(): boolean {
   return active.live === true;
 }
 
-/** Forget every live dataset (sign-out) and fall back to the primary demo workspace. */
+/** Forget every live dataset (sign-out): back to the primary demo workspace in demo mode, else to nothing. */
 export function dropLiveDatasets(): void {
   for (const [id, ds] of cache) {
     if (ds.live) cache.delete(id);
   }
-  if (active.live) applyActive(datasetFor("w1"));
+  if (active.live) applyActive(demo ? datasetFor(demo.primaryWorkspaceId) : blankDataset(""));
 }
 
 export function hydrateLiveBackendData(liveProjects: Project[], liveActivities: Activity[]) {
@@ -805,32 +422,13 @@ export function insights(): Insight[] {
  * Test-only reset
  * ========================================================================== */
 
-// Pristine deep-copies of every seed roster, captured at module load — i.e.
-// before any runtime mutation (hydration and invite flows push into these
-// shared arrays in place).
-const seedArrays: unknown[][] = [
-  primaryUsers,
-  primaryProjects,
-  primaryActivities,
-  PRIMARY_NOTIFICATIONS, // topbar mark-as-read flips `read` in place
-  acmeUsers,
-  acmeProjects,
-  nimbusUsers,
-  nimbusProjects,
-];
-const seedSnapshots = seedArrays.map((a) => structuredClone(a));
-
 /**
- * Restore the demo-data layer to its pristine state: undo in-place seed-array
- * mutations, drop every cached per-workspace dataset (including projects
- * seeded from localStorage) and re-point the live bindings at the primary
- * workspace. Imported ONLY by the test harness — never by app code.
+ * Drop every cached dataset and re-point the live bindings at the primary
+ * demo workspace (or at nothing outside demo mode). lib/demo-tenants'
+ * resetTenantDataForTests restores its seed rosters and then calls this.
+ * Imported ONLY by test code and that reset, never by app code.
  */
-export function resetTenantDataForTests(): void {
-  seedArrays.forEach((arr, i) => {
-    arr.length = 0;
-    arr.push(...structuredClone(seedSnapshots[i]));
-  });
+export function resetTenantRegistryForTests(): void {
   cache.clear();
-  applyActive(datasetFor("w1"));
+  applyActive(demo ? datasetFor(demo.primaryWorkspaceId) : blankDataset(""));
 }

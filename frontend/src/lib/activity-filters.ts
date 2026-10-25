@@ -1,6 +1,6 @@
 import { activities, projectById, projects, userById } from "./tenant-data";
 import type { Activity } from "./types";
-import { NOW } from "./mock-data";
+import { NOW } from "./demo-clock";
 import type { RangeKey } from "./reports-data";
 import { appKey, canonicalAppName } from "./apps";
 import {

@@ -9,10 +9,10 @@ import {
   planNameFor,
   seatLimitFor,
   usagePct,
-  workspaces,
   workspaceUsage,
   type Workspace,
 } from "./saas-data";
+import { workspaces } from "./demo-tenants";
 
 function liveWs(live: Partial<NonNullable<Workspace["live"]>> = {}, seatsUsed = 4): Workspace {
   return {

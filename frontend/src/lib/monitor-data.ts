@@ -1,4 +1,4 @@
-import { NOW } from "./mock-data";
+import { NOW } from "./demo-clock";
 import { reconcileSegmentProductivity, trimSegmentsToTarget } from "./metrics";
 import { isLiveDataset, projects, userById } from "./tenant-data";
 import { appCategory, appColor } from "./apps";

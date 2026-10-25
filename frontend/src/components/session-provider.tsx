@@ -1,9 +1,16 @@
 "use client";
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useReducer, useRef, useState, useSyncExternalStore } from "react";
-import { users as primaryUsers } from "@/lib/mock-data";
-import { datasetFor, dropLiveDatasets, installEmptyLiveDataset, installLiveDataset, setActiveWorkspace } from "@/lib/tenant-data";
-import { primaryWorkspace, workspaces as seedWorkspaces, type PlanId, type Workspace } from "@/lib/saas-data";
+import {
+  datasetFor,
+  demoDatasetsInstalled,
+  dropLiveDatasets,
+  installEmptyLiveDataset,
+  installLiveDataset,
+  setActiveWorkspace,
+} from "@/lib/tenant-data";
+import { demoWorkspaces as seededDemoWorkspaces, primaryDemoWorkspace, type PlanId, type Workspace } from "@/lib/saas-data";
+import { runtimeConfig } from "@/lib/runtime-config";
 import type { ActivityCoverage, User } from "@/lib/types";
 import { getApi, getPagedApi, loginApi, logoutApi, refreshAccessToken } from "@/hooks/useApi";
 import {
@@ -52,8 +59,13 @@ export const hostUser: User = {
 
 /**
  * Where the session stands:
- *  - "unknown"    first render, before browser storage is read (SSR-safe);
- *  - "demo"       no backend token: the built-in demo dataset;
+ *  - "unknown"    first render, before browser storage is read (SSR-safe),
+ *                 and, in demo mode, while the demo data loads;
+ *  - "demo"       no backend token and the deployment has demo mode on
+ *                 (DOSI_DEMO_MODE): the built-in demo dataset;
+ *  - "anonymous"  no backend token and no demo mode: a signed-out visitor
+ *                 (a stale or forged session cookie included). Pages send
+ *                 them to /login; nothing of the demo ever renders;
  *  - "loading"    token present, the real identity/workspace is being fetched;
  *  - "ready"      live session: real user, real workspace, real rows;
  *  - "error"      token present but the backend couldn't be reached. An error
@@ -62,7 +74,7 @@ export const hostUser: User = {
  *                 on its way to /login. Nothing of the old session — and no
  *                 demo data — renders in between.
  */
-export type SessionStatus = "unknown" | "demo" | "loading" | "ready" | "error" | "signedout";
+export type SessionStatus = "unknown" | "demo" | "anonymous" | "loading" | "ready" | "error" | "signedout";
 
 /**
  * Where a live session's sign-in stands. With a refresh token the session
@@ -189,6 +201,9 @@ const pendingLiveWorkspace: Workspace = {
 /** Shown while the page leaves for /login: a neutral identity, never a demo person. */
 const signedOutUser: User = { ...pendingLiveUser, id: "signed-out", name: "Signed out" };
 
+/** No session and no demo: no workspace at all (an empty, non-live dataset). */
+const noWorkspace: Workspace = { ...pendingLiveWorkspace, id: "", name: "" };
+
 interface LiveState {
   user: User;
   workspace: Workspace;
@@ -278,16 +293,26 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
   const snapshot = useSyncExternalStore(subscribeDemo, demoSnapshot, serverDemoSnapshot);
   const [overlay, setOverlay] = useState<Partial<Record<DemoKey, string | null>>>({});
   const demo = useMemo(() => parseDemoState(snapshot, overlay), [snapshot, overlay]);
-  const userId = demo.userId ?? primaryUsers[0].id;
-  const workspaceId = demo.workspaceId ?? primaryWorkspace.id;
+
+  // Demo mode is the deployment's explicit choice (DOSI_DEMO_MODE, lib/runtime-config),
+  // off by default. Its data (lib/demo-tenants) is loaded on demand, only then.
+  const demoMode = runtimeConfig().demoMode;
+  const [demoReady, setDemoReady] = useState(demoDatasetsInstalled);
+  const [demoFailed, setDemoFailed] = useState(false);
+  const demoActive = demoMode && demoReady;
+  const userId = demo.userId;
+  const workspaceId = demo.workspaceId ?? (demoActive ? primaryDemoWorkspace()?.id : undefined) ?? "";
 
   // Where the session stands is derived, not stored: rendering on the server
   // (and hydrating) says "unknown"; on the client a stored token means a live
-  // session ("loading" until its first load settles), no token means the demo.
+  // session ("loading" until its first load settles). No token means the demo
+  // where the deployment has demo mode on, else a signed-out visitor: a session
+  // cookie without a token (stale, or set by hand) never shows anything.
   const hydrated = useSyncExternalStore(subscribeNothing, onClient, onServer);
   const tokenPresent = useSyncExternalStore(subscribeDemo, isLiveSession, onServer);
   const [liveStatus, setLiveStatus] = useState<"idle" | "loading" | "ready" | "error">("idle");
   const [signedOut, setSignedOut] = useState(false);
+  const noTokenStatus: SessionStatus = !demoMode ? "anonymous" : demoFailed ? "error" : demoReady ? "demo" : "unknown";
   const status: SessionStatus = signedOut
     ? "signedout"
     : !hydrated
@@ -296,7 +321,9 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
         ? liveStatus
         : tokenPresent
           ? "loading"
-          : "demo";
+          : noTokenStatus;
+  /** A real backend token is in play (also while it loads, or failed to). */
+  const isLive = hydrated && !signedOut && (liveStatus !== "idle" || tokenPresent);
 
   // Live session state: `live` holds the REAL user/workspace once loaded.
   const [live, setLive] = useState<LiveState | null>(null);
@@ -448,13 +475,16 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
       const silent = options?.silent === true;
       if (!isLiveSession()) {
         const s = statusRef.current;
-        if (lastLoad.current || s === "loading" || s === "ready" || s === "error") {
+        // (An "error" from the demo chunk failing to load is not a live session.)
+        if (lastLoad.current || s === "loading" || s === "ready" || (s === "error" && !demoFailed)) {
           // The token went away under a live tab: that is a sign-out, never a fall back to the demo.
           endSession();
           return null;
         }
-        // No token: the demo — or, after a sign-out, the signed-out screen until the page leaves.
+        // No token: the demo (loaded again after a failed attempt) — or, after a sign-out or
+        // without demo mode, the signed-out screen until the page leaves.
         clearLiveState();
+        setDemoFailed(false);
         return null;
       }
       setSignedOut(false);
@@ -466,7 +496,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
       }
       return runLoad(seq, silent);
     },
-    [clearLiveState, endSession, runLoad],
+    [clearLiveState, endSession, runLoad, demoFailed],
   );
 
   /** A silent refresh, one at a time, and never while the sign-in has expired. */
@@ -511,6 +541,25 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
     installEmptyLiveDataset(LIVE_PENDING_WORKSPACE_ID);
     void runLoad(++loadSeq.current, false);
   }, [tokenPresent, signedOut, liveStatus, runLoad]);
+
+  // Demo mode with no session: load the demo tenants (a separate chunk a live deployment never fetches).
+  useEffect(() => {
+    if (!hydrated || tokenPresent || signedOut || !demoMode || demoReady || demoFailed) return;
+    let cancelled = false;
+    import("@/lib/demo-tenants")
+      .then((module) => {
+        module.installDemoTenants();
+        if (!cancelled) setDemoReady(true);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setLiveError("The demo couldn't be loaded. Check your connection and try again.");
+        setDemoFailed(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [hydrated, tokenPresent, signedOut, demoMode, demoReady, demoFailed]);
 
   // Other tabs share this browser's session: follow their sign-outs, sign-ins and renewals.
   useEffect(() => {
@@ -637,11 +686,12 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
     };
   }, [status, tokenEpoch]);
 
-  const isLive = status === "loading" || status === "ready" || status === "error";
-
-  const demoWorkspaces = [...seedWorkspaces, ...demo.created]
-    .filter((w) => !demo.deleted.includes(w.id))
-    .map((w) => (demo.patches[w.id] ? { ...w, ...demo.patches[w.id] } : w));
+  // Outside demo mode there are no demo workspaces, not even ones a demo visit once created here.
+  const demoWorkspaces = demoActive
+    ? [...seededDemoWorkspaces(), ...demo.created]
+        .filter((w) => !demo.deleted.includes(w.id))
+        .map((w) => (demo.patches[w.id] ? { ...w, ...demo.patches[w.id] } : w))
+    : [];
 
   // LIVE: exactly one workspace (the real tenant) and the real signed-in user.
   // No demo tenants, no demo roster, no demo impersonation.
@@ -650,7 +700,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
   const workspace =
     isLive || signedOut
       ? liveWorkspace
-      : (demoWorkspaces.find((w) => w.id === workspaceId) ?? demoWorkspaces[0] ?? primaryWorkspace);
+      : (demoWorkspaces.find((w) => w.id === workspaceId) ?? demoWorkspaces[0] ?? noWorkspace);
 
   // Point the tenant data layer at the active workspace. Combined with the
   // remount key in the dashboard layout, every page re-reads this tenant's data.
@@ -658,13 +708,16 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
 
   // Resolve the current user from the active tenant roster (+ host).
   // Do not keep primary-tenant users in the pool when viewing another workspace.
-  const activeUsers = datasetFor(workspace.id).users;
+  // No token and no demo: nobody, whatever datasets this tab happens to hold.
+  const anonymous = !isLive && !signedOut && !demoActive;
+  const activeUsers = anonymous ? [] : datasetFor(workspace.id).users;
   const pool: User[] = [hostUser, ...activeUsers];
-  const user = signedOut
-    ? signedOutUser
-    : isLive
-      ? (live?.user ?? pendingLiveUser)
-      : (pool.find((u) => u.id === userId) ?? activeUsers[0] ?? primaryUsers[0]);
+  const user =
+    signedOut || anonymous
+      ? signedOutUser
+      : isLive
+        ? (live?.user ?? pendingLiveUser)
+        : (pool.find((u) => u.id === userId) ?? activeUsers[0] ?? signedOutUser);
 
   const setUserById = (id: string) => {
     if (isLive || signedOut) return; // identity comes from the backend in a live session
@@ -712,7 +765,8 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
   const deleteWorkspace = (id: string) => {
     persist(WS_DELETED_KEY, JSON.stringify([...demo.deleted, id]));
     persist(WS_CREATED_KEY, JSON.stringify(demo.created.filter((w) => w.id !== id)));
-    if (workspaceId === id) setWorkspaceById(primaryWorkspace.id);
+    const primary = primaryDemoWorkspace();
+    if (workspaceId === id && primary) setWorkspaceById(primary.id);
   };
 
   const loginAsHost = () => {
