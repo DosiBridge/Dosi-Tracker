@@ -1,17 +1,16 @@
 import DosiTrackerCore
 import SwiftUI
 
-// The sign-in window (port of the Windows agent's `ui/login.rs`): workspace,
-// email and password, the server address under "Advanced", Enter submits, a
+// The sign-in window (port of the Windows agent's `ui/login.rs`): email and
+// password — the workspace is picked after signing in, from the ones the
+// account belongs to — the server address under "Advanced", Enter submits, a
 // show/hide password toggle, and the server's own reason when it refuses.
-// After "Sign-in expired" the workspace and email are prefilled and only the
-// password is asked for; when the server demands a new password, the form
-// asks for it.
+// After "Sign-in expired" the email is prefilled and only the password is
+// asked for; when the server demands a new password, the form asks for it.
 
 struct SignInView: View {
     @ObservedObject var model: AppModel
 
-    @State private var workspace = ""
     @State private var email = ""
     @State private var password = ""
     @State private var newPassword = ""
@@ -24,7 +23,6 @@ struct SignInView: View {
     @FocusState private var focus: Field?
 
     private enum Field: Hashable {
-        case workspace
         case email
         case password
     }
@@ -85,7 +83,7 @@ struct SignInView: View {
         VStack(spacing: 8) {
             LogoMark(size: 52)
             Text("Welcome to Dosi Tracker").font(.title2.weight(.semibold))
-            Text("Sign in to your workspace to start tracking.")
+            Text("Sign in with your work email to start tracking.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
         }
@@ -94,12 +92,6 @@ struct SignInView: View {
 
     private var accountFields: some View {
         VStack(alignment: .leading, spacing: 12) {
-            field("Workspace") {
-                TextField("", text: $workspace, prompt: Text("e.g. acme"))
-                    .textFieldStyle(.roundedBorder)
-                    .focused($focus, equals: .workspace)
-                    .onSubmit(submit)
-            }
             field("Email") {
                 TextField("", text: $email, prompt: Text("you@company.com"))
                     .textFieldStyle(.roundedBorder)
@@ -215,21 +207,18 @@ struct SignInView: View {
         }
     }
 
-    /// The last workspace, email and server; after "Sign-in expired" only the
-    /// password is left to type.
+    /// The last email and server; after "Sign-in expired" only the password
+    /// is left to type.
     private func prefill() {
         guard !prefilled else { return }
         prefilled = true
-        if workspace.isEmpty {
-            workspace = snapshot.workspace.isEmpty ? snapshot.suggestedWorkspace : snapshot.workspace
-        }
         if email.isEmpty {
             email = snapshot.displayName.isEmpty ? snapshot.suggestedUsername : snapshot.displayName
         }
         if server.isEmpty {
             server = snapshot.suggestedServerURL
         }
-        focus = email.isEmpty ? (workspace.isEmpty ? .workspace : .email) : .password
+        focus = email.isEmpty ? .email : .password
     }
 
     private func submit() {
@@ -241,7 +230,6 @@ struct SignInView: View {
         }
         let typedServer = server.trimmingCharacters(in: .whitespacesAndNewlines)
         model.signIn(
-            workspace: workspace,
             email: email,
             password: password,
             server: typedServer.isEmpty || snapshot.serverURLIsManaged ? nil : typedServer,

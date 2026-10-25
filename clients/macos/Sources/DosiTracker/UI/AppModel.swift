@@ -172,7 +172,7 @@ final class AppModel: ObservableObject {
         if next.capture != old.capture {
             requestMissingPermissions(for: next.capture)
         }
-        if old.status.needsSignIn && next.status.isSignedIn {
+        if !old.status.isSignedIn && next.status.isSignedIn {
             startAtLoginOnFirstSignIn()
         }
         for notice in next.notices where notice.id > lastNoticeId {
@@ -210,11 +210,35 @@ final class AppModel: ObservableObject {
 
     // MARK: Commands
 
-    func signIn(workspace: String, email: String, password: String, server: String?, newPassword: String?) {
+    func signIn(email: String, password: String, server: String?, newPassword: String?) {
         let worker = self.worker
         Task {
-            await worker.signIn(workspace: workspace, username: email, password: password, server: server,
-                                newPassword: newPassword)
+            await worker.signIn(username: email, password: password, server: server, newPassword: newPassword)
+        }
+    }
+
+    /// "Switch workspace…": list the user's workspaces to pick another.
+    func switchWorkspace() {
+        let worker = self.worker
+        Task {
+            await worker.switchWorkspace()
+        }
+    }
+
+    /// Track in `workspaceId` (one of the snapshot's choices) from now on.
+    func chooseWorkspace(_ workspaceId: String) {
+        let at = Date()
+        let worker = self.worker
+        Task {
+            await worker.chooseWorkspace(workspaceId, at: at)
+        }
+    }
+
+    /// Close the workspace picker without switching.
+    func cancelWorkspaceChoice() {
+        let worker = self.worker
+        Task {
+            await worker.cancelWorkspaceChoice()
         }
     }
 

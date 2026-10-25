@@ -208,7 +208,9 @@ public struct OAuthErrorBody: Decodable, Equatable, Sendable {
 /// inactive account, a required password change, …
 ///
 /// For the agent this is the only failure that means "Sign-in expired"; a
-/// network error, throttling or a 5xx keeps the saved sign-in.
+/// network error, throttling or a 5xx keeps the saved sign-in. A refused
+/// refresh token is one too: the user signs in again, the password is never
+/// re-sent silently.
 public struct AuthRejection: Equatable, Sendable {
     public enum Kind: Equatable, Sendable {
         case invalidCredentials
@@ -241,6 +243,11 @@ public struct AuthRejection: Equatable, Sendable {
         self.init(status: status, error: body.error, errorDescription: body.errorDescription,
                   changePasswordToken: body.changePasswordToken)
     }
+
+    /// No refresh token is left to renew the access token with (the server
+    /// granted none, or the user signed out): the user signs in again.
+    public static let sessionEnded = AuthRejection(
+        status: 401, error: "invalid_grant", errorDescription: "Your session has ended. Sign in again.")
 
     /// ABP 10.5's OAuth error for a deactivated (or not allowed) account,
     /// sent instead of `invalid_grant`.
@@ -359,6 +366,9 @@ public struct TokenFailure: Equatable, Sendable {
         }
         if status >= 500 {
             return "The server had a problem (HTTP \(status)). Try again shortly."
+        }
+        if (300..<400).contains(status) {
+            return ApiError.redirectMessage(status: status)
         }
         return errorDescription?.nonEmptyTrimmed ?? "Sign-in failed (HTTP \(status))."
     }

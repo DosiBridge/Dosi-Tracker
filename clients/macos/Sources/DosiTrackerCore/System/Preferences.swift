@@ -76,6 +76,7 @@ public final class Preferences: @unchecked Sendable {
         public static let deviceId = "DeviceId"
         public static let savedServerURL = "SavedServerURL"
         public static let lastWorkspace = "LastWorkspace"
+        public static let lastWorkspaceId = "LastWorkspaceId"
         public static let lastUsername = "LastUsername"
     }
 
@@ -151,10 +152,18 @@ public final class Preferences: @unchecked Sendable {
         set { setOrRemove(newValue?.nonEmptyTrimmed, forKey: Key.savedServerURL) }
     }
 
-    /// Workspace of the last sign-in (prefills the form after "Sign-in expired").
+    /// Name of the workspace last tracked in (shown while the saved sign-in
+    /// cannot be read).
     public var lastWorkspace: String? {
         get { defaults.string(forKey: Key.lastWorkspace)?.nonEmptyTrimmed }
         set { setOrRemove(newValue?.nonEmptyTrimmed, forKey: Key.lastWorkspace) }
+    }
+
+    /// GUID of the workspace last tracked in: chosen again after signing in
+    /// again, and the queue owner while the saved sign-in cannot be read.
+    public var lastWorkspaceId: String? {
+        get { defaults.string(forKey: Key.lastWorkspaceId)?.nonEmptyTrimmed }
+        set { setOrRemove(newValue?.nonEmptyTrimmed, forKey: Key.lastWorkspaceId) }
     }
 
     /// Email / user name of the last sign-in.

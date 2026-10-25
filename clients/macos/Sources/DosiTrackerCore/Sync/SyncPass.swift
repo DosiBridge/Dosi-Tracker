@@ -69,6 +69,9 @@ public enum SyncStop: Equatable, Sendable {
     case signInExpired(AuthRejection)
     /// The queue itself could not be read or updated.
     case queueError(String)
+    /// The device or the workspace lost its access: nothing more goes up for
+    /// this owner (``AccessLoss``).
+    case accessLost(AccessLoss)
 }
 
 /// The outcome of one upload pass.
@@ -106,6 +109,8 @@ public struct SyncReport: Equatable, Sendable {
 /// * Anything transient → the reason is noted on the row, the pass stops, and
 ///   the rest waits for ``SyncStop/retry(_:)``'s plan.
 /// * Refused credentials → the pass stops with "Sign-in expired".
+/// * A revoked device or a lost / archived workspace → the pass stops with
+///   ``SyncStop/accessLost(_:)``; the row stays queued.
 ///
 /// Rows are read ``AgentTiming/uploadBatchSize`` at a time and at most
 /// ``AgentTiming/maxUploadsPerPass`` are tried, so a large backlog drains over
@@ -222,6 +227,12 @@ public enum SyncPass {
 
                 case .signInExpired(let rejection):
                     report.stop = .signInExpired(rejection)
+                    break pass
+
+                case .accessLost(let loss):
+                    CoreLog.warning("sync", "the server refused this owner's uploads (\(loss.kind.rawValue)); stopping")
+                    note(row, loss.message ?? loss.kind.rawValue, in: queue)
+                    report.stop = .accessLost(loss)
                     break pass
 
                 case .stripCapturesAndResend:

@@ -116,6 +116,101 @@ struct ChooseProjectView: View {
     }
 }
 
+/// Which workspace to track in (cross-agent contract): after signing in with
+/// several, after losing access to the one tracked in, and from "Switch
+/// workspace…". Each workspace shows the user's role in it.
+struct ChooseWorkspaceView: View {
+    @ObservedObject var model: AppModel
+    let close: () -> Void
+
+    private var snapshot: TrackerSnapshot { model.snapshot }
+
+    /// No workspace is chosen yet: there is nothing to go back to.
+    private var mustChoose: Bool { snapshot.status == .choosingWorkspace }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 10) {
+                LogoMark(size: 32)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(mustChoose ? "Choose a workspace" : "Switch workspace").font(.title3.weight(.semibold))
+                    Text(mustChoose
+                         ? "Pick the workspace you track your time in."
+                         : "The block so far is saved in the workspace it was tracked in.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            if let note = snapshot.workspaceNote {
+                Banner(snapshot.workspaceChoices.isEmpty ? .warning : .info, note)
+            }
+            if snapshot.findingWorkspaces {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Loading your workspaces…").font(.callout).foregroundStyle(.secondary)
+                }
+            } else if snapshot.workspaceChoices.isEmpty {
+                Button("Try again") {
+                    model.switchWorkspace()
+                }
+            } else {
+                ScrollView {
+                    VStack(spacing: 6) {
+                        ForEach(snapshot.workspaceChoices) { workspace in
+                            Button {
+                                model.chooseWorkspace(workspace.id)
+                                if !workspace.isCurrent {
+                                    close()
+                                }
+                            } label: {
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 1) {
+                                        Text(workspace.name).font(.callout.weight(.medium))
+                                        if let role = workspace.role {
+                                            Text(role).font(.caption).foregroundStyle(.secondary)
+                                        }
+                                    }
+                                    Spacer()
+                                    if workspace.isCurrent {
+                                        Image(systemName: "checkmark").foregroundStyle(Theme.brand)
+                                    }
+                                }
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 9)
+                                .contentShape(Rectangle())
+                                .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Theme.card))
+                                .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(Theme.border, lineWidth: 1))
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(workspace.isCurrent)
+                        }
+                    }
+                }
+                .frame(maxHeight: 320)
+            }
+            HStack {
+                if mustChoose {
+                    Button("Sign out", role: .destructive) {
+                        model.signOut()
+                        close()
+                    }
+                }
+                Spacer()
+                if !mustChoose {
+                    Button("Cancel") {
+                        model.cancelWorkspaceChoice()
+                        close()
+                    }
+                    .keyboardShortcut(.cancelAction)
+                }
+            }
+        }
+        .padding(20)
+        .frame(width: 400)
+    }
+}
+
 /// "What are you working on?" as a native dialog (the menu bar's "Set
 /// task…"). Returns the new note, or nil when cancelled.
 @MainActor

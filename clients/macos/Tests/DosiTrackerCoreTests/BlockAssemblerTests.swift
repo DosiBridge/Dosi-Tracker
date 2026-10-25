@@ -85,8 +85,47 @@ final class BlockAssemblerTests: XCTestCase {
         XCTAssertNil(payload.idleSeconds)
         XCTAssertNil(payload.injectedInputEvents)
         XCTAssertTrue(payload.timeline.isEmpty, "all-inactive minutes would read as idle")
-        // Apps are still recorded.
+        // Not measured is null, never a 0 that reads as "no input".
+        XCTAssertNil(payload.keyboardHits)
+        XCTAssertNil(payload.mouseClicks)
+        // Apps are still recorded, without made-up counts.
         XCTAssertFalse(payload.activeWindows.isEmpty)
+        XCTAssertTrue(payload.activeWindows.allSatisfy { $0.keyboardHits == nil && $0.mouseClicks == nil })
+        let json = jsonDictionary(try! WireJSON.encoder().encode(payload))
+        XCTAssertTrue(json["keyboardHits"] is NSNull, "sent as an explicit null")
+        XCTAssertTrue(json["mouseClicks"] is NSNull, "sent as an explicit null")
+    }
+
+    func testEachInputKindIsMeasuredOnItsOwn() {
+        // The keyboard is recorded, the mouse is not (the project or the
+        // user's consent leaves it out).
+        var permissions = CapturePermissions.all
+        permissions.mouse = false
+        var measured = measurements()
+        measured.clicks = []
+        let payload = BlockAssembler.build(block(permissions), measured: measured, device: sampleDevice(), zone: zone)
+        XCTAssertEqual(payload.keyboardHits, 6)
+        XCTAssertNil(payload.mouseClicks)
+        XCTAssertNotNil(payload.productivity, "the keyboard alone still measures activity")
+        XCTAssertEqual(payload.timeline.count, 10)
+        XCTAssertTrue(payload.timeline.allSatisfy { $0.mouseClicks == nil && $0.keyboardHits != nil })
+        XCTAssertEqual(payload.timeline[0].keyboardHits, 1)
+        XCTAssertEqual(payload.timeline[6].keyboardHits, 0, "measured, and none: a real 0")
+        XCTAssertTrue(payload.activeWindows.allSatisfy { $0.mouseClicks == nil && $0.keyboardHits != nil })
+
+        let minute = jsonDictionary(try! WireJSON.encoder().encode(payload.timeline[0]))
+        XCTAssertEqual(minute["keyboardHits"] as? Int, 1)
+        XCTAssertTrue(minute["mouseClicks"] is NSNull)
+
+        // Measured and zero: 0, not null.
+        var quiet = measurements()
+        quiet.keyPresses = []
+        quiet.clicks = []
+        quiet.activeSeconds = []
+        let idle = BlockAssembler.build(block(), measured: quiet, device: sampleDevice(), zone: zone)
+        XCTAssertEqual(idle.keyboardHits, 0)
+        XCTAssertEqual(idle.mouseClicks, 0)
+        XCTAssertEqual(idle.productivity, 0)
     }
 
     func testActivityIsNotMeasuredWhenTheCaptureFailedDuringTheBlock() {
@@ -96,8 +135,9 @@ final class BlockAssemblerTests: XCTestCase {
         XCTAssertNil(payload.productivity)
         XCTAssertNil(payload.idleSeconds)
         XCTAssertTrue(payload.timeline.isEmpty)
-        // What was seen is still reported.
-        XCTAssertEqual(payload.keyboardHits, 6)
+        // A partial count would understate the input: not measured.
+        XCTAssertNil(payload.keyboardHits)
+        XCTAssertNil(payload.mouseClicks)
     }
 
     func testTheScreenCaptureFollowsTheProjectPolicy() {

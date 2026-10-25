@@ -6,8 +6,8 @@ import Foundation
 // per-state glyph, the session timer as its title while tracking, a tooltip
 // with the status and today's total, and the everyday actions one click away
 // — the same menu as the Windows tray: status, today / this week, Open,
-// Pause / Resume, timed breaks, Switch project, Set task…, Sync now, Open web
-// dashboard, Settings, Start at login, Quit. The menu is rebuilt each time it
+// Pause / Resume, timed breaks, Switch project, Switch workspace, Set task…,
+// Sync now, Open web dashboard, Settings, Start at login, Quit. The menu is rebuilt each time it
 // opens, so it always shows the current state.
 
 @MainActor
@@ -152,6 +152,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         if signedIn {
             let totals = model.liveTotals(now: now)
             menu.addItem(info("Today \(Formatting.secondsLabel(totals.today)) · This week \(Formatting.secondsLabel(totals.week))"))
+        } else if status == .choosingWorkspace {
+            menu.addItem(info("Choose a workspace to start tracking"))
         } else {
             menu.addItem(info(status == .signInExpired ? "Enter your password to continue" : "Sign in to start tracking"))
         }
@@ -165,6 +167,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         switch status {
         case .signedOut, .signInExpired:
             menu.addItem(action("Sign in…", #selector(openSignIn)))
+        case .choosingWorkspace:
+            menu.addItem(action("Choose a workspace…", #selector(openWorkspaces)))
         case .choosingProject:
             menu.addItem(action("Choose a project…", #selector(openChooser), enabled: !snapshot.projects.isEmpty))
         case .paused, .onBreak:
@@ -205,6 +209,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         projects.submenu = projectMenu
         projects.isEnabled = signedIn && idle && !snapshot.projects.isEmpty
         menu.addItem(projects)
+        menu.addItem(action("Switch workspace…", #selector(switchWorkspace), enabled: signedIn && idle))
 
         let note = snapshot.taskNote
         let shortNote = note.count > 40 ? String(note.prefix(40)) + "…" : note
@@ -272,6 +277,18 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     @objc private func openChooser() {
         windows.showChooseProject()
+    }
+
+    @objc private func openWorkspaces() {
+        windows.showChooseWorkspace()
+        if model.snapshot.workspaceChoices.isEmpty && !model.snapshot.findingWorkspaces {
+            model.switchWorkspace()
+        }
+    }
+
+    @objc private func switchWorkspace() {
+        model.switchWorkspace()
+        windows.showChooseWorkspace()
     }
 
     @objc private func openActivity() {

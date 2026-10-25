@@ -13,6 +13,16 @@ struct ProjectOption: Equatable, Sendable, Identifiable {
     let title: String
 }
 
+/// A workspace the user may track in, as the picker lists it.
+struct WorkspaceOption: Equatable, Sendable, Identifiable {
+    let id: String
+    let name: String
+    /// "Owner", "Manager", "Member"; nil when the server does not say.
+    let role: String?
+    /// The workspace tracked in now (while switching).
+    let isCurrent: Bool
+}
+
 /// Why queued blocks are not reaching the server right now (CONTRACT §1 "How
 /// agents treat upload responses"). The blocks stay queued; each kind is
 /// retried on its own schedule, and "Sync now" retries at once.
@@ -81,8 +91,14 @@ struct Notice: Equatable, Sendable, Identifiable {
         /// The local queue was damaged; it was set aside at `movedTo` and a
         /// fresh one started.
         case queueReset(movedTo: String)
-        /// The saved password no longer works.
+        /// The saved sign-in no longer works.
         case signInExpired
+        /// Access to the workspace tracked in was lost (removed from it, or it
+        /// was archived): tracking stopped there.
+        case workspaceLost(message: String)
+        /// An administrator removed this Mac: tracking stopped, and the saved
+        /// sign-in was forgotten.
+        case deviceRevoked
     }
 
     /// Increases with every notice, so each one is shown once.
@@ -106,6 +122,10 @@ struct Notice: Equatable, Sendable, Identifiable {
             return "The local queue was damaged and was set aside (\(movedTo)). Tracking continues."
         case .signInExpired:
             return "Your sign-in has expired. Enter your password to continue tracking."
+        case .workspaceLost(let message):
+            return message
+        case .deviceRevoked:
+            return "This Mac was removed from tracking by your workspace administrator. Tracking has stopped."
         }
     }
 }
@@ -135,15 +155,14 @@ struct TrackerSnapshot: Equatable, Sendable {
     var status: TrackerStatus = .signedOut
     /// The signed-in user (their email / user name).
     var displayName = ""
-    /// Workspace (tenant) of the signed-in account; empty for a host account.
+    /// Name of the workspace tracked in; empty while none is chosen.
     var workspace = ""
     /// The API address this account talks to.
     var serverURL = ""
     /// An MDM profile fixes the server address: the sign-in form must not
     /// offer to change it.
     var serverURLIsManaged = false
-    /// The sign-in form's suggestions: the last workspace, email and server.
-    var suggestedWorkspace = ""
+    /// The sign-in form's suggestions: the last email and server.
     var suggestedUsername = ""
     var suggestedServerURL = ""
     /// Whether the server answered the latest request. Tracking goes on
@@ -152,6 +171,15 @@ struct TrackerSnapshot: Equatable, Sendable {
 
     var projects: [ProjectOption] = []
     var selectedProjectId: String?
+
+    /// The workspaces to choose from: after signing in with several, after
+    /// losing access to one, or when "Switch workspace" asked for them.
+    var workspaceChoices: [WorkspaceOption] = []
+    /// The workspace list is being fetched.
+    var findingWorkspaces = false
+    /// Why there is nothing (else) to choose, or why the last workspace was
+    /// left.
+    var workspaceNote: String?
 
     /// Seconds tracked today / this week: the server's totals, plus blocks
     /// recorded since they were fetched. The time not saved yet is added live

@@ -18,8 +18,9 @@ public struct RecentBlock: Equatable, Sendable, Identifiable {
     public var endedAt: Date
     /// Nil when activity was not measured.
     public var productivity: Int?
-    public var keyboardHits: Int
-    public var mouseClicks: Int
+    /// Nil when that kind of input was not measured.
+    public var keyboardHits: Int?
+    public var mouseClicks: Int?
     public var hasScreenshot: Bool
     public var endReason: EndReason?
     public var upload: UploadState
@@ -29,7 +30,7 @@ public struct RecentBlock: Equatable, Sendable, Identifiable {
     public var id: Int64 { rowId }
 
     public init(rowId: Int64, projectTitle: String, startedAt: Date, endedAt: Date, productivity: Int?,
-                keyboardHits: Int, mouseClicks: Int, hasScreenshot: Bool, endReason: EndReason?,
+                keyboardHits: Int?, mouseClicks: Int?, hasScreenshot: Bool, endReason: EndReason?,
                 upload: UploadState = .queued, message: String? = nil) {
         self.rowId = rowId
         self.projectTitle = projectTitle

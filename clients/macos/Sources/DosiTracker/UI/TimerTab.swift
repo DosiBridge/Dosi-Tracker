@@ -358,6 +358,8 @@ struct ClockReadout {
             return idle("Offline", .warning, "Waiting for the server or a project. Work is kept on this Mac.")
         case .choosingProject:
             return idle("Choose a project", .info, "Pick the project you are working on to start tracking.")
+        case .choosingWorkspace:
+            return idle("Choose a workspace", .info, "Pick the workspace you track in to start tracking.")
         case .signedOut:
             return idle("Signed out", .neutral, "")
         case .signInExpired:

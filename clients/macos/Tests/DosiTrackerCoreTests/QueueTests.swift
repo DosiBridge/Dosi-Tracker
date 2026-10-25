@@ -1,10 +1,13 @@
 import XCTest
 @testable import DosiTrackerCore
 
+private let acmeId = "3f2a1b0c-0000-4000-8000-00000000a001"
+private let globexId = "3f2a1b0c-0000-4000-8000-00000000b002"
+
 /// Ports of the Windows agent's `storage.rs` tests, on temporary files.
 final class QueueTests: XCTestCase {
-    private let alice = "acme\u{1F}alice@acme.com"
-    private let bob = "acme\u{1F}bob@acme.com"
+    private let alice = "ws:\(acmeId)\u{1F}alice@acme.com"
+    private let bob = "ws:\(acmeId)\u{1F}bob@acme.com"
     private var files: [URL] = []
 
     override func tearDown() {
@@ -71,12 +74,42 @@ final class QueueTests: XCTestCase {
     // MARK: Ownership and order
 
     func testOwnerKeyIsCaseAndWhitespaceInsensitive() {
-        XCTAssertEqual(Queue.ownerKey(workspace: " Acme ", username: "Alice@Acme.com "), alice)
-        XCTAssertNotEqual(Queue.ownerKey(workspace: "acme", username: "alice@acme.com"),
-                          Queue.ownerKey(workspace: "", username: "alice@acme.com"))
+        XCTAssertEqual(Queue.ownerKey(workspaceId: " \(acmeId.uppercased()) ", username: "Alice@Acme.com "), alice)
+        XCTAssertNotEqual(Queue.ownerKey(workspaceId: acmeId, username: "alice@acme.com"),
+                          Queue.ownerKey(workspaceId: globexId, username: "alice@acme.com"))
         // The separator keeps the (workspace, user) split unambiguous.
-        XCTAssertNotEqual(Queue.ownerKey(workspace: "a", username: "bc"), Queue.ownerKey(workspace: "ab", username: "c"))
-        XCTAssertEqual(ApiClient.Account(workspace: "Acme", username: "Alice@Acme.com", password: "x").ownerKey, alice)
+        XCTAssertNotEqual(Queue.ownerKey(workspaceId: "a", username: "bc"), Queue.ownerKey(workspaceId: "ab", username: "c"))
+        XCTAssertEqual(Queue.workspaceId(ofOwner: alice), acmeId)
+        XCTAssertNil(Queue.workspaceId(ofOwner: "acme\u{1F}alice@acme.com"), "a retired, name-keyed owner")
+        XCTAssertNotEqual(Queue.legacyOwnerKey(workspaceName: "Acme", username: "alice@acme.com"), alice)
+        let saved = StoredSignIn(username: "Alice@Acme.com", workspaceId: acmeId, workspaceName: "Acme", refreshToken: "r")
+        XCTAssertEqual(saved.ownerKey, alice)
+    }
+
+    func testAUsersOtherWorkspacesAreListedForUpload() throws {
+        let queue = try store()
+        let aliceGlobex = Queue.ownerKey(workspaceId: globexId, username: "alice@acme.com")
+        let legacy = Queue.legacyOwnerKey(workspaceName: "Acme", username: "alice@acme.com")
+        try queue.enqueue(sample("g-1"), owner: aliceGlobex)
+        try queue.enqueue(sample("a-1"), owner: alice)
+        try queue.enqueue(sample("b-1"), owner: bob)
+        try queue.enqueue(sample("old-1"), owner: legacy)
+        try queue.enqueue(sample("a-2"), owner: alice)
+        // Alice's workspaces with pending rows, oldest first; never Bob's, never
+        // a name-keyed owner (it has no workspace to upload to).
+        XCTAssertEqual(try queue.pendingOwners(ofUser: " Alice@Acme.com "), [aliceGlobex, alice])
+        XCTAssertEqual(try queue.pendingOwners(ofUser: "bob@acme.com"), [bob])
+        XCTAssertEqual(try queue.pendingOwners(ofUser: "acme.com"), [], "a suffix of the name is not the user")
+        XCTAssertEqual(try queue.pendingOwners(ofUser: "carol@acme.com"), [])
+        XCTAssertTrue(Queue.owner(aliceGlobex, isUser: " Alice@Acme.com"))
+        XCTAssertFalse(Queue.owner(bob, isUser: "alice@acme.com"))
+        XCTAssertFalse(Queue.owner(legacy, isUser: "alice@acme.com"), "a name-keyed owner has no workspace")
+
+        // The retired owner's rows are handed to the workspace of that name.
+        XCTAssertEqual(try queue.reassignOwner(from: legacy, to: alice), 1)
+        XCTAssertEqual(try pending(queue, alice).map { $0.payload.projectId }, ["a-1", "old-1", "a-2"])
+        XCTAssertEqual(try queue.reassignOwner(from: legacy, to: alice), 0)
+        XCTAssertEqual(try queue.reassignOwner(from: alice, to: alice), 0)
     }
 
     func testEnqueueThenPendingRoundTrips() throws {

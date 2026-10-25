@@ -398,7 +398,7 @@ final class WorkerConsentLifecycleTests: XCTestCase {
 
     /// The queue owner key of the signed-in test account (workspace `test-ws`,
     /// user `user@example.com`): its project cache and its queued rows.
-    private static let owner = Queue.ownerKey(workspace: "test-ws", username: "user@example.com")
+    private static let owner = Queue.ownerKey(workspaceId: "test-ws", username: "user@example.com")
 
     /// One worker wired to fakes, and what to clean up after it.
     private struct Harness {
@@ -440,7 +440,8 @@ final class WorkerConsentLifecycleTests: XCTestCase {
         let consentManager = ConsentManager(initial: initialConsent, storage: storage)
 
         let credentials = TestCredentialsStore()
-        credentials.saved = StoredSignIn(account: ApiClient.Account(workspace: "test-ws", username: "user@example.com", password: "pwd"))
+        credentials.saved = StoredSignIn(username: "user@example.com", workspaceId: "test-ws", workspaceName: "Test WS",
+                                         refreshToken: "refresh-fixture")
 
         let suiteName = "test-\(UUID().uuidString.lowercased())"
         let userDefaults = UserDefaults(suiteName: suiteName)!
@@ -493,8 +494,8 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             },
             onShutdownJoining: onShutdownJoining ?? {},
             onCaptureCompleted: onCaptureCompleted ?? { _, _ in },
-            makeApiClient: { url, account in
-                ApiClient(baseURL: url, account: account, session: offlineSession)
+            makeApiClient: { url, identity in
+                ApiClient(baseURL: url, identity: identity, session: offlineSession)
             },
             publish: { snapshot in
                 snapshotsBox.value.append(snapshot)

@@ -5,8 +5,9 @@ import SwiftUI
 // The app's windows: SwiftUI views hosted in NSWindows (NSHostingController),
 // created on first use and kept (closing only hides them). It also decides
 // when a window appears by itself, from the snapshots: the sign-in form when
-// a sign-in is needed, the project chooser when the agent cannot pick one,
-// and the idle prompt when the user comes back.
+// a sign-in is needed, the workspace picker when the account must choose (or
+// asked to switch), the project chooser when the agent cannot pick one, and
+// the idle prompt when the user comes back.
 
 @MainActor
 final class WindowManager: NSObject, NSWindowDelegate {
@@ -15,6 +16,7 @@ final class WindowManager: NSObject, NSWindowDelegate {
     private var signInWindow: NSWindow?
     private var idleWindow: NSWindow?
     private var chooseWindow: NSWindow?
+    private var workspaceWindow: NSWindow?
     private var receivedFirstSnapshot = false
     /// The idle prompt was answered with a button (closing it otherwise
     /// discards the time away, the default).
@@ -32,6 +34,8 @@ final class WindowManager: NSObject, NSWindowDelegate {
     func showPrimary() {
         if model.snapshot.status.needsSignIn {
             showSignIn()
+        } else if model.snapshot.status == .choosingWorkspace {
+            showChooseWorkspace()
         } else {
             showMain(tab: nil)
         }
@@ -68,6 +72,17 @@ final class WindowManager: NSObject, NSWindowDelegate {
                                                 size: NSSize(width: 400, height: 360), resizable: false,
                                                 autosaveName: nil)
         chooseWindow = window
+        present(window)
+    }
+
+    func showChooseWorkspace() {
+        let content = ChooseWorkspaceView(model: model) { [weak self] in
+            self?.workspaceWindow?.close()
+        }
+        let window = workspaceWindow ?? makeWindow(title: "Choose a workspace", content: content,
+                                                   size: NSSize(width: 400, height: 380), resizable: false,
+                                                   autosaveName: nil)
+        workspaceWindow = window
         present(window)
     }
 
@@ -127,21 +142,39 @@ final class WindowManager: NSObject, NSWindowDelegate {
         // the saved password stopped working.
         if new.status.needsSignIn && (first || !old.status.needsSignIn) {
             closeWindow(chooseWindow)
+            closeWindow(workspaceWindow)
             closeWindow(idleWindow)
             if mainWindow?.isVisible == true || first || new.status == .signInExpired || old.status.isSignedIn {
                 closeWindow(mainWindow)
                 showSignIn()
             }
         }
-        // Signed in from the form: on to the main window (or the chooser).
+        // Signed in from the form: on to the main window (or a chooser).
         if !new.status.needsSignIn && (old.status.needsSignIn || first) && signInWindow?.isVisible == true {
             closeWindow(signInWindow)
-            if new.status != .choosingProject {
+            if new.status != .choosingProject && new.status != .choosingWorkspace {
+                showMain(tab: .timer)
+            }
+        }
+        // A workspace must be chosen, or the user asked to switch (the list
+        // arrived, or is on its way).
+        let wantsWorkspace = new.status == .choosingWorkspace || !new.workspaceChoices.isEmpty
+            || (new.findingWorkspaces && !old.findingWorkspaces)
+        let wantedWorkspace = old.status == .choosingWorkspace || !old.workspaceChoices.isEmpty
+            || old.findingWorkspaces
+        if wantsWorkspace && (!wantedWorkspace || first || new.workspaceChoices != old.workspaceChoices) {
+            closeWindow(chooseWindow)
+            showChooseWorkspace()
+        }
+        if old.status == .choosingWorkspace && new.status != .choosingWorkspace && new.workspaceChoices.isEmpty {
+            closeWindow(workspaceWindow)
+            if !new.status.needsSignIn {
                 showMain(tab: .timer)
             }
         }
         // The agent cannot pick the project (CONTRACT §2): ask.
-        if new.status == .choosingProject && (old.status != .choosingProject || first) && !new.projects.isEmpty {
+        if new.status == .choosingProject && (old.status != .choosingProject || first) && !new.projects.isEmpty
+            && new.workspaceChoices.isEmpty {
             showChooseProject()
         }
         if old.status == .choosingProject && new.status != .choosingProject {
@@ -176,6 +209,14 @@ final class WindowManager: NSObject, NSWindowDelegate {
     }
 
     private func windowClosing(_ window: NSWindow?) {
+        if let window = window, window === workspaceWindow {
+            // Closed while switching: nothing changes. (While a workspace
+            // must be chosen, the choices stay for the menu to reopen.)
+            if model.snapshot.status != .choosingWorkspace && !model.snapshot.workspaceChoices.isEmpty {
+                model.cancelWorkspaceChoice()
+            }
+            return
+        }
         guard let window = window, window === idleWindow else { return }
         // Closed without an answer: the default, discard.
         if !idleAnswered && model.snapshot.awayPrompt != nil {

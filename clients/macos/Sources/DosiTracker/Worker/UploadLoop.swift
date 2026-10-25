@@ -11,26 +11,45 @@ import Foundation
 // (30 s doubling to 30 min, never sooner than the server's `Retry-After`), an
 // hour after an inactive subscription, five minutes after "activity in the
 // future", and one last bounded pass when signing out or quitting.
+//
+// Rows belong to a user and the workspace they were tracked in. The signed-in
+// user's rows go up workspace by workspace — the current one first, then any
+// left from workspaces tracked in before — each with its own `X-Workspace-Id`.
+// A workspace the server no longer lets this user (or this Mac) into is left
+// alone for the rest of the sign-in: its rows wait.
+
+/// A workspace whose rows are uploaded: the queue owner and the workspace
+/// GUID its rows go to.
+struct UploadScope: Equatable, Sendable {
+    let owner: String
+    let workspaceId: String
+}
+
+/// Whose rows the uploader sends: the signed-in user and, once one is chosen,
+/// the workspace tracked in now.
+struct UploadUser: Equatable, Sendable {
+    let username: String
+    let current: UploadScope?
+}
 
 /// What the worker tells the uploader. Commands are applied in the order they
 /// were sent.
 enum UploadCommand: Sendable {
-    /// Upload this account's rows from now on (nil: stop uploading). Rows are
-    /// only ever uploaded under the token of their owner.
-    case account(client: ApiClient?, owner: String?)
+    /// Upload this user's rows from now on (nil: stop uploading). Rows are
+    /// only ever uploaded under the token of their user.
+    case account(client: ApiClient?, user: UploadUser?)
     /// New rows were queued: upload them, unless waiting out a back-off.
     case rowsQueued
     /// Upload now, whatever the back-off ("Sync now", the server is back).
     case now
-    /// `owner` signed out: upload what fits before `until`, then stop
-    /// uploading for it (ignored when another account took over meanwhile).
-    case signOut(owner: String, until: Date)
+    /// `username` signed out: upload what fits before `until`, then stop
+    /// uploading for them (ignored when another user took over meanwhile).
+    case signOut(username: String, until: Date)
 }
 
-/// What the uploader tells the worker. Each pass's events carry the account
-/// (queue owner) it ran for: a sign-out drain may still run for an account
-/// that is no longer the current one, and its answers must not be applied to
-/// the account signed in meanwhile.
+/// What the uploader tells the worker. Each pass's events carry the queue
+/// owner it ran for: a sign-out drain, or a pass for an earlier workspace,
+/// is not the current account, and its answers must not be applied to it.
 enum UploadEvent: Sendable {
     /// An upload attempt ended: the queue counts may have changed.
     case progress
@@ -39,8 +58,12 @@ enum UploadEvent: Sendable {
     case finished(owner: String, report: SyncReport, issue: UploadIssue?, clock: ClockReading?)
     /// `owner`'s project list, fetched after a 403 / 409 (CONTRACT §2).
     case projects(owner: String, [MyProject])
-    /// The server no longer accepts `owner`'s saved password.
+    /// The server no longer accepts `owner`'s sign-in.
     case signInExpired(owner: String, AuthRejection)
+    /// The server refused `owner`'s rows for good (``AccessLoss``): nothing
+    /// more goes up for that workspace in this sign-in (for this Mac at all,
+    /// when the device was revoked).
+    case accessLost(owner: String, AccessLoss)
 }
 
 actor UploadLoop {
@@ -56,7 +79,9 @@ actor UploadLoop {
     private let now: @Sendable () -> Date
 
     private var client: ApiClient?
-    private var owner: String?
+    private var user: UploadUser?
+    /// Workspaces the server refused for good during this sign-in.
+    private var blocked: Set<String> = []
     /// Consecutive failed passes that back off (a success resets it).
     private var backoffFailures = 0
     /// No pass before this (a back-off, an inactive subscription, a clock
@@ -68,8 +93,8 @@ actor UploadLoop {
     private var passDeadline: Date?
     /// New work arrived while a pass ran.
     private var again = false
-    /// The account whose sign-out drain is running.
-    private var signingOutOwner: String?
+    /// The user whose sign-out drain is running.
+    private var signingOutUser: String?
     /// Quitting: no new passes.
     private var stopped = false
 
@@ -106,7 +131,7 @@ actor UploadLoop {
         if let running = passTask {
             await running.value
         }
-        guard client != nil, owner != nil, now() < limit else { return }
+        guard client != nil, user != nil, now() < limit else { return }
         passDeadline = limit
         _ = await runOnePass()
         passDeadline = nil
@@ -131,8 +156,8 @@ actor UploadLoop {
     private func apply(_ command: UploadCommand) {
         guard !stopped else { return }
         switch command {
-        case .account(let newClient, let newOwner):
-            setAccount(newClient, owner: newOwner)
+        case .account(let newClient, let newUser):
+            setAccount(newClient, user: newUser)
         case .rowsQueued:
             kick()
         case .now:
@@ -143,25 +168,30 @@ actor UploadLoop {
         }
     }
 
-    private func setAccount(_ newClient: ApiClient?, owner newOwner: String?) {
-        let changed = newOwner != owner || newClient !== client
+    private func setAccount(_ newClient: ApiClient?, user newUser: UploadUser?) {
+        let changed = newUser?.username != user?.username || newClient !== client
         if changed && passTask != nil {
-            // The previous account's pass stops now.
+            // The previous user's pass stops now.
             passDeadline = now()
         }
         if changed {
-            signingOutOwner = nil
+            signingOutUser = nil
             backoffFailures = 0
+            blocked = []
+        }
+        if let current = newUser?.current {
+            // Chosen again: the server lists it, so it takes rows again.
+            blocked.remove(current.owner)
         }
         client = newClient
-        owner = newOwner
+        user = newUser
         notBefore = nil
         kick()
     }
 
     private func beginSignOut(_ leaving: String, until: Date) {
-        guard let current = owner, current == leaving, client != nil else { return }
-        signingOutOwner = leaving
+        guard let current = user, current.username == leaving, client != nil else { return }
+        signingOutUser = leaving
         // The last pass ignores the back-off.
         notBefore = nil
         passDeadline = until
@@ -177,7 +207,7 @@ actor UploadLoop {
     // MARK: Passes
 
     private func kick() {
-        guard !stopped, client != nil, owner != nil else { return }
+        guard !stopped, client != nil, user != nil else { return }
         if passTask != nil {
             again = true
             return
@@ -201,7 +231,7 @@ actor UploadLoop {
     private func runPasses() async {
         while true {
             again = false
-            if signingOutOwner == nil {
+            if signingOutUser == nil {
                 passDeadline = nil
             }
             let more = await runOnePass()
@@ -214,26 +244,54 @@ actor UploadLoop {
             break
         }
         passTask = nil
-        if let leaving = signingOutOwner, leaving == owner {
+        if let leaving = signingOutUser, leaving == user?.username {
             dropAccount()
         }
-        signingOutOwner = nil
+        signingOutUser = nil
         passDeadline = nil
         if let waitUntil = notBefore, pendingCount() > 0 {
             scheduleWake(at: waitUntil)
         }
     }
 
-    /// One `SyncPass` for the current account. Returns whether another pass
-    /// should follow at once (the pass reached its upload limit with rows
-    /// left and nothing to wait for).
+    /// One `SyncPass` per workspace of the current user, the current one
+    /// first. Returns whether another pass should follow at once (a pass
+    /// reached its upload limit with rows left and nothing to wait for).
     private func runOnePass() async -> Bool {
-        guard let passClient = client, let passOwner = owner else { return false }
+        guard let passClient = client, let passUser = user else { return false }
+        var more = false
+        for scope in uploadScopes() {
+            switch await runPass(scope, client: passClient, user: passUser) {
+            case .next(let unfinished):
+                more = more || unfinished
+            case .stop:
+                return false
+            }
+            // Another user took over during the pass: their schedule is their own.
+            guard user?.username == passUser.username, client === passClient, !isPastDeadline() else {
+                return false
+            }
+        }
+        return more
+    }
+
+    /// How one workspace's pass ended.
+    private enum PassEnd {
+        /// Go on with the next workspace (`unfinished`: rows are left that
+        /// the next pass can take at once).
+        case next(unfinished: Bool)
+        /// Nothing more in this round (a back-off, an expired sign-in, the
+        /// account gone).
+        case stop
+    }
+
+    private func runPass(_ scope: UploadScope, client passClient: ApiClient, user passUser: UploadUser) async -> PassEnd {
         let sink = events
-        let pendingBefore = pendingCount()
+        let pendingBefore = pendingCount(scope.owner)
+        let workspaceId = scope.workspaceId
         let report = await SyncPass.run(
             queue: queue,
-            owner: passOwner,
+            owner: scope.owner,
             // One row at a time: each can carry a screenshot, and memory stays
             // flat however long the backlog.
             batchSize: 1,
@@ -241,18 +299,18 @@ actor UploadLoop {
                 if self.isPastDeadline() {
                     return .failed(.transport(.cancelled))
                 }
-                let response = await passClient.uploadActivity(payload)
+                let response = await passClient.uploadActivity(payload, workspaceId: workspaceId)
                 await sink(.progress)
                 return response
             },
             verifyProject: { projectId in
                 do {
-                    let projects = try await passClient.myProjects()
-                    await sink(.projects(owner: passOwner, projects))
+                    let projects = try await passClient.myProjects(workspaceId: workspaceId)
+                    await sink(.projects(owner: scope.owner, projects))
                     return ProjectSelection.contains(projectId, in: projects) ? .available : .gone
                 } catch let error as ApiError {
                     if case .authRejected(let rejection) = error {
-                        await sink(.signInExpired(owner: passOwner, rejection))
+                        await sink(.signInExpired(owner: scope.owner, rejection))
                     }
                     CoreLog.warning("upload", "could not check the projects after a refusal: \(error.userMessage)")
                     return .unknown
@@ -263,43 +321,58 @@ actor UploadLoop {
         )
         let clock = await passClient.lastClockReading()
 
-        // Another account took over during the pass: its schedule is its own.
-        guard owner == passOwner else {
-            await sink(.finished(owner: passOwner, report: report, issue: nil, clock: clock))
-            return false
+        // Another user took over during the pass: their schedule is their own.
+        guard user?.username == passUser.username, client === passClient else {
+            await sink(.finished(owner: scope.owner, report: report, issue: nil, clock: clock))
+            return .stop
         }
         if !report.uploaded.isEmpty {
             backoffFailures = 0
         }
         let cutShort = isPastDeadline()
         var issue: UploadIssue?
-        var more = false
+        var end = PassEnd.next(unfinished: false)
         switch report.stop {
         case .none:
-            more = !report.drained && !cutShort
-            if more && pendingCount() >= pendingBefore {
+            var unfinished = !report.drained && !cutShort
+            if unfinished && pendingCount(scope.owner) >= pendingBefore {
                 // Rows went up but stay queued (they could not be removed, e.g.
                 // the disk is full): starting over at once would resend the
                 // same rows back to back. Back off instead.
                 CoreLog.warning("upload", "the pass removed no rows from the queue; backing off")
-                more = false
+                unfinished = false
                 issue = schedule(RetryPlan(reason: .unexpectedResponse(status: 0)))
+                end = .stop
+            } else {
+                end = .next(unfinished: unfinished)
             }
         case .some(.retry(let plan)):
             if !cutShort {
                 issue = schedule(plan)
             }
+            end = .stop
         case .some(.signInExpired(let rejection)):
             dropAccount()
-            await sink(.signInExpired(owner: passOwner, rejection))
+            await sink(.signInExpired(owner: scope.owner, rejection))
+            end = .stop
         case .some(.queueError(let message)):
             CoreLog.error("upload", "could not read the local queue: \(message)")
             let next = now().addingTimeInterval(UploadLoop.queueRetry)
             notBefore = next
             issue = .queueUnreadable(nextAttemptAt: next)
+            end = .stop
+        case .some(.accessLost(let loss)):
+            CoreLog.warning("upload", "the server refused this workspace's uploads (\(loss.kind.rawValue)); its rows wait")
+            blocked.insert(scope.owner)
+            if loss.isDeviceWide {
+                // This Mac may not upload anywhere any more.
+                dropAccount()
+                end = .stop
+            }
+            await sink(.accessLost(owner: scope.owner, loss))
         }
-        await sink(.finished(owner: passOwner, report: report, issue: issue, clock: clock))
-        return more
+        await sink(.finished(owner: scope.owner, report: report, issue: issue, clock: clock))
+        return end
     }
 
     /// Keep the rest queued and come back after the plan's wait (CONTRACT §1).
@@ -329,29 +402,51 @@ actor UploadLoop {
 
     // MARK: Helpers
 
+    /// The workspaces whose rows go up now: the current one first, then the
+    /// user's other workspaces with rows left, never one refused for good.
+    private func uploadScopes() -> [UploadScope] {
+        guard let current = user else { return [] }
+        var scopes: [UploadScope] = []
+        if let scope = current.current, !blocked.contains(scope.owner) {
+            scopes.append(scope)
+        }
+        let others = (try? queue.pendingOwners(ofUser: current.username)) ?? []
+        for owner in others where owner != current.current?.owner && !blocked.contains(owner) {
+            if let workspaceId = Queue.workspaceId(ofOwner: owner) {
+                scopes.append(UploadScope(owner: owner, workspaceId: workspaceId))
+            }
+        }
+        return scopes
+    }
+
     private func isPastDeadline() -> Bool {
         guard let deadline = passDeadline else { return false }
         return now() >= deadline
     }
 
     private func isReady() -> Bool {
-        guard !stopped, client != nil, owner != nil, !isPastDeadline() else { return false }
+        guard !stopped, client != nil, user != nil, !isPastDeadline() else { return false }
         if let waitUntil = notBefore, waitUntil > now() {
             return false
         }
         return pendingCount() > 0
     }
 
+    /// Rows waiting in every workspace that takes uploads now.
     private func pendingCount() -> Int {
-        guard let owner = owner else { return 0 }
-        return (try? queue.pendingCount(owner: owner)) ?? 0
+        uploadScopes().reduce(0) { $0 + pendingCount($1.owner) }
+    }
+
+    private func pendingCount(_ owner: String) -> Int {
+        (try? queue.pendingCount(owner: owner)) ?? 0
     }
 
     private func dropAccount() {
         client = nil
-        owner = nil
+        user = nil
         notBefore = nil
         backoffFailures = 0
+        blocked = []
         wakeTask?.cancel()
         wakeTask = nil
     }

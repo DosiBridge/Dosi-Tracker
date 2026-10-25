@@ -109,8 +109,9 @@ public struct QueuedRow: Equatable, Sendable, Identifiable {
 /// uses incremental auto-vacuum and ``reclaimSpace()`` gives the freed pages
 /// back to the disk.
 ///
-/// Every row carries its `owner` (``ownerKey(workspace:username:)``); uploads
-/// only ever read the signed-in account's rows.
+/// Every row carries its `owner` (``ownerKey(workspaceId:username:)``): the
+/// user and the workspace it was tracked in. Rows only ever upload under
+/// their user's sign-in, each to its own workspace.
 ///
 /// Thread-safe: every call runs under one lock on one connection.
 public final class Queue: @unchecked Sendable {
@@ -148,14 +149,49 @@ public final class Queue: @unchecked Sendable {
     /// window's notice that the queue was reset).
     public private(set) var movedAside: URL?
 
-    /// Identify the account a row belongs to: workspace (tenant) + user, both
-    /// trimmed and lower-cased (the server compares them case-insensitively),
-    /// joined by U+001F, a control character that cannot be typed into the
-    /// sign-in form, so two different accounts never produce the same key.
-    public static func ownerKey(workspace: String, username: String) -> String {
-        workspace.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            + "\u{1F}"
+    /// Prefix of the owner keys of ``ownerKey(workspaceId:username:)``.
+    static let workspaceOwnerPrefix = "ws:"
+    /// Joins the parts of an owner key: a control character that cannot be
+    /// typed into the sign-in form, so two accounts never share a key.
+    static let ownerSeparator = "\u{1F}"
+
+    /// Identify the account a row belongs to: the workspace it was tracked in
+    /// (its GUID, the `X-Workspace-Id` it uploads with) + the user, both
+    /// trimmed and lower-cased (the server compares them case-insensitively).
+    public static func ownerKey(workspaceId: String, username: String) -> String {
+        workspaceOwnerPrefix
+            + workspaceId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            + ownerSeparator
             + username.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    /// The owner key of builds that signed in to a workspace by its name (the
+    /// retired `__tenant` sign-in): their rows are handed to the workspace of
+    /// that name when its user signs in again
+    /// (``reassignOwner(from:to:)``).
+    public static func legacyOwnerKey(workspaceName: String, username: String) -> String {
+        workspaceName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            + ownerSeparator
+            + username.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    /// Whether `owner` (``ownerKey(workspaceId:username:)``) is one of
+    /// `username`'s workspaces.
+    public static func owner(_ owner: String, isUser username: String) -> Bool {
+        workspaceId(ofOwner: owner) != nil
+            && owner.hasSuffix(ownerSeparator + username.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+    }
+
+    /// The workspace GUID of an owner key of
+    /// ``ownerKey(workspaceId:username:)``; nil for any other key.
+    public static func workspaceId(ofOwner owner: String) -> String? {
+        guard owner.hasPrefix(workspaceOwnerPrefix),
+              let separator = owner.range(of: ownerSeparator)
+        else {
+            return nil
+        }
+        let id = owner[owner.index(owner.startIndex, offsetBy: workspaceOwnerPrefix.count)..<separator.lowerBound]
+        return id.isEmpty ? nil : String(id)
     }
 
     // MARK: Opening
@@ -435,6 +471,36 @@ public final class Queue: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return Int(try db.scalar("SELECT COUNT(*) FROM activities WHERE synced = 0 AND owner = ?1", [.text(owner)]) ?? 0)
+    }
+
+    /// The workspace owners of `username` (``ownerKey(workspaceId:username:)``)
+    /// with blocks waiting to upload, oldest row first: what the user tracked
+    /// in other workspaces still goes up, each with its own workspace.
+    public func pendingOwners(ofUser username: String) throws -> [String] {
+        let suffix = Queue.ownerSeparator + username.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        lock.lock()
+        defer { lock.unlock() }
+        return try db.query(
+            """
+            SELECT owner FROM activities
+            WHERE synced = 0 AND owner IS NOT NULL AND substr(owner, 1, ?2) = ?3
+              AND length(owner) > length(?1) AND substr(owner, -length(?1)) = ?1
+            GROUP BY owner ORDER BY MIN(id)
+            """,
+            [.text(suffix), .int(Int64(Queue.workspaceOwnerPrefix.count)), .text(Queue.workspaceOwnerPrefix)]
+        ) { row in
+            row.text(0) ?? ""
+        }.filter { !$0.isEmpty }
+    }
+
+    /// Hand every row of `old` to `new` (rows queued under a retired owner
+    /// key, once their account signs in again). Returns how many moved.
+    @discardableResult
+    public func reassignOwner(from old: String, to new: String) throws -> Int {
+        guard old != new else { return 0 }
+        lock.lock()
+        defer { lock.unlock() }
+        return try db.run("UPDATE activities SET owner = ?2 WHERE owner = ?1", [.text(old), .text(new)])
     }
 
     /// How many of `owner`'s blocks the server permanently rejected (shown in

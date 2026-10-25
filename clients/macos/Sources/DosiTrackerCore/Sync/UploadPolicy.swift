@@ -57,6 +57,80 @@ public enum RetryReason: Equatable, Sendable {
     }
 }
 
+/// A terminal answer about this device or the workspace it tracks in
+/// (cross-agent contract): the device was revoked, the account is no longer a
+/// member, the workspace is archived, or the request named no usable
+/// workspace. Retrying cannot help: capture and heartbeats stop for that
+/// workspace, its queued rows wait, and the user signs in again
+/// (``Kind/deviceRevoked``) or switches workspace.
+public struct AccessLoss: Equatable, Sendable {
+    public enum Kind: String, Equatable, Sendable {
+        /// 403 `Tracker:DeviceRevoked`: an administrator removed this Mac.
+        case deviceRevoked
+        /// 403 `Tracker:NotWorkspaceMember`.
+        case notWorkspaceMember
+        /// 403 `Tracker:WorkspaceArchived`.
+        case workspaceArchived
+        /// 400 `Tracker:WorkspaceRequired`: no (valid) workspace was named.
+        case workspaceRequired
+    }
+
+    public let kind: Kind
+    /// The server's own words, when it sent any.
+    public let message: String?
+
+    public init(kind: Kind, message: String? = nil) {
+        self.kind = kind
+        self.message = message
+    }
+
+    /// The access loss an error answer means, if it is one: the ABP error code
+    /// decides (an older server reports business errors with other statuses).
+    public static func of(status: Int, error: AbpError?) -> AccessLoss? {
+        guard (400..<500).contains(status), let code = error?.trimmedCode else { return nil }
+        let kind: Kind
+        switch code {
+        case UploadPolicy.Code.deviceRevoked:
+            kind = .deviceRevoked
+        case UploadPolicy.Code.notWorkspaceMember:
+            kind = .notWorkspaceMember
+        case UploadPolicy.Code.workspaceArchived:
+            kind = .workspaceArchived
+        case UploadPolicy.Code.workspaceRequired:
+            kind = .workspaceRequired
+        default:
+            return nil
+        }
+        return AccessLoss(kind: kind, message: error?.summary)
+    }
+
+    /// The access loss behind a failed API call, if that is what it was.
+    public static func of(_ error: ApiError) -> AccessLoss? {
+        guard case .http(let failure) = error else { return nil }
+        return of(status: failure.status, error: failure.error)
+    }
+
+    /// Whether it concerns this Mac in every workspace (sign in again), not
+    /// one workspace (switch workspace).
+    public var isDeviceWide: Bool { kind == .deviceRevoked }
+
+    /// What to tell the user; `workspace` names the workspace concerned.
+    public func userMessage(workspace: String) -> String {
+        let name = workspace.nonEmptyTrimmed ?? "this workspace"
+        switch kind {
+        case .deviceRevoked:
+            return "This Mac was removed from tracking by your workspace administrator. Tracking has stopped; "
+                + "sign in again once the administrator restores it."
+        case .notWorkspaceMember:
+            return "You are no longer a member of \(name). Tracking there has stopped; choose another workspace."
+        case .workspaceArchived:
+            return "\(name) was archived. Tracking there has stopped; choose another workspace."
+        case .workspaceRequired:
+            return "The server did not accept the workspace this Mac tracks in. Choose your workspace again."
+        }
+    }
+}
+
 /// When to try again: after `after` seconds, or (nil) after the exponential
 /// ``UploadBackoff``.
 public struct RetryPlan: Equatable, Sendable {
@@ -97,6 +171,9 @@ public enum UploadDecision: Equatable, Sendable {
     /// A definitive rejection of this block: park the row (it is never sent
     /// again, and purged after 14 days) and show the message.
     case park(reason: String)
+    /// The device or the workspace lost its access (``AccessLoss``): stop
+    /// uploading for it; the rows wait (and expire like other stranded rows).
+    case accessLost(AccessLoss)
 }
 
 /// Classification of upload results, exactly per the CONTRACT §1 table and
@@ -120,6 +197,10 @@ public enum UploadPolicy {
         public static let activityTooLong = "Tracker:ActivityTooLong"
         public static let activityTooOld = "Tracker:ActivityTooOld"
         public static let timeRangeInvalid = "Tracker:ActivityTimeRangeInvalid"
+        public static let deviceRevoked = "Tracker:DeviceRevoked"
+        public static let notWorkspaceMember = "Tracker:NotWorkspaceMember"
+        public static let workspaceArchived = "Tracker:WorkspaceArchived"
+        public static let workspaceRequired = "Tracker:WorkspaceRequired"
     }
 
     /// Retry after an inactive subscription: hourly.
@@ -179,6 +260,9 @@ public enum UploadPolicy {
             // 5xx (or anything unexpected): the server's trouble, not this block's.
             let reason: RetryReason = status >= 500 ? .serverError(status: status) : .unexpectedResponse(status: status)
             return .retry(RetryPlan(reason: reason, after: retryAfter))
+        }
+        if let loss = AccessLoss.of(status: status, error: error) {
+            return .accessLost(loss)
         }
 
         switch code {

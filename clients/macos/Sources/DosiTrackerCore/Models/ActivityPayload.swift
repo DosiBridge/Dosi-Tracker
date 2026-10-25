@@ -89,18 +89,22 @@ public struct WindowInfo: Codable, Equatable, Sendable {
 /// One minute of a block (`ActivityMinuteDto`): input counts, whether there
 /// was any input, the app mostly in front and how many seconds had input.
 /// Buckets match the activity % minutes (see ``ActivityMath``).
+///
+/// A count is nil when that kind of input is not measured (the project or the
+/// user's consent leaves it out, or the input capture was not working): it is
+/// sent as `null`, never as a 0 that would read as "no input".
 public struct ActivityMinute: Codable, Equatable, Sendable {
     /// 0-based minute of the block.
     public var minute: Int
-    public var keyboardHits: Int
-    public var mouseClicks: Int
+    public var keyboardHits: Int?
+    public var mouseClicks: Int?
     public var active: Bool
     public var appName: String?
     /// Seconds of this bucket with any input, 0...90 (the last bucket can
     /// run up to 89 s). Nil from rows queued by builds that did not send it.
     public var activeSeconds: Int?
 
-    public init(minute: Int, keyboardHits: Int = 0, mouseClicks: Int = 0, active: Bool = false,
+    public init(minute: Int, keyboardHits: Int? = 0, mouseClicks: Int? = 0, active: Bool = false,
                 appName: String? = nil, activeSeconds: Int? = nil) {
         self.minute = minute
         self.keyboardHits = keyboardHits
@@ -117,8 +121,9 @@ public struct ActivityMinute: Codable, Equatable, Sendable {
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         minute = try container.decodeIfPresent(Int.self, forKey: .minute) ?? 0
-        keyboardHits = try container.decodeIfPresent(Int.self, forKey: .keyboardHits) ?? 0
-        mouseClicks = try container.decodeIfPresent(Int.self, forKey: .mouseClicks) ?? 0
+        // Absent (an older build's row) or null: not measured.
+        keyboardHits = try container.decodeIfPresent(Int.self, forKey: .keyboardHits)
+        mouseClicks = try container.decodeIfPresent(Int.self, forKey: .mouseClicks)
         active = try container.decodeIfPresent(Bool.self, forKey: .active) ?? false
         appName = try container.decodeIfPresent(String.self, forKey: .appName)
         activeSeconds = try container.decodeIfPresent(Int.self, forKey: .activeSeconds)
@@ -127,8 +132,8 @@ public struct ActivityMinute: Codable, Equatable, Sendable {
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(minute, forKey: .minute)
-        try container.encode(keyboardHits, forKey: .keyboardHits)
-        try container.encode(mouseClicks, forKey: .mouseClicks)
+        try container.encodeCount(keyboardHits, forKey: .keyboardHits)
+        try container.encodeCount(mouseClicks, forKey: .mouseClicks)
         try container.encode(active, forKey: .active)
         try container.encodeIfPresent(appName, forKey: .appName)
         try container.encodeIfPresent(activeSeconds, forKey: .activeSeconds)
@@ -184,7 +189,10 @@ public enum CaptureLimits {
 /// are nil are left out of the JSON rather than sent as `null`: an older
 /// server whose `Productivity` is a non-nullable `int` then simply keeps its
 /// default instead of failing the whole request, and every new field stays
-/// invisible to it.
+/// invisible to it. The input counts are the exception (cross-agent
+/// contract): `mouseClicks` and `keyboardHits` are always sent, as `null`
+/// when that kind of input is not measured and 0 only when it was measured
+/// as none.
 public struct ActivityPayload: Codable, Equatable, Sendable {
     public var projectId: String
     /// Client-generated idempotency key (lower-case UUID).
@@ -194,8 +202,11 @@ public struct ActivityPayload: Codable, Equatable, Sendable {
     /// Activity % (0-100); nil = not measured (input capture unavailable, or
     /// the project allows neither keyboard nor mouse).
     public var productivity: Int?
-    public var mouseClicks: Int
-    public var keyboardHits: Int
+    /// Clicks in the block; nil = not measured (the project or the user's
+    /// consent leaves the mouse out, or the input capture was not working).
+    public var mouseClicks: Int?
+    /// Key presses in the block; nil = not measured, as for ``mouseClicks``.
+    public var keyboardHits: Int?
     /// The task note ("What are you working on?").
     public var description: String?
     /// Foreground usage over the block, one entry per (app, window title),
@@ -244,8 +255,8 @@ public struct ActivityPayload: Codable, Equatable, Sendable {
         startedAt: Date,
         endedAt: Date,
         productivity: Int? = nil,
-        mouseClicks: Int = 0,
-        keyboardHits: Int = 0,
+        mouseClicks: Int? = 0,
+        keyboardHits: Int? = 0,
         description: String? = nil,
         activeWindows: [WindowInfo] = [],
         runningPrograms: [WindowInfo] = [],
@@ -359,8 +370,10 @@ public struct ActivityPayload: Codable, Equatable, Sendable {
         startedAt = try c.decode(Date.self, forKey: .startedAt)
         endedAt = try c.decode(Date.self, forKey: .endedAt)
         productivity = try c.decodeIfPresent(Int.self, forKey: .productivity)
-        mouseClicks = try c.decodeIfPresent(Int.self, forKey: .mouseClicks) ?? 0
-        keyboardHits = try c.decodeIfPresent(Int.self, forKey: .keyboardHits) ?? 0
+        // Null: not measured. Absent only in rows of builds that always
+        // measured (they sent 0 for nothing), so it reads as 0.
+        mouseClicks = try c.contains(.mouseClicks) ? c.decodeIfPresent(Int.self, forKey: .mouseClicks) : 0
+        keyboardHits = try c.contains(.keyboardHits) ? c.decodeIfPresent(Int.self, forKey: .keyboardHits) : 0
         description = try c.decodeIfPresent(String.self, forKey: .description)
         activeWindows = try c.decodeIfPresent([WindowInfo].self, forKey: .activeWindows) ?? []
         runningPrograms = try c.decodeIfPresent([WindowInfo].self, forKey: .runningPrograms) ?? []
@@ -392,8 +405,8 @@ public struct ActivityPayload: Codable, Equatable, Sendable {
         try c.encode(startedAt, forKey: .startedAt)
         try c.encode(endedAt, forKey: .endedAt)
         try c.encodeIfPresent(productivity, forKey: .productivity)
-        try c.encode(mouseClicks, forKey: .mouseClicks)
-        try c.encode(keyboardHits, forKey: .keyboardHits)
+        try c.encodeCount(mouseClicks, forKey: .mouseClicks)
+        try c.encodeCount(keyboardHits, forKey: .keyboardHits)
         try c.encodeIfPresent(description, forKey: .description)
         try c.encode(activeWindows, forKey: .activeWindows)
         try c.encode(runningPrograms, forKey: .runningPrograms)
@@ -414,5 +427,17 @@ public struct ActivityPayload: Codable, Equatable, Sendable {
         try c.encodeIfPresent(screenshotCapturedAt, forKey: .screenshotCapturedAt)
         try c.encodeIfPresent(screenshotBlurred, forKey: .screenshotBlurred)
         try c.encodeIfPresent(injectedInputEvents, forKey: .injectedInputEvents)
+    }
+}
+
+extension KeyedEncodingContainer {
+    /// An input count as the contract wants it: the number, or an explicit
+    /// `null` when it was not measured (never left out, never a made-up 0).
+    mutating func encodeCount(_ count: Int?, forKey key: Key) throws {
+        if let count = count {
+            try encode(count, forKey: key)
+        } else {
+            try encodeNil(forKey: key)
+        }
     }
 }

@@ -29,6 +29,8 @@ final class UploadPolicyTests: XCTestCase {
             return "project"
         case .park:
             return "park"
+        case .accessLost:
+            return "access"
         }
     }
 
@@ -76,6 +78,33 @@ final class UploadPolicyTests: XCTestCase {
         XCTAssertEqual(kind(403, abp(UploadPolicy.Code.activityTooLong, "Too long")), "park")
         // Validation errors on another status are not a verdict.
         XCTAssertEqual(kind(422, validation), "transient")
+    }
+
+    /// Terminal for the device or the workspace (cross-agent contract): never
+    /// retried, never parked, whatever the status an older server uses.
+    func testARevokedDeviceAndALostWorkspaceAreAccessLosses() {
+        XCTAssertEqual(kind(403, abp(UploadPolicy.Code.deviceRevoked, "Revoked")), "access")
+        XCTAssertEqual(kind(403, abp(UploadPolicy.Code.notWorkspaceMember, "Not a member")), "access")
+        XCTAssertEqual(kind(403, abp(UploadPolicy.Code.workspaceArchived, "Archived")), "access")
+        XCTAssertEqual(kind(400, abp(UploadPolicy.Code.workspaceRequired, "Required")), "access")
+        XCTAssertEqual(kind(409, abp(UploadPolicy.Code.workspaceArchived, "Archived")), "access")
+        // A 5xx is the server's trouble, even with the code.
+        XCTAssertEqual(kind(500, abp(UploadPolicy.Code.deviceRevoked, "x")), "transient")
+        XCTAssertEqual(UploadPolicy.decide(status: 403, error: abp(UploadPolicy.Code.deviceRevoked, "This device was revoked."),
+                                           retryAfter: nil),
+                       .accessLost(AccessLoss(kind: .deviceRevoked, message: "This device was revoked.")))
+
+        let revoked = AccessLoss(kind: .deviceRevoked)
+        XCTAssertTrue(revoked.isDeviceWide)
+        XCTAssertTrue(revoked.userMessage(workspace: "Acme").contains("removed"))
+        let archived = AccessLoss(kind: .workspaceArchived)
+        XCTAssertFalse(archived.isDeviceWide)
+        XCTAssertTrue(archived.userMessage(workspace: "Acme").contains("Acme was archived"))
+        XCTAssertTrue(AccessLoss(kind: .notWorkspaceMember).userMessage(workspace: " ").contains("this workspace"))
+        XCTAssertNil(AccessLoss.of(.transport(.timedOut)))
+        XCTAssertNil(AccessLoss.of(status: 403, error: abp(UploadPolicy.Code.notProjectMember, "x")))
+        XCTAssertEqual(AccessLoss.of(.http(HTTPFailure(status: 403, error: abp(UploadPolicy.Code.workspaceArchived, "x"))))?.kind,
+                       .workspaceArchived)
     }
 
     func testTheServerMessageIsKeptAndRetryAfterIsHonoured() {

@@ -378,7 +378,7 @@ struct SettingsTab: View {
                 Image(systemName: "person.crop.circle.fill").font(.system(size: 36)).foregroundStyle(Theme.brand)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(snapshot.displayName.isEmpty ? "Not signed in" : snapshot.displayName).font(.callout.weight(.semibold))
-                    Text(snapshot.workspace.isEmpty ? "Host account" : "Workspace: \(snapshot.workspace)")
+                    Text(snapshot.workspace.isEmpty ? "No workspace chosen" : "Workspace: \(snapshot.workspace)")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Text("Server: \(snapshot.serverURL)").font(.caption).foregroundStyle(.tertiary).textSelection(.enabled)
@@ -390,12 +390,20 @@ struct SettingsTab: View {
                 } label: {
                     Label("Web dashboard", systemImage: "safari").frame(maxWidth: .infinity)
                 }
+                Button {
+                    model.switchWorkspace()
+                } label: {
+                    Label("Switch workspace…", systemImage: "building.2").frame(maxWidth: .infinity)
+                }
+                .disabled(!snapshot.status.isSignedIn && snapshot.status != .choosingWorkspace)
+                .help("Track in another workspace you belong to. The block so far is saved first.")
                 Button(role: .destructive) {
                     confirmSignOut = true
                 } label: {
                     Label("Sign out…", systemImage: "rectangle.portrait.and.arrow.right").frame(maxWidth: .infinity)
                 }
-                .disabled(!snapshot.status.isSignedIn && snapshot.status != .signInExpired)
+                .disabled(!snapshot.status.isSignedIn && snapshot.status != .signInExpired
+                          && snapshot.status != .choosingWorkspace)
             }
         }
     }

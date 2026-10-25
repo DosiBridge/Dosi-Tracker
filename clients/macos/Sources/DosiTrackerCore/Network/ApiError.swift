@@ -102,6 +102,13 @@ public enum ApiError: Error, Equatable, Sendable {
         }
     }
 
+    /// A 3xx answer: redirects are never followed, so the address must be the
+    /// API's own.
+    static func redirectMessage(status: Int) -> String {
+        "The server answered with a redirect (HTTP \(status)), which Dosi Tracker never follows. "
+            + "Use the API server's own https:// address."
+    }
+
     /// What to tell the user (sign-in form, status line).
     public var userMessage: String {
         switch self {
@@ -124,6 +131,8 @@ public enum ApiError: Error, Equatable, Sendable {
             return failure.userMessage
         case .http(let failure):
             switch failure.status {
+            case 300...399:
+                return ApiError.redirectMessage(status: failure.status)
             case 429:
                 return "The server is busy. Try again in a minute."
             case 500...599:

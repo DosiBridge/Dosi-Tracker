@@ -2,52 +2,87 @@ import Foundation
 import Security
 
 /// The saved sign-in, so a relaunch (e.g. at login) resumes silently and a
-/// "Sign-in expired" prompt can prefill the workspace and email.
+/// "Sign-in expired" prompt can prefill the email: the user, the workspace
+/// tracked in and the OpenIddict refresh token. The password is never kept —
+/// once the refresh token is refused the user signs in again (cross-agent
+/// contract), it is never re-sent silently.
 public struct StoredSignIn: Codable, Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible {
-    /// Workspace (tenant) name; empty for a host account.
-    public var workspace: String
     public var username: String
-    public var password: String
+    /// The workspace GUID tracked in; nil while none is chosen.
+    public var workspaceId: String?
+    /// Its name, for the window and the menu.
+    public var workspaceName: String
+    /// The latest (rotated) refresh token; nil when the server granted none,
+    /// which means signing in again.
+    public var refreshToken: String?
+    /// Saved by a build that signed in to a workspace by name with a stored
+    /// password (the retired `__tenant` sign-in): its workspace name, so its
+    /// queued rows can be handed to that workspace. Never saved again.
+    public private(set) var legacyWorkspaceName: String?
 
-    public init(workspace: String, username: String, password: String) {
-        self.workspace = workspace
+    public init(username: String, workspaceId: String?, workspaceName: String, refreshToken: String?) {
         self.username = username
-        self.password = password
+        self.workspaceId = workspaceId
+        self.workspaceName = workspaceName
+        self.refreshToken = refreshToken
+        legacyWorkspaceName = nil
     }
 
-    public init(account: ApiClient.Account) {
-        self.init(workspace: account.workspace, username: account.username, password: account.password)
+    /// The queue owner key of this sign-in; nil without a workspace.
+    public var ownerKey: String? {
+        guard let id = workspaceId?.nonEmptyTrimmed else { return nil }
+        return Queue.ownerKey(workspaceId: id, username: username)
     }
 
-    public var account: ApiClient.Account {
-        ApiClient.Account(workspace: workspace, username: username, password: password)
+    /// The owner key the retired build queued this user's rows under.
+    public var legacyOwnerKey: String? {
+        legacyWorkspaceName.map { Queue.legacyOwnerKey(workspaceName: $0, username: username) }
     }
 
-    /// The queue owner key of this sign-in.
-    public var ownerKey: String { Queue.ownerKey(workspace: workspace, username: username) }
+    /// Whether it can resume without the password: a refresh token, and not
+    /// the retired format.
+    public var canResume: Bool {
+        legacyWorkspaceName == nil && refreshToken?.nonEmptyTrimmed != nil
+    }
 
-    /// Never includes the password.
-    public var description: String { account.description }
+    /// Never includes the refresh token.
+    public var description: String {
+        let workspace = workspaceName.nonEmptyTrimmed ?? workspaceId ?? legacyWorkspaceName ?? "(no workspace)"
+        return "\(username) @ \(workspace)"
+    }
 
     public var debugDescription: String { description }
 
     private enum CodingKeys: String, CodingKey {
-        case workspace, username, password
+        case username, workspaceId, workspaceName, refreshToken
+        // The retired format: a workspace (tenant) name and the password.
+        case workspace, password
     }
 
-    /// A missing workspace reads as a host account.
+    /// Reads both formats. The retired one's password is dropped at once (it
+    /// is never used again) and its workspace name kept as
+    /// ``legacyWorkspaceName``.
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        workspace = try c.decodeIfPresent(String.self, forKey: .workspace) ?? ""
         username = try c.decode(String.self, forKey: .username)
-        password = try c.decode(String.self, forKey: .password)
+        workspaceId = try c.decodeIfPresent(String.self, forKey: .workspaceId)?.nonEmptyTrimmed
+        workspaceName = try c.decodeIfPresent(String.self, forKey: .workspaceName) ?? ""
+        refreshToken = try c.decodeIfPresent(String.self, forKey: .refreshToken)?.nonEmptyTrimmed
+        if c.contains(.password) {
+            legacyWorkspaceName = try c.decodeIfPresent(String.self, forKey: .workspace) ?? ""
+            workspaceId = nil
+            refreshToken = nil
+        } else {
+            legacyWorkspaceName = nil
+        }
     }
 
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encode(workspace, forKey: .workspace)
         try c.encode(username, forKey: .username)
-        try c.encode(password, forKey: .password)
+        try c.encodeIfPresent(workspaceId, forKey: .workspaceId)
+        try c.encode(workspaceName, forKey: .workspaceName)
+        try c.encodeIfPresent(refreshToken, forKey: .refreshToken)
     }
 }
 
@@ -88,8 +123,8 @@ public struct KeychainError: Error, Equatable, CustomStringConvertible {
 /// The sign-in as one generic-password item (`kSecClassGenericPassword`) in
 /// the user's Keychain: service `com.dosibridge.tracker`, accessible after
 /// the first unlock and never synced or migrated to another device
-/// (`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`). The password is
-/// never written anywhere else.
+/// (`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`). The refresh token is
+/// never written anywhere else, and the password is not kept at all.
 public final class KeychainCredentialsStore: CredentialsStore {
     public static let defaultService = AgentInfo.bundleIdentifier
     public static let defaultAccount = "sign-in"

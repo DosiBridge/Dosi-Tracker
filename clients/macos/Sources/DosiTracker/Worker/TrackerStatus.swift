@@ -11,6 +11,10 @@ import Foundation
 enum TrackerStatus: Equatable, Sendable {
     /// No saved sign-in: the sign-in window is shown.
     case signedOut
+    /// Signed in to the server, but no workspace is chosen to track in: after
+    /// signing in with several, or after losing access to the one tracked in
+    /// (removed, archived). Nothing is tracked and no heartbeat is sent.
+    case choosingWorkspace
     /// Signed in, waiting for the server's first answer (no project list yet).
     case connecting
     /// Signed in, but no project is chosen: several and none remembered, the
@@ -45,6 +49,8 @@ enum TrackerStatus: Equatable, Sendable {
         switch self {
         case .signedOut:
             return "Signed out"
+        case .choosingWorkspace:
+            return "Choose a workspace"
         case .connecting:
             return "Connecting…"
         case .choosingProject:
@@ -89,7 +95,7 @@ enum TrackerStatus: Equatable, Sendable {
             return .choosing
         case .stopped:
             return .stopped
-        case .signedOut, .signInExpired, .connecting, .offline:
+        case .signedOut, .signInExpired, .connecting, .offline, .choosingWorkspace:
             return nil
         }
     }
@@ -116,10 +122,11 @@ enum TrackerStatus: Equatable, Sendable {
         self == .signedOut || self == .signInExpired
     }
 
-    /// Signed in with a usable account (an expired one does not count).
+    /// Signed in with a usable account in a workspace (an expired one, or
+    /// one still choosing its workspace, does not count).
     var isSignedIn: Bool {
         switch self {
-        case .signedOut, .signInExpired, .stopped:
+        case .signedOut, .signInExpired, .stopped, .choosingWorkspace:
             return false
         default:
             return true
@@ -132,6 +139,8 @@ struct StatusFacts: Equatable, Sendable {
     /// The local queue is unusable: nothing can be recorded (why).
     var storageFailure: String?
     var signedIn = false
+    /// Signed in to the server without a workspace yet.
+    var choosingWorkspace = false
     var signInExpired = false
     var paused = false
     /// The pause is a timed break.
@@ -153,7 +162,7 @@ struct StatusFacts: Equatable, Sendable {
             return .stopped(failure)
         }
         if !signedIn {
-            return .signedOut
+            return choosingWorkspace ? .choosingWorkspace : .signedOut
         }
         if signInExpired {
             return .signInExpired

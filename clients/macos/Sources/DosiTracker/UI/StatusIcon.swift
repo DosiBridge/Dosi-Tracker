@@ -28,7 +28,7 @@ enum StatusBadge: Equatable {
             return .paused
         case .away, .locked, .asleep:
             return .away
-        case .connecting, .offline, .choosingProject:
+        case .connecting, .offline, .choosingProject, .choosingWorkspace:
             return .waiting
         case .signedOut:
             return .signedOut
