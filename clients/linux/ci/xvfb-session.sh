@@ -22,7 +22,7 @@ fi
 DISPLAY_NUM="${DOSI_XVFB_DISPLAY_NUM:-99}"
 HARNESS_DISPLAY=":${DISPLAY_NUM}"
 
-for tool in Xvfb xdpyinfo openbox dbus-daemon; do
+for tool in Xvfb xdpyinfo xprop openbox dbus-daemon; do
   command -v "${tool}" >/dev/null 2>&1 || {
     echo "ci/xvfb-session.sh: '${tool}' is required but not installed" >&2
     exit 1
@@ -118,6 +118,21 @@ export DBUS_SYSTEM_BUS_ADDRESS="${SYSTEM_BUS}"
 
 openbox >"${RUNTIME_DIR}/openbox.log" 2>&1 &
 PIDS+=("$!")
+
+# Windows mapped while openbox is still starting stay unmanaged (no
+# _NET_ACTIVE_WINDOW, no _NET_CLIENT_LIST entry), so wait until it has
+# announced itself as the EWMH window manager, then let it finish starting.
+tries=0
+until xprop -display "${HARNESS_DISPLAY}" -root _NET_SUPPORTING_WM_CHECK 2>/dev/null | grep -q 'window id'; do
+  tries=$((tries + 1))
+  if [ "${tries}" -gt 100 ]; then
+    echo "ci/xvfb-session.sh: openbox did not start on ${HARNESS_DISPLAY}" >&2
+    cat "${RUNTIME_DIR}/openbox.log" >&2 || true
+    exit 1
+  fi
+  sleep 0.1
+done
+sleep 0.5
 
 export DOSI_TEST_HARNESS=1
 export DOSI_TEST_DISPLAY="${HARNESS_DISPLAY}"

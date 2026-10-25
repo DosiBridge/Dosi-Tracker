@@ -49,6 +49,7 @@ RUN apt-get update \
       shellcheck \
       systemd \
       x11-utils \
+      x11-xserver-utils \
       xauth \
       xdotool \
       xterm \
