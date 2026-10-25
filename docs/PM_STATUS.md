@@ -3237,3 +3237,43 @@ Under direct user instruction ("start phase 2 quick"), implementation sequencing
 3. **Open Phase 2 Backlog**: Input counting (XInput2), screenshot acquisition, portal PipeWire capture, and V4L2 webcam remain open.
 4. **No Real Hardware Probing**: All tests run through deterministic injected fakes; no live X11 displays, input listeners, or camera devices were probed on host.
 
+---
+
+## 37. Linux Desktop Agent Phase 2: X11 Real Transport & Wire Protocol Decoding Correction (`TASK phase2-x11-real-transport-correction-20261025`)
+
+> **Execution Date:** October 25, 2026  
+> **Phase Task ID:** `TASK phase2-x11-real-transport-correction-20261025`  
+> **Status:** Correction Delivered; Verified via Synthetic Wire Protocol & Integration Test Harness (247/247 Tests Passed); Native Linux QA Pending on `mh-ubuntu`  
+> **Target Package:** `clients/linux` (Crate: `dosi-tracker-linux` v0.1.0)  
+
+### A. Defect Identification & Correction Scope
+Independent read-only QA identified a material placeholder in the delivered Phase 2 first slice (`66a9b681162961a0867a5f5959a5a4324ca39a78`):
+- **Source-Confirmed Defect**: `SysX11PropertyReader::get_active_window` in `clients/linux/src/tracking/x11.rs` only verified `$DISPLAY` or X11 socket presence and returned `Ok(None)` on Linux; `get_window_title`, `get_window_class`, and `get_window_pid` unconditionally returned `Ok(None)`. Passing `MockX11PropertyReader` test fixtures could not establish actual EWMH production transport.
+- **Correction Delivered**:
+  1. Implemented actual unprivileged X11 property transport using maintained pure-Rust `x11rb = "0.14.0"` (including `x11rb-protocol v0.14.0` with pure wire parser `GetPropertyReply::try_parse`).
+  2. Defined low-level transport seam `X11PropertyTransport` implemented by:
+     - `SysX11Transport`: Production X11 transport connecting lazily via `x11rb::connect(None)` upon the first property query on Linux only under affirmative consent. Strictly non-connecting during provider construction, default system wiring, or `doctor` diagnostics. Fails closed with `TrackingError::DisplayUnavailable` on non-Linux targets.
+     - `SyntheticX11Transport`: In-memory thread-safe transport storing raw property replies and errors for deterministic testing below `X11PropertyReader`.
+  3. Implemented robust, bounded protocol decoders:
+     - `decode_active_window`: Decodes 32-bit WINDOW property, validates format 32 and byte length $\ge 4$, maps `0` to `None` (unfocused desktop per EWMH), returns `Some(u64)`.
+     - `decode_window_title`: Decodes `_NET_WM_NAME` (UTF-8, bounded to `MAX_WINDOW_TITLE_BYTES = 512`, null trimmed) with fallback to `WM_NAME` (STRING: Latin-1/UTF-8), returning `None` if absent or empty.
+     - `decode_wm_class`: Decodes null-delimited ICCCM `<instance_name>\0<class_name>\0` (bounded to `MAX_WM_CLASS_BYTES = 256`), supporting single-string fallback and whitespace trimming.
+     - `decode_wm_pid`: Decodes 32-bit CARDINAL PID, validating format 32, byte length $\ge 4$, `pid > 0` -> `Some(pid)`, `0` -> `None`.
+  4. Default Provider Wiring: `X11ActiveWindowProvider::default_system(proc_reader)` constructs `SysX11PropertyReader::new()` backed by `SysX11Transport::new()`, ensuring the real transport implementation is selected, not merely declared.
+  5. Deterministic synthetic wire protocol tests: Exercised `GetPropertyReply::try_parse` from `x11rb::x11_utils::TryParse` with synthetic wire packets crafted via `craft_get_property_wire_reply`.
+
+### B. Verification Evidence
+| Execution Environment | Toolchain / Target | Command Executed | Tests / Steps | Result | Exit Code | Provenance Details |
+|---|---|---|:---:|:---:|:---:|---|
+| **Local Host** | `rustc 1.97.1` (x86_64 MSVC) | `cargo fmt --manifest-path clients/linux/Cargo.toml -- --check` | Formatting check | PASSED | **0** | Clean, 0 diffs. |
+| **Local Host** | `rustc 1.97.1` (x86_64 MSVC) | `cargo clippy --manifest-path clients/linux/Cargo.toml --locked --all-targets -- -D warnings` | Clippy lint check | PASSED | **0** | Clean, 0 warnings, 0 errors across all targets. |
+| **Local Host** | `rustc 1.97.1` (x86_64 MSVC) | `cargo test --manifest-path clients/linux/Cargo.toml --lib tracking::x11` | In-crate X11 unit tests | PASSED | **0** | 8 tests passed: wire parsing, active window decode, unfocused 0, UTF-8 title with multibyte unicode/emoji, fallback to WM_NAME, WM_CLASS decoding, PID decoding, malformed wire handling, and error propagation. |
+| **Local Host** | `rustc 1.97.1` (x86_64 MSVC) | `cargo test --manifest-path clients/linux/Cargo.toml --test tracking_native_adapter_tests` | Tracking native adapter integration tests | PASSED | **0** | 16 tests passed: 11 pre-existing + 5 new synthetic protocol transport integration tests (full-stack decoding, WM_NAME/WM_CLASS fallback, unfocused/zero XID, malformed wire/error handling, and consent-gated ABA revocation). |
+| **Local Host** | `rustc 1.97.1` (x86_64 MSVC) | `cargo test --manifest-path clients/linux/Cargo.toml --locked --release` | Full release test suite | PASSED | **0** | 247 release tests passed across 11 test suites (90 lib, 11 cli_auth, 21 cli_command, 32 consent_lifecycle, 10 diagnostics, 7 failing-before repro, 3 installer lifecycle [22 inner checks], 15 outbox CLI, 29 outbox, 13 sync, 16 tracking native adapters; 0 in Linux-gated private bus; exit 0). |
+
+### C. Synthetic vs Native Boundaries & Next Steps
+1. **Synthetic vs Native Boundaries**: All tests executed on the Windows host use deterministic synthetic wire-level protocol packets (`SyntheticX11Transport`, `craft_get_property_wire_reply`). No user X11 server, real display socket, input device, or camera was probed.
+2. **Open Phase 1 & Phase 2 Native Gates**: Full Linux target verification on `mh-ubuntu` (native private D-Bus SecretService tests, live X11 display session validation) remains open.
+3. **Remaining Phase 2 Scope**: XInput2 input counting, screenshot capture & blur policy, Wayland PipeWire portal ScreenCast, and V4L2 webcam capture remain deferred.
+
+

@@ -29,5 +29,7 @@ pub use traits::{
 };
 pub use wayland::WaylandActiveWindowProvider;
 pub use x11::{
-    MockX11PropertyReader, SysX11PropertyReader, X11ActiveWindowProvider, X11PropertyReader,
+    craft_get_property_wire_reply, MockX11PropertyReader, RawPropertyReply, SyntheticX11Transport,
+    SysX11PropertyReader, SysX11Transport, X11ActiveWindowProvider, X11PropertyReader,
+    X11PropertyTransport,
 };
