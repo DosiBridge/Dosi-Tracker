@@ -1,8 +1,11 @@
 import type { Metadata } from "next";
+import { headers } from "next/headers";
 import { Inter, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import { ThemeProvider } from "@/components/theme-provider";
 import { SessionProvider } from "@/components/session-provider";
+import { RUNTIME_CONFIG_ELEMENT_ID, resolveRuntimeConfig, serializeRuntimeConfig } from "@/lib/runtime-config";
+import { NONCE_HEADER } from "@/lib/security-headers";
 
 const inter = Inter({
   variable: "--font-inter",
@@ -30,15 +33,29 @@ const themeScript = `
 })();
 `;
 
-export default function RootLayout({
+/**
+ * Every page renders per request: the Content-Security-Policy nonce (src/proxy.ts)
+ * is new each time, and the deployment's configuration (API address, download
+ * location, demo switch) is read from the environment now, not frozen at build.
+ */
+export default async function RootLayout({
   children,
 }: Readonly<{
   children: React.ReactNode;
 }>) {
+  const nonce = (await headers()).get(NONCE_HEADER) ?? undefined;
+  const config = resolveRuntimeConfig(process.env);
+
   return (
     <html lang="en" suppressHydrationWarning className={`${inter.variable} ${geistMono.variable} h-full antialiased`}>
       <head>
-        <script dangerouslySetInnerHTML={{ __html: themeScript }} />
+        {/* Data, not code: never executed, so the CSP needs no allowance for it. */}
+        <script
+          id={RUNTIME_CONFIG_ELEMENT_ID}
+          type="application/json"
+          dangerouslySetInnerHTML={{ __html: serializeRuntimeConfig(config) }}
+        />
+        <script nonce={nonce} dangerouslySetInnerHTML={{ __html: themeScript }} />
       </head>
       <body className="min-h-full font-sans">
         <ThemeProvider>

@@ -1,245 +1,142 @@
 import Link from "next/link";
-import {
-  Monitor,
-  AlertTriangle,
-  Lock,
-  ExternalLink,
-  Cpu,
-  Layers,
-  Download,
-  Terminal,
-} from "lucide-react";
+import { Lock, Monitor, ShieldCheck } from "lucide-react";
 import { Card } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
-import { AGENT_RELEASES_URL } from "@/components/dashboard/agent-setup";
+import { AssetDownloads, Code, CommandBlock, FactTable, GuideBreadcrumb, GuideSection } from "@/components/install/install-parts";
+import { AGENT_PLATFORMS, RELEASE_ASSET_FILES, WINDOWS_COMMANDS } from "@/lib/agent-downloads";
+import { runtimeConfig } from "@/lib/runtime-config";
 
 export const metadata = {
-  title: "Windows Desktop Agent Installation & Setup Guide | Dosi-Tracker",
+  title: "Windows Desktop Agent Guide | Dosi-Tracker",
   description:
-    "Installation instructions, SmartScreen approval, silent enterprise deployment, and DPAPI credential protection for Dosi-Tracker on Windows 10 and 11.",
+    "Download and install the Dosi-Tracker agent for Windows 10 and 11: per-user install without administrator rights, sign-in, silent deployment, data locations and uninstall.",
 };
 
 export default function WindowsInstallPage() {
+  const { apiBaseUrl, downloadBaseUrl } = runtimeConfig();
+  const info = AGENT_PLATFORMS.windows;
+
   return (
     <div className="space-y-8">
-      {/* Page Title */}
       <div>
-        <div className="flex items-center gap-2 mb-2">
-          <Link href="/install" className="text-xs text-muted-foreground hover:text-foreground">
-            Guides
-          </Link>
-          <span className="text-xs text-muted-foreground/60" aria-hidden="true">/</span>
-          <span className="text-xs font-semibold text-primary-strong">Windows</span>
-        </div>
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <h1 className="font-display text-2xl sm:text-3xl font-bold tracking-tight text-foreground flex items-center gap-2.5">
-            <Monitor className="h-7 w-7 text-primary-strong" aria-hidden="true" />
-            Windows Desktop Agent Guide
-          </h1>
-          <Badge tone="primary">Source Crate &amp; NSIS Build Script</Badge>
-        </div>
-        <p className="mt-2 text-sm text-muted-foreground max-w-3xl leading-relaxed">
-          High-performance Rust desktop agent for Windows 10 and Windows 11. Lives in the Notification Area (system tray),
-          installs per-user without requiring administrator privileges, and protects stored credentials using Windows DPAPI.
+        <GuideBreadcrumb current="Windows" />
+        <h1 className="flex items-center gap-2.5 font-display text-2xl font-bold tracking-tight text-foreground sm:text-3xl">
+          <Monitor className="h-7 w-7 text-primary-strong" aria-hidden="true" />
+          Windows desktop agent guide
+        </h1>
+        <p className="mt-2 max-w-3xl text-sm leading-relaxed text-muted-foreground">
+          A small Rust agent that lives in {info.home}, records work in time blocks on the project you choose and uploads them to your
+          workspace. It installs for your Windows user only and never needs administrator rights.
+        </p>
+        <p className="mt-2 text-xs text-muted-foreground">
+          <span className="font-medium text-foreground">Requires:</span> {info.requirement}.
         </p>
       </div>
 
-      {/* Code Signing & Artifact Notice */}
-      <Card variant="quiet" className="border-blue-500/30 bg-blue-500/5 p-4 sm:p-5">
-        <div className="flex items-start gap-3">
-          <AlertTriangle className="h-5 w-5 text-blue-500 shrink-0 mt-0.5" aria-hidden="true" />
-          <div className="space-y-1.5 text-xs text-muted-foreground">
-            <h2 className="font-semibold text-sm text-foreground">Packaging, Compilation &amp; Signing Status</h2>
-            <p>
-              <strong className="text-foreground">Tracked Codebase Artifacts:</strong> The Rust source crate (<code className="font-mono text-foreground font-semibold">clients/windows</code>) and NSIS installer compilation script (<code className="font-mono text-foreground font-semibold">installer/dosi-tracker.nsi</code>) are tracked in the repository. Pre-built release binary installers are <strong className="text-foreground">unreleased / not distributed in the repository</strong>.
-            </p>
-            <p>
-              <strong className="text-foreground">Local Compilation:</strong> Source compilation check is verified on Windows hosts (<code className="font-mono text-foreground">cargo check --bin dosi-tracker</code> exits with code 0). Compiling the release installer binary locally requires:
-            </p>
-            <pre className="font-mono bg-muted/60 p-2 rounded text-[11px] text-foreground overflow-x-auto">
-{`cargo build --release --bin dosi-tracker
-makensis /DVERSION=0.1.0 installer/dosi-tracker.nsi`}
-            </pre>
-            <p>
-              <strong className="text-foreground">Signing &amp; SmartScreen:</strong> No Authenticode EV code-signing certificate exists in the repository (ad-hoc / unsigned). When running locally compiled installers, Windows Defender SmartScreen displays &ldquo;Windows protected your PC&rdquo;. Follow the verified SmartScreen instructions below.
-            </p>
-          </div>
-        </div>
+      <GuideSection title="Download">
+        <AssetDownloads platform="windows" downloadBaseUrl={downloadBaseUrl} />
+        <CommandBlock label="Check the download (PowerShell)" commands={[WINDOWS_COMMANDS.verify]} />
+      </GuideSection>
+
+      <GuideSection title="Install and sign in">
+        <Card className="p-5 text-xs">
+          <ol className="list-decimal space-y-3 pl-5 leading-relaxed text-muted-foreground">
+            <li>
+              Run <Code>{RELEASE_ASSET_FILES.windowsInstaller}</Code>. It installs to <Code>%LOCALAPPDATA%\Programs\DosiTracker</Code>,
+              adds a Start menu shortcut and starts the agent when you sign in to Windows.
+            </li>
+            <li>
+              If Windows SmartScreen says <span className="font-semibold text-foreground">&ldquo;Windows protected your PC&rdquo;</span>,
+              choose <span className="font-semibold text-foreground">More info</span>, then{" "}
+              <span className="font-semibold text-foreground">Run anyway</span>.
+            </li>
+            <li>
+              Sign in with the <span className="font-semibold text-foreground">server address</span>, your{" "}
+              <span className="font-semibold text-foreground">email</span> and <span className="font-semibold text-foreground">password</span>.
+              The server address is under <span className="font-semibold text-foreground">Advanced</span>; signed-in members find it on
+              the dashboard&apos;s <Link href="/download" className="font-medium text-primary-strong hover:underline">Download page</Link>
+              {apiBaseUrl ? (
+                <>
+                  {" "}
+                  (for this site: <Code>{apiBaseUrl}</Code>)
+                </>
+              ) : null}
+              .
+            </li>
+            <li>
+              If you belong to more than one workspace, pick the one to track for; then choose your project (only asked when you are on
+              more than one) and start tracking.
+            </li>
+          </ol>
+        </Card>
+      </GuideSection>
+
+      <GuideSection title="Silent and managed deployment">
+        <p className="text-xs leading-relaxed text-muted-foreground">
+          Deploy the installer to many computers without prompts and point every agent at your server, so nobody types the address:
+        </p>
+        <CommandBlock label="Silent install" commands={[WINDOWS_COMMANDS.silentInstall(apiBaseUrl)]} />
+        <FactTable
+          caption="Installer switches"
+          headers={["Switch", "Effect"]}
+          rows={[
+            [<Code key="s">/S</Code>, "Silent install."],
+            [
+              <Code key="server">/SERVER=&lt;url&gt;</Code>,
+              <>
+                The server address the agent signs in to, written to <Code>config.toml</Code> next to the program. An invalid address stops
+                the installer (exit code 2).
+              </>,
+            ],
+            [<Code key="dash">/DASHBOARD=&lt;url&gt;</Code>, "The web dashboard the agent links to."],
+            [<Code key="d">/D=&lt;folder&gt;</Code>, "Another install folder (must be the last switch)."],
+          ]}
+        />
+      </GuideSection>
+
+      <GuideSection title="Where things are kept">
+        <FactTable
+          caption="Agent files on Windows"
+          headers={["Where", "What"]}
+          rows={[
+            [<Code key="p">%LOCALAPPDATA%\Programs\DosiTracker\</Code>, "The program, its config.toml (when the installer wrote one) and uninstall.exe."],
+            [
+              <Code key="c">%APPDATA%\DosiTracker\credentials.bin</Code>,
+              "Your sign-in, encrypted with Windows DPAPI (CryptProtectData) for your Windows user only.",
+            ],
+            [<Code key="q">%LOCALAPPDATA%\DosiTracker\dosi-tracker.db</Code>, "The offline queue: blocks and screenshots waiting to upload."],
+            [<Code key="l">%LOCALAPPDATA%\DosiTracker\logs\</Code>, "Daily logs, kept 7 days."],
+          ]}
+        />
+        <Card variant="quiet" className="space-y-1.5 p-4 text-xs text-muted-foreground">
+          <p className="flex items-center gap-2 font-semibold text-foreground">
+            <Lock className="h-4 w-4 text-primary-strong" aria-hidden="true" /> Your password is never stored in clear text
+          </p>
+          <p>The sign-in is protected by Windows DPAPI and tied to your Windows account; it is never written to environment variables.</p>
+        </Card>
+      </GuideSection>
+
+      <GuideSection title="Quit, update and uninstall">
+        <p className="text-xs leading-relaxed text-muted-foreground">
+          Quitting saves and uploads the block in progress. Installing a new version asks the running agent to quit the same way first.
+        </p>
+        <CommandBlock label="Quit gracefully" commands={[WINDOWS_COMMANDS.quit]} />
+        <p className="text-xs leading-relaxed text-muted-foreground">
+          Uninstall from <span className="font-medium text-foreground">Settings → Apps → Installed apps → Dosi Tracker</span>, or run{" "}
+          <Code>%LOCALAPPDATA%\Programs\DosiTracker\uninstall.exe</Code>. It asks whether to delete your data (sign-in, preferences, logs
+          and time not uploaded yet). A silent uninstall deletes it; keep it with:
+        </p>
+        <CommandBlock label="Silent uninstall, keeping data" commands={[WINDOWS_COMMANDS.silentUninstallKeepData]} />
+      </GuideSection>
+
+      <Card variant="quiet" className="flex items-start gap-3 p-4 text-xs text-muted-foreground">
+        <ShieldCheck className="mt-0.5 h-5 w-5 shrink-0 text-success" aria-hidden="true" />
+        <p>
+          Windows asks desktop apps for no special permissions. The agent counts key presses and clicks — never which keys or what you
+          type — and captures only what your workspace&apos;s project allows. Camera photos need{" "}
+          <span className="font-medium text-foreground">Settings → Privacy &amp; security → Camera</span> and are off unless a project
+          turns them on.
+        </p>
       </Card>
-
-      {/* Supported Versions & System Requirements */}
-      <div className="space-y-4">
-        <h2 className="font-display text-lg font-bold text-foreground">Supported Windows Versions &amp; Hardware</h2>
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
-          <Card className="p-4">
-            <h3 className="font-semibold text-foreground flex items-center gap-2 mb-2">
-              <Cpu className="h-4 w-4 text-primary-strong" aria-hidden="true" /> Architecture &amp; Binary Target
-            </h3>
-            <ul className="space-y-1 text-muted-foreground list-disc pl-4">
-              <li><strong className="text-foreground">x86_64:</strong> 64-bit Windows PC (AMD64 / Intel 64)</li>
-              <li>Native Rust binary target: <code className="font-mono text-foreground">x86_64-pc-windows-msvc</code></li>
-              <li>Lightweight execution: ~18 MB RAM consumption</li>
-              <li>Installer build target: <code className="font-mono text-foreground">dosi-tracker-setup-&lt;version&gt;.exe</code></li>
-            </ul>
-          </Card>
-          <Card className="p-4">
-            <h3 className="font-semibold text-foreground flex items-center gap-2 mb-2">
-              <Layers className="h-4 w-4 text-primary-strong" aria-hidden="true" /> Supported OS Editions
-            </h3>
-            <ul className="space-y-1 text-muted-foreground list-disc pl-4">
-              <li><strong className="text-foreground">Windows 11:</strong> Home, Pro, Enterprise, Education (all builds)</li>
-              <li><strong className="text-foreground">Windows 10:</strong> Version 1809 or newer (64-bit)</li>
-              <li>Installs for current user only: <code className="font-mono text-foreground">%LOCALAPPDATA%\Programs\DosiTracker</code></li>
-              <li>Zero administrative or UAC elevation prompts required for standard use</li>
-            </ul>
-          </Card>
-        </div>
-      </div>
-
-      {/* Installation Steps & SmartScreen Handling */}
-      <div className="space-y-4">
-        <h2 className="font-display text-lg font-bold text-foreground flex items-center gap-2">
-          <Download className="h-5 w-5 text-primary-strong" aria-hidden="true" />
-          Standard User Installation Steps
-        </h2>
-
-        <Card className="p-5 border-border/80 space-y-4 text-xs">
-          <ol className="list-decimal pl-5 space-y-3 text-muted-foreground leading-relaxed">
-            <li>
-              <strong className="text-foreground">Obtain the Installer:</strong> Build from source using Cargo and NSIS, or download the setup executable if published on{" "}
-              <a
-                href={AGENT_RELEASES_URL}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="text-primary-strong font-semibold hover:underline inline-flex items-center gap-1"
-              >
-                GitHub Releases <ExternalLink className="h-3 w-3" aria-hidden="true" />
-              </a>.
-            </li>
-            <li>
-              <strong className="text-foreground">Run the Executable:</strong> Launch <code className="font-mono text-foreground">dosi-tracker-setup-&lt;version&gt;.exe</code>.
-              It installs to <code className="font-mono text-foreground">%LOCALAPPDATA%\Programs\DosiTracker</code>, creates a Start Menu shortcut,
-              and configures auto-start when you log in to Windows.
-            </li>
-            <li>
-              <strong className="text-foreground">Windows SmartScreen Approval:</strong> If Windows Defender SmartScreen displays{" "}
-              <span className="font-semibold text-foreground">&ldquo;Windows protected your PC&rdquo;</span>:
-              <div className="mt-2 pl-4 border-l-2 border-primary/40 space-y-1 text-foreground">
-                <p>1. Click <span className="font-bold underline">More info</span>.</p>
-                <p>2. Click the <span className="font-bold bg-muted px-2 py-0.5 rounded border border-border">Run anyway</span> button that appears.</p>
-              </div>
-            </li>
-            <li>
-              <strong className="text-foreground">Sign In:</strong> The application opens to the sign-in screen and places an icon in the Notification Area (system tray).
-            </li>
-          </ol>
-        </Card>
-      </div>
-
-      {/* Silent Enterprise / Administrator Deployment */}
-      <div className="space-y-4">
-        <h2 className="font-display text-lg font-bold text-foreground flex items-center gap-2">
-          <Terminal className="h-5 w-5 text-primary-strong" aria-hidden="true" />
-          Silent Enterprise &amp; Managed Deployment
-        </h2>
-        <p className="text-xs text-muted-foreground leading-relaxed">
-          System administrators can deploy the NSIS installer across fleet workstations silently with pre-configured server addresses:
-        </p>
-
-        <Card className="p-4 bg-muted/40 font-mono text-xs text-foreground overflow-x-auto">
-          <pre>{`# Silent installation with pre-configured API server URL and Dashboard:
-dosi-tracker-setup-0.1.0.exe /S /SERVER=https://tracker-api.example.com /DASHBOARD=https://app.example.com`}</pre>
-        </Card>
-
-        <div className="overflow-x-auto rounded-xl border border-border/80 bg-card">
-          <table className="w-full text-left text-xs">
-            <thead className="bg-muted/50 border-b border-border/80 text-foreground font-semibold">
-              <tr>
-                <th className="p-3">Switch</th>
-                <th className="p-3">Description</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-border/60 text-muted-foreground">
-              <tr className="hover:bg-muted/20">
-                <td className="p-3 font-mono font-medium text-foreground">/S</td>
-                <td className="p-3">Runs the NSIS installer in completely silent, unattended mode.</td>
-              </tr>
-              <tr className="hover:bg-muted/20">
-                <td className="p-3 font-mono font-medium text-foreground">/SERVER=&lt;url&gt;</td>
-                <td className="p-3">Sets the default API server URL in <code className="font-mono text-foreground">config.toml</code> (<code className="font-mono text-foreground">api_base_url</code>).</td>
-              </tr>
-              <tr className="hover:bg-muted/20">
-                <td className="p-3 font-mono font-medium text-foreground">/DASHBOARD=&lt;url&gt;</td>
-                <td className="p-3">Sets the default web dashboard address linked from the app (<code className="font-mono text-foreground">dashboard_url</code>).</td>
-              </tr>
-              <tr className="hover:bg-muted/20">
-                <td className="p-3 font-mono font-medium text-foreground">/D=&lt;folder&gt;</td>
-                <td className="p-3">Custom installation directory (must be the final argument on the command line).</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      {/* First-Run Configuration & DPAPI Security */}
-      <div className="space-y-4">
-        <h2 className="font-display text-lg font-bold text-foreground">First-Run Configuration &amp; DPAPI Protection</h2>
-        <p className="text-xs text-muted-foreground leading-relaxed">
-          When the sign-in window opens, enter your <strong className="text-foreground">Workspace</strong>, <strong className="text-foreground">Email</strong>,
-          and <strong className="text-foreground">Password</strong>. If your administrator did not deploy with <code className="font-mono text-foreground">/SERVER</code>,
-          click <strong className="text-foreground">Advanced</strong> and paste your server address from the web dashboard.
-        </p>
-
-        <Card variant="quiet" className="p-4 text-xs text-muted-foreground space-y-2">
-          <div className="flex items-center gap-2 text-foreground font-semibold">
-            <Lock className="h-4 w-4 text-primary-strong" aria-hidden="true" />
-            <span>Windows Data Protection API (DPAPI) Keying</span>
-          </div>
-          <p>
-            Your account credentials and authentication tokens are encrypted at rest using <strong className="text-foreground">Windows DPAPI</strong> (<code className="font-mono text-foreground">CryptProtectData</code>) at <code className="font-mono text-foreground">%APPDATA%\DosiTracker\credentials.bin</code>.
-            The encryption key is tied to your Windows user logon security identifier (SID). Credentials are never stored in cleartext files or environment variables.
-          </p>
-        </Card>
-      </div>
-
-      {/* Local Controls, Pause, Stop & Troubleshooting */}
-      <div className="space-y-4">
-        <h2 className="font-display text-lg font-bold text-foreground">Application Controls, Troubleshooting &amp; Uninstall</h2>
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
-          <Card className="p-4 space-y-2">
-            <h3 className="font-semibold text-foreground">System Tray &amp; Tabs</h3>
-            <p className="text-muted-foreground">The main window provides three organized tabs:</p>
-            <ul className="space-y-1 text-muted-foreground list-disc pl-4">
-              <li><strong className="text-foreground">Timer:</strong> Project selector, task notes, Pause / Resume, and timed breaks (15, 30, 60m).</li>
-              <li><strong className="text-foreground">Activity:</strong> Today&apos;s activity %, top apps, and upload queue status.</li>
-              <li><strong className="text-foreground">Settings:</strong> Launch on Windows startup, privacy rules, and logs.</li>
-            </ul>
-          </Card>
-          <Card className="p-4 space-y-2">
-            <h3 className="font-semibold text-foreground">Graceful Termination &amp; Upgrades</h3>
-            <p className="text-muted-foreground">To quit or prepare for an upgrade via CLI:</p>
-            <p className="font-mono text-[11px] text-foreground bg-muted/60 p-2 rounded">
-              dosi-tracker.exe --quit
-            </p>
-            <p className="text-muted-foreground">
-              Sends an IPC quit signal to the running instance, which finishes and uploads the in-progress time block before exiting cleanly.
-            </p>
-          </Card>
-        </div>
-
-        <Card variant="quiet" className="p-4 text-xs text-muted-foreground space-y-2">
-          <h3 className="font-semibold text-foreground">Uninstallation &amp; Cache Cleanup</h3>
-          <p>
-            To uninstall Dosi Tracker:
-          </p>
-          <ol className="list-decimal pl-5 space-y-1 text-muted-foreground">
-            <li>Open <strong className="text-foreground">Windows Settings → Apps → Installed apps</strong>.</li>
-            <li>Locate <strong className="text-foreground">Dosi Tracker</strong>, click the three dots, and select <strong className="text-foreground">Uninstall</strong>.</li>
-            <li>Alternatively, execute: <code className="font-mono text-foreground">%LOCALAPPDATA%\Programs\DosiTracker\uninstall.exe</code>.</li>
-            <li>To delete unsent queued activity blocks: delete <code className="font-mono text-foreground">%LOCALAPPDATA%\DosiTracker\queue.db</code>.</li>
-          </ol>
-        </Card>
-      </div>
     </div>
   );
 }

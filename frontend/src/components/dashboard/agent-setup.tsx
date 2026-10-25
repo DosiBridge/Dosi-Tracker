@@ -5,26 +5,25 @@ import { Check, Copy } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { toast } from "@/components/toast";
 import { cn } from "@/lib/utils";
+import { runtimeConfig } from "@/lib/runtime-config";
 
 /* ============================================================================
  * AGENT SETUP — what a person needs to connect a desktop agent: the server
- * address (the API this web app talks to — agents can't guess it), the
- * workspace name, their email and, after an invite or a reset, a one-time
- * password. Shared by the Download page, the invite result and the Team
+ * address (the API this web app talks to — agents can't guess it), their
+ * email and, after an invite or a reset, a one-time password. Accounts are
+ * global: the agent lists the person's workspaces after signing in, so no
+ * workspace name is asked for. Shared by the Download page, the invite result and the Team
  * page's password reset, so the instructions read the same everywhere.
  * ========================================================================== */
 
-/** The address agents sign in to: the same API this web app uses (useApi's default for local development). */
-export const AGENT_SERVER_URL = (process.env.NEXT_PUBLIC_API_URL || "https://localhost:6006").replace(/\/+$/, "");
-
-/** Where the agents are published. */
-export const AGENT_RELEASES_URL = "https://github.com/DosiBridge/Dosi-Tracker/releases/latest";
-
-/** In-app and public installation & onboarding guide URLs. */
-export const WINDOWS_GUIDE_URL = "/install/windows";
-export const MACOS_GUIDE_URL = "/install/macos";
-export const LINUX_GUIDE_URL = "/install/linux";
-export const ALL_GUIDES_URL = "/install";
+/**
+ * The address agents sign in to: the API this web app uses, as this
+ * deployment configures it at runtime (lib/runtime-config). Null when the
+ * deployment names none: agents can't guess it, so nothing is made up.
+ */
+export function agentServerUrl(): string | null {
+  return runtimeConfig().apiBaseUrl;
+}
 
 /** The visitor's desktop OS, for recommending an agent; "unknown" before hydration. */
 export type VisitorOs = "windows" | "macos" | "linux" | "other" | "unknown";
@@ -126,9 +125,21 @@ export function CopyButton({
   );
 }
 
-/** One labelled value with its own copy button, inside a SignInDetails list. */
-function DetailRow({ label, value, mono = true }: { label: React.ReactNode; value: string; mono?: boolean }) {
+/** One labelled value with its own copy button, inside a SignInDetails list (no value: a note, nothing to copy). */
+function DetailRow({ label, value, missing, mono = true }: { label: React.ReactNode; value: string | null; missing?: string; mono?: boolean }) {
   const labelId = useId();
+  if (value === null) {
+    return (
+      <div data-copy-row className="flex flex-wrap items-center gap-x-3 gap-y-1.5 py-2.5 first:pt-0 last:pb-0">
+        <dt id={labelId} className="w-full text-xs font-medium text-muted-foreground sm:w-36 sm:shrink-0">
+          {label}
+        </dt>
+        <dd data-copy-value className="min-w-0 flex-1 text-sm text-warning-on-tint">
+          {missing}
+        </dd>
+      </div>
+    );
+  }
   return (
     <div data-copy-row className="flex flex-wrap items-center gap-x-3 gap-y-1.5 py-2.5 first:pt-0 last:pb-0">
       <dt id={labelId} className="w-full text-xs font-medium text-muted-foreground sm:w-36 sm:shrink-0">
@@ -195,7 +206,11 @@ export function SignInDetails({
         <CopyButton value={allText} labelledBy={headingId} />
       </div>
       <dl ref={listRef} className="divide-y divide-border/70">
-        <DetailRow label="Server address" value={AGENT_SERVER_URL} />
+        <DetailRow
+          label="Server address"
+          value={agentServerUrl()}
+          missing="Not set up yet. Ask whoever runs this site to configure its API address."
+        />
         {email ? <DetailRow label="Email" value={email} mono={false} /> : null}
         {secret ? <DetailRow label={secret.label} value={secret.value} /> : null}
         {agentLink && origin ? <DetailRow label="Desktop agent" value={`${origin}/download`} mono={false} /> : null}

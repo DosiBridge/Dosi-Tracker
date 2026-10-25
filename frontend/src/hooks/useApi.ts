@@ -12,7 +12,8 @@ import {
   removeStorage,
   writeStorage,
 } from '@/lib/live-session';
-import { API_BASE_URL, WEB_SIGN_IN_CLIENT, tokenEndpoint, type WorkspaceMembership } from '@/lib/sign-in';
+import { WEB_SIGN_IN_CLIENT, tokenEndpoint, type WorkspaceMembership } from '@/lib/sign-in';
+import { apiUrl } from '@/lib/runtime-config';
 import {
   API_ROUTES,
   TEAM_ROUTES,
@@ -80,8 +81,11 @@ import {
 export { isLiveSession };
 
 // The storage keys, the API host and the sign-in client come from one place
-// each (lib/live-session, lib/sign-in): SessionProvider watches the same keys,
-// and the change-at-sign-in exchange talks to the same token endpoint.
+// each (lib/live-session, lib/runtime-config, lib/sign-in): SessionProvider
+// watches the same keys, and the change-at-sign-in exchange talks to the same
+// token endpoint. The API host is the deployment's runtime configuration: when
+// it names none, every call throws ApiNotConfiguredError (never a silent
+// localhost).
 
 /**
  * The request never reached the server (offline, DNS, TLS, server down) — as
@@ -253,7 +257,7 @@ const exchangeRefreshToken = async (): Promise<boolean> => {
       body: params.toString(),
     });
   } catch {
-    return false; // Unreachable: nothing renewed; the request that asked fails on its own terms.
+    return false; // Unreachable (or no API configured): nothing renewed; the request that asked fails on its own terms.
   }
   if (!res.ok) {
     // Refused (expired, revoked or already used): it will never renew anything again.
@@ -334,7 +338,7 @@ const send = async (
     await refreshAccessToken();
   }
   const attempt = (token: string | null) =>
-    fetch(`${API_BASE_URL}${endpoint}`, {
+    fetch(apiUrl(endpoint), {
       method: init.method,
       body: init.body,
       signal: init.signal,
@@ -580,9 +584,10 @@ export const loginApi = async (username: string, password: string): Promise<stri
   params.append('password', password);
   params.append('client_id', WEB_SIGN_IN_CLIENT.clientId);
   params.append('scope', WEB_SIGN_IN_CLIENT.scope);
+  const url = tokenEndpoint(); // throws ApiNotConfiguredError: a setup problem, not "can't reach"
   let res: Response;
   try {
-    res = await fetch(tokenEndpoint(), {
+    res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: params.toString(),
@@ -655,9 +660,10 @@ export const restoreWorkspaceApi = async (workspaceId: string): Promise<void> =>
 
 /** Anonymous JSON call: never a token, never a workspace. */
 const anonymous = async <T,>(endpoint: string, init: { method?: string; body?: unknown } = {}): Promise<T> => {
+  const url = apiUrl(endpoint); // throws ApiNotConfiguredError: a setup problem, not "can't reach"
   let res: Response;
   try {
-    res = await fetch(`${API_BASE_URL}${endpoint}`, {
+    res = await fetch(url, {
       method: init.method ?? 'GET',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'omit',

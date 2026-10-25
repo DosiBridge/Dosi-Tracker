@@ -17,8 +17,14 @@ Feature: Connecting a desktop agent
 
   Scenario: Every permission says what it is for
     Given the Download page
-    Then the macOS steps name Screen Recording, Accessibility and Camera with what each is used for
+    Then the macOS steps name Screen Recording, Input Monitoring, Accessibility and Camera with what each is used for
     And the Windows steps name the installer and say no special permissions are needed
+
+  Scenario: Every platform downloads its released agent
+    Given the Download page
+    Then Windows downloads dosi-tracker-setup.exe and macOS downloads DosiTracker-macos.zip
+    And Linux offers dosi-tracker_amd64.deb, dosi-tracker.x86_64.rpm and dosi-tracker-linux-x86_64.tar.gz with the real commands
+    And every link, the SHA256SUMS checksums included, comes from the deployment's download location
 
   Scenario: Members can always find the agent
     Given a signed-in member

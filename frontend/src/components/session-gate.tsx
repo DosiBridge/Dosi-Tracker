@@ -241,7 +241,7 @@ function ReauthDialog({ expired, onDone }: { expired: boolean; onDone: () => voi
           </div>
           {failure && (
             <p id={errorId} role="alert" className="rounded-lg bg-danger/10 px-3 py-2 text-sm text-danger-on-tint">
-              {signInFailureMessage(failure, { workspace: reauthIdentity?.workspace })}
+              {signInFailureMessage(failure)}
             </p>
           )}
           <div className="flex flex-wrap justify-end gap-2 pt-1">

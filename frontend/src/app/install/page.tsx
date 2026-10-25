@@ -1,251 +1,145 @@
 import Link from "next/link";
-import {
-  Monitor,
-  Laptop,
-  Terminal,
-  ArrowRight,
-  ShieldCheck,
-  Info,
-  ExternalLink,
-} from "lucide-react";
+import { ArrowRight, Download, Info, Laptop, Monitor, ShieldCheck, Terminal } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
+import { Code, FactTable } from "@/components/install/install-parts";
+import { linkButtonClass } from "@/components/dashboard/link-button";
+import { AGENT_PLATFORMS, AGENT_PLATFORM_ORDER, releaseAssetUrl, type AgentPlatform } from "@/lib/agent-downloads";
+import { runtimeConfig } from "@/lib/runtime-config";
+import { cn } from "@/lib/utils";
 
 export const metadata = {
-  title: "Desktop Agent Installation & Platform Matrix | Dosi-Tracker",
+  title: "Desktop Agent Installation Guides | Dosi-Tracker",
   description:
-    "Cross-platform desktop agent installation guides, version support, packaging status, and truthful display-server capability matrix for Linux, macOS, and Windows.",
+    "Download and install the Dosi-Tracker desktop agent for Windows, macOS and Linux, and see what each platform lets it measure.",
 };
 
+const ICONS: Record<AgentPlatform, LucideIcon> = { windows: Monitor, macos: Laptop, linux: Terminal };
+
 export default function InstallOverviewPage() {
+  const { apiBaseUrl, downloadBaseUrl } = runtimeConfig();
+
   return (
     <div className="space-y-8">
-      {/* Hero Header */}
       <div>
-        <div className="flex items-center gap-2 mb-2">
-          <span className="text-xs font-semibold uppercase tracking-wider text-primary-strong">
-            Documentation &amp; Setup
-          </span>
-        </div>
-        <h1 className="font-display text-3xl sm:text-4xl font-bold tracking-tight text-foreground">
-          Desktop Agent Installation &amp; Capabilities
-        </h1>
-        <p className="mt-2 text-sm text-muted-foreground max-w-3xl leading-relaxed">
-          Source-backed installation guides, display server boundaries, and verified capability matrices for Dosi-Tracker desktop agents.
-          We strictly report verified capabilities from repository source code and explicitly disclose unreleased or unimplemented components.
+        <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-primary-strong">Documentation &amp; setup</p>
+        <h1 className="font-display text-3xl font-bold tracking-tight text-foreground sm:text-4xl">Desktop agent installation</h1>
+        <p className="mt-2 max-w-3xl text-sm leading-relaxed text-muted-foreground">
+          Time and activity are recorded by a small agent on each computer. Pick your platform to download it and follow its guide.
         </p>
       </div>
 
-      {/* Security Invariant Banner */}
       <Card variant="quiet" className="border-border/80 bg-card/60 p-4 sm:p-5">
         <div className="flex items-start gap-3">
-          <ShieldCheck className="h-5 w-5 text-success shrink-0 mt-0.5" aria-hidden="true" />
+          <ShieldCheck className="mt-0.5 h-5 w-5 shrink-0 text-success" aria-hidden="true" />
           <div className="space-y-1 text-xs text-muted-foreground">
-            <h2 className="font-semibold text-sm text-foreground">Observer-Only Security &amp; Privacy Policy</h2>
+            <h2 className="text-sm font-semibold text-foreground">Privacy by design</h2>
             <p>
-              Dosi-Tracker operates strictly under affirmative local consent. Agents never run as root/administrator, never install global keyloggers,
-              and never bypass platform display isolation. Where telemetry is unsupported by the operating system (e.g. Wayland background input),
-              metrics are reported honestly as unmeasured (<code className="font-mono text-foreground font-semibold">null</code>), never fabricated zeros.
+              Agents never run as root or administrator and never record what you type: keyboard and mouse activity are counts only. Each
+              workspace project decides what is captured, the agent can only capture less, and anything a platform can&apos;t measure is
+              reported as not measured (<Code>null</Code>), never as a fabricated zero.
             </p>
           </div>
         </div>
       </Card>
 
-      {/* Platform Cards */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-        {/* Linux Card */}
-        <Card className="flex flex-col border-border/80 hover:border-primary/50 transition-colors">
-          <CardHeader className="pb-3">
-            <div className="flex items-center justify-between gap-2">
-              <div className="flex items-center gap-2">
-                <Terminal className="h-5 w-5 text-primary-strong" aria-hidden="true" />
-                <CardTitle className="text-base font-semibold">Linux</CardTitle>
-              </div>
-              <Badge tone="warning" className="text-[10px]">Headless Foundation</Badge>
-            </div>
-            <p className="text-xs text-muted-foreground mt-1">Ubuntu 22.04+, Fedora 38+, Arch, Debian 12+</p>
-          </CardHeader>
-          <CardContent className="flex flex-1 flex-col justify-between gap-4 text-xs text-muted-foreground">
-            <div className="space-y-2.5">
-              <p>
-                First finite headless client foundation implemented in <code className="font-mono text-foreground font-semibold">clients/linux</code> (diagnostic command <code className="font-mono text-foreground">doctor [--json]</code>, consent core).
-                All native capture adapters report NOT_IMPLEMENTED; pre-built binaries and sync remain unreleased.
-              </p>
-              <ul className="space-y-1.5 list-disc pl-4 text-foreground/80">
-                <li><strong className="text-foreground">Source Status:</strong> Headless foundation crate in clients/linux</li>
-                <li><strong className="text-foreground">Packaging:</strong> Source foundation only; no pre-built binaries or installers</li>
-                <li><strong className="text-foreground">Wayland Policy:</strong> Portal ScreenCast dialog; input activity unsupported (null)</li>
-              </ul>
-            </div>
-            <Link
-              href="/install/linux"
-              className="mt-2 inline-flex items-center justify-center gap-1.5 w-full rounded-lg bg-primary/10 hover:bg-primary/20 text-primary-strong font-medium py-2 transition-colors text-xs"
-            >
-              Linux Foundation &amp; Specification <ArrowRight className="h-3.5 w-3.5" aria-hidden="true" />
-            </Link>
-          </CardContent>
-        </Card>
-
-        {/* macOS Card */}
-        <Card className="flex flex-col border-border/80 hover:border-primary/50 transition-colors">
-          <CardHeader className="pb-3">
-            <div className="flex items-center justify-between gap-2">
-              <div className="flex items-center gap-2">
-                <Laptop className="h-5 w-5 text-primary-strong" aria-hidden="true" />
-                <CardTitle className="text-base font-semibold">macOS</CardTitle>
-              </div>
-              <Badge tone="warning" className="text-[10px]">Source Build Only</Badge>
-            </div>
-            <p className="text-xs text-muted-foreground mt-1">macOS 14 Sonoma or macOS 15 Sequoia</p>
-          </CardHeader>
-          <CardContent className="flex flex-1 flex-col justify-between gap-4 text-xs text-muted-foreground">
-            <div className="space-y-2.5">
-              <p>
-                Native Swift/Cocoa menu-bar agent built against Apple ScreenCaptureKit. Pre-built notarized packages are unreleased;
-                compiled from source using Xcode 15+.
-              </p>
-              <ul className="space-y-1.5 list-disc pl-4 text-foreground/80">
-                <li><strong className="text-foreground">Architectures:</strong> Apple Silicon (arm64) and Intel (x86_64)</li>
-                <li><strong className="text-foreground">Signing:</strong> Ad-hoc build requires Gatekeeper &ldquo;Open Anyway&rdquo; grant</li>
-                <li><strong className="text-foreground">Permissions:</strong> Standard TCC Screen Recording, Input Monitoring &amp; Accessibility</li>
-              </ul>
-            </div>
-            <Link
-              href="/install/macos"
-              className="mt-2 inline-flex items-center justify-center gap-1.5 w-full rounded-lg bg-primary/10 hover:bg-primary/20 text-primary-strong font-medium py-2 transition-colors text-xs"
-            >
-              macOS Setup Guide <ArrowRight className="h-3.5 w-3.5" aria-hidden="true" />
-            </Link>
-          </CardContent>
-        </Card>
-
-        {/* Windows Card */}
-        <Card className="flex flex-col border-border/80 hover:border-primary/50 transition-colors">
-          <CardHeader className="pb-3">
-            <div className="flex items-center justify-between gap-2">
-              <div className="flex items-center gap-2">
-                <Monitor className="h-5 w-5 text-primary-strong" aria-hidden="true" />
-                <CardTitle className="text-base font-semibold">Windows</CardTitle>
-              </div>
-              <Badge tone="primary" className="text-[10px]">Source Crate &amp; NSIS Script</Badge>
-            </div>
-            <p className="text-xs text-muted-foreground mt-1">Windows 10 (1809+) or Windows 11</p>
-          </CardHeader>
-          <CardContent className="flex flex-1 flex-col justify-between gap-4 text-xs text-muted-foreground">
-            <div className="space-y-2.5">
-              <p>
-                High-performance Rust/Win32 tray agent. Source code and NSIS installer script are present in repo;
-                pre-built binaries are unreleased. Installs per-user without administrator privileges.
-              </p>
-              <ul className="space-y-1.5 list-disc pl-4 text-foreground/80">
-                <li><strong className="text-foreground">Architectures:</strong> x86_64 (64-bit)</li>
-                <li><strong className="text-foreground">Packaging:</strong> NSIS script <code className="font-mono text-[11px]">installer/dosi-tracker.nsi</code> in repo</li>
-                <li><strong className="text-foreground">Signing:</strong> Ad-hoc / unsigned; SmartScreen &ldquo;Run anyway&rdquo;</li>
-              </ul>
-            </div>
-            <Link
-              href="/install/windows"
-              className="mt-2 inline-flex items-center justify-center gap-1.5 w-full rounded-lg bg-primary/10 hover:bg-primary/20 text-primary-strong font-medium py-2 transition-colors text-xs"
-            >
-              Windows Setup Guide <ArrowRight className="h-3.5 w-3.5" aria-hidden="true" />
-            </Link>
-          </CardContent>
-        </Card>
+      <div className="grid grid-cols-1 gap-6 md:grid-cols-3">
+        {AGENT_PLATFORM_ORDER.map((platform) => {
+          const info = AGENT_PLATFORMS[platform];
+          const Icon = ICONS[platform];
+          const primary = info.assets[0];
+          const headingId = `install-${platform}-title`;
+          return (
+            <Card key={platform} role="region" aria-labelledby={headingId} className="flex flex-col border-border/80">
+              <CardHeader className="pb-3">
+                <CardTitle id={headingId} className="flex items-center gap-2 text-base font-semibold">
+                  <Icon className="h-5 w-5 text-primary-strong" aria-hidden="true" /> {info.name}
+                </CardTitle>
+                <p className="mt-1 text-xs text-muted-foreground">{info.requirement}</p>
+              </CardHeader>
+              <CardContent className="flex flex-1 flex-col justify-between gap-4 text-xs text-muted-foreground">
+                <ul className="list-disc space-y-1 pl-4">
+                  {info.assets.map((asset) => (
+                    <li key={asset.file}>
+                      <span className="font-medium text-foreground">{asset.label}</span> — {asset.note}
+                    </li>
+                  ))}
+                </ul>
+                <div className="flex flex-col gap-2">
+                  <a href={releaseAssetUrl(downloadBaseUrl, primary.file)} className={cn(linkButtonClass("primary", "md"), "w-full")}>
+                    <Download className="h-4 w-4" aria-hidden="true" /> Download for {info.name}
+                  </a>
+                  <Link
+                    href={info.guidePath}
+                    className="inline-flex w-full items-center justify-center gap-1.5 rounded-lg bg-primary/10 py-2 text-xs font-medium text-primary-strong transition-colors hover:bg-primary/20"
+                  >
+                    {info.name} setup guide <ArrowRight className="h-3.5 w-3.5" aria-hidden="true" />
+                  </Link>
+                </div>
+              </CardContent>
+            </Card>
+          );
+        })}
       </div>
 
-      {/* Comparison & Evidence Matrix */}
-      <div className="space-y-4">
+      <section aria-labelledby="capabilities-title" className="space-y-4">
         <div>
-          <h2 className="font-display text-lg font-bold text-foreground">
-            Truthful Platform Capabilities &amp; Evidence Matrix
+          <h2 id="capabilities-title" className="font-display text-lg font-bold text-foreground">
+            What each platform can measure
           </h2>
-          <p className="text-xs text-muted-foreground mt-1">
-            This table reflects the actual codebase capabilities, storage mechanisms, and release boundaries verified in the repository.
-          </p>
+          <p className="mt-1 text-xs text-muted-foreground">Always subject to what the project records and what the person consents to.</p>
         </div>
+        <FactTable
+          caption="Agent capabilities by platform"
+          headers={["Platform", "Activity and apps", "Screenshots and sign-in storage"]}
+          rows={[
+            [
+              "Windows 10 and 11",
+              "Key press and click counts, activity %, active window and apps, running programs",
+              "Screenshots of the monitor you work on; sign-in encrypted with DPAPI",
+            ],
+            [
+              "macOS 14+",
+              "Counts with Input Monitoring, window titles with Accessibility, running apps",
+              "Screenshots with Screen Recording; sign-in in the login Keychain",
+            ],
+            [
+              "Linux on X11",
+              "Key press and click counts, activity %, active window and apps, running programs",
+              "Screenshots of the active monitor; sign-in in the desktop keyring",
+            ],
+            [
+              "Linux on Wayland",
+              "Time, idle and running programs; counts and window titles not measured (null)",
+              "Screenshots through the desktop's screenshot permission; sign-in in the desktop keyring",
+            ],
+          ]}
+        />
+        <p className="text-xs text-muted-foreground">No agent needs root or administrator rights to run.</p>
+      </section>
 
-        <div className="overflow-x-auto rounded-xl border border-border/80 bg-card">
-          <table className="w-full text-left text-xs">
-            <thead className="bg-muted/50 border-b border-border/80 text-foreground font-semibold">
-              <tr>
-                <th className="p-3">Platform</th>
-                <th className="p-3">Target Versions</th>
-                <th className="p-3">Packaging &amp; Artifact Status</th>
-                <th className="p-3">Screen Capture</th>
-                <th className="p-3">Input Activity</th>
-                <th className="p-3">Active Window Title</th>
-                <th className="p-3">Credential Vault</th>
-                <th className="p-3">Admin / Root</th>
-                <th className="p-3">Verification Status</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-border/60 text-muted-foreground">
-              <tr className="hover:bg-muted/20">
-                <td className="p-3 font-medium text-foreground">Linux (X11)</td>
-                <td className="p-3">Ubuntu 22+, Fedora 38+, Arch</td>
-                <td className="p-3"><Badge tone="warning" className="text-[10px]">Source Foundation (clients/linux)</Badge></td>
-                <td className="p-3">Planned: XShmGetImage / xcap</td>
-                <td className="p-3">Planned: XInput2 raw ticks</td>
-                <td className="p-3">Planned: _NET_ACTIVE_WINDOW</td>
-                <td className="p-3">Planned: Secret Service D-Bus</td>
-                <td className="p-3 font-medium text-success">No (Strictly Unprivileged)</td>
-                <td className="p-3 font-medium text-amber-600 dark:text-amber-400">FOUNDATION ONLY (Sensor-Free Crate; 101 Tests Passed on Host; Native Runtime Unverified)</td>
-              </tr>
-              <tr className="hover:bg-muted/20">
-                <td className="p-3 font-medium text-foreground">Linux (Wayland)</td>
-                <td className="p-3">GNOME 42+, KDE Plasma 5.27+</td>
-                <td className="p-3"><Badge tone="warning" className="text-[10px]">Source Foundation (clients/linux)</Badge></td>
-                <td className="p-3">Planned: Portal ScreenCast Dialog</td>
-                <td className="p-3 font-medium text-amber-600 dark:text-amber-400">UNSUPPORTED (Reported as null)</td>
-                <td className="p-3 font-medium text-amber-600 dark:text-amber-400">UNSUPPORTED (Reported as null)</td>
-                <td className="p-3">Planned: Secret Service D-Bus</td>
-                <td className="p-3 font-medium text-success">No (Strictly Prohibited)</td>
-                <td className="p-3 font-medium text-amber-600 dark:text-amber-400">FOUNDATION ONLY (Sensor-Free Crate; 101 Tests Passed on Host; Native Runtime Unverified)</td>
-              </tr>
-              <tr className="hover:bg-muted/20">
-                <td className="p-3 font-medium text-foreground">macOS (arm64 &amp; Intel)</td>
-                <td className="p-3">macOS 14 Sonoma, macOS 15 Sequoia</td>
-                <td className="p-3"><Badge tone="warning" className="text-[10px]">Source Only (clients/macos)</Badge></td>
-                <td className="p-3">Supported (ScreenCaptureKit)</td>
-                <td className="p-3">Supported (Input Monitoring counter)</td>
-                <td className="p-3">Supported (Accessibility API)</td>
-                <td className="p-3">macOS Login Keychain</td>
-                <td className="p-3 font-medium text-success">No (Standard User)</td>
-                <td className="p-3 font-medium text-amber-600 dark:text-amber-400">UNVERIFIED ON HOST (Host lacks macOS/Xcode)</td>
-              </tr>
-              <tr className="hover:bg-muted/20">
-                <td className="p-3 font-medium text-foreground">Windows Desktop</td>
-                <td className="p-3">Windows 10 (1809+) &amp; 11 (x86_64)</td>
-                <td className="p-3"><Badge tone="primary" className="text-[10px]">Source Crate &amp; NSIS Script</Badge></td>
-                <td className="p-3">Supported (xcap / Win32 GDI)</td>
-                <td className="p-3">Supported (Low-level hooks / FakeDriver)</td>
-                <td className="p-3">Supported (GetForegroundWindow)</td>
-                <td className="p-3">Windows DPAPI (CryptProtectData)</td>
-                <td className="p-3 font-medium text-success">No (Per-User Install)</td>
-                <td className="p-3 font-medium text-success">COMPILATION ONLY (cargo check exit 0; OS hooks unverified)</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      {/* Onboarding & Connection Guidance */}
-      <Card variant="quiet" className="p-4 sm:p-5 border border-border/80">
+      <Card variant="quiet" className="border border-border/80 p-4 sm:p-5">
         <div className="flex items-start gap-3">
-          <Info className="h-5 w-5 text-primary-strong shrink-0 mt-0.5" aria-hidden="true" />
+          <Info className="mt-0.5 h-5 w-5 shrink-0 text-primary-strong" aria-hidden="true" />
           <div className="space-y-2 text-xs text-muted-foreground">
-            <h3 className="font-semibold text-sm text-foreground">First-Run Server Configuration</h3>
+            <h2 className="text-sm font-semibold text-foreground">Signing in to an agent</h2>
             <p>
-              Desktop agents require three credentials to establish synchronization: the <strong className="text-foreground">API Server URL</strong> (e.g.{" "}
-              <code className="font-mono bg-muted px-1.5 py-0.5 rounded text-foreground">https://tracker-api.example.com</code>), your{" "}
-              <strong className="text-foreground">Workspace Name</strong>, and your <strong className="text-foreground">Email and Password</strong>.
+              Agents ask for the <strong className="text-foreground">server address</strong>
+              {apiBaseUrl ? (
+                <>
+                  {" "}
+                  (for this site: <Code>{apiBaseUrl}</Code>)
+                </>
+              ) : null}
+              , then your <strong className="text-foreground">email and password</strong> — the same ones you use on the web. If you belong
+              to several workspaces, the agent lets you pick one after signing in.
             </p>
             <p>
-              If you are already signed in to your workspace, navigate to the{" "}
-              <Link href="/download" className="text-primary-strong font-medium hover:underline inline-flex items-center gap-1">
-                Dashboard Download Page <ExternalLink className="h-3 w-3" aria-hidden="true" />
-              </Link>{" "}
-              to copy your server address and view personalized onboarding credentials.
+              Signed-in members find everything to copy on the dashboard&apos;s{" "}
+              <Link href="/download" className="font-medium text-primary-strong hover:underline">
+                Download page
+              </Link>
+              .
             </p>
           </div>
         </div>

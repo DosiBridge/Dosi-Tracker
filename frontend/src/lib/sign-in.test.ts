@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
+import { DEV_API_BASE_URL } from "./runtime-config";
 import {
-  API_BASE_URL,
   isWorkspaceOwner,
   pickWorkspace,
   workspaceInitial,
@@ -27,7 +27,8 @@ const invalid = (status: number, error: string | null, errorDescription: string 
 describe("classifySignInError — every way a sign-in fails, told apart", () => {
   it.each<[string, Error, SignInFailure]>([
     ["wrong email or password", invalid(400, "invalid_grant", "Invalid username or password!"), { kind: "invalid", status: 400 }],
-    ["no workspace by that name (ABP tenant resolution: 404)", invalid(404, null, null), { kind: "unknown-workspace", status: 404 }],
+    ["the token endpoint isn't there: the API address is wrong (404)", invalid(404, null, null), { kind: "misconfigured", status: 404 }],
+    ["no API address configured", thrown("ApiNotConfiguredError"), { kind: "misconfigured" }],
     ["locked after failed attempts", invalid(400, "account_locked", "The user account has been locked out…"), { kind: "locked", status: 400 }],
     ["deactivated", invalid(400, "account_inactive", "You are not allowed to login!"), { kind: "inactive", status: 400 }],
     ["one-time password must be changed", invalid(400, "invalid_grant", "ShouldChangePasswordOnNextLogin"), { kind: "change-required", status: 400 }],
@@ -58,14 +59,15 @@ describe("classifySignInError — every way a sign-in fails, told apart", () => 
 describe("signInFailureMessage", () => {
   it("blames the credentials only when the server rejected them", () => {
     expect(signInFailureMessage({ kind: "invalid" })).toBe("That email or password didn't match. Check them and try again.");
-    for (const kind of ["rate-limited", "unreachable", "server", "locked", "unknown-workspace", "storage"] as const) {
+    for (const kind of ["rate-limited", "unreachable", "server", "locked", "misconfigured", "storage"] as const) {
       expect(signInFailureMessage({ kind }), kind).not.toMatch(/didn't match/);
     }
   });
 
-  it("names the workspace that wasn't found", () => {
-    expect(signInFailureMessage({ kind: "unknown-workspace" }, { workspace: "acme" })).toMatch(/workspace named “acme”/);
-    expect(signInFailureMessage({ kind: "unknown-workspace" })).toMatch(/couldn't find that workspace/);
+  it("sends a misconfigured server address to whoever runs the site, never to the password", () => {
+    expect(signInFailureMessage({ kind: "misconfigured", status: 404 })).toMatch(/server address doesn't lead to a Dosi-Tracker server \(HTTP 404\)/);
+    expect(signInFailureMessage({ kind: "misconfigured" })).toMatch(/isn't connected to a Dosi-Tracker server yet/);
+    expect(signInFailureMessage({ kind: "misconfigured" })).not.toMatch(/workspace/);
   });
 
   it("says how long to wait out a rate limit, and that nothing is wrong with the details", () => {
@@ -105,14 +107,16 @@ describe("small helpers", () => {
   });
 
   it("failureField points at the field to fix", () => {
-    expect(failureField({ kind: "unknown-workspace" })).toBe("workspace");
+    expect(failureField({ kind: "misconfigured" })).toBeNull();
     expect(failureField({ kind: "invalid" })).toBe("credentials");
     expect(failureField({ kind: "locked" })).toBeNull();
   });
 
   it("tokenEndpoint names no workspace (accounts are global)", () => {
     expect(tokenEndpoint("https://api.test")).toBe("https://api.test/connect/token");
-    expect(tokenEndpoint()).toBe(`${API_BASE_URL}/connect/token`);
+    expect(tokenEndpoint("https://api.test//")).toBe("https://api.test/connect/token");
+    // This deployment's API (outside production with nothing configured: the dev backend).
+    expect(tokenEndpoint()).toBe(`${DEV_API_BASE_URL}/connect/token`);
   });
 });
 

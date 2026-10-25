@@ -1,8 +1,26 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { axe } from "jest-axe";
-import { AGENT_SERVER_URL, SignInDetails, visitorOs } from "./agent-setup";
+import { SignInDetails, agentServerUrl, visitorOs } from "./agent-setup";
+import { DEV_API_BASE_URL, RUNTIME_CONFIG_ELEMENT_ID, resetRuntimeConfigCache } from "@/lib/runtime-config";
+
+/** What the root layout renders: this deployment's runtime configuration. */
+function serveConfig(apiBaseUrl: string | null) {
+  const el = document.createElement("script");
+  el.type = "application/json";
+  el.id = RUNTIME_CONFIG_ELEMENT_ID;
+  el.textContent = JSON.stringify({ apiBaseUrl, downloadBaseUrl: "https://dl.example.com", demoMode: true, problems: [] });
+  document.head.appendChild(el);
+  resetRuntimeConfigCache();
+}
+
+afterEach(() => {
+  document.getElementById(RUNTIME_CONFIG_ELEMENT_ID)?.remove();
+  resetRuntimeConfigCache();
+});
+
+const AGENT_SERVER_URL = DEV_API_BASE_URL;
 
 describe("visitorOs", () => {
   it("recognises Windows, macOS and Linux desktops", () => {
@@ -62,7 +80,21 @@ describe("SignInDetails", () => {
   });
 
   it("the server address carries no trailing slash", () => {
-    expect(AGENT_SERVER_URL.endsWith("/")).toBe(false);
+    expect(agentServerUrl()?.endsWith("/")).toBe(false);
+  });
+
+  it("shows the address this deployment serves at runtime, not a build-time default", () => {
+    serveConfig("https://tracker-api.example.com");
+    render(<SignInDetails agentLink={false} />);
+    expect(screen.getByText("https://tracker-api.example.com")).toBeInTheDocument();
+  });
+
+  it("says the address isn't set up (and offers nothing to copy) when the deployment names none", () => {
+    serveConfig(null);
+    render(<SignInDetails agentLink={false} />);
+    expect(screen.getByText(/Not set up yet/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /copy server address/i })).not.toBeInTheDocument();
+    expect(screen.queryByText(DEV_API_BASE_URL)).not.toBeInTheDocument();
   });
 
   it("a11y: the details list has no axe violations", async () => {

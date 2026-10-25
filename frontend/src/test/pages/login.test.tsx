@@ -633,4 +633,20 @@ describe("login page — which workspace opens after sign-in", () => {
       window.history.pushState({}, "", "/");
     }
   });
+
+  it.each([
+    ["a backslash", "%2F%5Cevil.example"],
+    ["a tab", "%2F%09%2Fevil.example"],
+    ["a double-encoded slash", "%2F%252F%252Fevil.example"],
+  ])("?next= disguised with %s never sends a fresh sign-in off-site", async (_label, next) => {
+    window.history.pushState({}, "", `/login?next=${next}`);
+    try {
+      stubBackend("tok-x");
+      await signIn();
+      await waitFor(() => expect(__router.push).toHaveBeenCalledWith("/dashboard"), { timeout: 2000 });
+      for (const [target] of __router.push.mock.calls) expect(String(target)).not.toMatch(/evil/);
+    } finally {
+      window.history.pushState({}, "", "/");
+    }
+  });
 });

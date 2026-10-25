@@ -8,7 +8,8 @@ import { Input, Select } from "@/components/ui/input";
 import { ThemeToggle } from "@/components/ui/theme-toggle";
 import { LoginHero } from "@/components/motion/login-hero";
 import { ApiError, loginApi, registerWorkspaceApi } from "@/hooks/useApi";
-import { resolveLanding, safeNext } from "@/hooks/workspace-landing";
+import { resolveLanding } from "@/hooks/workspace-landing";
+import { safeRedirectPath } from "@/lib/safe-redirect";
 import { useSession } from "@/components/session-provider";
 import { landingFor } from "@/lib/roles";
 import { SUPPORT_EMAIL } from "@/lib/brand";
@@ -86,7 +87,7 @@ export default function LoginPage() {
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const id = window.setTimeout(() => {
-      setNext(safeNext(params.get("next")));
+      setNext(safeRedirectPath(params.get("next")));
       const invite = params.get("invite");
       if (invite) setInviteToken(invite);
       const prefill = params.get("email");
