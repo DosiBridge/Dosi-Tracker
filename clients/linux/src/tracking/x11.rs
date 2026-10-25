@@ -11,12 +11,15 @@
 //!   deterministic wire-level and property-level synthetic testing without a live display.
 //! - Lazy connection/query acquisition: construction and `doctor` NEVER open displays or query windows.
 //! - Graceful handling when no window is active (`_NET_ACTIVE_WINDOW = 0`), focused on root, or disconnected.
+//! - Explicit display injection (`with_display`): nothing here reads `DISPLAY` from the
+//!   process environment; the session probe hands the display in.
+//! - `_NET_CLIENT_LIST` window owners (`client_list_pids`) for the X11 running-programs filter.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use super::model::{file_name, WindowInfo};
-use super::procfs::ProcFsReader;
+use super::procfs::{PidSource, ProcFsReader};
 use super::traits::{ActiveWindowProvider, TrackingError};
 
 /// Maximum bytes read for a window title property.
@@ -24,6 +27,28 @@ pub const MAX_WINDOW_TITLE_BYTES: usize = 512;
 
 /// Maximum bytes read for a window class property.
 pub const MAX_WM_CLASS_BYTES: usize = 256;
+
+/// Maximum number of managed windows read from `_NET_CLIENT_LIST`.
+pub const MAX_CLIENT_LIST_WINDOWS: usize = 4096;
+
+/// Open a pure-Rust X11 connection to an explicit display string (`:99`,
+/// `localhost:10.0`). Returns the connection and its default screen index.
+/// The display always comes from the caller, never from the environment.
+pub fn connect_display(
+    display: &str,
+) -> Result<(x11rb::rust_connection::RustConnection, usize), TrackingError> {
+    if display.trim().is_empty() {
+        return Err(TrackingError::DisplayUnavailable(
+            "no X11 display was given".into(),
+        ));
+    }
+    x11rb::connect(Some(display)).map_err(|e| {
+        TrackingError::DisplayUnavailable(format!(
+            "Failed to connect to X11 display '{}': {}",
+            display, e
+        ))
+    })
+}
 
 /// Raw property reply returned from X11 server protocol query.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -231,6 +256,22 @@ pub fn decode_wm_class(
     }
 }
 
+/// Decode a 32-bit list of window ids (`_NET_CLIENT_LIST`), dropping `None`
+/// (0) entries and anything beyond [`MAX_CLIENT_LIST_WINDOWS`].
+pub fn decode_window_list(reply: &RawPropertyReply) -> Vec<u64> {
+    if reply.format != 32 {
+        return Vec::new();
+    }
+    reply
+        .value
+        .chunks_exact(4)
+        .map(|chunk| u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .filter(|&xid| xid != 0)
+        .take(MAX_CLIENT_LIST_WINDOWS)
+        .map(u64::from)
+        .collect()
+}
+
 /// Decode raw `_NET_WM_PID` 32-bit integer property into a process ID.
 pub fn decode_wm_pid(reply: &RawPropertyReply) -> Result<Option<u32>, TrackingError> {
     if reply.format != 32 || reply.value.len() < 4 {
@@ -357,10 +398,14 @@ impl X11PropertyTransport for SyntheticX11Transport {
 
 /// Real system X11 property transport using `x11rb`.
 ///
-/// Connects lazily to the X11 server upon the first property request.
-/// Construction (`SysX11Transport::new()`) never opens displays or performs I/O.
+/// Connects lazily to the X11 server upon the first property request, to the
+/// display given to [`SysX11Transport::with_display`]. Construction never
+/// opens displays or performs I/O, and the environment is never read: a
+/// transport built with [`SysX11Transport::new`] has no display and every
+/// query fails with `DisplayUnavailable`.
 #[derive(Default)]
 pub struct SysX11Transport {
+    display: Option<String>,
     #[cfg(target_os = "linux")]
     active_connection: Mutex<Option<ActiveX11Session>>,
 }
@@ -372,34 +417,46 @@ struct ActiveX11Session {
     atom_cache: HashMap<String, u32>,
 }
 
-#[cfg(target_os = "linux")]
 impl SysX11Transport {
+    /// A transport without a display: every query fails with
+    /// `DisplayUnavailable`.
     pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A transport for the explicit X11 `display` (e.g. `:0`).
+    pub fn with_display(display: impl Into<String>) -> Self {
         Self {
+            display: Some(display.into()),
+            #[cfg(target_os = "linux")]
             active_connection: Mutex::new(None),
         }
     }
 
+    /// The display this transport connects to, if any.
+    pub fn display(&self) -> Option<&str> {
+        self.display.as_deref()
+    }
+
+    fn require_display(&self) -> Result<&str, TrackingError> {
+        self.display
+            .as_deref()
+            .ok_or_else(|| TrackingError::DisplayUnavailable("no X11 display was given".into()))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl SysX11Transport {
     fn get_or_connect(
         &self,
     ) -> Result<(std::sync::MutexGuard<'_, Option<ActiveX11Session>>, u32), TrackingError> {
-        let mut guard = self.active_connection.lock().unwrap();
+        let mut guard = self
+            .active_connection
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if guard.is_none() {
-            let display = std::env::var("DISPLAY").map_err(|_| {
-                TrackingError::DisplayUnavailable("DISPLAY environment variable not set".into())
-            })?;
-            if display.trim().is_empty() {
-                return Err(TrackingError::DisplayUnavailable(
-                    "DISPLAY environment variable is empty".into(),
-                ));
-            }
-
-            let (conn, screen_num) = x11rb::connect(Some(&display)).map_err(|e| {
-                TrackingError::DisplayUnavailable(format!(
-                    "Failed to connect to X11 display '{}': {}",
-                    display, e
-                ))
-            })?;
+            let display = self.require_display()?;
+            let (conn, screen_num) = connect_display(display)?;
 
             use x11rb::connection::Connection;
 
@@ -466,12 +523,23 @@ impl X11PropertyTransport for SysX11Transport {
                 ))
             })?;
 
-        let reply = cookie.reply().map_err(|e| {
-            TrackingError::ProtocolError(format!(
-                "Failed to receive GetProperty reply for {}: {}",
-                property_name, e
-            ))
-        })?;
+        let reply = match cookie.reply() {
+            Ok(reply) => reply,
+            Err(x11rb::errors::ReplyError::ConnectionError(e)) => {
+                // A lost connection is dropped so the next query reconnects.
+                *guard = None;
+                return Err(TrackingError::DisplayUnavailable(format!(
+                    "X11 connection lost while reading {}: {}",
+                    property_name, e
+                )));
+            }
+            Err(e) => {
+                return Err(TrackingError::ProtocolError(format!(
+                    "Failed to receive GetProperty reply for {}: {}",
+                    property_name, e
+                )))
+            }
+        };
 
         if reply.format == 0 || reply.type_ == u32::from(AtomEnum::NONE) {
             return Ok(None);
@@ -522,23 +590,9 @@ fn get_or_intern_atom(
 }
 
 #[cfg(not(target_os = "linux"))]
-impl SysX11Transport {
-    pub fn new() -> Self {
-        Self {}
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
 impl X11PropertyTransport for SysX11Transport {
     fn root_window(&self) -> Result<u32, TrackingError> {
-        let display = std::env::var("DISPLAY").map_err(|_| {
-            TrackingError::DisplayUnavailable("DISPLAY environment variable not set".into())
-        })?;
-        if display.trim().is_empty() {
-            return Err(TrackingError::DisplayUnavailable(
-                "DISPLAY environment variable is empty".into(),
-            ));
-        }
+        self.require_display()?;
         Err(TrackingError::DisplayUnavailable(
             "Native X11 display transport is only available on Linux".into(),
         ))
@@ -571,6 +625,10 @@ pub trait X11PropertyReader: Send + Sync {
 
     /// Query `_NET_WM_PID` on the specified window.
     fn get_window_pid(&self, window_id: u64) -> Result<Option<u32>, TrackingError>;
+
+    /// Query `_NET_CLIENT_LIST` on the root window: the managed top-level
+    /// windows (empty when no EWMH window manager runs).
+    fn get_client_list(&self) -> Result<Vec<u64>, TrackingError>;
 }
 
 /// Real system X11 property reader implementing `X11PropertyReader`.
@@ -588,10 +646,17 @@ impl Default for SysX11PropertyReader {
 }
 
 impl SysX11PropertyReader {
-    /// Construct default system reader backed by `SysX11Transport`.
+    /// A reader without a display (every query fails with `DisplayUnavailable`).
     pub fn new() -> Self {
         Self {
             transport: Box::new(SysX11Transport::new()),
+        }
+    }
+
+    /// A reader for the explicit X11 `display`; the environment is never read.
+    pub fn with_display(display: impl Into<String>) -> Self {
+        Self {
+            transport: Box::new(SysX11Transport::with_display(display)),
         }
     }
 
@@ -687,6 +752,17 @@ impl X11PropertyReader for SysX11PropertyReader {
             None => Ok(None),
         }
     }
+
+    fn get_client_list(&self) -> Result<Vec<u64>, TrackingError> {
+        let root = self.transport.root_window()?;
+        let raw = self.transport.get_raw_property(
+            root,
+            "_NET_CLIENT_LIST",
+            Some("WINDOW"),
+            (MAX_CLIENT_LIST_WINDOWS * 4) as u32,
+        )?;
+        Ok(raw.as_ref().map(decode_window_list).unwrap_or_default())
+    }
 }
 
 /// In-memory mock X11 property reader for high-level tests without a display server.
@@ -696,6 +772,7 @@ pub struct MockX11PropertyReader {
     titles: Mutex<HashMap<u64, String>>,
     classes: Mutex<HashMap<u64, (String, String)>>,
     pids: Mutex<HashMap<u64, u32>>,
+    client_list: Mutex<Vec<u64>>,
     error: Mutex<Option<TrackingError>>,
 }
 
@@ -706,8 +783,13 @@ impl MockX11PropertyReader {
             titles: Mutex::new(HashMap::new()),
             classes: Mutex::new(HashMap::new()),
             pids: Mutex::new(HashMap::new()),
+            client_list: Mutex::new(Vec::new()),
             error: Mutex::new(None),
         }
+    }
+
+    pub fn set_client_list(&self, windows: Vec<u64>) {
+        *self.client_list.lock().unwrap() = windows;
     }
 
     pub fn set_active_window(&self, window_id: Option<u64>) {
@@ -775,6 +857,13 @@ impl X11PropertyReader for MockX11PropertyReader {
         let pids = self.pids.lock().unwrap();
         Ok(pids.get(&window_id).copied())
     }
+
+    fn get_client_list(&self) -> Result<Vec<u64>, TrackingError> {
+        if let Some(ref err) = *self.error.lock().unwrap() {
+            return Err(err.clone());
+        }
+        Ok(self.client_list.lock().unwrap().clone())
+    }
 }
 
 /// X11 EWMH active window provider.
@@ -794,9 +883,33 @@ impl X11ActiveWindowProvider {
         }
     }
 
-    /// Construct provider backed by real `SysX11PropertyReader` and optional `/proc` reader.
-    pub fn default_system(proc_reader: Option<Arc<dyn ProcFsReader>>) -> Self {
-        Self::new(Arc::new(SysX11PropertyReader::new()), proc_reader)
+    /// Provider for the explicit X11 `display` with an optional `/proc` reader.
+    pub fn with_display(
+        display: impl Into<String>,
+        proc_reader: Option<Arc<dyn ProcFsReader>>,
+    ) -> Self {
+        Self::new(
+            Arc::new(SysX11PropertyReader::with_display(display)),
+            proc_reader,
+        )
+    }
+
+    /// The pids owning a managed window (`_NET_CLIENT_LIST` plus each
+    /// window's `_NET_WM_PID`), first-seen order, without duplicates. Windows
+    /// without a pid are skipped; a window destroyed mid-scan is ignored.
+    pub fn client_list_pids(&self) -> Result<Vec<u32>, TrackingError> {
+        let mut seen = std::collections::HashSet::new();
+        let mut pids = Vec::new();
+        for window in self.reader.get_client_list()? {
+            match self.reader.get_window_pid(window) {
+                Ok(Some(pid)) if seen.insert(pid) => pids.push(pid),
+                Ok(_) => {}
+                // BadWindow: the window vanished between the list and this query.
+                Err(TrackingError::ProtocolError(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(pids)
     }
 
     /// Resolve the executable/application name given a window's PID and WM_CLASS.
@@ -824,6 +937,13 @@ impl X11ActiveWindowProvider {
         }
 
         "Unknown".to_string()
+    }
+}
+
+/// The X11 running-programs allow-list: owners of managed windows.
+impl PidSource for X11ActiveWindowProvider {
+    fn pids(&self) -> Result<Vec<u32>, TrackingError> {
+        self.client_list_pids()
     }
 }
 
@@ -1276,5 +1396,79 @@ mod tests {
             SysX11PropertyReader::with_transport(Box::new(SharedTransport(transport.clone())));
         let title = reader.get_window_title(win as u64).unwrap();
         assert_eq!(title, Some("Café".to_string()));
+    }
+
+    #[test]
+    fn a_transport_without_an_explicit_display_never_falls_back_to_the_environment() {
+        // Whatever DISPLAY the test process has, a display-less transport
+        // refuses: the display only ever comes from the caller.
+        let transport = SysX11Transport::new();
+        assert_eq!(transport.display(), None);
+        assert!(matches!(
+            transport.root_window(),
+            Err(TrackingError::DisplayUnavailable(_))
+        ));
+        let reader = SysX11PropertyReader::new();
+        assert!(matches!(
+            reader.get_active_window(),
+            Err(TrackingError::DisplayUnavailable(_))
+        ));
+        assert_eq!(SysX11Transport::with_display(":42").display(), Some(":42"));
+        assert!(matches!(
+            connect_display("  "),
+            Err(TrackingError::DisplayUnavailable(_))
+        ));
+    }
+
+    #[test]
+    fn client_list_windows_are_decoded_without_none_entries() {
+        let mut bytes = Vec::new();
+        for xid in [0x0040_0001u32, 0, 0x0040_0002] {
+            bytes.extend_from_slice(&xid.to_ne_bytes());
+        }
+        bytes.extend_from_slice(&[1, 2]); // trailing garbage shorter than a window id
+        let reply = RawPropertyReply::new(32, 33, bytes);
+        assert_eq!(decode_window_list(&reply), vec![0x0040_0001, 0x0040_0002]);
+        assert!(decode_window_list(&RawPropertyReply::new_bytes(31, b"abcd")).is_empty());
+    }
+
+    #[test]
+    fn client_list_pids_are_the_owners_of_managed_windows_once_each() {
+        let transport = Box::new(SyntheticX11Transport::new());
+        let root = 0x0100;
+        transport.set_root_window(root);
+        let windows = [0x0040_0001u32, 0x0040_0002, 0x0040_0003, 0x0040_0004];
+        let mut list = Vec::new();
+        for w in windows {
+            list.extend_from_slice(&w.to_ne_bytes());
+        }
+        transport.set_property(
+            root,
+            "_NET_CLIENT_LIST",
+            RawPropertyReply::new(32, 33, list),
+        );
+        transport.set_property(windows[0], "_NET_WM_PID", RawPropertyReply::new_u32(6, 100));
+        transport.set_property(windows[1], "_NET_WM_PID", RawPropertyReply::new_u32(6, 200));
+        // Second window of pid 100: listed once.
+        transport.set_property(windows[2], "_NET_WM_PID", RawPropertyReply::new_u32(6, 100));
+        // windows[3] has no pid; and a vanished window answers BadWindow.
+        transport.set_property_error(
+            windows[3],
+            "_NET_WM_PID",
+            TrackingError::ProtocolError("BadWindow".into()),
+        );
+        let provider = X11ActiveWindowProvider::new(
+            Arc::new(SysX11PropertyReader::with_transport(transport)),
+            None,
+        );
+        assert_eq!(provider.client_list_pids().unwrap(), vec![100, 200]);
+        assert_eq!(PidSource::pids(&provider).unwrap(), vec![100, 200]);
+
+        // A lost display is an error, not an empty list.
+        let mock = Arc::new(MockX11PropertyReader::new());
+        mock.set_client_list(vec![1, 2]);
+        mock.set_error(Some(TrackingError::DisplayUnavailable("gone".into())));
+        let broken = X11ActiveWindowProvider::new(mock, None);
+        assert!(broken.client_list_pids().is_err());
     }
 }

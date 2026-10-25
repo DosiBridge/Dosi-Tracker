@@ -24,6 +24,29 @@ use dosi_tracker_linux::tracking::{
     WaylandActiveWindowProvider, WindowInfo, X11ActiveWindowProvider, X11PropertyReader,
     MAX_RUNNING_PROGRAMS,
 };
+use dosi_tracker_linux::tracking::{
+    procfs::{ProcessScope, ProgramFilter},
+    ProcFsReader,
+};
+
+/// The mock's own user, admitting every listed pid as a window owner.
+fn own_user_window_owners<R: ProcFsReader + 'static>(reader: &Arc<R>) -> ProcessScope {
+    let reader = reader.clone();
+    ProcessScope::new(
+        MockProcFsReader::OWN_UID,
+        0,
+        ProgramFilter::WindowOwners(Arc::new(move || reader.list_pids())),
+    )
+}
+
+/// `/proc/<pid>/status` of a fake proc root, owned by `uid`.
+fn write_status(dir: &std::path::Path, uid: u32) {
+    std::fs::write(
+        dir.join("status"),
+        format!("Name:\tx\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n"),
+    )
+    .unwrap();
+}
 
 fn create_test_lifecycle() -> Arc<Mutex<TrackerLifecycle>> {
     let consent_mgr = ConsentManager::new(LocalConsent::Absent, None);
@@ -451,7 +474,7 @@ fn test_procfs_parsing_aggregation_filtering_and_max_cap() {
     // 6. Empty name / whitespace entry (must be filtered out)
     mock.add_process(401, "   ", None, None);
 
-    let provider = ProcFsRunningAppsProvider::new(mock.clone());
+    let provider = ProcFsRunningAppsProvider::new(mock.clone(), own_user_window_owners(&mock));
     let procs = provider
         .running_programs()
         .expect("procfs scan must succeed");
@@ -488,7 +511,7 @@ fn test_procfs_error_resilience_and_vanished_pids() {
     mock.add_process(500, "", None, None);
     mock.add_process(501, "valid_app", None, Some("/usr/bin/valid_app".into()));
 
-    let provider = ProcFsRunningAppsProvider::new(mock.clone());
+    let provider = ProcFsRunningAppsProvider::new(mock.clone(), own_user_window_owners(&mock));
     let procs = provider.running_programs().expect("must succeed");
     assert_eq!(procs.len(), 1);
     assert_eq!(procs[0].app_name, "valid_app");
@@ -1022,8 +1045,24 @@ fn test_procfs_fake_proc_root_provenance_preserves_bracketed_user_apps_and_exclu
     std::fs::create_dir(&p600).unwrap();
     std::fs::write(p600.join("comm"), "[unstat-task]\n").unwrap();
 
+    // Kernel threads belong to root; everything else to the agent's user.
+    for (pid, uid) in [
+        (2, 0),
+        (10, 0),
+        (100, 1000),
+        (200, 1000),
+        (400, 1000),
+        (500, 1000),
+        (600, 1000),
+    ] {
+        write_status(&root.join(pid.to_string()), uid);
+    }
+
     let sys_reader = Arc::new(SysProcFsReader::with_root(root));
-    let apps_provider = Arc::new(ProcFsRunningAppsProvider::new(sys_reader));
+    let apps_provider = Arc::new(ProcFsRunningAppsProvider::new(
+        sys_reader.clone(),
+        own_user_window_owners(&sys_reader),
+    ));
     let fake_window = Arc::new(FakeAcquisitionProvider::new());
     let lifecycle = create_test_lifecycle();
     let tracker = ConsentGatedTracker::new(fake_window, apps_provider, lifecycle.clone());
@@ -1065,4 +1104,65 @@ fn test_procfs_fake_proc_root_provenance_preserves_bracketed_user_apps_and_exclu
         assert!(p.keyboard_hits.is_none());
         assert!(p.mouse_clicks.is_none());
     }
+}
+
+#[test]
+fn test_procfs_running_programs_are_own_user_window_owners_through_the_gated_tracker() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    // 100: our editor (owns a window); 200: our shell (no window);
+    // 300: another user's app that owns a window on our display (e.g. via xhost).
+    for (pid, uid, comm, exe) in [
+        (100, 1000, "code", "/usr/share/code/code"),
+        (200, 1000, "bash", "/usr/bin/bash"),
+        (300, 1001, "gedit", "/usr/bin/gedit"),
+    ] {
+        let dir = root.join(pid.to_string());
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(
+            dir.join("stat"),
+            format!("{pid} ({comm}) S 1 {pid} {pid} 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0"),
+        )
+        .unwrap();
+        std::fs::write(dir.join("comm"), format!("{comm}\n")).unwrap();
+        std::fs::write(dir.join("cmdline"), format!("{exe}\0")).unwrap();
+        write_status(&dir, uid);
+    }
+
+    // The X11 window owners come from _NET_CLIENT_LIST through the X11 provider.
+    let x11 = Arc::new(MockX11PropertyReader::new());
+    x11.set_client_list(vec![0x10, 0x30]);
+    x11.set_window_info(0x10, "main.rs", "code", "Code", Some(100));
+    x11.set_window_info(0x30, "notes.txt", "gedit", "Gedit", Some(300));
+    let owners = Arc::new(X11ActiveWindowProvider::new(x11, None));
+    let scope = ProcessScope::new(1000, 4242, ProgramFilter::WindowOwners(owners));
+    let apps = Arc::new(ProcFsRunningAppsProvider::new(
+        Arc::new(SysProcFsReader::with_root(root)),
+        scope,
+    ));
+
+    let lifecycle = create_test_lifecycle();
+    let tracker = ConsentGatedTracker::new(
+        Arc::new(FakeAcquisitionProvider::new()),
+        apps,
+        lifecycle.clone(),
+    );
+    let policy = ConsentedPermissions {
+        running_programs: true,
+        ..ConsentedPermissions::all_disabled()
+    };
+    {
+        let mut lc = lifecycle.lock().unwrap();
+        lc.configure(policy);
+        lc.update_consent(LocalConsent::Granted(policy)).unwrap();
+        lc.start().unwrap();
+    }
+
+    let names: Vec<String> = tracker
+        .running_programs()
+        .expect("scan must succeed")
+        .into_iter()
+        .map(|p| p.app_name)
+        .collect();
+    assert_eq!(names, ["code"], "own user, window owners only");
 }

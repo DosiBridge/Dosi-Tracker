@@ -8,6 +8,12 @@
 //!   - Honest Wayland unsupported behavior (`WaylandActiveWindowProvider`).
 //!   - Consent-gated acquisition (`ConsentGatedTracker`) with ticket generation invalidation (ABA protection).
 //!   - Side-effect-free fake provider (`FakeAcquisitionProvider`) matching Windows test infrastructure.
+//! - Sensors (design section 7), reached through their module paths:
+//!   - `input` / `x11_input`: XI2 raw counts per second, XTEST counted as injected only.
+//!   - `usage`: foreground slices, per-app usage and the minute timeline (Windows port).
+//!   - `capture`, `x11_screen`, `portal_screen`: screen frames and the shared JPEG encoder.
+//!   - `x11_idle`, `dbus_idle`: idle sources for away detection (local only).
+//!   - `procfs`: running programs limited to the own user and to window owners / app scopes.
 
 pub mod build;
 pub mod capture;

@@ -4,7 +4,7 @@
 //! - Unprivileged Wayland protocol isolation invariant: window hierarchy and titles
 //!   are private to the compositor and cannot be queried by unprivileged clients.
 //! - Truthful reporting of `TrackingError::UnsupportedSession` without synthetic or fabricated telemetry.
-//! - Anti-keylogger / anti-surveillance invariant: never escalates to `root` or `evdev`.
+//! - Anti-keylogger / anti-surveillance invariant: never escalates to `root` or reads kernel input devices.
 
 use super::model::WindowInfo;
 use super::traits::{ActiveWindowProvider, TrackingError};

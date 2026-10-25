@@ -154,10 +154,11 @@ Stages: `fmt`, `clippy`, `test`, `harness` (ignored display/bus tests inside `ci
 | Capability | X11 Protocol | Wayland Compositor | Implementation Status |
 |---|---|---|---|
 | **Active Window** | Supported via `_NET_ACTIVE_WINDOW` & `WM_CLASS` | **UNSUPPORTED** (reported as `null` / unsupported) | **Delivered in Phase 2** (`X11ActiveWindowProvider`, `WaylandActiveWindowProvider`, root normalization, priority title fallback) |
-| **Running Applications** | Supported via `/proc` enumeration | Supported via `/proc` enumeration | **Delivered in Phase 2** (`ProcFsRunningAppsProvider`, 200 cap, deduplication, `PF_KTHREAD` filtering, bracketed user app preservation) |
-| **Screen Capture** | Supported via XShm / `xcap` | Supported via PipeWire / `xdg-desktop-portal` | Planned Phase 2 Backlog |
-| **Keyboard Counting** | Supported via XInput2 raw ticks | **UNSUPPORTED** (reported as `null`) | Planned Phase 2 Backlog (X11 only; Wayland isolated) |
-| **Mouse Counting** | Supported via XInput2 raw ticks | **UNSUPPORTED** (reported as `null`) | Planned Phase 2 Backlog (X11 only; Wayland isolated) |
+| **Running Applications** | Own-user `/proc` processes that own a `_NET_CLIENT_LIST` window | Own-user `/proc` processes in a systemd app scope (`app.slice/app-*.scope` / `app-*.service`) | **Sensor delivered** (`ProcFsRunningAppsProvider` with a mandatory `ProcessScope`: own euid only, never the agent itself, 200 cap, deduplication, `PF_KTHREAD` filtering); worker wiring pending |
+| **Screen Capture** | `GetImage` of the RandR monitor showing most of the active window (fallback: whole root), 24/32-bit visuals (`X11ScreenSource`) | `org.freedesktop.portal.Screenshot`, non-interactive; returned file deleted; refusal = Denied until an explicit retry; 30 s timeout = needs approval (`PortalScreenSource`) | **Sensor delivered**; shared encoder (`tracking::capture`: ≤1920 px JPEG ladder within 8 MB, 480 px thumbnail within 512 KB, unreadable blur); worker wiring pending |
+| **Keyboard Counting** | XInput 2.2 raw key presses on the root for master devices; keycodes never read; auto-repeat dropped; XTEST counted as injected only (`X11InputListener` → `InputLog`) | **UNSUPPORTED** (reported as `null`) | **Sensor delivered**; worker wiring pending |
+| **Mouse Counting** | XInput 2.2 raw buttons 1-3/8-9 as clicks; wheel and motion as activity only; XTEST counted as injected only | **UNSUPPORTED** (reported as `null`) | **Sensor delivered**; worker wiring pending |
+| **Idle Detection (local only)** | Last physical XI2 input, else MIT-SCREEN-SAVER (`X11ScreenSaverIdleSource`) | Mutter IdleMonitor, `org.freedesktop.ScreenSaver`, logind `IdleHint` (`probe_idle_sources`); none = manual mode | **Sensor delivered**; worker wiring pending |
 | **Webcam Photo** | Supported via V4L2 (`/dev/video*`) | Supported via V4L2 / PipeWire camera portal | Planned Phase 2 Backlog |
 | **Credential Storage** | Freedesktop Secret Service (D-Bus) | Freedesktop Secret Service (D-Bus) | **Delivered** (account-level items; opt-in owner-only 0600 file store without the password, with a doctor warning) |
 | **Backend Sync & Transport** | Real HTTP Delivery Transport | Real HTTP Delivery Transport | **Delivered in Phase 1** (Library transport `HttpDeliveryTransport::from_store` / `from_credentials` reusing persisted login credentials; background daemon loop is Phase 3, CLI queue flush command is Phase 4) |
@@ -193,11 +194,14 @@ Stages: `fmt`, `clippy`, `test`, `harness` (ignored display/bus tests inside `ci
     - Truthful, honest Wayland unsupported behavior (`WaylandActiveWindowProvider`) reporting architectural unprivileged limits (`TrackingError::UnsupportedSession`) without synthetic or fabricated telemetry.
     - Wired into capability architecture and `doctor` support reporting (`DiagnosticStatus::Supported` under X11/procfs; `DiagnosticStatus::Unsupported` under Wayland; `adapters.window_sampler` derived directly from `active_window.adapter_status`).
     - Deterministic test harness (`tracking_native_adapter_tests`): default deny, capability-specific consent, wrapper-level in-flight pause->resume and revoke->regrant ABA generation mismatch invalidation, unsupported sessions, parsing/aggregation, and error paths.
+  - **Sensors delivered (L3; not yet wired into the worker)**:
+    - XInput 2.2 counts-only listener with a 125-minute ring of per-second buckets (`InputLog`), the ported Windows activity %, minute timeline and per-app usage math (`tracking::input`, `tracking::usage`, 3 s `UsageSampler` with a synchronous stop).
+    - X11 `GetImage` and Wayland Screenshot-portal screen sources with the ported Windows JPEG/thumbnail/blur encoder.
+    - X11 MIT-SCREEN-SAVER and Wayland D-Bus idle sources; explicit display and bus injection everywhere (nothing reads `DISPLAY` or `DBUS_SESSION_BUS_ADDRESS`).
+    - Tests: crafted XI2 wire events, capture encoding, fake portal / idle services on private buses, and `tests/x11_xvfb_it.rs` against the harness Xvfb (`xdotool` input is counted as injected only).
   - **Remaining Phase 2 Backlog (OPEN)**:
-    - XInput2 counts-only interval activity.
-    - X11 screenshot policy/blur.
-    - Wayland visible portal ScreenCast/PipeWire user consent.
-    - Separate opt-in V4L2 webcam.
+    - Worker wiring of the sensors (blocks, consent-gated start/stop, capture moment).
+    - Separate opt-in V4L2 webcam (deferred to v1.1).
 - **Phase 3 (Worker, Presence, Session & Configuration - OPEN)**:
   - Interval capture worker with ABA generation tickets.
   - Decoupled background upload loop preventing UI or capture blocking.

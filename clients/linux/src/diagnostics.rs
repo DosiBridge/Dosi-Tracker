@@ -256,7 +256,7 @@ impl DoctorReport {
             SessionType::Wayland => CapabilityDiagnosis {
                 adapter_status: DiagnosticStatus::Unsupported,
                 architectural_support: ArchitecturalSupport::UnsupportedOnWayland,
-                architectural_notes: "Wayland protocol strictly isolates unprivileged input to focused surface. Anti-keylogger invariant prohibits root/evdev escalation."
+                architectural_notes: "Wayland protocol strictly isolates unprivileged input to focused surface. Anti-keylogger invariant prohibits root or kernel input-device access."
                     .to_string(),
                 adapter_notes: "Global keyboard counting is architecturally UNSUPPORTED on Wayland. Must report null."
                     .to_string(),
@@ -283,7 +283,7 @@ impl DoctorReport {
             SessionType::Wayland => CapabilityDiagnosis {
                 adapter_status: DiagnosticStatus::Unsupported,
                 architectural_support: ArchitecturalSupport::UnsupportedOnWayland,
-                architectural_notes: "Wayland protocol isolates unprivileged mouse pointer events. Anti-keylogger invariant prohibits root/evdev escalation."
+                architectural_notes: "Wayland protocol isolates unprivileged mouse pointer events. Anti-keylogger invariant prohibits root or kernel input-device access."
                     .to_string(),
                 adapter_notes: "Global mouse counting is architecturally UNSUPPORTED on Wayland. Must report null."
                     .to_string(),
