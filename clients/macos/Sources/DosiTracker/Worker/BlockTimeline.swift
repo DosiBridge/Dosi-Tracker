@@ -222,6 +222,34 @@ struct BlockTimeline: Sendable {
         stretch = current
     }
 
+    /// The open block under a changed consent, without ending it. What is
+    /// measured over the whole block (keyboard, mouse, the window in front)
+    /// can only narrow: input nobody measured earlier in the block must not
+    /// count as measured. What is taken at one moment (the screenshot, the
+    /// webcam photo, the running programs) follows `policy` both ways, since
+    /// it is taken after the change. Blur can only be added. Its timing stays.
+    mutating func adjustOpenBlock(to policy: BlockPolicy) {
+        guard var current = stretch else { return }
+        let open = current.block
+        current.block = OpenBlock(id: open.id, startedAt: open.startedAt,
+                                  policy: BlockTimeline.adjusted(open.policy, to: policy),
+                                  description: open.description, captureAt: open.captureAt, captured: open.captured)
+        stretch = current
+    }
+
+    /// `open` adjusted to `policy` as ``adjustOpenBlock(to:)`` does.
+    static func adjusted(_ open: BlockPolicy, to policy: BlockPolicy) -> BlockPolicy {
+        var adjusted = open
+        adjusted.permissions.keyboard = open.permissions.keyboard && policy.permissions.keyboard
+        adjusted.permissions.mouse = open.permissions.mouse && policy.permissions.mouse
+        adjusted.permissions.activeWindow = open.permissions.activeWindow && policy.permissions.activeWindow
+        adjusted.permissions.screenshot = policy.permissions.screenshot
+        adjusted.permissions.webcam = policy.permissions.webcam
+        adjusted.permissions.runningPrograms = policy.permissions.runningPrograms
+        adjusted.blurScreenshots = open.blurScreenshots || policy.blurScreenshots
+        return adjusted
+    }
+
     /// The open block whose screenshot moment has come, if it is due one.
     func captureDue(now: Date) -> Int? {
         guard let block = stretch?.block else { return nil }

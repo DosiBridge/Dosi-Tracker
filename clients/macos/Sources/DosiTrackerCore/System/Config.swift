@@ -27,7 +27,8 @@ public enum ServerURLError: Error, Equatable, Sendable {
 
 /// Runtime configuration of the agent, resolved in this order (later wins):
 ///
-/// 1. built-in defaults (a local development server),
+/// 1. built-in defaults (a local development server, which never counts as
+///    a configured one: see ``serverURLIsConfigured``),
 /// 2. the app bundle's Info.plist keys (what a release build ships with),
 /// 3. UserDefaults in the app's domain (`defaults write com.dosibridge.tracker
 ///    DosiApiBaseURL https://…`), which is also where MDM configuration
@@ -79,9 +80,18 @@ public struct Config: Equatable, Sendable {
     public var serverURLIsManaged: Bool
     /// The administrator allows an `http://` server that is not this Mac.
     public var allowInsecureHTTP: Bool
+    /// Some source named the server (the build, a profile, `config.json`, or
+    /// the address saved at sign-in). False while ``apiBaseURL`` is only the
+    /// built-in development default: a distributed build then asks for the
+    /// address instead of signing in to `localhost`.
+    public var serverURLIsConfigured: Bool
+    /// Some source named the web dashboard; false while ``dashboardURL`` is
+    /// only the built-in development default.
+    public var dashboardURLIsConfigured: Bool
 
     public init(apiBaseURL: URL, dashboardURL: URL, intervalMinutes: Int, capture: CapturePermissions,
-                blurScreenshots: Bool = false, serverURLIsManaged: Bool = false, allowInsecureHTTP: Bool = false) {
+                blurScreenshots: Bool = false, serverURLIsManaged: Bool = false, allowInsecureHTTP: Bool = false,
+                serverURLIsConfigured: Bool = false, dashboardURLIsConfigured: Bool = false) {
         self.apiBaseURL = apiBaseURL
         self.dashboardURL = dashboardURL
         self.intervalMinutes = intervalMinutes
@@ -89,15 +99,18 @@ public struct Config: Equatable, Sendable {
         self.blurScreenshots = blurScreenshots
         self.serverURLIsManaged = serverURLIsManaged
         self.allowInsecureHTTP = allowInsecureHTTP
+        self.serverURLIsConfigured = serverURLIsConfigured
+        self.dashboardURLIsConfigured = dashboardURLIsConfigured
     }
 
     /// `https://localhost:6006`, the backend's development address
-    /// (HttpApi.Host `App:SelfUrl`).
+    /// (HttpApi.Host `App:SelfUrl`). Never used without the user typing it:
+    /// a build with no configured server asks for the address.
     public static let defaultAPIBaseURL = URL(string: "https://localhost:6006")!
     /// `http://localhost:6005`, the web app's development address.
     public static let defaultDashboardURL = URL(string: "http://localhost:6005")!
 
-    /// The built-in defaults.
+    /// The built-in defaults (no server configured).
     public static let builtIn = Config(
         apiBaseURL: defaultAPIBaseURL,
         dashboardURL: defaultDashboardURL,
@@ -132,6 +145,7 @@ public struct Config: Equatable, Sendable {
             switch validateServerURL(saved, allowInsecureHTTP: config.allowInsecureHTTP) {
             case .success(let url):
                 config.apiBaseURL = url
+                config.serverURLIsConfigured = true
             case .failure(let error):
                 CoreLog.warning("config", "the saved server address is unusable (\(error.userMessage)); using the configured one")
             }
@@ -238,6 +252,7 @@ public struct Config: Equatable, Sendable {
         if let text = Config.string(value(Key.apiBaseURL)) {
             if let url = Config.normalizeServerURL(text, allowInsecureHTTP: allowInsecureHTTP) {
                 apiBaseURL = url
+                serverURLIsConfigured = true
             } else {
                 CoreLog.warning("config", "\(name): \(Key.apiBaseURL) is not a usable server address; ignored")
             }
@@ -247,6 +262,7 @@ public struct Config: Equatable, Sendable {
             // http(s) address will do.
             if let url = Config.normalizeServerURL(text, allowInsecureHTTP: true) {
                 dashboardURL = url
+                dashboardURLIsConfigured = true
             } else {
                 CoreLog.warning("config", "\(name): \(Key.dashboardURL) is not a usable address; ignored")
             }

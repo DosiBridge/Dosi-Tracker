@@ -169,9 +169,14 @@ final class AppModel: ObservableObject {
         } else if pendingAction == .resuming && !next.status.isPaused {
             pendingAction = nil
         }
-        if next.capture != old.capture {
-            requestMissingPermissions(for: next.capture)
+        // The system prompts follow what will be recorded (the project's
+        // policy AND the user's consent): never one for a capture the user
+        // did not switch on.
+        if next.effectiveCapture != old.effectiveCapture {
+            requestMissingPermissions(for: next.effectiveCapture)
         }
+        // Any signed-in state counts, waiting for consent included: the login
+        // item must not depend on the user granting consent first.
         if !old.status.isSignedIn && next.status.isSignedIn {
             startAtLoginOnFirstSignIn()
         }
@@ -194,6 +199,19 @@ final class AppModel: ObservableObject {
                 settingsError = "Could not save consent: \(error)"
             }
         }
+    }
+
+    /// The standard choice: keyboard and mouse counts, the app in front and
+    /// blurred screenshots; never the webcam or the running programs (each
+    /// is switched on on its own).
+    func grantStandardConsent() {
+        var standard = ConsentedPermissions.allDisabled
+        standard.keyboard = true
+        standard.mouse = true
+        standard.activeWindow = true
+        standard.screenshot = true
+        standard.blurScreenshots = true
+        updateConsent(permissions: standard)
     }
 
     func revokeConsent() {
@@ -337,9 +355,15 @@ final class AppModel: ObservableObject {
 
     // MARK: Links and folders
 
-    /// The web dashboard (`DosiDashboardURL`), in the browser.
+    /// The web dashboard (`DosiDashboardURL`), in the browser. A build that
+    /// names none never opens the development address.
     func openDashboard() {
-        let url = configSource.load(savedServerURL: preferences.savedServerURL).dashboardURL
+        let config = configSource.load(savedServerURL: preferences.savedServerURL)
+        guard config.dashboardURLIsConfigured else {
+            show("The web dashboard address is not set on this Mac. Ask your workspace admin for it.")
+            return
+        }
+        let url = config.dashboardURL
         if !NSWorkspace.shared.open(url) {
             show("Could not open \(url.absoluteString)")
         }
@@ -423,9 +447,18 @@ final class AppModel: ObservableObject {
 
     // MARK: Permissions
 
-    /// The permissions the current project needs but lacks.
+    /// The permissions what is recorded needs (the project's policy AND the
+    /// user's consent) but lacks.
     var missingPermissions: [PrivacyPermission] {
-        permissions.missing(for: snapshot.capture.permissions)
+        permissions.missing(for: snapshot.effectiveCapture.permissions)
+    }
+
+    /// Keyboard and mouse should be measured right now, but the event tap
+    /// cannot (no Input Monitoring, or it failed to start). Not while paused
+    /// or away, when the tap is stopped on purpose.
+    var inputCaptureBlocked: Bool {
+        snapshot.status == .tracking && snapshot.effectiveCapture.measuresInput
+            && (inputCapture == .waitingForPermission || inputCapture == .failed)
     }
 
     /// Fix a missing permission: the system prompt when it was never asked
@@ -452,7 +485,7 @@ final class AppModel: ObservableObject {
         refreshSystemState()
     }
 
-    /// Ask for what a newly known capture policy needs: each system prompt at
+    /// Ask for what newly recorded captures need: each system prompt at
     /// most once per launch (macOS itself shows each only once), Accessibility
     /// only once ever and only when Screen Recording cannot reveal window
     /// titles instead.
@@ -497,11 +530,11 @@ final class AppModel: ObservableObject {
     }
 
     /// The block in progress so far: counts, activity % and per-minute bars,
-    /// over the kinds of input the project records, on the same buckets as
+    /// over the kinds of input that are recorded, on the same buckets as
     /// the upload.
     func liveBlock(now: Date) -> LiveBlock? {
         guard snapshot.status == .tracking, let start = snapshot.blockStartedAt, now > start else { return nil }
-        let flags = snapshot.capture
+        let flags = snapshot.effectiveCapture
         let counts = input.counts(from: start, to: now)
         var percent: Int?
         var bars: [MinuteBar] = []

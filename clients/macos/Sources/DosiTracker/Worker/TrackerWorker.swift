@@ -143,6 +143,8 @@ actor TrackerWorker {
     static let noWorkspaceMessage =
         "You are not in any workspace yet. Create one on the web dashboard or ask for an invitation."
     static let oneWorkspaceMessage = "You are not in any other workspace."
+    static let serverNeededMessage =
+        "Enter your server address. Your workspace admin can give it to you (it is on the web dashboard's Download page)."
     /// The today / this-week totals are fetched again this often…
     static let totalsEvery: TimeInterval = 5 * 60
     /// …and after uploads, but not more often than this.
@@ -414,10 +416,16 @@ actor TrackerWorker {
         }
     }
 
+    /// The configured server as the window shows it; empty while none is
+    /// (the built-in development address is never offered).
+    private var configuredServerText: String {
+        config.serverURLIsConfigured ? config.apiBaseURL.absoluteString : ""
+    }
+
     private func resumeSignIn(_ savedSignIn: StoredSignIn?, now: Date) {
         shared.suggestedUsername = savedSignIn?.username ?? deps.preferences.lastUsername ?? ""
-        shared.suggestedServerURL = config.apiBaseURL.absoluteString
-        shared.serverURL = config.apiBaseURL.absoluteString
+        shared.suggestedServerURL = configuredServerText
+        shared.serverURL = configuredServerText
         guard let savedSignIn = savedSignIn else { return }
         guard savedSignIn.canResume else {
             // Nothing to resume with: the user signs in again (the email is
@@ -454,6 +462,7 @@ actor TrackerWorker {
                                 generation: generation)
         saved = savedSignIn
         shared.displayName = savedSignIn.username
+        shared.serverURL = config.apiBaseURL.absoluteString
         guard let workspaceId = savedSignIn.workspaceId, let owner = savedSignIn.ownerKey else {
             // Signed in, but no workspace is chosen yet: list them again.
             pending = PendingSignIn(client: client, username: savedSignIn.username, serverURL: config.apiBaseURL,
@@ -699,8 +708,9 @@ actor TrackerWorker {
         stopDriversNow()
         let now = deps.now()
         CoreLog.warning("worker", "access to the workspace was lost (\(loss.kind.rawValue)); tracking stops there")
+        // The server ended it: queued at once, nothing more is captured.
         let finished = blocks.end(at: now, now: now, reason: .signOut)
-        record(finished, speed: .normal)
+        record(finished, speed: .fast)
         let message = loss.userMessage(workspace: current.workspaceName)
         current.client.useWorkspace(nil)
         if var stored = saved {
@@ -730,6 +740,8 @@ actor TrackerWorker {
         stopDriversNow()
         let now = deps.now()
         CoreLog.warning("worker", "this device was revoked; tracking stops and the sign-in is forgotten")
+        // The server ended it: queued at once, nothing more is captured.
+        record(blocks.end(at: now, now: now, reason: .signOut), speed: .fast)
         do {
             try deps.credentials.clear()
         } catch {
@@ -814,7 +826,7 @@ actor TrackerWorker {
         if let current = session {
             if let listed = list.first(where: { $0.id.caseInsensitiveCompare(current.projectId) == .orderedSame }) {
                 let refreshed = TrackingSession(project: listed, config: config)
-                blocks.updatePolicy(BlockPolicy(session: refreshed))
+                blocks.updatePolicy(blockPolicy(for: refreshed))
                 session = refreshed
                 deps.setReadsWindowTitles(refreshed.permissions.activeWindow)
             } else {
@@ -890,6 +902,53 @@ actor TrackerWorker {
         return deps.consentManager.effectivePermissions(project: current.project.allowedCaptures)
     }
 
+    /// What a block of `session` is recorded under, fixed when it starts: the
+    /// session's policy (the project's, narrowed by the local configuration)
+    /// narrowed again to what the user consented to on this Mac now, blurred
+    /// when either asks for it (port of the Windows `session_for`). Input the
+    /// user did not consent to is therefore never "measured" — its counts and
+    /// activity are null, not a 0 that would read as idleness.
+    private func blockPolicy(for session: TrackingSession) -> BlockPolicy {
+        var policy = BlockPolicy(session: session)
+        let consented = deps.consentManager.current.permissions
+        policy.permissions = policy.permissions.intersection(consented.toCapturePermissions())
+        policy.blurScreenshots = policy.blurScreenshots || consented.blurScreenshots
+        return policy
+    }
+
+    /// What the user consents to on this Mac now, whether or not tracking is
+    /// running: a block ending by a pause, a quit or a sign-out may still take
+    /// its capture at the end (its own policy allowing), but never one the
+    /// user withdrew meanwhile.
+    private var consentedNow: ConsentedPermissions {
+        deps.consentManager.current.permissions
+    }
+
+    /// The consent changed: the next blocks are recorded under the new one,
+    /// and so is the rest of the open block. When what is measured over the
+    /// block (keyboard, mouse, the window in front) changed, a block a minute
+    /// old or more ends here (by `interval`) and the next starts under the
+    /// new consent; otherwise — or when the block is younger, and would be
+    /// dropped as too short — it is adjusted in place
+    /// (``BlockTimeline/adjustOpenBlock(to:)``: measured kinds only narrow).
+    private func applyConsentToOpenBlock(at moment: Date) {
+        guard let stretch = blocks.stretch, let current = session else { return }
+        let next = blockPolicy(for: current)
+        blocks.updatePolicy(next)
+        let open = stretch.block.policy
+        guard next != open else { return }
+        let now = deps.now()
+        let measuredChanged = next.permissions.keyboard != open.permissions.keyboard
+            || next.permissions.mouse != open.permissions.mouse
+            || next.permissions.activeWindow != open.permissions.activeWindow
+        if measuredChanged && min(moment, now).timeIntervalSince(stretch.block.startedAt) >= AgentTiming.minimumBlock {
+            let finished = blocks.cut(at: moment, now: now, reason: .interval, fraction: BlockTimeline.randomFraction())
+            record(finished, speed: .normal)
+        } else {
+            blocks.adjustOpenBlock(to: next)
+        }
+    }
+
     private var shouldTrack: Bool {
         queue != nil && account != nil && !expired && session != nil && pauseRecord == nil && away == nil
             && !locked && !disconnected && suspended == nil && shuttingDown == nil && !quitting
@@ -906,7 +965,7 @@ actor TrackerWorker {
 
         if shouldTrack {
             guard !blocks.isOpen, let current = session else { return }
-            blocks.start(at: min(moment, now), policy: BlockPolicy(session: current), description: taskNote,
+            blocks.start(at: min(moment, now), policy: blockPolicy(for: current), description: taskNote,
                          fraction: BlockTimeline.randomFraction())
             if announceAutostart {
                 announceAutostart = false
@@ -944,7 +1003,8 @@ actor TrackerWorker {
             // after the upload, replace the estimate.
             addEstimate(start: block.startedAt, end: block.endedAt, sign: 1, now: now)
             if speed == .fast {
-                if commit(assemble(job, screen: screen(for: block), webcam: nil, windowNow: nil, effective: currentEffectivePermissions), job: job, now: now) {
+                if commit(assemble(job, screen: screen(for: block), webcam: nil, windowNow: nil, consented: consentedNow),
+                          job: job, now: now) {
                     queuedFast = true
                 }
                 releaseScreen(block.id)
@@ -1018,7 +1078,8 @@ actor TrackerWorker {
         for job in pending {
             let fast = RecordJob(block: job.block, speed: .fast, owner: job.owner, projectTitle: job.projectTitle,
                                  late: job.late)
-            if commit(assemble(fast, screen: screen(for: job.block), webcam: nil, windowNow: nil, effective: currentEffectivePermissions), job: fast, now: now) {
+            if commit(assemble(fast, screen: screen(for: job.block), webcam: nil, windowNow: nil, consented: consentedNow),
+                      job: fast, now: now) {
                 queued = true
             }
             if let entry = inFlightCaptureTasks.removeValue(forKey: job.block.id) {
@@ -1036,54 +1097,63 @@ actor TrackerWorker {
     /// The payload of a block ending normally: its screenshot (the one taken
     /// at its random moment, or one now when it ended before that moment and
     /// may take one at the end), its webcam photo, and the window in front.
+    ///
+    /// What the block records is its own policy (consent included, fixed when
+    /// it started), never whether tracking still runs: a block ended by a
+    /// pause, a quit or a sign-out keeps its capture at the end and its
+    /// running programs. What is taken *now* also needs the user's consent
+    /// now.
     private func buildPayload(_ job: RecordJob) async -> ActivityPayload {
         let block = job.block
-        let currentEffective = currentEffectivePermissions
+        let consented = consentedNow
         if completedScreens[block.id] == nil, let pending = inFlightCaptureTasks[block.id]?.task {
             await pending.value
         }
         var shot = screen(for: block)
         let policy = block.policy
-        if shot == nil && !job.late && block.captureAtEnd && currentEffective.screenshot
+        if shot == nil && !job.late && block.captureAtEnd && consented.screenshot
             && policy.permissions.screenshot && block.endReason.allowsCaptureAtEnd {
             let gen = lifecycleGeneration
-            let captured = await captureScreenNow(blur: currentEffective.blurScreenshots || policy.blurScreenshots)
-            if gen == lifecycleGeneration && currentEffectivePermissions.screenshot {
+            let captured = await captureScreenNow(blur: consented.blurScreenshots || policy.blurScreenshots)
+            // Withdrawn while it was being taken: dropped.
+            if gen == lifecycleGeneration && consentedNow.screenshot {
                 shot = captured
             }
         }
         var photo: Data?
-        if currentEffective.webcam && policy.permissions.webcam && !job.late && block.endReason.allowsCaptureAtEnd {
+        if consented.webcam && policy.permissions.webcam && !job.late && block.endReason.allowsCaptureAtEnd {
             photo = await capturePhotoNow()
         }
-        // The window in front now is the block's last one — gated on current effective permission
+        // The window in front now is the block's last one (not after a lock,
+        // a sleep or going idle: it would not show the user's work).
         var windowNow: ForegroundWindow?
-        if !job.late && currentEffective.activeWindow && policy.permissions.activeWindow {
+        if !job.late && consented.activeWindow && policy.permissions.activeWindow && block.endReason.allowsCaptureAtEnd {
             windowNow = await deps.foreground.currentWindow()
         }
-        return assemble(job, screen: shot, webcam: photo, windowNow: windowNow, effective: currentEffective)
+        return assemble(job, screen: shot, webcam: photo, windowNow: windowNow, consented: consentedNow)
     }
 
     /// Measure and assemble the payload of `job` over its own window only
-    /// (the core's `BlockAssembler`, identical to the Windows agent's).
+    /// (the core's `BlockAssembler`, identical to the Windows agent's), under
+    /// the block's own policy. `consented` is the user's consent now: it
+    /// gates what is read now (the running programs) and can add blur.
     private func assemble(_ job: RecordJob, screen shot: ScreenCapture?, webcam: Data?,
-                          windowNow: ForegroundWindow?, effective: ConsentedPermissions) -> ActivityPayload {
+                          windowNow: ForegroundWindow?, consented: ConsentedPermissions) -> ActivityPayload {
         let block = job.block
         var permissions = block.policy.permissions
         if job.speed == .fast || job.late {
             permissions.webcam = false
         }
-        // Input the user has not consented to is not measured (the event tap
-        // never ran for it): its counts and activity are null, never a 0
-        // that would read as "no input".
-        let consented = deps.consentManager.current.permissions
-        permissions.keyboard = permissions.keyboard && consented.keyboard
-        permissions.mouse = permissions.mouse && consented.mouse
+        // The open apps are read now: not before a sleep or a shutdown, after a
+        // lock or going idle, or once the server ended tracking (all fast).
+        if job.speed == .fast || !block.endReason.allowsCaptureAtEnd {
+            permissions.runningPrograms = false
+        }
         let spec = BlockSpec(projectId: block.policy.projectId, permissions: permissions,
-                             blurScreenshots: effective.blurScreenshots || block.policy.blurScreenshots,
+                             blurScreenshots: consented.blurScreenshots || block.policy.blurScreenshots,
                              startedAt: block.startedAt, endedAt: block.endedAt, endReason: block.endReason,
                              taskNote: block.description)
-        let programs = (effective.runningPrograms && permissions.runningPrograms) ? deps.running.runningProgramNames() : []
+        let programs = (consented.runningPrograms && permissions.runningPrograms) ? deps.running.runningProgramNames() : []
         let measured = BlockAssembler.measure(spec, input: deps.input, usage: deps.usage, windowNow: windowNow,
                                               runningPrograms: programs, screen: shot, webcamJpeg: webcam)
         return BlockAssembler.build(spec, measured: measured, device: deps.device,
@@ -1521,9 +1591,20 @@ actor TrackerWorker {
                 typedServer = valid.absoluteString
             case .failure(let error):
                 shared.loginError = error.userMessage
+                shared.loginNeedsServer = true
                 publish()
                 return
             }
+        }
+        // A build that names no server never signs in to the development
+        // default: the address is asked for.
+        if typedServer == nil && !config.serverURLIsConfigured {
+            shared.loginError = config.serverURLIsManaged
+                ? "The server address set by your organisation cannot be used. Contact your administrator."
+                : TrackerWorker.serverNeededMessage
+            shared.loginNeedsServer = true
+            publish()
+            return
         }
         var change: ApiClient.PasswordChange?
         if let token = shared.passwordChangeToken, let fresh = newPassword, !fresh.isEmpty {
@@ -1531,6 +1612,7 @@ actor TrackerWorker {
         }
         signingIn = true
         shared.loginError = nil
+        shared.loginNeedsServer = false
         publish()
 
         // The same user signing in again goes back to the workspace tracked
@@ -1573,6 +1655,7 @@ actor TrackerWorker {
             shared.loginError = error.isTransport || error.isAuthRejection
                 ? error.userMessage
                 : "Signed in, but your workspaces could not be loaded (\(error.userMessage))."
+            shared.loginNeedsServer = error.concernsServerAddress
             publish()
             return
         }
@@ -1609,6 +1692,9 @@ actor TrackerWorker {
             CoreLog.warning("worker", "could not sign in: \(apiError?.userMessage ?? error.localizedDescription)")
         }
         shared.loginError = apiError?.userMessage ?? error.localizedDescription
+        // Nothing answered at that address (or not the API): the form opens
+        // the address field.
+        shared.loginNeedsServer = apiError?.concernsServerAddress ?? true
     }
 
     /// The server accepted a sign-in and its workspace is known. The same
@@ -1644,9 +1730,11 @@ actor TrackerWorker {
         deps.preferences.lastWorkspaceId = workspace.id
         deps.preferences.lastUsername = waiting.username
         if let typed = waiting.typedServer {
-            // Remembered only when it differs from the configured address.
-            let configured = deps.configSource.load(savedServerURL: nil).apiBaseURL
-            deps.preferences.savedServerURL = waiting.serverURL == configured ? nil : typed
+            // Remembered unless it is the address the build or a profile
+            // configures (the development default configures nothing).
+            let configured = deps.configSource.load(savedServerURL: nil)
+            let isConfigured = configured.serverURLIsConfigured && waiting.serverURL == configured.apiBaseURL
+            deps.preferences.savedServerURL = isConfigured ? nil : typed
             config = deps.configSource.load(savedServerURL: deps.preferences.savedServerURL)
         }
 
@@ -1774,7 +1862,7 @@ actor TrackerWorker {
         deps.setReadsWindowTitles(false)
         shared.displayName = ""
         shared.workspace = ""
-        shared.serverURL = config.apiBaseURL.absoluteString
+        shared.serverURL = configuredServerText
         shared.projects = []
         shared.trackedTodaySeconds = 0
         shared.trackedWeekSeconds = 0
@@ -2048,6 +2136,9 @@ actor TrackerWorker {
         }
         inFlightCaptureTasks.removeAll()
         completedScreens.removeAll()
+        // The open block and the next ones are recorded under what is
+        // consented now (a withdrawal at once, before any I/O).
+        applyConsentToOpenBlock(at: deps.now())
         reconcile(at: deps.now(), reason: .interval)
         publish()
 
@@ -2057,6 +2148,7 @@ actor TrackerWorker {
         } catch {
             // On save failure: conservative state is preserved!
             deps.consentManager.failTransition(transition)
+            applyConsentToOpenBlock(at: deps.now())
             reconcile(at: deps.now(), reason: .interval)
             publish()
             throw error
@@ -2066,6 +2158,7 @@ actor TrackerWorker {
         let committed = deps.consentManager.commitTransition(transition)
         if committed {
             lifecycleGeneration &+= 1
+            applyConsentToOpenBlock(at: deps.now())
             reconcile(at: deps.now(), reason: .interval)
             publish()
         }
@@ -2215,8 +2308,8 @@ actor TrackerWorker {
     private func makeHeartbeat(_ status: PresenceStatus, since: Date, now: Date) -> Heartbeat? {
         guard DeviceInfo.normalizedDeviceId(deps.device.deviceId) != nil else { return nil }
         // The app in front only while tracking, and only when the project
-        // records the active window.
-        let recordsWindow = session?.permissions.activeWindow ?? false
+        // records the active window and the user consented to it.
+        let recordsWindow = (session?.permissions.activeWindow ?? false) && currentEffectivePermissions.activeWindow
         let currentApp = status == .tracking && recordsWindow ? deps.foreground.frontmostAppName : nil
         return Heartbeat(device: deps.device, status: status, projectId: session?.projectId, statusSince: since,
                          currentApp: currentApp, timeZone: .autoupdatingCurrent, now: now)
@@ -2321,8 +2414,9 @@ actor TrackerWorker {
         stopDriversNow()
         let now = deps.now()
         CoreLog.warning("worker", "the saved sign-in is no longer accepted: \(reason)")
+        // The server ended it: queued at once, nothing more is captured.
         let finished = blocks.end(at: now, now: now, reason: .signOut)
-        record(finished, speed: .normal)
+        record(finished, speed: .fast)
         expired = true
         contacting = false
         away = nil
@@ -2435,7 +2529,8 @@ actor TrackerWorker {
         next.idleThresholdMinutes = session.flatMap { $0.idleThreshold > 0 ? WorkerRules.minutes($0.idleThreshold) : nil }
         next.capture = session.map { CaptureFlags(session: $0) } ?? CaptureFlags.nothing
         next.localConsent = deps.consentManager.current
-        next.effectiveCapture = CaptureFlags(consented: currentEffectivePermissions)
+        next.effectiveCapture = session.map { CaptureFlags(policy: blockPolicy(for: $0)) } ?? CaptureFlags.nothing
+        next.serverURLIsConfigured = config.serverURLIsConfigured
         next.taskNote = taskNote ?? ""
         next.serverReachable = reachable
         next.serverURLIsManaged = config.serverURLIsManaged

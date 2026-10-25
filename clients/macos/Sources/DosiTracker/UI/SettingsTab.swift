@@ -2,10 +2,10 @@ import DosiTrackerCore
 import SwiftUI
 
 // The Settings tab (port of the Windows agent's `ui/settings.rs`): start at
-// login, the user's goals, the macOS privacy permissions with a way to fix
-// each, what the current project records (the admin's policy, read-only),
-// this Mac, the account with a confirmed sign-out, and help (logs, data
-// folder).
+// login, the user's goals, the user's own consent, the macOS privacy
+// permissions with a way to fix each, what is recorded (each capture on, off
+// by the user, or off by the workspace), this Mac, the account with a
+// confirmed sign-out, and help (logs, data folder).
 
 struct SettingsTab: View {
     @ObservedObject var model: AppModel
@@ -20,7 +20,7 @@ struct SettingsTab: View {
             }
             generalCard
             goalsCard
-            consentCard
+            ConsentCard(model: model)
             permissionsCard
             policyCard
             deviceCard
@@ -95,145 +95,12 @@ struct SettingsTab: View {
         }
     }
 
-    // MARK: Local Consent
-
-    private var consentCard: some View {
-        let consent = model.localConsent
-        let perms = consent.permissions
-        let trailingBadge: String = {
-            switch consent {
-            case .granted: return "Opted In"
-            case .revoked: return "Revoked"
-            case .absent: return "Not Consented"
-            }
-        }()
-
-        return Card("Local Consent & Data Collection", trailing: trailingBadge) {
-            settingRow("Keyboard Activity", "Record hardware keypress counts (never what you type).") {
-                Toggle("", isOn: Binding(
-                    get: { perms.keyboard },
-                    set: { val in
-                        var next = perms
-                        next.keyboard = val
-                        model.updateConsent(permissions: next)
-                    }
-                ))
-                .toggleStyle(.switch)
-                .labelsHidden()
-            }
-            Divider()
-            settingRow("Mouse Activity", "Record mouse clicks, scroll and movement counts.") {
-                Toggle("", isOn: Binding(
-                    get: { perms.mouse },
-                    set: { val in
-                        var next = perms
-                        next.mouse = val
-                        model.updateConsent(permissions: next)
-                    }
-                ))
-                .toggleStyle(.switch)
-                .labelsHidden()
-            }
-            Divider()
-            settingRow("Active Window & App", "Record which application and window title was active.") {
-                Toggle("", isOn: Binding(
-                    get: { perms.activeWindow },
-                    set: { val in
-                        var next = perms
-                        next.activeWindow = val
-                        model.updateConsent(permissions: next)
-                    }
-                ))
-                .toggleStyle(.switch)
-                .labelsHidden()
-            }
-            Divider()
-            settingRow("Running Programs", "Record names of active running desktop applications.") {
-                Toggle("", isOn: Binding(
-                    get: { perms.runningPrograms },
-                    set: { val in
-                        var next = perms
-                        next.runningPrograms = val
-                        model.updateConsent(permissions: next)
-                    }
-                ))
-                .toggleStyle(.switch)
-                .labelsHidden()
-            }
-            Divider()
-            settingRow("Screen Captures", "Take interval screenshots of your work display.") {
-                Toggle("", isOn: Binding(
-                    get: { perms.screenshot },
-                    set: { val in
-                        var next = perms
-                        next.screenshot = val
-                        model.updateConsent(permissions: next)
-                    }
-                ))
-                .toggleStyle(.switch)
-                .labelsHidden()
-            }
-            if perms.screenshot {
-                Divider()
-                settingRow("Blur Screenshots", "Blur captured screenshots beyond recognition before saving.") {
-                    Toggle("", isOn: Binding(
-                        get: { perms.blurScreenshots },
-                        set: { val in
-                            var next = perms
-                            next.blurScreenshots = val
-                            model.updateConsent(permissions: next)
-                        }
-                    ))
-                    .toggleStyle(.switch)
-                    .labelsHidden()
-                }
-            }
-            Divider()
-            settingRow("Webcam Photos", "Capture periodic webcam photos.") {
-                Toggle("", isOn: Binding(
-                    get: { perms.webcam },
-                    set: { val in
-                        var next = perms
-                        next.webcam = val
-                        model.updateConsent(permissions: next)
-                    }
-                ))
-                .toggleStyle(.switch)
-                .labelsHidden()
-            }
-            Divider()
-            HStack {
-                if consent.isGranted {
-                    Button(role: .destructive) {
-                        model.revokeConsent()
-                    } label: {
-                        Text("Revoke All Consent")
-                    }
-                } else {
-                    Button {
-                        var initial = ConsentedPermissions.allDisabled
-                        initial.keyboard = true
-                        initial.mouse = true
-                        initial.activeWindow = true
-                        initial.screenshot = true
-                        initial.blurScreenshots = true
-                        model.updateConsent(permissions: initial)
-                    } label: {
-                        Text("Grant Standard Consent")
-                    }
-                }
-            }
-            Text("Explicit local user consent is required on this Mac. Capture is admitted only when granted locally AND allowed by your project policy. Revocation detaches drivers immediately.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-    }
-
     // MARK: Permissions
 
     private var permissionsCard: some View {
-        let needed = snapshot.capture.permissions
+        // Needed only for what is recorded: the project's policy AND the
+        // user's consent.
+        let needed = snapshot.effectiveCapture.permissions
         return Card("Permissions", trailing: "System Settings → Privacy & Security") {
             ForEach(PrivacyPermission.allCases, id: \.self) { permission in
                 permissionRow(permission, needed: isNeeded(permission, by: needed))
@@ -245,7 +112,7 @@ struct SettingsTab: View {
                 Text("Keyboard and mouse capture:").font(.caption).foregroundStyle(.secondary)
                 Text(inputCaptureText).font(.caption.weight(.semibold))
             }
-            Text("macOS ties each permission to this app's signature. Screen Recording takes effect after Dosi Tracker is restarted. Nothing is captured beyond what your project records.")
+            Text("macOS ties each permission to this app's signature. Screen Recording takes effect after Dosi Tracker is restarted. Nothing is captured beyond what you consented to and your project records.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -260,7 +127,7 @@ struct SettingsTab: View {
                 .font(.system(size: 18))
             VStack(alignment: .leading, spacing: 1) {
                 Text(permission.title).font(.callout.weight(.semibold))
-                Text(permission.purpose + (needed ? "" : " — not used by this project"))
+                Text(permission.purpose + (needed ? "" : " — not needed for what is recorded now"))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -306,18 +173,24 @@ struct SettingsTab: View {
     // MARK: Policy
 
     private var policyCard: some View {
-        let flags = snapshot.capture
+        let policy = snapshot.capture
+        let recorded = snapshot.effectiveCapture
         let project = snapshot.currentProject?.title ?? "your project"
         return Card("What is recorded", trailing: project) {
-            policyRow("camera", "Screenshots", flags.screenshot,
-                      flags.blurScreenshots
+            policyRow("camera", "Screenshots", CaptureState.of(policy.screenshot, recorded.screenshot),
+                      recorded.blurScreenshots
                           ? "One per block, of the screen you work on — blurred before upload"
                           : "One per block, of the screen you work on")
-            policyRow("video", "Webcam photo", flags.webcam, "One per block")
-            policyRow("keyboard", "Keyboard activity", flags.keyboard, "Counts only — never what you type")
-            policyRow("computermouse", "Mouse activity", flags.mouse, "Clicks and movement, as counts")
-            policyRow("macwindow", "Apps & window titles", flags.activeWindow, "Which app was in front, and for how long")
-            policyRow("square.stack.3d.up", "Running programs", flags.runningPrograms, "The names of open apps, never their windows")
+            policyRow("video", "Webcam photo", CaptureState.of(policy.webcam, recorded.webcam), "One per block")
+            policyRow("keyboard", "Keyboard activity", CaptureState.of(policy.keyboard, recorded.keyboard),
+                      "Counts only — never what you type")
+            policyRow("computermouse", "Mouse activity", CaptureState.of(policy.mouse, recorded.mouse),
+                      "Clicks and movement, as counts")
+            policyRow("macwindow", "Apps & window titles", CaptureState.of(policy.activeWindow, recorded.activeWindow),
+                      "Which app was in front, and for how long")
+            policyRow("square.stack.3d.up", "Running programs",
+                      CaptureState.of(policy.runningPrograms, recorded.runningPrograms),
+                      "The names of open apps, never their windows")
             Text(policySummary)
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -326,7 +199,7 @@ struct SettingsTab: View {
     }
 
     private var policySummary: String {
-        var text = "Set by your workspace admin for each project. A snapshot is taken every \(snapshot.intervalMinutes) minutes."
+        var text = "Your workspace admin sets what each project may record; you choose what this Mac records within that. A snapshot is taken every \(snapshot.intervalMinutes) minutes."
         if let idle = snapshot.idleThresholdMinutes {
             text += " After \(idle) minutes without input you count as away, and that time is not tracked unless you keep it."
         } else if snapshot.currentProject != nil {
@@ -335,8 +208,9 @@ struct SettingsTab: View {
         return text
     }
 
-    private func policyRow(_ symbol: String, _ title: String, _ on: Bool, _ detail: String) -> some View {
-        HStack(spacing: 10) {
+    private func policyRow(_ symbol: String, _ title: String, _ state: CaptureState, _ detail: String) -> some View {
+        let on = state == .on
+        return HStack(spacing: 10) {
             Image(systemName: symbol)
                 .frame(width: 20)
                 .foregroundStyle(on ? Color.primary : Color.secondary)
@@ -345,7 +219,7 @@ struct SettingsTab: View {
                 Text(detail).font(.caption).foregroundStyle(.secondary)
             }
             Spacer(minLength: 6)
-            Pill(on ? "On" : "Off", tone: on ? .success : .neutral)
+            Pill(state.label, tone: on ? .success : .neutral)
         }
     }
 
@@ -381,7 +255,10 @@ struct SettingsTab: View {
                     Text(snapshot.workspace.isEmpty ? "No workspace chosen" : "Workspace: \(snapshot.workspace)")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                    Text("Server: \(snapshot.serverURL)").font(.caption).foregroundStyle(.tertiary).textSelection(.enabled)
+                    Text("Server: \(snapshot.serverURL.isEmpty ? "not set" : snapshot.serverURL)")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                        .textSelection(.enabled)
                 }
             }
             HStack(spacing: 10) {
@@ -441,6 +318,34 @@ struct SettingsTab: View {
             }
             Spacer(minLength: 8)
             control()
+        }
+    }
+}
+
+/// Whether one kind of capture is recorded, and if not, who switched it off
+/// (as the Windows agent's `CapabilityStatus`).
+enum CaptureState: Equatable {
+    case on
+    /// The project allows it; the user did not consent to it on this Mac.
+    case offByYou
+    /// The project (or this Mac's configuration) does not record it.
+    case offByWorkspace
+
+    static func of(_ allowed: Bool, _ recorded: Bool) -> CaptureState {
+        if recorded {
+            return .on
+        }
+        return allowed ? .offByYou : .offByWorkspace
+    }
+
+    var label: String {
+        switch self {
+        case .on:
+            return "On"
+        case .offByYou:
+            return "Off — your choice"
+        case .offByWorkspace:
+            return "Off — by your workspace"
         }
     }
 }

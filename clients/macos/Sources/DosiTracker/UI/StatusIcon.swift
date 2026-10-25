@@ -17,7 +17,8 @@ enum StatusBadge: Equatable {
     case waiting
     /// Signed out: the bare ring.
     case signedOut
-    /// Needs the user (sign-in expired, stopped): an exclamation mark.
+    /// Needs the user (sign-in expired, consent required, stopped): an
+    /// exclamation mark.
     case attention
 
     static func of(_ status: TrackerStatus) -> StatusBadge {
@@ -32,7 +33,7 @@ enum StatusBadge: Equatable {
             return .waiting
         case .signedOut:
             return .signedOut
-        case .signInExpired, .stopped:
+        case .signInExpired, .stopped, .consentRequired:
             return .attention
         }
     }

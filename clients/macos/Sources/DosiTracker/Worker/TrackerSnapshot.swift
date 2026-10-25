@@ -162,9 +162,17 @@ struct TrackerSnapshot: Equatable, Sendable {
     /// An MDM profile fixes the server address: the sign-in form must not
     /// offer to change it.
     var serverURLIsManaged = false
-    /// The sign-in form's suggestions: the last email and server.
+    /// The sign-in form's suggestions: the last email and server (empty when
+    /// no server is configured).
     var suggestedUsername = ""
     var suggestedServerURL = ""
+    /// The build, a profile or an earlier sign-in names the server. When
+    /// none does, the sign-in form shows the address field and asks for it.
+    var serverURLIsConfigured = false
+    /// The last sign-in failed because of the server address (nothing
+    /// answered there, it is not the API, or none was given): the form opens
+    /// the address field.
+    var loginNeedsServer = false
     /// Whether the server answered the latest request. Tracking goes on
     /// offline (on the saved project list); blocks upload once it is back.
     var serverReachable = true
@@ -198,10 +206,14 @@ struct TrackerSnapshot: Equatable, Sendable {
     /// Minutes without input before the block is ended as idle; nil when the
     /// project turned idle detection off (or no project is known).
     var idleThresholdMinutes: Int?
+    /// What the project records (its policy and the local configuration),
+    /// whatever the user consented to.
     var capture = CaptureFlags.nothing
     /// Current local affirmative consent state.
     var localConsent = LocalConsent.absent
-    /// Current effective capture flags (local consent intersected with project policy).
+    /// What a block records while tracking: ``capture`` narrowed to what the
+    /// user consented to on this Mac. The permission prompts, warnings and
+    /// "What is recorded" follow this, never the policy alone.
     var effectiveCapture = CaptureFlags.nothing
     /// "What are you working on?" — sent as each block's description.
     var taskNote = ""

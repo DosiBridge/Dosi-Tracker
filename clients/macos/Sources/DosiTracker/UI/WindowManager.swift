@@ -6,8 +6,9 @@ import SwiftUI
 // created on first use and kept (closing only hides them). It also decides
 // when a window appears by itself, from the snapshots: the sign-in form when
 // a sign-in is needed, the workspace picker when the account must choose (or
-// asked to switch), the project chooser when the agent cannot pick one, and
-// the idle prompt when the user comes back.
+// asked to switch), the consent card when nothing may be recorded yet, the
+// project chooser when the agent cannot pick one, and the idle prompt when
+// the user comes back.
 
 @MainActor
 final class WindowManager: NSObject, NSWindowDelegate {
@@ -171,6 +172,11 @@ final class WindowManager: NSObject, NSWindowDelegate {
             if !new.status.needsSignIn {
                 showMain(tab: .timer)
             }
+        }
+        // Signed in, but nothing may be recorded until the user chooses what:
+        // asked in place, on the Timer tab.
+        if new.status == .consentRequired && (old.status != .consentRequired || first) && new.workspaceChoices.isEmpty {
+            showMain(tab: .timer)
         }
         // The agent cannot pick the project (CONTRACT §2): ask.
         if new.status == .choosingProject && (old.status != .choosingProject || first) && !new.projects.isEmpty

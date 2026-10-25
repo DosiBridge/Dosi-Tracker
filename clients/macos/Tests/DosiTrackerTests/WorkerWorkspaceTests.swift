@@ -180,6 +180,12 @@ final class WorkerWorkspaceTests: XCTestCase {
             defer { lock.unlock() }
             return history.last
         }
+
+        var all: [ConsentedPermissions] {
+            lock.lock()
+            defer { lock.unlock() }
+            return history
+        }
     }
 
     private final class Snapshots: @unchecked Sendable {
@@ -234,11 +240,20 @@ final class WorkerWorkspaceTests: XCTestCase {
         let root: URL
     }
 
-    private func makeHarness(saved: StoredSignIn?, cachedProjectsFor owner: String? = nil) throws -> Harness {
+    /// The server a deployment configures (`config.json`, as a build or a
+    /// profile would); nil: none, as in a build that names no server.
+    static let configuredServer = "https://tracker.example.com"
+
+    private func makeHarness(saved: StoredSignIn?, cachedProjectsFor owner: String? = nil,
+                             server: String? = WorkerWorkspaceTests.configuredServer) throws -> Harness {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("worker-workspace-\(UUID().uuidString.lowercased())", isDirectory: true)
         let paths = AppPaths.rooted(at: root)
         try paths.createDirectories()
+        if let server = server {
+            let file = paths.applicationSupport.appendingPathComponent(ConfigFile.fileName, isDirectory: false)
+            try JSONSerialization.data(withJSONObject: ["apiBaseURL": server]).write(to: file)
+        }
         let suiteName = "test-\(UUID().uuidString.lowercased())"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         let preferences = Preferences(defaults: defaults)
@@ -482,6 +497,89 @@ final class WorkerWorkspaceTests: XCTestCase {
         XCTAssertNotNil(snapshot.loginError)
         XCTAssertNil(harness.credentials.saved, "the item that held the password is gone")
         XCTAssertTrue(ScriptedURLProtocol.requests.isEmpty, "nothing is sent with the retired password")
+        await tearDown(harness)
+    }
+
+    // MARK: - The server address
+
+    func testABuildThatNamesNoServerAsksForTheAddressBeforeSigningIn() async throws {
+        ScriptedURLProtocol.reset([
+            "/connect/token": [Self.token("refresh-1")],
+            "/api/app/workspaces/mine": [Self.ok(#"[{"id":"ws-1","name":"Acme","role":"member"}]"#)],
+            "/api/app/project/my-projects": [Self.ok(Self.project("p-1"))],
+        ])
+        let harness = try makeHarness(saved: nil, server: nil)
+        let worker = harness.worker
+        await worker.start(launchedAtLogin: false, startPeriodicTicks: false)
+        let signedOut = try XCTUnwrap(harness.snapshots.latest)
+        XCTAssertFalse(signedOut.serverURLIsConfigured)
+        XCTAssertEqual(signedOut.suggestedServerURL, "", "the development default is never offered")
+        XCTAssertEqual(signedOut.serverURL, "")
+
+        // Never signed in to the development default behind the user's back.
+        await worker.signIn(username: "user@example.com", password: "pw-fixture", server: nil, newPassword: nil)
+        let refused = try XCTUnwrap(harness.snapshots.latest)
+        XCTAssertEqual(refused.status, .signedOut)
+        XCTAssertEqual(refused.loginError, TrackerWorker.serverNeededMessage)
+        XCTAssertTrue(refused.loginNeedsServer, "the form opens the address field")
+        XCTAssertTrue(ScriptedURLProtocol.requests.isEmpty, "nothing is sent anywhere")
+
+        // With the address typed, it signs in there and remembers it.
+        await worker.signIn(username: "user@example.com", password: "pw-fixture", server: "tracker.example.com/",
+                            newPassword: nil)
+        await eventually("tracking in the only workspace") {
+            await worker.facts().tracking
+        }
+        XCTAssertEqual(harness.preferences.savedServerURL, "https://tracker.example.com")
+        let signedIn = try XCTUnwrap(harness.snapshots.latest)
+        XCTAssertTrue(signedIn.serverURLIsConfigured)
+        XCTAssertFalse(signedIn.loginNeedsServer)
+        XCTAssertEqual(signedIn.serverURL, "https://tracker.example.com")
+        await tearDown(harness)
+    }
+
+    func testASignInThatReachesNothingPointsAtTheAddress() async throws {
+        // No reply scripted: every request fails as if offline.
+        ScriptedURLProtocol.reset([:])
+        let harness = try makeHarness(saved: nil)
+        let worker = harness.worker
+        await worker.start(launchedAtLogin: false, startPeriodicTicks: false)
+        await worker.signIn(username: "user@example.com", password: "pw-fixture", server: nil, newPassword: nil)
+        let snapshot = try XCTUnwrap(harness.snapshots.latest)
+        XCTAssertEqual(snapshot.status, .signedOut)
+        XCTAssertNotNil(snapshot.loginError)
+        XCTAssertTrue(snapshot.loginNeedsServer)
+        await tearDown(harness)
+    }
+
+    // MARK: - Sign-in expired
+
+    func testAnExpiredSignInStopsEveryCaptureAtOnce() async throws {
+        let owner = Queue.ownerKey(workspaceId: "ws-1", username: "user@example.com")
+        ScriptedURLProtocol.reset([
+            "/connect/token": [ScriptedURLProtocol.Reply(
+                status: 400, body: #"{"error":"invalid_grant","error_description":"The refresh token is no longer valid."}"#)],
+        ])
+        let harness = try makeHarness(
+            saved: StoredSignIn(username: "user@example.com", workspaceId: "ws-1", workspaceName: "Acme",
+                                refreshToken: "refresh-1"),
+            cachedProjectsFor: owner)
+        let worker = harness.worker
+        await worker.start(launchedAtLogin: false, startPeriodicTicks: false)
+        // Offline first: tracking started on the saved project list...
+        XCTAssertTrue(harness.drivers.all.contains { $0.keyboard && $0.activeWindow })
+
+        // ...until the server refuses the saved sign-in.
+        await eventually("sign-in expired") {
+            harness.snapshots.latest?.status == .signInExpired
+        }
+        XCTAssertEqual(harness.drivers.last, ConsentedPermissions.allDisabled,
+                       "the event tap and the window sampler stop at once")
+        let facts = await worker.facts()
+        XCTAssertFalse(facts.tracking)
+        XCTAssertNil(harness.credentials.saved?.refreshToken, "the refused token is never tried again")
+        XCTAssertFalse(requests("/connect/token").contains { $0.form["grant_type"] == "password" },
+                       "never a silent password sign-in")
         await tearDown(harness)
     }
 }

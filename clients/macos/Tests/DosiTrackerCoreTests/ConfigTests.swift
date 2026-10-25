@@ -103,6 +103,32 @@ final class ConfigTests: XCTestCase {
         XCTAssertFalse(config.blurScreenshots)
         XCTAssertFalse(config.serverURLIsManaged)
         XCTAssertFalse(config.allowInsecureHTTP)
+        // The development addresses are placeholders, never a configured server.
+        XCTAssertFalse(config.serverURLIsConfigured)
+        XCTAssertFalse(config.dashboardURLIsConfigured)
+    }
+
+    func testAServerCountsAsConfiguredOnlyWhenSomeSourceNamesIt() {
+        // Baked into the build.
+        var config = Config.resolve(infoDictionary: [Config.Key.apiBaseURL: "https://tracker.example.com"],
+                                    defaults: defaults, savedServerURL: nil)
+        XCTAssertTrue(config.serverURLIsConfigured)
+        XCTAssertFalse(config.dashboardURLIsConfigured)
+        // Saved at sign-in.
+        config = Config.resolve(infoDictionary: [:], defaults: defaults, savedServerURL: "https://saved.example.com")
+        XCTAssertTrue(config.serverURLIsConfigured)
+        // A preference or a profile.
+        defaults.set("https://preferred.example.com", forKey: Config.Key.apiBaseURL)
+        defaults.set("https://app.example.com", forKey: Config.Key.dashboardURL)
+        config = Config.resolve(infoDictionary: [:], defaults: defaults, savedServerURL: nil)
+        XCTAssertTrue(config.serverURLIsConfigured)
+        XCTAssertTrue(config.dashboardURLIsConfigured)
+        // An unusable value configures nothing.
+        defaults.removeObject(forKey: Config.Key.apiBaseURL)
+        config = Config.resolve(infoDictionary: [Config.Key.apiBaseURL: "ftp://tracker.example.com"], defaults: defaults,
+                                savedServerURL: "ftp://saved")
+        XCTAssertFalse(config.serverURLIsConfigured)
+        XCTAssertEqual(config.apiBaseURL, Config.defaultAPIBaseURL)
     }
 
     func testLaterSourcesWinKeyByKey() {

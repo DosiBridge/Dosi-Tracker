@@ -589,8 +589,22 @@ final class WorkerConsentLifecycleTests: XCTestCase {
             XCTAssertFalse(facts.consentGranted)
             XCTAssertFalse(facts.tracking, "Nothing is tracked without consent")
             let snapshot = try self.latest(snapshots)
-            XCTAssertEqual(snapshot.status, .stopped("Consent required"))
+            XCTAssertEqual(snapshot.status, .consentRequired)
+            XCTAssertTrue(snapshot.status.isSignedIn, "Waiting for consent is still signed in")
             XCTAssertEqual(snapshot.localConsent, .absent)
+            XCTAssertEqual(snapshot.effectiveCapture.permissions, CapturePermissions.nothing,
+                           "Nothing is recorded, so nothing is asked of macOS")
+            XCTAssertTrue(snapshot.capture.screenshot, "The project's own policy is still shown")
+        }
+    }
+
+    func testWaitingForConsentStillAllowsSigningOut() async throws {
+        try await withHarness(initialConsent: .absent) { worker, _, driverRecorder, snapshots, _ in
+            await worker.start(launchedAtLogin: false, startPeriodicTicks: false)
+            XCTAssertEqual(try self.latest(snapshots).status, .consentRequired)
+            await worker.signOut(at: Date())
+            XCTAssertEqual(try self.latest(snapshots).status, .signedOut)
+            XCTAssertTrue(driverRecorder.all.allSatisfy { $0 == ConsentedPermissions.allDisabled })
         }
     }
 
@@ -1543,5 +1557,172 @@ final class WorkerConsentLifecycleTests: XCTestCase {
         let operationSuccess = await task.value
         XCTAssertEqual(operationSuccess, true, "Synthetic operation must finish with explicit barrier release rather than timeout")
         await observerTracker.joinAll()
+    }
+
+    // MARK: - Consent Is Part Of Each Block's Policy
+
+    /// The project of these tests, with a one-hour interval: its screenshot
+    /// moment (10-90 %) is never within the first six minutes.
+    private static let hourProject = MyProject(
+        id: "p-test", title: "Test Project", intervalMinutes: 60, allowScreenshot: true, allowWebcam: true,
+        allowKeyboard: true, allowMouse: true, allowActiveWindow: true, allowRunningPrograms: true,
+        idleThresholdMinutes: 5, blurScreenshots: false)
+
+    /// Now, on a whole second: the queue keeps instants to the millisecond,
+    /// so a block's ends compare exactly with the test's clock.
+    private static func wholeSecondNow() -> Date {
+        Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded(.down))
+    }
+
+    /// The blocks the worker queued for the test account, oldest first.
+    private func queuedBlocks(_ paths: AppPaths) throws -> [ActivityPayload] {
+        let queue = try Queue.open(at: paths.database, legacyOwner: nil)
+        return try queue.pendingBatch(owner: Self.owner, afterId: 0, limit: 50).map { $0.payload }
+            .sorted { $0.startedAt < $1.startedAt }
+    }
+
+    func testAPauseBeforeTheScreenshotMomentStillCapturesAtTheEndAndKeepsTheRunningPrograms() async throws {
+        let everything = ConsentedPermissions(screenshot: true, webcam: false, keyboard: true, mouse: true,
+                                              activeWindow: true, runningPrograms: true, blurScreenshots: false)
+        let clock = Box(Self.wholeSecondNow())
+        let start = clock.value
+        let screen = TestScreenCapturer()
+        try await withHarness(initialConsent: .granted(everything), screenCapturer: screen, project: Self.hourProject,
+                              clock: clock) { worker, _, _, _, paths in
+            await worker.start(launchedAtLogin: false, startPeriodicTicks: false)
+            clock.value = start.addingTimeInterval(120)
+            await worker.pause(resumeAfter: nil, at: clock.value)
+            await worker.flushRecorder()
+
+            let blocks = try self.queuedBlocks(paths)
+            XCTAssertEqual(blocks.count, 1)
+            let block = try XCTUnwrap(blocks.first)
+            XCTAssertEqual(block.endReason, .pause)
+            XCTAssertNotNil(block.screenshotPngBase64, "Ended before its screenshot moment: one is taken at the end")
+            XCTAssertEqual(screen.captureCount, 1)
+            XCTAssertEqual(block.runningPrograms.map { $0.appName }, ["Xcode", "Finder"])
+            XCTAssertEqual(block.activeWindows.first?.appName, "Xcode", "The window in front at the end")
+            XCTAssertEqual(block.keyboardHits, 0, "Measured, and none")
+            XCTAssertEqual(block.mouseClicks, 0)
+            XCTAssertNotNil(block.productivity)
+        }
+    }
+
+    func testScreenshotOnlyConsentMeasuresNoActivityAtAll() async throws {
+        let screenshotsOnly = ConsentedPermissions(screenshot: true, blurScreenshots: true)
+        let clock = Box(Self.wholeSecondNow())
+        let start = clock.value
+        try await withHarness(initialConsent: .granted(screenshotsOnly), project: Self.hourProject,
+                              clock: clock) { worker, _, driverRecorder, snapshots, paths in
+            await worker.start(launchedAtLogin: false, startPeriodicTicks: false)
+            XCTAssertEqual(try self.latest(snapshots).status, .tracking)
+            XCTAssertEqual(driverRecorder.last?.keyboard, false, "The event tap never runs for it")
+            let recorded = try self.latest(snapshots).effectiveCapture
+            XCTAssertFalse(recorded.measuresInput)
+            XCTAssertTrue(recorded.screenshot && recorded.blurScreenshots)
+
+            clock.value = start.addingTimeInterval(120)
+            await worker.pause(resumeAfter: nil, at: clock.value)
+            await worker.flushRecorder()
+
+            let block = try XCTUnwrap(self.queuedBlocks(paths).first)
+            XCTAssertNil(block.productivity, "Not measured, never a fabricated 0 %")
+            XCTAssertNil(block.idleSeconds)
+            XCTAssertNil(block.keyboardHits)
+            XCTAssertNil(block.mouseClicks)
+            XCTAssertNil(block.injectedInputEvents)
+            XCTAssertTrue(block.timeline.isEmpty, "No minutes that would read as idle")
+            XCTAssertTrue(block.activeWindows.isEmpty, "Not consented")
+            XCTAssertTrue(block.runningPrograms.isEmpty, "Not consented")
+            XCTAssertEqual(block.screenshotBlurred, true)
+        }
+    }
+
+    func testKeyboardOnlyConsentLeavesTheMouseUnmeasured() async throws {
+        let keyboardOnly = ConsentedPermissions(keyboard: true)
+        let clock = Box(Self.wholeSecondNow())
+        let start = clock.value
+        try await withHarness(initialConsent: .granted(keyboardOnly), project: Self.hourProject,
+                              clock: clock) { worker, _, _, _, paths in
+            await worker.start(launchedAtLogin: false, startPeriodicTicks: false)
+            clock.value = start.addingTimeInterval(120)
+            await worker.pause(resumeAfter: nil, at: clock.value)
+            await worker.flushRecorder()
+
+            let block = try XCTUnwrap(self.queuedBlocks(paths).first)
+            XCTAssertEqual(block.keyboardHits, 0)
+            XCTAssertNil(block.mouseClicks, "The mouse is not measured: null, not 0")
+            XCTAssertNotNil(block.productivity, "Activity is measured from the keyboard")
+            XCTAssertTrue(block.timeline.allSatisfy { $0.mouseClicks == nil })
+            XCTAssertNil(block.screenshotPngBase64)
+        }
+    }
+
+    func testWithdrawingInputConsentEndsTheBlockThereAndTheNextOneLeavesItUnmeasured() async throws {
+        let input = ConsentedPermissions(keyboard: true, mouse: true)
+        let clock = Box(Self.wholeSecondNow())
+        let start = clock.value
+        try await withHarness(initialConsent: .granted(input), project: Self.hourProject,
+                              clock: clock) { worker, _, driverRecorder, _, paths in
+            await worker.start(launchedAtLogin: false, startPeriodicTicks: false)
+            clock.value = start.addingTimeInterval(120)
+            try await worker.updateConsent(.granted(ConsentedPermissions(mouse: true)))
+            XCTAssertEqual(driverRecorder.last?.keyboard, false)
+            clock.value = start.addingTimeInterval(240)
+            await worker.pause(resumeAfter: nil, at: clock.value)
+            await worker.flushRecorder()
+
+            let blocks = try self.queuedBlocks(paths)
+            XCTAssertEqual(blocks.count, 2, "The block ends at the withdrawal")
+            XCTAssertEqual(blocks.first?.endedAt, start.addingTimeInterval(120))
+            XCTAssertEqual(blocks.first?.keyboardHits, 0, "Consented while it was recorded")
+            XCTAssertEqual(blocks.last?.startedAt, start.addingTimeInterval(120))
+            XCTAssertNil(blocks.last?.keyboardHits, "Withdrawn: not measured")
+            XCTAssertEqual(blocks.last?.mouseClicks, 0)
+        }
+    }
+
+    func testAWithdrawalInTheFirstMinuteNarrowsTheBlockInsteadOfDroppingIt() async throws {
+        let input = ConsentedPermissions(keyboard: true, mouse: true)
+        let clock = Box(Self.wholeSecondNow())
+        let start = clock.value
+        try await withHarness(initialConsent: .granted(input), project: Self.hourProject,
+                              clock: clock) { worker, _, _, _, paths in
+            await worker.start(launchedAtLogin: false, startPeriodicTicks: false)
+            clock.value = start.addingTimeInterval(30)
+            try await worker.updateConsent(.granted(ConsentedPermissions(mouse: true)))
+            clock.value = start.addingTimeInterval(150)
+            await worker.pause(resumeAfter: nil, at: clock.value)
+            await worker.flushRecorder()
+
+            let blocks = try self.queuedBlocks(paths)
+            XCTAssertEqual(blocks.count, 1)
+            XCTAssertEqual(blocks.first?.startedAt, start)
+            XCTAssertNil(blocks.first?.keyboardHits, "The whole block reads the keyboard as not measured")
+            XCTAssertEqual(blocks.first?.mouseClicks, 0)
+        }
+    }
+
+    func testABlockEndedByTheLockTakesNothingMoreAtItsEnd() async throws {
+        let everything = ConsentedPermissions(screenshot: true, webcam: false, keyboard: true, mouse: true,
+                                              activeWindow: true, runningPrograms: true, blurScreenshots: false)
+        let clock = Box(Self.wholeSecondNow())
+        let start = clock.value
+        let screen = TestScreenCapturer()
+        try await withHarness(initialConsent: .granted(everything), screenCapturer: screen, project: Self.hourProject,
+                              clock: clock) { worker, _, _, _, paths in
+            await worker.start(launchedAtLogin: false, startPeriodicTicks: false)
+            clock.value = start.addingTimeInterval(120)
+            await worker.handleSystemEvent(SystemEvent(kind: .screenLocked, at: clock.value))
+            await worker.flushRecorder()
+
+            let block = try XCTUnwrap(self.queuedBlocks(paths).first)
+            XCTAssertEqual(block.endReason, .lock)
+            XCTAssertNil(block.screenshotPngBase64, "The locked screen shows nothing of the work")
+            XCTAssertEqual(screen.captureCount, 0)
+            XCTAssertTrue(block.runningPrograms.isEmpty)
+            XCTAssertTrue(block.activeWindows.isEmpty, "Not the window in front of a locked screen")
+            XCTAssertEqual(block.keyboardHits, 0, "What was measured during the block stays")
+        }
     }
 }

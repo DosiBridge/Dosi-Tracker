@@ -40,6 +40,11 @@ enum TrackerStatus: Equatable, Sendable {
     /// The server no longer accepts the saved password. Tracking stopped; the
     /// queue is kept and uploads once the password is entered again.
     case signInExpired
+    /// Signed in, but the user has not chosen what may be recorded on this
+    /// Mac (or revoked it): nothing is captured until they do. It counts as
+    /// signed in — signing out, switching project and uploading what is
+    /// already queued all work — and the presence heartbeat says `stopped`.
+    case consentRequired
     /// Nothing can be recorded (the local queue cannot be opened); the text
     /// says why.
     case stopped(String)
@@ -71,6 +76,8 @@ enum TrackerStatus: Equatable, Sendable {
             return "Offline — will retry"
         case .signInExpired:
             return "Sign-in expired"
+        case .consentRequired:
+            return "Consent required"
         case .stopped:
             return "Stopped"
         }
@@ -93,7 +100,7 @@ enum TrackerStatus: Equatable, Sendable {
             return .locked
         case .choosingProject:
             return .choosing
-        case .stopped:
+        case .stopped, .consentRequired:
             return .stopped
         case .signedOut, .signInExpired, .connecting, .offline, .choosingWorkspace:
             return nil
@@ -123,7 +130,8 @@ enum TrackerStatus: Equatable, Sendable {
     }
 
     /// Signed in with a usable account in a workspace (an expired one, or
-    /// one still choosing its workspace, does not count).
+    /// one still choosing its workspace, does not count; one waiting for the
+    /// user's consent does).
     var isSignedIn: Bool {
         switch self {
         case .signedOut, .signInExpired, .stopped, .choosingWorkspace:
@@ -154,6 +162,7 @@ struct StatusFacts: Equatable, Sendable {
     /// Asleep, or the session is ending (shutdown, restart, log out).
     var suspended = false
     var away = false
+    /// The user consented to at least one kind of capture on this Mac.
     var consentGranted = false
     var tracking = false
 
@@ -167,6 +176,11 @@ struct StatusFacts: Equatable, Sendable {
         if signInExpired {
             return .signInExpired
         }
+        // Before anything else that keeps tracking off: nothing starts
+        // without it (as on Windows).
+        if !consentGranted {
+            return .consentRequired
+        }
         if paused {
             return timedBreak ? .onBreak : .paused
         }
@@ -175,9 +189,6 @@ struct StatusFacts: Equatable, Sendable {
                 return .choosingProject
             }
             return contacting ? .connecting : .offline
-        }
-        if !consentGranted {
-            return .stopped("Consent required")
         }
         if suspended {
             return .asleep
