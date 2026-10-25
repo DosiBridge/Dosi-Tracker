@@ -52,6 +52,11 @@ mod tray;
 mod ui;
 mod worker;
 
+// The build script's version rules (build.rs), tested with the crate.
+#[cfg(test)]
+#[path = "../build-support/version.rs"]
+mod build_version;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 

@@ -11,8 +11,10 @@ use serde::{Deserialize, Serialize};
 /// `platform` on the wire.
 pub const PLATFORM: &str = "windows";
 
-/// This agent's version (`agentVersion`).
-pub const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// This agent's version (`agentVersion`): `Cargo.toml`'s (or CI's release
+/// version), with the git commit as build metadata when the build knew it
+/// (`build.rs`).
+pub const AGENT_VERSION: &str = env!("DOSI_AGENT_VERSION");
 
 /// Where the install id is kept, under the machine-local data folder.
 const DEVICE_FILE: &str = "device.json";
@@ -277,11 +279,27 @@ mod tests {
     }
 
     #[test]
+    fn the_agent_version_names_the_release_and_fits_the_server() {
+        assert!(AGENT_VERSION.len() <= crate::build_version::MAX_AGENT_VERSION_LEN, "{AGENT_VERSION}");
+        let (release, commit) = match AGENT_VERSION.split_once('+') {
+            Some((release, commit)) => (release, Some(commit)),
+            None => (AGENT_VERSION, None),
+        };
+        assert!(crate::build_version::numeric_core(release).is_ok(), "{AGENT_VERSION}");
+        if option_env!("DOSI_VERSION").is_none_or(|v| v.trim().is_empty()) {
+            assert_eq!(release, env!("CARGO_PKG_VERSION"), "Cargo.toml's version unless CI names one");
+        }
+        if let Some(commit) = commit {
+            assert!(commit.len() >= 7 && commit.chars().all(|c| c.is_ascii_hexdigit()), "{AGENT_VERSION}");
+        }
+    }
+
+    #[test]
     fn the_device_context_is_complete_on_this_machine() {
         let dir = std::env::temp_dir().join(format!("dosi-device-{}", uuid::Uuid::new_v4()));
         let info = DeviceInfo::collect_in(Some(&dir));
         assert_eq!(info.platform, "windows");
-        assert_eq!(info.agent_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(info.agent_version, env!("DOSI_AGENT_VERSION"));
         assert_eq!(DeviceInfo::collect_in(Some(&dir)).device_id, info.device_id, "one id per install");
         assert!(info.device_id.is_some());
         assert_eq!(DeviceInfo::collect_in(None).device_id, None, "nowhere to keep it: none");

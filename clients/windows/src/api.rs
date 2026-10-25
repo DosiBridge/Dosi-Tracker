@@ -95,7 +95,7 @@ pub mod codes {
 fn build_http_client() -> reqwest::Client {
     let builder = || {
         reqwest::Client::builder()
-            .user_agent(concat!("dosi-tracker/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("dosi-tracker/", env!("DOSI_AGENT_VERSION")))
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())

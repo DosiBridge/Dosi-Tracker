@@ -156,7 +156,7 @@ impl TrackerApp {
             label.on_hover_text(format!("{} Next try at {}.", issue.message(), format::local_hm(issue.next_attempt_at())));
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(egui::RichText::new(concat!("v", env!("CARGO_PKG_VERSION"))).font(theme::regular(11.5)).color(theme::FAINT));
+            ui.label(egui::RichText::new(concat!("v", env!("DOSI_AGENT_VERSION"))).font(theme::regular(11.5)).color(theme::FAINT));
         });
     }
 }

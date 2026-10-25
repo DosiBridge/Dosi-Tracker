@@ -1,0 +1,9 @@
+# The Rust toolchain the Windows agent is built, linted and released with.
+# Pinned so a new stable release (and its new clippy lints) never changes a
+# build or breaks CI by itself; CI's windows job uses this file. Bump it on
+# purpose, in its own commit, and fix what the new clippy finds.
+[toolchain]
+channel = "1.97.1"
+components = ["clippy"]
+targets = ["x86_64-pc-windows-msvc"]
+profile = "minimal"

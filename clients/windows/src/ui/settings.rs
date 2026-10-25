@@ -284,7 +284,7 @@ impl TrackerApp {
     }
 
     fn support_card(&mut self, ui: &mut egui::Ui) {
-        section(ui, "Help & support", Some(concat!("Version ", env!("CARGO_PKG_VERSION"))), |ui| {
+        section(ui, "Help & support", Some(concat!("Version ", env!("DOSI_AGENT_VERSION"))), |ui| {
             let mut open_logs = false;
             let mut open_data = false;
             super::equal_row(ui, 2, 8.0, |i, ui| {
