@@ -1,0 +1,79 @@
+# Dependency updates for every ecosystem in the repository. Security updates are raised as soon as an advisory is
+# published (enable "Dependabot security updates" in the repository settings); the weekly version updates below are
+# grouped so a routine week produces a handful of PRs, not dozens. Every PR runs the full CI gate set.
+version: 2
+
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # Backend (.NET 10 + ABP). ABP packages must move in lockstep, so they are always one PR.
+  - package-ecosystem: nuget
+    directory: /backend
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    groups:
+      abp:
+        patterns: ["Volo.Abp.*"]
+      microsoft:
+        patterns: ["Microsoft.*", "System.*", "Npgsql*"]
+      test-tooling:
+        patterns: ["xunit*", "Shouldly", "NSubstitute", "coverlet.*", "Microsoft.NET.Test.Sdk"]
+      minor-and-patch:
+        update-types: ["minor", "patch"]
+
+  # Web dashboard (Next.js).
+  - package-ecosystem: npm
+    directory: /frontend
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    groups:
+      next-react:
+        patterns: ["next", "eslint-config-next", "react", "react-dom", "@types/react", "@types/react-dom"]
+      test-tooling:
+        patterns: ["vitest", "@vitest/*", "@playwright/test", "@axe-core/*", "@testing-library/*", "@stryker-mutator/*", "jsdom", "jest-axe", "@types/jest-axe", "fast-check"]
+      minor-and-patch:
+        update-types: ["minor", "patch"]
+
+  # Desktop agents (Rust).
+  - package-ecosystem: cargo
+    directories:
+      - /clients/windows
+      - /clients/linux
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    groups:
+      minor-and-patch:
+        update-types: ["minor", "patch"]
+
+  # macOS agent (Swift Package Manager).
+  - package-ecosystem: swift
+    directory: /clients/macos
+    schedule:
+      interval: weekly
+      day: monday
+
+  # Container base images.
+  - package-ecosystem: docker
+    directories:
+      - /backend/src/Dosi.Tracker.HttpApi.Host
+      - /backend/src/Dosi.Tracker.DbMigrator
+      - /frontend
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      base-images:
+        patterns: ["*"]

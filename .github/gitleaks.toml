@@ -1,0 +1,17 @@
+# Secret-scan rules for the CI "Secret scan" job (.github/workflows/ci.yml). The repository is public, so any
+# credential that reaches a commit must be treated as leaked: rotate it first, then rewrite nothing — fix forward.
+#
+# The default gitleaks rule set applies unchanged. Allowlist entries below must be narrow (path AND exact match),
+# name the reason, and never cover a value that could be a real secret.
+
+title = "Dosi Tracker gitleaks config"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "ProductionSecretsGuardTests: a made-up connection-string password proving the guard accepts a secret overridden by a later configuration provider. It is test data, not a credential."
+condition = "AND"
+paths = ['''^backend/test/Dosi\.Tracker\.Domain\.Tests/Security/ProductionSecretsGuardTests\.cs$''']
+regexTarget = "match"
+regexes = ['''Password=s3cr3t-from-env;''']

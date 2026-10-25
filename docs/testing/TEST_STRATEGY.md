@@ -51,22 +51,20 @@ Consequences:
 | **E2E + a11y + visual + responsive** | Playwright (+ `@axe-core/playwright`) | `e2e/` | `npm run build` then `npm run test:e2e` | The whole app, production build, driven like a user — in hermetic demo mode (§3) |
 | **Mutation** | StrykerJS (`stryker.config.json`) | mutates `src/lib/**/*.ts` + `src/middleware.ts`, minus the fixture blobs (`mock-data.ts`, `monitor-data.ts`, `host-data.ts`) and `types.ts` | `npm run test:mutation` | That the unit tests actually *detect* faults. Break threshold **78** (ratchet floor); nightly in CI |
 | **Coverage gate** | `@vitest/coverage-v8` (`vitest.config.ts`) | logic layer only (§4) | `npm run test:coverage` | Regression floor: lines **94**, statements **94**, functions **85**, branches **91** |
-| **Dependency audit** | `npm audit` | `package-lock.json` | `npm audit --audit-level=critical` | Known-vuln floor; gate level is itself a ratchet (see below) |
+| **Dependency audit** | `npm audit` | `package-lock.json` | `npm audit --audit-level=high` | Known-vuln floor: any high or critical advisory fails (see below) |
 | **Bundle budget** | `scripts/bundle-budget.mjs` | `.next/static/chunks` after build | `npm run build:budget` | Single chunk ≤ **480 KB**, total JS ≤ **1900 KB** (env-overridable ratchet; tighten, never loosen without written justification) |
 
 CI wiring: `.github/workflows/ci.yml` has two frontend jobs on every PR. **`frontend`** runs
-typecheck → lint → `test:coverage` → `test:arch` → `npm audit --audit-level=critical` → build →
+typecheck → lint → `test:coverage` → `test:arch` → `npm audit --audit-level=high` → build →
 `build:budget`. **`frontend-e2e`** installs chromium + firefox + webkit, builds, and runs
 `npx playwright test --grep-invert "@visual"` — the whole Playwright suite except the screenshot
 assertions, which stay local-only until Linux baselines exist (§11.3).
 `.github/workflows/mutation.yml` runs Stryker nightly (03:00 UTC) and on `workflow_dispatch`.
 `npm run validate` is the local pre-push aggregate (typecheck + lint + test + arch).
 
-The audit gate sits at **`critical`**, not `high`, deliberately: the 8 high-severity advisories in
-the tree are transitive through `next@16.2.10` (sharp → libvips) with no override available — they
-clear only when Next is upgraded. Gating at `high` today would mean a permanently red pipeline that
-teaches everyone to ignore it. **Ratchet the level to `high` in the same PR that lands the Next
-upgrade** (tracked in `TEST_MATRIX.md`).
+The audit gate sits at **`high`**: the Next 16.4 upgrade cleared the high-severity advisories that
+`next@16.2.10` pulled in (sharp → libvips), so any new high or critical advisory now fails the build.
+Moderate and low advisories do not gate; Dependabot (`.github/dependabot.yml`) raises the upgrades.
 
 Tag conventions:
 
