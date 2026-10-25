@@ -527,6 +527,29 @@ impl Tracker {
         self.auth.read().unwrap().active
     }
 
+    /// Are the input hooks attached?
+    pub fn input_hooks_running(&self) -> bool {
+        self.driver.is_input_running()
+    }
+
+    /// Do the input hooks see all of the user's input right now: attached,
+    /// working, and allowed to see both keys and the mouse? Only then is
+    /// their view of "the last input" complete — anything less and Windows'
+    /// own idle clock knows better.
+    pub fn hooks_see_all_input(&self) -> bool {
+        self.input_hooks_running()
+            && self.input.hook_healthy()
+            && self.input.is_keyboard_allowed()
+            && self.input.is_mouse_allowed()
+    }
+
+    /// Seconds since Windows last saw any keyboard or mouse input
+    /// (`GetLastInputInfo`): one tick count, read without any hook. What idle
+    /// and return detection fall back on while the hooks are off.
+    pub fn system_idle_seconds(&self) -> Option<u64> {
+        self.driver.system_idle_seconds()
+    }
+
     /// The app in front now (its executable name), queried through the acquisition provider
     /// ONLY IF actively tracking and active_window is authorized in current policy.
     ///
@@ -863,13 +886,24 @@ pub struct Zone {
 /// `injectedInputEvents` left out, and no per-minute timeline (whose
 /// `active: false` minutes would read as idle) — when the project records
 /// neither keyboard nor mouse, or the input hooks were not working for the
-/// whole block.
+/// whole block. Each count (block, minute, window) of a kind of input that is
+/// not measured is `null`, never a made-up 0.
 pub fn build_activity(block: &BlockSpec<'_>, measured: Measurements, device: &DeviceInfo, zone: Zone) -> Activity {
     let perms = block.perms;
     let (start, end) = (block.started_at.timestamp(), block.ended_at.timestamp());
-    let input_measured = (perms.keyboard || perms.mouse) && measured.input_available;
+    let keyboard_measured = perms.keyboard && measured.input_available;
+    let mouse_measured = perms.mouse && measured.input_available;
+    let input_measured = keyboard_measured || mouse_measured;
+    let only_measured = |keys: &mut Option<u64>, clicks: &mut Option<u64>| {
+        if !keyboard_measured {
+            *keys = None;
+        }
+        if !mouse_measured {
+            *clicks = None;
+        }
+    };
 
-    let active_windows: Vec<WindowInfo> = if !perms.active_window {
+    let mut active_windows: Vec<WindowInfo> = if !perms.active_window {
         Vec::new()
     } else if measured.slices.is_empty() {
         // Too short for a single sample: fall back to the window in front.
@@ -877,7 +911,10 @@ pub fn build_activity(block: &BlockSpec<'_>, measured: Measurements, device: &De
     } else {
         usage::app_usage(&measured.slices, &measured.key_presses, &measured.clicks)
     };
-    let timeline = if input_measured {
+    for window in &mut active_windows {
+        only_measured(&mut window.keyboard_hits, &mut window.mouse_clicks);
+    }
+    let mut timeline = if input_measured {
         usage::minute_timeline(
             start,
             end,
@@ -889,6 +926,9 @@ pub fn build_activity(block: &BlockSpec<'_>, measured: Measurements, device: &De
     } else {
         Vec::new()
     };
+    for minute in &mut timeline {
+        only_measured(&mut minute.keyboard_hits, &mut minute.mouse_clicks);
+    }
 
     // Only a capture the project allows, and blurred when it must be: the
     // server would drop an unblurred one anyway.
@@ -906,8 +946,8 @@ pub fn build_activity(block: &BlockSpec<'_>, measured: Measurements, device: &De
     let activity = Activity {
         description: clean_description(block.description),
         productivity: input_measured.then(|| input::activity_percent(&measured.active_seconds, start, end)),
-        mouse_clicks: measured.clicks.len() as u64,
-        keyboard_hits: measured.key_presses.len() as u64,
+        mouse_clicks: mouse_measured.then_some(measured.clicks.len() as u64),
+        keyboard_hits: keyboard_measured.then_some(measured.key_presses.len() as u64),
         active_windows,
         running_programs: measured.running_programs,
         idle_seconds: input_measured.then(|| usage::idle_seconds(&timeline, start, end)),
@@ -1087,7 +1127,7 @@ mod tests {
         assert_eq!(activity.productivity, Some(70));
         assert_eq!(activity.idle_seconds, Some(3 * 60));
         assert_eq!(activity.injected_input_events, Some(3));
-        assert_eq!((activity.keyboard_hits, activity.mouse_clicks), (6, 1));
+        assert_eq!((activity.keyboard_hits, activity.mouse_clicks), (Some(6), Some(1)));
         assert_eq!(activity.timeline.len(), 10);
         assert_eq!(activity.timeline[0].active_seconds, Some(1));
         assert_eq!(activity.timeline[6].active_seconds, Some(0));
@@ -1134,8 +1174,33 @@ mod tests {
         assert_eq!(activity.productivity, None);
         assert_eq!(activity.idle_seconds, None);
         assert!(activity.timeline.is_empty());
-        // What was seen is still reported.
-        assert_eq!(activity.keyboard_hits, 6);
+        // What was seen is only part of it: not measured, never an
+        // understated count.
+        assert_eq!((activity.keyboard_hits, activity.mouse_clicks), (None, None));
+    }
+
+    #[test]
+    fn only_the_kinds_of_input_recorded_are_counted_the_rest_are_null() {
+        // Keys only: clicks are not measured, anywhere in the block.
+        let perms = CapturePermissions { mouse: false, ..all_allowed() };
+        let measured = Measurements { clicks: Vec::new(), ..measurements() };
+        let activity = build_activity(&block(&perms, None), measured, &device(), zone());
+        assert_eq!((activity.keyboard_hits, activity.mouse_clicks), (Some(6), None));
+        assert!(!activity.timeline.is_empty());
+        assert!(activity.timeline.iter().all(|m| m.keyboard_hits.is_some() && m.mouse_clicks.is_none()));
+        assert!(activity.active_windows.iter().all(|w| w.mouse_clicks.is_none()));
+
+        // Neither: both null, not 0.
+        let none = CapturePermissions { keyboard: false, mouse: false, ..all_allowed() };
+        let measured = Measurements { key_presses: Vec::new(), clicks: Vec::new(), ..measurements() };
+        let activity = build_activity(&block(&none, None), measured, &device(), zone());
+        assert_eq!((activity.keyboard_hits, activity.mouse_clicks), (None, None));
+        assert!(activity.active_windows.iter().all(|w| w.keyboard_hits.is_none() && w.mouse_clicks.is_none()));
+
+        // Measured and nothing typed: a real 0.
+        let measured = Measurements { key_presses: Vec::new(), clicks: Vec::new(), ..measurements() };
+        let activity = build_activity(&block(&all_allowed(), None), measured, &device(), zone());
+        assert_eq!((activity.keyboard_hits, activity.mouse_clicks), (Some(0), Some(0)));
     }
 
     #[test]
@@ -1489,8 +1554,8 @@ mod tests {
         assert_eq!(acq.process_calls(), 0, "zero new process queries");
 
         // 5. But historical accumulators (keys, clicks, slices) are preserved!
-        assert_eq!(activity.keyboard_hits, 1, "historical key presses preserved");
-        assert_eq!(activity.mouse_clicks, 1, "historical clicks preserved");
+        assert_eq!(activity.keyboard_hits, Some(1), "historical key presses preserved");
+        assert_eq!(activity.mouse_clicks, Some(1), "historical clicks preserved");
         assert!(!activity.active_windows.is_empty(), "historical usage slices preserved");
         assert!(activity.webcam_jpg_base64.is_none());
     }
@@ -2081,8 +2146,8 @@ mod tests {
         );
 
         // 10. Prove genuinely authorized historical accumulators ARE preserved:
-        assert_eq!(activity.keyboard_hits, 1, "genuinely authorized historical keyboard events must be preserved");
-        assert_eq!(activity.mouse_clicks, 1, "genuinely authorized historical mouse clicks must be preserved");
+        assert_eq!(activity.keyboard_hits, Some(1), "genuinely authorized historical keyboard events must be preserved");
+        assert_eq!(activity.mouse_clicks, Some(1), "genuinely authorized historical mouse clicks must be preserved");
         assert_eq!(activity.active_windows.len(), 1, "active_windows from authorized historical slices must be preserved");
         assert_eq!(activity.active_windows[0].app_name, "historical_app.exe");
         assert!(activity.active_windows.iter().all(|w| w.app_name != "early_app.exe"), "early_app.exe must not appear in active_windows");

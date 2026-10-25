@@ -20,8 +20,11 @@ pub trait SensorDriver: Send + Sync {
     fn stop_input(&self);
 
     /// Whether input hooks are currently attached and running.
-    #[expect(dead_code, reason = "for inspection and tests")]
     fn is_input_running(&self) -> bool;
+
+    /// Seconds since Windows last saw keyboard or mouse input
+    /// (`GetLastInputInfo`), hooks or not; `None` when it will not say.
+    fn system_idle_seconds(&self) -> Option<u64>;
 
     /// Start the active-window foreground usage sampler.
     fn start_usage(&self, recorder: Arc<UsageRecorder>);
@@ -45,12 +48,20 @@ pub struct FakeSensorDriver {
     pub usage_running: AtomicBool,
     pub last_keyboard_allowed: AtomicBool,
     pub last_mouse_allowed: AtomicBool,
+    /// The simulated Windows idle clock: seconds since the last input, or
+    /// `None` while it says nothing.
+    pub system_idle: Mutex<Option<u64>>,
 }
 
 #[cfg_attr(not(test), expect(dead_code, reason = "for synthetic tests and simulation"))]
 impl FakeSensorDriver {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Simulate Windows' idle clock (no real input is ever read).
+    pub fn set_system_idle_seconds(&self, idle: Option<u64>) {
+        *self.system_idle.lock().unwrap_or_else(|e| e.into_inner()) = idle;
     }
 
     pub fn input_started_count(&self) -> usize {
@@ -96,6 +107,10 @@ impl SensorDriver for FakeSensorDriver {
 
     fn is_input_running(&self) -> bool {
         self.input_running.load(Ordering::SeqCst)
+    }
+
+    fn system_idle_seconds(&self) -> Option<u64> {
+        *self.system_idle.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn start_usage(&self, _recorder: Arc<UsageRecorder>) {
@@ -457,6 +472,10 @@ impl SensorDriver for NativeSensorDriver {
         guard.is_some()
     }
 
+    fn system_idle_seconds(&self) -> Option<u64> {
+        super::input::idle_seconds()
+    }
+
     fn start_usage(&self, recorder: Arc<UsageRecorder>) {
         let mut guard = self.usage_lock.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_some() {
@@ -531,6 +550,7 @@ impl SensorDriver for NativeSensorDriver {
     fn start_input(&self, _counter: Arc<InputCounter>, _keyboard: bool, _mouse: bool) {}
     fn stop_input(&self) {}
     fn is_input_running(&self) -> bool { false }
+    fn system_idle_seconds(&self) -> Option<u64> { None }
     fn start_usage(&self, _recorder: Arc<UsageRecorder>) {}
     fn stop_usage(&self) {}
     fn is_usage_running(&self) -> bool { false }

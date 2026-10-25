@@ -11,16 +11,25 @@ use crate::signing;
 /// Files SQLite keeps next to a database (a hot journal is part of it).
 pub const SQLITE_SIDECARS: [&str; 3] = ["-journal", "-wal", "-shm"];
 
-/// Identify the user a queued row belongs to (the workspace it belongs to is
-/// kept per row, in `workspace_id`).
+/// Identify the account a queued row belongs to: the user *on a server* (the
+/// workspace it belongs to is kept per row, in `workspace_id`).
 ///
 /// Rows are only ever uploaded under the token of the user who captured
-/// them — otherwise signing out and in as someone else would upload the first
-/// user's time and screenshots as the second user's. Emails are
-/// case-insensitive on the server, so they are normalised here. The prefix
-/// keeps keys of older builds (workspace + user) from ever matching.
-pub fn owner_key(username: &str) -> String {
-    format!("user\u{1f}{}", username.trim().to_lowercase())
+/// them, to the server they were captured for — otherwise signing out and in
+/// as someone else would upload the first user's time and screenshots as the
+/// second user's, and the same email on another organisation's server would
+/// receive this one's. Emails are case-insensitive on the server and server
+/// addresses are compared normalized. The prefix keeps keys of older builds
+/// (user only, or workspace + user) from ever matching.
+pub fn owner_key(server: &str, username: &str) -> String {
+    let server = server.trim().trim_end_matches('/').to_lowercase();
+    format!("acct\u{1f}{server}\u{1f}{}", username.trim().to_lowercase())
+}
+
+/// The key the previous build tagged `owner_key`'s user with (no server).
+fn user_only_key(owner_key: &str) -> Option<String> {
+    let user = owner_key.strip_prefix("acct\u{1f}")?.rsplit_once('\u{1f}')?.1;
+    Some(format!("user\u{1f}{user}"))
 }
 
 /// Bounds that keep the offline queue from growing without limit while the
@@ -75,6 +84,8 @@ pub struct PendingRow {
     pub id: i64,
     pub workspace_id: String,
     pub activity: Activity,
+    /// Earlier attempts the server answered with an error about this row.
+    pub attempts: u32,
 }
 
 /// One row of the queue as the window lists it.
@@ -107,6 +118,11 @@ const STRIP_CAPTURES: &str = "CASE WHEN json_valid(payload) \
      THEN json_remove(payload, '$.screenshotPngBase64', '$.screenshotThumbJpgBase64', \
      '$.webcamJpgBase64', '$.screenshotCapturedAt', '$.screenshotBlurred') \
      ELSE payload END";
+
+/// SQL condition of a row the uploader may send now: pending, in a
+/// workspace, not held, and not deferred past now.
+const DUE: &str = "synced = 0 AND workspace_id IS NOT NULL AND held IS NULL \
+     AND (retry_at IS NULL OR retry_at <= CAST(strftime('%s', 'now') AS INTEGER))";
 
 /// The bytes of a row's images, computed from its JSON (for rows queued
 /// before the size was recorded at enqueue time).
@@ -146,6 +162,12 @@ impl std::error::Error for DamagedDatabase {}
 ///
 /// Every row carries its `owner` ([`owner_key`]); uploads only ever read the
 /// signed-in account's rows.
+///
+/// A pending row the uploader must not send right now is either *held* —
+/// its workspace refused it (`held` names why; [`Storage::hold_workspace`])
+/// until that workspace is used again ([`Storage::release_workspace`]) — or
+/// *deferred* until `retry_at` after the server answered an error about that
+/// row alone ([`Storage::defer`]). Neither stops the rows behind it.
 pub struct Storage {
     conn: Connection,
     /// Device signing key loaded at startup; `None` only in tests that call
@@ -162,11 +184,13 @@ impl Storage {
 
     /// Open (and migrate) the queue.
     ///
-    /// `legacy_owner` is the account signed in when this build first opens a
-    /// database created before rows were tagged with an owner: those untagged
-    /// rows were captured by that account, so they are assigned to it — once,
-    /// at migration time. Without a saved account they stay untagged, are never
-    /// uploaded, and are purged by [`Storage::purge_foreign_pending_older_than`].
+    /// `legacy_owner` is the [`owner_key`] of the account signed in when this
+    /// build opens the queue. Rows queued by older builds were captured by
+    /// that account, so they are assigned to it (and so to its server): rows
+    /// never tagged with an owner (once, when the column is added), and rows
+    /// tagged with its user alone, before owners named their server. Without
+    /// a saved account they keep their old tags, are never uploaded, and are
+    /// purged by [`Storage::purge_foreign_pending_older_than`].
     pub fn open(path: &str, legacy_owner: Option<&str>) -> Result<Self> {
         Self::open_with(path, legacy_owner, VACUUM_SWITCH_MAX_LIVE_BYTES)
     }
@@ -226,6 +250,17 @@ impl Storage {
         add_column_if_missing(&tx, "ended_at", "TEXT NULL")?;
         add_column_if_missing(&tx, "sig", "TEXT NULL")?;
         add_column_if_missing(&tx, "workspace_id", "TEXT NULL")?;
+        add_column_if_missing(&tx, "attempts", "INTEGER NOT NULL DEFAULT 0")?;
+        add_column_if_missing(&tx, "retry_at", "INTEGER NULL")?;
+        add_column_if_missing(&tx, "held", "TEXT NULL")?;
+        // Owners once named the user alone: those rows were recorded for the
+        // saved sign-in's server.
+        if let Some((owner, user_only)) = legacy_owner.and_then(|owner| Some((owner, user_only_key(owner)?))) {
+            let claimed = tx.execute("UPDATE activities SET owner = ?1 WHERE owner = ?2", [owner, user_only.as_str()])?;
+            if claimed > 0 {
+                tracing::info!(claimed, "assigned queued activities to the saved account's server");
+            }
+        }
         if summary_columns_added {
             tx.execute(
                 "UPDATE activities SET \
@@ -315,23 +350,24 @@ impl Storage {
         Ok(self.pending_rows(owner, after_id, limit)?.into_iter().map(|row| (row.id, row.activity)).collect())
     }
 
-    /// [`Storage::pending_batch`], with each row's workspace. Rows without a
-    /// workspace (queued by older builds) are never uploaded.
+    /// [`Storage::pending_batch`], with each row's workspace: the rows that
+    /// may be sent now (neither held nor deferred). Rows without a workspace
+    /// (queued by older builds) are never uploaded.
     pub fn pending_rows(&self, owner: &str, after_id: i64, limit: u32) -> Result<Vec<PendingRow>> {
-        let rows: Vec<(i64, String, Option<String>, String)> = {
-            let mut stmt = self.conn.prepare(
-                "SELECT id, payload, sig, workspace_id FROM activities \
-                 WHERE synced = 0 AND owner = ?1 AND workspace_id IS NOT NULL AND id > ?2 \
-                 ORDER BY id LIMIT ?3",
-            )?;
+        let rows: Vec<(i64, String, Option<String>, String, i64)> = {
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT id, payload, sig, workspace_id, attempts FROM activities \
+                 WHERE {DUE} AND owner = ?1 AND id > ?2 \
+                 ORDER BY id LIMIT ?3"
+            ))?;
             let mapped = stmt.query_map(rusqlite::params![owner, after_id, limit], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
             })?;
             mapped.collect::<rusqlite::Result<_>>()?
         };
 
         let mut out = Vec::with_capacity(rows.len());
-        for (id, payload, sig, workspace_id) in rows {
+        for (id, payload, sig, workspace_id, attempts) in rows {
             match serde_json::from_str::<Activity>(&payload) {
                 Ok(mut activity) => {
                     // Propagate the stored signature into the Activity so the
@@ -339,7 +375,8 @@ impl Storage {
                     if activity.payload_signature.is_none() {
                         activity.payload_signature = sig;
                     }
-                    out.push(PendingRow { id, workspace_id, activity });
+                    let attempts = u32::try_from(attempts).unwrap_or(0);
+                    out.push(PendingRow { id, workspace_id, activity, attempts });
                 }
                 Err(e) => {
                     tracing::warn!(id, ?e, "queued activity is unreadable; parking it");
@@ -350,7 +387,8 @@ impl Storage {
         Ok(out)
     }
 
-    /// How many of `owner`'s activities are waiting to upload.
+    /// How many of `owner`'s activities are waiting to upload (held and
+    /// deferred ones included).
     pub fn pending_count(&self, owner: &str) -> Result<u32> {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM activities WHERE synced = 0 AND owner = ?1 AND workspace_id IS NOT NULL",
@@ -358,6 +396,62 @@ impl Storage {
             |row| row.get(0),
         )?;
         Ok(count.max(0) as u32)
+    }
+
+    /// How many of `owner`'s activities may be sent now.
+    pub fn due_count(&self, owner: &str) -> Result<u32> {
+        let count: i64 = self.conn.query_row(
+            &format!("SELECT COUNT(*) FROM activities WHERE {DUE} AND owner = ?1"),
+            [owner],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as u32)
+    }
+
+    /// When the earliest of `owner`'s deferred rows may be sent again.
+    pub fn next_retry_at(&self, owner: &str) -> Result<Option<DateTime<Utc>>> {
+        let at: Option<i64> = self.conn.query_row(
+            "SELECT MIN(retry_at) FROM activities \
+             WHERE synced = 0 AND owner = ?1 AND workspace_id IS NOT NULL AND held IS NULL AND retry_at IS NOT NULL",
+            [owner],
+            |row| row.get(0),
+        )?;
+        Ok(at.and_then(|secs| DateTime::from_timestamp(secs, 0)))
+    }
+
+    /// The server answered an error about this row alone: count the attempt,
+    /// say why, and leave it until `retry_at`. Returns the attempts so far.
+    pub fn defer(&self, id: i64, reason: &str, retry_at: DateTime<Utc>) -> Result<u32> {
+        self.conn.execute(
+            "UPDATE activities SET attempts = attempts + 1, error = ?2, retry_at = ?3 WHERE id = ?1 AND synced = 0",
+            rusqlite::params![id, reason, retry_at.timestamp()],
+        )?;
+        let attempts: i64 = self
+            .conn
+            .query_row("SELECT attempts FROM activities WHERE id = ?1", [id], |row| row.get(0))
+            .optional()?
+            .unwrap_or(0);
+        Ok(u32::try_from(attempts).unwrap_or(0))
+    }
+
+    /// The server refused `workspace` for `owner` (lost access, archived):
+    /// hold all of its pending rows, with `reason`, until it is used again.
+    /// They are not sent again meanwhile — not even on a timer.
+    pub fn hold_workspace(&self, owner: &str, workspace: &str, reason: &str) -> Result<usize> {
+        Ok(self.conn.execute(
+            "UPDATE activities SET held = ?3, error = ?3 WHERE synced = 0 AND owner = ?1 AND workspace_id = ?2",
+            rusqlite::params![owner, workspace, reason],
+        )?)
+    }
+
+    /// `owner` uses `workspace` again (signed in to it, switched to it): its
+    /// held rows are sent again.
+    pub fn release_workspace(&self, owner: &str, workspace: &str) -> Result<usize> {
+        Ok(self.conn.execute(
+            "UPDATE activities SET held = NULL, retry_at = NULL \
+             WHERE synced = 0 AND owner = ?1 AND workspace_id = ?2 AND held IS NOT NULL",
+            rusqlite::params![owner, workspace],
+        )?)
     }
 
     /// `owner`'s newest rows, queued and parked, newest first — what the
@@ -450,13 +544,14 @@ impl Storage {
         Ok(count.max(0) as u32)
     }
 
-    /// Drop parked rows older than `days`. Without this the queue — and the
-    /// base64 captures inside it — would grow without bound for the life of the
-    /// install. Returns how many rows were removed.
+    /// Drop parked rows, and rows held for a workspace that never came back,
+    /// older than `days`. Without this the queue — and the base64 captures
+    /// inside it — would grow without bound for the life of the install.
+    /// Returns how many rows were removed.
     pub fn purge_rejected_older_than(&self, days: u32) -> Result<usize> {
         let removed = self.conn.execute(
             "DELETE FROM activities \
-             WHERE synced = 2 AND created_at < datetime('now', ?1)",
+             WHERE (synced = 2 OR (synced = 0 AND held IS NOT NULL)) AND created_at < datetime('now', ?1)",
             [format!("-{days} days")],
         )?;
         Ok(removed)
@@ -633,16 +728,18 @@ fn add_column_if_missing(conn: &Connection, column: &str, decl: &str) -> Result<
 mod tests {
     use super::*;
 
-    const ALICE: &str = "user\u{1f}alice@acme.com";
-    const BOB: &str = "user\u{1f}bob@acme.com";
+    const ALICE: &str = "acct\u{1f}https://tracker.acme.com\u{1f}alice@acme.com";
+    const BOB: &str = "acct\u{1f}https://tracker.acme.com\u{1f}bob@acme.com";
+    /// The same email on another organisation's server.
+    const ALICE_ELSEWHERE: &str = "acct\u{1f}https://tracker.globex.com\u{1f}alice@acme.com";
     const WS: &str = "w1";
 
     fn sample(project: &str) -> Activity {
         let now = Utc::now();
         Activity {
             productivity: Some(40),
-            mouse_clicks: 1,
-            keyboard_hits: 2,
+            mouse_clicks: Some(1),
+            keyboard_hits: Some(2),
             ..Activity::new(project, now, now)
         }
     }
@@ -695,10 +792,98 @@ mod tests {
 
     #[test]
     fn owner_key_is_case_and_whitespace_insensitive() {
-        assert_eq!(owner_key(" Alice@Acme.com "), ALICE);
-        assert_ne!(owner_key("alice@acme.com"), owner_key("bob@acme.com"));
-        // Keys of older builds (workspace + user) never match.
-        assert_ne!(owner_key("alice@acme.com"), "acme\u{1f}alice@acme.com");
+        assert_eq!(owner_key("https://Tracker.Acme.com/", " Alice@Acme.com "), ALICE);
+        assert_ne!(owner_key("https://tracker.acme.com", "alice@acme.com"), owner_key("https://tracker.acme.com", "bob@acme.com"));
+        // Keys of older builds (user only, or workspace + user) never match.
+        assert_ne!(owner_key("https://tracker.acme.com", "alice@acme.com"), "user\u{1f}alice@acme.com");
+        assert_ne!(owner_key("https://tracker.acme.com", "alice@acme.com"), "acme\u{1f}alice@acme.com");
+        assert_eq!(user_only_key(ALICE).as_deref(), Some("user\u{1f}alice@acme.com"));
+        assert_eq!(user_only_key("user\u{1f}alice@acme.com"), None);
+    }
+
+    #[test]
+    fn the_same_email_on_another_server_is_another_account() {
+        let s = store();
+        s.enqueue(&with_captures("acme-work"), ALICE, WS).unwrap();
+        assert_eq!(owner_key("https://tracker.globex.com", "alice@acme.com"), ALICE_ELSEWHERE);
+        // Signed in with the same email on another organisation's server:
+        // nothing recorded for the first one is ever sent there.
+        assert!(pending(&s, ALICE_ELSEWHERE).is_empty());
+        assert_eq!(s.due_count(ALICE_ELSEWHERE).unwrap(), 0);
+        assert_eq!(s.pending_count(ALICE).unwrap(), 1);
+        // ...and it expires there like any other account's rows.
+        let id = pending(&s, ALICE)[0].0;
+        backdate(&s, id, 20);
+        assert_eq!(s.purge_foreign_pending_older_than(Some(ALICE_ELSEWHERE), 14).unwrap(), 1);
+    }
+
+    #[test]
+    fn rows_tagged_with_the_user_alone_move_to_the_saved_accounts_server() {
+        let path = temp_db_path();
+        let path_str = path.to_string_lossy().into_owned();
+        {
+            let s = Storage::open(&path_str, None).unwrap();
+            // As the previous build tagged them: the user, no server.
+            for (owner, project) in [("user\u{1f}alice@acme.com", "alice"), ("user\u{1f}bob@acme.com", "bob")] {
+                s.enqueue(&sample(project), owner, WS).unwrap();
+            }
+        }
+        {
+            let s = Storage::open(&path_str, Some(ALICE)).unwrap();
+            let alice: Vec<String> = pending(&s, ALICE).into_iter().map(|(_, a)| a.project_id).collect();
+            assert_eq!(alice, ["alice"], "the saved sign-in's rows, now on its server");
+            assert_eq!(owned(&s, "user\u{1f}bob@acme.com"), 1, "another user's rows keep their old tag (never uploaded)");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_held_workspace_waits_without_holding_up_the_others() {
+        let s = store();
+        let w1 = s.enqueue(&sample("p1"), ALICE, "w1").unwrap();
+        let w2 = s.enqueue(&sample("p2"), ALICE, "w2").unwrap();
+        s.enqueue(&sample("bob"), BOB, "w1").unwrap();
+
+        assert_eq!(s.hold_workspace(ALICE, "w1", "No access to Acme.").unwrap(), 1, "only Alice's rows");
+        let due: Vec<i64> = pending(&s, ALICE).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(due, [w2]);
+        assert_eq!(s.due_count(ALICE).unwrap(), 1);
+        assert_eq!(s.pending_count(ALICE).unwrap(), 2, "still shown as waiting");
+        assert_eq!(s.next_retry_at(ALICE).unwrap(), None, "no timer: it waits for the workspace");
+        assert_eq!(s.recent_rows(ALICE, 10).unwrap().iter().find(|r| r.id == w1).unwrap().reason.as_deref(), Some("No access to Acme."));
+        assert_eq!(s.due_count(BOB).unwrap(), 1);
+
+        assert_eq!(s.release_workspace(ALICE, "w1").unwrap(), 1);
+        assert_eq!(s.due_count(ALICE).unwrap(), 2);
+        assert_eq!(s.release_workspace(ALICE, "w1").unwrap(), 0, "nothing left to release");
+
+        // Held for longer than the retention: purged with the parked rows.
+        s.hold_workspace(ALICE, "w1", "archived").unwrap();
+        backdate(&s, w1, 20);
+        backdate(&s, w2, 20);
+        assert_eq!(s.purge_rejected_older_than(14).unwrap(), 1, "the held row only");
+        assert_eq!(s.pending_count(ALICE).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_deferred_row_waits_for_its_time_and_counts_its_attempts() {
+        let s = store();
+        let first = s.enqueue(&sample("p1"), ALICE, WS).unwrap();
+        let second = s.enqueue(&sample("p2"), ALICE, WS).unwrap();
+        let later = Utc::now() + chrono::Duration::minutes(10);
+
+        assert_eq!(s.defer(first, "HTTP 422 Tracker:New: ?", later).unwrap(), 1);
+        let due = s.pending_rows(ALICE, 0, 10).unwrap();
+        assert_eq!(due.iter().map(|r| r.id).collect::<Vec<_>>(), [second], "the next row goes on");
+        assert_eq!(s.due_count(ALICE).unwrap(), 1);
+        assert_eq!(s.next_retry_at(ALICE).unwrap().map(|t| t.timestamp()), Some(later.timestamp()));
+
+        // Its time has come: due again, with the attempts so far.
+        assert_eq!(s.defer(first, "again", Utc::now() - chrono::Duration::seconds(1)).unwrap(), 2);
+        let row = s.pending_rows(ALICE, 0, 10).unwrap().into_iter().find(|r| r.id == first).unwrap();
+        assert_eq!(row.attempts, 2);
+        assert_eq!(s.recent_rows(ALICE, 10).unwrap().iter().find(|r| r.id == first).unwrap().reason.as_deref(), Some("again"));
+        assert_eq!(s.defer(999, "gone", later).unwrap(), 0, "an unknown row");
     }
 
     #[test]
@@ -850,7 +1035,7 @@ mod tests {
 
         let row = raw_payload(&s, id);
         assert!(!row.has_captures());
-        assert_eq!((row.project_id.as_str(), row.productivity, row.keyboard_hits), ("p1", Some(40), 2));
+        assert_eq!((row.project_id.as_str(), row.productivity, row.keyboard_hits), ("p1", Some(40), Some(2)));
         assert!(raw_payload(&s, other).has_captures(), "only that row");
         assert_eq!(pending(&s, ALICE).len(), 2, "still queued, to be resent");
         assert!(!s.recent_rows(ALICE, 10).unwrap().iter().find(|r| r.id == id).unwrap().has_captures);

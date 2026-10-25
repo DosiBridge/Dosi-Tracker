@@ -626,9 +626,9 @@ pub fn idle_millis(now_tick: u64, last_input_tick: u32) -> u64 {
 }
 
 /// Seconds since the last keyboard or mouse input anywhere in this session
-/// (`GetLastInputInfo`), or `None` when Windows will not say. Software-
-/// injected input counts here too; see [`InputCounter::last_input_at`].
-#[expect(dead_code, reason = "read by the worker's idle detection")]
+/// (`GetLastInputInfo`), or `None` when Windows will not say. A single tick
+/// count: no key, position or content, and no hook. Software-injected input
+/// counts here too; see [`InputCounter::last_input_at`].
 pub fn idle_seconds() -> Option<u64> {
     system_idle_millis().map(|ms| ms / 1000)
 }

@@ -468,8 +468,9 @@ impl TrackerApp {
                     tray.notify(notice_title(&notice.kind), &text, warning);
                 }
             }
-            // An expired sign-in replaces the window with its own form.
-            if notice.kind != NoticeKind::SignInExpired {
+            // An expired sign-in (or a removed computer) replaces the window
+            // with the sign-in form, which says why.
+            if !matches!(notice.kind, NoticeKind::SignInExpired | NoticeKind::DeviceRevoked) {
                 self.show_toast(tone, text);
             }
         }
@@ -683,7 +684,7 @@ fn notice_tone(kind: &NoticeKind) -> Tone {
     match kind {
         NoticeKind::TrackingStartedAutomatically { .. } | NoticeKind::ChooseProject => Tone::Info,
         NoticeKind::ProjectUnavailable { .. } | NoticeKind::QueueReset { .. } | NoticeKind::WorkspaceLost { .. } => Tone::Warning,
-        NoticeKind::SignInExpired => Tone::Danger,
+        NoticeKind::SignInExpired | NoticeKind::DeviceRevoked => Tone::Danger,
     }
 }
 
@@ -695,7 +696,10 @@ fn notice_title(kind: &NoticeKind) -> &'static str {
         NoticeKind::ProjectUnavailable { .. } => "Project no longer available",
         NoticeKind::QueueReset { .. } => "Local queue reset",
         NoticeKind::SignInExpired => "Sign-in expired",
+        NoticeKind::WorkspaceLost { refusal: crate::api::WorkspaceRefusal::Archived, .. } => "Workspace archived",
+        NoticeKind::WorkspaceLost { refusal: crate::api::WorkspaceRefusal::Required, .. } => "Workspace not received",
         NoticeKind::WorkspaceLost { .. } => "Workspace access removed",
+        NoticeKind::DeviceRevoked => "Computer removed",
     }
 }
 

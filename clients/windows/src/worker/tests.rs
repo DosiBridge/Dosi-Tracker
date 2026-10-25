@@ -140,8 +140,8 @@ fn block(row_id: i64) -> RecentBlock {
         started_at: at,
         ended_at: at,
         productivity: 50,
-        keyboard_hits: 0,
-        mouse_clicks: 0,
+        keyboard_hits: Some(0),
+        mouse_clicks: Some(0),
         screenshot: false,
         upload: UploadState::Queued,
     }
@@ -186,10 +186,18 @@ fn task_notes_are_one_tidy_line_of_at_most_two_hundred_characters() {
 // ---- The worker, driven through a fake machine -----------------------------------------
 
 /// A machine whose clocks, input and screen the test controls.
+///
+/// Input is modelled as a real machine sees it: the user's own input
+/// (`inputs`) reaches the input hooks only while they are attached and only
+/// from the moment they were; Windows' idle clock sees all of it, plus
+/// software-injected input (`injected`, a mouse jiggler).
 struct FakeMachine {
     now: Mutex<DateTime<Utc>>,
     awake_ms: Mutex<u64>,
     inputs: Mutex<Vec<DateTime<Utc>>>,
+    injected: Mutex<Vec<DateTime<Utc>>>,
+    /// Since when the input hooks are attached (`None`: they are not).
+    hooks_since: Mutex<Option<DateTime<Utc>>>,
     captures: Mutex<u32>,
     fraction: Mutex<f64>,
     device: DeviceInfo,
@@ -218,6 +226,8 @@ impl FakeMachine {
             now: Mutex::new(start),
             awake_ms: Mutex::new(1_000_000),
             inputs: Mutex::new(Vec::new()),
+            injected: Mutex::new(Vec::new()),
+            hooks_since: Mutex::new(None),
             captures: Mutex::new(0),
             fraction: Mutex::new(0.5),
             device: DeviceInfo {
@@ -262,6 +272,26 @@ impl FakeMachine {
 
     fn input_at(&self, when: DateTime<Utc>) {
         self.inputs.lock().unwrap().push(when);
+    }
+
+    /// Software-injected input (a mouse jiggler): only Windows' idle clock
+    /// sees it.
+    fn injected_at(&self, when: DateTime<Utc>) {
+        self.injected.lock().unwrap().push(when);
+    }
+
+    /// What Windows' idle clock says: the latest input of any kind.
+    fn system_last_input(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        let real = self.inputs.lock().unwrap().clone();
+        let injected = self.injected.lock().unwrap().clone();
+        real.into_iter().chain(injected).filter(|t| *t <= now).max()
+    }
+
+    /// The hooks see both kinds of input (as the real tracker requires).
+    fn hooks_see_all(&self) -> bool {
+        self.is_input_running()
+            && self.last_keyboard.load(std::sync::atomic::Ordering::SeqCst)
+            && self.last_mouse.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn captures(&self) -> u32 {
@@ -335,11 +365,25 @@ impl Machine for FakeMachine {
     }
 
     fn last_input(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-        self.inputs.lock().unwrap().iter().copied().filter(|t| *t <= now).max()
+        if self.hooks_see_all() {
+            self.inputs.lock().unwrap().iter().copied().filter(|t| *t <= now).max()
+        } else {
+            self.system_last_input(now)
+        }
     }
 
     fn first_input_after(&self, since: DateTime<Utc>, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-        self.inputs.lock().unwrap().iter().copied().filter(|t| *t > since && *t <= now).min()
+        if self.hooks_see_all() {
+            // Only what happened while the hooks were attached.
+            let attached = self.hooks_since.lock().unwrap().unwrap_or(since);
+            self.inputs.lock().unwrap().iter().copied().filter(|t| *t > since && *t >= attached && *t <= now).min()
+        } else {
+            self.system_last_input(now).filter(|last| *last > since)
+        }
+    }
+
+    fn input_hooks_running(&self) -> bool {
+        self.is_input_running()
     }
 
     fn capture_screen(&self, blur: bool) -> Option<crate::tracking::ProvenanceScreenCapture> {
@@ -520,9 +564,11 @@ impl Machine for FakeMachine {
         if keyboard || mouse {
             if !self.input_running.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 self.input_starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                *self.hooks_since.lock().unwrap() = Some(self.now());
             }
         } else if self.input_running.swap(false, std::sync::atomic::Ordering::SeqCst) {
             self.input_stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *self.hooks_since.lock().unwrap() = None;
         }
 
         if active_window {
@@ -661,7 +707,7 @@ impl Harness {
     }
 
     fn owner(&self) -> String {
-        storage::owner_key("alice@acme.com")
+        storage::owner_key("https://localhost:6006", "alice@acme.com")
     }
 
     /// The queued blocks, oldest first.
@@ -694,6 +740,16 @@ impl Harness {
 
     fn tracking_since(&self) -> Option<DateTime<Utc>> {
         self.state.snapshot().tracking_since
+    }
+
+    /// The user comes back at `when` after being away: Windows' idle clock
+    /// sees it on the next tick, the input hooks are attached to confirm it,
+    /// and they see the user still at it a moment later.
+    fn come_back(&mut self, when: DateTime<Utc>) {
+        self.machine.input_at(when);
+        self.tick(when + TimeDelta::seconds(1));
+        self.machine.input_at(when + TimeDelta::seconds(2));
+        self.tick(when + TimeDelta::seconds(3));
     }
 }
 
@@ -813,8 +869,7 @@ fn a_break_that_ends_while_the_user_is_away_resumes_with_their_return() {
     assert_eq!(h.status(), TrackerStatus::Away);
     assert!(h.tracking_since().is_none());
 
-    h.machine.input_at(at("10:31:10"));
-    h.tick(at("10:31:11"));
+    h.come_back(at("10:31:10"));
     assert_eq!(h.status(), TrackerStatus::Tracking);
     assert_eq!(h.tracking_since(), Some(at("10:31:10")));
     assert!(h.state.snapshot().away_prompt.is_none(), "a break is not time to ask about");
@@ -856,8 +911,7 @@ fn time_away_can_be_kept_after_the_sign_in_expired() {
     let mut h = tracking();
     h.machine.input_at(at("10:02:00"));
     h.tick(at("10:07:00"));
-    h.machine.input_at(at("10:40:00"));
-    h.tick(at("10:40:01"));
+    h.come_back(at("10:40:00"));
     assert!(h.state.snapshot().away_prompt.is_some());
     let owner = h.owner();
     h.worker.on_upload(UploadEvent::SignInExpired { owner, reason: "Invalid username or password!".into() });
@@ -873,7 +927,7 @@ fn time_away_can_be_kept_after_the_sign_in_expired() {
 #[test]
 fn upload_events_of_the_previous_account_are_ignored() {
     let mut h = tracking();
-    let other = storage::owner_key("bob@acme.com");
+    let other = storage::owner_key("https://localhost:6006", "bob@acme.com");
     h.worker.on_upload(UploadEvent::Projects { owner: other.clone(), projects: vec![project("p9", 5)] });
     h.worker.on_upload(UploadEvent::SignInExpired { owner: other, reason: "Invalid username or password!".into() });
     h.worker.publish();
@@ -896,8 +950,7 @@ fn going_idle_ends_the_block_at_the_last_input_and_asks_about_the_time_away() {
     assert!(h.heartbeats().contains(&PresenceStatus::Idle));
 
     // Back at 10:30: a new block starts there, and the question is asked.
-    h.machine.input_at(at("10:30:00"));
-    h.tick(at("10:30:01"));
+    h.come_back(at("10:30:00"));
     assert_eq!(h.status(), TrackerStatus::Tracking);
     assert_eq!(h.tracking_since(), Some(at("10:30:00")));
     let prompt = h.state.snapshot().away_prompt.expect("asked");
@@ -929,8 +982,7 @@ fn time_away_is_discarded_unless_kept() {
     let mut h = tracking();
     h.machine.input_at(at("10:02:00"));
     h.tick(at("10:07:00"));
-    h.machine.input_at(at("10:40:00"));
-    h.tick(at("10:40:01"));
+    h.come_back(at("10:40:00"));
     assert!(h.state.snapshot().away_prompt.is_some());
     h.command(at("10:40:05"), Command::ResolveAway { keep: false });
     assert_eq!(h.queued().len(), 1, "only the block before leaving");
@@ -1191,8 +1243,8 @@ fn a_refused_password_stops_tracking_keeps_the_queue_and_asks_for_it_again() {
     };
     assert_eq!(account.server, AppConfig::default().api_base_url);
     // The saved workspace is picked again among several.
-    let workspaces = vec![Workspace { id: "w0".into(), name: "Other".into(), role: None, plan_name: None, is_owner: false },
-        Workspace { id: "w1".into(), name: "Acme".into(), role: None, plan_name: None, is_owner: false }];
+    let workspaces = vec![Workspace { id: "w0".into(), name: "Other".into(), role: None, plan_name: None, is_owner: false, is_archived: false },
+        Workspace { id: "w1".into(), name: "Acme".into(), role: None, plan_name: None, is_owner: false, is_archived: false }];
     h.worker.on_control(ControlEvent::SignedIn { account, workspaces: Ok(workspaces) });
     h.worker.publish();
     assert_eq!(h.status(), TrackerStatus::Tracking);
@@ -1225,7 +1277,7 @@ fn a_sign_in_with_a_server_address_saves_it() {
         other => panic!("expected a sign-in check, got {other:?}"),
     };
     assert_eq!(account.server, "https://tracker.acme.com");
-    let only = Workspace { id: "w1".into(), name: "Acme".into(), role: None, plan_name: None, is_owner: false };
+    let only = Workspace { id: "w1".into(), name: "Acme".into(), role: None, plan_name: None, is_owner: false, is_archived: false };
     h.worker.on_control(ControlEvent::SignedIn { account, workspaces: Ok(vec![only]) });
     h.worker.on_control(ControlEvent::Projects(vec![project("a", 5), project("b", 5)]));
     h.worker.publish();
@@ -1361,7 +1413,7 @@ async fn e2e_capture_upload_and_totals() {
     store.enqueue(&activity, &owner, &workspace.id).unwrap();
     let queued = store.pending_batch(&owner, 0, 1).unwrap().remove(0).1;
     println!(
-        "queued: {} windows, {} timeline minutes, screenshot {}, thumb {}, keys {}, clicks {}, {:?}%",
+        "queued: {} windows, {} timeline minutes, screenshot {}, thumb {}, keys {:?}, clicks {:?}, {:?}%",
         queued.active_windows.len(),
         queued.timeline.len(),
         queued.screenshot_png_base64.is_some(),
@@ -1479,7 +1531,7 @@ fn starting_a_stretch_resets_the_clocks_and_clears_a_pause() {
 // ---- Choosing the workspace -----------------------------------------------------------
 
 fn workspace(id: &str, name: &str) -> Workspace {
-    Workspace { id: id.into(), name: name.into(), role: Some("Member".into()), plan_name: None, is_owner: false }
+    Workspace { id: id.into(), name: name.into(), role: Some("Member".into()), plan_name: None, is_owner: false, is_archived: false }
 }
 
 /// Type the email and password; the server accepts them.
@@ -1659,22 +1711,25 @@ fn losing_access_to_the_workspace_stops_tracking_and_asks_for_another() {
     h.machine.input_at(at("10:04:00"));
     h.machine.set(at("10:04:00"));
     h.control_requests();
-    h.worker.on_upload(UploadEvent::WorkspaceLost { owner: h.owner(), workspace_id: "w-other".into() });
+    h.worker.on_upload(UploadEvent::WorkspaceLost { owner: h.owner(), workspace_id: "w-other".into(), refusal: crate::api::WorkspaceRefusal::NotMember });
     h.worker.publish();
     assert_eq!(h.status(), TrackerStatus::Tracking, "rows of another workspace: not about this one");
 
-    h.worker.on_control(ControlEvent::WorkspaceLost("w1".into()));
+    h.worker.on_control(ControlEvent::WorkspaceLost("w1".into(), crate::api::WorkspaceRefusal::NotMember));
     h.worker.publish();
     let snapshot = h.state.snapshot();
     assert_eq!(snapshot.status, TrackerStatus::ChooseProject);
     assert!(snapshot.tracking_since.is_none());
     assert_eq!(snapshot.workspace_lost.as_deref(), Some("Acme"));
     assert_eq!(snapshot.workspace_note.as_deref(), Some("You no longer have access to Acme."));
-    assert!(snapshot.notices.iter().any(|n| matches!(&n.kind, NoticeKind::WorkspaceLost { name } if name == "Acme")));
+    assert!(snapshot.notices.iter().any(|n| matches!(&n.kind, NoticeKind::WorkspaceLost { name, .. } if name == "Acme")));
     assert!(snapshot.finding_workspaces);
     assert!(h.control_requests().iter().any(|r| matches!(r, ControlRequest::MyWorkspaces)), "the picker is opened");
-    let rows = h.worker.store.pending_rows(&h.owner(), 0, 10).unwrap();
-    assert_eq!((rows[0].activity.ended_at, rows[0].workspace_id.as_str()), (at("10:04:00"), "w1"), "the work is kept, waiting");
+    // The work is kept, held: never re-sent to a workspace that refuses it.
+    let rows = h.worker.store.recent_rows(&h.owner(), 10).unwrap();
+    assert_eq!((rows.len(), rows[0].ended_at, rows[0].status), (1, Some(at("10:04:00")), storage::RowStatus::Queued));
+    assert_eq!(rows[0].reason.as_deref(), Some("You no longer have access to Acme."));
+    assert_eq!(h.worker.store.due_count(&h.owner()).unwrap(), 0);
     assert!(h.heartbeats().is_empty(), "no heartbeat without a workspace");
 
     // Another workspace is chosen: tracking can start there.
@@ -1684,6 +1739,7 @@ fn losing_access_to_the_workspace_stops_tracking_and_asks_for_another() {
     h.worker.publish();
     let snapshot = h.state.snapshot();
     assert_eq!((snapshot.status, snapshot.workspace.as_str(), snapshot.workspace_lost.as_deref()), (TrackerStatus::Tracking, "Globex", None));
+    assert_eq!(h.worker.store.due_count(&h.owner()).unwrap(), 0, "Acme's rows stay held while tracking elsewhere");
 }
 
 #[test]
@@ -1768,12 +1824,19 @@ fn sensor_lifecycle_stops_on_away_and_resumes_on_return() {
     assert!(!h.machine.is_input_running(), "input hooks must detach when away");
     assert!(!h.machine.is_usage_running(), "window sampler must stop when away");
 
-    // User comes back: input at 10:16:00
+    // Input at 10:16:00, seen by Windows' idle clock: only the input hooks
+    // attach, to confirm it is the user's own.
     h.machine.input_at(at("10:16:00"));
-    h.machine.set(at("10:16:01"));
-    h.worker.on_tick();
-    h.worker.publish();
-    // Prompt is shown about time away; tracking resumed
+    h.tick(at("10:16:01"));
+    assert_eq!(h.status(), TrackerStatus::Away);
+    assert!(h.machine.is_input_running(), "the hooks confirm the return");
+    assert!(!h.machine.is_usage_running() && !h.machine.is_screenshot_allowed() && !h.machine.is_webcam_allowed(), "nothing else runs");
+
+    // The user is still typing: back, from where the idle clock saw it.
+    h.machine.input_at(at("10:16:02"));
+    h.tick(at("10:16:03"));
+    assert_eq!(h.status(), TrackerStatus::Tracking);
+    assert_eq!(h.tracking_since(), Some(at("10:16:00")));
     assert!(h.machine.is_tracking_active(), "sensors reactivate upon return");
     assert!(h.machine.is_input_running());
     assert!(h.machine.is_usage_running());
@@ -1784,7 +1847,7 @@ fn sensor_lifecycle_stops_on_workspace_lost() {
     let mut h = tracking();
     assert!(h.machine.is_tracking_active());
 
-    h.worker.on_control(ControlEvent::WorkspaceLost("w1".into()));
+    h.worker.on_control(ControlEvent::WorkspaceLost("w1".into(), crate::api::WorkspaceRefusal::NotMember));
     h.worker.publish();
     assert_ne!(h.status(), TrackerStatus::Tracking);
     assert!(!h.machine.is_tracking_active(), "sensors must stop when workspace access is lost");
@@ -2666,8 +2729,8 @@ fn consent_21_held_blocks_do_not_acquire_withdrawn_screen_or_webcam_at_finalizat
     let held_block = &queued[0];
     assert_eq!(held_block.started_at, at("10:00:00"));
     assert_eq!(held_block.ended_at, at("10:10:00"));
-    assert_eq!(held_block.keyboard_hits, 1, "authorized key hits in held block preserved");
-    assert_eq!(held_block.mouse_clicks, 1, "authorized clicks in held block preserved");
+    assert_eq!(held_block.keyboard_hits, Some(1), "authorized key hits in held block preserved");
+    assert_eq!(held_block.mouse_clicks, Some(1), "authorized clicks in held block preserved");
     assert_eq!(held_block.active_windows.len(), 1, "authorized usage slice preserved");
     assert_eq!(held_block.screenshot_png_base64, None, "no screenshot acquired on held block");
     assert_eq!(held_block.webcam_jpg_base64, None, "no webcam acquired on held block");
@@ -2734,10 +2797,335 @@ fn consent_22_mixed_narrowing_stops_withdrawn_sensors_before_reconcile_record_bl
 
     let queued = h.queued();
     assert_eq!(queued.len(), 1, "interval block recorded");
-    assert_eq!(queued[0].keyboard_hits, 0, "withdrawn keyboard count not populated");
-    assert_eq!(queued[0].mouse_clicks, 1, "retained mouse clicks preserved");
+    assert_eq!(queued[0].keyboard_hits, None, "withdrawn keyboard: not measured (null), never a made-up 0");
+    assert_eq!(queued[0].mouse_clicks, Some(1), "retained mouse clicks preserved");
     assert_eq!(queued[0].screenshot_png_base64, None, "no screenshot attached");
     assert_eq!(queued[0].webcam_jpg_base64, None, "no webcam attached");
     assert!(queued[0].running_programs.is_empty(), "no running programs attached");
 }
 
+
+// ---- Idle detection without the input hooks (WIN-P0-01, WIN-P0-02) --------------------
+
+#[test]
+fn the_real_tracker_reads_windows_idle_clock_while_the_hooks_are_off() {
+    let (tracker, driver) = Tracker::new_fake();
+    let now = Utc::now();
+    // Hooks never attached (away, paused, or input not allowed): before the
+    // fix, "healthy" hooks with no data answered None forever.
+    driver.set_system_idle_seconds(Some(30));
+    assert!(!Machine::input_hooks_running(&tracker));
+    let last = Machine::last_input(&tracker, now).expect("Windows' idle clock answers");
+    assert_eq!((now - last).num_seconds(), 30);
+    assert_eq!(Machine::first_input_after(&tracker, now - TimeDelta::minutes(10), now), Some(last), "a return is seen");
+    assert_eq!(Machine::first_input_after(&tracker, now - TimeDelta::seconds(5), now), None, "nothing newer");
+    driver.set_system_idle_seconds(None);
+    assert_eq!(Machine::last_input(&tracker, now), None, "Windows says nothing: nothing");
+
+    // Hooks attached for both kinds: their view (the user's own input) wins.
+    driver.set_system_idle_seconds(Some(0));
+    Machine::apply_sensor_policy(&tracker, true, Some(&CapturePermissions::default()));
+    assert!(Machine::input_hooks_running(&tracker));
+    assert_eq!(Machine::last_input(&tracker, now), None, "no input seen by the hooks yet, whatever Windows says");
+    assert_eq!(Machine::first_input_after(&tracker, now - TimeDelta::minutes(1), now), None);
+
+    // Keys only: the hooks would miss someone scrolling, so the idle clock
+    // decides.
+    let keys_only = CapturePermissions { mouse: false, ..CapturePermissions::default() };
+    Machine::apply_sensor_policy(&tracker, true, Some(&keys_only));
+    assert!(Machine::input_hooks_running(&tracker));
+    assert_eq!(Machine::last_input(&tracker, now).map(|t| (now - t).num_seconds()), Some(0));
+
+    // Detached again: the idle clock.
+    Machine::apply_sensor_policy(&tracker, false, None);
+    driver.set_system_idle_seconds(Some(7));
+    assert_eq!(Machine::last_input(&tracker, now).map(|t| (now - t).num_seconds()), Some(7));
+}
+
+#[test]
+fn a_mouse_jiggler_never_ends_the_time_away() {
+    let mut h = tracking();
+    h.machine.input_at(at("10:02:00"));
+    h.tick(at("10:07:00"));
+    assert_eq!(h.status(), TrackerStatus::Away);
+    h.heartbeats();
+
+    // Injected input every few seconds: Windows' idle clock moves, the
+    // hooks (attached to check) see none of the user's own.
+    for second in (10..60).step_by(5) {
+        let when = at("10:10:00") + TimeDelta::seconds(second);
+        h.machine.injected_at(when);
+        h.tick(when + TimeDelta::seconds(1));
+        assert_eq!(h.status(), TrackerStatus::Away, "at {when}");
+    }
+    assert!(h.machine.is_input_running(), "the hooks are checking");
+    assert!(!h.machine.is_usage_running() && !h.machine.is_screenshot_allowed(), "and only they run");
+    assert!(h.tracking_since().is_none());
+    assert!(!h.heartbeats().contains(&PresenceStatus::Tracking), "presence never claims tracking");
+    assert_eq!(h.spans().len(), 1, "nothing recorded while away");
+
+    // The user is really back.
+    h.machine.input_at(at("10:11:00"));
+    h.tick(at("10:11:01"));
+    assert_eq!(h.status(), TrackerStatus::Tracking);
+    assert_eq!(h.tracking_since(), Some(at("10:10:10")), "from when the idle clock first moved");
+}
+
+#[test]
+fn a_break_that_ends_after_typing_during_it_resumes_at_its_end() {
+    let mut h = tracking();
+    h.command(at("10:05:00"), Command::Pause { resume_after: Some(Duration::from_secs(15 * 60)), at: at("10:05:00") });
+    assert!(!h.machine.is_input_running(), "no hooks while on a break");
+    // Typing during the break (nothing is counted, but Windows' idle clock
+    // knows): someone is at the computer when it ends.
+    h.machine.input_at(at("10:19:30"));
+    h.tick(at("10:20:01"));
+    assert_eq!(h.status(), TrackerStatus::Tracking, "not stuck in Away after a 15-minute break");
+    assert_eq!(h.tracking_since(), Some(at("10:20:00")));
+}
+
+#[test]
+fn input_after_an_announced_sleep_is_seen_without_the_hooks() {
+    let mut h = tracking();
+    h.system(SystemEvent::Suspending, at("10:05:00"));
+    assert!(!h.machine.is_input_running());
+    // The resume broadcast never arrived; the user types.
+    h.machine.input_at(at("10:30:00"));
+    h.tick(at("10:30:01"));
+    assert_eq!(h.status(), TrackerStatus::Tracking);
+}
+
+/// Consent to everything except input counts.
+fn screenshots_and_windows_only() -> LocalConsent {
+    LocalConsent::Granted(ConsentedPermissions {
+        screenshot: true,
+        active_window: true,
+        running_programs: true,
+        ..ConsentedPermissions::default()
+    })
+}
+
+#[test]
+fn without_input_counts_time_is_still_recorded_and_idle_detection_works() {
+    for consent in [screenshots_and_windows_only(), LocalConsent::Granted(ConsentedPermissions::all_disabled())] {
+        let mut h = harness_with_consent(at("10:00:00"), Some(saved(vec![project("p1", 5)], None)), consent);
+        assert_eq!(h.status(), TrackerStatus::Tracking, "{consent:?}");
+        assert!(!h.machine.is_input_running(), "no hooks without input consent");
+
+        // The user keeps working: Windows' idle clock sees it, nothing is counted.
+        for minute in 1..=12 {
+            let when = at("10:00:00") + TimeDelta::minutes(minute);
+            h.machine.input_at(when - TimeDelta::seconds(20));
+            h.tick(when);
+            assert_eq!(h.status(), TrackerStatus::Tracking, "{consent:?} at {when}");
+        }
+        let spans = h.spans();
+        assert_eq!(spans, [(at("10:00:00"), at("10:10:00"), Some(EndReason::Interval))], "{consent:?}: time is recorded");
+        let block = &h.queued()[0];
+        assert_eq!((block.keyboard_hits, block.mouse_clicks, block.productivity), (None, None, None), "not measured");
+
+        // Gone for good: away after the threshold, at the last input.
+        h.tick(at("10:18:00"));
+        assert_eq!(h.status(), TrackerStatus::Away, "{consent:?}");
+        assert_eq!(h.state.snapshot().away_since, Some(at("10:11:40")));
+        // Back: nothing can tell injected input apart, so the idle clock decides at once.
+        h.machine.input_at(at("10:30:00"));
+        h.tick(at("10:30:01"));
+        assert_eq!(h.status(), TrackerStatus::Tracking, "{consent:?}");
+        assert_eq!(h.tracking_since(), Some(at("10:30:00")));
+        assert!(!h.machine.is_input_running());
+    }
+}
+
+// ---- Terminal server errors ------------------------------------------------------------
+
+#[test]
+fn a_revoked_device_stops_everything_and_forgets_the_sign_in() {
+    let file = std::env::temp_dir().join(format!("dosi-worker-{}.bin", uuid::Uuid::new_v4()));
+    credentials::save_at(&file, &saved(vec![project("p1", 5)], None)).unwrap();
+    let mut h = harness_at(at("10:00:00"), credentials::load_from(&file), false, Some(file.clone()));
+    assert_eq!(h.status(), TrackerStatus::Tracking);
+    h.machine.input_at(at("10:04:00"));
+    h.machine.set(at("10:04:00"));
+    h.control_requests();
+    h.upload_commands();
+
+    h.worker.on_control(ControlEvent::DeviceRevoked("This device was removed.".into()));
+    h.worker.publish();
+    let snapshot = h.state.snapshot();
+    assert_eq!(snapshot.status, TrackerStatus::SignedOut);
+    assert_eq!(snapshot.login_error.as_deref(), Some(crate::state::DEVICE_REVOKED_TEXT));
+    assert!(snapshot.notices.iter().any(|n| n.kind == NoticeKind::DeviceRevoked));
+    assert!(!h.machine.is_input_running() && !h.machine.is_usage_running() && !h.machine.is_tracking_active(), "capture stopped");
+    assert!(credentials::load_from(&file).is_none(), "the saved sign-in is forgotten");
+    assert!(h.upload_commands().iter().any(|c| matches!(c, UploadCommand::Account(None))));
+    assert!(h.control_requests().iter().any(|r| matches!(r, ControlRequest::UseAccount(None))));
+    // The work so far is kept, never sent from here meanwhile.
+    let owner = storage::owner_key("https://localhost:6006", "alice@acme.com");
+    let spans: Vec<_> = h.worker.store.pending_batch(&owner, 0, 10).unwrap().into_iter().map(|(_, a)| (a.started_at, a.ended_at, a.end_reason)).collect();
+    assert_eq!(spans, [(at("10:00:00"), at("10:04:00"), Some(EndReason::SignOut))]);
+    h.tick(at("10:06:00"));
+    assert!(h.heartbeats().is_empty(), "no heartbeats");
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn a_revoked_device_reported_by_the_uploader_of_this_account_stops_too() {
+    let mut h = tracking();
+    let other = storage::owner_key("https://localhost:6006", "bob@acme.com");
+    h.worker.on_upload(UploadEvent::DeviceRevoked { owner: other, reason: "x".into() });
+    h.worker.publish();
+    assert_eq!(h.status(), TrackerStatus::Tracking, "another account's: ignored");
+    h.worker.on_upload(UploadEvent::DeviceRevoked { owner: h.owner(), reason: "x".into() });
+    h.worker.publish();
+    assert_eq!(h.status(), TrackerStatus::SignedOut);
+}
+
+#[test]
+fn an_archived_workspace_stops_tracking_there_and_says_so() {
+    let mut h = tracking();
+    h.machine.input_at(at("10:04:00"));
+    h.machine.set(at("10:04:00"));
+    h.control_requests();
+    h.worker.on_control(ControlEvent::WorkspaceLost("w1".into(), crate::api::WorkspaceRefusal::Archived));
+    h.worker.publish();
+    let snapshot = h.state.snapshot();
+    assert!(snapshot.tracking_since.is_none());
+    assert_eq!(snapshot.workspace_note.as_deref(), Some("Acme was archived; nothing more can be tracked there."));
+    assert!(snapshot
+        .notices
+        .iter()
+        .any(|n| matches!(&n.kind, NoticeKind::WorkspaceLost { refusal: crate::api::WorkspaceRefusal::Archived, .. })));
+    assert_eq!(h.worker.store.due_count(&h.owner()).unwrap(), 0, "its rows are held");
+    assert!(h.heartbeats().is_empty());
+}
+
+#[test]
+fn archived_workspaces_are_never_offered() {
+    let mut archived = workspace("w0", "Old");
+    archived.is_archived = true;
+    let mut h = harness_at(at("10:00:00"), None, false, None);
+    let account = typed_sign_in(&mut h, None);
+    h.worker.on_control(ControlEvent::SignedIn { account, workspaces: Ok(vec![archived.clone(), workspace("w1", "Acme")]) });
+    assert_eq!(used_account(&mut h).workspace_id.as_deref(), Some("w1"), "the only usable one, at once");
+
+    let mut h = harness_at(at("10:00:00"), None, false, None);
+    let account = typed_sign_in(&mut h, Some("Old"));
+    h.worker.on_control(ControlEvent::SignedIn { account, workspaces: Ok(vec![archived.clone()]) });
+    let snapshot = h.state.snapshot();
+    assert_eq!(snapshot.login_error.as_deref(), Some(ALL_ARCHIVED));
+    assert!(h.worker.saved.is_none() && snapshot.workspace_choices.is_empty());
+
+    // Switching: not listed either.
+    let mut h = tracking();
+    h.command(at("10:01:00"), Command::SwitchWorkspace);
+    h.worker.on_control(ControlEvent::MyWorkspaces(Ok(vec![workspace("w1", "Acme"), archived])));
+    assert_eq!(h.state.snapshot().workspace_note.as_deref(), Some(ONE_WORKSPACE));
+}
+
+#[test]
+fn a_workspace_used_again_sends_its_held_rows_again() {
+    let mut h = tracking();
+    h.machine.input_at(at("10:04:00"));
+    h.machine.set(at("10:04:00"));
+    h.worker.on_control(ControlEvent::WorkspaceLost("w1".into(), crate::api::WorkspaceRefusal::NotMember));
+    assert_eq!(h.worker.store.due_count(&h.owner()).unwrap(), 0);
+    // Access restored: picked again.
+    h.worker.on_control(ControlEvent::MyWorkspaces(Ok(vec![workspace("w1", "Acme")])));
+    h.command(at("10:05:00"), Command::SwitchToWorkspace { index: 0, at: at("10:05:00") });
+    assert_eq!(h.worker.store.due_count(&h.owner()).unwrap(), 1, "released for one more try");
+}
+
+// ---- Signing in safely -----------------------------------------------------------------
+
+#[test]
+fn a_plain_http_server_is_refused_unless_the_admin_allows_it() {
+    let mut h = harness_at(at("10:00:00"), None, false, None);
+    let sign_in = |server: &str| Command::SignIn {
+        workspace: None,
+        username: "alice@acme.com".into(),
+        password: "pw".into(),
+        server: Some(server.into()),
+    };
+    h.command(at("10:00:00"), sign_in("http://10.0.0.5:6006"));
+    assert!(h.state.snapshot().login_error.unwrap().contains("not encrypted"));
+    assert!(h.control_requests().is_empty(), "nothing is sent");
+
+    // This computer is fine.
+    h.command(at("10:00:01"), sign_in("http://localhost:44300"));
+    assert!(matches!(h.control_requests().pop(), Some(ControlRequest::SignIn(a)) if a.server == "http://localhost:44300"));
+
+    // The admin opted in: allowed, and the window warns.
+    let mut h = harness_at(at("10:00:00"), None, false, None);
+    h.worker.cfg.allow_insecure_http = true;
+    h.command(at("10:00:00"), sign_in("http://10.0.0.5:6006"));
+    let account = match h.control_requests().pop() {
+        Some(ControlRequest::SignIn(account)) => account,
+        other => panic!("expected a sign-in check, got {other:?}"),
+    };
+    assert!(account.allow_insecure_http);
+    h.worker.on_control(ControlEvent::SignedIn { account, workspaces: Ok(vec![workspace("w1", "Acme")]) });
+    assert!(h.state.snapshot().unencrypted_connection);
+}
+
+#[test]
+fn every_sign_in_names_this_device_and_never_keeps_the_password_once_refreshable() {
+    let file = std::env::temp_dir().join(format!("dosi-worker-{}.bin", uuid::Uuid::new_v4()));
+    let mut h = harness_at(at("10:00:00"), None, false, Some(file.clone()));
+    let account = typed_sign_in(&mut h, None);
+    assert_eq!(account.device_id.as_deref(), Some("5b0c1b9e-8f2c-4a43-9a51-0c7f6f2d9b11"));
+    // The server granted a refresh token with the sign-in.
+    let account = Account { tokens: TokenCell::with_refresh_token(Some("r3fr3sh".into())), ..account };
+    h.worker.on_control(ControlEvent::SignedIn { account, workspaces: Ok(vec![workspace("w1", "Acme")]) });
+    let used = used_account(&mut h);
+    assert_eq!(used.password, "", "the password is let go");
+    assert_eq!(used.device_id.as_deref(), Some("5b0c1b9e-8f2c-4a43-9a51-0c7f6f2d9b11"));
+    let saved = credentials::load_from(&file).expect("saved");
+    assert_eq!((saved.password.as_str(), saved.refresh_token.as_deref()), ("", Some("r3fr3sh")));
+
+    // A sign-in saved by an older build with its password: dropped on the
+    // next save once a refresh token is there.
+    let mut older = self::saved(vec![project("p1", 5)], None);
+    older.refresh_token = Some("r1".into());
+    credentials::save_at(&file, &older).unwrap();
+    let mut h = harness_at(at("10:00:00"), credentials::load_from(&file), false, Some(file.clone()));
+    assert_eq!(used_account(&mut h).password, "", "a refresh token never falls back to the password");
+    h.command(at("10:01:00"), Command::Pause { resume_after: None, at: at("10:01:00") });
+    assert_eq!(credentials::load_from(&file).unwrap().password, "");
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn the_same_email_on_another_server_is_another_account() {
+    let mut h = tracking();
+    h.machine.input_at(at("10:04:00"));
+    h.command(at("10:04:00"), Command::SignOut { at: at("10:04:00") });
+    let acme = h.owner();
+    assert_eq!(h.worker.store.pending_count(&acme).unwrap(), 1);
+
+    // Signed in again with the same email, on another organisation's server.
+    h.command(at("10:05:00"), Command::SignIn {
+        workspace: None,
+        username: "alice@acme.com".into(),
+        password: "pw".into(),
+        server: Some("https://tracker.globex.com".into()),
+    });
+    let account = match h.control_requests().pop() {
+        Some(ControlRequest::SignIn(account)) => account,
+        other => panic!("expected a sign-in check, got {other:?}"),
+    };
+    assert_ne!(account.owner(), acme);
+    h.worker.on_control(ControlEvent::SignedIn { account, workspaces: Ok(vec![workspace("w1", "Globex")]) });
+    let snapshot = h.state.snapshot();
+    assert_eq!(snapshot.pending_uploads, 0, "Acme's blocks are not this account's");
+    let uploading = h
+        .upload_commands()
+        .into_iter()
+        .rev()
+        .find_map(|c| match c {
+            UploadCommand::Account(Some(account)) => Some(account),
+            _ => None,
+        })
+        .expect("the uploader has the new account");
+    assert_ne!(uploading.owner(), acme, "so it never uploads them there");
+}

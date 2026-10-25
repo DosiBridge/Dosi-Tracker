@@ -36,6 +36,9 @@ pub struct Credentials {
     pub workspace_name: String,
     /// The email (or user name) typed at sign-in.
     pub username: String,
+    /// Only in sign-ins saved by older builds: once a refresh token is
+    /// saved the password is not kept (an expired sign-in asks for it).
+    #[serde(default)]
     pub password: String,
     /// Renews the access token without the password.
     #[serde(default)]
@@ -76,14 +79,16 @@ impl Credentials {
         }
     }
 
-    /// The user, as the offline queue tags its rows.
-    pub fn owner_key(&self) -> String {
-        crate::storage::owner_key(&self.username)
+    /// The account, as the offline queue tags its rows: this user on
+    /// `server` (the address in effect for this sign-in).
+    pub fn owner_key(&self, server: &str) -> String {
+        crate::storage::owner_key(server, &self.username)
     }
 
-    /// Is this the same user (compared as the server does)?
-    pub fn same_account(&self, username: &str) -> bool {
-        self.owner_key() == crate::storage::owner_key(username)
+    /// Is this the same user (compared as the server does)? Whether it is
+    /// the same *account* also depends on the server.
+    pub fn same_user(&self, username: &str) -> bool {
+        self.username.trim().to_lowercase() == username.trim().to_lowercase()
     }
 
     /// The saved project list, if it may still be used at `now`.
@@ -329,9 +334,19 @@ mod tests {
     #[test]
     fn accounts_compare_like_the_server() {
         let saved = Credentials::new("Alice@Acme.com".into(), "pw".into(), None);
-        assert!(saved.same_account(" alice@acme.com "));
-        assert!(!saved.same_account("bob@acme.com"));
-        assert_eq!(saved.owner_key(), crate::storage::owner_key("alice@acme.com"));
+        assert!(saved.same_user(" alice@acme.com "));
+        assert!(!saved.same_user("bob@acme.com"));
+        let server = "https://tracker.acme.com";
+        assert_eq!(saved.owner_key(server), crate::storage::owner_key(server, "alice@acme.com"));
+        assert_ne!(saved.owner_key(server), saved.owner_key("https://tracker.globex.com"), "the server is part of the account");
+    }
+
+    #[test]
+    fn a_sign_in_saved_without_a_password_still_loads() {
+        let json = br#"{"workspace_id":"w1","username":"a","refresh_token":"r"}"#;
+        let parsed: Credentials = serde_json::from_slice(json).expect("the password is optional");
+        assert_eq!(parsed.password, "");
+        assert_eq!(parsed.refresh_token.as_deref(), Some("r"));
     }
 }
 

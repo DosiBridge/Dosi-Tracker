@@ -357,19 +357,20 @@ pub fn minute_timeline(
     let mut timeline: Vec<ActivityMinute> = (0..minutes as usize)
         .map(|i| ActivityMinute {
             minute: i as u32,
-            keyboard_hits: 0,
-            mouse_clicks: 0,
+            keyboard_hits: Some(0),
+            mouse_clicks: Some(0),
             active: active[i],
             app_name: None,
             active_seconds: Some(seconds_per_bucket[i].min(bucket_seconds(i, start, end))),
         })
         .collect();
 
+    let bump = |count: &mut Option<u64>| *count = Some(count.unwrap_or(0) + 1);
     for &ms in key_presses {
-        timeline[bucket_of(ms.div_euclid(1000), start, minutes)].keyboard_hits += 1;
+        bump(&mut timeline[bucket_of(ms.div_euclid(1000), start, minutes)].keyboard_hits);
     }
     for &ms in clicks {
-        timeline[bucket_of(ms.div_euclid(1000), start, minutes)].mouse_clicks += 1;
+        bump(&mut timeline[bucket_of(ms.div_euclid(1000), start, minutes)].mouse_clicks);
     }
 
     // Foreground milliseconds per app in each bucket; bucket i spans
@@ -625,8 +626,8 @@ mod tests {
         let timeline = minute_timeline(T0, T0 + 180, &slices, &keys, &clicks, &active);
         let minute = |m: u32, k: u64, c: u64, active: bool, app: &str, seconds: u32| ActivityMinute {
             minute: m,
-            keyboard_hits: k,
-            mouse_clicks: c,
+            keyboard_hits: Some(k),
+            mouse_clicks: Some(c),
             active,
             app_name: Some(app.into()),
             active_seconds: Some(seconds),
@@ -679,7 +680,7 @@ mod tests {
         let slices = [slice("a.exe", "", 0, 60), slice("b.exe", "", 60, 130)];
         let timeline = minute_timeline(T0, T0 + 130, &slices, &[T0_MS + 125_000], &[], &[T0 + 125]);
         assert_eq!(timeline.len(), 2);
-        assert_eq!(timeline[1].keyboard_hits, 1);
+        assert_eq!(timeline[1].keyboard_hits, Some(1));
         assert!(timeline[1].active && !timeline[0].active);
         assert_eq!(timeline[1].app_name.as_deref(), Some("b.exe"));
     }
@@ -688,7 +689,7 @@ mod tests {
     fn timeline_without_usage_still_has_counts() {
         let timeline = minute_timeline(T0, T0 + 60, &[], &[T0_MS], &[], &[T0]);
         assert_eq!(timeline.len(), 1);
-        assert_eq!(timeline[0].keyboard_hits, 1);
+        assert_eq!(timeline[0].keyboard_hits, Some(1));
         assert_eq!(timeline[0].app_name, None);
         assert!(minute_timeline(T0, T0, &[], &[], &[], &[]).is_empty());
     }

@@ -63,6 +63,9 @@ pub const CLOCK_SKEW_WARNING_SECS: i64 = 120;
 /// The server's business error codes the agent acts on (CONTRACT §1).
 pub mod codes {
     pub const NOT_WORKSPACE_MEMBER: &str = "Tracker:NotWorkspaceMember";
+    pub const WORKSPACE_ARCHIVED: &str = "Tracker:WorkspaceArchived";
+    pub const WORKSPACE_REQUIRED: &str = "Tracker:WorkspaceRequired";
+    pub const DEVICE_REVOKED: &str = "Tracker:DeviceRevoked";
     pub const ACTIVITY_TIME_RANGE_INVALID: &str = "Tracker:ActivityTimeRangeInvalid";
     pub const ACTIVITY_CLIENT_ID_CONFLICT: &str = "Tracker:ActivityClientIdConflict";
     pub const ACTIVITY_IN_FUTURE: &str = "Tracker:ActivityInFuture";
@@ -82,12 +85,17 @@ pub mod codes {
 /// dev certificate installed by `dotnet dev-certs https --trust` work) *in
 /// addition to* the bundled Mozilla roots (so public CAs Windows has not
 /// fetched yet still work). Certificate verification is always on.
+///
+/// Redirects are never followed: no API call needs one, and following a 307
+/// or 308 would resend the password (or a screenshot) to wherever it points,
+/// downgraded to `http://` or on another host. A 3xx is an error answer.
 fn build_http_client() -> reqwest::Client {
     let builder = || {
         reqwest::Client::builder()
             .user_agent(concat!("dosi-tracker/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
     };
     builder().build().unwrap_or_else(|e| {
         // An unreadable Windows store must not take tracking down: fall back to
@@ -271,6 +279,46 @@ pub struct Workspace {
     pub plan_name: Option<String>,
     #[serde(default)]
     pub is_owner: bool,
+    /// Archived workspaces are listed too, but refuse every tracker call.
+    #[serde(default)]
+    pub is_archived: bool,
+}
+
+/// Why the server refused the workspace a request named. Each is terminal
+/// for that workspace (CONTRACT, "terminal server errors"): capture and
+/// heartbeats stop there and another workspace is asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceRefusal {
+    /// 403 `Tracker:NotWorkspaceMember`: the account lost access to it.
+    NotMember,
+    /// 403 `Tracker:WorkspaceArchived`.
+    Archived,
+    /// 400 `Tracker:WorkspaceRequired`: the request reached the server
+    /// without its workspace (a proxy stripped the header) — a setup
+    /// problem, never a reason to park a block.
+    Required,
+}
+
+impl WorkspaceRefusal {
+    /// The refusal a business error code stands for.
+    pub fn of_code(code: Option<&str>) -> Option<Self> {
+        match code? {
+            codes::NOT_WORKSPACE_MEMBER => Some(WorkspaceRefusal::NotMember),
+            codes::WORKSPACE_ARCHIVED => Some(WorkspaceRefusal::Archived),
+            codes::WORKSPACE_REQUIRED => Some(WorkspaceRefusal::Required),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for WorkspaceRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            WorkspaceRefusal::NotMember => "not a workspace member",
+            WorkspaceRefusal::Archived => "workspace archived",
+            WorkspaceRefusal::Required => "workspace required",
+        })
+    }
 }
 
 /// Why a request other than an upload failed.
@@ -283,9 +331,10 @@ pub enum ApiError {
     /// The server answered with an error status (after one sign-in retry on
     /// a 401), and its ABP error body when it sent one.
     Http { status: u16, error: Option<AbpError> },
-    /// 403 `Tracker:NotWorkspaceMember`: the account lost access to the
-    /// workspace the request named.
-    NotWorkspaceMember(String),
+    /// The server refused the workspace the request named.
+    Workspace { refusal: WorkspaceRefusal, message: String },
+    /// 403 `Tracker:DeviceRevoked`: a workspace admin removed this computer.
+    DeviceRevoked(String),
     /// The answer could not be read.
     Invalid(String),
 }
@@ -316,7 +365,8 @@ impl std::fmt::Display for ApiError {
                 Some(summary) => write!(f, "HTTP {status}: {summary}"),
                 None => write!(f, "HTTP {status}"),
             },
-            ApiError::NotWorkspaceMember(message) => write!(f, "not a workspace member: {message}"),
+            ApiError::Workspace { refusal, message } => write!(f, "{refusal}: {message}"),
+            ApiError::DeviceRevoked(message) => write!(f, "device revoked: {message}"),
             ApiError::Invalid(reason) => write!(f, "unexpected response: {reason}"),
         }
     }
@@ -329,10 +379,10 @@ impl std::error::Error for ApiError {}
 /// row; every other outcome keeps it.
 #[derive(Debug)]
 pub enum SubmitError {
-    /// Network trouble, a timeout, 408/429/5xx/404/405, a 4xx without an ABP
-    /// error code, or a business error this agent does not know: keep the row
-    /// and retry with backoff, no sooner than `retry_after` when the server
-    /// sent one.
+    /// Network trouble, a timeout, a redirect, 408/429/5xx/404/405 or a 4xx
+    /// without an ABP error code: the server's (or the network's) trouble,
+    /// not this row's. Keep the row and retry the queue with backoff, no
+    /// sooner than `retry_after` when the server sent one.
     Transient { reason: String, retry_after: Option<Duration> },
     /// Signing in again was refused (the saved credentials no longer work):
     /// "Sign-in expired". Keep the queue and stop capturing.
@@ -348,9 +398,17 @@ pub enum SubmitError {
     /// 413, `Tracker:CaptureTooLarge` or `Tracker:InvalidCaptureData`: the
     /// images are the problem. Strip them from the row and resend at once.
     StripCaptures(String),
-    /// 403 `Tracker:NotWorkspaceMember`: the account lost access to the
-    /// row's workspace. Keep the row; it waits for access to come back.
-    NotWorkspaceMember(String),
+    /// The server refused the row's workspace (access lost, archived, or the
+    /// header never arrived). Keep the row: that workspace's rows are held
+    /// until it is usable again, and the rest of the queue goes on.
+    Workspace { refusal: WorkspaceRefusal, message: String },
+    /// 403 `Tracker:DeviceRevoked`: a workspace admin removed this computer.
+    /// Keep the queue; nothing more is sent from this device.
+    DeviceRevoked(String),
+    /// A business error this agent does not know, about this row: keep it and
+    /// retry it later on its own schedule while the rows behind it go on;
+    /// parked after too many attempts.
+    RowRetry(String),
     /// A definitive rejection of this block (overlap, too long/old, invalid
     /// time range, id conflict, validation errors): park it with the server's
     /// message.
@@ -369,7 +427,9 @@ impl std::fmt::Display for SubmitError {
             SubmitError::ProjectUnavailable { code, message } => write!(f, "{code}: {message}"),
             SubmitError::ClockAhead(message) => write!(f, "clock ahead: {message}"),
             SubmitError::StripCaptures(message) => write!(f, "captures refused: {message}"),
-            SubmitError::NotWorkspaceMember(message) => write!(f, "not a workspace member: {message}"),
+            SubmitError::Workspace { refusal, message } => write!(f, "{refusal}: {message}"),
+            SubmitError::DeviceRevoked(message) => write!(f, "device revoked: {message}"),
+            SubmitError::RowRetry(message) => write!(f, "{message}"),
             SubmitError::Rejected(message) => write!(f, "rejected: {message}"),
         }
     }
@@ -395,10 +455,16 @@ pub fn classify_upload_failure(status: u16, body: &str, retry_after: Option<Dura
         // 5xx (or anything unexpected): the server's trouble, not this block's.
         return transient(format!("HTTP {status}"));
     }
+    // Terminal for the device or the workspace, whatever came with them.
+    if code == Some(codes::DEVICE_REVOKED) {
+        return SubmitError::DeviceRevoked(message);
+    }
+    if let Some(refusal) = WorkspaceRefusal::of_code(code) {
+        return SubmitError::Workspace { refusal, message };
+    }
     let invalid_payload = status == 400 && error.as_ref().is_some_and(AbpError::has_validation_errors);
     match code {
         Some(codes::SUBSCRIPTION_INACTIVE) => SubmitError::SubscriptionInactive(message),
-        Some(codes::NOT_WORKSPACE_MEMBER) => SubmitError::NotWorkspaceMember(message),
         Some(code @ (codes::NOT_PROJECT_MEMBER | codes::PROJECT_ARCHIVED)) => {
             SubmitError::ProjectUnavailable { code: code.to_string(), message }
         }
@@ -414,8 +480,9 @@ pub fn classify_upload_failure(status: u16, body: &str, retry_after: Option<Dura
         // resending it unchanged can never succeed.
         _ if invalid_payload => SubmitError::Rejected(message),
         // A business error this agent does not know: keep the block and retry
-        // later rather than guess that it is permanent.
-        Some(other) => transient(format!("HTTP {status} {other}: {message}")),
+        // it later rather than guess that it is permanent — without holding
+        // up the rows behind it.
+        Some(other) => SubmitError::RowRetry(format!("HTTP {status} {other}: {message}")),
         // 404, 405, 408, 429, or any 4xx without an ABP error code (a proxy,
         // a missing route).
         None => transient(format!("HTTP {status}")),
@@ -508,10 +575,16 @@ impl std::fmt::Debug for TokenCell {
 /// Thin HTTP client wrapping the Dosi-Tracker backend REST API.
 ///
 /// Authentication uses the backend's OpenIddict token endpoint
-/// (`POST /connect/token`). The token is renewed with the refresh token
-/// shortly before it expires and once when a request answers 401; only when
-/// the refresh token is refused does it sign in again with the saved password.
-/// Workspace-scoped requests carry [`WORKSPACE_HEADER`].
+/// (`POST /connect/token`), naming this install's `device_id` on every grant.
+/// The token is renewed with the refresh token shortly before it expires and
+/// once when a request answers 401. A refused refresh token means "sign-in
+/// expired": the password is never sent again behind the user's back. The
+/// password is only used while there is no refresh token at all (the sign-in
+/// itself). Workspace-scoped requests carry [`WORKSPACE_HEADER`].
+///
+/// Nothing is sent to a plain `http://` server other than this computer
+/// unless the admin opted in ([`ApiClient::with_insecure_http`]); see
+/// [`crate::config::check_transport`].
 pub struct ApiClient {
     http: reqwest::Client,
     base_url: String,
@@ -520,6 +593,10 @@ pub struct ApiClient {
     tokens: TokenCell,
     workspace_id: Option<String>,
     clock: ServerClock,
+    /// This install's id, sent with the password and refresh grants.
+    device_id: Option<String>,
+    /// `config.toml`'s `allow_insecure_http`.
+    insecure_http_allowed: bool,
 }
 
 #[derive(Clone)]
@@ -574,7 +651,28 @@ impl ApiClient {
             tokens: TokenCell::default(),
             workspace_id: None,
             clock: ServerClock::default(),
+            device_id: None,
+            insecure_http_allowed: false,
         }
+    }
+
+    /// Name this install (a UUID kept per install) on the token grants.
+    pub fn with_device_id(mut self, device_id: Option<String>) -> Self {
+        self.device_id = device_id.map(|id| id.trim().to_owned()).filter(|id| !id.is_empty());
+        self
+    }
+
+    /// Allow a plain `http://` server that is not this computer (the admin's
+    /// explicit `allow_insecure_http = true`).
+    pub fn with_insecure_http(mut self, allowed: bool) -> Self {
+        self.insecure_http_allowed = allowed;
+        self
+    }
+
+    /// Refuse to talk to the server at all over a transport it may not use.
+    fn check_transport(&self) -> Result<(), AuthError> {
+        crate::config::check_transport(&self.base_url, self.insecure_http_allowed)
+            .map_err(|e| AuthError::Server(e.to_string()))
     }
 
     /// Share `clock` with this client (e.g. one the window already reads), so
@@ -617,10 +715,11 @@ impl ApiClient {
         &self.base_url
     }
 
-    /// The user this client acts as, in the form the offline queue tags rows
-    /// with — so rows are only ever uploaded under their owner's token.
+    /// The user (on this server) this client acts as, in the form the offline
+    /// queue tags rows with — so rows are only ever uploaded under their
+    /// owner's token, to the server they were recorded for.
     pub fn owner_key(&self) -> String {
-        crate::storage::owner_key(&self.username)
+        crate::storage::owner_key(&self.base_url, &self.username)
     }
 
     /// Send a request and note the server's clock from its `Date` header.
@@ -639,6 +738,12 @@ impl ApiClient {
 
     /// `POST /connect/token` with `params`; the token is stored on success.
     async fn token_request(&self, params: &[(&str, &str)], previous_refresh: Option<String>) -> Result<(), AuthError> {
+        self.check_transport()?;
+        let mut params = params.to_vec();
+        if let Some(device_id) = self.device_id.as_deref() {
+            params.push(("device_id", device_id));
+        }
+        let params = params.as_slice();
         let url = format!("{}/connect/token", self.base_url);
         let response = self
             .execute(self.http.post(url).header(ACCEPT, "application/json").form(params))
@@ -682,15 +787,10 @@ impl ApiClient {
             return Ok(token);
         }
         if let Some(refresh_token) = self.tokens.refresh_token() {
-            match self.refresh(&refresh_token).await {
-                Ok(()) => {}
-                Err(AuthError::Rejected(reason)) if self.password.is_empty() => return Err(AuthError::Rejected(reason)),
-                Err(AuthError::Rejected(reason)) => {
-                    tracing::info!(%reason, "the refresh token was refused; signing in with the saved password");
-                    self.login().await?;
-                }
-                Err(e) => return Err(e),
-            }
+            // A refused refresh token (`invalid_grant`: revoked, expired, the
+            // password changed) means "sign-in expired" — never a silent
+            // sign-in with a password behind the user's back.
+            self.refresh(&refresh_token).await?;
         } else if self.password.is_empty() {
             return Err(AuthError::Rejected("Please sign in again.".to_owned()));
         } else {
@@ -708,6 +808,7 @@ impl ApiClient {
     where
         F: Fn(&reqwest::Client, &str) -> reqwest::RequestBuilder,
     {
+        self.check_transport().map_err(RequestError::Auth)?;
         let token = self.ensure_token().await.map_err(RequestError::Auth)?;
         let response = self
             .execute(scoped(build(&self.http, &token), workspace_id))
@@ -836,12 +937,19 @@ impl ApiClient {
     }
 }
 
-/// The error for a failed answer: lost workspace access has its own kind.
+/// The error for a failed answer: a refused workspace and a revoked device
+/// have their own kinds (they are terminal).
 fn http_error(status: u16, body: &str) -> ApiError {
     let error = AbpError::from_body(body);
-    if status == 403 && error.as_ref().and_then(AbpError::code) == Some(codes::NOT_WORKSPACE_MEMBER) {
-        let message = error.as_ref().and_then(AbpError::summary).unwrap_or_else(|| "HTTP 403".to_owned());
-        return ApiError::NotWorkspaceMember(message);
+    let code = error.as_ref().and_then(AbpError::code);
+    if (400..500).contains(&status) {
+        let message = || error.as_ref().and_then(AbpError::summary).unwrap_or_else(|| format!("HTTP {status}"));
+        if code == Some(codes::DEVICE_REVOKED) {
+            return ApiError::DeviceRevoked(message());
+        }
+        if let Some(refusal) = WorkspaceRefusal::of_code(code) {
+            return ApiError::Workspace { refusal, message: message() };
+        }
     }
     ApiError::Http { status, error }
 }
@@ -870,8 +978,10 @@ mod tests {
 
     #[test]
     fn owner_key_matches_the_queue_tagging() {
-        let client = ApiClient::new("https://example.invalid", "Alice@Acme.com".into(), "secret".into());
-        assert_eq!(client.owner_key(), crate::storage::owner_key("alice@acme.com"));
+        let client = ApiClient::new("https://example.invalid/", "Alice@Acme.com".into(), "secret".into());
+        assert_eq!(client.owner_key(), crate::storage::owner_key("https://example.invalid", "alice@acme.com"));
+        let elsewhere = ApiClient::new("https://other.invalid", "Alice@Acme.com".into(), "secret".into());
+        assert_ne!(elsewhere.owner_key(), client.owner_key(), "the same email on another server is another account");
     }
 
     #[test]
@@ -927,7 +1037,11 @@ mod tests {
             SubmitError::SubscriptionInactive(_) => "subscription",
             SubmitError::ProjectUnavailable { .. } => "project",
             SubmitError::ClockAhead(_) => "clock",
-            SubmitError::NotWorkspaceMember(_) => "workspace",
+            SubmitError::Workspace { refusal: WorkspaceRefusal::NotMember, .. } => "workspace",
+            SubmitError::Workspace { refusal: WorkspaceRefusal::Archived, .. } => "archived",
+            SubmitError::Workspace { refusal: WorkspaceRefusal::Required, .. } => "required",
+            SubmitError::DeviceRevoked(_) => "revoked",
+            SubmitError::RowRetry(_) => "row",
             SubmitError::StripCaptures(_) => "strip",
             SubmitError::Rejected(_) => "park",
         };
@@ -938,9 +1052,23 @@ mod tests {
         }
         assert_eq!(kind(400, "<html>bad request</html>"), "transient");
         assert_eq!(kind(403, r#"{"title":"Forbidden"}"#), "transient");
-        assert_eq!(kind(422, &abp(Some("Tracker:SomethingNew"), "?")), "transient");
+        // A redirect is never followed, and is not this block's fault.
+        assert_eq!(kind(307, ""), "transient");
+        assert_eq!(kind(308, "<html>moved</html>"), "transient");
+        // A business code this agent does not know: that row alone waits.
+        assert_eq!(kind(422, &abp(Some("Tracker:SomethingNew"), "?")), "row");
         // A 5xx is transient even with a business code.
         assert_eq!(kind(500, &abp(Some(codes::ACTIVITY_OVERLAPS), "x")), "transient");
+        assert_eq!(kind(503, &abp(Some(codes::DEVICE_REVOKED), "x")), "transient");
+
+        // Terminal: the device, or the workspace (never parked).
+        assert_eq!(kind(403, &abp(Some(codes::DEVICE_REVOKED), "Removed")), "revoked");
+        assert_eq!(kind(403, &abp(Some(codes::NOT_WORKSPACE_MEMBER), "No access")), "workspace");
+        assert_eq!(kind(403, &abp(Some(codes::WORKSPACE_ARCHIVED), "Archived")), "archived");
+        assert_eq!(kind(400, &abp(Some(codes::WORKSPACE_REQUIRED), "Which workspace?")), "required");
+        let required_with_validation = r#"{"error":{"code":"Tracker:WorkspaceRequired","message":"Which workspace?",
+            "validationErrors":[{"message":"X-Workspace-Id is required.","members":["workspace"]}]}}"#;
+        assert_eq!(kind(400, required_with_validation), "required", "a setup problem, never a park");
 
         // Special handling.
         assert_eq!(kind(402, &abp(Some(codes::SUBSCRIPTION_INACTIVE), "Inactive")), "subscription");
@@ -968,8 +1096,9 @@ mod tests {
         let coded_validation = r#"{"error":{"code":"Volo.Abp.Validation","message":"Your request is not valid!",
             "validationErrors":[{"message":"The field TimeZone is invalid.","members":["timeZone"]}]}}"#;
         assert_eq!(kind(400, coded_validation), "park");
-        // ...but only on a 400: elsewhere they are not about this payload.
-        assert_eq!(kind(422, coded_validation), "transient");
+        // ...but only on a 400: elsewhere the code is just one this agent does
+        // not know, and that row alone is tried again later.
+        assert_eq!(kind(422, coded_validation), "row");
 
         // The server's message is kept for the window; Retry-After is passed on.
         match classify_upload_failure(400, validation, None) {
@@ -1411,15 +1540,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_refused_refresh_token_falls_back_to_the_saved_password() {
+    async fn a_refused_refresh_token_means_sign_in_expired_never_a_silent_password_sign_in() {
         let refused = http("400 Bad Request", &[], r#"{"error":"invalid_grant","error_description":"The token is no longer valid."}"#);
         let (url, requests) = canned_server(vec![refused.clone(), token_ok(), http("200 OK", &[], "[]")]);
+        // Even with a password at hand.
         let mut api = client(&url).with_tokens(TokenCell::with_refresh_token(Some("r1".into())));
-        api.workspaces_mine().await.unwrap();
+        let error = api.workspaces_mine().await.unwrap_err();
+        assert!(error.is_auth_rejected(), "{error}");
+        assert!(error.to_string().contains("The token is no longer valid."), "{error}");
         let requests: Vec<String> = requests.try_iter().collect();
-        assert!(body_of(&requests[1]).contains("grant_type=password"));
+        assert_eq!(requests.len(), 1, "only the refresh: {requests:?}");
+        assert!(!body_of(&requests[0]).contains("grant_type=password"));
+        assert!(!body_of(&requests[0]).contains("password=pw"));
 
-        // Without a saved password the refusal means signing in again.
+        // Without a saved password it is the same.
         let (url, _requests) = canned_server(vec![refused]);
         let mut api = ApiClient::new(url, "alice@acme.com".into(), String::new()).with_tokens(TokenCell::with_refresh_token(Some("r1".into())));
         assert!(api.workspaces_mine().await.unwrap_err().is_auth_rejected());
@@ -1435,10 +1569,89 @@ mod tests {
         ]);
         let mut api = client(&url).with_workspace(Some("w1".into()));
         match api.my_projects().await {
-            Err(ApiError::NotWorkspaceMember(message)) => assert_eq!(message, "You are not a member of this workspace."),
+            Err(ApiError::Workspace { refusal: WorkspaceRefusal::NotMember, message }) => {
+                assert_eq!(message, "You are not a member of this workspace.")
+            }
             other => panic!("expected not a member, got {other:?}"),
         }
-        assert!(matches!(api.submit_activity(&sample_activity()).await, Err(SubmitError::NotWorkspaceMember(_))));
-        assert!(matches!(classify_upload_failure(403, &not_member, None), SubmitError::NotWorkspaceMember(_)), "never parked");
+        assert!(matches!(
+            api.submit_activity(&sample_activity()).await,
+            Err(SubmitError::Workspace { refusal: WorkspaceRefusal::NotMember, .. })
+        ));
+        assert!(matches!(classify_upload_failure(403, &not_member, None), SubmitError::Workspace { .. }), "never parked");
+    }
+
+    #[test]
+    fn terminal_codes_of_other_calls_have_their_own_errors() {
+        let archived = abp(Some(codes::WORKSPACE_ARCHIVED), "This workspace is archived.");
+        assert!(matches!(
+            http_error(403, &archived),
+            ApiError::Workspace { refusal: WorkspaceRefusal::Archived, message } if message == "This workspace is archived."
+        ));
+        assert!(matches!(
+            http_error(400, &abp(Some(codes::WORKSPACE_REQUIRED), "?")),
+            ApiError::Workspace { refusal: WorkspaceRefusal::Required, .. }
+        ));
+        assert!(matches!(http_error(403, &abp(Some(codes::DEVICE_REVOKED), "Removed")), ApiError::DeviceRevoked(m) if m == "Removed"));
+        // Not from a 5xx, and not without the code.
+        assert!(matches!(http_error(500, &archived), ApiError::Http { status: 500, .. }));
+        assert!(matches!(http_error(403, ""), ApiError::Http { status: 403, error: None }));
+        // Archived workspaces are read from the list.
+        let mine: Vec<Workspace> = serde_json::from_str(r#"[{"id":"w1","name":"Old","isArchived":true},{"id":"w2","name":"New"}]"#).unwrap();
+        assert!(mine[0].is_archived && !mine[1].is_archived);
+    }
+
+    #[tokio::test]
+    async fn every_grant_names_this_device() {
+        let device = "0b9a7c55-2f37-4f40-a7e5-5a8f0f6b2d11";
+        let refreshed = http("200 OK", &[], r#"{"access_token":"n3w","refresh_token":"r2","expires_in":3600}"#);
+        let (url, requests) = canned_server(vec![token_ok(), refreshed]);
+        let mut api = client(&url).with_device_id(Some(device.into()));
+        api.login().await.unwrap();
+        api.refresh("r1").await.unwrap();
+        let requests: Vec<String> = requests.try_iter().collect();
+        for (request, grant) in requests.iter().zip(["grant_type=password", "grant_type=refresh_token"]) {
+            let form = body_of(request);
+            assert!(form.contains(grant), "{form}");
+            assert!(form.contains(&format!("device_id={device}")), "{form}");
+            assert!(!request.to_lowercase().contains("__tenant"), "{request}");
+        }
+
+        // No id (it could not be stored): no field at all.
+        let (url, requests) = canned_server(vec![token_ok()]);
+        client(&url).with_device_id(Some("  ".into())).login().await.unwrap();
+        assert!(!body_of(&requests.try_iter().next().unwrap()).contains("device_id"));
+    }
+
+    #[tokio::test]
+    async fn redirects_are_never_followed() {
+        // A proxy redirecting the password elsewhere (here: back to itself,
+        // which would be followed and answered 200 if redirects were on).
+        let (url, requests) = canned_server(vec![
+            http("307 Temporary Redirect", &[("Location", "/elsewhere")], ""),
+            http("200 OK", &[], r#"{"access_token":"t","expires_in":3600}"#),
+        ]);
+        let error = client(&url).login().await.unwrap_err();
+        assert!(matches!(&error, AuthError::Server(m) if m.contains("307")), "{error:?}");
+        assert_eq!(requests.try_iter().count(), 1, "the redirect was not followed");
+    }
+
+    #[tokio::test]
+    async fn plain_http_to_another_computer_is_refused_before_anything_is_sent() {
+        // Nothing listens there: the refusal must come before any connection.
+        let mut api = ApiClient::new("http://192.0.2.10:6006", "alice@acme.com".into(), "pw".into());
+        match api.login().await {
+            Err(AuthError::Server(message)) => assert!(message.contains("not encrypted"), "{message}"),
+            other => panic!("expected the refusal, got {other:?}"),
+        }
+        assert!(matches!(api.my_projects().await, Err(ApiError::Auth(AuthError::Server(_)))));
+        assert!(matches!(api.submit_activity(&sample_activity()).await, Err(SubmitError::Transient { .. })));
+
+        // The admin opted in: it is tried (and here fails to connect).
+        let mut opted_in = ApiClient::new("http://192.0.2.10:6006", "a".into(), "b".into()).with_insecure_http(true);
+        let started = Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(1), opted_in.login()).await;
+        assert!(result.is_err() || matches!(result, Ok(Err(AuthError::Offline(_)))), "{result:?}");
+        assert!(started.elapsed() <= Duration::from_secs(2));
     }
 }

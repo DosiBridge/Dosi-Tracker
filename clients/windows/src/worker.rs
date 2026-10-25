@@ -32,8 +32,8 @@ use chrono::{DateTime, Datelike, Local, NaiveDate, TimeDelta, TimeZone, Utc};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::time::Instant;
 
-use crate::api::{ApiClient, ApiError, AuthError, ServerClock, TokenCell, Workspace};
-use crate::config::{normalize_server_url, AppConfig, CapturePermissions, ConsentStore, FileConsentStore};
+use crate::api::{ApiClient, ApiError, AuthError, ServerClock, TokenCell, Workspace, WorkspaceRefusal};
+use crate::config::{AppConfig, CapturePermissions, ConsentStore, FileConsentStore};
 use crate::credentials::{self, Credentials, ProjectCache, SavedPause};
 use crate::model::{Activity, EndReason, Heartbeat, PresenceStatus, Project};
 use crate::power::{self, SleepDetector};
@@ -112,6 +112,9 @@ const ONE_WORKSPACE: &str = "You aren't in any other workspace.";
 pub const NO_WORKSPACE: &str =
     "You aren't in any workspace yet. Create one on the web dashboard or ask for an invite.";
 
+pub const ALL_ARCHIVED: &str =
+    "All of your workspaces are archived. Ask a workspace owner to restore one, or create a new one on the web dashboard.";
+
 const NO_PROJECTS: &str = "You are not a member of any active project.";
 
 /// The signed-in user, the server it lives on and the workspace tracked in.
@@ -120,17 +123,39 @@ pub struct Account {
     /// The API address, normalized.
     pub server: String,
     pub username: String,
+    /// Only until the server has granted a refresh token (signing in, or a
+    /// sign-in saved by an older build): it is never sent again after that.
     pub password: String,
     /// `None` until a workspace is chosen (or after access to it was lost).
     pub workspace_id: Option<String>,
     pub workspace_name: String,
     /// The user's token, shared by every client of this sign-in.
     pub tokens: TokenCell,
+    /// This install's id, named on every token grant.
+    pub device_id: Option<String>,
+    /// `config.toml`'s `allow_insecure_http`.
+    pub allow_insecure_http: bool,
 }
 
 impl Account {
     pub fn new(server: String, username: String, password: String) -> Self {
-        Self { server, username, password, workspace_id: None, workspace_name: String::new(), tokens: TokenCell::default() }
+        Self {
+            server,
+            username,
+            password,
+            workspace_id: None,
+            workspace_name: String::new(),
+            tokens: TokenCell::default(),
+            device_id: None,
+            allow_insecure_http: false,
+        }
+    }
+
+    /// This install (`device_id`) under this configuration.
+    pub fn on_device(mut self, device_id: Option<String>, cfg: &AppConfig) -> Self {
+        self.device_id = device_id;
+        self.allow_insecure_http = cfg.allow_insecure_http;
+        self
     }
 
     /// The same sign-in, tracking in another workspace.
@@ -140,20 +165,25 @@ impl Account {
         self
     }
 
-    fn of(saved: &Credentials, cfg: &AppConfig) -> Self {
+    fn of(saved: &Credentials, cfg: &AppConfig, device_id: Option<String>) -> Self {
+        let refresh_token = saved.refresh_token.clone().filter(|t| !t.is_empty());
         Self {
             server: cfg.effective_api_base_url(saved.server.as_deref()),
             username: saved.username.clone(),
-            password: saved.password.clone(),
+            // A sign-in with a refresh token never falls back to a password.
+            password: if refresh_token.is_some() { String::new() } else { saved.password.clone() },
             workspace_id: saved.workspace_id.clone(),
             workspace_name: saved.workspace_name.clone(),
-            tokens: TokenCell::with_refresh_token(saved.refresh_token.clone()),
+            tokens: TokenCell::with_refresh_token(refresh_token),
+            device_id,
+            allow_insecure_http: cfg.allow_insecure_http,
         }
     }
 
-    /// The user, as the offline queue tags its rows.
+    /// The account, as the offline queue tags its rows: the user on this
+    /// server.
     pub fn owner(&self) -> String {
-        storage::owner_key(&self.username)
+        storage::owner_key(&self.server, &self.username)
     }
 
     /// A client for this account. Every client shares `clock`, so the clock
@@ -163,6 +193,8 @@ impl Account {
             .with_server_clock(clock.clone())
             .with_tokens(self.tokens.clone())
             .with_workspace(self.workspace_id.clone())
+            .with_device_id(self.device_id.clone())
+            .with_insecure_http(self.allow_insecure_http)
     }
 }
 
@@ -184,10 +216,19 @@ pub trait Machine: Send + Sync {
     fn now(&self) -> DateTime<Utc>;
     /// Milliseconds the machine has been awake ([`power::awake_millis`]).
     fn awake_millis(&self) -> u64;
-    /// The user's latest keyboard or mouse input.
+    /// The user's latest keyboard or mouse input: as the input hooks saw it
+    /// (the user's own input only) while they are attached and working;
+    /// otherwise Windows' idle clock (`GetLastInputInfo`, a single time, no
+    /// content), which software-injected input moves too. Idle detection
+    /// never depends on hooks the policy does not allow.
     fn last_input(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>>;
-    /// The user's first input after `since`, up to `now` (coming back).
+    /// The user's first input after `since`, up to `now` (coming back): from
+    /// the hooks while they are attached and working; otherwise the latest
+    /// input Windows' idle clock saw, if it is after `since`.
     fn first_input_after(&self, since: DateTime<Utc>, now: DateTime<Utc>) -> Option<DateTime<Utc>>;
+    /// Are the input hooks attached (so the two above see only the user's
+    /// own input)?
+    fn input_hooks_running(&self) -> bool;
     fn capture_screen(&self, blur: bool) -> Option<crate::tracking::ProvenanceScreenCapture>;
     /// Build the block's upload payload.
     fn snapshot(&self, block: &BlockSpec<'_>, screen: Option<crate::tracking::ProvenanceScreenCapture>) -> Activity;
@@ -222,20 +263,22 @@ impl Machine for Tracker {
         power::awake_millis()
     }
 
-    /// The hooks' view (the user's own input) while they work; otherwise
-    /// Windows' idle clock, which mouse jigglers also reset.
+    /// The hooks' view (the user's own input) while they are attached, work
+    /// and see both kinds of input; otherwise Windows' idle clock, which
+    /// mouse jigglers also reset. Detached hooks report "healthy" (nothing
+    /// proves them silent), so whether they run is checked first; hooks that
+    /// may only count keys would take someone scrolling for someone away.
     fn last_input(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-        let input = self.input();
-        if input.hook_healthy() {
-            input.last_input_at()
+        if self.hooks_see_all_input() {
+            self.input().last_input_at()
         } else {
-            crate::tracking::input::idle_seconds().map(|idle| now - seconds(idle))
+            self.system_idle_seconds().map(|idle| now - seconds(idle))
         }
     }
 
     fn first_input_after(&self, since: DateTime<Utc>, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         let input = self.input();
-        if input.hook_healthy() {
+        if self.hooks_see_all_input() {
             input
                 .active_seconds(since + TimeDelta::seconds(1), now, true, true)
                 .into_iter()
@@ -244,6 +287,10 @@ impl Machine for Tracker {
         } else {
             self.last_input(now).filter(|last| *last > since)
         }
+    }
+
+    fn input_hooks_running(&self) -> bool {
+        Tracker::input_hooks_running(self)
     }
 
     fn capture_screen(&self, blur: bool) -> Option<crate::tracking::ProvenanceScreenCapture> {
@@ -394,8 +441,8 @@ async fn run(
     let credentials_file = credentials::default_path().ok();
     let saved = credentials_file.as_deref().and_then(credentials::load_from);
     // The saved sign-in claims rows queued by builds that predate per-account
-    // tagging.
-    let legacy_owner = saved.as_ref().map(Credentials::owner_key);
+    // (and per-server) tagging.
+    let legacy_owner = saved.as_ref().map(|saved| saved.owner_key(&cfg.effective_api_base_url(saved.server.as_deref())));
 
     // A damaged queue is moved aside and replaced. One that cannot be opened
     // at all (locked by another program, no permission, disk full) leaves
@@ -521,6 +568,10 @@ struct Away {
     after_break: bool,
     /// The project tracked when they left, for "Keep as work".
     session: Option<Session>,
+    /// When Windows' idle clock first showed input again, while the input
+    /// hooks confirm it was the user's own (a mouse jiggler moves that clock
+    /// too). The time away ends here once they do.
+    noticed: Option<DateTime<Utc>>,
 }
 
 /// The time away, waiting for "Keep as work" or "Discard".
@@ -708,7 +759,7 @@ impl Worker {
         }
 
         let now = self.now();
-        let owner = saved.as_ref().map(Credentials::owner_key);
+        let owner = saved.as_ref().map(|saved| saved.owner_key(&self.cfg.effective_api_base_url(saved.server.as_deref())));
         // Reclaim space (old rejects, other accounts' expired rows, over-limit
         // images), and show what is left.
         maintain_queue(&self.store, owner.as_deref());
@@ -721,7 +772,7 @@ impl Worker {
         // A sign-in saved by an older build names no workspace: sign in again.
         let Some(mut saved) = saved.filter(|saved| saved.workspace_id.is_some()) else {
             let server = self.cfg.api_base_url.clone();
-            self.state.update(|s| s.server_url = server);
+            self.state.update(|s| s.set_server(server));
             return;
         };
         let pause = restored_pause(saved.pause, now, self.autostart);
@@ -729,7 +780,8 @@ impl Worker {
         saved.pause = pause;
         self.pause = pause;
         self.task_note = saved.task_note.as_deref().and_then(clean_note);
-        let account = Account::of(&saved, &self.cfg);
+        let account = Account::of(&saved, &self.cfg, self.machine.device().device_id.clone());
+        self.release_held(&account);
         // Offline first: the saved list is used at once; the server's answer
         // replaces it shortly.
         self.projects = saved.usable_projects(now).map(<[Project]>::to_vec);
@@ -737,7 +789,7 @@ impl Worker {
         self.state.update(|s| {
             s.display_name = name;
             s.workspace = workspace;
-            s.server_url = server;
+            s.set_server(server);
         });
         self.saved = Some(saved);
         if pause_changed {
@@ -1099,23 +1151,57 @@ impl Worker {
         tracing::info!(%since, "no input for the idle threshold; away");
         // An earlier question nobody answered: no answer means discard.
         self.prompt = None;
-        self.away = Some(Away { since, until: None, after_break: false, session: self.session.clone() });
+        self.away = Some(Away { since, until: None, after_break: false, session: self.session.clone(), noticed: None });
     }
 
     fn present(&self) -> bool {
         !(self.locked || self.disconnected || self.suspended.is_some() || self.shutting_down.is_some())
     }
 
+    /// Back at the computer? While away the input hooks are off, so Windows'
+    /// idle clock says first. It is also moved by mouse jigglers and remote
+    /// tools, so when the project records input the hooks confirm it: they
+    /// are attached (counting only, nothing else runs) and the user's own
+    /// next input ends the time away — where the idle clock first saw it.
+    /// Without input permission nothing can confirm it, and the idle clock
+    /// decides alone.
     fn check_return(&mut self, now: DateTime<Utc>) {
-        let Some(since) = self.away.as_ref().map(|away| away.since) else {
+        let Some((since, noticed)) = self.away.as_ref().map(|away| (away.since, away.noticed)) else {
             return;
         };
         if !self.present() {
             return;
         }
-        if let Some(back) = self.machine.first_input_after(since, now) {
-            self.come_back(back);
+        let Some(seen) = self.machine.first_input_after(since, now) else {
+            return;
+        };
+        if self.hooks_confirm_return() && !self.machine.input_hooks_running() {
+            if noticed.is_none() {
+                tracing::debug!(%seen, "input while away; confirming it with the input hooks");
+            }
+            if let Some(away) = self.away.as_mut() {
+                away.noticed.get_or_insert(seen);
+            }
+            return;
         }
+        self.come_back(noticed.map_or(seen, |noticed| noticed.min(seen)));
+    }
+
+    /// Can the input hooks tell the user's own input from injected input on
+    /// their return? Only when the project (and consent) lets them see both
+    /// keys and the mouse.
+    fn hooks_confirm_return(&self) -> bool {
+        let perms = self.current_effective_perms();
+        perms.keyboard && perms.mouse
+    }
+
+    /// While away, after Windows' idle clock showed input: the input hooks,
+    /// alone, to confirm the return.
+    fn return_probe_perms(&self) -> Option<CapturePermissions> {
+        let probing = self.away.as_ref().is_some_and(|away| away.noticed.is_some()) && self.present();
+        let perms = self.current_effective_perms();
+        (probing && perms.keyboard && perms.mouse)
+            .then(|| CapturePermissions { keyboard: true, mouse: true, ..CapturePermissions::all_disabled() })
     }
 
     /// The user is back at `at`: a new block starts there, and — unless they
@@ -1158,7 +1244,7 @@ impl Worker {
         let last = self.machine.last_input(now).map_or(pause.since, |last| last.max(pause.since));
         if self.session.is_some() && threshold.is_some_and(|threshold| now - last >= threshold) {
             tracing::info!("the break is over, but nobody is at the computer; resuming with the next input");
-            self.away = Some(Away { since: last, until: None, after_break: true, session: None });
+            self.away = Some(Away { since: last, until: None, after_break: true, session: None, noticed: None });
         } else {
             // Not inside a sleep (or a lock) that outlasted the break: the
             // time before the machine was last awake again is not work.
@@ -1422,18 +1508,22 @@ impl Worker {
             tracing::warn!("sign-in ignored: already signed in");
             return;
         }
-        let typed = match server.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(normalize_server_url).transpose() {
+        // A typed address must be one the agent may use: never plain http://
+        // to another computer without the admin's opt-in.
+        let typed = match server.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(|s| self.cfg.server_url(s)).transpose() {
             Ok(typed) => typed,
             Err(e) => {
                 self.state.update(|s| s.login_error = Some(e.to_string()));
                 return;
             }
         };
-        // The same user signing in again keeps the server and workspace saved.
-        let same = self.saved.as_ref().filter(|saved| saved.same_account(&username));
-        let saved_server = same.and_then(|saved| saved.server.clone());
-        let saved_workspace = same.and_then(|saved| saved.workspace_id.clone());
-        let server = self.cfg.effective_api_base_url(typed.or(saved_server).as_deref());
+        // The same user signing in again keeps the server saved — and, on
+        // that server, the workspace.
+        let same_user = self.saved.as_ref().filter(|saved| saved.same_user(&username));
+        let saved_server = same_user.map(|saved| self.cfg.effective_api_base_url(saved.server.as_deref()));
+        let server = typed.or(saved_server.clone()).unwrap_or_else(|| self.cfg.api_base_url.clone());
+        let saved_workspace =
+            same_user.filter(|_| saved_server.as_deref() == Some(server.as_str())).and_then(|saved| saved.workspace_id.clone());
         self.clear_choices();
         self.preselect = workspace.map(|w| w.trim().to_owned()).filter(|w| !w.is_empty()).or(saved_workspace);
         self.signing_in = true;
@@ -1441,7 +1531,8 @@ impl Worker {
             s.signing_in = true;
             s.login_error = None;
         });
-        self.control.send(ControlRequest::SignIn(Account::new(server, username, password)));
+        let account = Account::new(server, username, password).on_device(self.machine.device().device_id.clone(), &self.cfg);
+        self.control.send(ControlRequest::SignIn(account));
     }
 
     /// The server accepted the sign-in: pick the workspace to track in.
@@ -1465,6 +1556,15 @@ impl Worker {
                 });
             }
         };
+        // An archived workspace refuses every tracker call: never offered.
+        let listed = !workspaces.is_empty();
+        let workspaces: Vec<Workspace> = workspaces.into_iter().filter(|w| !w.is_archived).collect();
+        if listed && workspaces.is_empty() {
+            return self.state.update(|s| {
+                s.signing_in = false;
+                s.login_error = Some(ALL_ARCHIVED.to_owned());
+            });
+        }
         let preselected = preselect.as_deref().and_then(|wanted| {
             workspaces.iter().find(|w| w.id.eq_ignore_ascii_case(wanted)).or_else(|| workspaces.iter().find(|w| w.name.trim().eq_ignore_ascii_case(wanted)))
         });
@@ -1527,6 +1627,8 @@ impl Worker {
         self.state.update(|s| s.finding_workspaces = false);
         let Some(current) = self.account.as_ref().filter(|_| !self.expired).map(|a| a.workspace_id.clone()) else { return };
         let others = |items: &[Workspace]| items.iter().filter(|w| current.as_deref() != Some(w.id.as_str())).count();
+        // Archived workspaces are never offered.
+        let found = found.map(|items| items.into_iter().filter(|w| !w.is_archived).collect::<Vec<_>>());
         let items = match found {
             Err(message) => return self.state.update(|s| s.workspace_note = Some(message)),
             Ok(items) if items.is_empty() => return self.state.update(|s| s.workspace_note = Some(NO_WORKSPACE.to_owned())),
@@ -1587,6 +1689,7 @@ impl Worker {
             }
         });
         self.account = Some(account.clone());
+        self.release_held(&account);
         self.control.send(ControlRequest::UseAccount(Some(account.clone())));
         self.uploader.send(UploadCommand::Account(Some(account.clone())));
         if account.workspace_id.is_some() {
@@ -1598,44 +1701,94 @@ impl Worker {
         self.reconcile(now, EndReason::Interval);
     }
 
-    /// The account lost access to the workspace it tracks in: tracking stops
-    /// (what was recorded waits in the queue) and another workspace is asked for.
-    fn workspace_lost(&mut self, workspace_id: &str) {
+    /// The server refused the workspace tracked in (access removed, the
+    /// workspace archived, or it never arrived): tracking and heartbeats stop
+    /// there, what was recorded is held in the queue, and another workspace
+    /// is asked for (CONTRACT, terminal server errors).
+    fn workspace_lost(&mut self, workspace_id: &str, refusal: WorkspaceRefusal) {
         let Some(account) = self.account.clone().filter(|_| !self.expired) else { return };
         if account.workspace_id.as_deref() != Some(workspace_id) {
             return;
         }
         let now = self.now();
         let name = if account.workspace_name.trim().is_empty() { "this workspace".to_owned() } else { account.workspace_name.clone() };
-        tracing::warn!(%workspace_id, "no longer a member of the workspace; tracking stops");
+        tracing::warn!(%workspace_id, %refusal, "the server refused the workspace; tracking stops there");
         let finished = self.blocks.end(now, now, EndReason::SignOut);
         self.record(finished, Speed::Normal);
+        // Nothing more is sent there until it is used again.
+        let note = crate::state::workspace_lost_text(&name, refusal);
+        if let Err(e) = self.store.hold_workspace(&account.owner(), workspace_id, &note) {
+            tracing::warn!(?e, "could not hold the workspace's queued blocks");
+        }
         self.uploader.send(UploadCommand::RowsQueued);
         let mut account = account;
         account.workspace_id = None;
         self.use_workspace(account, now);
-        let note = format!("You no longer have access to {name}.");
         self.state.update(|s| {
             s.workspace_lost = Some(name.clone());
             s.workspace_note = Some(note);
             s.finding_workspaces = true;
-            s.push_notice(NoticeKind::WorkspaceLost { name }, now);
+            s.push_notice(NoticeKind::WorkspaceLost { name, refusal }, now);
         });
         self.control.send(ControlRequest::MyWorkspaces);
+    }
+
+    /// A workspace admin removed this computer (403 `Tracker:DeviceRevoked`):
+    /// capture and heartbeats stop at once, the saved sign-in for that server
+    /// is forgotten, and the user is told. The queue is kept (tagged with the
+    /// account), in case the computer is restored and they sign in again.
+    fn device_revoked(&mut self, reason: &str) {
+        if self.account.is_none() {
+            return;
+        }
+        let now = self.now();
+        tracing::warn!(%reason, "this device was removed by a workspace admin; tracking stops and the sign-in is forgotten");
+        self.machine.apply_sensor_policy(false, None);
+        // The work so far is this account's: queued, never sent from here.
+        let finished = self.blocks.end(now, now, EndReason::SignOut);
+        self.record(finished, Speed::Fast);
+        self.control.send(ControlRequest::UseAccount(None));
+        self.uploader.send(UploadCommand::Account(None));
+        if let Some(path) = &self.credentials_file {
+            if let Err(e) = credentials::clear_at(path) {
+                tracing::warn!(?e, "could not forget the saved sign-in");
+            }
+        }
+        self.forget_account(now);
+        self.state.update(|s| {
+            s.login_error = Some(crate::state::DEVICE_REVOKED_TEXT.to_owned());
+            s.push_notice(NoticeKind::DeviceRevoked, now);
+        });
+    }
+
+    /// The account tracks in its workspace again: rows held there after the
+    /// server refused it are sent again (once; a refusal holds them again).
+    fn release_held(&self, account: &Account) {
+        let Some(workspace) = account.workspace_id.as_deref() else { return };
+        match self.store.release_workspace(&account.owner(), workspace) {
+            Ok(released) if released > 0 => tracing::info!(released, %workspace, "held blocks of the workspace are sent again"),
+            Err(e) => tracing::warn!(?e, "could not release the workspace's held blocks"),
+            _ => {}
+        }
     }
 
     /// A workspace was chosen after signing in. The same user in the same
     /// workspace (the password entered again after it expired) keeps
     /// everything it remembered; otherwise it starts afresh.
-    fn signed_in(&mut self, account: Account) {
+    fn signed_in(&mut self, mut account: Account) {
         let now = self.now();
         self.signing_in = false;
-        let same = self
-            .saved
-            .as_ref()
-            .is_some_and(|saved| saved.owner_key() == account.owner() && saved.workspace_id == account.workspace_id);
+        let same = self.saved.as_ref().is_some_and(|saved| {
+            saved.owner_key(&self.cfg.effective_api_base_url(saved.server.as_deref())) == account.owner()
+                && saved.workspace_id == account.workspace_id
+        });
         if !same && self.account.is_some() {
             self.forget_account(now);
+        }
+        // With a refresh token the password is never needed again: it is
+        // neither kept nor saved (a refused refresh means "sign in again").
+        if account.tokens.refresh_token().is_some() {
+            account.password.clear();
         }
         let mut saved = match self.saved.take() {
             Some(saved) if same => saved,
@@ -1657,12 +1810,13 @@ impl Worker {
         if !same {
             maintain_queue(&self.store, Some(&owner));
         }
+        self.release_held(&account);
         publish_queue(&self.store, &self.state, Some(&owner));
         let (name, workspace, server) = (account.username.clone(), account.workspace_name.clone(), account.server.clone());
         self.state.update(|s| {
             s.display_name = name;
             s.workspace = workspace;
-            s.server_url = server;
+            s.set_server(server);
             s.signing_in = false;
             s.login_error = None;
             s.workspace_lost = None;
@@ -1766,7 +1920,7 @@ impl Worker {
         self.state.update(|s| {
             s.display_name.clear();
             s.workspace.clear();
-            s.server_url = server;
+            s.set_server(server);
             s.projects.clear();
             s.selected_project = None;
             s.tracked_today_secs = 0.0;
@@ -1929,7 +2083,8 @@ impl Worker {
             ControlEvent::SignedIn { account, workspaces } => self.signed_in_to_server(account, workspaces),
             ControlEvent::SignInFailed(error) => self.sign_in_failed(&error),
             ControlEvent::MyWorkspaces(found) => self.my_workspaces_found(found),
-            ControlEvent::WorkspaceLost(workspace) => self.workspace_lost(&workspace),
+            ControlEvent::WorkspaceLost(workspace, refusal) => self.workspace_lost(&workspace, refusal),
+            ControlEvent::DeviceRevoked(reason) => self.device_revoked(&reason),
             ControlEvent::Projects(projects) => {
                 if self.account.as_ref().is_some_and(|a| a.workspace_id.is_some()) && !self.expired {
                     self.apply_projects(projects);
@@ -1954,12 +2109,14 @@ impl Worker {
             | UploadEvent::Projects { owner, .. }
             | UploadEvent::Parked { owner, .. }
             | UploadEvent::WorkspaceLost { owner, .. }
+            | UploadEvent::DeviceRevoked { owner, .. }
                 if !self.is_current_owner(&owner) =>
             {
                 tracing::debug!("an upload event of the previous account ignored");
             }
             UploadEvent::SignInExpired { reason, .. } => self.expire(&reason),
-            UploadEvent::WorkspaceLost { workspace_id, .. } => self.workspace_lost(&workspace_id),
+            UploadEvent::DeviceRevoked { reason, .. } => self.device_revoked(&reason),
+            UploadEvent::WorkspaceLost { workspace_id, refusal, .. } => self.workspace_lost(&workspace_id, refusal),
             UploadEvent::Projects { projects, .. } => {
                 if !self.expired && self.account.as_ref().is_some_and(|a| a.workspace_id.is_some()) {
                     self.apply_projects(projects);
@@ -2050,12 +2207,13 @@ impl Worker {
         let view = self.view();
         let status = view.status;
         let is_tracking = status == TrackerStatus::Tracking;
+        let probe = (status == TrackerStatus::Away).then(|| self.return_probe_perms()).flatten();
         let perms = if is_tracking {
             self.session.as_ref().map(|s| &s.policy.perms)
         } else {
-            None
+            probe.as_ref()
         };
-        self.machine.apply_sensor_policy(is_tracking, perms);
+        self.machine.apply_sensor_policy(perms.is_some(), perms);
         if self.published.as_ref() != Some(&view) {
             let v = view.clone();
             self.state.update(|s| {
@@ -2147,6 +2305,11 @@ impl Worker {
         let mut saved = saved.clone();
         if let Some(refresh_token) = self.account.as_ref().and_then(|a| a.tokens.refresh_token()) {
             saved.refresh_token = Some(refresh_token);
+        }
+        // A sign-in saved by an older build carried the password: once there
+        // is a refresh token it is dropped from the file.
+        if saved.refresh_token.as_deref().is_some_and(|t| !t.is_empty()) {
+            saved.password.clear();
         }
         if let Err(e) = credentials::save_at(path, &saved) {
             tracing::warn!(?e, "could not save the sign-in");

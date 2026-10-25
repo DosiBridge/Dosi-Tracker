@@ -396,8 +396,8 @@ fn seed_ui_preview(state: &StateHandle, kind: &str) {
                 started_at: now - minutes(10 * (i + 1) + 3),
                 ended_at: now - minutes(10 * i + 3),
                 productivity: [84, 67, 41, 92][i as usize],
-                keyboard_hits: 300,
-                mouse_clicks: 80,
+                keyboard_hits: Some(300),
+                mouse_clicks: Some(80),
                 screenshot: true,
                 upload: if i == 0 { UploadState::Queued } else { UploadState::Uploaded },
             })

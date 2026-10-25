@@ -18,6 +18,13 @@ pub struct AppConfig {
     /// Base URL of the Dosi-Tracker backend API.
     pub api_base_url: String,
 
+    /// Allow a plain `http://` server that is not this computer. Off by
+    /// default: the password, tokens, screenshots and window titles would
+    /// cross the network unencrypted. Only an admin who knows the network is
+    /// trusted turns it on, in `config.toml`; the window then warns that the
+    /// connection is not encrypted.
+    pub allow_insecure_http: bool,
+
     /// The web dashboard, opened by "Open web dashboard" in the window and tray.
     pub dashboard_url: String,
 
@@ -441,6 +448,8 @@ pub enum ServerUrlError {
     /// Only `http://` and `https://` are supported.
     UnsupportedScheme(String),
     Invalid,
+    /// `http://` to another computer, without the admin's opt-in.
+    Insecure,
 }
 
 impl std::fmt::Display for ServerUrlError {
@@ -451,11 +460,43 @@ impl std::fmt::Display for ServerUrlError {
                 write!(f, "The server address must start with https:// or http:// (not {scheme}://).")
             }
             ServerUrlError::Invalid => write!(f, "That is not a valid server address."),
+            ServerUrlError::Insecure => write!(
+                f,
+                "This server address is not encrypted (http://). Use its https:// address — your password and screenshots must not cross the network in the clear."
+            ),
         }
     }
 }
 
 impl std::error::Error for ServerUrlError {}
+
+/// Is `host` this computer (`localhost`, `127.0.0.0/8`, `::1`)? Traffic to it
+/// never leaves the machine, so plain `http://` is fine there.
+pub fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if host.eq_ignore_ascii_case("localhost") || host.to_ascii_lowercase().ends_with(".localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+/// May the agent talk to `url` at all? `https://` always; `http://` only to
+/// this computer, or anywhere once the admin set `allow_insecure_http`.
+pub fn check_transport(url: &str, allow_insecure_http: bool) -> Result<(), ServerUrlError> {
+    let parsed = reqwest::Url::parse(url.trim()).map_err(|_| ServerUrlError::Invalid)?;
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" if allow_insecure_http || parsed.host_str().is_some_and(is_loopback_host) => Ok(()),
+        "http" => Err(ServerUrlError::Insecure),
+        other => Err(ServerUrlError::UnsupportedScheme(other.to_owned())),
+    }
+}
+
+/// Does talking to `url` send data over the network unencrypted (plain
+/// `http://` to another computer)? The window warns while it does.
+pub fn is_unencrypted_remote(url: &str) -> bool {
+    check_transport(url, false) == Err(ServerUrlError::Insecure)
+}
 
 /// Normalize a server (API) address typed at sign-in or written in the
 /// config: surrounding whitespace and trailing slashes go (pages are appended
@@ -491,6 +532,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             api_base_url: "https://localhost:6006".to_string(), // matches HttpApi.Host App:SelfUrl
+            allow_insecure_http: false,
             dashboard_url: "http://localhost:6005".to_string(), // the Next.js frontend (`npm run dev`)
             interval_minutes: 10,
             capture: CapturePermissions::default(),
@@ -550,7 +592,12 @@ impl AppConfig {
         self.dashboard_url = trimmed.to_string();
         // A trailing slash would make every endpoint "//connect/token" (404,
         // reported as "cannot reach the server"); a typo must not go unnoticed.
-        self.api_base_url = match normalize_server_url(&self.api_base_url) {
+        let allow_insecure_http = self.allow_insecure_http;
+        let usable = |url: &str| {
+            let url = normalize_server_url(url)?;
+            check_transport(&url, allow_insecure_http).map(|()| url)
+        };
+        self.api_base_url = match usable(&self.api_base_url) {
             Ok(url) => url,
             Err(e) => {
                 let fallback = AppConfig::default().api_base_url;
@@ -567,10 +614,9 @@ impl AppConfig {
 
     /// The server to talk to: the address saved with the sign-in (typed on
     /// the sign-in screen) wins over `config.toml` / `DOSI__API_BASE_URL`, as
-    /// long as it is a valid address.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the server address saved at sign-in"))]
+    /// long as it is a valid address the agent may use.
     pub fn effective_api_base_url(&self, saved_server: Option<&str>) -> String {
-        match saved_server.map(normalize_server_url) {
+        match saved_server.map(|server| self.server_url(server)) {
             Some(Ok(url)) => url,
             Some(Err(e)) => {
                 tracing::warn!(%e, "the saved server address is invalid; using the configured one");
@@ -578,6 +624,15 @@ impl AppConfig {
             }
             None => self.api_base_url.clone(),
         }
+    }
+
+    /// A server address typed at sign-in, normalized — or why it cannot be
+    /// used (not an address, or `http://` to another computer without
+    /// `allow_insecure_http`).
+    pub fn server_url(&self, input: &str) -> Result<String, ServerUrlError> {
+        let url = normalize_server_url(input)?;
+        check_transport(&url, self.allow_insecure_http)?;
+        Ok(url)
     }
 }
 
@@ -680,6 +735,38 @@ mod tests {
         assert_eq!(cfg.effective_api_base_url(Some("saved.example.com/")), "https://saved.example.com");
         // A damaged saved value never breaks the agent.
         assert_eq!(cfg.effective_api_base_url(Some("ftp://saved")), "https://configured.example.com");
+    }
+
+    #[test]
+    fn plain_http_is_only_for_this_computer_unless_the_admin_opts_in() {
+        for local in ["http://localhost:6006", "http://127.0.0.1:44300", "http://127.9.9.9", "http://[::1]:6006", "http://dev.localhost"] {
+            assert_eq!(check_transport(local, false), Ok(()), "{local}");
+            assert!(!is_unencrypted_remote(local), "{local}");
+        }
+        for remote in ["http://10.0.0.5:6006", "http://tracker.example.com", "http://localhost.example.com"] {
+            assert_eq!(check_transport(remote, false), Err(ServerUrlError::Insecure), "{remote}");
+            assert_eq!(check_transport(remote, true), Ok(()), "opted in: {remote}");
+            assert!(is_unencrypted_remote(remote), "{remote}");
+        }
+        assert_eq!(check_transport("https://tracker.example.com", false), Ok(()));
+        assert_eq!(check_transport("ftp://tracker.example.com", true), Err(ServerUrlError::UnsupportedScheme("ftp".into())));
+        assert!(ServerUrlError::Insecure.to_string().contains("https://"));
+    }
+
+    #[test]
+    fn an_insecure_server_is_refused_everywhere_without_the_opt_in() {
+        // Configured: the default is used instead (loudly).
+        let cfg = from_toml("api_base_url = \"http://10.0.0.5:6006\"");
+        assert_eq!(cfg.api_base_url, AppConfig::default().api_base_url);
+        assert!(!cfg.allow_insecure_http);
+        // Typed at sign-in, or saved with an older sign-in.
+        assert_eq!(cfg.server_url("http://10.0.0.5:6006"), Err(ServerUrlError::Insecure));
+        assert_eq!(cfg.effective_api_base_url(Some("http://10.0.0.5:6006")), AppConfig::default().api_base_url);
+        assert_eq!(cfg.server_url("localhost:6006/"), Ok("https://localhost:6006".into()));
+
+        let opted_in = from_toml("allow_insecure_http = true\napi_base_url = \"http://10.0.0.5:6006\"");
+        assert_eq!(opted_in.api_base_url, "http://10.0.0.5:6006");
+        assert_eq!(opted_in.server_url("http://10.0.0.6"), Ok("http://10.0.0.6".into()));
     }
 
     #[test]
