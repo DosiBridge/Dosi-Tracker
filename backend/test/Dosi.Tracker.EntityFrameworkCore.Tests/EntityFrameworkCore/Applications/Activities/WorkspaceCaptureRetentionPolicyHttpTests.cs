@@ -38,6 +38,8 @@ namespace Dosi.Tracker.EntityFrameworkCore.Applications.Activities;
 /// real WorkspaceMembershipManager aggregate authorization, real persisted workspace-keyed settings,
 /// and instrumented in-memory ScriptedBlobProvider.
 /// </summary>
+// Runs a background sweep, whose named lock is process-wide (ABP's local lock): never alongside the other sweepers.
+[Xunit.Collection(TrackerTestConsts.CollectionDefinitionName)]
 public class WorkspaceCaptureRetentionPolicyHttpTests : WorkspaceHttpTestBase<TrackerHttpApiServerTestModule>
 {
     private static readonly Guid OwnerA = Guid.Parse("3f701e62-0953-4dd3-910b-dc6cc93ccb21");
