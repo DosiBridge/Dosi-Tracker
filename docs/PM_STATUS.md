@@ -3333,5 +3333,52 @@ Following independent source review of clean archive files at `60aaaccffd1b5f0f7
 2. **Open Phase 1 & Phase 2 Native Gates**: Full Linux target verification on `mh-ubuntu` (native private D-Bus SecretService tests, live X11 display session validation) remains open.
 3. **Phase 2 Backlog Remainder**: Input counting (XInput2), screenshot acquisition, portal PipeWire capture, and V4L2 webcam remain deferred in the Phase 2 backlog.
 
+---
+
+## 39. Linux Desktop Agent Phase 2: Running-App Provenance & Bracketed User Process Correction (TASK phase2-procfs-provenance-correction-20261025)
+
+> **Execution Date:** October 25, 2026  
+> **Phase Task ID:** `TASK phase2-procfs-provenance-correction-20261025`  
+> **Status:** Running-App Provenance Correction Delivered; Bracketed User Tasks Preserved; Synthetic & Integration Test Suites Passing (220/220 Tests Passed, Exit 0); Native Linux QA Lane Kept Open  
+> **Target Package:** `clients/linux` (Crate: `dosi-tracker-linux` v0.1.0)  
+
+### A. Context & Bounded Source Defects Corrected
+Following independent source review of commit `13cab4b9f96c0691f38fbca07a43bebf7f33fe04`, Hermes confirmed one residual requirement of kernel thread identification:
+- *Defect:* Although `SysProcFsReader` correctly identified native kernel threads via `PF_KTHREAD` (`0x0020_0000`) in `/proc/[pid]/stat`, `resolve_app_name_for_pid` still filtered bracketed comm names via `model::is_kernel_thread` at line 319, and `running_programs` fed `program_list`, whose implementation in `model.rs` dropped bracketed raw/resolved names. As a result, a legitimate user process or executable named `[editor]` or `[custom-app]` with `PF_KTHREAD` clear was silently discarded even after positive user stat parsing. Furthermore, if a stat file was missing or unreadable, `resolve_app_name_for_pid` failed rather than falling back to user comm.
+- *Corrections:*
+  1. **Strict Kernel Thread Exclusivity in `resolve_app_name_for_pid` (`tracking/procfs.rs`)**:
+     - Skips ONLY positively confirmed kernel threads: `if matches!(self.reader.is_kernel_thread(pid), Ok(true)) { return Ok(None); }`. When stat flags are clear or thread status is unavailable (e.g. unreadable or missing stat), execution proceeds to user application resolution.
+     - In Priority 3 (`read_comm`), removed the heuristic `&& !is_kernel_thread(name)` check, preserving nonempty bracketed user process comm fallbacks.
+  2. **Provenance-Aware Running Programs Aggregation (`tracking/model.rs`, `procfs.rs`)**:
+     - Implemented `aggregate_running_programs<I>(app_names: I) -> Vec<WindowInfo>`. Unlike legacy `program_list`, this provenance-aware aggregator does NOT drop bracketed application names, since kernel thread status has already been verified via procfs provenance (`PF_KTHREAD`), while maintaining canonical filename extraction (`file_name`), whitespace trimming, empty string rejection, case-insensitive first-seen deduplication, ordering, server cap at `MAX_RUNNING_PROGRAMS = 200`, and zero titles / null usage metrics.
+     - Preserved legacy `program_list` untouched for callers lacking procfs provenance, ensuring existing helper tests and invariants remain intact.
+     - Wired `ProcFsRunningAppsProvider::running_programs` to invoke `aggregate_running_programs(app_names)`.
+  3. **Mock Reader Parity (`MockProcFsReader` in `procfs.rs`)**:
+     - In `MockProcFsReader::add_process`, default `is_kthread = cmdline.is_none() && exe.is_none() && is_kernel_thread(&comm_str)` so existing mock tests continue to treat bracketed comm-only entries as kernel threads unless specified otherwise.
+     - Added `add_user_process` explicitly setting `is_kernel_thread: false` even for bracketed comm.
+  4. **Deterministic Fake-Proc-Root & Integration Regressions (`procfs.rs`, `tracking_native_adapter_tests.rs`)**:
+     - In `SysProcFsReader::with_root` unit tests (`fake_proc_root_sys_proc_fs_reader_excludes_kthreads_and_preserves_user_fallback`), added:
+       - PID 400: `PF_KTHREAD`-clear bracketed user comm fallback (`[editor]`) with absent exe and empty cmdline.
+       - PID 500: `PF_KTHREAD`-clear bracketed executable/cmdline name (`[custom-app]`).
+       - PID 600: unknown/missing stat user fallback (`[unstat-task]`, no stat file).
+       - Confirmed unbracketed `kthreadd` (PID 2) and `kworker` (PID 10) are positively excluded in the same fixture, while `[editor]`, `[custom-app]`, and `[unstat-task]` are retained.
+     - Added `test_procfs_fake_proc_root_provenance_preserves_bracketed_user_apps_and_excludes_kthreads` in `tracking_native_adapter_tests.rs` running `SysProcFsReader::with_root` end-to-end through `ConsentGatedTracker` under affirmative consent.
+
+### B. Verification Evidence
+| Execution Environment | Toolchain / Target | Command Executed | Tests / Steps | Result | Exit Code | Provenance Details |
+|---|---|---|:---:|:---:|:---:|---|
+| **Local Host** | `rustc 1.97.1` (x86_64 MSVC) | `cargo fmt --manifest-path clients/linux/Cargo.toml -- --check` | Formatting check | PASSED | **0** | Clean, 0 diffs. |
+| **Local Host** | `rustc 1.97.1` (x86_64 MSVC) | `cargo clippy --manifest-path clients/linux/Cargo.toml --locked --all-targets -- -D warnings` | Clippy lint check | PASSED | **0** | Clean, 0 warnings, 0 errors across all targets. |
+| **Local Host** | `rustc 1.97.1` (x86_64 MSVC) | `cargo test --manifest-path clients/linux/Cargo.toml --lib tracking::model` | Model unittests | PASSED | **0** | 5 passed (+1 new test for aggregate_running_programs bracketed preservation and case-insensitive dedup). |
+| **Local Host** | `rustc 1.97.1` (x86_64 MSVC) | `cargo test --manifest-path clients/linux/Cargo.toml --lib tracking::procfs` | Procfs unittests | PASSED | **0** | 6 passed (+1 new test mock_procfs_preserves_bracketed_user_process_with_kthread_clear, expanded fake proc root test with PIDs 400, 500, 600). |
+| **Local Host** | `rustc 1.97.1` (x86_64 MSVC) | `cargo test --manifest-path clients/linux/Cargo.toml --test tracking_native_adapter_tests` | Tracking native adapter tests | PASSED | **0** | 18 passed (+1 new test test_procfs_fake_proc_root_provenance_preserves_bracketed_user_apps_and_excludes_kthreads). |
+| **Local Host** | `rustc 1.97.1` (x86_64 MSVC) | `cargo test --manifest-path clients/linux/Cargo.toml --locked --release` | Full release test suite | PASSED | **0** | 220 release tests passed across 11 test suites (103 lib, 3 main, 8 doctor, 21 identity/transport/signing, 7 failing-before repro, 3 installer lifecycle [22 inner checks], 15 outbox status CLI, 29 outbox, 13 sync, 18 tracking native adapters; 0 in Linux-gated private bus; exit 0). |
+
+### C. Synthetic vs Native Boundaries & Next Steps
+1. **Worker Evidence Only**: Windows execution represents host worker evidence using deterministic fake proc roots and synthetic packets. Native Linux QA lane on `mh-ubuntu` remains open.
+2. **Open Phase 1 & Phase 2 Native Gates**: Linux target verification on `mh-ubuntu` (native private D-Bus SecretService tests, live X11 display session validation) remains open.
+3. **Phase 2 Backlog Remainder**: Input counting (XInput2), screenshot acquisition & blur, portal PipeWire capture, and V4L2 webcam capture remain deferred.
+
+
 
 

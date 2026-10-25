@@ -12,7 +12,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use super::model::{file_name, is_kernel_thread, program_list, WindowInfo, MAX_RUNNING_PROGRAMS};
+use super::model::{
+    aggregate_running_programs, file_name, is_kernel_thread, WindowInfo, MAX_RUNNING_PROGRAMS,
+};
 use super::traits::{RunningAppsProvider, TrackingError};
 
 /// Linux kernel task flag indicating a kernel thread (`#define PF_KTHREAD 0x00200000` in `include/linux/sched.h`).
@@ -207,6 +209,27 @@ impl MockProcFsReader {
         cmdline: Option<Vec<String>>,
         exe: Option<String>,
     ) {
+        let comm_str = comm.into();
+        let is_kthread = cmdline.is_none() && exe.is_none() && is_kernel_thread(&comm_str);
+        let mut procs = self.processes.lock().unwrap();
+        procs.insert(
+            pid,
+            MockProcessEntry {
+                comm: comm_str,
+                cmdline,
+                exe,
+                is_kernel_thread: is_kthread,
+            },
+        );
+    }
+
+    pub fn add_user_process(
+        &self,
+        pid: u32,
+        comm: impl Into<String>,
+        cmdline: Option<Vec<String>>,
+        exe: Option<String>,
+    ) {
         let mut procs = self.processes.lock().unwrap();
         procs.insert(
             pid,
@@ -290,8 +313,11 @@ impl ProcFsRunningAppsProvider {
 
     /// Resolve the executable name for a specific PID.
     pub fn resolve_app_name_for_pid(&self, pid: u32) -> Result<Option<String>, TrackingError> {
-        // Skip positively identified kernel threads
-        if self.reader.is_kernel_thread(pid)? {
+        // Skip positively identified kernel threads:
+        // On native Linux, kernel threads are positively identified via PF_KTHREAD flag in /proc/[pid]/stat.
+        // We skip ONLY positively confirmed kernel threads. When flags are clear or thread status is unavailable
+        // (missing or unreadable stat), we proceed to resolve the user application name.
+        if matches!(self.reader.is_kernel_thread(pid), Ok(true)) {
             return Ok(None);
         }
 
@@ -317,7 +343,7 @@ impl ProcFsRunningAppsProvider {
         // Preserves ordinary user processes where exe/cmdline is unavailable (e.g. zombies or permission-denied)
         if let Some(comm) = self.reader.read_comm(pid)? {
             let name = comm.trim();
-            if !name.is_empty() && !is_kernel_thread(name) {
+            if !name.is_empty() {
                 return Ok(Some(name.to_string()));
             }
         }
@@ -337,7 +363,7 @@ impl RunningAppsProvider for ProcFsRunningAppsProvider {
             }
         }
 
-        Ok(program_list(app_names))
+        Ok(aggregate_running_programs(app_names))
     }
 }
 
@@ -504,6 +530,36 @@ mod tests {
         .unwrap();
         std::fs::write(p300.join("comm"), "worker (job) \n").unwrap();
 
+        // PID 400: bracketed user process with comm only and PF_KTHREAD clear
+        let p400 = root.join("400");
+        std::fs::create_dir(&p400).unwrap();
+        std::fs::write(
+            p400.join("stat"),
+            "400 ([editor]) S 1 400 400 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0",
+        )
+        .unwrap();
+        std::fs::write(p400.join("comm"), "[editor]\n").unwrap();
+
+        // PID 500: bracketed user executable/cmdline name with PF_KTHREAD clear
+        let p500 = root.join("500");
+        std::fs::create_dir(&p500).unwrap();
+        std::fs::write(
+            p500.join("stat"),
+            "500 ([custom-app]) S 1 500 500 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0",
+        )
+        .unwrap();
+        std::fs::write(p500.join("comm"), "[custom-app]\n").unwrap();
+        std::fs::write(
+            p500.join("cmdline"),
+            b"/usr/local/bin/[custom-app]\0--run\0",
+        )
+        .unwrap();
+
+        // PID 600: unknown/missing stat user fallback (stat file is absent)
+        let p600 = root.join("600");
+        std::fs::create_dir(&p600).unwrap();
+        std::fs::write(p600.join("comm"), "[unstat-task]\n").unwrap();
+
         // Non-numeric entry in proc root (must be ignored by list_pids)
         let cpuinfo = root.join("cpuinfo");
         std::fs::write(cpuinfo, "processor: 0\n").unwrap();
@@ -516,6 +572,9 @@ mod tests {
         assert!(!sys_reader.is_kernel_thread(100).unwrap());
         assert!(!sys_reader.is_kernel_thread(200).unwrap());
         assert!(!sys_reader.is_kernel_thread(300).unwrap());
+        assert!(!sys_reader.is_kernel_thread(400).unwrap());
+        assert!(!sys_reader.is_kernel_thread(500).unwrap());
+        assert!(!sys_reader.is_kernel_thread(600).unwrap());
 
         // Check running apps provider integration
         let provider = ProcFsRunningAppsProvider::new(sys_reader);
@@ -534,5 +593,36 @@ mod tests {
         // Ordinary user fallback on comm must be preserved when exe/cmdline are absent
         assert!(names.contains(&"zombie-worker"));
         assert!(names.contains(&"worker (job)"));
+
+        // Bracketed user applications with PF_KTHREAD clear must be preserved
+        assert!(names.contains(&"[editor]"));
+        assert!(names.contains(&"[custom-app]"));
+
+        // User fallback with missing/unknown stat must be preserved even if bracketed
+        assert!(names.contains(&"[unstat-task]"));
+    }
+
+    #[test]
+    fn mock_procfs_preserves_bracketed_user_process_with_kthread_clear() {
+        let mock = Arc::new(MockProcFsReader::new());
+        // Bracketed comm user process with is_kernel_thread = false
+        mock.add_user_process(401, "[editor]", None, None);
+        // Bracketed exe user process
+        mock.add_process(
+            402,
+            "[custom-app]",
+            Some(vec!["/usr/bin/[custom-app]".into()]),
+            Some("/usr/bin/[custom-app]".into()),
+        );
+        // Positively identified kernel thread
+        mock.add_kernel_thread(2, "kthreadd");
+
+        let provider = ProcFsRunningAppsProvider::new(mock);
+        let procs = provider.running_programs().expect("Must succeed");
+        let names: Vec<&str> = procs.iter().map(|p| p.app_name.as_str()).collect();
+
+        assert!(!names.contains(&"kthreadd"));
+        assert!(names.contains(&"[editor]"));
+        assert!(names.contains(&"[custom-app]"));
     }
 }

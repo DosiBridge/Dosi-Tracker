@@ -154,4 +154,25 @@ mod tests {
         let programs = program_list((0..500).map(|i| format!("app{i}")));
         assert_eq!(programs.len(), MAX_RUNNING_PROGRAMS);
     }
+
+    #[test]
+    fn aggregate_running_programs_preserves_bracketed_user_names_and_deduplicates() {
+        let names = [
+            "/usr/bin/[editor]".to_string(),
+            "[editor]".to_string(),
+            "[custom-app]".to_string(),
+            "".to_string(),
+            "   ".to_string(),
+            "[CUSTOM-APP]".to_string(),
+            "/usr/bin/slack".to_string(),
+        ];
+
+        let programs = aggregate_running_programs(names);
+        let listed: Vec<&str> = programs.iter().map(|p| p.app_name.as_str()).collect();
+        assert_eq!(listed, ["[editor]", "[custom-app]", "slack"]);
+        assert!(programs.iter().all(|p| p.window_title.is_empty()));
+        assert!(programs
+            .iter()
+            .all(|p| p.seconds.is_none() && p.keyboard_hits.is_none() && p.mouse_clicks.is_none()));
+    }
 }

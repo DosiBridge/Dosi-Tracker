@@ -63,11 +63,11 @@ pub use sync::{
     MAX_REPORT_DIAGNOSTIC_BYTES,
 };
 pub use tracking::{
-    craft_get_property_wire_reply, file_name, is_kernel_thread, program_list, AcquisitionProvider,
-    AcquisitionProviderExt, ActiveWindowProvider, ConsentGatedTracker, FakeAcquisitionProvider,
-    MockProcFsReader, MockProcessEntry, MockX11PropertyReader, ProcFsReader,
-    ProcFsRunningAppsProvider, RawPropertyReply, RunningAppsProvider, SyntheticX11Transport,
-    SysProcFsReader, SysX11PropertyReader, SysX11Transport, TrackingError,
-    WaylandActiveWindowProvider, WindowInfo, X11ActiveWindowProvider, X11PropertyReader,
-    X11PropertyTransport, MAX_RUNNING_PROGRAMS,
+    aggregate_running_programs, craft_get_property_wire_reply, file_name, is_kernel_thread,
+    program_list, AcquisitionProvider, AcquisitionProviderExt, ActiveWindowProvider,
+    ConsentGatedTracker, FakeAcquisitionProvider, MockProcFsReader, MockProcessEntry,
+    MockX11PropertyReader, ProcFsReader, ProcFsRunningAppsProvider, RawPropertyReply,
+    RunningAppsProvider, SyntheticX11Transport, SysProcFsReader, SysX11PropertyReader,
+    SysX11Transport, TrackingError, WaylandActiveWindowProvider, WindowInfo,
+    X11ActiveWindowProvider, X11PropertyReader, X11PropertyTransport, MAX_RUNNING_PROGRAMS,
 };

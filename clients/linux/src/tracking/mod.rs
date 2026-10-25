@@ -19,7 +19,10 @@ pub mod x11;
 
 pub use fake::FakeAcquisitionProvider;
 pub use gated::ConsentGatedTracker;
-pub use model::{file_name, is_kernel_thread, program_list, WindowInfo, MAX_RUNNING_PROGRAMS};
+pub use model::{
+    aggregate_running_programs, file_name, is_kernel_thread, program_list, WindowInfo,
+    MAX_RUNNING_PROGRAMS,
+};
 pub use procfs::{
     MockProcFsReader, MockProcessEntry, ProcFsReader, ProcFsRunningAppsProvider, SysProcFsReader,
 };

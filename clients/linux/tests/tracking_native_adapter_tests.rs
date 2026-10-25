@@ -20,8 +20,9 @@ use dosi_tracker_linux::tracking::{
     craft_get_property_wire_reply, file_name, program_list, AcquisitionProviderExt,
     ActiveWindowProvider, ConsentGatedTracker, FakeAcquisitionProvider, MockProcFsReader,
     MockX11PropertyReader, ProcFsRunningAppsProvider, RawPropertyReply, RunningAppsProvider,
-    SyntheticX11Transport, SysX11PropertyReader, TrackingError, WaylandActiveWindowProvider,
-    WindowInfo, X11ActiveWindowProvider, X11PropertyReader, MAX_RUNNING_PROGRAMS,
+    SyntheticX11Transport, SysProcFsReader, SysX11PropertyReader, TrackingError,
+    WaylandActiveWindowProvider, WindowInfo, X11ActiveWindowProvider, X11PropertyReader,
+    MAX_RUNNING_PROGRAMS,
 };
 
 fn create_test_lifecycle() -> Arc<Mutex<TrackerLifecycle>> {
@@ -947,4 +948,121 @@ fn test_consent_gated_tracker_with_real_x11_transport_and_revocation() {
         tracker.current_active_window(),
         Err(TrackingError::ConsentRequired)
     );
+}
+
+#[test]
+fn test_procfs_fake_proc_root_provenance_preserves_bracketed_user_apps_and_excludes_kthreads() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+
+    // 1. Kernel thread (kthreadd): unbracketed comm, PF_KTHREAD flag set in stat
+    let p2 = root.join("2");
+    std::fs::create_dir(&p2).unwrap();
+    std::fs::write(
+        p2.join("stat"),
+        "2 (kthreadd) S 0 0 0 0 -1 2129984 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0",
+    )
+    .unwrap();
+    std::fs::write(p2.join("comm"), "kthreadd\n").unwrap();
+
+    // 2. Kernel thread (kworker): unbracketed comm, PF_KTHREAD flag set in stat
+    let p10 = root.join("10");
+    std::fs::create_dir(&p10).unwrap();
+    std::fs::write(
+        p10.join("stat"),
+        "10 (kworker/u16:0) I 2 0 0 0 -1 69238848 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0",
+    )
+    .unwrap();
+    std::fs::write(p10.join("comm"), "kworker/u16:0\n").unwrap();
+
+    // 3. User process: standard command with cmdline and clear PF_KTHREAD
+    let p100 = root.join("100");
+    std::fs::create_dir(&p100).unwrap();
+    std::fs::write(
+        p100.join("stat"),
+        "100 (bash) S 1 100 100 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0",
+    )
+    .unwrap();
+    std::fs::write(p100.join("comm"), "bash\n").unwrap();
+    std::fs::write(p100.join("cmdline"), b"/usr/bin/bash\0-i\0").unwrap();
+
+    // 4. User process: comm-only fallback (zombie/unprivileged) with clear PF_KTHREAD
+    let p200 = root.join("200");
+    std::fs::create_dir(&p200).unwrap();
+    std::fs::write(
+        p200.join("stat"),
+        "200 (zombie-worker) Z 1 200 200 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0",
+    )
+    .unwrap();
+    std::fs::write(p200.join("comm"), "zombie-worker\n").unwrap();
+
+    // 5. User process: bracketed comm fallback with clear PF_KTHREAD (e.g. [editor])
+    let p400 = root.join("400");
+    std::fs::create_dir(&p400).unwrap();
+    std::fs::write(
+        p400.join("stat"),
+        "400 ([editor]) S 1 400 400 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0",
+    )
+    .unwrap();
+    std::fs::write(p400.join("comm"), "[editor]\n").unwrap();
+
+    // 6. User process: bracketed executable name with clear PF_KTHREAD (e.g. [custom-app])
+    let p500 = root.join("500");
+    std::fs::create_dir(&p500).unwrap();
+    std::fs::write(
+        p500.join("stat"),
+        "500 ([custom-app]) S 1 500 500 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0",
+    )
+    .unwrap();
+    std::fs::write(p500.join("comm"), "[custom-app]\n").unwrap();
+    std::fs::write(p500.join("cmdline"), b"/opt/tools/[custom-app]\0--daemon\0").unwrap();
+
+    // 7. User process: unknown/missing stat (stat file absent, thread status unavailable)
+    let p600 = root.join("600");
+    std::fs::create_dir(&p600).unwrap();
+    std::fs::write(p600.join("comm"), "[unstat-task]\n").unwrap();
+
+    let sys_reader = Arc::new(SysProcFsReader::with_root(root));
+    let apps_provider = Arc::new(ProcFsRunningAppsProvider::new(sys_reader));
+    let fake_window = Arc::new(FakeAcquisitionProvider::new());
+    let lifecycle = create_test_lifecycle();
+    let tracker = ConsentGatedTracker::new(fake_window, apps_provider, lifecycle.clone());
+
+    // Configure consent for running_programs
+    let policy = ConsentedPermissions {
+        running_programs: true,
+        ..ConsentedPermissions::all_disabled()
+    };
+    {
+        let mut lc = lifecycle.lock().unwrap();
+        lc.configure(policy);
+        lc.update_consent(LocalConsent::Granted(policy)).unwrap();
+        lc.start().unwrap();
+    }
+
+    let procs = tracker.running_programs().expect("scan must succeed");
+    let names: Vec<&str> = procs.iter().map(|p| p.app_name.as_str()).collect();
+
+    // Positively identified kernel threads must be excluded even if unbracketed
+    assert!(!names.contains(&"kthreadd"));
+    assert!(!names.contains(&"kworker/u16:0"));
+
+    // Standard and comm-fallback user applications must be retained
+    assert!(names.contains(&"bash"));
+    assert!(names.contains(&"zombie-worker"));
+
+    // Bracketed user applications with PF_KTHREAD clear must be preserved
+    assert!(names.contains(&"[editor]"));
+    assert!(names.contains(&"[custom-app]"));
+
+    // Bracketed user applications with missing/unknown stat must be preserved
+    assert!(names.contains(&"[unstat-task]"));
+
+    // Privacy invariants
+    for p in &procs {
+        assert!(p.window_title.is_empty());
+        assert!(p.seconds.is_none());
+        assert!(p.keyboard_hits.is_none());
+        assert!(p.mouse_clicks.is_none());
+    }
 }
