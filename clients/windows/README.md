@@ -16,7 +16,7 @@ shows the timer, what was recorded, and what your workspace captures.
 1. Download `dosi-tracker-setup-<version>.exe` (CI builds it on every push).
 2. Run it. It installs **for your Windows user only** — no administrator rights —
    to `%LOCALAPPDATA%\Programs\DosiTracker`, adds a Start menu shortcut, and
-   starts Dosi Tracker when you sign in to Windows. If SmartScreen says
+   (on a first install) starts Dosi Tracker when you sign in to Windows. If SmartScreen says
    *Windows protected your PC*, choose **More info → Run anyway**.
 3. Sign in (below).
 
@@ -40,7 +40,17 @@ the installer (exit code 2) instead of installing an agent that cannot connect.
 Installing over a running agent first asks it to **quit gracefully**
 (`dosi-tracker.exe --quit`: the block in progress is saved and uploaded), and
 only ends it if it has not quit within 30 s — or if it is an older build that
-does not know `--quit`.
+does not know `--quit`. Only *your* agent, in your Windows session, is ever
+ended: an installer run by an admin or in another session leaves other users'
+agents alone.
+
+**Upgrades keep your choices.** *Start with Windows* is switched on by a first
+install only; an upgrade leaves it as you set it in the app. After a **silent**
+upgrade (`/S`, e.g. from MDM) the agent is started again (with `--autostart`,
+so it comes back in the tray) if it was running before, or if it is signed in
+and starts with Windows — nobody is left untracked until their next Windows
+sign-in. An interactive install offers *Start Dosi Tracker now* on its last
+page instead.
 
 ## Sign in
 
@@ -57,9 +67,20 @@ that the connection is not encrypted.
 
 After signing in the agent lists your workspaces and uses the only one, or
 asks; **archived workspaces are never offered**. The sign-in is stored
-**encrypted with Windows DPAPI**, keyed to your Windows user. Only the refresh
-token the server grants is kept — **not the password**: it is sent once, when
-you sign in.
+**encrypted with Windows DPAPI**, keyed to your Windows user and to this app
+(DPAPI "entropy", so a tool that sweeps every DPAPI blob of your user does not
+open it). Only the refresh token the server grants is kept — **never the
+password**: it is sent once, when you sign in, and forgotten as soon as the
+server accepts it. The server replaces the refresh token on every renewal; the
+new one is saved within seconds. A sign-in saved by an older build that still
+held the password is rewritten without it at the first start of this one (the
+password is used once more, in memory, to obtain a refresh token).
+
+**Signing out** uploads what it can (up to 15 s), then **revokes the refresh
+token at the server** (OpenIddict's revocation endpoint, as the server's
+`/.well-known/openid-configuration` names it, else `/connect/revocat`) and
+deletes the saved sign-in. If the server is out of reach the token is still
+forgotten on this computer and expires on the server by itself.
 
 When signing in fails, the form says why:
 
@@ -265,8 +286,10 @@ audio, files, or the window titles of programs in the background.
 | Where | What |
 |---|---|
 | `%LOCALAPPDATA%\Programs\DosiTracker\` | `dosi-tracker.exe`, `config.toml` (if written by the installer), `uninstall.exe` |
-| `%APPDATA%\DosiTracker\credentials.bin` | the sign-in, DPAPI-encrypted, with the chosen project, the last project list (for offline starts), a pause and the task note |
+| `%APPDATA%\DosiTracker\credentials.bin` | the sign-in — the refresh token, never the password — DPAPI-encrypted, with the chosen project, the last project list (for offline starts), a pause and the task note |
 | `%APPDATA%\DosiTracker\preferences.json` | your preferences (window behaviour, notifications, goals) |
+| `%APPDATA%\DosiTracker\consent.json` | what you agreed to capture on this computer |
+| `%APPDATA%\DosiTracker\signing.key` | a DPAPI-encrypted key for the local tag on each queued block (the server does not verify it) |
 | `%LOCALAPPDATA%\DosiTracker\dosi-tracker.db` | the offline queue (SQLite), with screenshots waiting to upload |
 | `%LOCALAPPDATA%\DosiTracker\logs\` | daily logs, kept 7 days |
 | `%LOCALAPPDATA%\DosiTracker\device.json` | the device ID |
@@ -276,9 +299,19 @@ Builds before this one kept the queue and logs in `%APPDATA%`; they are moved to
 
 **Uninstall** from *Settings → Apps* (or `uninstall.exe`). It asks the agent to
 quit gracefully, removes the program, shortcut and autostart entry, and then
-**asks whether to delete your data** (sign-in, preferences, logs, and any time
-not uploaded yet). A silent uninstall (`/S`) deletes it; add `/KEEPDATA` to
-keep it.
+**asks whether to delete your data** (everything in the table above outside the
+program folder: sign-in, preferences, consent, logs, and any time not uploaded
+yet). From a script:
+
+| Command | Your data |
+|---|---|
+| `uninstall.exe /S` | **kept** — so tracked time not uploaded yet is never lost by accident |
+| `uninstall.exe /S /PURGE` | deleted, without asking (offboarding a computer) |
+| `uninstall.exe /S /KEEPDATA` | kept (also wins over `/PURGE`) |
+
+Deleting the data removes the saved sign-in from this computer, but does not
+revoke it at the server: sign out in the app first (that revokes the refresh
+token), or let the workspace admin remove the computer.
 
 ## Configuration
 
@@ -302,6 +335,7 @@ Any key can also be set as an environment variable, e.g. `DOSI__API_BASE_URL`,
 | | |
 |---|---|
 | Sign-in | OpenIddict password grant, `POST /connect/token` (`client_id=Tracker_App`, scope `openid profile email roles offline_access Tracker`, no `__tenant`), with `device_id` (this install's UUID) on the password and every refresh grant. Then `GET /api/app/workspaces/mine`; every workspace-scoped call carries `X-Workspace-Id`. The token is renewed with the refresh token before it expires and once after a 401; a refused refresh token means *sign-in expired*. |
+| Sign-out | After the last uploads (up to 15 s), the refresh token is revoked: `POST` to the `revocation_endpoint` of `/.well-known/openid-configuration` when it is on the same server, else `/connect/revocat` (`token`, `token_type_hint=refresh_token`, `client_id=Tracker_App`). Best effort, 5 s; the saved sign-in is deleted either way. |
 | Projects | `GET /api/app/project/my-projects` every 5 minutes and after a 403/409 from an upload: interval, capture permissions, idle threshold, blur. |
 | Upload | `POST /api/app/activity`, one block at a time, oldest first, on a thread of its own (so pausing, locking or quitting never waits for a slow upload). |
 | Presence | `POST /api/app/presence/heartbeat` every 60 s and on every status change; "stopped" / "signed out" when quitting or signing out. |
@@ -407,7 +441,15 @@ makensis /DVERSION=0.1.0 dosi-tracker.nsi   # -> dosi-tracker-setup-0.1.0.exe
 ```
 
 CI takes the version from `Cargo.toml`, builds the installer on every push and
-uploads it as a workflow artifact.
+uploads it as a workflow artifact. Without Windows, `makensis` from the Linux
+`nsis` package builds the same installer (CI uses the Windows build of NSIS).
+
+Things to check by hand on a test machine after changing it (they need a real
+Windows session): a first install turns *Start with Windows* on; turning it off
+in the app and upgrading keeps it off; a silent upgrade (`/S`) over a running,
+signed-in agent restarts it in the tray; `uninstall.exe /S` keeps
+`%APPDATA%\DosiTracker` and `%LOCALAPPDATA%\DosiTracker`, `/S /PURGE` removes
+both.
 
 ### Reviewing the window without a backend
 
@@ -483,8 +525,14 @@ src/
 ## Known gaps
 
 - No automatic updater — new versions are installed by running the setup again.
-- A worker that panics is reported (red *Stopped*) but not restarted
-  automatically; restarting the app recovers.
+- A worker that panics is reported (red *Stopped*) and the panic — message,
+  place and backtrace — is written to the log, but the worker is not
+  restarted automatically; restarting the app recovers.
+- Sign-in is the OpenIddict password grant: an account that requires
+  single sign-on or multi-factor sign-in cannot sign in from the agent yet
+  (that needs the browser-based authorization-code flow).
+- Builds are not code-signed yet, and the per-block `payloadSignature` is a
+  local tag the server does not verify (no tamper protection).
 - Autostart uses the per-user Run key, not a Windows service: capture needs the
   user's interactive session, which a session-0 service cannot reach.
 - Input to apps running as administrator is not counted (see Troubleshooting).
