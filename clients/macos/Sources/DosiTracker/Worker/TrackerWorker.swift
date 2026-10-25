@@ -80,6 +80,11 @@ actor TrackerWorker {
         /// The workspace to take without asking when it is listed (the one
         /// tracked in before).
         let preferred: String?
+        /// Whether a workspace may be taken without asking (the preferred
+        /// one, or the only one listed). False once the server ended access
+        /// to the one tracked in: the user chooses the next one, even when a
+        /// single one is left (cross-agent contract).
+        let autoSelect: Bool
         let generation: Int
     }
 
@@ -143,6 +148,8 @@ actor TrackerWorker {
     static let noWorkspaceMessage =
         "You are not in any workspace yet. Create one on the web dashboard or ask for an invitation."
     static let oneWorkspaceMessage = "You are not in any other workspace."
+    static let workspaceEndedMessage =
+        "You no longer have access to the workspace you tracked in. Choose where to track your time."
     static let serverNeededMessage =
         "Enter your server address. Your workspace admin can give it to you (it is on the web dashboard's Download page)."
     /// The today / this-week totals are fetched again this often…
@@ -465,9 +472,10 @@ actor TrackerWorker {
         shared.serverURL = config.apiBaseURL.absoluteString
         guard let workspaceId = savedSignIn.workspaceId, let owner = savedSignIn.ownerKey else {
             // Signed in, but no workspace is chosen yet: list them again.
+            // After access to the last one was lost, the user picks the next.
             pending = PendingSignIn(client: client, username: savedSignIn.username, serverURL: config.apiBaseURL,
                                     typedServer: nil, preferred: deps.preferences.lastWorkspaceId,
-                                    generation: generation)
+                                    autoSelect: !savedSignIn.mustChooseWorkspace, generation: generation)
             uploader?.send(.account(client: client, user: UploadUser(username: savedSignIn.username, current: nil)))
             requestWorkspaces(client: client)
             return
@@ -545,7 +553,10 @@ actor TrackerWorker {
             return
         }
         if let waiting = pending {
-            switch WorkspaceSelection.resolve(listed, preferred: waiting.preferred) {
+            // After access to the last one was lost, every usable workspace
+            // is offered (a single one too) and nothing is tracked until the
+            // user picks one.
+            switch WorkspaceSelection.resolve(listed, preferred: waiting.preferred, autoSelect: waiting.autoSelect) {
             case .selected(let workspace):
                 let onlyOne = listed.filter { !$0.isArchived }.count == 1
                 Task {
@@ -553,6 +564,10 @@ actor TrackerWorker {
                 }
             case .choose(let usable):
                 workspaceChoices = usable
+                if !waiting.autoSelect && workspaceNote == nil {
+                    // After a relaunch the note of the loss is gone: say why.
+                    workspaceNote = TrackerWorker.workspaceEndedMessage
+                }
             case .noWorkspace:
                 workspaceChoices = []
                 workspaceNote = TrackerWorker.noWorkspaceMessage
@@ -716,13 +731,17 @@ actor TrackerWorker {
         if var stored = saved {
             stored.workspaceId = nil
             stored.workspaceName = ""
+            // A relaunch asks too: never moved to another workspace unasked.
+            stored.mustChooseWorkspace = true
             persist(stored)
         }
         leaveWorkspaceState()
         account = nil
         contacting = false
+        // The user chooses where to track next, even when one workspace is
+        // left: it may belong to another organisation.
         pending = PendingSignIn(client: current.client, username: current.username, serverURL: current.serverURL,
-                                typedServer: nil, preferred: nil, generation: current.generation)
+                                typedServer: nil, preferred: nil, autoSelect: false, generation: current.generation)
         workspaceChoices = []
         workspaceNote = message
         shared.workspace = ""
@@ -1660,9 +1679,13 @@ actor TrackerWorker {
             return
         }
         signInGeneration = generation
+        // Access to the workspace tracked in was lost and none was chosen
+        // since: the user picks the next one, even the only one left.
+        let autoSelect = !(sameUser && saved?.mustChooseWorkspace == true)
         let waiting = PendingSignIn(client: candidate, username: trimmedUsername, serverURL: url,
-                                    typedServer: typedServer, preferred: preferred, generation: generation)
-        switch WorkspaceSelection.resolve(workspaces, preferred: preferred) {
+                                    typedServer: typedServer, preferred: preferred, autoSelect: autoSelect,
+                                    generation: generation)
+        switch WorkspaceSelection.resolve(workspaces, preferred: preferred, autoSelect: autoSelect) {
         case .noWorkspace:
             CoreLog.warning("worker", "signed in, but not a member of any active workspace")
             shared.loginError = TrackerWorker.noWorkspaceMessage
@@ -1676,7 +1699,7 @@ actor TrackerWorker {
             }
             pending = waiting
             workspaceChoices = usable
-            workspaceNote = nil
+            workspaceNote = autoSelect ? nil : TrackerWorker.workspaceEndedMessage
             shared.loginError = nil
             shared.displayName = trimmedUsername
         }

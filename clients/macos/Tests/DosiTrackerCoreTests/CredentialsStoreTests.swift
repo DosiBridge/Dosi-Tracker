@@ -26,6 +26,21 @@ final class CredentialsStoreTests: XCTestCase {
         XCTAssertEqual(Set(json.keys), ["username", "workspaceId", "workspaceName", "refreshToken"])
     }
 
+    /// A lost workspace is remembered across a relaunch, so the next one is
+    /// asked for; older items without the field read as "not lost".
+    func testTheMarkOfALostWorkspaceRoundTrips() throws {
+        let lost = StoredSignIn(username: "alice@acme.com", workspaceId: nil, workspaceName: "",
+                                refreshToken: "refresh-fixture-3", mustChooseWorkspace: true)
+        let data = try JSONEncoder().encode(lost)
+        XCTAssertEqual(jsonDictionary(data)["mustChooseWorkspace"] as? Bool, true)
+        let back = try JSONDecoder().decode(StoredSignIn.self, from: data)
+        XCTAssertEqual(back, lost)
+        XCTAssertTrue(back.canResume)
+        XCTAssertFalse(sample().mustChooseWorkspace)
+        let older = Data(#"{"username":"alice@acme.com","workspaceName":"","refreshToken":"r"}"#.utf8)
+        XCTAssertFalse(try JSONDecoder().decode(StoredSignIn.self, from: older).mustChooseWorkspace)
+    }
+
     func testASignInWithoutATokenOrAWorkspaceCannotResumeAlone() {
         XCTAssertFalse(sample(nil).canResume, "without a refresh token the user signs in again")
         let unchosen = StoredSignIn(username: "alice@acme.com", workspaceId: nil, workspaceName: "",

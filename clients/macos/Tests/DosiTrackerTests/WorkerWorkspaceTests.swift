@@ -422,7 +422,7 @@ final class WorkerWorkspaceTests: XCTestCase {
         await tearDown(harness)
     }
 
-    func testALostWorkspaceStopsTrackingThereAndAnotherOneIsChosen() async throws {
+    func testALostWorkspaceStopsTrackingAndAsksBeforeTrackingInTheOnlyOtherOne() async throws {
         let owner = Queue.ownerKey(workspaceId: "ws-1", username: "user@example.com")
         ScriptedURLProtocol.reset([
             "/connect/token": [Self.token("refresh-rotated")],
@@ -439,17 +439,108 @@ final class WorkerWorkspaceTests: XCTestCase {
         let startedTracking = await worker.facts().tracking
         XCTAssertTrue(startedTracking)
 
-        // The workspace refused; the only other one is taken.
-        await eventually("tracking in the other workspace") {
-            harness.credentials.saved?.workspaceId == "ws-2"
+        // The workspace refused: the only other one is offered, never taken
+        // on the user's behalf (it may belong to another organisation).
+        await eventually("the other workspace offered") {
+            harness.snapshots.latest?.workspaceChoices.map { $0.name } == ["Globex"]
         }
+        let choosing = try XCTUnwrap(harness.snapshots.latest)
+        XCTAssertEqual(choosing.status, .choosingWorkspace)
+        XCTAssertTrue(choosing.workspaceNote?.contains("Acme") ?? false, "the user is told why")
+        XCTAssertEqual(harness.drivers.last, ConsentedPermissions.allDisabled, "capture stops at once")
+        let trackingWhileAsked = await worker.facts().tracking
+        XCTAssertFalse(trackingWhileAsked)
+        XCTAssertNil(harness.credentials.saved?.workspaceId)
+        XCTAssertEqual(harness.credentials.saved?.mustChooseWorkspace, true, "a relaunch asks too")
         XCTAssertNil(requests("/api/app/workspaces/mine").first?.header("X-Workspace-Id"))
-        XCTAssertEqual(requests("/api/app/project/my-projects").map { $0.header("X-Workspace-Id") }.first, "ws-1")
-        await eventually("the other workspace's projects") {
-            requests("/api/app/project/my-projects").contains { $0.header("X-Workspace-Id") == "ws-2" }
+        XCTAssertEqual(requests("/api/app/project/my-projects").first?.header("X-Workspace-Id"), "ws-1")
+        XCTAssertFalse(requests("/api/app/project/my-projects").contains { $0.header("X-Workspace-Id") == "ws-2" },
+                       "nothing is asked of the other workspace before the user picks it")
+
+        // The user picks it: tracking goes on there.
+        await worker.chooseWorkspace("ws-2", at: Date())
+        await eventually("tracking in the chosen workspace") {
+            await worker.facts().tracking
         }
+        XCTAssertEqual(harness.credentials.saved?.workspaceId, "ws-2")
+        XCTAssertEqual(harness.credentials.saved?.mustChooseWorkspace, false)
+        XCTAssertTrue(requests("/api/app/project/my-projects").contains { $0.header("X-Workspace-Id") == "ws-2" })
         XCTAssertEqual(harness.credentials.saved?.refreshToken, "refresh-rotated", "the rotated token is saved")
         XCTAssertEqual(harness.snapshots.latest?.workspace, "Globex")
+        await tearDown(harness)
+    }
+
+    func testARelaunchAfterALostWorkspaceStillAsks() async throws {
+        ScriptedURLProtocol.reset([
+            "/connect/token": [Self.token("refresh-2")],
+            "/api/app/project/my-projects": [Self.ok(Self.project("p-2"))],
+            "/api/app/workspaces/mine": [Self.ok(#"[{"id":"ws-2","name":"Globex","role":"member"}]"#)],
+        ])
+        let harness = try makeHarness(
+            saved: StoredSignIn(username: "user@example.com", workspaceId: nil, workspaceName: "",
+                                refreshToken: "refresh-1", mustChooseWorkspace: true))
+        let worker = harness.worker
+        await worker.start(launchedAtLogin: false, startPeriodicTicks: false)
+
+        await eventually("the workspace offered") {
+            harness.snapshots.latest?.workspaceChoices.map { $0.name } == ["Globex"]
+        }
+        let choosing = try XCTUnwrap(harness.snapshots.latest)
+        XCTAssertEqual(choosing.status, .choosingWorkspace)
+        XCTAssertEqual(choosing.workspaceNote, TrackerWorker.workspaceEndedMessage)
+        let notTracking = await worker.facts().tracking
+        XCTAssertFalse(notTracking)
+        XCTAssertTrue(requests("/api/app/project/my-projects").isEmpty)
+
+        await worker.chooseWorkspace("ws-2", at: Date())
+        await eventually("tracking in the chosen workspace") {
+            await worker.facts().tracking
+        }
+        XCTAssertEqual(harness.credentials.saved?.workspaceId, "ws-2")
+        XCTAssertEqual(harness.credentials.saved?.mustChooseWorkspace, false)
+        await tearDown(harness)
+    }
+
+    func testASavedSignInWithNoWorkspaceYetTakesTheOnlyOne() async throws {
+        ScriptedURLProtocol.reset([
+            "/connect/token": [Self.token("refresh-2")],
+            "/api/app/project/my-projects": [Self.ok(Self.project("p-1"))],
+            "/api/app/workspaces/mine": [Self.ok(#"[{"id":"ws-1","name":"Acme","role":"member"}]"#)],
+        ])
+        let harness = try makeHarness(
+            saved: StoredSignIn(username: "user@example.com", workspaceId: nil, workspaceName: "",
+                                refreshToken: "refresh-1"))
+        let worker = harness.worker
+        await worker.start(launchedAtLogin: false, startPeriodicTicks: false)
+        await eventually("tracking in the only workspace") {
+            await worker.facts().tracking
+        }
+        XCTAssertEqual(harness.credentials.saved?.workspaceId, "ws-1")
+        await tearDown(harness)
+    }
+
+    func testSigningInAgainAfterALostWorkspaceStillAsks() async throws {
+        ScriptedURLProtocol.reset([
+            "/connect/token": [Self.token("refresh-2")],
+            "/api/app/project/my-projects": [Self.ok(Self.project("p-2"))],
+            "/api/app/workspaces/mine": [Self.ok(#"[{"id":"ws-2","name":"Globex","role":"member"}]"#)],
+        ])
+        // The sign-in expired while the next workspace was being chosen.
+        let harness = try makeHarness(
+            saved: StoredSignIn(username: "user@example.com", workspaceId: nil, workspaceName: "",
+                                refreshToken: nil, mustChooseWorkspace: true))
+        let worker = harness.worker
+        await worker.start(launchedAtLogin: false, startPeriodicTicks: false)
+        XCTAssertEqual(harness.snapshots.latest?.status, .signedOut)
+
+        await worker.signIn(username: "user@example.com", password: "pw-fixture", server: nil, newPassword: nil)
+        let choosing = try XCTUnwrap(harness.snapshots.latest)
+        XCTAssertEqual(choosing.status, .choosingWorkspace)
+        XCTAssertEqual(choosing.workspaceChoices.map { $0.name }, ["Globex"])
+        XCTAssertEqual(choosing.workspaceNote, TrackerWorker.workspaceEndedMessage)
+        let notTracking = await worker.facts().tracking
+        XCTAssertFalse(notTracking)
+        XCTAssertTrue(requests("/api/app/project/my-projects").isEmpty)
         await tearDown(harness)
     }
 

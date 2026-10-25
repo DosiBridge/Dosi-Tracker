@@ -86,16 +86,22 @@ public struct Workspace: Codable, Equatable, Sendable, Identifiable {
 /// Which workspace to track in after signing in (cross-agent contract):
 /// archived ones are never offered; the one asked for (the workspace tracked
 /// before, by id) when it is still listed, else the only one, else the user
-/// chooses.
+/// chooses. Without `autoSelect` (the server ended access to the workspace
+/// tracked in) the user always chooses, even the only one left.
 public enum WorkspaceSelection: Equatable, Sendable {
     case selected(Workspace)
-    /// Several: the user picks one of these.
+    /// The user picks one of these (several, or any number without
+    /// `autoSelect`).
     case choose([Workspace])
     /// The user is in no (active) workspace.
     case noWorkspace
 
-    public static func resolve(_ listed: [Workspace], preferred: String?) -> WorkspaceSelection {
+    public static func resolve(_ listed: [Workspace], preferred: String?,
+                               autoSelect: Bool = true) -> WorkspaceSelection {
         let usable = listed.filter { !$0.isArchived }
+        guard autoSelect else {
+            return usable.isEmpty ? .noWorkspace : .choose(usable)
+        }
         if let wanted = usable.first(where: { $0.hasId(preferred) }) {
             return .selected(wanted)
         }

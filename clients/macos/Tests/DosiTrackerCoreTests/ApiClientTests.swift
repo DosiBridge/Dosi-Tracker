@@ -195,6 +195,19 @@ final class ApiClientTests: XCTestCase {
         XCTAssertEqual(WorkspaceSelection.resolve([], preferred: nil), WorkspaceSelection.noWorkspace)
     }
 
+    /// After the server ended access to the workspace tracked in, the user
+    /// picks the next one: never taken for them, not even the only one left.
+    func testAfterALostWorkspaceTheUserAlwaysChooses() {
+        let a = Workspace(id: acme, name: "Acme", role: "owner")
+        let b = Workspace(id: globex, name: "Globex", role: "member")
+        let archived = Workspace(id: "w-archived", name: "Old", isArchived: true)
+        XCTAssertEqual(WorkspaceSelection.resolve([a, archived], preferred: nil, autoSelect: false), .choose([a]))
+        XCTAssertEqual(WorkspaceSelection.resolve([a, b], preferred: acme, autoSelect: false), .choose([a, b]))
+        XCTAssertEqual(WorkspaceSelection.resolve([archived], preferred: nil, autoSelect: false),
+                       WorkspaceSelection.noWorkspace)
+        XCTAssertEqual(WorkspaceSelection.resolve([], preferred: nil, autoSelect: false), WorkspaceSelection.noWorkspace)
+    }
+
     func testEveryWorkspaceScopedCallNamesTheWorkspace() async throws {
         let server = MockServer([
             .tokenOK(),

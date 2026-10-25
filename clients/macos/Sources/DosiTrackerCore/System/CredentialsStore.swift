@@ -15,16 +15,23 @@ public struct StoredSignIn: Codable, Equatable, Sendable, CustomStringConvertibl
     /// The latest (rotated) refresh token; nil when the server granted none,
     /// which means signing in again.
     public var refreshToken: String?
+    /// The server ended access to the workspace tracked in (cross-agent
+    /// contract): the next one is chosen by the user, never taken on their
+    /// behalf — not even when it is the only one listed, and not after a
+    /// relaunch either.
+    public var mustChooseWorkspace: Bool
     /// Saved by a build that signed in to a workspace by name with a stored
     /// password (the retired `__tenant` sign-in): its workspace name, so its
     /// queued rows can be handed to that workspace. Never saved again.
     public private(set) var legacyWorkspaceName: String?
 
-    public init(username: String, workspaceId: String?, workspaceName: String, refreshToken: String?) {
+    public init(username: String, workspaceId: String?, workspaceName: String, refreshToken: String?,
+                mustChooseWorkspace: Bool = false) {
         self.username = username
         self.workspaceId = workspaceId
         self.workspaceName = workspaceName
         self.refreshToken = refreshToken
+        self.mustChooseWorkspace = mustChooseWorkspace
         legacyWorkspaceName = nil
     }
 
@@ -54,7 +61,7 @@ public struct StoredSignIn: Codable, Equatable, Sendable, CustomStringConvertibl
     public var debugDescription: String { description }
 
     private enum CodingKeys: String, CodingKey {
-        case username, workspaceId, workspaceName, refreshToken
+        case username, workspaceId, workspaceName, refreshToken, mustChooseWorkspace
         // The retired format: a workspace (tenant) name and the password.
         case workspace, password
     }
@@ -68,6 +75,7 @@ public struct StoredSignIn: Codable, Equatable, Sendable, CustomStringConvertibl
         workspaceId = try c.decodeIfPresent(String.self, forKey: .workspaceId)?.nonEmptyTrimmed
         workspaceName = try c.decodeIfPresent(String.self, forKey: .workspaceName) ?? ""
         refreshToken = try c.decodeIfPresent(String.self, forKey: .refreshToken)?.nonEmptyTrimmed
+        mustChooseWorkspace = try c.decodeIfPresent(Bool.self, forKey: .mustChooseWorkspace) ?? false
         if c.contains(.password) {
             legacyWorkspaceName = try c.decodeIfPresent(String.self, forKey: .workspace) ?? ""
             workspaceId = nil
@@ -83,6 +91,9 @@ public struct StoredSignIn: Codable, Equatable, Sendable, CustomStringConvertibl
         try c.encodeIfPresent(workspaceId, forKey: .workspaceId)
         try c.encode(workspaceName, forKey: .workspaceName)
         try c.encodeIfPresent(refreshToken, forKey: .refreshToken)
+        if mustChooseWorkspace {
+            try c.encode(true, forKey: .mustChooseWorkspace)
+        }
     }
 }
 
