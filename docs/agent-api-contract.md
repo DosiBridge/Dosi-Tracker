@@ -69,13 +69,16 @@ Errors follow RFC 6749: status 400 with `{"error": "...", "error_description": "
 
 | `error` | When | Agent |
 |---|---|---|
-| `invalid_grant` on a password grant | wrong user name or password, account locked or inactive | show the message, stay signed out |
-| `invalid_grant` on a refresh | refresh token expired, revoked (device revoked, sign-out elsewhere), reused, or issued to another device | enter **"sign-in expired"**: stop capture, keep the queue, ask the user to sign in again. Never re-send a stored password. |
+| `invalid_grant` on a password grant | wrong user name or password, account locked, inactive or deleted | show the message, stay signed out |
+| `invalid_grant` on a refresh | refresh token expired, revoked (device revoked, sign-out elsewhere, account deleted), reused, or issued to another device | enter **"sign-in expired"**: stop capture, keep the queue, ask the user to sign in again. Never re-send a stored password. |
 | `invalid_request` | malformed request, e.g. `device_id` is not a UUID (or is the empty UUID) | bug: report it |
 | `invalid_client`, `unauthorized_client` | wrong `client_id` | bug |
 
 429 with `Retry-After` (seconds): the per-client sign-in limits were hit (by default 60 password grants and
 120 refreshes a minute per client IP, 10 password grants a minute per account). Wait at least `Retry-After`.
+
+A forgotten password is recovered in the web app (its reset page emails a one-time link); an agent links the user
+there instead of implementing recovery itself.
 
 ### 2.5 Sign-out
 
@@ -118,6 +121,9 @@ Authorization: Bearer <access token>
 The server answers a bad header before anything else: 400 `Tracker:WorkspaceRequired` (missing on a
 workspace-scoped call, or not a UUID), 403 `Tracker:NotWorkspaceMember`, 403 `Tracker:WorkspaceArchived`, then
 403 `Tracker:DeviceRevoked` when the token's device is revoked in that workspace (section 6).
+
+A workspace an owner **deleted** is gone at once: it no longer appears in `mine`, and every call in it answers 403
+`Tracker:NotWorkspaceMember` (its data is purged later, queued blocks included, so there is nothing to upload to).
 
 ## 4. Endpoints
 
@@ -222,7 +228,9 @@ titles are never stored; send them empty.
   "creationTime": "…", "creatorId": "…" }
 ```
 
-Delete the queued row only after a 200.
+Delete the queued row only after a 200, or a 410 `Tracker:ActivityDeleted`: an owner or manager deleted that
+block from the workspace (with its captures), and the server keeps its client id so that the block is never
+recreated. Drop the row and its captures; resending can never succeed.
 
 **No payload signature.** The server does not verify, and ignores, a `payloadSignature` field. A key the
 device generated and keeps can only make the local queue tamper-evident; it proves nothing to the server, so no
@@ -316,12 +324,18 @@ them in a loop), and tell the user. They need a new sign-in or a workspace switc
 | 422 | `Tracker:ActivityTooLong` | longer than 120 minutes (`data.maxMinutes`) |
 | 422 | `Tracker:ActivityTooOld` | started more than 45 days ago (`data.maxAgeDays`) |
 
+**Drop** (delete the queued row, it can never be stored):
+
+| Status | `error.code` | Meaning |
+|---|---|---|
+| 410 | `Tracker:ActivityDeleted` | an owner or manager deleted this block; log it, do not tell the user as an error |
+
 **Retry later** (keep the row, back off exponentially, cap the delay at a few minutes):
 
 | Status | `error.code` | Meaning |
 |---|---|---|
 | 425 | `Tracker:ActivityInFuture` | ends more than 5 minutes after the server's clock: tell the user to fix the clock; retry, and park after a day |
-| 402 | `Tracker:SubscriptionInactive` | the workspace's subscription is not active: tell the user, keep the rows queued and retry about hourly |
+| 402 | `Tracker:SubscriptionInactive` | the workspace's subscription is not active (canceled, lapsed trial or overdue): tell the user, keep the rows queued and retry about hourly. Never answered by a deployment with billing off (`Billing:Enabled`, the self-hosted default) |
 | 401 | — | access token expired or rejected: refresh (2.3) once, then retry |
 | 429, 5xx, timeouts, no network | — | transient (a 500 is also what a concurrent upload of the same member gets) |
 
@@ -353,3 +367,14 @@ is dropped and the block stored). Any other code: treat as per block for an uplo
   sessions become revocable once the agent refreshes or signs in with `device_id`. A server running several instances must share its
   distributed cache (for example Redis) so that every instance sees a revocation at once; with one instance (the
   default deployment) it is immediate.
+
+## 7. Deleted data
+
+- **Blocks and captures.** Owners and managers can delete a member's block with its captures, or a capture alone,
+  and members can delete their own captures for a short while after upload (the workspace's window, 60 minutes by
+  default). Nothing changes for an agent except the 410 on a replay of a deleted block (4.2): an agent never needs
+  to re-send or re-capture deleted data.
+- **Workspaces.** See section 3: a deleted workspace answers 403 `Tracker:NotWorkspaceMember`, a terminal error.
+- **Accounts.** A person who deletes their account loses every session at once (refresh: `invalid_grant`, sign-in
+  expired); a later password sign-in answers `invalid_grant`. The agent keeps its queue, which can no longer be
+  uploaded; offering to clear it is up to the agent.

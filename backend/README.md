@@ -11,7 +11,28 @@ This is a layered startup solution based on [Domain Driven Design (DDD)](https:/
 
 ### Configurations
 
-The solution comes with a default configuration that works out of the box. However, you may consider to change the following configuration before running your solution:
+The solution comes with a default configuration that works out of the box for development. The API host reads every
+setting from configuration, so in a deployment set them as environment variables (`Section__Key`) or in a secret
+store — never in the tracked `appsettings.json`. Outside `Development` the host **refuses to start** while a secret is
+a well-known value (the template passphrases, a database password published in this repository or a stock default),
+is read from the tracked `appsettings.json`, or while `openiddict.pfx` is a localhost development certificate or has
+expired.
+
+| Setting | Purpose | Default |
+|---|---|---|
+| `App__ClientUrl` | The web app's address; emailed links (invitations, password reset, email confirmation, billing) open it | the first `App__CorsOrigins` entry |
+| `App__CorsOrigins` | Browser origins the API admits, comma-separated (`https://app.example.com`, `https://*.example.com`); `*` is refused | `http://localhost:6005` |
+| `App__ForwardedHeaders__KnownNetworks` / `__KnownProxies` | Reverse proxies trusted for `X-Forwarded-For`/`-Proto` (CIDR / IPs). Behind a proxy that is not on the same host, set it, or sign-ins fail as plain HTTP; the host warns at start-up when HTTPS is required and nothing is trusted | loopback only |
+| `Billing__Enabled` | Bill workspaces (trials, seat limits, invoices, owner downgrade/cancel). Off, every workspace is active and has no limits | `false` |
+| `Settings__Abp.Mailing.Smtp.Host`, `…Port`, `…UserName`, `…EnableSsl` | SMTP server for the emails. Until a host is set, nothing is sent and the host logs that an email was not sent | none |
+| `Email__SmtpPassword` | SMTP password in plain text (environment or secret store only); alternatively the setting `Abp.Mailing.Smtp.Password`, encrypted with `StringEncryption__DefaultPassPhrase` | none |
+| `Settings__Abp.Mailing.DefaultFromAddress`, `…DefaultFromDisplayName` | Sender of the emails | ABP's defaults |
+| `DataErasure__IsEnabled`, `__PeriodMinutes`, `__WorkspaceGraceDays`, `__BatchSize` | The erasure sweep: purges deleted workspaces (captures and files included) after the grace period and scrubs deleted accounts | on, 60, 7, 200 |
+| `DataProtection__KeysDirectory`, `__ApplicationName` | Data Protection keys (sign-in cookies, password-reset and confirmation tokens) are kept in the database table `AppDataProtectionKeys`; a directory instead when set. The application name must be the same on every instance | database, `Dosi.Tracker` |
+
+Emails are queued as ABP background jobs (table `AbpBackgroundJobs`) and retried with a growing delay when the SMTP
+server fails. For local testing, point SMTP at a mail catcher such as Mailpit (`Settings__Abp.Mailing.Smtp.Host=localhost`,
+`…Port=1025`, `…EnableSsl=false`).
 
 
 ### Before running the application
@@ -27,7 +48,7 @@ The first DbMigrator run on an empty database creates the platform administrator
 
 `AgentDataV2` and `AgentDataV2Followup` also bring existing data in line with the new rules (PostgreSQL only):
 
-* Subscriptions are enforced from now on: a workspace whose trial ended cannot record time or grow its team until the host activates it (`POST /api/app/platform/activate-subscription`). Workspaces whose trial had already ended before the upgrade (status `past_due`, nothing invoiced) get a new 14-day trial from the moment of the upgrade, so their owners are reminded three days before it ends and told when it ended, and the host can activate the paying ones first.
+* Subscriptions are enforced from now on (on a deployment with `Billing__Enabled=true`): a workspace whose trial ended cannot record time or grow its team until the host activates it (`POST /api/app/platform/activate-subscription`). Workspaces whose trial had already ended before the upgrade (status `past_due`, nothing invoiced) get a new 14-day trial from the moment of the upgrade, so their owners are reminded three days before it ends and told when it ended, and the host can activate the paying ones first.
 * The Identity `manager` role is taken from everyone who no longer holds an Admin/Manager membership on an existing project.
 * Duplicate memberships are merged (the oldest stays), and every membership's rate matches its latest rate-history entry.
 * Activity of blocks that never measured input (projects that allow neither keyboard nor mouse, agents that sent no timeline) becomes "not measured" instead of 0%.
@@ -36,13 +57,17 @@ The first DbMigrator run on an empty database creates the platform administrator
 
 In the production environment, you need to use a production signing certificate. ABP Framework sets up signing and encryption certificates in your application and expects an `openiddict.pfx` file in your application.
 
-To generate a signing certificate, you can use the following command:
+To generate a self-signed signing certificate (named for your API host, not `localhost`, and protected with a
+passphrase of your own, which you then supply as `AuthServer__CertificatePassPhrase`):
 
 ```bash
-dotnet dev-certs https -v -ep openiddict.pfx -p 3f027835-7c52-4bf7-bc1f-77582ca37aef
+openssl req -x509 -newkey rsa:3072 -sha256 -days 730 -nodes -subj "/CN=api.example.com" -keyout openiddict.key -out openiddict.crt
+openssl pkcs12 -export -inkey openiddict.key -in openiddict.crt -out openiddict.pfx
 ```
 
-> `3f027835-7c52-4bf7-bc1f-77582ca37aef` is the password of the certificate, you can change it to any password you want.
+The host refuses a `dotnet dev-certs` certificate (subject `localhost`), an expired certificate and the template
+passphrase outside `Development`. Renew the certificate before it expires: every token signed with it becomes
+invalid when it is replaced.
 
 It is recommended to use **two** RSA certificates, distinct from the certificate(s) used for HTTPS: one for encryption, one for signing.
 
