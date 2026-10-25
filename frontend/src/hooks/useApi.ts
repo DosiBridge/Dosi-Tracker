@@ -117,6 +117,8 @@ export class ApiError extends Error {
   readonly validationErrors: ApiErrorInfo['validationErrors'];
   /** Seconds the server asked to wait before retrying (Retry-After), when it said. */
   readonly retryAfterSeconds: number | null;
+  /** ABP `error.data`: the business error's parameters (e.g. AI assist's `resetsAt`); null when it sent none. */
+  readonly data: Record<string, unknown> | null;
 
   constructor(message: string, status: number, info: ApiErrorInfo, retryAfterSeconds: number | null = null) {
     super(message);
@@ -127,6 +129,7 @@ export class ApiError extends Error {
     this.details = info.details;
     this.validationErrors = info.validationErrors;
     this.retryAfterSeconds = retryAfterSeconds;
+    this.data = info.data ?? null;
   }
 }
 
@@ -545,8 +548,9 @@ export const delApi = async (endpoint: string) => {
   }
 };
 
-export const postApi = async (endpoint: string, body: unknown) => {
-  const res = await send(endpoint, { method: 'POST', body: JSON.stringify(body) });
+/** POST a JSON body; 204-safe. Pass a `signal` to abandon the request (e.g. a cancelled AI summary). */
+export const postApi = async (endpoint: string, body: unknown, init: { signal?: AbortSignal } = {}) => {
+  const res = await send(endpoint, { method: 'POST', body: JSON.stringify(body), signal: init.signal });
   if (!res.ok) {
     throw await apiFailure('API POST Error', res);
   }
@@ -554,8 +558,9 @@ export const postApi = async (endpoint: string, body: unknown) => {
   return text ? JSON.parse(text) : null; // 204-safe
 };
 
-export const putApi = async (endpoint: string, body: unknown) => {
-  const res = await send(endpoint, { method: 'PUT', body: JSON.stringify(body) });
+/** PUT a JSON body; 204-safe. Pass a `signal` to abandon the request. */
+export const putApi = async (endpoint: string, body: unknown, init: { signal?: AbortSignal } = {}) => {
+  const res = await send(endpoint, { method: 'PUT', body: JSON.stringify(body), signal: init.signal });
   if (!res.ok) {
     throw await apiFailure('API PUT Error', res);
   }

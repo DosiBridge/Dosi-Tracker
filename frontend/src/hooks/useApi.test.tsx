@@ -222,6 +222,42 @@ describe("failed responses are typed ApiErrors", () => {
     expect(localStorage.getItem("dosi-token")).toBeNull();
   });
 
+  it("carry ABP's error.data, and null when the server sent none", async () => {
+    fetchMock.mockResolvedValue(
+      res({ error: { code: "Tracker:AiRateLimited", message: "Too many AI requests.", data: { reason: "minute", retryAfterSeconds: 20 } } }, 429),
+    );
+    await expect(postApi("/api/app/ai-assist/period-summary", {})).rejects.toMatchObject({
+      code: "Tracker:AiRateLimited",
+      data: { reason: "minute", retryAfterSeconds: 20 },
+    });
+    fetchMock.mockResolvedValue(res({ error: { code: "Tracker:CannotModifySelf", data: {} } }, 403));
+    await expect(putApi("/api/app/x", {})).rejects.toMatchObject({ data: null });
+    fetchMock.mockResolvedValue(res(undefined, 500));
+    await expect(getApi("/api/app/x")).rejects.toMatchObject({ data: null });
+  });
+
+  it("let POST and PUT be abandoned with a signal (backward compatible without one)", async () => {
+    fetchMock.mockResolvedValue(res({ ok: true }));
+    const controller = new AbortController();
+    await postApi("/api/app/x", { a: 1 }, { signal: controller.signal });
+    expect(calledInit(0)).toMatchObject({ method: "POST", body: '{"a":1}', signal: controller.signal });
+    await putApi("/api/app/y", { b: 2 }, { signal: controller.signal });
+    expect(calledInit(1)).toMatchObject({ method: "PUT", body: '{"b":2}', signal: controller.signal });
+    await postApi("/api/app/z", {});
+    expect(calledInit(2).signal).toBeUndefined();
+
+    fetchMock.mockImplementation(
+      (_url, init) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+        }),
+    );
+    const aborted = new AbortController();
+    const pending = postApi("/api/app/ai-assist/period-summary", {}, { signal: aborted.signal });
+    aborted.abort();
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+  });
+
   it("keep a successful POST/PUT 204-safe and return the parsed body otherwise", async () => {
     fetchMock.mockResolvedValue(res(undefined, 204));
     expect(await putApi("/api/app/x", {})).toBeNull();

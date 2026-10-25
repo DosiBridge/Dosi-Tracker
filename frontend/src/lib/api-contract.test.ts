@@ -301,6 +301,23 @@ describe("parseApiErrorBody", () => {
     });
   });
 
+  it("keeps error.data only when it is a non-empty object", () => {
+    const body = (data: unknown) => JSON.stringify({ error: { code: "Tracker:AiQuotaExceeded", message: "Used up.", data } });
+    expect(parseApiErrorBody(body({ scope: "workspace-month", resetsAt: "2026-08-01T00:00:00Z" }))).toEqual({
+      code: "Tracker:AiQuotaExceeded",
+      message: "Used up.",
+      details: null,
+      validationErrors: [],
+      data: { scope: "workspace-month", resetsAt: "2026-08-01T00:00:00Z" },
+    });
+    for (const empty of [{}, [], ["x"], null, "reason", 3, true]) {
+      const info = parseApiErrorBody(body(empty));
+      expect(info).not.toHaveProperty("data");
+      expect(info.code).toBe("Tracker:AiQuotaExceeded");
+    }
+    expect(parseApiErrorBody(JSON.stringify({ error: { code: "Tracker:AiDisabled" } }))).not.toHaveProperty("data");
+  });
+
   it("yields empty fields for anything else", () => {
     const empty = { code: null, message: null, details: null, validationErrors: [] };
     for (const body of ["", null, undefined, "<html>Bad gateway</html>", "42", "null", JSON.stringify({ error: { code: "  " } })]) {

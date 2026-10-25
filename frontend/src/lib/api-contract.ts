@@ -86,12 +86,23 @@ export interface ApiErrorInfo {
   details: string | null;
   /** DataAnnotations failures (400): one entry per rule, with the offending members. */
   validationErrors: { message: string; members: string[] }[];
+  /**
+   * ABP `error.data`: the business error's parameters (AI assist sends
+   * `resetsAt`, `retryAfterSeconds`, `reason`, …). Present only when the server
+   * sent a non-empty object.
+   */
+  data?: Record<string, unknown>;
 }
 
 const EMPTY_ERROR: ApiErrorInfo = { code: null, message: null, details: null, validationErrors: [] };
 
 function text(value: unknown): string | null {
   return typeof value === "string" && value.trim() !== "" ? value : null;
+}
+
+/** A parsed JSON object with at least one key (not an array, not null). */
+function isNonEmptyPlainObject(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).length > 0;
 }
 
 /** Read an error response body; anything that isn't one of the two known shapes yields empty fields. */
@@ -113,7 +124,14 @@ export function parseApiErrorBody(body: string | null | undefined): ApiErrorInfo
         message: v.message as string,
         members: Array.isArray(v.members) ? v.members.filter((m): m is string => typeof m === "string") : [],
       }));
-    return { code: text(e.code), message: text(e.message), details: text(e.details), validationErrors };
+    const data = (e as { data?: unknown }).data;
+    return {
+      code: text(e.code),
+      message: text(e.message),
+      details: text(e.details),
+      validationErrors,
+      ...(isNonEmptyPlainObject(data) ? { data } : {}),
+    };
   }
   return { ...EMPTY_ERROR, code: text(root.error), message: text(root.error_description) };
 }
