@@ -65,6 +65,15 @@ public static class TrustedProxies
         }
     }
 
+    /// <summary>True when any proxy or proxy network is configured. Without one, only a proxy on the same host is
+    /// trusted: behind a containerised proxy or an ingress the API then sees plain HTTP from the proxy's address — OpenIddict
+    /// refuses the requests when HTTPS is required, and every caller shares the proxy's rate-limit budget.</summary>
+    public static bool HasConfiguredProxies(IConfiguration configuration)
+    {
+        var section = configuration.GetSection(SectionName);
+        return ReadList(section.GetSection("KnownProxies")).Any() || ReadList(section.GetSection("KnownNetworks")).Any();
+    }
+
     /// <summary>A configured list: a JSON array (or indexed environment variables) or one comma/semicolon-separated string.</summary>
     private static IEnumerable<string> ReadList(IConfigurationSection section)
     {

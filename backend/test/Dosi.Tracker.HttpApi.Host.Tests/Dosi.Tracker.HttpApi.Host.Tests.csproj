@@ -21,6 +21,7 @@
          coverage gate. -->
     <Compile Include="..\..\src\Dosi.Tracker.HttpApi.Host\Security\AuthRateLimiting.cs" Link="Security\Host\AuthRateLimiting.cs" />
     <Compile Include="..\..\src\Dosi.Tracker.HttpApi.Host\Security\TrustedProxies.cs" Link="Security\Host\TrustedProxies.cs" />
+    <Compile Include="..\..\src\Dosi.Tracker.HttpApi.Host\Security\CorsOrigins.cs" Link="Security\Host\CorsOrigins.cs" />
     <Compile Include="..\..\src\Dosi.Tracker.HttpApi.Host\Security\DiagnosticsExposure.cs" Link="Security\Host\DiagnosticsExposure.cs" />
     <Compile Include="..\..\src\Dosi.Tracker.HttpApi.Host\Compatibility\LegacyAgentCompatibility.cs" Link="Compatibility\Host\LegacyAgentCompatibility.cs" />
     <Compile Include="..\..\src\Dosi.Tracker.HttpApi.Host\Workspaces\WorkspaceResolution.cs" Link="Workspaces\Host\WorkspaceResolution.cs" />
