@@ -26,6 +26,7 @@ namespace Dosi.Tracker.EntityFrameworkCore.Applications.Activities;
 public class ActivityInputCountsHttpTests : WorkspaceHttpTestBase<TrackerHttpApiServerTestModule>
 {
     private static readonly Guid Member = Guid.Parse("7b701e62-0953-4dd3-910b-dc6cc93ccb51");
+    private static readonly Guid AgentDeviceId = Guid.Parse("7b701e62-0953-4dd3-910b-dc6cc93ccb52");
 
     private readonly IRepository<Activity, Guid> _activityRepository;
     private readonly IGuidGenerator _guidGenerator;
@@ -73,7 +74,10 @@ public class ActivityInputCountsHttpTests : WorkspaceHttpTestBase<TrackerHttpApi
 
     private async Task<JsonElement> UploadAsync(Guid workspaceId, object block)
     {
-        var response = await CreateHttpClient().SendAsync(CreateRequest(HttpMethod.Post, "/api/app/activity", Member, workspaceId, block));
+        // The agent's device travels in its token only (the blocks name none).
+        var request = CreateRequest(HttpMethod.Post, "/api/app/activity", Member, workspaceId, block);
+        request.Headers.Add(TestAuthHandler.DeviceHeaderName, AgentDeviceId.ToString());
+        var response = await CreateHttpClient().SendAsync(request);
         var body = await response.Content.ReadAsStringAsync();
         response.StatusCode.ShouldBe(HttpStatusCode.OK, body);
         return JsonDocument.Parse(body).RootElement.Clone();

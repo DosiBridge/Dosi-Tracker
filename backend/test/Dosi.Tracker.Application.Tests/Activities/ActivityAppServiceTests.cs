@@ -25,6 +25,9 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
     /// <summary>A day inside the 45-day upload window and in the past, whenever the suite runs.</summary>
     private static readonly DateTime BaseDay = DateTime.UtcNow.Date.AddDays(-10);
 
+    /// <summary>The agent install the uploads come from (an upload must name one: Tracker:DeviceIdRequired).</summary>
+    private static readonly Guid AgentDeviceId = Guid.Parse("5d0c1f6a-3b8e-4a51-9c2e-7f40a1b2c3d4");
+
     private readonly IActivityAppService _activityAppService;
     private readonly IRepository<Activity, Guid> _activityRepository;
     private readonly IRepository<Project, Guid> _projectRepository;
@@ -74,6 +77,7 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
         {
             ProjectId = Guid.NewGuid(),
             ClientActivityId = clientActivityId ?? Guid.NewGuid(),
+            DeviceId = AgentDeviceId,
             StartedAt = start,
             EndedAt = endedAt ?? start.AddMinutes(10),
             Productivity = 80,
@@ -851,7 +855,6 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
         input.Platform = "freebsd";
         input.OsVersion = "   ";
         input.AgentVersion = "\u0001\u0002";
-        input.DeviceId = Guid.Empty;
         input.TimeZone = "Mars/Olympus_Mons";
         input.UtcOffsetMinutes = 900;
         input.EndReason = "crashed";
@@ -864,12 +867,29 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
         created.Platform.ShouldBeNull();
         created.OsVersion.ShouldBeNull();
         created.AgentVersion.ShouldBeNull();
-        created.DeviceId.ShouldBeNull();
+        created.DeviceId.ShouldBe(AgentDeviceId);
         created.TimeZone.ShouldBeNull();
         created.UtcOffsetMinutes.ShouldBeNull();
         created.EndReason.ShouldBeNull();
         created.IdleSeconds.ShouldBeNull();
         created.InjectedInputEvents.ShouldBeNull();
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Create_Should_Refuse_A_Block_Naming_No_Device_Without_Storing_It(bool emptyId)
+    {
+        // Neither the caller's token (not device-bound here) nor the block names an install, so a revocation could
+        // not apply to it: refused rather than stored anonymously.
+        var input = NewInput();
+        input.DeviceId = emptyId ? Guid.Empty : null;
+
+        var exception = await Should.ThrowAsync<BusinessException>(() => SubmitAsync(input));
+
+        exception.Code.ShouldBe(TrackerDomainErrorCodes.DeviceIdRequired);
+        (await WithUnitOfWorkAsync(() => _activityRepository.AnyAsync(a => a.ClientActivityId == input.ClientActivityId)))
+            .ShouldBeFalse();
     }
 
     [Fact]
@@ -1322,7 +1342,7 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
         dto.Platform.ShouldBeNull();
         dto.OsVersion.ShouldBeNull();
         dto.AgentVersion.ShouldBeNull();
-        dto.DeviceId.ShouldBeNull();
+        dto.DeviceId.ShouldBe(AgentDeviceId); // the only context an upload must carry
         dto.DeviceName.ShouldBeNull();
         dto.TimeZone.ShouldBeNull();
         dto.UtcOffsetMinutes.ShouldBeNull();

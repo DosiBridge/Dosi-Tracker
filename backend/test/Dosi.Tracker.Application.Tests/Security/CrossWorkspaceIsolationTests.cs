@@ -198,6 +198,7 @@ public abstract class CrossWorkspaceIsolationTests<TStartupModule> : TrackerAppl
             {
                 ProjectId = projB,
                 ClientActivityId = Guid.NewGuid(),
+                DeviceId = Guid.NewGuid(),
                 StartedAt = Day,
                 EndedAt = Day.AddMinutes(10),
                 Productivity = 80,

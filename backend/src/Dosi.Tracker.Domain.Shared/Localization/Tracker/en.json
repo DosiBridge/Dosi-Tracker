@@ -17,6 +17,8 @@
     "Permission:Team.Manage": "Manage team members",
     "Permission:Billing": "Billing",
     "Permission:Reporting": "Reporting",
+    "Permission:Devices": "Devices",
+    "Permission:Devices.Manage": "Revoke and restore members' devices",
     "Permission:Platform": "Platform administration (host console)",
     "Tracker:ActivityTimeRangeInvalid": "The activity's end time must be after its start time.",
     "Tracker:ActivityClientIdRequired": "The activity must carry the client-generated activity id (idempotency key).",
@@ -49,6 +51,10 @@
     "Tracker:InvitationEmailMismatch": "This invitation was sent to a different email address.",
     "Tracker:AlreadyWorkspaceMember": "This person is already a member of the workspace.",
     "Tracker:EmailNotConfirmed": "Verify your email address first, or open the invitation link you were sent.",
-    "Tracker:ExportExceedsLimit": "The requested export exceeds the maximum limit of {limit} records (found {totalCount}). Please narrow your date range or filters."
+    "Tracker:ExportExceedsLimit": "The requested export exceeds the maximum limit of {limit} records (found {totalCount}). Please narrow your date range or filters.",
+    "Tracker:DeviceRevoked": "This computer was removed from this workspace and was signed out. Ask a workspace owner or manager to restore it to track time here again.",
+    "Tracker:DeviceNotObserved": "This device has never been seen for this member in this workspace.",
+    "Tracker:DeviceNotFound": "This device is not revoked in this workspace.",
+    "Tracker:DeviceIdRequired": "The request names no device: sign in with a device_id, or send the agent's deviceId."
   }
 }

@@ -34,6 +34,14 @@ public static class TrackerPermissions
         public const string Manage = Default + ".Manage";
     }
 
+    /// <summary>Desktop agent installs. Members manage their own devices with no permission; revoking or restoring
+    /// another member's device needs <see cref="Manage"/>.</summary>
+    public static class Devices
+    {
+        public const string Default = GroupName + ".Devices";
+        public const string Manage = Default + ".Manage";
+    }
+
     public static class Billing
     {
         public const string Default = GroupName + ".Billing";

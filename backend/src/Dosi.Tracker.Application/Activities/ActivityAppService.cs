@@ -71,7 +71,7 @@ public class ActivityAppService : TrackerAppService, IActivityAppService
     private readonly IRepository<Screenshot, Guid> _screenshotRepository;
     private readonly IRepository<ProjectMember, Guid> _memberRepository;
     private readonly IRepository<Project, Guid> _projectRepository;
-    private readonly IRepository<DeviceRevocation, Guid> _revocationRepository;
+    private readonly DeviceRevocationManager _revocationManager;
     private readonly IBlobContainer _blobContainer;
     private readonly ISubscriptionAccessChecker _subscriptionAccessChecker;
     private readonly IAbpDistributedLock _distributedLock;
@@ -82,7 +82,7 @@ public class ActivityAppService : TrackerAppService, IActivityAppService
         IRepository<Screenshot, Guid> screenshotRepository,
         IRepository<ProjectMember, Guid> memberRepository,
         IRepository<Project, Guid> projectRepository,
-        IRepository<DeviceRevocation, Guid> revocationRepository,
+        DeviceRevocationManager revocationManager,
         IBlobContainer blobContainer,
         ISubscriptionAccessChecker subscriptionAccessChecker,
         IAbpDistributedLock distributedLock,
@@ -92,7 +92,7 @@ public class ActivityAppService : TrackerAppService, IActivityAppService
         _screenshotRepository = screenshotRepository;
         _memberRepository = memberRepository;
         _projectRepository = projectRepository;
-        _revocationRepository = revocationRepository;
+        _revocationManager = revocationManager;
         _blobContainer = blobContainer;
         _subscriptionAccessChecker = subscriptionAccessChecker;
         _distributedLock = distributedLock;
@@ -132,20 +132,10 @@ public class ActivityAppService : TrackerAppService, IActivityAppService
             return await MapToDtoWithCapturesAsync(stored);
         }
 
-        // Deny subsequent activity ingestion for a revoked logical device id before persistence or blob side effects.
-        if (input.DeviceId.HasValue && input.DeviceId.Value != Guid.Empty)
-        {
-            var isRevoked = await _revocationRepository.AnyAsync(r =>
-                r.WorkspaceId == CurrentWorkspace.GetId() &&
-                r.UserId == userId &&
-                r.DeviceId == input.DeviceId.Value);
-
-            if (isRevoked)
-            {
-                throw new BusinessException(TrackerDomainErrorCodes.DeviceRevoked)
-                    .WithData("deviceId", input.DeviceId.Value);
-            }
-        }
+        // A revoked install is refused before persistence or blob side effects, whether it is named by the token it
+        // signed in with or by the block; a block naming no device at all is refused (revocation could not apply).
+        var deviceId = await _revocationManager.EnsureCanIngestAsync(
+            CurrentWorkspace.GetId(), userId, TokenDeviceId, input.DeviceId);
 
         var project = await GetUploadProjectAsync(userId, input.ProjectId);
 
@@ -163,7 +153,7 @@ public class ActivityAppService : TrackerAppService, IActivityAppService
             throw new BusinessException(TrackerDomainErrorCodes.SubscriptionInactive);
         }
 
-        var activity = BuildActivity(userId, project, input);
+        var activity = BuildActivity(userId, project, input, deviceId);
         var captures = DecodeCaptures(project, input);
 
         return await StoreAsync(activity, captures);
@@ -374,7 +364,7 @@ public class ActivityAppService : TrackerAppService, IActivityAppService
     /// <summary>The block as stored. The capture policy is enforced server-side too: data the project does not
     /// allow is not stored, even if an outdated or misconfigured agent sends it; the time block itself is always kept.
     /// The optional context is normalized (an unusable value becomes null, never a rejection).</summary>
-    private Activity BuildActivity(Guid userId, Project project, CreateActivityDto input)
+    private Activity BuildActivity(Guid userId, Project project, CreateActivityDto input, Guid deviceId)
     {
         var blockLength = AgentContextNormalizer.AsUtc(input.EndedAt) - AgentContextNormalizer.AsUtc(input.StartedAt);
         // Activity % and input integrity mean nothing when the project measures neither keyboard nor mouse.
@@ -402,7 +392,7 @@ public class ActivityAppService : TrackerAppService, IActivityAppService
             Platform = AgentContextNormalizer.NormalizePlatform(input.Platform),
             OsVersion = AgentContextNormalizer.CleanText(input.OsVersion, ActivityConsts.MaxOsVersionLength),
             AgentVersion = AgentContextNormalizer.CleanText(input.AgentVersion, ActivityConsts.MaxAgentVersionLength),
-            DeviceId = AgentContextNormalizer.NormalizeDeviceId(input.DeviceId),
+            DeviceId = deviceId,
             DeviceName = AgentContextNormalizer.CleanText(input.DeviceName, ActivityConsts.MaxDeviceNameLength),
             TimeZone = AgentContextNormalizer.NormalizeTimeZone(input.TimeZone),
             UtcOffsetMinutes = AgentContextNormalizer.NormalizeUtcOffset(input.UtcOffsetMinutes),

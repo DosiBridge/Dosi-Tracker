@@ -44,7 +44,15 @@ public static class TrackerDomainErrorCodes
     public const string EmailNotConfirmed = "Tracker:EmailNotConfirmed";
 
     public const string ExportExceedsLimit = "Tracker:ExportExceedsLimit";
+    /// <summary>The device (the token's, or the one the request names) is revoked in this workspace. Terminal for an
+    /// agent: its sessions were revoked with it.</summary>
     public const string DeviceRevoked = "Tracker:DeviceRevoked";
+
     public const string DeviceNotObserved = "Tracker:DeviceNotObserved";
+
+    /// <summary>No revocation of that device exists to restore.</summary>
     public const string DeviceNotFound = "Tracker:DeviceNotFound";
+
+    /// <summary>An upload or heartbeat names no device: neither its token is device-bound nor its body has a deviceId.</summary>
+    public const string DeviceIdRequired = "Tracker:DeviceIdRequired";
 }

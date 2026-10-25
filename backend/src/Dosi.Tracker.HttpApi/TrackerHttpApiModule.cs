@@ -87,6 +87,7 @@ public class TrackerHttpApiModule : AbpModule
             options.Map(TrackerDomainErrorCodes.DeviceRevoked, HttpStatusCode.Forbidden);
             options.Map(TrackerDomainErrorCodes.DeviceNotObserved, HttpStatusCode.BadRequest);
             options.Map(TrackerDomainErrorCodes.DeviceNotFound, HttpStatusCode.NotFound);
+            options.Map(TrackerDomainErrorCodes.DeviceIdRequired, HttpStatusCode.BadRequest);
         });
     }
 }

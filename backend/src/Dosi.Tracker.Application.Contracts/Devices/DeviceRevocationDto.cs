@@ -10,4 +10,7 @@ public class DeviceRevocationDto : EntityDto<Guid>
     public Guid DeviceId { get; set; }
     public DateTime RevokedAt { get; set; }
     public string? Reason { get; set; }
+
+    /// <summary>Who revoked the device: the member themselves, or a workspace owner or manager.</summary>
+    public Guid? RevokedByUserId { get; set; }
 }

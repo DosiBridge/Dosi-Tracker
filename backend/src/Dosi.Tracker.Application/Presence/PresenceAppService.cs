@@ -35,19 +35,22 @@ public class PresenceAppService : TrackerAppService, IPresenceAppService
     private readonly IIdentityUserRepository _userRepository;
     private readonly IRepository<WorkspaceMember, Guid> _memberRepository;
     private readonly IRepository<DeviceRevocation, Guid> _revocationRepository;
+    private readonly DeviceRevocationManager _revocationManager;
 
     public PresenceAppService(
         IRepository<AgentPresence, Guid> presenceRepository,
         IRepository<Project, Guid> projectRepository,
         IIdentityUserRepository userRepository,
         IRepository<WorkspaceMember, Guid> memberRepository,
-        IRepository<DeviceRevocation, Guid> revocationRepository)
+        IRepository<DeviceRevocation, Guid> revocationRepository,
+        DeviceRevocationManager revocationManager)
     {
         _presenceRepository = presenceRepository;
         _projectRepository = projectRepository;
         _userRepository = userRepository;
         _memberRepository = memberRepository;
         _revocationRepository = revocationRepository;
+        _revocationManager = revocationManager;
     }
 
     /// <summary>Records the caller's agent state on one device. Not written to the audit log: every running agent
@@ -58,16 +61,8 @@ public class PresenceAppService : TrackerAppService, IPresenceAppService
         var userId = CurrentUser.GetId();
         var currentWorkspaceId = CurrentWorkspace.GetId();
 
-        var isRevoked = await _revocationRepository.AnyAsync(r =>
-            r.WorkspaceId == currentWorkspaceId &&
-            r.UserId == userId &&
-            r.DeviceId == input.DeviceId);
-
-        if (isRevoked)
-        {
-            throw new BusinessException(TrackerDomainErrorCodes.DeviceRevoked)
-                .WithData("deviceId", input.DeviceId);
-        }
+        // The heartbeat's device and the one the token was issued to must both be unrevoked here.
+        await _revocationManager.EnsureCanIngestAsync(currentWorkspaceId, userId, TokenDeviceId, input.DeviceId);
 
         var now = AgentContextNormalizer.AsUtc(Clock.Now);
         // Validation has already refused an unknown status (400).

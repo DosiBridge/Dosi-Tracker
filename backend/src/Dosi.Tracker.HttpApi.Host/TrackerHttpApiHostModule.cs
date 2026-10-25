@@ -7,6 +7,7 @@ using System.Threading.Tasks;
 using Dosi.Tracker.Billing;
 using Dosi.Tracker.Activities.Retention;
 using Dosi.Tracker.Compatibility;
+using Dosi.Tracker.Devices;
 using Dosi.Tracker.Retention;
 using Dosi.Tracker.SaaS;
 using Microsoft.AspNetCore.Http;
@@ -82,6 +83,18 @@ public class TrackerHttpApiHostModule : AbpModule
                 options.UseLocalServer();
                 options.UseAspNetCore();
             });
+        });
+
+        PreConfigure<OpenIddictServerBuilder>(serverBuilder =>
+        {
+            // Desktop agents bind their tokens to their install (device_id) so a device can be revoked
+            // (docs/agent-api-contract.md).
+            serverBuilder.AddEventHandler(ValidateDeviceIdParameter.Descriptor);
+            serverBuilder.AddEventHandler(AttachDeviceBinding.Descriptor);
+
+            // RFC 7009 token revocation: agents revoke their refresh token on sign-out. ABP serves it at
+            // connect/revocat; connect/revoke is the conventional path the agent contract names.
+            serverBuilder.SetRevocationEndpointUris("connect/revocat", "connect/revoke");
         });
 
         if (!hostingEnvironment.IsDevelopment())

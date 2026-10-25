@@ -8,6 +8,7 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc.Controllers;
 using Microsoft.AspNetCore.Mvc.Filters;
+using Dosi.Tracker.Devices;
 using Microsoft.Extensions.DependencyInjection;
 using Volo.Abp;
 
@@ -17,7 +18,8 @@ namespace Dosi.Tracker.Workspaces;
 /// Resolves the workspace of a request from the <c>X-Workspace-Id</c> header: a signed-in caller must be an active
 /// member of it (otherwise 403 <c>Tracker:NotWorkspaceMember</c>), and the request then runs in it with the caller's
 /// role (<see cref="ICurrentWorkspace"/>), which is also what <c>/api/abp/application-configuration</c> reports
-/// permissions for. An anonymous request's header is ignored. Runs after authentication.
+/// permissions for. A token bound to a desktop agent install that is revoked in the workspace is refused there
+/// (403 <c>Tracker:DeviceRevoked</c>). An anonymous request's header is ignored. Runs after authentication.
 /// </summary>
 public class WorkspaceResolutionMiddleware
 {
@@ -79,6 +81,17 @@ public class WorkspaceResolutionMiddleware
 
         using (context.RequestServices.GetRequiredService<ICurrentWorkspace>().Change(workspaceId, role))
         {
+            // A desktop agent's token names its install; a revoked install may do nothing more in this workspace (its
+            // sessions were revoked with it, but an access token stays valid until it expires).
+            var deviceId = DeviceTokenBinding.Parse(context.User.FindFirst(DeviceConsts.TokenClaimType)?.Value);
+            if (deviceId != null && await context.RequestServices.GetRequiredService<DeviceRevocationManager>()
+                    .IsDeviceRevokedAsync(workspaceId, userId.Value, deviceId.Value))
+            {
+                await WriteErrorAsync(context, StatusCodes.Status403Forbidden, TrackerDomainErrorCodes.DeviceRevoked,
+                    "This computer was removed from this workspace.");
+                return;
+            }
+
             await _next(context);
         }
     }
