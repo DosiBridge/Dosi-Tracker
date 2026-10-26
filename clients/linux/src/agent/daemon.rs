@@ -10,9 +10,10 @@
 //!    carry titles, app names, tokens or passwords;
 //! 3. loads the configuration, probes the session (logind first), resolves
 //!    the credential store and builds the tracker for the session;
-//! 4. spawns the worker (with its control task and uploader), the session
-//!    events, the notice relay ([`relay`]), the X connection watch and the IPC
-//!    server ([`methods`] maps the requests to worker commands);
+//! 4. spawns the worker (with its control task and uploader), the tray
+//!    (feature `tray`, [`super::tray`]), the session events, the notice relay
+//!    ([`relay`]), the X connection watch and the IPC server ([`methods`] maps
+//!    the requests to worker commands);
 //! 5. tells systemd `READY=1` once IPC listens, then waits: SIGTERM, SIGINT
 //!    and SIGHUP save the block, send the farewell and give uploads at most
 //!    15 s (exit within 20 s); the worker quitting by itself (session removed,
@@ -272,11 +273,57 @@ impl ExeIdentity {
     }
 }
 
-/// Hook for the tray (step L7): start the StatusNotifierItem and return
-/// whether a tray host shows it. Until then there is no tray.
-fn spawn_tray(_state: &StateHandle, _sink: &CommandSink) -> bool {
-    // L7: spawn the daemon-owned tray here (agent::tray).
-    false
+/// Start the daemon-owned tray (feature `tray`, and only with a session bus)
+/// and say whether a host shows it; `snapshot.indicator.tray` then follows
+/// the watcher's comings and goings.
+#[cfg(feature = "tray")]
+fn spawn_tray(
+    state: &StateHandle,
+    sink: &CommandSink,
+    clock: &Clock,
+    cfg: &AppConfig,
+    paths: &LinuxPaths,
+    session_bus: Option<&str>,
+    gui: Option<&super::tray::GuiLauncher>,
+) -> Option<super::tray::TrayHandle> {
+    session_bus?;
+    let entry = paths.autostart_entry();
+    let exe = std::env::current_exe().ok();
+    let actions = super::tray::TrayActions {
+        sink: sink.clone(),
+        clock: clock.clone(),
+        open_gui: match gui.cloned() {
+            Some(launcher) => Arc::new(move |view| launcher.launch(view)),
+            None => Arc::new(|_| tracing::info!("the window is not installed")),
+        },
+        open_url: Arc::new(super::tray::xdg_open),
+        set_autostart: {
+            let entry = entry.clone();
+            Arc::new(move |on| {
+                let changed = match (&exe, on) {
+                    (Some(exe), true) => crate::service::enable_autostart(&entry, exe).map(drop),
+                    (_, false) => crate::service::disable_autostart(&entry).map(drop),
+                    (None, true) => Ok(()),
+                };
+                if let Err(e) = changed {
+                    tracing::warn!(error = %e, "start at login was not changed");
+                }
+                crate::service::autostart_enabled(&entry)
+            })
+        },
+        autostart_enabled: Arc::new(move || crate::service::autostart_enabled(&entry)),
+        dashboard_url: cfg.dashboard_url.clone(),
+    };
+    match super::tray::spawn(super::tray::TrayConfig {
+        state: state.clone(),
+        actions,
+    }) {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            tracing::info!(error = %e, "no tray");
+            None
+        }
+    }
 }
 
 fn system_bus(env: &SessionEnv) -> Option<zbus::blocking::Connection> {
@@ -509,8 +556,22 @@ pub fn run(args: DaemonArgs) -> u8 {
         }
     };
     let sink = CommandSink::new(handle.commands.clone());
-    let tray = spawn_tray(&state, &sink);
-    state.update(|s| s.indicator.tray = tray);
+    let gui = gui_launcher(&paths);
+    #[cfg(feature = "tray")]
+    let tray = spawn_tray(
+        &state,
+        &sink,
+        &clock,
+        &cfg,
+        &paths,
+        env.dbus_session_bus_address.as_deref(),
+        gui.as_ref(),
+    );
+    #[cfg(feature = "tray")]
+    let shown = tray.as_ref().is_some_and(|t| t.shown());
+    #[cfg(not(feature = "tray"))]
+    let shown = false;
+    state.update(|s| s.indicator.tray = shown);
 
     // Session events: lock, sleep, shutdown, session removed.
     let events = SessionEvents::spawn(
@@ -559,7 +620,7 @@ pub fn run(args: DaemonArgs) -> u8 {
         inhibitor,
         notifications_enabled: cfg.notifications.enabled,
         rx: relay_rx,
-        gui_exe: gui_exe(),
+        gui,
         clock: clock.clone(),
     });
 
@@ -631,6 +692,10 @@ pub fn run(args: DaemonArgs) -> u8 {
     let _ = std::fs::remove_file(&socket);
     drop(events);
     relay.stop();
+    #[cfg(feature = "tray")]
+    if let Some(tray) = tray {
+        tray.stop();
+    }
     drop(notifier);
     tracing::info!(?outcome, "the agent stopped");
     match outcome {
@@ -672,11 +737,19 @@ fn exe_check_interval(vars: &[(String, String)]) -> Duration {
     EXE_CHECK_EVERY
 }
 
-/// `dosi-tracker-gui` next to this binary, if installed.
-fn gui_exe() -> Option<PathBuf> {
+/// The launcher of `dosi-tracker-gui` next to this binary, if installed.
+fn gui_launcher(paths: &LinuxPaths) -> Option<super::tray::GuiLauncher> {
     let exe = std::env::current_exe().ok()?;
     let gui = exe.with_file_name("dosi-tracker-gui");
-    gui.is_file().then_some(gui)
+    gui.is_file().then(|| {
+        let path = std::env::var_os("PATH");
+        let runtime_base = paths.runtime_dir();
+        super::tray::GuiLauncher::new(
+            gui,
+            path.as_deref(),
+            runtime_base.as_deref().and_then(Path::parent),
+        )
+    })
 }
 
 /// Replace this process with the (new) binary at `path` (detached mode).

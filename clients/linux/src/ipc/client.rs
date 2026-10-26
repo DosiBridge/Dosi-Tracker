@@ -203,8 +203,12 @@ impl Client {
             method: method.into(),
             params,
         };
-        let mut frame = encode(&request).map_err(|e| ClientError::Protocol(e.to_string()))?;
+        let frame = encode(&request).map_err(|e| ClientError::Protocol(e.to_string()));
+        // The params may carry a password (`auth.sign_in`): wipe them.
+        let mut request = request;
+        wipe_strings(&mut request.params);
         drop(request);
+        let mut frame = frame?;
         let written = self.stream.write_all(&frame);
         frame.zeroize();
         written.map_err(|e| ClientError::Protocol(e.to_string()))?;
@@ -277,6 +281,17 @@ impl Client {
 
     fn pending_frame(&mut self) -> Result<Option<ServerFrame>, ClientError> {
         Ok(self.frames.pop_front())
+    }
+}
+
+/// Zeroize every string in `value` (request params that may carry a
+/// password are dropped this way).
+pub fn wipe_strings(value: &mut Value) {
+    match value {
+        Value::String(text) => text.zeroize(),
+        Value::Array(items) => items.iter_mut().for_each(wipe_strings),
+        Value::Object(map) => map.values_mut().for_each(wipe_strings),
+        _ => {}
     }
 }
 

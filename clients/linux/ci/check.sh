@@ -122,12 +122,31 @@ check_outbox_status_fails_closed() {
   rm -rf "${home}"
 }
 
-stage_release() {
-  log "release build"
-  cargo build --locked --release --bins
+# Parallel jobs for the release (LTO) builds: each LTO link of a binary that
+# carries the GUI takes about 2 GiB, so a many-core host with little memory
+# per core would have the kernel kill rustc. CARGO_BUILD_JOBS wins when set.
+lto_jobs() {
+  if [ -n "${CARGO_BUILD_JOBS:-}" ]; then
+    echo "${CARGO_BUILD_JOBS}"
+    return
+  fi
+  local mem_kb cpus jobs
+  mem_kb="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+  cpus="$(nproc 2>/dev/null || echo 1)"
+  jobs=$((mem_kb / (2 * 1024 * 1024)))
+  [ "${jobs}" -ge 1 ] || jobs=1
+  [ "${jobs}" -le "${cpus}" ] || jobs="${cpus}"
+  echo "${jobs}"
+}
 
-  log "release-mode tests"
-  cargo test --locked --release
+stage_release() {
+  local jobs
+  jobs="$(lto_jobs)"
+  log "release build (${jobs} jobs)"
+  cargo build --locked --release --bins -j "${jobs}"
+
+  log "release-mode tests (${jobs} jobs)"
+  cargo test --locked --release -j "${jobs}"
 
   local name bin
   for name in "${RELEASE_BINS[@]}"; do

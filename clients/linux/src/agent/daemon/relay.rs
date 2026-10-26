@@ -8,7 +8,6 @@
 //! Runs on `dosi-relay`; the notification server's `ActionInvoked` signals
 //! come back as [`RelayMessage::Notification`] and turn into worker commands.
 
-use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,6 +18,7 @@ use super::CommandSink;
 use crate::agent::notify::{Notification, Notifier, NotifyEvent, Urgency};
 use crate::agent::session_events::InhibitorControl;
 use crate::agent::state::{Command, Notice, SharedState, StateHandle, TrackerStatus};
+use crate::agent::tray::GuiLauncher;
 
 /// How often the relay looks at the snapshot.
 const POLL: Duration = Duration::from_millis(250);
@@ -51,8 +51,8 @@ pub struct RelayConfig {
     pub inhibitor: Option<InhibitorControl>,
     pub notifications_enabled: bool,
     pub rx: Receiver<RelayMessage>,
-    /// `dosi-tracker-gui`, for the Open action.
-    pub gui_exe: Option<PathBuf>,
+    /// Opens `dosi-tracker-gui`, for the Open action.
+    pub gui: Option<GuiLauncher>,
     /// The machine's clock.
     pub clock: super::Clock,
 }
@@ -107,7 +107,7 @@ pub fn spawn(config: RelayConfig) -> RelayHandle {
         inhibitor,
         notifications_enabled,
         rx,
-        gui_exe,
+        gui,
         clock,
     } = config;
     let _ = std::thread::Builder::new()
@@ -124,7 +124,7 @@ pub fn spawn(config: RelayConfig) -> RelayHandle {
         sink,
         notifier: notifier.filter(|_| notifications_enabled),
         inhibitor,
-        gui_exe,
+        gui,
         clock,
         last_notice: None,
         away: None,
@@ -146,7 +146,7 @@ struct Relay {
     sink: CommandSink,
     notifier: Option<Arc<Notifier>>,
     inhibitor: Option<InhibitorControl>,
-    gui_exe: Option<PathBuf>,
+    gui: Option<GuiLauncher>,
     clock: super::Clock,
     /// The newest notice shown.
     last_notice: Option<u64>,
@@ -316,15 +316,8 @@ impl Relay {
                     });
                 }
                 ACTION_OPEN => {
-                    if let Some(gui) = &self.gui_exe {
-                        if let Err(e) = std::process::Command::new(gui)
-                            .stdin(std::process::Stdio::null())
-                            .stdout(std::process::Stdio::null())
-                            .stderr(std::process::Stdio::null())
-                            .spawn()
-                        {
-                            tracing::warn!(error = %e, "could not open the window");
-                        }
+                    if let Some(gui) = &self.gui {
+                        gui.launch(None);
                     }
                 }
                 _ => {}
