@@ -12,8 +12,9 @@
 //! - Header rules (Windows parity): `GET /api/app/workspaces/mine` is sent with the bearer
 //!   token only; every workspace-scoped call carries `X-Workspace-Id`.
 //! - Pre-expiry token renewal: tokens are refreshed 60 seconds before expiration. A refused
-//!   refresh falls back to the saved password (only when one is remembered), else the sign-in
-//!   has expired. A rotated refresh token is handed to the [`TokenCell`] rotation listener.
+//!   refresh always means the sign-in has expired: it is never a cue to silently fall back
+//!   to a remembered password. A rotated refresh token is handed to the [`TokenCell`]
+//!   rotation listener.
 //! - Bounded 401 retry: upon receiving HTTP 401, attempts token refresh once and retries once.
 //! - Activity delivery follows `POST /api/app/activity` with exact `client_activity_id` idempotency;
 //!   `sentAt` is stamped per attempt. Upload failures are classified exactly as on Windows
@@ -1289,13 +1290,15 @@ impl ApiClient {
         if let Some(refresh_token) = self.tokens.refresh_token() {
             match self.refresh(&refresh_token).await {
                 Ok(()) => {}
-                Err(AuthError::Rejected(_)) if self.password.is_empty() => {
+                Err(AuthError::Rejected(_)) => {
+                    // The refresh was refused (OpenIddict `invalid_grant`): per the
+                    // cross-lane contract this always means the sign-in has expired,
+                    // never a cue to silently re-authenticate with a remembered
+                    // password. Propagate it so the caller enters the SignInExpired
+                    // state and requires explicit re-sign-in (or a workspace switch).
                     return Err(AuthError::Rejected(
                         "Session expired. Please sign in again.".into(),
                     ));
-                }
-                Err(AuthError::Rejected(_)) => {
-                    self.login().await?;
                 }
                 Err(e) => {
                     let (now_instant, _) = self.tokens.current_time();
@@ -3428,23 +3431,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_refused_refresh_token_falls_back_to_the_saved_password_only() {
+    async fn a_refused_refresh_token_always_means_sign_in_expired() {
+        // Cross-lane contract: "Refresh refused with invalid_grant -> 'sign-in
+        // expired' state, never a silent password re-login." This must hold
+        // whether or not a password is remembered.
         let refused = http_resp(
             "400 Bad Request",
             &[],
             r#"{"error":"invalid_grant","error_description":"The token is no longer valid."}"#,
         );
-        let (url, requests) = canned_server(vec![
-            refused.clone(),
-            token_t0k3n(),
-            http_resp("200 OK", &[], "[]"),
-        ]);
-        let mut api = client(&url).with_tokens(TokenCell::with_refresh_token(Some("r1".into())));
-        api.workspaces_mine().await.unwrap();
-        let requests: Vec<String> = requests.try_iter().collect();
-        assert!(body_of(&requests[1]).contains("grant_type=password"));
 
-        // Without a saved password the refusal means signing in again.
+        // With a saved password: still rejected, never a silent password grant.
+        let (url, requests) = canned_server(vec![refused.clone()]);
+        let mut api = client(&url).with_tokens(TokenCell::with_refresh_token(Some("r1".into())));
+        assert!(api.workspaces_mine().await.unwrap_err().is_auth_rejected());
+        assert_eq!(
+            requests.try_iter().count(),
+            1,
+            "no password grant was attempted even though a password is remembered"
+        );
+
+        // Without a saved password the refusal means signing in again, as before.
         let (url, requests) = canned_server(vec![refused]);
         let mut api = ApiClient::new(url, "alice@acme.com".into(), String::new())
             .with_password(None)
