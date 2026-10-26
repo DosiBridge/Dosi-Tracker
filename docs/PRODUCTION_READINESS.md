@@ -45,7 +45,7 @@ Core backend DDD architecture (.NET 10 / ABP), EF Core PostgreSQL persistence, O
 
 ### P1 — Operability
 
-6. `docker-compose` (Postgres ± API) for local parity.  
+6. ~~`docker-compose` (Postgres ± API) for local parity.~~ Done: production-like self-host stack, see [`SELF_HOSTING.md`](./SELF_HOSTING.md).  
 7. CI: build + test backend + frontend lint on PR.  
 8. Secrets out of git (User Secrets / env / Key Vault).  
 9. Backup job + restore drill documented with RTO/RPO targets.  

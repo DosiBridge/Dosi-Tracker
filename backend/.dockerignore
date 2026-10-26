@@ -1,0 +1,39 @@
+# Build context for the backend images (docker build -f src/<project>/Dockerfile backend/).
+# Images are built from source inside the SDK stage, so nothing a developer built, installed or configured on the
+# host may leak in: no build output, no client libraries, no local settings, secrets or certificates.
+
+# Build output and caches
+**/bin/
+**/obj/
+**/Logs/
+**/TestResults/
+**/node_modules/
+**/wwwroot/libs/
+**/.abpstudio/
+
+# Developer-local configuration and secrets (the image must only ever carry the tracked appsettings.json)
+**/appsettings.secrets.json
+**/appsettings.Development.json
+**/appsettings.*.local.json
+**/*.pfx
+**/*.p12
+**/*.pem
+**/*.key
+**/.env
+**/.env.*
+
+# Not needed to build the services
+test/
+etc/
+scripts/
+**/*.md
+**/Dockerfile*
+**/.dockerignore
+**/.vs/
+**/.idea/
+**/.vscode/
+**/.cursor/
+**/*.user
+**/*.DotSettings.user
+**/*.db
+**/*.db-journal

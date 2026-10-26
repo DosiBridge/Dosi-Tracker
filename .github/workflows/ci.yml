@@ -2,27 +2,98 @@ name: CI
 
 on:
   push:
-    branches: [main, master, develop]
+    branches: [main, master, develop, "ci/**"]
   pull_request:
+  workflow_dispatch:
+
+# Least privilege for GITHUB_TOKEN: every job only reads the repository.
+permissions:
+  contents: read
+
+# A newer push to the same PR supersedes the running one; branch pushes always finish (their results are history).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Pinned toolchains, so CI only turns red because of a code change. Bump deliberately, together with the code
+  # that the new version needs (new clippy lints, analyzer rules, ...).
+  DOTNET_VERSION: "10.0.x"
+  NODE_VERSION: "24"
+  RUST_TOOLCHAIN: "1.97.1"
+  REPORTGENERATOR_VERSION: "5.5.10"
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  DOTNET_NOLOGO: "1"
+  NEXT_TELEMETRY_DISABLED: "1"
 
 jobs:
+  secret-scan:
+    name: Secret scan (gitleaks, full history)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      # Pinned by digest; bump the tag and digest together.
+      GITLEAKS_IMAGE: zricethezav/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The repository is public: a secret in any commit is leaked, not just one at HEAD, so every commit is scanned.
+      # Allowlisted test data lives in .github/gitleaks.toml (narrow, with a reason per entry).
+      - name: gitleaks (every commit)
+        run: |
+          docker run --rm -v "${GITHUB_WORKSPACE}:/repo" \
+            -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' \
+            "${GITLEAKS_IMAGE}" git /repo --config /repo/.github/gitleaks.toml --redact --no-banner --verbose
+
+  release-scripts:
+    name: Release workflow helper scripts (unit tests)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      # .github/scripts/is-latest-release.sh decides whether a release workflow run also tags the GHCR images
+      # `:latest` (release.yml's `images` job); exercised here against synthetic tag histories so a regression in
+      # that logic fails CI on every PR, not only during a real release.
+      - name: is-latest-release.sh
+        run: bash .github/scripts/test-is-latest-release.sh
+
   backend:
     name: Backend build, tests & coverage gate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Setup .NET 10
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v6
         with:
-          dotnet-version: "10.0.x"
+          dotnet-version: ${{ env.DOTNET_VERSION }}
 
       - name: Restore & build
         working-directory: backend
         run: dotnet build Dosi.Tracker.slnx --configuration Release
 
+      # Known-vulnerable NuGet packages (direct and transitive), checked against the GitHub Advisory Database.
+      # High or critical fails the job; moderate and low are listed for triage.
+      - name: NuGet vulnerability audit (high/critical = fail)
+        working-directory: backend
+        run: |
+          dotnet list Dosi.Tracker.slnx package --vulnerable --include-transitive --format json > vulnerable-packages.json
+          jq -r '[.projects[]?.frameworks[]? | ((.topLevelPackages // []) + (.transitivePackages // []))[]
+                  | select(.vulnerabilities) | . as $p | .vulnerabilities[]
+                  | "\(.severity)\t\($p.id) \($p.resolvedVersion)\t\(.advisoryurl)"] | unique | .[]' \
+            vulnerable-packages.json | tee vulnerable-packages.txt
+          if grep -qE '^(High|Critical)' vulnerable-packages.txt; then
+            echo "::error::High or critical NuGet vulnerabilities (above). Upgrade or pin a fixed version."
+            exit 1
+          fi
+
       - name: Install ReportGenerator (coverage merge)
-        run: dotnet tool install -g dotnet-reportgenerator-globaltool
+        run: dotnet tool install -g dotnet-reportgenerator-globaltool --version "${REPORTGENERATOR_VERSION}"
 
       - name: Test (unit + SQLite integration) with coverage
         working-directory: backend
@@ -39,7 +110,7 @@ jobs:
 
       - name: Upload test results & coverage
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: backend-test-results
           path: |
@@ -48,14 +119,15 @@ jobs:
 
   frontend:
     name: Frontend typecheck, lint, tests & build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
-          node-version: "22"
+          node-version: ${{ env.NODE_VERSION }}
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
@@ -84,15 +156,14 @@ jobs:
         working-directory: frontend
         run: npm run test:arch
 
-      # Known-vuln floor. Currently 8 high findings inherited from next@16.2.10 (sharp) — gate at
-      # critical until the Next upgrade lands, then ratchet to --audit-level=high.
-      - name: Dependency audit (critical = fail)
+      # Known-vuln floor: any high or critical advisory fails. Moderate/low are left to Dependabot.
+      - name: Dependency audit (high = fail)
         working-directory: frontend
-        run: npm audit --audit-level=critical
+        run: npm audit --audit-level=high
 
       - name: Upload coverage
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: frontend-coverage
           path: frontend/coverage
@@ -108,14 +179,15 @@ jobs:
 
   frontend-e2e:
     name: Frontend E2E (Playwright, demo mode)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
-          node-version: "22"
+          node-version: ${{ env.NODE_VERSION }}
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
@@ -140,30 +212,146 @@ jobs:
 
       - name: Upload Playwright report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: frontend-playwright-report
           path: frontend/playwright-report
 
+  # What an operator deploys, booted the way an operator boots it: the container images built from a clean checkout,
+  # migrations against real PostgreSQL, the API in Production with a throwaway signing certificate, then the agent
+  # sign-in contract end to end. The steps live in .github/scripts/deploy-smoke.sh, which also runs locally.
+  deploy-smoke:
+    name: Deploy smoke (images, PostgreSQL, Production boot, sign-in)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: Tracker
+          POSTGRES_USER: tracker
+          # A database that exists only for this job, on the runner's private service network (no published port).
+          POSTGRES_PASSWORD: smoke-ci-only
+        options: >-
+          --health-cmd "pg_isready -U tracker -d Tracker"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v7
+
+      # docker-compose.yml must render with a complete .env, and must refuse to start from the bare template (every
+      # required secret is empty there), so a self-host can never come up with missing or default secrets.
+      - name: Validate docker-compose.yml against .env.example
+        run: |
+          set -euo pipefail
+          if docker compose --env-file .env.example config --quiet 2>"${RUNNER_TEMP}/compose-template.err"; then
+            echo "::error::docker compose accepted .env.example, whose required secrets are empty"; exit 1
+          fi
+          grep -q "required variable" "${RUNNER_TEMP}/compose-template.err"
+          env_file="$(mktemp)"
+          sed -e 's#^\(TRACKER_DB_PASSWORD\|TRACKER_ADMIN_PASSWORD\|TRACKER_CERT_PASSPHRASE\|TRACKER_ENCRYPTION_PASSPHRASE\)=$#\1=ci-placeholder-not-a-secret#' \
+            .env.example > "${env_file}"
+          docker compose --env-file "${env_file}" --profile proxy --profile init config --quiet
+          echo "docker-compose.yml renders with a complete .env and refuses the bare template"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build DbMigrator image
+        uses: docker/build-push-action@v7
+        with:
+          context: backend
+          file: backend/src/Dosi.Tracker.DbMigrator/Dockerfile
+          tags: dosi-tracker-migrator:smoke
+          load: true
+          cache-from: type=gha,scope=migrator
+          cache-to: type=gha,mode=max,scope=migrator
+
+      - name: Build API image
+        uses: docker/build-push-action@v7
+        with:
+          context: backend
+          file: backend/src/Dosi.Tracker.HttpApi.Host/Dockerfile
+          tags: dosi-tracker-api:smoke
+          load: true
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,mode=max,scope=api
+
+      - name: Build dashboard image
+        uses: docker/build-push-action@v7
+        with:
+          context: frontend
+          file: frontend/Dockerfile
+          tags: dosi-tracker-web:smoke
+          load: true
+          cache-from: type=gha,scope=web
+          cache-to: type=gha,mode=max,scope=web
+
+      - name: Smoke (migrate, boot in Production, health, sign-in, secrets guard, dashboard)
+        env:
+          SMOKE_API_IMAGE: dosi-tracker-api:smoke
+          SMOKE_MIGRATOR_IMAGE: dosi-tracker-migrator:smoke
+          SMOKE_WEB_IMAGE: dosi-tracker-web:smoke
+          SMOKE_NETWORK: ${{ job.services.postgres.network }}
+          SMOKE_DB_HOST: postgres
+          SMOKE_DB_USER: tracker
+          SMOKE_DB_PASSWORD: smoke-ci-only
+          SMOKE_DB_NAME: Tracker
+          # The dashboard reads its API base URL at run time (frontend/src/lib/runtime-config.ts).
+          SMOKE_WEB_API_URL_VAR: DOSI_API_URL
+        run: bash .github/scripts/deploy-smoke.sh
+
+
   windows-agent:
     name: Windows agent (build, lint, installer)
-    runs-on: windows-latest
+    runs-on: windows-2025
+    timeout-minutes: 45
+    env:
+      # The windows-2025 images no longer ship NSIS; this pinned version is installed before anything else.
+      NSIS_VERSION: "3.12.0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      # Installed first so a broken NSIS install fails in seconds, not after the Rust build.
+      - name: Install NSIS (pinned)
+        shell: pwsh
+        run: |
+          choco install nsis --version=$env:NSIS_VERSION -y --no-progress
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $nsisDir = Join-Path ${env:ProgramFiles(x86)} 'NSIS'
+          if (-not (Test-Path (Join-Path $nsisDir 'makensis.exe'))) { throw "makensis.exe not found in $nsisDir" }
+          Add-Content -Path $env:GITHUB_PATH -Value $nsisDir
+
+      - name: NSIS version (fail fast)
+        shell: pwsh
+        run: |
+          $reported = (& makensis /VERSION | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # Chocolatey's 3.12.0 is NSIS v3.12.
+          $expected = 'v' + ($env:NSIS_VERSION -replace '\.0$', '')
+          Write-Host "makensis $reported (expected $expected)"
+          if ($reported -ne $expected) { throw "Expected NSIS $expected on PATH, found $reported" }
+
+      - name: Setup Rust (pinned)
+        shell: pwsh
+        run: |
+          rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal --component clippy
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup default $env:RUST_TOOLCHAIN
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustc --version
+          cargo clippy --version
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             clients/windows/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('clients/windows/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-windows-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('clients/windows/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-windows-${{ env.RUST_TOOLCHAIN }}-
 
       - name: Build (locked to the committed Cargo.lock)
         working-directory: clients/windows
@@ -195,7 +383,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Upload installer
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dosi-tracker-windows-setup
           path: clients/windows/installer/dosi-tracker-setup-*.exe
@@ -203,14 +391,30 @@ jobs:
 
   macos-agent:
     name: macOS agent (build, test, app bundle)
-    runs-on: macos-14
+    # macos-14 is retired (2 Nov 2026). macos-15 with an explicitly selected Xcode 16 keeps the compiler fixed;
+    # Package.swift's swift-tools-version 5.x keeps the package in the Swift 5 language mode under Swift 6.x.
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      XCODE_VERSION: "16.4"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+
+      - name: Select Xcode
+        run: |
+          xcode_app="/Applications/Xcode_${XCODE_VERSION}.app"
+          if [ ! -d "${xcode_app}" ]; then
+            echo "::error::${xcode_app} is not installed on this runner image"
+            ls -d /Applications/Xcode*.app
+            exit 1
+          fi
+          sudo xcode-select --switch "${xcode_app}/Contents/Developer"
 
       - name: Toolchain
         run: |
           xcodebuild -version
           swift --version
+          xcodebuild -version | grep -q "^Xcode ${XCODE_VERSION}" || { echo "::error::Xcode ${XCODE_VERSION} is not selected"; exit 1; }
 
       - name: Build
         working-directory: clients/macos
@@ -231,75 +435,10 @@ jobs:
         run: bash scripts/build-app.sh
 
       - name: Upload app
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dosi-tracker-macos
           path: clients/macos/.build/dist/DosiTracker-*-macos.zip
           if-no-files-found: error
 
-  linux-agent:
-    name: Linux agent (fmt, clippy, build, test, diagnostics, installer)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            clients/linux/target
-          key: ${{ runner.os }}-cargo-linux-${{ hashFiles('clients/linux/Cargo.lock') }}
-
-      - name: Format check
-        working-directory: clients/linux
-        run: cargo fmt --check
-
-      - name: Clippy
-        working-directory: clients/linux
-        run: cargo clippy --locked --all-targets -- -D warnings
-
-      - name: Build release (locked)
-        working-directory: clients/linux
-        run: cargo build --locked --release
-
-      - name: Test release (locked)
-        working-directory: clients/linux
-        run: cargo test --locked --release
-
-      - name: Release binary doctor (--json)
-        working-directory: clients/linux
-        run: |
-          export HOME=$(mktemp -d)
-          export XDG_DATA_HOME="${HOME}/.local/share"
-          export XDG_CONFIG_HOME="${HOME}/.config"
-          ./target/release/dosi-tracker-linux doctor --json
-
-      - name: Outbox status fail-closed (missing DB)
-        working-directory: clients/linux
-        run: |
-          export HOME=$(mktemp -d)
-          export XDG_DATA_HOME="${HOME}/.local/share"
-          export XDG_CONFIG_HOME="${HOME}/.config"
-          MISSING_DB="${HOME}/missing_dosi_outbox_${RANDOM}_$$.db"
-          rm -f "${MISSING_DB}"
-          if ./target/release/dosi-tracker-linux outbox status --db "${MISSING_DB}" --account-id "00000000-0000-0000-0000-000000000001" --workspace-id "00000000-0000-0000-0000-000000000002" --json; then
-            echo "ERROR: outbox status succeeded unexpectedly on non-existent DB"
-            exit 1
-          fi
-          if [ -e "${MISSING_DB}" ]; then
-            echo "ERROR: outbox status created the database file"
-            exit 1
-          fi
-
-      - name: Installer lifecycle tests
-        working-directory: clients/linux
-        run: bash tests/test_installer_lifecycle.sh
-
-
+  # The Linux agent's jobs live in .github/workflows/linux.yml.

@@ -93,9 +93,8 @@ Cross-cutting facts behind the cells:
    verify with `grep -rl "fast-check" src`. Priority targets: `canAccess` prefix matching (no
    path traversal past a guard), activity-filter invariants (filtered ⊆ input, order preserved),
    export round-trip (parse(serialize(x)) = x), corrupt-localStorage fuzzing of session recovery.
-7. **Ratchet the dependency audit to `high`.** The gate sits at `--audit-level=critical` only
-   because 8 high advisories come in transitively via `next@16.2.10` (sharp/libvips). Upgrade Next,
-   then tighten the level in the same PR (strategy §2).
+7. ~~**Ratchet the dependency audit to `high`.**~~ Done: Next 16.4 cleared the transitive
+   sharp/libvips advisories and CI now runs `npm audit --audit-level=high` (strategy §2).
 8. **Screenshot blob flows.** `getAuthedBlobUrl` and capture rendering need a live backend; cover
    via a nightly job against a seeded backend, or accept and document manual-QA-only status.
 9. **Host impersonation depth.** Enter/exit is covered; assert what an impersonating host can and

@@ -1,0 +1,29 @@
+# Reverse proxy for the self-hosted stack (docker-compose.yml, profile "proxy"); see docs/SELF_HOSTING.md.
+#
+# Terminates TLS for the two public URLs from .env and forwards plain HTTP to the containers on the "edge" network.
+# Caddy sends X-Forwarded-For / X-Forwarded-Proto, which the API accepts from this network only
+# (App__ForwardedHeaders__KnownNetworks = TRACKER_EDGE_SUBNET); with them OpenIddict sees HTTPS and the sign-in rate
+# limits see the real client address.
+#
+# TRACKER_PROXY_TLS: "internal" (Caddy's local CA, for testing) or your e-mail address (publicly trusted ACME
+# certificates; ports 80/443 must be reachable from the internet).
+
+(common) {
+	tls {$TRACKER_PROXY_TLS}
+	encode zstd gzip
+	header -Server
+	log {
+		output stdout
+		format json
+	}
+}
+
+{$TRACKER_API_URL} {
+	import common
+	reverse_proxy api:8080
+}
+
+{$TRACKER_WEB_URL} {
+	import common
+	reverse_proxy web:3000
+}

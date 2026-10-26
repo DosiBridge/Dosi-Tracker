@@ -1,0 +1,458 @@
+name: Release
+
+# A product release: every desktop agent's shippable artifact, the backend/frontend
+# container images, and a GitHub Release that ties them together.
+#
+#   - windows / macos / linux build their platform's artifact (reusing, for Linux, the
+#     Linux lane's own Docker packaging from .github/workflows/linux.yml) and upload it.
+#   - images builds api/migrator/web from source (same Dockerfiles as ci.yml's
+#     deploy-smoke) and pushes them to GHCR.
+#   - release downloads every artifact, checks the version-less aliases the product
+#     contract promises, writes SHA256SUMS over all of them, and publishes the release.
+#
+# Signing is opportunistic: Windows Authenticode and macOS Developer ID + notarization
+# run only when their secrets are configured, so a fork (or this repository before
+# signing is set up) still produces a working, unsigned/ad-hoc-signed release.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, without the leading v (e.g. 1.2.3)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.inputs.version || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  RUST_TOOLCHAIN: "1.97.1"
+  NSIS_VERSION: "3.12.0"
+  XCODE_VERSION: "16.4"
+  REGISTRY: ghcr.io
+  IMAGE_OWNER: dosibridge
+
+jobs:
+  version:
+    name: Resolve release version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      is_latest: ${{ steps.latest.outputs.is_latest }}
+    steps:
+      # Full tag history, so "is this the highest released version" (below) can see every release, not just the
+      # ref this run happens to be on.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      # The tag push (vX.Y.Z) is the normal path; workflow_dispatch's input is for a
+      # manual re-run (e.g. re-signing, or a GHCR-only re-push) against a chosen ref.
+      - name: From the tag or the dispatch input
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            version="$DISPATCH_VERSION"
+          else
+            version="${GITHUB_REF_NAME#v}"
+          fi
+          case "$version" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::version must look like 1.2.3 (got '$version')"; exit 1 ;;
+          esac
+          echo "Releasing ${version}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      # Gates the `images` job's `:latest` tag (see is-latest-release.sh): a workflow_dispatch re-run against an
+      # older version (the comment above documents that path as supported) must not win the floating `:latest` tag
+      # away from a version that shipped after it.
+      - name: Is this the latest release?
+        id: latest
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: echo "is_latest=$(bash .github/scripts/is-latest-release.sh)" >> "$GITHUB_OUTPUT"
+
+  windows:
+    name: Windows installer
+    needs: version
+    runs-on: windows-2025
+    timeout-minutes: 45
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # The windows-2025 images no longer ship NSIS; this pinned version is installed
+      # before anything else (same as ci.yml's windows-agent job).
+      - name: Install NSIS (pinned)
+        shell: pwsh
+        run: |
+          choco install nsis --version=$env:NSIS_VERSION -y --no-progress
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $nsisDir = Join-Path ${env:ProgramFiles(x86)} 'NSIS'
+          if (-not (Test-Path (Join-Path $nsisDir 'makensis.exe'))) { throw "makensis.exe not found in $nsisDir" }
+          Add-Content -Path $env:GITHUB_PATH -Value $nsisDir
+
+      - name: NSIS version (fail fast)
+        shell: pwsh
+        run: |
+          $reported = (& makensis /VERSION | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $expected = 'v' + ($env:NSIS_VERSION -replace '\.0$', '')
+          Write-Host "makensis $reported (expected $expected)"
+          if ($reported -ne $expected) { throw "Expected NSIS $expected on PATH, found $reported" }
+
+      - name: Setup Rust (pinned)
+        shell: pwsh
+        run: |
+          rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup default $env:RUST_TOOLCHAIN
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            clients/windows/target
+          key: ${{ runner.os }}-cargo-windows-release-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('clients/windows/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-windows-release-${{ env.RUST_TOOLCHAIN }}-
+
+      # The shippable artifact: an optimized GUI binary. Quality gates (clippy, tests)
+      # already ran on this commit in ci.yml; this job only builds what ships.
+      - name: Release build
+        working-directory: clients/windows
+        run: cargo build --locked --release
+
+      # Versioned from the release tag (not Cargo.toml): the installer's version is the
+      # product release's version, independent of the crate's own internal version.
+      - name: Build installer (NSIS)
+        working-directory: clients/windows/installer
+        shell: pwsh
+        run: |
+          $numeric = ($env:VERSION -split '[-+]')[0]
+          Write-Host "Dosi Tracker $env:VERSION"
+          makensis /DVERSION=$env:VERSION /DVERSION_NUMERIC=$numeric dosi-tracker.nsi
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # Authenticode signing only when both signing secrets exist. Without them the
+      # installer ships unsigned, same as a local build — SmartScreen warns, as documented
+      # in clients/windows/README.md.
+      - name: Sign the installer (Authenticode)
+        if: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 != '' && secrets.WINDOWS_CERTIFICATE_PASSWORD != '' }}
+        shell: pwsh
+        env:
+          CERT_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP 'codesign.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERT_BASE64))
+          $signtool = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe -ErrorAction Stop |
+            Where-Object { $_.FullName -match '\\x64\\' } | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $signtool) { throw "signtool.exe not found under Windows Kits 10" }
+          $installer = (Get-ChildItem "dosi-tracker-setup-$env:VERSION.exe").FullName
+          & $signtool sign /f $pfx /p $env:CERT_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $installer
+          if ($LASTEXITCODE -ne 0) { Remove-Item $pfx -Force; exit $LASTEXITCODE }
+          & $signtool verify /pa $installer
+          if ($LASTEXITCODE -ne 0) { Remove-Item $pfx -Force; exit $LASTEXITCODE }
+          Remove-Item $pfx -Force
+
+      # Contract: /releases/latest/download/dosi-tracker-setup.exe, next to the
+      # versioned one.
+      - name: Version-less alias
+        working-directory: clients/windows/installer
+        shell: pwsh
+        run: Copy-Item "dosi-tracker-setup-$env:VERSION.exe" dosi-tracker-setup.exe
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-windows
+          path: |
+            clients/windows/installer/dosi-tracker-setup-*.exe
+            clients/windows/installer/dosi-tracker-setup.exe
+          if-no-files-found: error
+
+  macos:
+    name: macOS app bundle
+    needs: version
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # macos-14 is retired; macos-15 with an explicitly selected Xcode 16 keeps the
+      # compiler fixed (same as ci.yml's macos-agent job).
+      - name: Select Xcode
+        run: |
+          xcode_app="/Applications/Xcode_${XCODE_VERSION}.app"
+          if [ ! -d "${xcode_app}" ]; then
+            echo "::error::${xcode_app} is not installed on this runner image"
+            ls -d /Applications/Xcode*.app
+            exit 1
+          fi
+          sudo xcode-select --switch "${xcode_app}/Contents/Developer"
+
+      # Developer ID signing + notarization only when the certificate secret exists.
+      # Without it the app ships ad-hoc signed (scripts/build-app.sh's default) and
+      # Gatekeeper asks the user to open it once from Privacy & Security.
+      - name: Import the signing certificate
+        id: signing
+        if: ${{ secrets.MACOS_CERTIFICATE_P12 != '' }}
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+          CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
+        run: |
+          keychain="$RUNNER_TEMP/release-signing.keychain-db"
+          cert_path="$RUNNER_TEMP/codesign.p12"
+          printf '%s' "$CERT_P12" | base64 --decode > "$cert_path"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security import "$cert_path" -k "$keychain" -P "$CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$keychain"
+          existing="$(security list-keychains -d user | sed 's/"//g')"
+          # shellcheck disable=SC2086
+          security list-keychains -d user -s "$keychain" $existing
+          rm -f "$cert_path"
+          echo "identity=${CODESIGN_IDENTITY}" >> "$GITHUB_OUTPUT"
+          echo "keychain=${keychain}" >> "$GITHUB_OUTPUT"
+
+      # Notarization needs the Developer ID signature above, plus an app-specific
+      # Apple ID password.
+      - name: Store notary credentials
+        id: notary
+        if: ${{ steps.signing.outcome == 'success' && secrets.APPLE_NOTARY_PASSWORD != '' }}
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_NOTARY_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
+        run: |
+          xcrun notarytool store-credentials release-notary \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_NOTARY_PASSWORD"
+          echo "profile=release-notary" >> "$GITHUB_OUTPUT"
+
+      - name: Build the universal app bundle
+        working-directory: clients/macos
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+          UNIVERSAL: "1"
+          CODESIGN_IDENTITY: ${{ steps.signing.outputs.identity }}
+          NOTARY_PROFILE: ${{ steps.notary.outputs.profile }}
+        run: bash scripts/build-app.sh
+
+      # Contract: /releases/latest/download/DosiTracker-macos.zip, next to the
+      # versioned one.
+      - name: Version-less alias
+        working-directory: clients/macos/.build/dist
+        run: cp "DosiTracker-${VERSION}-macos.zip" DosiTracker-macos.zip
+
+      - name: Remove the temporary keychain
+        if: always() && steps.signing.outcome == 'success'
+        run: security delete-keychain "${{ steps.signing.outputs.keychain }}" || true
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-macos
+          path: |
+            clients/macos/.build/dist/DosiTracker-*-macos.zip
+            clients/macos/.build/dist/DosiTracker-macos.zip
+          if-no-files-found: error
+
+  # Linux packaging is the Linux lane's own (.github/workflows/linux.yml's "package"
+  # job, reused verbatim here): the same CI image, the same ci/check.sh stage, which
+  # runs packaging/build-dist.sh and already writes both the versioned and the
+  # version-less (contract) names.
+  linux:
+    name: Linux packages (tarball, .deb, .rpm)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CI_IMAGE: dosi-linux-ci:22.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache cargo registry and packaging tools
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/cargo-registry
+          key: linux-cargo-package-${{ hashFiles('clients/linux/Cargo.lock', 'clients/linux/ci/check.sh') }}
+          restore-keys: linux-cargo-package-
+
+      - name: Build CI image
+        run: >
+          docker build --build-arg BUILDER_UID="$(id -u)"
+          -t "$CI_IMAGE" -f clients/linux/ci/Dockerfile clients/linux/ci
+
+      - name: ci/check.sh package
+        run: |
+          mkdir -p "$RUNNER_TEMP/cargo-registry" "$RUNNER_TEMP/linux-target"
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          docker run --rm --user builder \
+            -v "$GITHUB_WORKSPACE:/repo" \
+            -v "$RUNNER_TEMP/linux-target:/target" \
+            -v "$RUNNER_TEMP/cargo-registry:/usr/local/cargo/registry" \
+            -e CARGO_TARGET_DIR=/target \
+            -e SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
+            -w /repo/clients/linux \
+            "$CI_IMAGE" bash ci/check.sh package
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-linux
+          path: ${{ runner.temp }}/linux-target/dist/
+          if-no-files-found: error
+
+  # The same Dockerfiles ci.yml's deploy-smoke job builds and boots, pushed to GHCR
+  # instead of loaded locally. No signing secrets needed: GITHUB_TOKEN can push to this
+  # repository's own package namespace.
+  images:
+    name: Container images (GHCR)
+    needs: version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      packages: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      IS_LATEST: ${{ needs.version.outputs.is_latest }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Only the highest released version also gets the floating `:latest` tag (needs.version resolved that with
+      # is-latest-release.sh). Docker tags have no version ordering, so a workflow_dispatch re-run against an older
+      # version (the `version` job's own comment documents that as a supported path, e.g. to re-sign the Windows
+      # installer) must keep `:latest` pointed at whatever actually shipped last, not silently regress it.
+      - name: Resolve image tags
+        id: tags
+        run: |
+          for name in migrator api web; do
+            image="${REGISTRY}/${IMAGE_OWNER}/dosi-tracker-${name}"
+            tags="${image}:${VERSION}"
+            if [[ "${IS_LATEST}" == "true" ]]; then
+              tags+=$'\n'"${image}:latest"
+            fi
+            {
+              echo "${name}<<TAGS_EOF"
+              echo "${tags}"
+              echo "TAGS_EOF"
+            } >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Build & push the migrator image
+        uses: docker/build-push-action@v7
+        with:
+          context: backend
+          file: backend/src/Dosi.Tracker.DbMigrator/Dockerfile
+          push: true
+          tags: ${{ steps.tags.outputs.migrator }}
+          cache-from: type=gha,scope=migrator
+          cache-to: type=gha,mode=max,scope=migrator
+
+      - name: Build & push the API image
+        uses: docker/build-push-action@v7
+        with:
+          context: backend
+          file: backend/src/Dosi.Tracker.HttpApi.Host/Dockerfile
+          push: true
+          tags: ${{ steps.tags.outputs.api }}
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,mode=max,scope=api
+
+      - name: Build & push the dashboard image
+        uses: docker/build-push-action@v7
+        with:
+          context: frontend
+          file: frontend/Dockerfile
+          push: true
+          tags: ${{ steps.tags.outputs.web }}
+          cache-from: type=gha,scope=web
+          cache-to: type=gha,mode=max,scope=web
+
+  release:
+    name: Publish the GitHub release
+    needs: [version, windows, macos, linux, images]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - name: Download the Windows artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: release-windows
+          path: dist
+
+      - name: Download the macOS artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: release-macos
+          path: dist
+
+      - name: Download the Linux artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: release-linux
+          path: dist
+
+      # CROSS-LANE CONTRACT: these version-less names must exist so
+      # /releases/latest/download/<name> works for every platform.
+      - name: Check the version-less aliases
+        run: |
+          for f in dosi-tracker-setup.exe DosiTracker-macos.zip dosi-tracker-linux-x86_64.tar.gz \
+                   dosi-tracker_amd64.deb dosi-tracker.x86_64.rpm; do
+            if [ ! -s "dist/$f" ]; then
+              echo "::error::dist/$f is missing"
+              exit 1
+            fi
+          done
+
+      # packaging/build-dist.sh already wrote a SHA256SUMS for the three Linux files
+      # alone; replace it with one over every asset in the release.
+      - name: SHA256SUMS (every asset)
+        working-directory: dist
+        run: |
+          rm -f SHA256SUMS
+          sha256sum -- * > SHA256SUMS
+
+      # Not --verify-tag on workflow_dispatch: the tag may not exist yet, and gh then
+      # creates it at $GITHUB_SHA.
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          args=(--repo "$GITHUB_REPOSITORY" --title "Dosi Tracker ${VERSION}" --target "$GITHUB_SHA" \
+            --notes "Windows installer, macOS app, Linux tarball/.deb/.rpm (each also under a version-less name for /releases/latest/download/<name>), and container images at ${REGISTRY}/${IMAGE_OWNER}/dosi-tracker-{api,migrator,web}:${VERSION}. Verify downloads with: sha256sum -c --ignore-missing SHA256SUMS.")
+          if [ "$EVENT_NAME" = "push" ]; then
+            args+=(--verify-tag)
+          fi
+          gh release create "v${VERSION}" dist/* "${args[@]}"

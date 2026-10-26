@@ -130,3 +130,6 @@ clients/macos/config.json
 
 # NSIS installer output
 clients/windows/installer/*.exe
+
+# Self-hosting: the OpenIddict certificate created by `docker compose --profile init run --rm certgen`.
+/certs/

@@ -19,9 +19,8 @@ present but no JWT is in localStorage, so pages render seeded demo data (frozen 
 - [ ] `npm run build` succeeds with no errors.
 - [ ] `npx next start -p 3123` serves the production build; `http://localhost:3123` responds.
 - [ ] `npm run validate` is green (typecheck + lint cap + tests + architecture).
-- [ ] `npm audit --audit-level=critical` passes. Note the **high** count in the release record — the
-      gate is deliberately set at `critical` while `next@16.2.10` drags in sharp/libvips advisories
-      (strategy §2); if that count moved, find out why.
+- [ ] `npm audit --audit-level=high` passes (the CI gate, strategy §2). Note the **moderate** count in
+      the release record; if it moved, find out why.
 
 ## 2. Demo login & session
 
