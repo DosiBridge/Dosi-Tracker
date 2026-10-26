@@ -11,8 +11,8 @@ namespace Dosi.Tracker.AiAssist.Fakes;
 /// <summary>
 /// The model in tests. Every call is recorded (messages and options) and answered from a script; a call nobody
 /// scripted fails the test, so a test can never reach a real provider or pass by accident. Script entries are used in
-/// order, one per call; <see cref="EnqueueDelay"/> entries are waited out (honouring the call's token) before the next
-/// entry answers the same call.
+/// order, one per call; <see cref="EnqueueDelay"/> entries are waited out (honouring the call's token) and <see cref="EnqueueProbe"/>
+/// entries run before the next entry answers the same call.
 /// </summary>
 public sealed class FakeChatClient : IChatClient
 {
@@ -85,6 +85,10 @@ public sealed class FakeChatClient : IChatClient
     /// <summary>The next call waits <paramref name="delay"/> (cancelled by its token) before the following entry answers it.</summary>
     public FakeChatClient EnqueueDelay(TimeSpan delay) => Enqueue(new Step(null, delay));
 
+    /// <summary>The next call runs <paramref name="probe"/> (inside the call, to observe the caller's state) before the
+    /// following entry answers it.</summary>
+    public FakeChatClient EnqueueProbe(Action probe) => Enqueue(new Step(null, Probe: probe));
+
     public async Task<ChatResponse> GetResponseAsync(
         IEnumerable<ChatMessage> messages,
         ChatOptions? options = null,
@@ -112,6 +116,12 @@ public sealed class FakeChatClient : IChatClient
             if (step.Delay is { } delay)
             {
                 await Task.Delay(delay, cancellationToken);
+                continue;
+            }
+
+            if (step.Probe != null)
+            {
+                step.Probe();
                 continue;
             }
 
@@ -165,7 +175,7 @@ public sealed class FakeChatClient : IChatClient
         Usage = usage ?? Usage
     };
 
-    private sealed record Step(Func<ChatOptions?, ChatResponse>? Answer, TimeSpan? Delay = null);
+    private sealed record Step(Func<ChatOptions?, ChatResponse>? Answer, TimeSpan? Delay = null, Action? Probe = null);
 }
 
 /// <summary>One call the fake received.</summary>

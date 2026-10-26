@@ -30,8 +30,10 @@ public sealed class AiContextBundle
         IReadOnlyList<string> caveats,
         IReadOnlyList<string> routes,
         JsonArray candidates,
-        IReadOnlyDictionary<string, AiAlias> resolution)
+        IReadOnlyDictionary<string, AiAlias> resolution,
+        int injectionRemovals = 0)
     {
+        InjectionRemovals = injectionRemovals;
         CallerId = callerId;
         FactList = facts;
         Facts = facts.ToDictionary(f => f.Key, f => f.Value, StringComparer.Ordinal);
@@ -80,6 +82,10 @@ public sealed class AiContextBundle
 
     /// <summary>Every id a placeholder may name: facts, labels, member handles and <c>ME</c>.</summary>
     public IReadOnlySet<string> KnownIds { get; }
+
+    /// <summary>How many quoted texts had an injection-shaped phrase removed (<see cref="AiBundleWriter.InjectionRemovals"/>),
+    /// for the <c>ai.injection_flags</c> metric. Never serialized.</summary>
+    public int InjectionRemovals { get; }
 
     /// <summary>True when there is nothing to describe (no facts, lists or candidates): no model is called.</summary>
     public bool IsEmpty => Facts.Count == 0 && Lists.Count == 0 && Candidates.Count == 0;

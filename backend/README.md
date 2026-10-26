@@ -44,8 +44,9 @@ container's environment there).
 #### AI assist (off by default)
 
 AI assist will send aggregated tracker data to an OpenAI-protocol provider, only in workspaces whose owner turns it on.
-So far the server has the provider configuration, the workspace settings, the usage views and the toolkit that
-prepares requests and checks answers; no feature calls the provider yet. It is off unless `AI__Enabled=true`.
+So far the server has the provider configuration, the workspace settings, the usage views, the toolkit that
+prepares requests and checks answers, the request pipeline and the read layer; no endpoint calls the provider yet. It
+is off unless `AI__Enabled=true`.
 
 - **Owners opt in** (`PUT /api/app/ai-assist/settings`) after acknowledging the current disclosure version
   (`"1.{AI:Disclosure:Version}"`); turning on window titles or task notes needs the same acknowledgement. Every change
@@ -66,6 +67,22 @@ prepares requests and checks answers; no feature calls the provider yet. It is o
   links or markup, and are rendered from the reader's own data. Golden tests pin the exact messages.
 - **Data quality** (`GET /api/app/reporting/data-quality`, a regular report, scoped like the others): per member, the
   blocks, tracked and unmeasured minutes, the largest device clock skew and the blocks with software-generated input.
+- **The request pipeline** (`Application/AiAssist/Pipeline`) runs every AI card the same way: the access checks, the
+  feature's own scope check (refused, never narrowed), the per-minute limit, the data read as the caller, "no data"
+  without a call, the result cache (keyed by the data's hash, the workspace, the reader's scope and when AI assist was
+  turned on; a regenerate skips it at most 3 times a day per feature and subject), the daily, monthly and platform
+  allowances, one request in flight per member, `AI__Concurrency__Global` / `__PerWorkspace` provider calls per
+  instance, and a circuit breaker (5 transient failures within a minute pause the provider for a minute; a rejected
+  key pauses it for 10 minutes and logs a Critical line). The provider call has one deadline
+  (`AI__RequestTimeoutSeconds`, retries included) and up to `AI__RepairAttempts` repair turns; a failure, the deadline
+  or an open breaker gives the feature's deterministic fallback. Every served request writes one ledger row in its own
+  short transaction, refusals write none, and AI-calling methods must not hold a database transaction. Metrics are on
+  the `Dosi.Tracker.AI` meter (`ai.requests`, `ai.tokens`, `ai.latency_ms`, `ai.injection_flags`).
+- **The read layer** (`Application/AiAssist/Read`) is the only way AI reads workspace data: the reporting, activity,
+  team, project and task app services, called as the caller, projected to models without emails, device names, OS
+  versions, input counts, timelines, captures or pay. A caller who does not see the team reads only their own data,
+  and asking about someone else is refused. Window titles and notes are read only when the owner allows them. An
+  architecture test keeps repositories out of it.
 
 At start-up the host logs one line with the provider state (`Disabled`,
 `Configured`, or what is missing). The key is never logged, and it must never be written into a tracked file:
@@ -86,6 +103,9 @@ under `backend/` that carries one.
 | `AI__Pricing__<n>__Model`, `__InputPer1M`, `__CachedInputPer1M`, `__OutputPer1M` | USD per million tokens, for cost estimates and the USD budget | none |
 | `AI__Quotas__Default__*`, `AI__Quotas__Plans__<Plan>__*` | `MonthlyRequests`, `MonthlyTokens`, `UserDailyRequests`, `UserPerMinute`, by plan name (built in: Free, Starter, Business; anything else uses Default: 200 / 800,000 / 20 / 4) | see text |
 | `AI__Disclosure__ProviderDisplayName`, `__ProcessingRegion`, `__RetentionNote`, `__Version` | What owners are shown before they opt in; raise `Version` to ask for consent again | `OpenAI`, none, none, `0` |
+| `AI__RepairAttempts`, `AI__StructuredOutput` | Repair turns after invalid output (0-3); `JsonSchema` (strict) or `JsonObject` for servers without json_schema | `1`, `JsonSchema` |
+| `AI__Concurrency__Global`, `__PerWorkspace` | Provider calls in flight per API instance; a request waits at most 2 s for a slot | `16`, `3` |
+| `AI__Budget__MonthlyTokenLimit`, `__MonthlyUsdLimit` | The platform-wide monthly ceiling (USD only for priced models) | `20000000`, none |
 | `AI__Usage__RetentionDays` | How long usage-ledger rows are kept | `400` |
 
 List the models your key can use locally (`GET https://api.openai.com/v1/models`), never in CI. Prefer a dedicated

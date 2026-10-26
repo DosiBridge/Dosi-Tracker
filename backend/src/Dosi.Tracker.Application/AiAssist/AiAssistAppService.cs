@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 using Dosi.Tracker.AiAssist.Access;
+using Dosi.Tracker.AiAssist.Pipeline;
 using Dosi.Tracker.AiAssist.Provider;
 using Dosi.Tracker.Workspaces;
 using Microsoft.AspNetCore.Authorization;
@@ -71,6 +72,7 @@ public partial class AiAssistAppService : TrackerAppService, IAiAssistAppService
     private readonly IIdentityUserRepository _userRepository;
     private readonly IAiChatClientProvider _provider;
     private readonly IOptions<AiOptions> _options;
+    private readonly AiQuotaPolicy _quotaPolicy;
 
     public AiAssistAppService(
         AiCallerContextFactory callerContextFactory,
@@ -81,7 +83,8 @@ public partial class AiAssistAppService : TrackerAppService, IAiAssistAppService
         WorkspaceMembershipManager memberships,
         IIdentityUserRepository userRepository,
         IAiChatClientProvider provider,
-        IOptions<AiOptions> options)
+        IOptions<AiOptions> options,
+        AiQuotaPolicy quotaPolicy)
     {
         _callerContextFactory = callerContextFactory;
         _accessGuard = accessGuard;
@@ -92,6 +95,7 @@ public partial class AiAssistAppService : TrackerAppService, IAiAssistAppService
         _userRepository = userRepository;
         _provider = provider;
         _options = options;
+        _quotaPolicy = quotaPolicy;
     }
 
     public virtual async Task<AiStatusDto> GetStatusAsync()
@@ -100,7 +104,7 @@ public partial class AiAssistAppService : TrackerAppService, IAiAssistAppService
         var reason = await _accessGuard.FindWorkspaceBlockAsync(caller) ?? _accessGuard.FindRoleBlock(caller);
 
         var now = Clock.Now;
-        var limits = _options.Value.Quotas.For(caller.PlanName);
+        var limits = _quotaPolicy.For(caller.PlanName);
         AiQuotaDto? quota = null;
         if (caller.IsOwner || caller.IsManager)
         {
@@ -191,7 +195,7 @@ public partial class AiAssistAppService : TrackerAppService, IAiAssistAppService
         var caller = await _callerContextFactory.CreateAsync();
         var now = Clock.Now;
         var monthStart = AiUsageRecordQueries.MonthStart(now);
-        var limits = _options.Value.Quotas.For(caller.PlanName);
+        var limits = _quotaPolicy.For(caller.PlanName);
         var today = await _ledger.GetTotalsAsync(caller.WorkspaceId, AiUsageRecordQueries.DayStart(now), caller.UserId);
 
         var summary = new AiUsageSummaryDto

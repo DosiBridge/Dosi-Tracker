@@ -2,6 +2,7 @@ using System;
 using System.Linq;
 using System.Threading.Tasks;
 using Dosi.Tracker.AiAssist;
+using Dosi.Tracker.AiAssist.Pipeline;
 using Dosi.Tracker.AiAssist.Provider;
 using Dosi.Tracker.Permissions;
 using Dosi.Tracker.Workspaces;
@@ -21,28 +22,27 @@ public class PlatformAiAppService : TrackerAppService, IPlatformAiAppService
     /// <summary>How many workspaces the overview lists.</summary>
     public const int TopWorkspaceCount = 10;
 
-    /// <summary>Until AI requests go through a circuit breaker, the provider is always reachable as far as the server
-    /// knows.</summary>
-    public const string ClosedBreakerState = "closed";
-
     private readonly IAiChatClientProvider _provider;
     private readonly IOptions<AiOptions> _options;
     private readonly AiSettingsManager _aiSettings;
     private readonly AiUsageLedger _ledger;
     private readonly IRepository<Workspace, Guid> _workspaceRepository;
+    private readonly AiCircuitBreaker _circuitBreaker;
 
     public PlatformAiAppService(
         IAiChatClientProvider provider,
         IOptions<AiOptions> options,
         AiSettingsManager aiSettings,
         AiUsageLedger ledger,
-        IRepository<Workspace, Guid> workspaceRepository)
+        IRepository<Workspace, Guid> workspaceRepository,
+        AiCircuitBreaker circuitBreaker)
     {
         _provider = provider;
         _options = options;
         _aiSettings = aiSettings;
         _ledger = ledger;
         _workspaceRepository = workspaceRepository;
+        _circuitBreaker = circuitBreaker;
     }
 
     public virtual async Task<PlatformAiOverviewDto> GetOverviewAsync()
@@ -72,7 +72,8 @@ public class PlatformAiAppService : TrackerAppService, IPlatformAiAppService
             DefaultModel = configured ? _provider.Descriptor?.DefaultModel : null,
             ConfigEnabled = options.Enabled,
             RuntimeEnabled = await _aiSettings.IsPlatformEnabledAsync(),
-            BreakerState = ClosedBreakerState,
+            // This instance's breaker: with several API instances, each pauses on its own.
+            BreakerState = _circuitBreaker.StateName,
             MonthStart = monthStart,
             Requests = requests,
             InputTokens = usage.Sum(u => u.InputTokens),

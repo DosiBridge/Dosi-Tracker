@@ -2,6 +2,7 @@ using System;
 using System.Linq;
 using System.Threading.Tasks;
 using Dosi.Tracker.AiAssist.Access;
+using Dosi.Tracker.AiAssist.Pipeline;
 using Dosi.Tracker.AiAssist.Provider;
 using Dosi.Tracker.Platform;
 using Dosi.Tracker.Workspaces;
@@ -46,6 +47,14 @@ public abstract class PlatformAiAppServiceTests<TStartupModule> : AiAssistTestBa
         overview.FallbackRate.ShouldBe(0);
         overview.ErrorRate.ShouldBe(0);
         overview.TopWorkspaces.ShouldBeEmpty();
+    }
+
+    [Fact]
+    public async Task The_Overview_Should_Show_The_Instances_Circuit_Breaker()
+    {
+        GetRequiredService<AiCircuitBreaker>().RecordFailure(AiProviderErrorKind.Auth);
+
+        (await _service.GetOverviewAsync()).BreakerState.ShouldBe("open");
     }
 
     [Fact]

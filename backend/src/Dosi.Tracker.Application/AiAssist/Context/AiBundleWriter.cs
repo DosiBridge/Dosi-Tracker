@@ -158,7 +158,8 @@ public sealed class AiBundleWriter
             _caveats.ToList(),
             _routes.ToList(),
             (JsonArray)_candidates.DeepClone(),
-            new Dictionary<string, AiAlias>(_resolution, StringComparer.Ordinal));
+            new Dictionary<string, AiAlias>(_resolution, StringComparer.Ordinal),
+            InjectionRemovals);
     }
 
     private string AddLabel(string prefix, string? identity, string? raw, int max)

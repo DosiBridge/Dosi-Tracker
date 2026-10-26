@@ -30,6 +30,22 @@ public class AiResultMetaDto
     public string Disclaimer { get; set; } = string.Empty;
 }
 
+/// <summary>The values of <see cref="AiResultMetaDto.Status"/>.</summary>
+public static class AiResultStatuses
+{
+    /// <summary>The model wrote it now.</summary>
+    public const string Generated = "generated";
+
+    /// <summary>The model wrote it earlier for the same data; served from the result cache.</summary>
+    public const string Cached = "cached";
+
+    /// <summary>The server wrote it from the same figures, because the model failed or answered unreliably.</summary>
+    public const string Fallback = "fallback";
+
+    /// <summary>There was nothing to describe; nothing was sent.</summary>
+    public const string NoData = "no-data";
+}
+
 /// <summary>A figure a result used, rendered with real names, for "Show the figures used".</summary>
 public class AiFactRefDto
 {
