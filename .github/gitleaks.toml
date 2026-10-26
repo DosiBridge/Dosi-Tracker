@@ -15,3 +15,17 @@ condition = "AND"
 paths = ['''^backend/test/Dosi\.Tracker\.Domain\.Tests/Security/ProductionSecretsGuardTests\.cs$''']
 regexTarget = "match"
 regexes = ['''Password=s3cr3t-from-env;''']
+
+[[allowlists]]
+description = "privacy_guards.rs: a named canary string proving the CLI refuses a password given on argv and never echoes or logs it. It is test data, not a credential."
+condition = "AND"
+paths = ['''^clients/linux/tests/privacy_guards\.rs$''']
+regexTarget = "match"
+regexes = ['''sentinel-argv-31337''']
+
+[[allowlists]]
+description = "cli_e2e_tests.rs: a named canary string proving a password given on argv is refused before it ever reaches a request or a log. It is test data, not a credential."
+condition = "AND"
+paths = ['''^clients/linux/tests/cli_e2e_tests\.rs$''']
+regexTarget = "match"
+regexes = ['''hunter2-argv-canary''']
