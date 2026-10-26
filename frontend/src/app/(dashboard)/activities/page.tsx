@@ -8,15 +8,16 @@ import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { PageHeader, PageStack } from "@/components/ui/page-header";
 import { SegmentedControl } from "@/components/ui/toolbar";
-import { ActivityDrawer, type ProjectLabel } from "@/components/activities/activity-drawer";
+import { ActivityDrawer, type ActivityErasureControls, type ProjectLabel } from "@/components/activities/activity-drawer";
 import { ActivityFilterBar } from "@/components/activities/activity-filter-bar";
 import type { NoteEditing } from "@/components/activities/note-editor";
 import { ScreenTile, SessionCard, isViewable, type CardMember } from "@/components/activities/session-card";
 import { ScreenshotViewer, type ViewerItem } from "@/components/activities/screenshot-viewer";
 import { useTeamPresence, useVisibleInterval } from "@/components/monitor/use-team-presence";
 import { useSession } from "@/components/session-provider";
+import { toast } from "@/components/toast";
 import { activities as demoActivities, projectById, userById, users } from "@/lib/tenant-data";
-import { ApiError, getPagedApi, updateActivityNote } from "@/hooks/useApi";
+import { ApiError, deleteActivityApi, deleteCaptureApi, getPagedApi, getWorkspaceSettings, updateActivityNote } from "@/hooks/useApi";
 import { useReportingZone } from "@/hooks/use-reporting-zone";
 import { agoLabel, referenceNow } from "@/lib/live-session";
 import {
@@ -53,6 +54,8 @@ import {
 import { reportAccessFor } from "@/lib/report-math";
 import { timeZoneLabel } from "@/lib/time-zone";
 import { scopeActivities } from "@/lib/scope";
+import { blockErasure, erasureErrorText } from "@/lib/erasure";
+import { PERMISSION } from "@/lib/live-identity";
 import type { Activity } from "@/lib/types";
 
 type ViewMode = "sessions" | "screens";
@@ -100,6 +103,18 @@ function appendRows(rows: unknown[], more: unknown[]): unknown[] {
   return [...rows, ...more.filter((r) => !seen.has(rowId(r)))];
 }
 
+const DEMO_NOTE = "Demo workspace — this lasts until you reload.";
+
+/** A deletion the server refused, as the dialog shows it; "already gone" (404) counts as done. */
+async function erase(run: () => Promise<unknown>, fallback: string): Promise<void> {
+  try {
+    await run();
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 404) return;
+    throw new Error(erasureErrorText(err, fallback));
+  }
+}
+
 /** Why a note couldn't be saved, in words. */
 function noteErrorMessage(err: unknown): string {
   if (err instanceof ApiError) {
@@ -124,6 +139,26 @@ function ActivitiesPageInner() {
   const { user, isLive, livePolicies } = useSession();
   // Team managers by the real grant (Tracker.Team.Manage) when live; by role in the demo.
   const canManageTeam = reportAccessFor(user.role, isLive ? livePolicies : null).manageTeam;
+  // Deleting tracked data: the real grant (Tracker.Activities.Delete) when live; owners and managers in the demo.
+  const canDeleteActivities = isLive ? livePolicies?.[PERMISSION.deleteActivities] === true : user.role === "owner" || user.role === "admin";
+  // How long members may delete their own captures (workspace settings, readable by every member; null = the server's default).
+  const [captureWindow, setCaptureWindow] = useState<number | null>(null);
+  useEffect(() => {
+    if (!isLive || canDeleteActivities) return;
+    let alive = true;
+    getWorkspaceSettings()
+      .then((s) => alive && setCaptureWindow(typeof s?.memberCaptureDeleteMinutes === "number" ? s.memberCaptureDeleteMinutes : null))
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, [isLive, canDeleteActivities]);
+  // Deleted on this page: blocks leave the list at once, and so do deleted captures (a screen goes with its thumbnail).
+  const [erased, setErased] = useState<{ blocks: ReadonlySet<string>; captures: ReadonlySet<string>; screensOf: ReadonlySet<string> }>(() => ({
+    blocks: new Set(),
+    captures: new Set(),
+    screensOf: new Set(),
+  }));
   const router = useRouter();
   const searchParams = useSearchParams();
   const [filters, setFilters] = useState<ActivityFilters>(defaultActivityFilters);
@@ -232,10 +267,21 @@ function ActivitiesPageInner() {
 
   // Live: real rows only. A failed load shows an error, never the demo rows.
   const list = useMemo(() => {
-    const rows = isLive ? (liveActivities ?? []) : demoActivities;
-    if (notes.size === 0) return rows;
-    return rows.map((a) => (notes.has(a.id) ? { ...a, description: notes.get(a.id) ?? DEFAULT_SESSION_DESCRIPTION } : a));
-  }, [isLive, liveActivities, notes]);
+    const all = isLive ? (liveActivities ?? []) : demoActivities;
+    const rows = erased.blocks.size ? all.filter((a) => !erased.blocks.has(a.id)) : all;
+    const withCaptures =
+      erased.captures.size || erased.screensOf.size
+        ? rows.map((a) => {
+            if (!a.captures?.length) return a;
+            const captures = a.captures.filter(
+              (c) => !erased.captures.has(c.id) && !(erased.screensOf.has(a.id) && (c.kind === "screen" || c.kind === "thumb")),
+            );
+            return captures.length === a.captures.length ? a : { ...a, captures, hasWebcam: captures.some((c) => c.kind === "webcam") };
+          })
+        : rows;
+    if (notes.size === 0) return withCaptures;
+    return withCaptures.map((a) => (notes.has(a.id) ? { ...a, description: notes.get(a.id) ?? DEFAULT_SESSION_DESCRIPTION } : a));
+  }, [isLive, liveActivities, notes, erased]);
   const liveLoading = isLive && !loaded && liveFailure !== queryKey;
   const liveError = isLive && !loaded && liveFailure === queryKey;
 
@@ -295,6 +341,40 @@ function ActivitiesPageInner() {
       },
     }),
     [clock, isLive, user.id, canManageTeam],
+  );
+
+  // What the viewer may delete of a block, and the deletions themselves (E2E-07).
+  const erasureFor = useCallback(
+    (a: Activity): ActivityErasureControls => ({
+      rights: blockErasure({
+        viewer: { canDeleteActivities, isOwner: user.role === "owner", userId: user.id },
+        blockUserId: a.userId,
+        blockOwnerIsOwner: userById(a.userId)?.role === "owner",
+        uploadedAt: a.uploadedAt ?? null,
+        windowMinutes: captureWindow,
+        now: new Date(clock),
+      }),
+      onDeleteBlock: async (reason) => {
+        if (isLive) await erase(() => deleteActivityApi(a.id, reason), "Couldn't delete the block. Try again.");
+        setErased((e) => ({ ...e, blocks: new Set(e.blocks).add(a.id) }));
+        setSelected(null);
+        toast({
+          tone: isLive ? "success" : "info",
+          title: "Time block deleted",
+          description: isLive ? "It and its captures are gone from every report." : DEMO_NOTE,
+        });
+      },
+      onDeleteCapture: async (capture, reason) => {
+        if (isLive) await erase(() => deleteCaptureApi(capture.id, reason), "Couldn't delete the capture. Try again.");
+        setErased((e) =>
+          capture.kind === "screen"
+            ? { ...e, captures: new Set(e.captures).add(capture.id), screensOf: new Set(e.screensOf).add(a.id) }
+            : { ...e, captures: new Set(e.captures).add(capture.id) },
+        );
+        toast({ tone: "success", title: capture.kind === "webcam" ? "Webcam frame deleted" : "Screenshot deleted" });
+      },
+    }),
+    [canDeleteActivities, user.role, user.id, captureWindow, clock, isLive],
   );
 
   function setViewMode(mode: ViewMode) {
@@ -594,6 +674,7 @@ function ActivitiesPageInner() {
         project={selectedActivity ? resolveProject(selectedActivity.projectId) ?? null : null}
         details={selectedActivity ? detailsOf(selectedActivity) : undefined}
         note={selectedActivity ? noteEditing(selectedActivity) : undefined}
+        erasure={selectedActivity ? erasureFor(selectedActivity) : undefined}
         liveNow={!!selectedActivity && liveIds.has(selectedActivity.id)}
         memberStatus={selectedActivity ? memberOf(selectedActivity).status : undefined}
         timeZone={timeZone}
