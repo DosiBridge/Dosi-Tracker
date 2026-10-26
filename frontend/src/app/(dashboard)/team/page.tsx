@@ -49,7 +49,7 @@ import { DataQualityCard } from "@/components/ai/data-quality-card";
 import { activities, projects, users } from "@/lib/tenant-data";
 import { useSession } from "@/components/session-provider";
 import { countSeats, inviteableRoles, roleLabels } from "@/lib/roles";
-import { fmtLimit, planNameFor, seatLimitFor, usagePct } from "@/lib/saas-data";
+import { billingEnabledFor, fmtLimit, planNameFor, seatLimitFor, usagePct } from "@/lib/saas-data";
 import type { Role, UserStatus } from "@/lib/types";
 import { cn, formatDuration } from "@/lib/utils";
 import {
@@ -567,6 +567,8 @@ export default function TeamPage() {
         }
       />
 
+      {/* Seats are a billing figure: none to show while the deployment doesn't bill. */}
+      {billingEnabledFor(workspace) && (
       <Card variant="quiet" className="p-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
@@ -592,6 +594,7 @@ export default function TeamPage() {
           />
         </div>
       </Card>
+      )}
 
       <ViewTabs value={view} onChange={setView} />
       <div role="tabpanel" id={`team-${view}-panel`} aria-labelledby={`team-${view}-tab`} className="space-y-6">

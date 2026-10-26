@@ -108,6 +108,7 @@ import {
   type SendResetCodeDto,
   type SubscriptionDto,
   type WorkspaceDeviceDto,
+  type PlanDto,
 } from '@/lib/api-contract';
 
 export { isLiveSession };
@@ -1030,3 +1031,9 @@ export const resendInvitationApi = (invitationId: string): Promise<InviteMemberR
 
 /** Owner: email an active member a recovery link (it goes only to their own address). */
 export const sendMemberRecoveryEmailApi = (userId: string): Promise<RecoveryEmailSentDto> => postApi(memberRecoveryEmailRoute(userId), {});
+
+/** Every plan, cheapest first (anonymous: the sign-up form offers them while billing is on). */
+export const getAvailablePlansApi = async (): Promise<PlanDto[]> =>
+  listOf<PlanDto>(await anonymous<unknown>(WORKSPACE_ROUTES.availablePlans))
+    .filter((p) => p && typeof p.id === 'string')
+    .sort((a, b) => Number(a.pricePerUser ?? 0) - Number(b.pricePerUser ?? 0));

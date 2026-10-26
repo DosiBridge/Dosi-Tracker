@@ -1197,6 +1197,8 @@ export const WORKSPACE_ROUTES = {
   mine: "/api/app/workspaces/mine",
   create: "/api/app/workspaces",
   register: "/api/app/workspace/register",
+  /** Anonymous: every plan (sign-up offers them while billing is on). */
+  availablePlans: "/api/app/workspace/available-plans",
 } as const;
 
 export function leaveWorkspaceRoute(workspaceId: string): string {

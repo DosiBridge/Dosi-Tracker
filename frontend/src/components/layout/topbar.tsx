@@ -23,7 +23,7 @@ import { Badge } from "@/components/ui/badge";
 import { useSession } from "@/components/session-provider";
 import { AiLauncher } from "@/components/ai/ai-launcher";
 import { roleLabels } from "@/lib/roles";
-import { planNameFor, statusLabel } from "@/lib/saas-data";
+import { billingEnabledFor, planNameFor, statusLabel } from "@/lib/saas-data";
 import { notifications as seedNotifications } from "@/lib/tenant-data";
 import { type AppNotification, type NotificationType } from "@/lib/reports-data";
 import { mapApiNotifications } from "@/lib/live-dataset";
@@ -160,8 +160,8 @@ export function Topbar({ onMenuClick }: { onMenuClick: () => void }) {
           <Search className="h-4 w-4" />
         </button>
 
-        {/* Plan — quiet text chip, same height as icon tray */}
-        {currentUser.role === "owner" ? (
+        {/* Plan — quiet text chip, same height as icon tray (none while the deployment doesn't bill) */}
+        {!billingEnabledFor(workspace) ? null : currentUser.role === "owner" ? (
           <Link
             href="/billing"
             className={cn(

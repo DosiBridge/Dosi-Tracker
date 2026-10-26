@@ -5,7 +5,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { Radar, Eye, EyeOff, Loader2, ArrowLeft, Building2, KeyRound, ShieldAlert } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Input, Select } from "@/components/ui/input";
+import { Input } from "@/components/ui/input";
 import { ThemeToggle } from "@/components/ui/theme-toggle";
 import { LoginHero } from "@/components/motion/login-hero";
 import { ApiError, loginApi, registerWorkspaceApi } from "@/hooks/useApi";
@@ -24,15 +24,7 @@ import {
   tokenEndpoint,
   type SignInFailure,
 } from "@/lib/sign-in";
-import type { PlanId } from "@/lib/saas-data";
-
-// Backend plan names (seeded by PlanDataSeedContributor).
-const PLAN_NAME: Record<PlanId, string> = {
-  free: "Free",
-  starter: "Starter",
-  business: "Business",
-  enterprise: "Business",
-};
+import { SignupPlanPicker } from "@/components/auth/signup-plan-picker";
 
 /** Where "Forgot password?" leads (FE-09). */
 const RECOVERY_PAGE = "/forgot-password";
@@ -67,7 +59,8 @@ export default function LoginPage() {
   const [show, setShow] = useState(false);
   const [loading, setLoading] = useState<string | null>(null);
   const [wsName, setWsName] = useState("");
-  const [wsPlan, setWsPlan] = useState<PlanId>("free");
+  /** The server's plan id the new workspace starts on; null: none chosen (billing off, or the server's default). */
+  const [wsPlan, setWsPlan] = useState<string | null>(null);
   const [failure, setFailure] = useState<SignInFailure | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [infoMsg, setInfoMsg] = useState<string | null>(null);
@@ -249,7 +242,7 @@ export default function LoginPage() {
         surname: surname.trim() || undefined,
         email: email.trim(),
         password,
-        ...(inviteToken ? { inviteToken } : { workspaceName: wsName.trim(), planName: PLAN_NAME[wsPlan] }),
+        ...(inviteToken ? { inviteToken } : { workspaceName: wsName.trim(), ...(wsPlan ? { planId: wsPlan } : {}) }),
       });
       workspaceId = result?.workspaceId || undefined;
     } catch (err) {
@@ -424,14 +417,7 @@ export default function LoginPage() {
                       <label htmlFor="signup-workspace-name" className="text-sm font-medium">Workspace name</label>
                       <Input id="signup-workspace-name" value={wsName} onChange={(e) => setWsName(e.target.value)} placeholder="Acme Corp" autoComplete="organization" required />
                     </div>
-                    <div className="space-y-1.5">
-                      <label htmlFor="signup-plan" className="text-sm font-medium">Choose a plan</label>
-                      <Select id="signup-plan" value={wsPlan} onChange={(e) => setWsPlan(e.target.value as PlanId)}>
-                        <option value="free">Free — $0 · up to 3 seats</option>
-                        <option value="starter">Starter — $6/user/mo · 14-day trial</option>
-                        <option value="business">Business — $12/user/mo · 14-day trial</option>
-                      </Select>
-                    </div>
+                    <SignupPlanPicker onChange={setWsPlan} />
                   </>
                 )}
                 {errorText && <ErrorNote id={errorId}>{errorText}</ErrorNote>}

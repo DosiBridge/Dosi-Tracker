@@ -191,8 +191,14 @@ describe("buildLiveWorkspace", () => {
   it("reports an unknown plan honestly instead of borrowing the demo table", () => {
     const ws = buildLiveWorkspace(config({ tenantName: "  " }), null, null, NOW);
     expect(ws).toMatchObject({ name: "Workspace", slug: "workspace", planId: "enterprise", status: "active" });
-    expect(ws.live).toEqual({ known: false, planName: null, pricePerUser: null, seatLimit: null, trialEndsAt: null });
-    expect(buildLiveWorkspace(config(), { planId: "missing" }, plans, NOW).live?.known).toBe(false);
+    expect(ws.live).toEqual({ known: false, planId: null, planName: null, pricePerUser: null, seatLimit: null, trialEndsAt: null });
+    expect(buildLiveWorkspace(config(), { planId: "missing" }, plans, NOW).live).toMatchObject({ known: false, planId: "missing" });
+  });
+
+  it("carries the deployment's billing mode only when the server said it", () => {
+    expect(buildLiveWorkspace(config(), null, null, NOW, undefined, { enabled: false }).live?.billingEnabled).toBe(false);
+    expect(buildLiveWorkspace(config(), null, null, NOW, undefined, { enabled: true }).live?.billingEnabled).toBe(true);
+    expect(buildLiveWorkspace(config(), null, null, NOW).live).not.toHaveProperty("billingEnabled");
   });
 
   it("names the host's pseudo-workspace 'Platform'", () => {

@@ -279,7 +279,7 @@ describe("login page — create-workspace mode", () => {
 
     await user.type(screen.getByPlaceholderText("Acme Corp"), "Acme Corp");
     expect(submit).toBeDisabled(); // email + password still missing
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(fetchMock.mock.calls.some(([u]) => String(u).includes("/api/app/workspace/register"))).toBe(false);
   });
 
   it("does not invent a subdomain or ask people to remember the workspace name", async () => {
@@ -310,7 +310,9 @@ describe("login page — create-workspace mode", () => {
     fetchMock.mockImplementation(async (input, init) =>
       String(input).includes("/api/app/workspace/register")
         ? jsonResponse({ workspaceId: ACME, workspaceName: "Acme Corp", userName: "founder" })
-        : base(input, init),
+        : String(input).includes("/api/app/workspace/available-plans")
+          ? jsonResponse({ items: [{ id: "plan-s", name: "Starter", pricePerUser: 6, maxSeats: 10, trialDays: 14 }, { id: "plan-f", name: "Free", pricePerUser: 0, maxSeats: 3, trialDays: 0 }] })
+          : base(input, init),
     );
     const user = userEvent.setup();
     renderWithProviders(<LoginPage />, { route: "/login" });
@@ -324,18 +326,36 @@ describe("login page — create-workspace mode", () => {
     await user.click(screen.getByRole("button", { name: /^create workspace$/i }));
 
     await waitFor(() => expect(__router.push).toHaveBeenCalledWith("/dashboard"), { timeout: 2000 });
-    const [regUrl, regInit] = fetchMock.mock.calls[0];
-    expect(String(regUrl)).toBe(`${API_BASE}/api/app/workspace/register`);
+    const regIndex = fetchMock.mock.calls.findIndex(([u]) => String(u) === `${API_BASE}/api/app/workspace/register`);
+    const [, regInit] = fetchMock.mock.calls[regIndex];
+    // The plan is the server's own (cheapest first), sent by id: no prices or trials the server doesn't offer (FE-12).
     expect(JSON.parse(String(regInit?.body))).toEqual({
       firstName: "Fara",
       surname: "Haque",
       email: "founder@acme.dev",
       password: "hunter22",
       workspaceName: "Acme Corp",
-      planName: "Free",
+      planId: "plan-f",
     });
-    expect(String(fetchMock.mock.calls[1][0])).toBe(`${API_BASE}/connect/token`);
+    expect(String(fetchMock.mock.calls[regIndex + 1][0])).toBe(`${API_BASE}/connect/token`);
     expect(localStorage.getItem("dosi-workspace")).toBe(ACME);
+  });
+
+  it("offers the server's plans as the server describes them (FE-12)", async () => {
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.includes("/api/app/workspace/available-plans")) {
+        return jsonResponse([{ id: "plan-f", name: "Free", pricePerUser: 0, maxSeats: 5 }, { id: "plan-b", name: "Team", pricePerUser: 9, trialDays: 30 }]);
+      }
+      return jsonResponse({});
+    });
+    const user = userEvent.setup();
+    const first = renderWithProviders(<LoginPage />, { route: "/login" });
+    await user.click(screen.getByRole("button", { name: /create a workspace/i }));
+    const picker = await screen.findByLabelText("Choose a plan");
+    expect([...picker.querySelectorAll("option")].map((o) => o.textContent)).toEqual(["Free — $0 · up to 5 seats", "Team — $9/user/mo · 30-day trial"]);
+    expect(screen.queryByText(/\$12/)).not.toBeInTheDocument();
+    first.unmount();
   });
 
   it("an email that already has an account says to sign in and create the workspace from the sidebar", async () => {

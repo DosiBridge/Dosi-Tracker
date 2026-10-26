@@ -136,8 +136,9 @@ interface SessionContextValue {
    * mode / when the backend couldn't be reached. `silent` keeps the current
    * screen up while reloading (after editing data, or the periodic refresh):
    * it re-reads the roster, projects and totals but only the newest rows.
+   * `freshPlan` also re-reads the subscription (after a plan change).
    */
-  refreshSession: (options?: { silent?: boolean }) => Promise<User | null>;
+  refreshSession: (options?: { silent?: boolean; freshPlan?: boolean }) => Promise<User | null>;
   /** Whether the session can still renew itself, or must be signed in again soon / now. */
   expiry: SessionExpiry;
   /** Who a re-authentication signs in as (null outside a live session). */
@@ -400,12 +401,12 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
    * load merges into the previous one (see loadLiveSession's pulse).
    */
   const runLoad = useCallback(
-    async (seq: number, silent: boolean): Promise<User | null> => {
+    async (seq: number, silent: boolean, freshPlan = false): Promise<User | null> => {
       const previous = silent ? lastLoad.current : null;
       const token = readStorage(TOKEN_STORAGE_KEY);
       const now = new Date();
       try {
-        const data = await loadLiveSession(getApi, now, { getPage: getPagedApi, previous, workspaceId: currentWorkspaceId() });
+        const data = await loadLiveSession(getApi, now, { getPage: getPagedApi, previous, workspaceId: currentWorkspaceId(), freshPlan });
         if (seq !== loadSeq.current) return null;
         // Another account signed in from another tab: start over rather than mix two sessions.
         if (lastLoad.current && !isSameIdentity(lastLoad.current.identity, data.identity)) {
@@ -470,7 +471,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
    * any time: after a client-side sign-in, on Retry, and as a silent refresh.
    */
   const refreshSession = useCallback(
-    async (options?: { silent?: boolean }): Promise<User | null> => {
+    async (options?: { silent?: boolean; freshPlan?: boolean }): Promise<User | null> => {
       const seq = ++loadSeq.current;
       const silent = options?.silent === true;
       if (!isLiveSession()) {
@@ -494,7 +495,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
         setLiveWarning(null);
         installEmptyLiveDataset(LIVE_PENDING_WORKSPACE_ID);
       }
-      return runLoad(seq, silent);
+      return runLoad(seq, silent, options?.freshPlan === true);
     },
     [clearLiveState, endSession, runLoad, demoFailed],
   );

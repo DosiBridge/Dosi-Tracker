@@ -43,7 +43,8 @@ let openAssistant: ReturnType<typeof vi.fn<(options?: AiAssistantOpenOptions) =>
 
 function as(role: Role, status: AiStatusDto | null = demoAiStatus(role)) {
   openAssistant = vi.fn<(options?: AiAssistantOpenOptions) => void>();
-  session.current = { user: { ...me, role }, isLive: true, status: "ready" };
+  // A billed workspace (the checklist links its plan for owners).
+  session.current = { user: { ...me, role }, isLive: true, status: "ready", workspace: { id: "live-tenant-x", live: { billingEnabled: true } } };
   ai.value = aiContext({ role, status, openAssistant });
 }
 
