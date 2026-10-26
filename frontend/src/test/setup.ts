@@ -3,11 +3,18 @@
 // DOM state into one another.
 import "@testing-library/jest-dom/vitest";
 import { afterEach, expect } from "vitest";
-import { cleanup } from "@testing-library/react";
+import { cleanup, configure } from "@testing-library/react";
 import { toHaveNoViolations } from "jest-axe";
 import { installDemoTenants } from "@/lib/demo-tenants";
 
 expect.extend(toHaveNoViolations);
+
+// The default 1000ms findBy*/waitFor timeout is tuned for an idle machine. On this
+// shared dev box, several unrelated build/test processes from other lanes often run
+// at once, and a handful of AI-card tests (e.g. ai-monitor-live, ai-timesheet) that
+// wait for an async render have been seen to exceed 1000ms purely from CPU contention
+// — they pass reliably alone. Raise the budget instead of chasing a phantom render bug.
+configure({ asyncUtilTimeout: 3000 });
 
 // The app loads the demo tenants on demand (a dynamic import, demo mode only);
 // tests render demo pages synchronously, so they are installed up front.
