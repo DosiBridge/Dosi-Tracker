@@ -144,7 +144,7 @@ describe("live", () => {
     expect(screen.queryByRole("link", { name: /Check the desktop agent|Open/ })).toBeNull();
   });
 
-  it("says when nothing looks unusual, and when nothing was tracked", async () => {
+  it("says nothing looks unusual for an empty review, and for the server's no-data answer (no candidates)", async () => {
     const user = userEvent.setup();
     vi.mocked(requestAiFeature).mockResolvedValueOnce({ ...dataQualityResult(), items: [], candidateCount: 0 });
     const first = render(<Review />);
@@ -154,7 +154,9 @@ describe("live", () => {
     vi.mocked(requestAiFeature).mockResolvedValueOnce(dataQualityResult("no-data"));
     const { container } = render(<Review from="2026-07-06T00:00:00.000Z" />);
     await generate(user);
-    expect(await within(await card()).findAllByText(AI_COPY.noData)).not.toHaveLength(0);
+    // Zero candidates come back as no-data, so it must not claim nothing was tracked.
+    expect(await within(await card()).findAllByText("Nothing in this period's tracking looks unusual.")).not.toHaveLength(0);
+    expect(within(await card()).queryByText(AI_COPY.noData)).toBeNull();
     expect(await axe(container)).toHaveNoViolations(); // a11y: ai card no-data has no violations
   });
 

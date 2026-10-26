@@ -393,6 +393,67 @@ describe("with the real request hook in demo mode", () => {
   });
 });
 
+describe("keyboard focus across the steps", () => {
+  it("keeps focus on the card's own button as Generate turns into Cancel, then Regenerate", async () => {
+    const user = userEvent.setup();
+    const req = request({ phase: "idle" });
+    const { rerender } = render(<Card req={req} />);
+    screen.getByRole("button", { name: "Generate" }).focus();
+    await user.keyboard("{Enter}");
+    expect(req.run).toHaveBeenCalledWith(false);
+
+    rerender(<Card req={{ ...req, state: { phase: "loading" } }} />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Cancel" })).toHaveFocus());
+
+    rerender(<Card req={{ ...req, state: { phase: "ready", result: summary(), reused: false } }} />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Regenerate" })).toHaveFocus());
+    expect(screen.getByRole("status")).toHaveTextContent("Summary ready");
+    // (Opening "Show the figures used" from the keyboard is a browser behaviour: e2e/ai-assist.spec.ts.)
+  });
+
+  it("keeps focus on Retry after a failed attempt, and on the card when no button is left", async () => {
+    const req = request({ phase: "loading" });
+    const { rerender } = render(<Card req={req} />);
+    screen.getByRole("button", { name: "Cancel" }).focus();
+    const error = (retryable: boolean) => ({ phase: "error" as const, error: { kind: "unknown" as const, message: "It failed.", retryAfterSeconds: null, resetsAt: null, retryable } });
+
+    rerender(<Card req={{ ...req, state: error(true) }} />);
+    await waitFor(() => expect(within(screen.getByRole("alert")).getByRole("button", { name: "Retry" })).toHaveFocus());
+
+    rerender(<Card req={{ ...req, state: { phase: "loading" } }} />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Cancel" })).toHaveFocus());
+    rerender(<Card req={{ ...req, state: { phase: "ready", result: summary("no-data"), reused: false } }} />);
+    await waitFor(() => expect(screen.getByRole("region", { name: "This week at a glance" })).toHaveFocus());
+  });
+
+  it("never takes focus from elsewhere when a result arrives", async () => {
+    const user = userEvent.setup();
+    const req = request({ phase: "idle" });
+    const { rerender } = render(
+      <>
+        <Card req={req} />
+        <button type="button">Elsewhere</button>
+      </>,
+    );
+    await user.click(screen.getByRole("button", { name: "Generate" }));
+    rerender(
+      <>
+        <Card req={{ ...req, state: { phase: "loading" } }} />
+        <button type="button">Elsewhere</button>
+      </>,
+    );
+    await user.click(screen.getByRole("button", { name: "Elsewhere" }));
+    rerender(
+      <>
+        <Card req={{ ...req, state: { phase: "ready", result: summary(), reused: false } }} />
+        <button type="button">Elsewhere</button>
+      </>,
+    );
+    await act(() => new Promise((r) => setTimeout(r, 0)));
+    expect(screen.getByRole("button", { name: "Elsewhere" })).toHaveFocus();
+  });
+});
+
 describe("AiUnavailableNote", () => {
   it("says the server has no AI assist, as a note", async () => {
     const { container } = render(<AiUnavailableNote />);

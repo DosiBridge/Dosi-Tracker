@@ -201,6 +201,8 @@ export function DataQualityBody({ title, purpose, input, availability, timeZone,
       availability={availability}
       className={className}
       readyLabel="Review ready"
+      // A review answers "no-data" whenever no rule found a candidate (spec: zero candidates, no call), tracked time or not.
+      noDataLabel={NOTHING_UNUSUAL}
       renderResult={(r) => <DataQualityResult result={r} />}
       resultText={dataQualityText}
     />

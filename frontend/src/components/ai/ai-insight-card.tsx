@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { RefreshCw, Sparkles, X } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -48,6 +48,45 @@ function Skeleton() {
 }
 
 /**
+ * Keeps focus inside the card when the control holding it is replaced.
+ * `inside` follows focus within the card: it stays set when focus left only
+ * because its element was removed (the browser then leaves it on <body>,
+ * whether or not it fires blur), and clears when the person moved focus
+ * elsewhere. After each change of `step`, a card that held focus and lost it
+ * puts it on `primary` (the step's own button), else on `fallback`. Focus is
+ * never taken from anywhere else, so a result arriving steals nothing.
+ */
+function useKeepFocus(step: string) {
+  const inside = useRef(false);
+  const primary = useRef<HTMLButtonElement>(null);
+  const fallback = useRef<HTMLElement>(null);
+  useEffect(() => {
+    if (!inside.current) return;
+    const active = document.activeElement;
+    if (active && active !== document.body) return;
+    (primary.current ?? fallback.current)?.focus();
+  }, [step]);
+  const lost = () => !document.activeElement || document.activeElement === document.body;
+  return {
+    primary,
+    fallback,
+    onFocus: () => {
+      inside.current = true;
+    },
+    onBlur: (e: React.FocusEvent) => {
+      const card = e.currentTarget;
+      const left = e.target;
+      if (e.relatedTarget instanceof Node && card.contains(e.relatedTarget)) return;
+      // Decided once the update settles: a removed element "left" without the person moving on.
+      setTimeout(() => {
+        if (!left.isConnected && lost()) return;
+        if (!card.contains(document.activeElement)) inside.current = false;
+      }, 0);
+    },
+  };
+}
+
+/**
  * The shell every AI insight shares (AI assist spec §18.3/§18.4): a section
  * with a real heading and a visible badge ("AI"; "Basic summary" for the
  * fallback; "Sample" in the demo; none when nothing was tracked), and the
@@ -59,6 +98,11 @@ function Skeleton() {
  *    stays where it was;
  *  - error: an alert, with Retry when trying again can help.
  * Nothing generates until the person presses Generate.
+ *
+ * Each step swaps the button that was pressed for the next one (Generate,
+ * then Cancel, then Regenerate or Retry), so a keyboard user's focus would
+ * fall back to the top of the page. It is kept on the card instead (see
+ * useKeepFocus): on the step's own button, or on the card itself.
  */
 export function AiInsightCard<T extends { meta: AiResultMetaDto }>({
   title,
@@ -76,6 +120,7 @@ export function AiInsightCard<T extends { meta: AiResultMetaDto }>({
   const timeZone = useBrowserTimeZone();
   const { state, run, cancel } = request;
   const loading = state.phase === "loading";
+  const { primary, fallback, onFocus, onBlur } = useKeepFocus(state.phase);
 
   // "Still working" belongs to one run: a new run starts its own 10 s.
   const [runs, setRuns] = useState(0);
@@ -103,7 +148,14 @@ export function AiInsightCard<T extends { meta: AiResultMetaDto }>({
 
   return (
     <Card className={className}>
-      <section aria-labelledby={headingId}>
+      <section
+        ref={fallback}
+        tabIndex={-1}
+        aria-labelledby={headingId}
+        onFocus={onFocus}
+        onBlur={onBlur}
+        className="rounded-[inherit] outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
         <CardHeader>
           <div className="flex min-w-0 items-center gap-2">
             <Sparkles aria-hidden className="h-4 w-4 shrink-0 text-primary" />
@@ -112,18 +164,18 @@ export function AiInsightCard<T extends { meta: AiResultMetaDto }>({
           </div>
           <div className="flex items-center gap-2">
             {state.phase === "idle" && (
-              <Button type="button" size="sm" onClick={() => start(false)}>
+              <Button ref={primary} type="button" size="sm" onClick={() => start(false)}>
                 {AI_COPY.generate}
               </Button>
             )}
             {loading && (
-              <Button type="button" size="sm" variant="outline" onClick={cancel}>
+              <Button ref={primary} type="button" size="sm" variant="outline" onClick={cancel}>
                 <X aria-hidden className="h-3.5 w-3.5" />
                 {AI_COPY.cancel}
               </Button>
             )}
             {result && !noData && (
-              <Button type="button" size="sm" variant="outline" onClick={() => start(true)}>
+              <Button ref={primary} type="button" size="sm" variant="outline" onClick={() => start(true)}>
                 <RefreshCw aria-hidden className="h-3.5 w-3.5" />
                 {AI_COPY.regenerate}
               </Button>
@@ -146,7 +198,7 @@ export function AiInsightCard<T extends { meta: AiResultMetaDto }>({
             <div role="alert" className="flex flex-wrap items-center justify-between gap-2 rounded-xl bg-danger/10 px-3 py-2 text-sm text-danger-on-tint">
               <span>{state.error.message}</span>
               {state.error.retryable && (
-                <Button type="button" size="sm" variant="outline" onClick={() => start(false)}>
+                <Button ref={primary} type="button" size="sm" variant="outline" onClick={() => start(false)}>
                   {AI_COPY.retry}
                 </Button>
               )}
