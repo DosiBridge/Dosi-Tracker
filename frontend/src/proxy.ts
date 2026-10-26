@@ -83,6 +83,9 @@ export function proxy(request: NextRequest) {
 }
 
 export const config = {
-  // Everything except static assets, Next internals and the health probe is gated.
-  matcher: ["/((?!_next/static|_next/image|healthz$|favicon\\.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp|ico)$).*)"],
+  // Everything except Next's build output, the app icon, the files in public/ (by exact name) and
+  // the health probe is gated. Never skip by file extension: every dynamic route accepts a segment
+  // like `abc.png`, and that page would render with no Content-Security-Policy and no sign-in
+  // check. A file added to public/ must be listed here (proxy.test.ts fails until it is).
+  matcher: ["/((?!_next/static/|_next/image$|healthz$|favicon\\.ico$|(?:file|globe|next|vercel|window)\\.svg$).*)"],
 };

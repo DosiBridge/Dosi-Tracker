@@ -1,5 +1,7 @@
 // @vitest-environment node
 // The route gate runs on the server (Next's proxy, on the Node.js runtime), so we exercise it in a node environment.
+import { readdirSync } from "node:fs";
+import { join, relative, sep } from "node:path";
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { config, proxy } from "./proxy";
 import type { NextRequest } from "next/server";
@@ -159,11 +161,44 @@ describe("proxy security headers", () => {
 describe("proxy matcher", () => {
   const matcher = new RegExp(`^${config.matcher[0]}$`);
 
-  it("runs on pages, not on static assets, Next internals or the health probe", () => {
+  it("runs on pages, not on Next's build output, the app icon or the health probe", () => {
     for (const path of ["/", "/dashboard", "/login", "/install/linux", "/invite/abc", "/healthz/extra"]) {
       expect(matcher.test(path), path).toBe(true);
     }
-    for (const path of ["/_next/static/chunks/a.js", "/_next/image", "/favicon.ico", "/logo.svg", "/healthz"]) {
+    for (const path of ["/_next/static/chunks/a.js", "/_next/static/media/font.woff2", "/_next/image", "/favicon.ico", "/healthz"]) {
+      expect(matcher.test(path), path).toBe(false);
+    }
+  });
+
+  it("runs on a page whatever its URL ends in: a segment like abc.png must not skip the CSP and the sign-in check", () => {
+    const pages = [
+      "/projects/abc.png",
+      "/projects/x.svg",
+      "/invite/x.png",
+      "/invite/x.ico",
+      "/reports/a.svg",
+      "/reports/a.webp",
+      "/projects/a.jpeg",
+      "/abc.png", // a top-level name that isn't a public/ file renders the not-found page
+      "/next.svg/x",
+      "/projects/next.svg",
+      "/favicon.ico/x",
+      "/favicon.icox",
+      "/_next/staticx",
+      "/_next/imagex",
+    ];
+    for (const path of pages) {
+      expect(matcher.test(path), path).toBe(true);
+    }
+  });
+
+  it("skips exactly the files in public/, so none of them is sent to /login (list each one in the matcher)", () => {
+    const publicDir = join(process.cwd(), "public");
+    const files = readdirSync(publicDir, { recursive: true, withFileTypes: true })
+      .filter((entry) => entry.isFile())
+      .map((entry) => "/" + relative(publicDir, join(entry.parentPath, entry.name)).split(sep).join("/"));
+    expect(files.length).toBeGreaterThan(0);
+    for (const path of files) {
       expect(matcher.test(path), path).toBe(false);
     }
   });

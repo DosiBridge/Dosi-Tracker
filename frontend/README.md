@@ -76,7 +76,10 @@ and show this deployment's server address in every command.
 - **Content-Security-Policy** per request from [`src/proxy.ts`](src/proxy.ts):
   a fresh nonce for scripts (`'strict-dynamic'`), `connect-src` limited to the
   site and the configured API origin, `frame-ancestors 'none'`. Every page is
-  therefore rendered on demand.
+  therefore rendered on demand. The proxy skips only Next's build output, the
+  app icon, the health probe and the files in `public/` by exact name (never
+  by extension: `/projects/abc.png` is a page). Anything it skips keeps a
+  baseline policy from `next.config.ts` under which no script runs.
 - Static headers for every route in [`next.config.ts`](next.config.ts):
   `X-Content-Type-Options`, `Referrer-Policy`, `Permissions-Policy`,
   `X-Frame-Options`, `Cross-Origin-Opener-Policy`, HSTS (outside `next dev`);

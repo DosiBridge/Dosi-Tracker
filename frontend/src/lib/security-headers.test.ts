@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { HSTS_HEADER, STATIC_SECURITY_HEADERS, contentSecurityPolicy, createNonce } from "./security-headers";
+import { BASELINE_CSP_HEADER, HSTS_HEADER, STATIC_SECURITY_HEADERS, contentSecurityPolicy, createNonce } from "./security-headers";
 
 const directives = (csp: string) => new Map(csp.split("; ").map((d) => [d.split(" ")[0], d.split(" ").slice(1)]));
 
@@ -62,5 +62,16 @@ describe("static security headers", () => {
     expect(byKey.get("Cross-Origin-Opener-Policy")).toBe("same-origin");
     expect(byKey.get("Permissions-Policy")).toMatch(/camera=\(\).*microphone=\(\).*geolocation=\(\)/);
     expect(HSTS_HEADER.value).toMatch(/^max-age=\d{8,}; includeSubDomains$/);
+  });
+
+  it("include a baseline CSP under which nothing runs, loads or frames, for whatever the proxy skips", () => {
+    expect(BASELINE_CSP_HEADER.key).toBe("Content-Security-Policy");
+    const csp = directives(BASELINE_CSP_HEADER.value);
+    expect(csp.get("default-src")).toEqual(["'none'"]);
+    expect(csp.get("script-src")).toEqual(["'none'"]);
+    expect(csp.get("object-src")).toEqual(["'none'"]);
+    expect(csp.get("base-uri")).toEqual(["'none'"]);
+    expect(csp.get("form-action")).toEqual(["'none'"]);
+    expect(csp.get("frame-ancestors")).toEqual(["'none'"]);
   });
 });

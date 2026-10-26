@@ -17,6 +17,11 @@
  *
  * The static headers (nosniff, referrer and permissions policy, frame
  * denial, HSTS) are set for every route, assets included, in next.config.ts.
+ * So is BASELINE_CSP, a policy that lets no script run at all: the proxy's
+ * header replaces it on every response the proxy handles, so it only stays
+ * on responses the proxy skipped (build output, the icon, public/ files, the
+ * health probe) and makes any page that ever slips past the proxy inert
+ * instead of unprotected.
  * ========================================================================== */
 
 export interface CspOptions {
@@ -76,6 +81,17 @@ export const STATIC_SECURITY_HEADERS: ReadonlyArray<{ key: string; value: string
     value: "camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=(), hid=(), bluetooth=()",
   },
 ];
+
+/**
+ * The Content-Security-Policy of every response the proxy did not handle
+ * (next.config.ts): nothing may run, load or frame it. Subresources ignore a
+ * policy on their own response, so the scripts, styles and fonts under
+ * /_next/static/ load as before; a document served with it is inert.
+ */
+export const BASELINE_CSP_HEADER = {
+  key: "Content-Security-Policy",
+  value: "default-src 'none'; script-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+} as const;
 
 /**
  * HSTS for production servers (next.config.ts adds it outside `next dev`, so a

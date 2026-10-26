@@ -1,5 +1,5 @@
 import type { NextConfig } from "next";
-import { HSTS_HEADER, STATIC_SECURITY_HEADERS } from "./src/lib/security-headers";
+import { BASELINE_CSP_HEADER, HSTS_HEADER, STATIC_SECURITY_HEADERS } from "./src/lib/security-headers";
 
 const dev = process.env.NODE_ENV === "development";
 
@@ -24,11 +24,13 @@ const nextConfig: NextConfig = {
     turbopackChunking: { minChunkSize: 6000 },
   },
   async headers() {
-    // The Content-Security-Policy is per request (nonce, runtime API origin) and set by src/proxy.ts.
+    // A page's Content-Security-Policy is per request (nonce, runtime API origin) and set by
+    // src/proxy.ts, replacing the baseline one here; the baseline (no scripts at all) stays on
+    // whatever the proxy skips, so a page that ever slips past it is inert, not unprotected.
     return [
       {
         source: "/:path*",
-        headers: [...STATIC_SECURITY_HEADERS, ...(dev ? [] : [HSTS_HEADER])],
+        headers: [...STATIC_SECURITY_HEADERS, BASELINE_CSP_HEADER, ...(dev ? [] : [HSTS_HEADER])],
       },
     ];
   },
