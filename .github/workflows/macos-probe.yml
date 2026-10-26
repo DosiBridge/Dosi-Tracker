@@ -1,0 +1,77 @@
+# TEMPORARY: compiler loop for the macOS lane (no Mac on the dev machine).
+# Builds, tests and bundles clients/macos on both supported toolchains.
+# Remove once the macOS job in ci.yml is green on these runners.
+name: macos-probe
+
+on:
+  push:
+    branches: ['probe/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    name: ${{ matrix.runner }} (${{ matrix.label }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            label: default Xcode 16
+            xcode: ''
+          - runner: macos-14
+            label: Xcode 15.4
+            xcode: /Applications/Xcode_15.4.app
+    defaults:
+      run:
+        working-directory: clients/macos
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        if: matrix.xcode != ''
+        run: sudo xcode-select -s "${{ matrix.xcode }}"
+
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Build
+        run: swift build
+
+      - name: Test
+        run: swift test
+
+      - name: App bundle
+        env:
+          BUILD_NUMBER: '0'
+        run: bash scripts/build-app.sh
+
+      - name: Release outputs
+        run: |
+          set -euo pipefail
+          test -f .build/dist/DosiTracker-macos.zip
+          (cd .build/dist && shasum -a 256 -c SHA256SUMS)
+          plist=".build/dist/Dosi Tracker.app/Contents/Info.plist"
+          if /usr/libexec/PlistBuddy -c 'Print :DosiApiBaseURL' "$plist" 2>/dev/null; then
+            echo "::error::a server address was baked into the bundle"; exit 1
+          fi
+          plan="$(GITHUB_REF=refs/tags/v9.8.7 bash scripts/build-app.sh --plan)"
+          [[ "$plan" == *"version        9.8.7 (build"* ]] || { echo "::error::the tag does not set the version"; exit 1; }
+          if DEVELOPER_ID_P12_BASE64=x bash scripts/build-app.sh --plan; then
+            echo "::error::half-configured signing must fail"; exit 1
+          fi
+          if CODESIGN_IDENTITY='Developer ID Application: X (T)' DOSI_API_BASE_URL=https://localhost:6006 \
+            bash scripts/build-app.sh --plan; then
+            echo "::error::a Developer ID build must refuse a local server"; exit 1
+          fi
+          plutil -lint deploy/DosiTracker-sample.mobileconfig
