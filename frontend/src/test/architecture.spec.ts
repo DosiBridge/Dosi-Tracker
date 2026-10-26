@@ -477,6 +477,8 @@ describe("architecture spec: secret scanning", () => {
       // A backend business error CODE (TrackerDomainErrorCodes): the confirming
       // value given for a sensitive change was wrong. A name, not a value.
       "Tracker:InvalidPassword",
+      // UI copy for that code (lib/erasure): names the field, carries no value.
+      "That isn't your current password.",
       // HTML autocomplete tokens on password FIELDS (sign-in, the session's
       // re-authentication dialog, Settings → Security, the change-at-sign-in
       // step): they tell password managers which saved value goes in the box.

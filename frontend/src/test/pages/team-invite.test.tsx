@@ -244,8 +244,19 @@ function liveBackend(opts: LiveOptions = {}) {
       if (email.endsWith("@known.test")) {
         return json({ added: true, workspaceRole: "member", member: { id: "m-new", projectId: "p-01", userId: "u-new", role: "Worker", hourlyRate: 0 } });
       }
-      return json({ added: false, workspaceRole: "member", invitationId: "inv-new", invitePath: "/invite/tok-new", expiresAt: "2026-10-15T00:00:00Z" });
+      return json({
+        added: false,
+        workspaceRole: "member",
+        invitationId: "inv-new",
+        invitePath: "/invite/tok-new",
+        expiresAt: "2026-10-15T00:00:00Z",
+        emailSent: email.endsWith("@mailed.test"),
+      });
     }
+    if (url === "/api/app/team/inv-1/resend-invitation" && method === "POST") {
+      return json({ added: false, workspaceRole: "member", invitationId: "inv-1", invitePath: "/invite/tok-renewed", expiresAt: "2026-10-30T00:00:00Z", emailSent: false });
+    }
+    if (url.startsWith("/api/app/team/send-password-reset") && method === "POST") return json({ emailSent: true });
     if (url.startsWith("/api/app/team/invitations")) {
       return json({ items: [{ id: "inv-1", email: "pending@realco.test", role: "member", expiresAt: "2026-10-20T00:00:00Z", creationTime: "2026-10-06T00:00:00Z" }] });
     }
@@ -402,7 +413,7 @@ describe("team page — live invite", () => {
     expect(await navigator.clipboard.readText()).toBe(`${window.location.origin}/invite/tok-new`);
   });
 
-  it("someone who already has an account is added at once", async () => {
+  it("only someone already in the workspace is added at once (to the project), never an outside account (E2E-01)", async () => {
     liveBackend();
     const user = userEvent.setup();
     renderAsRole(<TeamPage />, "owner");
@@ -412,7 +423,34 @@ describe("team page — live invite", () => {
     await user.type(within(dialog).getByLabelText(/email addresses/i), "ana@known.test");
     await user.click(within(dialog).getByRole("button", { name: /send invites/i }));
     expect(await within(dialog).findByText("Added")).toBeInTheDocument();
+    expect(within(dialog).getByText(/already a member of this workspace/i)).toBeInTheDocument();
+    expect(within(dialog).queryByText(/already have an account/i)).not.toBeInTheDocument();
     expect(within(dialog).queryByTestId("invite-link")).not.toBeInTheDocument();
+  });
+
+  it("everyone else gets an invitation to accept, and the copy never says whether they have an account", async () => {
+    liveBackend();
+    const user = userEvent.setup();
+    renderAsRole(<TeamPage />, "owner");
+    await screen.findByRole("heading", { name: "Sam Lee" });
+    await user.click(screen.getByRole("button", { name: /invite member/i }));
+    const dialog = screen.getByRole("dialog", { name: "Invite members" });
+    await user.type(within(dialog).getByLabelText(/email addresses/i), "ana@mailed.test, bo@realco.test");
+    await user.click(within(dialog).getByRole("button", { name: /send invites/i }));
+    expect(await within(dialog).findByText(/we emailed them the invitation/i)).toBeInTheDocument();
+    expect(within(dialog).getByText(/this server doesn't send email/i)).toBeInTheDocument();
+    expect(within(dialog).getAllByText(/they join once they accept it/i)).toHaveLength(2);
+    expect(within(dialog).queryByText(/account/i)).not.toBeInTheDocument();
+  });
+
+  it("renews a pending invitation and shows its new link once", async () => {
+    liveBackend();
+    const user = userEvent.setup();
+    renderAsRole(<TeamPage />, "owner");
+    const section = (await screen.findByRole("heading", { name: /pending invitations/i })).closest("section")!;
+    await user.click(within(section).getByRole("button", { name: /resend invitation to pending@realco.test/i }));
+    await waitFor(() => expect(calls("/api/app/team/inv-1/resend-invitation", "POST")).toHaveLength(1));
+    expect(await within(section).findByTestId("invite-link")).toHaveTextContent(`${window.location.origin}/invite/tok-renewed`);
   });
 
   it("lists pending invitations and revokes one after confirming", async () => {
@@ -516,13 +554,30 @@ describe("team page — live member management", () => {
     expect(await screen.findByText("Sam Lee removed from the workspace")).toBeInTheDocument();
   });
 
-  it("the owner changes a member's workspace role; no password reset is offered", async () => {
+  it("the owner can have a member emailed a recovery link, which goes only to the member", async () => {
+    liveBackend();
+    const user = userEvent.setup();
+    renderAsRole(<TeamPage />, "owner", { withToasts: true });
+    const dialog = await openManage(user, "Sam Lee");
+    await user.click(within(dialog).getByRole("button", { name: /email a reset link/i }));
+    await waitFor(() => expect(calls(`/api/app/team/send-password-reset?userId=${SAM}`, "POST")).toHaveLength(1));
+    expect(await screen.findByText(/got a link at their own address/i)).toBeInTheDocument();
+  });
+
+  it("a manager is offered no recovery email for others", async () => {
+    liveBackend({ roles: [] });
+    const user = userEvent.setup();
+    renderAsRole(<TeamPage />, "admin");
+    const dialog = await openManage(user, "Sam Lee");
+    expect(within(dialog).queryByRole("button", { name: /email a reset link/i })).not.toBeInTheDocument();
+  });
+
+  it("the owner changes a member's workspace role", async () => {
     liveBackend();
     const user = userEvent.setup();
     renderAsRole(<TeamPage />, "owner");
 
     const dialog = await openManage(user, "Sam Lee");
-    expect(within(dialog).queryByRole("button", { name: /reset/i })).not.toBeInTheDocument();
     const select = within(dialog).getByLabelText(/workspace role/i);
     expect(within(select).getAllByRole("option").map((o) => o.textContent)).toEqual(["Owner", "Manager", "Member"]);
     await user.selectOptions(select, "manager");

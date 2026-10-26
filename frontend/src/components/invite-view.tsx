@@ -5,7 +5,7 @@ import Link from "next/link";
 import { Loader2, MailCheck, Radar } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { linkButtonClass } from "@/components/dashboard/link-button";
-import { ApiError, acceptInvitationApi, getApi, getInvitationApi, logoutApi } from "@/hooks/useApi";
+import { ApiError, acceptInvitationApi, declineInvitationApi, getApi, getInvitationApi, logoutApi } from "@/hooks/useApi";
 import { isLiveSession, switchToWorkspace } from "@/lib/live-session";
 import { LIVE_ENDPOINTS } from "@/lib/live-loader";
 import type { AppConfiguration } from "@/lib/live-identity";
@@ -24,6 +24,8 @@ const sameEmail = (a: string | null | undefined, b: string | null | undefined) =
 export function InviteView({ token }: { token: string }) {
   const [load, setLoad] = useState<Load>({ state: "loading" });
   const [accepting, setAccepting] = useState(false);
+  const [declining, setDeclining] = useState(false);
+  const [declined, setDeclined] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -73,6 +75,27 @@ export function InviteView({ token }: { token: string }) {
     }
   }
 
+  /** Say no: the invitation is used up, and nobody joins anything. */
+  async function decline() {
+    setDeclining(true);
+    setError(null);
+    try {
+      await declineInvitationApi(token);
+      setDeclined(true);
+    } catch (err) {
+      const code = err instanceof ApiError ? err.code : null;
+      setError(
+        code === "Tracker:InvitationExpired" || code === "Tracker:InvitationNotFound"
+          ? "This invitation is no longer valid, so there is nothing to decline."
+          : code === "Tracker:InvitationEmailMismatch"
+            ? "This invitation was sent to a different email address."
+            : "We couldn't decline the invitation. Try again.",
+      );
+    } finally {
+      setDeclining(false);
+    }
+  }
+
   function signOut() {
     logoutApi();
     // eslint-disable-next-line @next/next/no-location-assign-relative-destination -- reload the invitation signed out: a full navigation drops the previous account's in-memory session
@@ -110,16 +133,29 @@ export function InviteView({ token }: { token: string }) {
               <span className="font-medium text-foreground" data-testid="invite-email">{load.info.email}</span>.
             </p>
 
-            {load.info.expired ? (
+            {declined ? (
+              <div className="mt-6 space-y-3">
+                <p role="status" className="rounded-lg bg-muted px-3 py-2 text-sm text-muted-foreground">
+                  You declined the invitation. You won&apos;t join {load.info.workspaceName}.
+                </p>
+                <Link href="/workspaces" className={`${linkButtonClass("outline", "md")} w-full`}>
+                  Go to your workspaces
+                </Link>
+              </div>
+            ) : load.info.expired ? (
               <p role="alert" className="mt-6 rounded-lg bg-warning/15 px-3 py-2 text-sm text-warning-on-tint">
                 This invitation has expired. Ask the workspace owner for a new one.
               </p>
             ) : load.signedInEmail && sameEmail(load.signedInEmail, load.info.email) ? (
               <div className="mt-6 space-y-3">
-                <Button size="lg" className="w-full" onClick={() => void accept()} disabled={accepting}>
+                <Button size="lg" className="w-full" onClick={() => void accept()} disabled={accepting || declining}>
                   {accepting && <Loader2 className="h-4 w-4 animate-spin motion-reduce:animate-none" aria-hidden="true" />}
                   {accepting ? "Joining…" : "Accept invitation"}
                 </Button>
+                <Button variant="ghost" className="w-full" onClick={() => void decline()} disabled={accepting || declining}>
+                  {declining ? "Declining…" : "Decline"}
+                </Button>
+                <p className="text-xs text-muted-foreground">You join only if you accept.</p>
               </div>
             ) : load.signedInEmail ? (
               <div className="mt-6 space-y-3">

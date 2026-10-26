@@ -145,7 +145,7 @@ describe("workspace chooser", () => {
     const dialog = await screen.findByRole("dialog");
     expect(dialog).toHaveTextContent(/archive acme\?/i);
     expect(dialog).toHaveTextContent(/restore it at any time/i);
-    expect(dialog).toHaveTextContent(/subscription billing is not cancelled/i);
+    expect(dialog).toHaveTextContent(/archived workspaces are not invoiced/i);
 
     await user.click(within(dialog).getByRole("button", { name: /cancel/i }));
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();

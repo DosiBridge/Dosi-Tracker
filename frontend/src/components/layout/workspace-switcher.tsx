@@ -328,7 +328,7 @@ function ArchiveWorkspaceDialog({ open, workspace, onClose }: { open: boolean; w
       onConfirm={() => void archive()}
       busy={busy}
       title={`Archive ${workspace.name}?`}
-      description="This workspace will be archived and hidden from normal switching. You can restore it at any time, and its projects, activities, and settings will be preserved. Subscription billing is not cancelled."
+      description="This workspace will be archived and hidden from normal switching. You can restore it at any time, and its projects, activities, and settings will be preserved. Archived workspaces are not invoiced."
       confirmLabel="Archive workspace"
       tone="danger"
     />

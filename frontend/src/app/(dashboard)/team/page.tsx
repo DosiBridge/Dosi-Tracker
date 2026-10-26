@@ -17,6 +17,7 @@ import {
   Trash2,
   MonitorSmartphone,
   RotateCw,
+  KeyRound,
 } from "lucide-react";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -61,7 +62,9 @@ import {
   inviteMember,
   removeMemberFromWorkspace,
   removeProjectMember,
+  resendInvitationApi,
   revokeInvitation,
+  sendMemberRecoveryEmailApi,
   updateProjectMember,
 } from "@/hooks/useApi";
 import { useReportingZone } from "@/hooks/use-reporting-zone";
@@ -727,6 +730,8 @@ interface InviteOutcome {
   added?: boolean;
   invitePath?: string | null;
   expiresAt?: string | null;
+  /** The server emailed the invitation (absent from older servers: treated as not emailed). */
+  emailSent?: boolean;
   error?: string;
 }
 
@@ -798,7 +803,14 @@ function InviteModal({
           workspaceRole: workspaceRoleFor[role],
           hourlyRate: rate,
         });
-        outcomes.push({ email, ok: true, added: res?.added === true, invitePath: res?.invitePath ?? null, expiresAt: res?.expiresAt ?? null });
+        outcomes.push({
+          email,
+          ok: true,
+          added: res?.added === true,
+          invitePath: res?.invitePath ?? null,
+          expiresAt: res?.expiresAt ?? null,
+          emailSent: res?.emailSent === true,
+        });
       } catch (err) {
         outcomes.push({ email, ok: false, error: membershipErrorText(err, "The invite failed.") });
       }
@@ -835,11 +847,9 @@ function InviteModal({
                 {r.ok ? <Badge tone="success">{r.added ? "Added" : "Invited"}</Badge> : <Badge tone="danger">Failed</Badge>}
               </div>
               {r.ok && r.added && (
-                <p className="mt-1 text-xs text-muted-foreground">
-                  They already have an account and were added to this workspace. It appears in their workspace switcher.
-                </p>
+                <p className="mt-1 text-xs text-muted-foreground">Already a member of this workspace, so they were added to the project now.</p>
               )}
-              {r.ok && !r.added && r.invitePath && <InviteLink path={r.invitePath} expiresAt={r.expiresAt} />}
+              {r.ok && !r.added && r.invitePath && <InviteLink path={r.invitePath} expiresAt={r.expiresAt} emailSent={r.emailSent} />}
               {!r.ok && <p className="mt-1 text-xs text-danger-on-tint">{r.error}</p>}
             </div>
           ))}
@@ -930,13 +940,21 @@ function InviteModal({
   );
 }
 
-/** A copyable invitation link and when it expires. */
-function InviteLink({ path, expiresAt }: { path: string; expiresAt?: string | null }) {
+/**
+ * A copyable invitation link and when it expires. Nobody joins without
+ * accepting it, whether or not they already have an account (the server never
+ * says which), so the copy promises neither.
+ */
+function InviteLink({ path, expiresAt, emailSent }: { path: string; expiresAt?: string | null; emailSent?: boolean }) {
   const url = inviteUrl(path);
   const expiry = formatExpiry(expiresAt);
   return (
     <div className="mt-2 space-y-1.5">
-      <p className="text-xs text-muted-foreground">They don&apos;t have an account yet. Send them this link to join:</p>
+      <p className="text-xs text-muted-foreground">
+        {emailSent
+          ? "We emailed them the invitation. They join once they accept it. You can also share this link:"
+          : "This server doesn't send email, so share this link with them. They join once they accept it:"}
+      </p>
       <div className="flex items-center gap-2">
         <span data-testid="invite-link" className="min-w-0 flex-1 break-all rounded-lg bg-card px-2 py-1.5 font-mono text-xs">
           {url}
@@ -955,6 +973,9 @@ function PendingInvitations() {
   const [failed, setFailed] = useState(false);
   const [revoking, setRevoking] = useState<WorkspaceInvitationDto | null>(null);
   const [busy, setBusy] = useState(false);
+  // A renewed invitation's new link, shown under its row (the token is shown only once).
+  const [renewed, setRenewed] = useState<{ email: string; path: string; expiresAt: string | null; emailSent: boolean } | null>(null);
+  const [resending, setResending] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -984,6 +1005,25 @@ function PendingInvitations() {
     }
   }
 
+  /** A new link and expiry; the old link stops working. */
+  async function resend(inv: WorkspaceInvitationDto) {
+    setResending(inv.id);
+    try {
+      const res = await resendInvitationApi(inv.id);
+      if (res?.invitePath) setRenewed({ email: inv.email, path: res.invitePath, expiresAt: res.expiresAt ?? null, emailSent: res.emailSent === true });
+      toast({
+        tone: "success",
+        title: "Invitation renewed",
+        description: res?.emailSent ? `A new invitation was emailed to ${inv.email}. The old link no longer works.` : "Share the new link with them. The old one no longer works.",
+      });
+      await load();
+    } catch (err) {
+      toast({ tone: "danger", title: "Couldn't renew the invitation", description: membershipErrorText(err, "Try again.") });
+    } finally {
+      setResending(null);
+    }
+  }
+
   if (failed) {
     return (
       <p role="alert" className="text-sm text-muted-foreground">
@@ -1003,12 +1043,21 @@ function PendingInvitations() {
             <span className="min-w-0 flex-1 truncate text-sm font-medium">{inv.email}</span>
             <Badge tone="muted">{workspaceRoleLabel(inv.role)}</Badge>
             {formatExpiry(inv.expiresAt) && <span className="text-xs text-muted-foreground">Expires {formatExpiry(inv.expiresAt)}</span>}
+            <Button size="sm" variant="ghost" onClick={() => void resend(inv)} disabled={resending === inv.id} aria-label={`Resend invitation to ${inv.email}`}>
+              <Send className="h-3.5 w-3.5" /> {resending === inv.id ? "Sending…" : "Resend"}
+            </Button>
             <Button size="sm" variant="ghost" className="text-danger-on-tint" onClick={() => setRevoking(inv)} aria-label={`Revoke invitation for ${inv.email}`}>
               <Trash2 className="h-3.5 w-3.5" /> Revoke
             </Button>
           </li>
         ))}
       </ul>
+      {renewed && (
+        <div className="rounded-xl border border-border/60 bg-muted/40 p-3" role="status">
+          <p className="text-sm font-medium">New link for {renewed.email}</p>
+          <InviteLink path={renewed.path} expiresAt={renewed.expiresAt} emailSent={renewed.emailSent} />
+        </div>
+      )}
       <ConfirmDialog
         open={!!revoking}
         onCancel={() => setRevoking(null)}
@@ -1084,6 +1133,9 @@ function ManageMemberModal({
   const [workspaceRole, setWorkspaceRole] = useState<WorkspaceRole>(initialWorkspaceRole);
   const [roleSaving, setRoleSaving] = useState(false);
   const [roleError, setRoleError] = useState<string | null>(null);
+  const [recovering, setRecovering] = useState(false);
+  // Owners may have another member emailed a recovery link; it goes only to that member's own address.
+  const canSendRecovery = viewer.role === "owner" && viewer.id !== member.id;
 
   const prefillFor = `${projectId}:${prefillKey}`;
   const prefill: Prefill = !live
@@ -1165,6 +1217,26 @@ function ManageMemberModal({
       setError(membershipErrorText(err, "Couldn't remove them from the project."));
     } finally {
       setRemoving(false);
+    }
+  }
+
+  async function sendRecoveryLink() {
+    if (!live) {
+      toast({ title: "Recovery email", description: DEMO_NOTE });
+      return;
+    }
+    setRecovering(true);
+    try {
+      const res = await sendMemberRecoveryEmailApi(member.id);
+      toast(
+        res?.emailSent
+          ? { tone: "success", title: "Recovery email sent", description: `${member.name} got a link at their own address. You never see it.` }
+          : { tone: "info", title: "No email was sent", description: "This server doesn't send email. They can use the sign-in page's recovery once email is set up." },
+      );
+    } catch (err) {
+      toast({ tone: "danger", title: "Couldn't send the recovery email", description: membershipErrorText(err, "Try again.") });
+    } finally {
+      setRecovering(false);
     }
   }
 
@@ -1306,6 +1378,20 @@ function ManageMemberModal({
             <UserPlus className="h-3.5 w-3.5" /> Add to another project
           </Button>
         </div>
+
+        {canSendRecovery && (
+          <section aria-labelledby="manage-recovery-heading" className="flex flex-wrap items-center justify-between gap-3 border-t border-border pt-4">
+            <div className="min-w-0 text-sm">
+              <h3 id="manage-recovery-heading" className="font-semibold">
+                Locked out?
+              </h3>
+              <p className="text-xs text-muted-foreground">Email {member.name} a link to choose a new password. It goes only to their own address.</p>
+            </div>
+            <Button variant="outline" size="sm" onClick={() => void sendRecoveryLink()} disabled={recovering}>
+              <KeyRound aria-hidden className="h-3.5 w-3.5" /> {recovering ? "Sending…" : "Email a reset link"}
+            </Button>
+          </section>
+        )}
 
         {(account.canChangeWorkspaceRole || account.canRemoveFromWorkspace) && (
           <section aria-labelledby="manage-account-heading" className="space-y-3 border-t border-border pt-4">
