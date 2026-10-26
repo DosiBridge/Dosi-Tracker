@@ -1,0 +1,30 @@
+[Desktop Entry]
+Type=Application
+Version=1.4
+Name=Dosi Tracker
+GenericName=Time Tracker
+Comment=Track working time for your team's Dosi Tracker workspace
+Exec=@BINDIR@/dosi-tracker-gui
+TryExec=@BINDIR@/dosi-tracker-gui
+Icon=io.github.dosibridge.DosiTracker
+Terminal=false
+Categories=Office;ProjectManagement;
+Keywords=time;tracking;timesheet;work;hours;dosi;
+StartupNotify=true
+StartupWMClass=io.github.dosibridge.DosiTracker
+# SingleMainWindow (spec 1.5) is unknown to desktop-file-validate 0.26 (Ubuntu 22.04);
+# GNOME Shell reads this older key the same way.
+X-GNOME-SingleWindow=true
+Actions=pause;resume;sync;
+
+[Desktop Action pause]
+Name=Pause tracking
+Exec=@BINDIR@/dosi-tracker pause
+
+[Desktop Action resume]
+Name=Resume tracking
+Exec=@BINDIR@/dosi-tracker resume
+
+[Desktop Action sync]
+Name=Sync now
+Exec=@BINDIR@/dosi-tracker sync

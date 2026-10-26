@@ -4,7 +4,12 @@
 //! - Fakeable traits matching Windows (`AcquisitionProvider`, `ActiveWindowProvider`, `RunningAppsProvider`).
 //! - Complete decoupling of OS queries from lifecycle and consent decision boundaries.
 //! - Truthful error propagation without synthetic fallback.
+//! - Sensor seams: [`IdleSource`], [`ScreenSource`] and the capability state
+//!   [`Availability`] (available, unsupported, denied, needs approval, unavailable).
 
+use chrono::{DateTime, Utc};
+
+pub use super::capture::RawFrame;
 use super::model::WindowInfo;
 use crate::lifecycle::AcquisitionCapability;
 
@@ -25,6 +30,14 @@ pub enum TrackingError {
     IoError(String),
     /// Protocol or property decoding error.
     ProtocolError(String),
+    /// The user (or the desktop on their behalf) refused the request, e.g. a
+    /// screenshot portal dialog answered "deny". Not retried until the user acts.
+    PermissionDenied(String),
+    /// The desktop is waiting for the user to approve the request (e.g. a
+    /// portal dialog nobody answered in time).
+    NeedsApproval(String),
+    /// A captured image could not be decoded or encoded within its limits.
+    EncodeError(String),
 }
 
 impl std::fmt::Display for TrackingError {
@@ -58,11 +71,67 @@ impl std::fmt::Display for TrackingError {
             TrackingError::ProtocolError(reason) => {
                 write!(f, "Protocol error during acquisition: {}", reason)
             }
+            TrackingError::PermissionDenied(reason) => {
+                write!(f, "Permission denied: {}", reason)
+            }
+            TrackingError::NeedsApproval(reason) => {
+                write!(f, "Waiting for the user's approval: {}", reason)
+            }
+            TrackingError::EncodeError(reason) => {
+                write!(f, "Capture encoding failed: {}", reason)
+            }
         }
     }
 }
 
 impl std::error::Error for TrackingError {}
+
+/// Whether a sensor can deliver on this desktop right now — the capability
+/// state shown by status, doctor and the GUI. Never a fabricated "working".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Availability {
+    /// The source works.
+    Available,
+    /// The session or desktop cannot provide it (e.g. no portal, Wayland).
+    Unsupported(String),
+    /// The user refused it; nothing is requested again until they act.
+    Denied,
+    /// The desktop asks the user first and nobody answered yet.
+    NeedsApproval,
+    /// Supported, but failing at the moment (connection lost, I/O error).
+    Unavailable(String),
+}
+
+/// A source of "when did the user last give input" for idle and away
+/// detection. Local only: never uploaded.
+pub trait IdleSource: Send + Sync {
+    /// When the user last gave input, as seen at `now`; `None` when the source
+    /// has no input on record.
+    fn last_input(&self, now: DateTime<Utc>) -> Result<Option<DateTime<Utc>>, TrackingError>;
+    /// Short stable name of the source (`mutter`, `screensaver`, ...) for
+    /// status and doctor.
+    fn kind(&self) -> &'static str;
+}
+
+/// What a screen source should capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CaptureTarget {
+    /// The monitor showing most of the active window (the whole screen when
+    /// that cannot be told).
+    #[default]
+    ActiveMonitor,
+    /// The whole screen.
+    WholeScreen,
+}
+
+/// A source of screen frames (X11 GetImage, the Screenshot portal). Encoding
+/// to JPEG is done afterwards by [`super::capture::encode_frame`].
+pub trait ScreenSource: Send + Sync {
+    /// Capture one frame.
+    fn capture(&self, target: CaptureTarget) -> Result<RawFrame, TrackingError>;
+    /// The source's current state, without capturing.
+    fn availability(&self) -> Availability;
+}
 
 /// Abstract provider for querying the currently active foreground window.
 pub trait ActiveWindowProvider: Send + Sync {

@@ -1,0 +1,71 @@
+{
+  "clientActivityId": "0b9a7c55-2f37-4f40-a7e5-5a8f0f6b2d11",
+  "projectId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "startedAt": "2026-10-05T10:00:00Z",
+  "endedAt": "2026-10-05T10:03:00Z",
+  "description": "Release notes",
+  "productivity": 67,
+  "mouseClicks": 42,
+  "keyboardHits": 310,
+  "activeWindows": [
+    {
+      "appName": "code",
+      "windowTitle": "main.rs - dosi-tracker",
+      "seconds": 140,
+      "keyboardHits": 300,
+      "mouseClicks": 30
+    },
+    {
+      "appName": "firefox",
+      "windowTitle": "Docs",
+      "seconds": 40,
+      "keyboardHits": 10,
+      "mouseClicks": 12
+    }
+  ],
+  "runningPrograms": [
+    { "appName": "code", "windowTitle": "" },
+    { "appName": "firefox", "windowTitle": "" }
+  ],
+  "timeline": [
+    {
+      "minute": 0,
+      "keyboardHits": 200,
+      "mouseClicks": 20,
+      "active": true,
+      "appName": "code",
+      "activeSeconds": 55
+    },
+    {
+      "minute": 1,
+      "keyboardHits": 110,
+      "mouseClicks": 22,
+      "active": true,
+      "appName": "firefox",
+      "activeSeconds": 41
+    },
+    {
+      "minute": 2,
+      "keyboardHits": 0,
+      "mouseClicks": 0,
+      "active": false,
+      "activeSeconds": 0
+    }
+  ],
+  "screenshotPngBase64": "/9j/4AAQSkZJRgABAQ==",
+  "screenshotThumbJpgBase64": "/9j/2wBDAAgGBg==",
+  "platform": "linux",
+  "osVersion": "Ubuntu 24.04.1 LTS (Linux 6.8.0-45-generic)",
+  "agentVersion": "0.1.0",
+  "deviceId": "5b0c1b9e-8f2c-4a43-9a51-0c7f6f2d9b11",
+  "deviceName": "workstation-1",
+  "timeZone": "Asia/Dhaka",
+  "utcOffsetMinutes": 360,
+  "idleSeconds": 60,
+  "endReason": "interval",
+  "sentAt": "2026-10-05T10:03:02Z",
+  "screenshotCapturedAt": "2026-10-05T10:01:30Z",
+  "screenshotBlurred": false,
+  "injectedInputEvents": 4,
+  "payloadSignature": "c2lnbmF0dXJl"
+}

@@ -1,14 +1,24 @@
 //! Secure credential storage and identity management for Dosi-Tracker Linux.
 //!
-//! Provides isolated, account- and workspace-scoped credential persistence adhering to:
-//! - Primary backend: Freedesktop Secret Service (`org.freedesktop.secrets`) over session D-Bus.
-//! - Fallback backend: Owner-only private file store (`0600` file, `0700` directory) with atomic
-//!   rename durability and non-following target symlink refusal.
+//! Provides isolated, account-scoped credential persistence adhering to:
+//! - Primary backend: Freedesktop Secret Service (`org.freedesktop.secrets`) over session D-Bus,
+//!   one item per account (`workspace_id` attribute empty): OpenIddict tokens are user-global
+//!   and refresh tokens rotate, so per-workspace copies would go stale. Older per-workspace
+//!   items (`workspace_id` set) are still readable through the same API.
+//! - Opt-in file backend: Owner-only private file store (`0600` file, `0700` directory) with
+//!   atomic rename durability and non-following target symlink refusal. It never stores a
+//!   password: the password is only ever kept in the Secret Service, and only when
+//!   `remember_password` is on.
 //! - In-memory store: For deterministic testing and fault injection without touching real keyrings.
+//! - Store selection ([`resolve_store`]): `auto` uses the Secret Service when
+//!   `org.freedesktop.secrets` has an owner or is activatable and otherwise fails with
+//!   [`CredentialError::NoSecretService`] — never a silent file fallback.
+//! - A locked collection is reported as [`CredentialError::Locked`]; the unlock prompt is only
+//!   shown on an explicit unlock ([`SecretServiceStore::unlock`]).
 //! - Security invariants:
 //!   - Zero password or token leaks in logs, errors, or Display/Debug formatters.
 //!   - Strict account and workspace scoping: credentials from workspace A never leak to workspace B.
-//!   - No silent downgrade: Using file fallback emits an explicit diagnostic warning in `doctor`.
+//!   - No silent downgrade: Using the file store emits an explicit diagnostic warning in `doctor`.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -21,7 +31,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::MetadataExt;
 
 /// Kind of credential storage backend currently active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,6 +69,11 @@ pub enum CredentialError {
     UnsafeStorage(String),
     /// Injected failure for testing fault resilience.
     Injected(String),
+    /// The keyring collection (or item) is locked; `prompt` is the Secret
+    /// Service prompt object an explicit unlock would show.
+    Locked { prompt: String },
+    /// `credentials.store = "auto"` found no Secret Service on the session bus.
+    NoSecretService(String),
 }
 
 impl fmt::Display for CredentialError {
@@ -75,6 +90,14 @@ impl fmt::Display for CredentialError {
             }
             Self::UnsafeStorage(err) => write!(f, "Unsafe credential storage rejected: {err}"),
             Self::Injected(err) => write!(f, "Injected credential fault: {err}"),
+            Self::Locked { .. } => write!(
+                f,
+                "The keyring is locked and requires interactive unlock prompt: run `dosi-tracker unlock`"
+            ),
+            Self::NoSecretService(hint) => write!(
+                f,
+                "No Secret Service (org.freedesktop.secrets) on the session bus: {hint}"
+            ),
         }
     }
 }
@@ -95,7 +118,7 @@ pub struct Credentials {
     /// Human-readable workspace name for display.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_name: Option<String>,
-    /// Target API server URL (e.g. `https://api.dosi-tracker.com`).
+    /// Target API server URL (e.g. `https://tracker.example.com`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_url: Option<String>,
     /// OpenIddict refresh token.
@@ -146,6 +169,20 @@ impl Credentials {
     pub fn invalidate_access_token(&mut self) {
         self.access_token = None;
         self.access_token_expires_at = None;
+    }
+
+    /// The account-level form these credentials are stored in (one item per
+    /// account): no workspace binding.
+    pub fn account_level(mut self) -> Self {
+        self.workspace_id = None;
+        self.workspace_name = None;
+        self
+    }
+
+    /// The same credentials without the password.
+    pub fn without_password(mut self) -> Self {
+        self.password = None;
+        self
     }
 }
 
@@ -209,6 +246,179 @@ pub trait CredentialStore: Send + Sync {
 
     /// Returns the active backend kind.
     fn kind(&self) -> CredentialStoreKind;
+
+    /// Loads the account-level credentials of `account_id`.
+    fn load_account(&self, account_id: &str) -> Result<Option<Credentials>, CredentialError> {
+        self.load(account_id, None)
+    }
+
+    /// Saves `credentials` as the account-level item (no workspace binding).
+    fn save_account(&self, credentials: &Credentials) -> Result<(), CredentialError> {
+        self.save(&credentials.clone().account_level())
+    }
+
+    /// Clears the account-level credentials of `account_id`.
+    fn clear_account(&self, account_id: &str) -> Result<(), CredentialError> {
+        self.clear(account_id, None)
+    }
+}
+
+/// `credentials.store` in the configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StoreSetting {
+    /// The Secret Service when one is reachable; otherwise an error.
+    #[default]
+    Auto,
+    /// The Secret Service, or an error.
+    SecretService,
+    /// The opt-in 0600 file store (never holds a password).
+    File,
+}
+
+impl StoreSetting {
+    pub fn parse(value: &str) -> Option<StoreSetting> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(StoreSetting::Auto),
+            "secret-service" => Some(StoreSetting::SecretService),
+            "file" => Some(StoreSetting::File),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StoreSetting::Auto => "auto",
+            StoreSetting::SecretService => "secret-service",
+            StoreSetting::File => "file",
+        }
+    }
+}
+
+/// Hint shown with [`CredentialError::NoSecretService`].
+pub const NO_SECRET_SERVICE_HINT: &str = "install and unlock a keyring (GNOME Keyring, KWallet, KeePassXC) or set credentials.store = \"file\" (keeps tokens in a 0600 file, never the password)";
+
+/// Pick the credential store for `setting`. `secret_service_reachable` is
+/// asked only for `auto` (see [`secret_service_available`]); `auto` never
+/// falls back to the file store silently.
+pub fn resolve_store_with(
+    setting: StoreSetting,
+    paths: &crate::paths::LinuxPaths,
+    remember_password: bool,
+    secret_service_reachable: impl FnOnce() -> Result<bool, CredentialError>,
+) -> Result<Box<dyn CredentialStore>, CredentialError> {
+    match setting {
+        StoreSetting::File => Ok(Box::new(FileCredentialStore::new(paths.credentials_file()))),
+        StoreSetting::SecretService => Ok(Box::new(
+            SecretServiceStore::default().with_remember_password(remember_password),
+        )),
+        StoreSetting::Auto => match secret_service_reachable() {
+            Ok(true) => Ok(Box::new(
+                SecretServiceStore::default().with_remember_password(remember_password),
+            )),
+            Ok(false) => Err(CredentialError::NoSecretService(
+                NO_SECRET_SERVICE_HINT.to_string(),
+            )),
+            Err(e) => Err(CredentialError::NoSecretService(format!(
+                "{NO_SECRET_SERVICE_HINT} ({e})"
+            ))),
+        },
+    }
+}
+
+/// [`resolve_store_with`] against the session bus.
+pub fn resolve_store(
+    setting: StoreSetting,
+    paths: &crate::paths::LinuxPaths,
+    remember_password: bool,
+) -> Result<Box<dyn CredentialStore>, CredentialError> {
+    resolve_store_with(
+        setting,
+        paths,
+        remember_password,
+        session_secret_service_available,
+    )
+}
+
+/// The well-known bus name of the Secret Service.
+pub const SECRET_SERVICE_NAME: &str = "org.freedesktop.secrets";
+
+/// Does `org.freedesktop.secrets` have an owner on `conn`'s bus, or can the
+/// bus activate it?
+#[cfg(target_os = "linux")]
+pub fn secret_service_available(
+    conn: &zbus::blocking::Connection,
+) -> Result<bool, CredentialError> {
+    let unavailable = |e: zbus::Error| CredentialError::SecretServiceUnavailable(e.to_string());
+    let has_owner: bool = conn
+        .call_method(
+            Some("org.freedesktop.DBus"),
+            "/org/freedesktop/DBus",
+            Some("org.freedesktop.DBus"),
+            "NameHasOwner",
+            &(SECRET_SERVICE_NAME,),
+        )
+        .map_err(unavailable)?
+        .body()
+        .deserialize()
+        .map_err(unavailable)?;
+    if has_owner {
+        return Ok(true);
+    }
+    let activatable: Vec<String> = conn
+        .call_method(
+            Some("org.freedesktop.DBus"),
+            "/org/freedesktop/DBus",
+            Some("org.freedesktop.DBus"),
+            "ListActivatableNames",
+            &(),
+        )
+        .map_err(unavailable)?
+        .body()
+        .deserialize()
+        .map_err(unavailable)?;
+    Ok(activatable.iter().any(|name| name == SECRET_SERVICE_NAME))
+}
+
+/// [`secret_service_available`] on the session bus; no session bus means no
+/// Secret Service.
+pub fn session_secret_service_available() -> Result<bool, CredentialError> {
+    #[cfg(target_os = "linux")]
+    {
+        match zbus::blocking::Connection::session() {
+            Ok(conn) => secret_service_available(&conn),
+            Err(_) => Ok(false),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(false)
+    }
+}
+
+/// The credentials file written by the foundation `login`
+/// (`~/.config/dosi-tracker/credentials.json`), if it still exists. Doctor
+/// warns about it; it is deleted after the next successful sign-in.
+pub fn legacy_credentials_file(paths: &crate::paths::LinuxPaths) -> Option<PathBuf> {
+    let path = paths.legacy_credentials_file();
+    fs::symlink_metadata(&path).ok().map(|_| path)
+}
+
+/// Delete the legacy credentials file (after a successful sign-in). Returns
+/// whether one was removed.
+pub fn remove_legacy_credentials(
+    paths: &crate::paths::LinuxPaths,
+) -> Result<bool, CredentialError> {
+    let Some(path) = legacy_credentials_file(paths) else {
+        return Ok(false);
+    };
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(CredentialError::Io(format!(
+            "Failed removing the legacy credentials file: {e}"
+        ))),
+    }
 }
 
 /// In-memory credential store for deterministic testing without external dependencies.
@@ -288,9 +498,11 @@ impl CredentialStore for InMemoryCredentialStore {
     }
 }
 
-/// Owner-only local JSON file credential store.
+/// Owner-only local JSON file credential store (explicit opt-in).
 ///
 /// Features:
+/// - Never stores a password: it is stripped before writing, and one found in
+///   an older file is ignored on load.
 /// - Atomic write-then-rename to avoid half-written files.
 /// - Created with Unix permission mode `0600` (`S_IRUSR | S_IWUSR`).
 /// - Parent directory created with Unix permission mode `0700`.
@@ -305,11 +517,15 @@ impl FileCredentialStore {
         Self { path }
     }
 
-    /// Resolves the default XDG fallback credential store path:
-    /// `$XDG_CONFIG_HOME/dosi-tracker/credentials.json` or `~/.config/dosi-tracker/credentials.json`.
+    /// Resolves the default credential file path:
+    /// `$XDG_DATA_HOME/dosi-tracker/credentials.json` (or `~/.local/share/...`).
     pub fn default_path() -> Result<PathBuf, CredentialError> {
-        let paths = crate::paths::LinuxPaths::from_env();
-        Ok(paths.config_dir.join("credentials.json"))
+        Ok(crate::paths::LinuxPaths::from_env().credentials_file())
+    }
+
+    /// The file this store reads and writes.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     fn validate_target_file(path: &Path) -> Result<(), CredentialError> {
@@ -370,50 +586,61 @@ impl FileCredentialStore {
         if bytes.is_empty() {
             return Ok(Vec::new());
         }
-        serde_json::from_slice::<Vec<Credentials>>(&bytes)
-            .map_err(|e| CredentialError::Serialization(e.to_string()))
+        let records = serde_json::from_slice::<Vec<Credentials>>(&bytes)
+            .map_err(|e| CredentialError::Serialization(e.to_string()))?;
+        Ok(records
+            .into_iter()
+            .map(Credentials::without_password)
+            .collect())
     }
 
     fn save_all_records(&self, records: &[Credentials]) -> Result<(), CredentialError> {
-        if let Some(parent) = self.path.parent() {
-            if !parent.exists() {
-                #[cfg(unix)]
-                {
-                    let mut builder = fs::DirBuilder::new();
-                    builder.recursive(true);
-                    builder.mode(0o700);
-                    builder.create(parent).map_err(|e| {
-                        CredentialError::Io(format!("Failed creating config directory: {e}"))
-                    })?;
-                }
-                #[cfg(not(unix))]
-                {
+        let serialized = zeroize::Zeroizing::new(
+            serde_json::to_vec_pretty(records)
+                .map_err(|e| CredentialError::Serialization(e.to_string()))?,
+        );
+
+        #[cfg(unix)]
+        {
+            if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                crate::paths::ensure_private_dir(parent).map_err(|e| {
+                    CredentialError::UnsafeStorage(format!(
+                        "Failed preparing the credentials directory: {e}"
+                    ))
+                })?;
+            }
+            crate::paths::write_private_atomic(&self.path, &serialized).map_err(|e| {
+                CredentialError::Io(format!("Failed atomically replacing credentials file: {e}"))
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            if let Some(parent) = self.path.parent() {
+                if !parent.exists() {
                     fs::create_dir_all(parent).map_err(|e| {
                         CredentialError::Io(format!("Failed creating config directory: {e}"))
                     })?;
                 }
             }
+            self.replace_file(&serialized)
         }
+    }
 
-        let serialized = serde_json::to_vec_pretty(records)
-            .map_err(|e| CredentialError::Serialization(e.to_string()))?;
-
+    #[cfg(not(unix))]
+    fn replace_file(&self, serialized: &[u8]) -> Result<(), CredentialError> {
         let temp_path = self
             .path
             .with_extension(format!("tmp.{}", std::process::id()));
 
-        // Open temporary file with exclusive creation and 0600 mode on Unix
         {
             let mut opts = fs::OpenOptions::new();
             opts.write(true).create(true).truncate(true);
-            #[cfg(unix)]
-            opts.mode(0o600);
 
             use std::io::Write;
             let mut file = opts.open(&temp_path).map_err(|e| {
                 CredentialError::Io(format!("Failed opening temporary credentials file: {e}"))
             })?;
-            file.write_all(&serialized).map_err(|e| {
+            file.write_all(serialized).map_err(|e| {
                 let _ = fs::remove_file(&temp_path);
                 CredentialError::Io(format!("Failed writing temporary credentials file: {e}"))
             })?;
@@ -458,7 +685,7 @@ impl CredentialStore for FileCredentialStore {
             !(c.account_id == norm_acc
                 && c.workspace_id.as_ref().map(|w| w.trim().to_string()) == norm_ws)
         });
-        records.push(credentials.clone());
+        records.push(credentials.clone().without_password());
         self.save_all_records(&records)
     }
 
@@ -492,9 +719,16 @@ pub trait SecretServiceTransport: Send + Sync + fmt::Debug {
         attributes: &HashMap<String, String>,
     ) -> Result<(Vec<String>, Vec<String>), CredentialError>;
 
-    /// Attempt to unlock the specified object paths.
-    /// Returns (unlocked_paths, prompt_required).
-    fn unlock(&self, objects: &[String]) -> Result<(Vec<String>, bool), CredentialError>;
+    /// Attempt to unlock the specified object paths without user interaction.
+    /// Returns (unlocked_paths, prompt): `prompt` is the prompt object path when
+    /// the service needs the user to unlock, `None` when no prompt is needed.
+    fn unlock(&self, objects: &[String]) -> Result<(Vec<String>, Option<String>), CredentialError>;
+
+    /// Show the prompt object `prompt_path` (`org.freedesktop.Secret.Prompt.Prompt`
+    /// with an empty window id) and wait for its `Completed` signal. Returns
+    /// `true` when the user completed it, `false` when they dismissed it.
+    /// Only called on an explicit user action.
+    fn prompt(&self, prompt_path: &str) -> Result<bool, CredentialError>;
 
     /// Open a "plain" session for secret transfer.
     /// Returns the session object path.
@@ -521,11 +755,15 @@ pub trait SecretServiceTransport: Send + Sync + fmt::Debug {
     fn close_session(&self, session_path: &str) -> Result<(), CredentialError>;
 }
 
+/// The default collection's alias object (unlocked together with the items).
+pub const DEFAULT_COLLECTION_ALIAS: &str = "/org/freedesktop/secrets/aliases/default";
+
 /// Freedesktop Secret Service backend store over D-Bus (`org.freedesktop.secrets`).
 #[derive(Clone, Debug)]
 pub struct SecretServiceStore {
     application: String,
     transport: Arc<dyn SecretServiceTransport>,
+    remember_password: bool,
 }
 
 impl SecretServiceStore {
@@ -533,19 +771,12 @@ impl SecretServiceStore {
     pub fn new(application: impl Into<String>) -> Self {
         let app = application.into();
         #[cfg(target_os = "linux")]
-        {
-            Self {
-                application: app,
-                transport: Arc::new(ZbusSecretServiceTransport::new()),
-            }
-        }
+        let transport: Arc<dyn SecretServiceTransport> =
+            Arc::new(ZbusSecretServiceTransport::new());
         #[cfg(not(target_os = "linux"))]
-        {
-            Self {
-                application: app,
-                transport: Arc::new(UnsupportedSecretServiceTransport),
-            }
-        }
+        let transport: Arc<dyn SecretServiceTransport> =
+            Arc::new(UnsupportedSecretServiceTransport);
+        Self::with_transport(app, transport)
     }
 
     /// Construct a SecretServiceStore with an explicit transport seam for testing.
@@ -556,12 +787,53 @@ impl SecretServiceStore {
         Self {
             application: application.into(),
             transport,
+            remember_password: true,
         }
+    }
+
+    /// Keep the password in the item (`credentials.remember_password`, default
+    /// on). When off, the password is stripped before every save.
+    pub fn with_remember_password(mut self, remember: bool) -> Self {
+        self.remember_password = remember;
+        self
     }
 
     /// Application name identifier used for scoping.
     pub fn application(&self) -> &str {
         &self.application
+    }
+
+    /// Search the items of `account_id`/`workspace_id`, unlocking locked ones
+    /// when that needs no user interaction; a needed prompt is reported as
+    /// [`CredentialError::Locked`] (never shown here).
+    fn unlocked_items(
+        &self,
+        attrs: &HashMap<String, String>,
+    ) -> Result<Vec<String>, CredentialError> {
+        let (mut unlocked, locked) = self.transport.search_items(attrs)?;
+        if !locked.is_empty() {
+            let (newly_unlocked, prompt) = self.transport.unlock(&locked)?;
+            if let Some(prompt) = prompt {
+                return Err(CredentialError::Locked { prompt });
+            }
+            unlocked.extend(newly_unlocked);
+        }
+        Ok(unlocked)
+    }
+
+    /// Explicit unlock (`dosi-tracker unlock`): unlock the default collection
+    /// and the account's items, showing the Secret Service prompt if one is
+    /// needed and waiting for it. Returns `false` when the user dismissed it.
+    pub fn unlock(&self, account_id: &str) -> Result<bool, CredentialError> {
+        let attrs = self.build_attributes(&account_id.trim().to_lowercase(), None);
+        let (_, locked) = self.transport.search_items(&attrs)?;
+        let mut objects = vec![DEFAULT_COLLECTION_ALIAS.to_string()];
+        objects.extend(locked);
+        let (_, prompt) = self.transport.unlock(&objects)?;
+        match prompt {
+            Some(prompt) => self.transport.prompt(&prompt),
+            None => Ok(true),
+        }
     }
 
     fn build_attributes(
@@ -598,17 +870,7 @@ impl CredentialStore for SecretServiceStore {
         let norm_ws = workspace_id.map(|w| w.trim().to_string());
         let attrs = self.build_attributes(&norm_acc, norm_ws.as_deref());
 
-        let (mut unlocked, locked) = self.transport.search_items(&attrs)?;
-        if !locked.is_empty() {
-            let (newly_unlocked, prompt_required) = self.transport.unlock(&locked)?;
-            if prompt_required {
-                return Err(CredentialError::SecretServiceUnavailable(
-                    "Freedesktop Secret Service item or collection is locked and requires interactive unlock prompt".into(),
-                ));
-            }
-            unlocked.extend(newly_unlocked);
-        }
-
+        let unlocked = self.unlocked_items(&attrs)?;
         if unlocked.is_empty() {
             return Ok(None);
         }
@@ -649,8 +911,15 @@ impl CredentialStore for SecretServiceStore {
             .map(|w| w.trim().to_string());
         let attrs = self.build_attributes(&norm_acc, norm_ws.as_deref());
 
-        let secret_bytes = serde_json::to_vec_pretty(credentials)
-            .map_err(|e| CredentialError::Serialization(e.to_string()))?;
+        let stored = if self.remember_password {
+            credentials.clone()
+        } else {
+            credentials.clone().without_password()
+        };
+        let secret_bytes = zeroize::Zeroizing::new(
+            serde_json::to_vec_pretty(&stored)
+                .map_err(|e| CredentialError::Serialization(e.to_string()))?,
+        );
 
         let session_path = self.transport.open_session()?;
 
@@ -678,17 +947,7 @@ impl CredentialStore for SecretServiceStore {
         let norm_ws = workspace_id.map(|w| w.trim().to_string());
         let attrs = self.build_attributes(&norm_acc, norm_ws.as_deref());
 
-        let (mut unlocked, locked) = self.transport.search_items(&attrs)?;
-        if !locked.is_empty() {
-            let (newly_unlocked, prompt_required) = self.transport.unlock(&locked)?;
-            if prompt_required {
-                return Err(CredentialError::SecretServiceUnavailable(
-                    "Freedesktop Secret Service item or collection is locked and requires interactive unlock prompt to clear".into(),
-                ));
-            }
-            unlocked.extend(newly_unlocked);
-        }
-
+        let unlocked = self.unlocked_items(&attrs)?;
         for item_path in &unlocked {
             self.transport.delete_item(item_path)?;
         }
@@ -715,7 +974,16 @@ impl SecretServiceTransport for UnsupportedSecretServiceTransport {
         ))
     }
 
-    fn unlock(&self, _objects: &[String]) -> Result<(Vec<String>, bool), CredentialError> {
+    fn unlock(
+        &self,
+        _objects: &[String],
+    ) -> Result<(Vec<String>, Option<String>), CredentialError> {
+        Err(CredentialError::SecretServiceUnavailable(
+            "Freedesktop Secret Service requires Linux session D-Bus".into(),
+        ))
+    }
+
+    fn prompt(&self, _prompt_path: &str) -> Result<bool, CredentialError> {
         Err(CredentialError::SecretServiceUnavailable(
             "Freedesktop Secret Service requires Linux session D-Bus".into(),
         ))
@@ -774,7 +1042,14 @@ pub struct MockSecretServiceTransport {
     pub prompt_required_on_create: AtomicBool,
     pub prompt_required_on_delete: AtomicBool,
     pub daemon_available: AtomicBool,
+    /// The user dismisses the next prompt instead of completing it.
+    pub dismiss_prompt: AtomicBool,
+    /// How many prompts were shown.
+    pub prompts_shown: std::sync::atomic::AtomicU64,
 }
+
+/// The prompt object path the mock hands out.
+pub const MOCK_PROMPT_PATH: &str = "/org/freedesktop/secrets/prompt/mock";
 
 #[derive(Clone, Debug)]
 struct MockSession {
@@ -807,6 +1082,8 @@ impl MockSecretServiceTransport {
             prompt_required_on_create: AtomicBool::new(false),
             prompt_required_on_delete: AtomicBool::new(false),
             daemon_available: AtomicBool::new(true),
+            dismiss_prompt: AtomicBool::new(false),
+            prompts_shown: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -898,14 +1175,14 @@ impl SecretServiceTransport for MockSecretServiceTransport {
         Ok((unlocked, locked))
     }
 
-    fn unlock(&self, objects: &[String]) -> Result<(Vec<String>, bool), CredentialError> {
+    fn unlock(&self, objects: &[String]) -> Result<(Vec<String>, Option<String>), CredentialError> {
         if !self.daemon_available.load(Ordering::Relaxed) {
             return Err(CredentialError::SecretServiceUnavailable(
                 "org.freedesktop.secrets D-Bus daemon is unavailable".into(),
             ));
         }
         if self.prompt_required_on_unlock.load(Ordering::Relaxed) {
-            return Ok((Vec::new(), true));
+            return Ok((Vec::new(), Some(MOCK_PROMPT_PATH.to_string())));
         }
         let mut map = self.items.lock().unwrap();
         let mut newly_unlocked = Vec::new();
@@ -915,7 +1192,33 @@ impl SecretServiceTransport for MockSecretServiceTransport {
                 newly_unlocked.push(path.clone());
             }
         }
-        Ok((newly_unlocked, false))
+        Ok((newly_unlocked, None))
+    }
+
+    fn prompt(&self, prompt_path: &str) -> Result<bool, CredentialError> {
+        if !self.daemon_available.load(Ordering::Relaxed) {
+            return Err(CredentialError::SecretServiceUnavailable(
+                "org.freedesktop.secrets D-Bus daemon is unavailable".into(),
+            ));
+        }
+        if prompt_path != MOCK_PROMPT_PATH {
+            return Err(CredentialError::SecretServiceUnavailable(format!(
+                "No such prompt {prompt_path}"
+            )));
+        }
+        self.prompts_shown.fetch_add(1, Ordering::Relaxed);
+        if self.dismiss_prompt.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        // The user typed the keyring password: everything is unlocked.
+        self.prompt_required_on_unlock
+            .store(false, Ordering::Relaxed);
+        self.prompt_required_on_create
+            .store(false, Ordering::Relaxed);
+        for item in self.items.lock().unwrap().values_mut() {
+            item.locked = false;
+        }
+        Ok(true)
     }
 
     fn open_session(&self) -> Result<String, CredentialError> {
@@ -1012,9 +1315,9 @@ impl SecretServiceTransport for MockSecretServiceTransport {
             }
         }
         if self.prompt_required_on_create.load(Ordering::Relaxed) {
-            return Err(CredentialError::SecretServiceUnavailable(
-                "Creating Secret Service item requires interactive unlock prompt".into(),
-            ));
+            return Err(CredentialError::Locked {
+                prompt: MOCK_PROMPT_PATH.to_string(),
+            });
         }
         let mut map = self.items.lock().unwrap();
         if replace {
@@ -1056,9 +1359,9 @@ impl SecretServiceTransport for MockSecretServiceTransport {
             ));
         }
         if self.prompt_required_on_delete.load(Ordering::Relaxed) {
-            return Err(CredentialError::SecretServiceUnavailable(
-                "Deleting Secret Service item requires interactive prompt".into(),
-            ));
+            return Err(CredentialError::Locked {
+                prompt: MOCK_PROMPT_PATH.to_string(),
+            });
         }
         let mut map = self.items.lock().unwrap();
         map.remove(item_path);
@@ -1082,6 +1385,12 @@ impl SecretServiceTransport for MockSecretServiceTransport {
 /// Real Freedesktop Secret Service transport connecting over session D-Bus.
 #[cfg(target_os = "linux")]
 use zbus::zvariant;
+
+/// A prompt object path from the Secret Service, or `None` for `/` (no prompt).
+#[cfg(target_os = "linux")]
+fn prompt_path(prompt: zvariant::OwnedObjectPath) -> Option<String> {
+    (prompt.as_str() != "/").then(|| prompt.to_string())
+}
 
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
@@ -1187,7 +1496,7 @@ impl SecretServiceTransport for ZbusSecretServiceTransport {
         ))
     }
 
-    fn unlock(&self, objects: &[String]) -> Result<(Vec<String>, bool), CredentialError> {
+    fn unlock(&self, objects: &[String]) -> Result<(Vec<String>, Option<String>), CredentialError> {
         let conn = self.connection()?;
         let obj_paths: Vec<zvariant::OwnedObjectPath> = objects
             .iter()
@@ -1215,11 +1524,41 @@ impl SecretServiceTransport for ZbusSecretServiceTransport {
                 ))
             })?;
 
-        let prompt_required = prompt.as_str() != "/";
         Ok((
             unlocked.into_iter().map(|p| p.to_string()).collect(),
-            prompt_required,
+            prompt_path(prompt),
         ))
+    }
+
+    fn prompt(&self, prompt_path: &str) -> Result<bool, CredentialError> {
+        let conn = self.connection()?;
+        let failed = |what: &str, e: zbus::Error| {
+            CredentialError::SecretServiceUnavailable(format!("Secret Service {what} failed: {e}"))
+        };
+        let proxy = zbus::blocking::Proxy::new(
+            &conn,
+            "org.freedesktop.secrets",
+            prompt_path,
+            "org.freedesktop.Secret.Prompt",
+        )
+        .map_err(|e| failed("prompt proxy", e))?;
+        // Subscribe before showing the prompt so Completed cannot be missed.
+        let mut completed = proxy
+            .receive_signal("Completed")
+            .map_err(|e| failed("Completed subscription", e))?;
+        proxy
+            .call_method("Prompt", &("",))
+            .map_err(|e| failed("Prompt call", e))?;
+        let signal = completed.next().ok_or_else(|| {
+            CredentialError::SecretServiceUnavailable(
+                "The Secret Service closed before the prompt completed".into(),
+            )
+        })?;
+        let (dismissed, _result): (bool, zvariant::OwnedValue) = signal
+            .body()
+            .deserialize()
+            .map_err(|e| failed("Completed signal decoding", e))?;
+        Ok(!dismissed)
     }
 
     fn open_session(&self) -> Result<String, CredentialError> {
@@ -1333,10 +1672,8 @@ impl SecretServiceTransport for ZbusSecretServiceTransport {
                 ))
             })?;
 
-        if prompt.as_str() != "/" {
-            return Err(CredentialError::SecretServiceUnavailable(
-                "Creating Secret Service item requires interactive unlock prompt".into(),
-            ));
+        if let Some(prompt) = prompt_path(prompt) {
+            return Err(CredentialError::Locked { prompt });
         }
 
         Ok(item_path.to_string())
@@ -1364,10 +1701,8 @@ impl SecretServiceTransport for ZbusSecretServiceTransport {
             ))
         })?;
 
-        if prompt.as_str() != "/" {
-            return Err(CredentialError::SecretServiceUnavailable(
-                "Deleting Secret Service item requires interactive prompt".into(),
-            ));
+        if let Some(prompt) = prompt_path(prompt) {
+            return Err(CredentialError::Locked { prompt });
         }
 
         Ok(())
@@ -1501,7 +1836,7 @@ mod tests {
 
         let mut cred = Credentials::new("worker@corp.com", Some("p4ssw0rd".into()));
         cred.workspace_id = Some("ws-01".into());
-        cred.server_url = Some("https://api.dosi.local".into());
+        cred.server_url = Some("https://tracker.example.local".into());
         cred.device_signing_key = Some(vec![1, 2, 3, 4]);
 
         store.save(&cred).unwrap();
@@ -1511,8 +1846,17 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(loaded.account_id, "worker@corp.com");
-        assert_eq!(loaded.password.as_deref(), Some("p4ssw0rd"));
-        assert_eq!(loaded.server_url.as_deref(), Some("https://api.dosi.local"));
+        assert_eq!(
+            loaded.password, None,
+            "the file store never keeps a password"
+        );
+        assert!(!String::from_utf8(fs::read(&cred_file).unwrap())
+            .unwrap()
+            .contains("p4ssw0rd"));
+        assert_eq!(
+            loaded.server_url.as_deref(),
+            Some("https://tracker.example.local")
+        );
         assert_eq!(
             loaded.device_signing_key.as_deref(),
             Some(&[1, 2, 3, 4][..])
@@ -1588,7 +1932,7 @@ mod tests {
         let mut alice_alpha = Credentials::new("alice@corp.com", Some("pass-alpha".into()));
         alice_alpha.workspace_id = Some("ws-alpha".into());
         alice_alpha.access_token = Some("tok-alpha-123".into());
-        alice_alpha.server_url = Some("https://api.dosi.local".into());
+        alice_alpha.server_url = Some("https://tracker.example.local".into());
         alice_alpha.device_signing_key = Some(vec![10, 20, 30]);
         store
             .save(&alice_alpha)
@@ -1717,7 +2061,14 @@ mod tests {
         let err = store
             .load("locked@corp.com", Some("ws-locked"))
             .unwrap_err();
-        assert!(matches!(err, CredentialError::SecretServiceUnavailable(_)));
+        assert!(
+            matches!(err, CredentialError::Locked { ref prompt } if prompt == MOCK_PROMPT_PATH)
+        );
+        assert_eq!(
+            mock.prompts_shown.load(Ordering::Relaxed),
+            0,
+            "a load never shows the prompt"
+        );
         assert!(err
             .to_string()
             .contains("requires interactive unlock prompt"));
@@ -1742,7 +2093,7 @@ mod tests {
 
         let cred = Credentials::new("user@corp.com", Some("pass".into()));
         let err = store.save(&cred).unwrap_err();
-        assert!(matches!(err, CredentialError::SecretServiceUnavailable(_)));
+        assert!(matches!(err, CredentialError::Locked { .. }));
         assert!(err
             .to_string()
             .contains("requires interactive unlock prompt"));
@@ -1759,8 +2110,10 @@ mod tests {
         mock.prompt_required_on_delete
             .store(true, Ordering::Relaxed);
         let err = store.clear("user@corp.com", None).unwrap_err();
-        assert!(matches!(err, CredentialError::SecretServiceUnavailable(_)));
-        assert!(err.to_string().contains("requires interactive prompt"));
+        assert!(matches!(err, CredentialError::Locked { .. }));
+        assert!(err
+            .to_string()
+            .contains("requires interactive unlock prompt"));
     }
 
     #[test]
@@ -1906,5 +2259,178 @@ mod tests {
             CredentialError::SecretServiceUnavailable(_)
         ));
         assert!(closed_err.to_string().contains("is closed"));
+    }
+
+    #[test]
+    fn account_level_items_have_an_empty_workspace_attribute() {
+        let mock = Arc::new(MockSecretServiceTransport::new());
+        let store = SecretServiceStore::with_transport("dosi-tracker", mock.clone());
+        let mut creds = Credentials::new("Alice@Corp.com", Some("pw".into()));
+        creds.workspace_id = Some("ws-1".into());
+        creds.refresh_token = Some("r1".into());
+        store.save_account(&creds).unwrap();
+
+        let attrs = store.build_attributes("alice@corp.com", None);
+        assert_eq!(attrs["workspace_id"], "");
+        let (unlocked, _) = mock.search_items(&attrs).unwrap();
+        assert_eq!(unlocked.len(), 1, "one item per account");
+
+        let loaded = store.load_account("alice@corp.com").unwrap().unwrap();
+        assert_eq!(loaded.workspace_id, None);
+        assert_eq!(loaded.refresh_token.as_deref(), Some("r1"));
+        assert_eq!(
+            loaded.password.as_deref(),
+            Some("pw"),
+            "remembered by default"
+        );
+        // A per-workspace lookup does not see the account item.
+        assert_eq!(store.load("alice@corp.com", Some("ws-1")).unwrap(), None);
+        store.clear_account("alice@corp.com").unwrap();
+        assert_eq!(store.load_account("alice@corp.com").unwrap(), None);
+    }
+
+    #[test]
+    fn the_password_is_kept_only_when_remembered() {
+        let mock = Arc::new(MockSecretServiceTransport::new());
+        let store = SecretServiceStore::with_transport("dosi-tracker", mock.clone())
+            .with_remember_password(false);
+        let mut creds = Credentials::new("bob@corp.com", Some("SENTINEL-PASSWORD".into()));
+        creds.refresh_token = Some("r1".into());
+        store.save_account(&creds).unwrap();
+        let loaded = store.load_account("bob@corp.com").unwrap().unwrap();
+        assert_eq!(loaded.password, None);
+        assert_eq!(loaded.refresh_token.as_deref(), Some("r1"));
+        let attrs = store.build_attributes("bob@corp.com", None);
+        let (items, _) = mock.search_items(&attrs).unwrap();
+        let session = mock.open_session().unwrap();
+        let secret = mock.get_secret(&items[0], &session).unwrap();
+        assert!(!String::from_utf8_lossy(&secret).contains("SENTINEL-PASSWORD"));
+    }
+
+    #[test]
+    fn an_explicit_unlock_shows_the_prompt_and_waits_for_it() {
+        let mock = Arc::new(MockSecretServiceTransport::new());
+        let store = SecretServiceStore::with_transport("dosi-tracker", mock.clone());
+        let mut attrs = HashMap::new();
+        attrs.insert("application".into(), "dosi-tracker".into());
+        attrs.insert("account_id".into(), "carol@corp.com".into());
+        attrs.insert("workspace_id".into(), String::new());
+        mock.insert_locked_item(
+            "/org/freedesktop/secrets/collection/default/locked_2",
+            "Dosi-Tracker (carol@corp.com)",
+            attrs,
+            br#"{"account_id":"carol@corp.com"}"#.to_vec(),
+        );
+        mock.prompt_required_on_unlock
+            .store(true, Ordering::Relaxed);
+
+        assert!(matches!(
+            store.load_account("carol@corp.com"),
+            Err(CredentialError::Locked { .. })
+        ));
+
+        // Dismissed: still locked.
+        mock.dismiss_prompt.store(true, Ordering::Relaxed);
+        assert!(!store.unlock("carol@corp.com").unwrap());
+        assert!(matches!(
+            store.load_account("carol@corp.com"),
+            Err(CredentialError::Locked { .. })
+        ));
+
+        // Completed: the item loads.
+        mock.dismiss_prompt.store(false, Ordering::Relaxed);
+        assert!(store.unlock("carol@corp.com").unwrap());
+        assert_eq!(mock.prompts_shown.load(Ordering::Relaxed), 2);
+        let loaded = store.load_account("carol@corp.com").unwrap().unwrap();
+        assert_eq!(loaded.account_id, "carol@corp.com");
+        // Nothing locked: no prompt.
+        assert!(store.unlock("carol@corp.com").unwrap());
+        assert_eq!(mock.prompts_shown.load(Ordering::Relaxed), 2);
+    }
+
+    fn temp_paths(root: &Path) -> crate::paths::LinuxPaths {
+        crate::paths::LinuxPaths::resolve(
+            Some(root),
+            Some(&root.join("config")),
+            Some(&root.join("data")),
+            Some(&root.join("state")),
+        )
+    }
+
+    #[test]
+    fn store_resolution_never_falls_back_to_the_file_silently() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = temp_paths(temp.path());
+
+        let file = resolve_store_with(StoreSetting::File, &paths, true, || {
+            panic!("the file store needs no probe")
+        })
+        .unwrap();
+        assert_eq!(file.kind(), CredentialStoreKind::FileFallback);
+
+        let service = resolve_store_with(StoreSetting::Auto, &paths, true, || Ok(true)).unwrap();
+        assert_eq!(service.kind(), CredentialStoreKind::SecretService);
+
+        for probe in [
+            Ok(false),
+            Err(CredentialError::SecretServiceUnavailable("no bus".into())),
+        ] {
+            let err = resolve_store_with(StoreSetting::Auto, &paths, true, move || probe)
+                .err()
+                .unwrap();
+            assert!(matches!(err, CredentialError::NoSecretService(_)), "{err}");
+            assert!(err.to_string().contains("credentials.store"));
+        }
+
+        let explicit =
+            resolve_store_with(StoreSetting::SecretService, &paths, false, || Ok(false)).unwrap();
+        assert_eq!(explicit.kind(), CredentialStoreKind::SecretService);
+
+        assert_eq!(
+            StoreSetting::parse(" Secret-Service "),
+            Some(StoreSetting::SecretService)
+        );
+        assert_eq!(StoreSetting::parse("file"), Some(StoreSetting::File));
+        assert_eq!(StoreSetting::parse("keyring"), None);
+        assert_eq!(StoreSetting::default().as_str(), "auto");
+    }
+
+    #[test]
+    fn the_file_store_defaults_to_the_data_dir_and_legacy_files_are_found_and_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = temp_paths(temp.path());
+        assert!(paths
+            .credentials_file()
+            .starts_with(temp.path().join("data")));
+
+        assert_eq!(legacy_credentials_file(&paths), None);
+        assert!(!remove_legacy_credentials(&paths).unwrap());
+        let legacy = paths.legacy_credentials_file();
+        assert!(legacy.starts_with(temp.path().join("config")));
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, br#"[{"account_id":"a","password":"old"}]"#).unwrap();
+        assert_eq!(legacy_credentials_file(&paths), Some(legacy.clone()));
+        assert!(remove_legacy_credentials(&paths).unwrap());
+        assert!(!legacy.exists());
+    }
+
+    #[test]
+    fn a_password_in_an_older_file_is_never_handed_out() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("credentials.json");
+        fs::write(
+            &path,
+            br#"[{"account_id":"dave@corp.com","password":"legacy-secret","refresh_token":"r"}]"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let store = FileCredentialStore::new(path);
+        let loaded = store.load("dave@corp.com", None).unwrap().unwrap();
+        assert_eq!(loaded.password, None);
+        assert_eq!(loaded.refresh_token.as_deref(), Some("r"));
     }
 }

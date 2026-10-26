@@ -1,0 +1,14 @@
+{
+  "deviceId": "5b0c1b9e-8f2c-4a43-9a51-0c7f6f2d9b11",
+  "deviceName": "workstation-1",
+  "platform": "linux",
+  "osVersion": "Ubuntu 24.04.1 LTS (Linux 6.8.0-45-generic)",
+  "agentVersion": "0.1.0",
+  "status": "tracking",
+  "projectId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "statusSince": "2026-10-05T10:00:00Z",
+  "currentApp": "code",
+  "timeZone": "Asia/Dhaka",
+  "utcOffsetMinutes": 360,
+  "sentAt": "2026-10-05T10:10:02Z"
+}

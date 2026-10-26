@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Dosi Tracker agent
+Comment=Starts the Dosi Tracker agent at login. Turn it off with "dosi-tracker service disable" or in the app's Settings.
+Exec=@EXEC@ service session-start
+TryExec=@TRYEXEC@
+Icon=io.github.dosibridge.DosiTracker
+NoDisplay=true
+Terminal=false
+X-GNOME-Autostart-enabled=true
+X-DosiTracker-Managed=true

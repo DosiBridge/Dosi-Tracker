@@ -1,31 +1,49 @@
-//! End-to-end integration tests for Phase 1 identity, transport, and signing.
+//! End-to-end identity, transport and signing (v1 contract).
 //!
 //! Enforces:
-//! - Complete CLI login -> status -> queue -> signed delivery -> ack delete lifecycle.
-//! - Mid-upload outage row retention and attempt counter incrementation (HTTP 502 response and TCP socket interruption).
-//! - Subprocess execution assertions and fail-closed security invariants: failed logins never count as delivery evidence.
-//! - Reusing credentials persisted by CLI login for production upload transport (`from_store`).
-//! - Read-only inspection invariants: status and doctor never create files or directories.
-//! - Deterministic execution over in-process loopback fixtures without external network access.
-//! - Complete redaction: zero secrets in CLI stdout, stderr, or JSON reports.
+//! - CLI login (password on stdin, through the daemon) -> status -> logout,
+//!   against a stateful fake backend: no `__tenant`, the install's device id
+//!   on token requests, no password or token in any output.
+//! - Fail-closed status: with the agent down `status` exits 3, prints local
+//!   facts and never creates files or directories.
+//! - Queue depth from the read-only inspector.
+//! - The credentials the sign-in persisted (file store: tokens and the device
+//!   signing key, never the password) drive a v2 transport: signed delivery,
+//!   ack deletion, and transient failures (HTTP 503, an interrupted socket)
+//!   that keep the row and count the attempt, without touching other scopes.
+//! - A refused sign-in stores nothing.
+//! - Transport scope binding (library level, unchanged).
+
+#![cfg(target_os = "linux")]
+
+mod support;
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
+use serde_json::Value;
 use tempfile::tempdir;
 
-use dosi_tracker_linux::api::{ApiClient, HttpDeliveryTransport};
+use dosi_tracker_linux::agent::model::{Activity, PLATFORM};
+use dosi_tracker_linux::api::{
+    verify_v2_entry, ApiClient, HttpDeliveryTransport, ServerClock, TokenCell, TransportConfig,
+};
 use dosi_tracker_linux::credentials::{
     CredentialStore, Credentials, FileCredentialStore, InMemoryCredentialStore,
 };
-use dosi_tracker_linux::outbox::{ActivityEnvelope, Outbox, OutboxLimits, OutboxScope};
-use dosi_tracker_linux::signing::verify_activity_envelope;
+use dosi_tracker_linux::outbox::{
+    ActivityEnvelope, Outbox, OutboxLimits, OutboxScope, PendingActivity,
+};
 use dosi_tracker_linux::sync::{SyncPassConfig, SyncPassCoordinator, SyncStopReason};
+use support::agent::{parse, Agent};
+use support::fake_backend::{ActivityMode, FakeBackend, PROJECT_WEBSITE, WS_ACME};
+
+const EMAIL: &str = "tester@dosi.test";
+const PASSWORD: &str = "super-secret-password";
 
 fn http_resp(status: &str, headers: &[(&str, &str)], body: &str) -> String {
     let extra: String = headers
@@ -73,23 +91,8 @@ fn read_request(stream: &mut std::net::TcpStream) -> String {
     String::from_utf8_lossy(&data).into_owned()
 }
 
-fn canned_server(responses: Vec<String>) -> (String, std::sync::mpsc::Receiver<String>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        for response in responses {
-            let Ok((mut stream, _)) = listener.accept() else {
-                return;
-            };
-            let _ = tx.send(read_request(&mut stream));
-            let _ = stream.write_all(response.as_bytes());
-            let _ = stream.flush();
-        }
-    });
-    (url, rx)
-}
-
+/// Answers the token request, then reads the upload's headers and drops the
+/// connection without an answer.
 fn interrupting_server() -> (
     String,
     std::sync::mpsc::Receiver<String>,
@@ -99,16 +102,13 @@ fn interrupting_server() -> (
     let url = format!("http://{}", listener.local_addr().unwrap());
     let (tx, rx) = std::sync::mpsc::channel();
     let handle = std::thread::spawn(move || {
-        // Step 1: Token request for login
         if let Ok((mut stream, _)) = listener.accept() {
             let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
             let req = read_request(&mut stream);
             let _ = tx.send(req);
-            let resp = token_ok();
-            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.write_all(token_ok().as_bytes());
             let _ = stream.flush();
         }
-        // Step 2: Activity upload request -> observe request headers/body, then abruptly drop/shutdown
         if let Ok((mut stream, _)) = listener.accept() {
             let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
             let mut read_bytes = Vec::new();
@@ -124,7 +124,6 @@ fn interrupting_server() -> (
             }
             let _ = tx.send(String::from_utf8_lossy(&read_bytes).into_owned());
             let _ = stream.shutdown(std::net::Shutdown::Both);
-            drop(stream);
         }
     });
     (url, rx, handle)
@@ -187,1172 +186,340 @@ fn sample_envelope(client_activity_id: &str) -> ActivityEnvelope {
     }
 }
 
+// ---- The v1 contract through the CLI --------------------------------------------------------
+
+/// A daemon on the real machine (no graphical session in the tests) with the
+/// file credential store.
+fn agent() -> Agent {
+    let mut agent = Agent::new().without_var("DOSI_TEST_MACHINE");
+    agent.start_daemon();
+    agent
+}
+
+fn login(agent: &Agent, backend: &FakeBackend, password: &str) -> std::process::Output {
+    agent.cli_stdin(
+        &[
+            "--json",
+            "login",
+            "--server",
+            &backend.url,
+            "--email",
+            EMAIL,
+            "--password-stdin",
+        ],
+        &format!("{password}\n"),
+    )
+}
+
+fn stop(agent: &mut Agent) {
+    assert_eq!(
+        agent.signal_daemon(libc::SIGTERM, Duration::from_secs(25)),
+        Some(0)
+    );
+    agent.daemon = None;
+}
+
+fn file_store(agent: &Agent) -> FileCredentialStore {
+    FileCredentialStore::new(agent.xdg.data_dir().join("credentials.json"))
+}
+
+fn outbox(agent: &Agent) -> Outbox {
+    Outbox::open(
+        agent.xdg.data_dir().join("outbox.db"),
+        OutboxLimits::default(),
+    )
+    .unwrap()
+}
+
+fn scope() -> OutboxScope {
+    OutboxScope::new(EMAIL, WS_ACME).unwrap()
+}
+
+fn block(minutes_ago: i64) -> Activity {
+    let start = Utc::now() - chrono::Duration::minutes(minutes_ago);
+    let mut activity = Activity::new(PROJECT_WEBSITE, start, start + chrono::Duration::minutes(5));
+    activity.platform = Some(PLATFORM.into());
+    activity
+}
+
+/// A v2 transport from the credentials the sign-in saved.
+fn transport_from_saved(agent: &Agent, server: &str) -> (HttpDeliveryTransport, [u8; 32]) {
+    let creds = file_store(agent)
+        .load_account(EMAIL)
+        .unwrap()
+        .expect("the sign-in was saved");
+    assert!(
+        creds.password.is_none(),
+        "the file store never holds the password"
+    );
+    let key: [u8; 32] = creds
+        .device_signing_key
+        .clone()
+        .expect("a device signing key")
+        .try_into()
+        .expect("32 bytes");
+    let transport = HttpDeliveryTransport::new_shared(TransportConfig {
+        server: server.to_string(),
+        account: EMAIL.to_string(),
+        password: None,
+        tokens: TokenCell::with_refresh_token(creds.refresh_token.clone()),
+        workspace_id: WS_ACME.to_string(),
+        device_id: creds.device_id.clone(),
+        signing_key: Some(key),
+        clock: ServerClock::default(),
+        allow_insecure_http: false,
+    })
+    .expect("a transport");
+    (transport, key)
+}
+
 #[test]
 fn test_cli_login_status_logout_lifecycle() {
-    let dir = tempdir().unwrap();
-    let cred_path = dir.path().join("credentials.json");
+    let backend = FakeBackend::start(EMAIL, PASSWORD);
+    let agent = agent();
 
-    let (url, rx) = canned_server(vec![token_ok()]);
+    let output = login(&agent, &backend, PASSWORD);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    let value = parse(&output);
+    assert_eq!(value["result"]["account"], EMAIL);
+    assert_eq!(value["result"]["workspace"], "Acme");
+    for secret in [PASSWORD, "access-1", "refresh-1"] {
+        assert!(
+            !stdout.contains(secret) && !stderr.contains(secret),
+            "{secret} printed"
+        );
+    }
 
-    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
-
-    // 1. Login via CLI
-    let login_out = Command::new(exe)
-        .args([
-            "login",
-            "--username",
-            "tester@dosi.test",
-            "--password",
-            "super-secret-password",
-            "--workspace-id",
-            "ws-123",
-            "--server",
-            &url,
-            "--credentials-file",
-            cred_path.to_str().unwrap(),
-        ])
-        .output()
-        .expect("Failed to execute login command");
-
+    // The token request: password grant, the install's device id, no tenant.
+    let token = &backend.requests_to("/connect/token")[0];
+    let form = token.form();
+    assert_eq!(form["grant_type"], "password");
+    assert_eq!(form["username"], EMAIL);
+    assert_eq!(form["password"], PASSWORD);
     assert!(
-        login_out.status.success(),
-        "Login failed with status code {:?}",
-        login_out.status.code()
+        uuid::Uuid::parse_str(&form["device_id"]).is_ok(),
+        "{form:?}"
     );
-    let login_stdout = String::from_utf8_lossy(&login_out.stdout);
-    assert!(login_stdout.contains("tester@dosi.test"));
-    assert!(login_stdout.contains("ws-123"));
-    assert!(!login_stdout.contains("super-secret-password"));
-    assert!(!login_stdout.contains("mock-token-xyz"));
+    assert!(!token.target.contains("__tenant") && !token.body.contains("__tenant"));
 
-    // Verify token request parameters sent to mock server
-    let token_req = rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("Token request received");
-    assert!(token_req.contains("grant_type=password"));
-    assert!(token_req.contains("username=tester%40dosi.test"));
-    assert!(token_req.contains("password=super-secret-password"));
+    // Status.
+    let snapshot = agent.wait_state(Duration::from_secs(15), |s| s["workspace"] == "Acme");
+    assert_eq!(snapshot["display_name"], EMAIL);
+    let text = snapshot.to_string();
+    assert!(!text.contains(PASSWORD) && !text.contains("access-1") && !text.contains("refresh-1"));
 
-    // 2. Status inspection via CLI (JSON)
-    let status_out = Command::new(exe)
-        .args([
-            "status",
-            "--account-id",
-            "tester@dosi.test",
-            "--workspace-id",
-            "ws-123",
-            "--credentials-file",
-            cred_path.to_str().unwrap(),
-            "--json",
-        ])
-        .output()
-        .expect("Failed to execute status command");
+    // The saved sign-in: tokens and the key, never the password.
+    let raw = std::fs::read_to_string(agent.xdg.data_dir().join("credentials.json")).unwrap();
+    assert!(!raw.contains(PASSWORD));
+    let creds = file_store(&agent).load_account(EMAIL).unwrap().unwrap();
+    assert!(creds.refresh_token.is_some() && creds.device_signing_key.is_some());
 
-    assert!(
-        status_out.status.success(),
-        "Status failed with status code {:?}",
-        status_out.status.code()
-    );
-    let status_stdout = String::from_utf8_lossy(&status_out.stdout);
-    let json: serde_json::Value = serde_json::from_str(&status_stdout).expect("Valid JSON");
-    assert_eq!(json["account_id"], "tester@dosi.test");
-    assert_eq!(json["workspace_id"], "ws-123");
-    assert_eq!(json["token_valid"], true);
-    assert_eq!(json["has_signing_key"], true);
-    assert!(!status_stdout.contains("super-secret-password"));
-    assert!(!status_stdout.contains("mock-token-xyz"));
-
-    // 3. Logout via CLI
-    let logout_out = Command::new(exe)
-        .args([
-            "logout",
-            "--account-id",
-            "tester@dosi.test",
-            "--workspace-id",
-            "ws-123",
-            "--credentials-file",
-            cred_path.to_str().unwrap(),
-        ])
-        .output()
-        .expect("Failed to execute logout command");
-
-    assert!(
-        logout_out.status.success(),
-        "Logout failed with status code {:?}",
-        logout_out.status.code()
-    );
-
-    // 4. Status after logout must fail closed
-    let status_after = Command::new(exe)
-        .args([
-            "status",
-            "--account-id",
-            "tester@dosi.test",
-            "--workspace-id",
-            "ws-123",
-            "--credentials-file",
-            cred_path.to_str().unwrap(),
-        ])
-        .output()
-        .expect("Failed to execute status command");
-
-    assert!(!status_after.status.success());
+    // Logout forgets it; status fails closed for the account.
+    let (code, value) = agent.json(&["logout"]);
+    assert_eq!(code, Some(0), "{value}");
+    assert_eq!(agent.snapshot()["status"], "signed_out");
+    assert!(file_store(&agent).load_account(EMAIL).unwrap().is_none());
+    let (code, value) = agent.json(&["whoami"]);
+    assert_eq!(code, Some(4), "{value}");
 }
 
 #[test]
 fn test_cli_status_fails_closed_and_never_creates_files() {
-    let dir = tempdir().unwrap();
-    let nonexistent_file = dir.path().join("subdir").join("creds.json");
-
-    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
-
-    let output = Command::new(exe)
-        .args([
-            "status",
-            "--account-id",
-            "missing@dosi.test",
-            "--workspace-id",
-            "ws-missing",
-            "--credentials-file",
-            nonexistent_file.to_str().unwrap(),
-        ])
-        .output()
-        .expect("Failed to execute status command");
-
-    assert!(!output.status.success());
-    assert!(!nonexistent_file.exists());
-    assert!(!dir.path().join("subdir").exists());
+    let xdg = support::xdg::TestXdg::builder().create_dirs(false).build();
+    let agent = Agent::with_xdg(xdg);
+    let (code, value) = agent.json(&["status"]);
+    assert_eq!(code, Some(3), "{value}");
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["result"]["account"], Value::Null);
+    assert!(!agent.xdg.home.exists(), "status created HOME");
 }
 
 #[test]
 fn test_cli_status_with_db_reports_queue_depth() {
-    let dir = tempdir().unwrap();
-    let db_path = dir.path().join("outbox.db");
-    let cred_path = dir.path().join("credentials.json");
+    let backend = FakeBackend::start(EMAIL, PASSWORD);
+    let mut agent = agent();
+    assert_eq!(login(&agent, &backend, PASSWORD).status.code(), Some(0));
+    stop(&mut agent);
 
-    let (url, rx) = canned_server(vec![token_ok()]);
+    let (_, key) = transport_from_saved(&agent, &backend.url);
+    let store = outbox(&agent);
+    for minutes in [30, 20] {
+        let pending = PendingActivity::from_activity(&block(minutes), Vec::new()).unwrap();
+        store.enqueue_activity(&scope(), &pending, &key).unwrap();
+    }
+    drop(store);
 
-    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
-
-    // Login via CLI and assert exit status
-    let login_out = Command::new(exe)
-        .args([
-            "login",
-            "--username",
-            "queue-user@dosi.test",
-            "--password",
-            "pass",
-            "--workspace-id",
-            "ws-q",
-            "--server",
-            &url,
-            "--credentials-file",
-            cred_path.to_str().unwrap(),
-        ])
-        .output()
-        .expect("Failed to execute login command");
-
-    assert!(
-        login_out.status.success(),
-        "Login subprocess failed with exit code {:?}",
-        login_out.status.code()
-    );
-    let _ = rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("Token request received");
-
-    // Enqueue 2 entries in outbox
-    let scope = OutboxScope::new("queue-user@dosi.test", "ws-q").unwrap();
-    let outbox = Outbox::open(&db_path, OutboxLimits::default()).unwrap();
-    outbox.enqueue(&scope, &sample_envelope("act-1")).unwrap();
-    outbox.enqueue(&scope, &sample_envelope("act-2")).unwrap();
-
-    // Status inspection with --db
-    let status_out = Command::new(exe)
-        .args([
-            "status",
-            "--account-id",
-            "queue-user@dosi.test",
-            "--workspace-id",
-            "ws-q",
-            "--db",
-            db_path.to_str().unwrap(),
-            "--credentials-file",
-            cred_path.to_str().unwrap(),
-            "--json",
-        ])
-        .output()
-        .expect("Failed to execute status command");
-
-    assert!(
-        status_out.status.success(),
-        "Status command failed with exit code {:?}",
-        status_out.status.code()
-    );
-    let stdout = String::from_utf8_lossy(&status_out.stdout);
-    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(json["queue_depth"], 2);
+    let (code, value) = agent.json(&["status"]);
+    assert_eq!(code, Some(3), "the agent is down");
+    assert_eq!(value["result"]["queue"]["pending"], 2, "{value}");
+    let (code, value) = agent.json(&["queue", "status"]);
+    assert_eq!(code, Some(0));
+    assert_eq!(value["result"]["pending"], 2, "{value}");
+    assert_eq!(value["result"]["source"], "local");
 }
 
 #[test]
 fn test_end_to_end_signed_block_delivery_and_ack_deletion() {
-    let dir = tempdir().unwrap();
-    let db_path = dir.path().join("outbox.db");
-    let cred_path = dir.path().join("credentials.json");
+    let backend = FakeBackend::start(EMAIL, PASSWORD);
+    let mut agent = agent();
+    assert_eq!(login(&agent, &backend, PASSWORD).status.code(), Some(0));
+    stop(&mut agent);
 
-    let (server_url, rx) = canned_server(vec![
-        token_ok(),
-        http_resp("200 OK", &[], r#"{"clientActivityId":"act-signed-slice"}"#),
-    ]);
-    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
-
-    // 1. Login via CLI and assert successful status
-    let login_out = Command::new(exe)
-        .args([
-            "login",
-            "--username",
-            "signer@dosi.test",
-            "--password",
-            "pw",
-            "--workspace-id",
-            "ws-sign",
-            "--server",
-            &server_url,
-            "--credentials-file",
-            cred_path.to_str().unwrap(),
-        ])
-        .output()
-        .expect("Failed to execute login command");
-
+    let (mut transport, key) = transport_from_saved(&agent, &backend.url);
+    let store = outbox(&agent);
+    let activity = block(15);
+    let pending = PendingActivity::from_activity(&activity, Vec::new()).unwrap();
+    store.enqueue_activity(&scope(), &pending, &key).unwrap();
+    let queued = store.peek_ready(&scope(), 10).unwrap();
+    assert_eq!(queued.len(), 1);
     assert!(
-        login_out.status.success(),
-        "Login subprocess failed with exit code {:?}",
-        login_out.status.code()
+        verify_v2_entry(&key, &queued[0]),
+        "the row is signed with the saved key"
     );
-    let login_req = rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("Login request received");
-    assert!(login_req.contains("grant_type=password"));
 
-    // 2. Enqueue activity in outbox
-    let scope = OutboxScope::new("signer@dosi.test", "ws-sign").unwrap();
-    let outbox = Outbox::open(&db_path, OutboxLimits::default()).unwrap();
-    let envelope = sample_envelope("act-signed-slice");
-    outbox.enqueue(&scope, &envelope).unwrap();
-
-    // 3. Construct transport directly from persisted credentials in store (reusing session)
-    let store = FileCredentialStore::new(cred_path.clone());
-    let mut transport =
-        HttpDeliveryTransport::from_store(&store, "signer@dosi.test", Some("ws-sign"))
-            .expect("Failed to construct HttpDeliveryTransport from persisted store");
-
-    let coordinator = SyncPassCoordinator::new(&outbox, SyncPassConfig::default());
-
-    // 4. Execute sync pass using persisted credentials
-    let report = coordinator.run_pass(&scope, &mut transport).unwrap();
+    let report = SyncPassCoordinator::new(&store, SyncPassConfig::default())
+        .run_pass(&scope(), &mut transport)
+        .unwrap();
     assert_eq!(
         report.persisted_acknowledged,
-        vec!["act-signed-slice".to_string()]
+        vec![activity.client_activity_id.clone()]
     );
-    assert_eq!(report.transient_failures.len(), 0);
+    assert!(report.transient_failures.is_empty());
 
-    // 5. Verify payload signature received by canned backend
-    let upload_req = rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("Upload request received");
-    assert!(upload_req.contains("payloadSignature"));
-
-    // Extract signature and verify with signing key from store
-    let creds = store
-        .load("signer@dosi.test", Some("ws-sign"))
-        .unwrap()
-        .expect("Credentials persisted");
-    let key_bytes: [u8; 32] = creds
-        .device_signing_key
-        .expect("Signing key present")
-        .try_into()
-        .expect("32 bytes");
-
-    let body_start = upload_req.find("\r\n\r\n").unwrap() + 4;
-    let body_json = &upload_req[body_start..];
-    let parsed: serde_json::Value = serde_json::from_str(body_json).unwrap();
-    let sig = parsed["payloadSignature"].as_str().unwrap();
-
-    let mut env_check = envelope.clone();
-    env_check.payload_signature = Some(sig.to_string());
-    assert!(
-        verify_activity_envelope(&key_bytes, &env_check),
-        "Uploaded envelope signature must be mathematically valid"
+    // The saved refresh token renewed the sign-in, with the device id.
+    let refresh = backend
+        .requests_to("/connect/token")
+        .into_iter()
+        .find(|r| r.form().get("grant_type").map(String::as_str) == Some("refresh_token"))
+        .expect("a refresh grant");
+    assert!(refresh.form().contains_key("device_id"));
+    // The upload: the row's workspace, the stored signature, null counts.
+    let upload = &backend.requests_to("/api/app/activity")[0];
+    assert_eq!(upload.header("x-workspace-id"), Some(WS_ACME));
+    let body = upload.json();
+    assert_eq!(
+        body["payloadSignature"].as_str(),
+        queued[0].payload_signature.as_deref()
     );
+    assert!(body["keyboardHits"].is_null() && body["mouseClicks"].is_null());
 
-    // 6. Verify outbox queue: entry deleted after positive ack
-    let pending = outbox.peek_pending(&scope, 10).unwrap();
-    assert_eq!(pending.len(), 0);
-
-    // 7. Verify status reports queue depth = 0
-    let status_out = Command::new(exe)
-        .args([
-            "status",
-            "--account-id",
-            "signer@dosi.test",
-            "--workspace-id",
-            "ws-sign",
-            "--db",
-            db_path.to_str().unwrap(),
-            "--credentials-file",
-            cred_path.to_str().unwrap(),
-            "--json",
-        ])
-        .output()
-        .expect("Failed to execute status command");
-
-    assert!(
-        status_out.status.success(),
-        "Status command failed with exit code {:?}",
-        status_out.status.code()
-    );
-    let status_json: serde_json::Value =
-        serde_json::from_str(&String::from_utf8_lossy(&status_out.stdout)).unwrap();
-    assert_eq!(status_json["queue_depth"], 0);
+    // Acknowledged: deleted.
+    assert!(store.peek_ready(&scope(), 10).unwrap().is_empty());
+    drop(store);
+    let (_, value) = agent.json(&["queue", "status"]);
+    assert_eq!(value["result"]["pending"], 0, "{value}");
 }
 
 #[test]
-fn test_end_to_end_mid_upload_server_502_error_retains_row_and_increments_retry() {
-    let dir = tempdir().unwrap();
-    let db_path = dir.path().join("outbox.db");
-    let cred_path = dir.path().join("credentials.json");
+fn test_end_to_end_mid_upload_server_error_retains_row_and_increments_retry() {
+    let backend = FakeBackend::start(EMAIL, PASSWORD);
+    let mut agent = agent();
+    assert_eq!(login(&agent, &backend, PASSWORD).status.code(), Some(0));
+    stop(&mut agent);
+    backend.with(|s| s.activity_mode = ActivityMode::Unavailable);
 
-    let (server_url, rx) = canned_server(vec![
-        token_ok(),
-        http_resp("502 Bad Gateway", &[], r#"{"error":"gateway timeout"}"#),
-    ]);
-    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+    let (mut transport, key) = transport_from_saved(&agent, &backend.url);
+    let store = outbox(&agent);
+    let activity = block(15);
+    store
+        .enqueue_activity(
+            &scope(),
+            &PendingActivity::from_activity(&activity, Vec::new()).unwrap(),
+            &key,
+        )
+        .unwrap();
+    // Another account's row must not be touched.
+    let sentinel = OutboxScope::new("other-user@dosi.test", WS_ACME).unwrap();
+    store
+        .enqueue_activity(
+            &sentinel,
+            &PendingActivity::from_activity(&block(40), Vec::new()).unwrap(),
+            &key,
+        )
+        .unwrap();
 
-    // Login via CLI and assert successful status
-    let login_out = Command::new(exe)
-        .args([
-            "login",
-            "--username",
-            "outage-user@dosi.test",
-            "--password",
-            "pw",
-            "--workspace-id",
-            "ws-outage",
-            "--server",
-            &server_url,
-            "--credentials-file",
-            cred_path.to_str().unwrap(),
-        ])
-        .output()
-        .expect("Failed to execute login command");
-
-    assert!(
-        login_out.status.success(),
-        "Login subprocess failed with exit code {:?}",
-        login_out.status.code()
-    );
-    let _ = rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("Login request received");
-
-    // Enqueue activity in Target Scope
-    let scope = OutboxScope::new("outage-user@dosi.test", "ws-outage").unwrap();
-    let outbox = Outbox::open(&db_path, OutboxLimits::default()).unwrap();
-    let envelope = sample_envelope("act-mid-outage");
-    outbox.enqueue(&scope, &envelope).unwrap();
-
-    // Enqueue sentinel activity in Unrelated Scope B to verify no cross-scope mutation
-    let sentinel_scope = OutboxScope::new("other-user@dosi.test", "ws-sentinel").unwrap();
-    let sentinel_env = sample_envelope("act-sentinel-502");
-    outbox.enqueue(&sentinel_scope, &sentinel_env).unwrap();
-
-    // Construct transport directly from persisted store (reusing session)
-    let store = FileCredentialStore::new(cred_path.clone());
-    let mut transport =
-        HttpDeliveryTransport::from_store(&store, "outage-user@dosi.test", Some("ws-outage"))
-            .expect("Failed to construct transport from store");
-
-    let coordinator = SyncPassCoordinator::new(&outbox, SyncPassConfig::default());
-
-    // Execute sync pass: upload fails transiently on 502 Bad Gateway
-    let report = coordinator.run_pass(&scope, &mut transport).unwrap();
-    assert_eq!(report.persisted_acknowledged.len(), 0);
+    let report = SyncPassCoordinator::new(&store, SyncPassConfig::default())
+        .run_pass(&scope(), &mut transport)
+        .unwrap();
+    assert!(report.persisted_acknowledged.is_empty());
     assert_eq!(report.transient_failures.len(), 1);
     assert_eq!(
         report.transient_failures[0].client_activity_id,
-        "act-mid-outage"
+        activity.client_activity_id
     );
 
-    // Verify target row is RETAINED with retry_count incremented to 1
-    let pending = outbox.peek_pending(&scope, 10).unwrap();
-    assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].client_activity_id, "act-mid-outage");
-    assert_eq!(pending[0].retry_count, 1);
-    assert!(pending[0].last_error.is_some());
-    assert_eq!(pending[0].envelope.description, envelope.description);
-
-    // Verify sentinel row in unrelated scope is completely untouched
-    let sentinel_pending = outbox.peek_pending(&sentinel_scope, 10).unwrap();
-    assert_eq!(sentinel_pending.len(), 1);
-    assert_eq!(sentinel_pending[0].client_activity_id, "act-sentinel-502");
-    assert_eq!(sentinel_pending[0].retry_count, 0);
-    assert_eq!(sentinel_pending[0].last_error, None);
-
-    // Verify status reports queue depth = 1
-    let status_out = Command::new(exe)
-        .args([
-            "status",
-            "--account-id",
-            "outage-user@dosi.test",
-            "--workspace-id",
-            "ws-outage",
-            "--db",
-            db_path.to_str().unwrap(),
-            "--credentials-file",
-            cred_path.to_str().unwrap(),
-            "--json",
-        ])
-        .output()
-        .expect("Failed to execute status command");
-
-    assert!(
-        status_out.status.success(),
-        "Status command failed with exit code {:?}",
-        status_out.status.code()
-    );
-    let status_json: serde_json::Value =
-        serde_json::from_str(&String::from_utf8_lossy(&status_out.stdout)).unwrap();
-    assert_eq!(status_json["queue_depth"], 1);
+    let kept = store.peek_ready(&scope(), 10).unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].retry_count, 1);
+    assert!(kept[0].last_error.is_some());
+    let other = store.peek_ready(&sentinel, 10).unwrap();
+    assert_eq!((other.len(), other[0].retry_count), (1, 0));
+    assert!(other[0].last_error.is_none());
+    drop(store);
+    let (_, value) = agent.json(&["status"]);
+    assert_eq!(value["result"]["queue"]["pending"], 1, "{value}");
 }
 
 #[test]
 fn test_end_to_end_mid_upload_socket_interruption_retains_row_and_increments_retry() {
-    let dir = tempdir().unwrap();
-    let db_path = dir.path().join("outbox.db");
-    let cred_path = dir.path().join("credentials.json");
+    let backend = FakeBackend::start(EMAIL, PASSWORD);
+    let mut agent = agent();
+    assert_eq!(login(&agent, &backend, PASSWORD).status.code(), Some(0));
+    stop(&mut agent);
 
-    let (server_url, rx, server_handle) = interrupting_server();
-    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+    let (server_url, rx, server) = interrupting_server();
+    let (mut transport, key) = transport_from_saved(&agent, &server_url);
+    let store = outbox(&agent);
+    let activity = block(15);
+    store
+        .enqueue_activity(
+            &scope(),
+            &PendingActivity::from_activity(&activity, Vec::new()).unwrap(),
+            &key,
+        )
+        .unwrap();
 
-    // 1. CLI Login against server
-    let login_out = Command::new(exe)
-        .args([
-            "login",
-            "--username",
-            "interrupt-user@dosi.test",
-            "--password",
-            "pw",
-            "--workspace-id",
-            "ws-interrupt",
-            "--server",
-            &server_url,
-            "--credentials-file",
-            cred_path.to_str().unwrap(),
-        ])
-        .output()
-        .expect("Failed to execute login command");
+    let report = SyncPassCoordinator::new(&store, SyncPassConfig::default())
+        .run_pass(&scope(), &mut transport)
+        .unwrap();
+    let token = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(token.contains("grant_type=refresh_token"), "{token}");
+    let upload = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(upload.contains("POST /api/app/activity"));
+    server.join().unwrap();
 
-    assert!(
-        login_out.status.success(),
-        "Login subprocess failed with exit code {:?}",
-        login_out.status.code()
-    );
-    let login_req = rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("Login request received");
-    assert!(login_req.contains("grant_type=password"));
-
-    // 2. Enqueue activity in target scope
-    let scope = OutboxScope::new("interrupt-user@dosi.test", "ws-interrupt").unwrap();
-    let outbox = Outbox::open(&db_path, OutboxLimits::default()).unwrap();
-    let envelope = sample_envelope("act-interrupted-socket");
-    outbox.enqueue(&scope, &envelope).unwrap();
-
-    // 3. Enqueue sentinel activity in unrelated scope to verify cross-scope isolation
-    let sentinel_scope = OutboxScope::new("sentinel-user@dosi.test", "ws-sentinel").unwrap();
-    let sentinel_env = sample_envelope("act-sentinel-intact");
-    outbox.enqueue(&sentinel_scope, &sentinel_env).unwrap();
-
-    // 4. Construct transport directly from store (reusing session)
-    let store = FileCredentialStore::new(cred_path.clone());
-    let mut transport =
-        HttpDeliveryTransport::from_store(&store, "interrupt-user@dosi.test", Some("ws-interrupt"))
-            .expect("Failed to construct transport from store");
-
-    let coordinator = SyncPassCoordinator::new(&outbox, SyncPassConfig::default());
-
-    // 5. Execute sync pass: upload is interrupted mid-upload without valid HTTP response
-    let report = coordinator.run_pass(&scope, &mut transport).unwrap();
-
-    // Wait for server thread with bound
-    let upload_req = rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("Upload request observed by server before interruption");
-    assert!(upload_req.contains("POST /api/app/activity"));
-    server_handle
-        .join()
-        .expect("Server thread finished cleanly");
-
-    // 6. Assertions on delivery outcome:
-    // No acknowledged deletion
-    assert_eq!(report.persisted_acknowledged.len(), 0);
-    // Transient failure reported
+    assert!(report.persisted_acknowledged.is_empty());
     assert_eq!(report.transient_failures.len(), 1);
-    assert_eq!(
-        report.transient_failures[0].client_activity_id,
-        "act-interrupted-socket"
-    );
-
-    // 7. Verify outbox row in target scope is RETAINED with retry_count incremented to 1
-    let pending = outbox.peek_pending(&scope, 10).unwrap();
-    assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].client_activity_id, "act-interrupted-socket");
-    assert_eq!(pending[0].retry_count, 1);
-    assert!(pending[0].last_error.is_some());
-    assert_eq!(pending[0].envelope.description, envelope.description);
-    assert_eq!(pending[0].envelope.started_at, envelope.started_at);
-
-    // 8. Verify sentinel row in unrelated scope is completely untouched
-    let sentinel_pending = outbox.peek_pending(&sentinel_scope, 10).unwrap();
-    assert_eq!(sentinel_pending.len(), 1);
-    assert_eq!(
-        sentinel_pending[0].client_activity_id,
-        "act-sentinel-intact"
-    );
-    assert_eq!(sentinel_pending[0].retry_count, 0);
-    assert_eq!(sentinel_pending[0].last_error, None);
-
-    // 9. Verify CLI status on target scope reports queue depth = 1
-    let status_out = Command::new(exe)
-        .args([
-            "status",
-            "--account-id",
-            "interrupt-user@dosi.test",
-            "--workspace-id",
-            "ws-interrupt",
-            "--db",
-            db_path.to_str().unwrap(),
-            "--credentials-file",
-            cred_path.to_str().unwrap(),
-            "--json",
-        ])
-        .output()
-        .expect("Failed to execute status command");
-
-    assert!(
-        status_out.status.success(),
-        "Status command failed with exit code {:?}",
-        status_out.status.code()
-    );
-    let status_json: serde_json::Value =
-        serde_json::from_str(&String::from_utf8_lossy(&status_out.stdout)).unwrap();
-    assert_eq!(status_json["queue_depth"], 1);
-
-    // 10. Verify CLI status on sentinel scope (has no credentials, fails closed)
-    let status_sentinel = Command::new(exe)
-        .args([
-            "status",
-            "--account-id",
-            "sentinel-user@dosi.test",
-            "--workspace-id",
-            "ws-sentinel",
-            "--db",
-            db_path.to_str().unwrap(),
-            "--credentials-file",
-            cred_path.to_str().unwrap(),
-            "--json",
-        ])
-        .output()
-        .expect("Failed to execute status command on sentinel");
-
-    assert!(!status_sentinel.status.success());
+    let kept = store.peek_ready(&scope(), 10).unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].retry_count, 1);
+    assert_eq!(kept[0].client_activity_id, activity.client_activity_id);
 }
 
 #[test]
 fn test_failed_login_fails_closed_and_cannot_be_counted_as_delivery_evidence() {
-    let dir = tempdir().unwrap();
-    let db_path = dir.path().join("outbox.db");
-    let cred_path = dir.path().join("credentials.json");
-
-    let (url, rx) = canned_server(vec![http_resp(
-        "400 Bad Request",
-        &[],
-        r#"{"error":"invalid_grant","error_description":"Incorrect username or password."}"#,
-    )]);
-
-    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
-
-    // 1. Attempt login with wrong password
-    let login_out = Command::new(exe)
-        .args([
-            "login",
-            "--username",
-            "rejected-user@dosi.test",
-            "--password",
-            "wrong-password",
-            "--workspace-id",
-            "ws-rejected",
-            "--server",
-            &url,
-            "--credentials-file",
-            cred_path.to_str().unwrap(),
-        ])
-        .output()
-        .expect("Failed to execute login command");
-
-    // Assert login fails with non-zero exit code
-    assert!(
-        !login_out.status.success(),
-        "Expected login to fail for invalid credentials"
+    let backend = FakeBackend::start(EMAIL, PASSWORD);
+    let mut agent = agent();
+    let output = login(&agent, &backend, "wrong-password");
+    assert_eq!(output.status.code(), Some(4));
+    let value = parse(&output);
+    assert_eq!(value["error"]["code"], "sign_in_failed");
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(login_out.status.code(), Some(1));
-
-    // Assert safe diagnostics: zero credentials leaked
-    let stderr = String::from_utf8_lossy(&login_out.stderr);
-    assert!(stderr.contains("Authentication failed"));
-    assert!(!stderr.contains("wrong-password"));
-
-    let _ = rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("Token request observed");
-
-    // 2. Assert no credentials stored for this scope
-    let store = FileCredentialStore::new(cred_path.clone());
-    let loaded = store
-        .load("rejected-user@dosi.test", Some("ws-rejected"))
-        .unwrap();
-    assert_eq!(
-        loaded, None,
-        "Failed login must never persist credentials to store"
-    );
-
-    // 3. Status inspection must fail closed
-    let status_out = Command::new(exe)
-        .args([
-            "status",
-            "--account-id",
-            "rejected-user@dosi.test",
-            "--workspace-id",
-            "ws-rejected",
-            "--credentials-file",
-            cred_path.to_str().unwrap(),
-        ])
-        .output()
-        .expect("Failed to execute status command");
-
-    assert!(
-        !status_out.status.success(),
-        "Status must fail closed when credentials are absent"
-    );
-
-    // 4. Enqueue activity in outbox
-    let scope = OutboxScope::new("rejected-user@dosi.test", "ws-rejected").unwrap();
-    let outbox = Outbox::open(&db_path, OutboxLimits::default()).unwrap();
-    let env = sample_envelope("act-unauth");
-    outbox.enqueue(&scope, &env).unwrap();
-
-    // 5. Attempting to construct transport from store fails closed
-    let transport_err =
-        HttpDeliveryTransport::from_store(&store, "rejected-user@dosi.test", Some("ws-rejected"));
-    assert!(
-        transport_err.is_err(),
-        "Transport cannot be created from non-existent credentials"
-    );
-
-    // 6. Verify outbox row remains untouched with retry_count = 0, zero deletions
-    let pending = outbox.peek_pending(&scope, 10).unwrap();
-    assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].client_activity_id, "act-unauth");
-    assert_eq!(pending[0].retry_count, 0);
-    assert_eq!(pending[0].last_error, None);
+    assert!(!all.contains("wrong-password"));
+    assert_eq!(agent.snapshot()["status"], "signed_out");
+    stop(&mut agent);
+    // Nothing was saved: no transport can be built from it.
+    assert!(file_store(&agent).load_account(EMAIL).unwrap().is_none());
+    assert!(backend.requests_to("/api/app/activity").is_empty());
 }
 
-#[test]
-fn test_cli_login_short_grant_stores_actual_expiry_upper_bound() {
-    let dir = tempdir().unwrap();
-    let cred_path = dir.path().join("credentials.json");
-
-    // Loopback in-process fake token endpoint returning short expires_in: 5
-    let short_token_response = http_resp(
-        "200 OK",
-        &[],
-        r#"{"access_token":"short-live-token-5s","token_type":"Bearer","expires_in":5,"refresh_token":"short-refresh-5s"}"#,
-    );
-    let (url, _rx) = canned_server(vec![short_token_response]);
-
-    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
-
-    let login_time_before = Utc::now();
-
-    // Actual CLI login via subprocess
-    let login_out = Command::new(exe)
-        .args([
-            "login",
-            "--username",
-            "short-tester@dosi.test",
-            "--password",
-            "test-pass",
-            "--workspace-id",
-            "ws-short",
-            "--server",
-            &url,
-            "--credentials-file",
-            cred_path.to_str().unwrap(),
-        ])
-        .output()
-        .expect("Failed to execute login command");
-
-    assert!(
-        login_out.status.success(),
-        "Login failed with status code {:?}",
-        login_out.status.code()
-    );
-
-    let login_time_after = Utc::now();
-
-    // Inspect persisted credentials from disk
-    let store = FileCredentialStore::new(cred_path);
-    let creds = store
-        .load("short-tester@dosi.test", Some("ws-short"))
-        .expect("Store load should succeed")
-        .expect("Credentials must be saved");
-
-    assert_eq!(creds.access_token.as_deref(), Some("short-live-token-5s"));
-    assert_eq!(creds.refresh_token.as_deref(), Some("short-refresh-5s"));
-
-    let expires_at = creds
-        .access_token_expires_at
-        .expect("access_token_expires_at must be populated from server response");
-
-    // Defect regression check: Must NEVER be extended to 3600 seconds!
-    // The delta from login time must be bounded by the actual 5-second grant (e.g. <= 6s).
-    let delta_from_before = (expires_at - login_time_before).num_seconds();
-    let delta_from_after = (expires_at - login_time_after).num_seconds();
-
-    assert!(
-        delta_from_before <= 6,
-        "Persisted expiry delta ({}s) exceeded actual server grant (5s); token was extended!",
-        delta_from_before
-    );
-    assert!(
-        delta_from_after >= 3,
-        "Persisted expiry delta ({}s) too short; expected ~5s grant",
-        delta_from_after
-    );
-    let expiry_not_extended = delta_from_before <= 6;
-    assert!(
-        expiry_not_extended,
-        "Regression probe condition failed: expiry was extended beyond server lifetime"
-    );
-}
-
-#[test]
-fn test_cli_login_json_success_and_redaction() {
-    let dir = tempdir().unwrap();
-    let cred_path = dir.path().join("credentials.json");
-
-    let server_response = http_resp(
-        "200 OK",
-        &[],
-        r#"{"access_token":"canary-access-token-999","token_type":"Bearer","expires_in":3600,"refresh_token":"canary-refresh-token-888"}"#,
-    );
-    let (url, _rx) = canned_server(vec![server_response]);
-
-    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
-
-    let out = Command::new(exe)
-        .args([
-            "login",
-            "--username",
-            "json-user@dosi.test",
-            "--password",
-            "canary-secret-pass-777",
-            "--workspace-id",
-            "ws-json",
-            "--server",
-            &url,
-            "--credentials-file",
-            cred_path.to_str().unwrap(),
-            "--json",
-        ])
-        .output()
-        .expect("Failed to execute login --json command");
-
-    assert_eq!(out.status.code(), Some(0));
-
-    let stdout_str = String::from_utf8_lossy(&out.stdout);
-    let stderr_str = String::from_utf8_lossy(&out.stderr);
-
-    // Verify stdout is pure parseable JSON
-    let json: serde_json::Value = serde_json::from_str(&stdout_str).expect("Valid JSON on stdout");
-    assert_eq!(json["success"], true);
-    assert_eq!(json["account_id"], "json-user@dosi.test");
-    assert_eq!(json["workspace_id"], "ws-json");
-    assert_eq!(json["server_url"], url);
-    assert_eq!(json["has_signing_key"], true);
-    assert!(json["store_backend"].is_string());
-    assert!(json["token_expires_in_secs"].as_i64().unwrap_or(0) > 0);
-    assert!(json.get("error").is_none() || json["error"].is_null());
-
-    // Verify zero secret canaries leaked in stdout or stderr
-    assert!(!stdout_str.contains("canary-secret-pass-777"));
-    assert!(!stderr_str.contains("canary-secret-pass-777"));
-    assert!(!stdout_str.contains("canary-access-token-999"));
-    assert!(!stderr_str.contains("canary-access-token-999"));
-    assert!(!stdout_str.contains("canary-refresh-token-888"));
-    assert!(!stderr_str.contains("canary-refresh-token-888"));
-
-    // Verify credentials actually saved to disk
-    let store = FileCredentialStore::new(cred_path);
-    let saved = store
-        .load("json-user@dosi.test", Some("ws-json"))
-        .unwrap()
-        .expect("Credentials must be saved");
-    assert_eq!(saved.account_id, "json-user@dosi.test");
-    assert_eq!(saved.workspace_id.as_deref(), Some("ws-json"));
-    assert_eq!(
-        saved.access_token.as_deref(),
-        Some("canary-access-token-999")
-    );
-    assert_eq!(
-        saved.refresh_token.as_deref(),
-        Some("canary-refresh-token-888")
-    );
-    assert!(saved.device_signing_key.is_some());
-}
-
-#[test]
-fn test_cli_login_json_auth_rejection_and_redaction() {
-    let dir = tempdir().unwrap();
-    let cred_path = dir.path().join("credentials.json");
-
-    let server_response = http_resp(
-        "401 Unauthorized",
-        &[],
-        r#"{"error":"invalid_grant","error_description":"Bad credentials"}"#,
-    );
-    let (url, _rx) = canned_server(vec![server_response]);
-
-    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
-
-    let out = Command::new(exe)
-        .args([
-            "login",
-            "--username",
-            "rejected-json@dosi.test",
-            "--password",
-            "canary-rejected-pass-555",
-            "--workspace-id",
-            "ws-rejected-json",
-            "--server",
-            &url,
-            "--credentials-file",
-            cred_path.to_str().unwrap(),
-            "--json",
-        ])
-        .output()
-        .expect("Failed to execute login --json command");
-
-    assert_eq!(out.status.code(), Some(1));
-
-    let stdout_str = String::from_utf8_lossy(&out.stdout);
-    let stderr_str = String::from_utf8_lossy(&out.stderr);
-
-    // Verify stdout is pure parseable JSON with failure status
-    let json: serde_json::Value = serde_json::from_str(&stdout_str).expect("Valid JSON on stdout");
-    assert_eq!(json["success"], false);
-    assert!(
-        json["error"]
-            .as_str()
-            .unwrap()
-            .contains("Authentication failed"),
-        "Expected error message indicating auth failure, got: {:?}",
-        json["error"]
-    );
-
-    // Verify zero secret canaries leaked in stdout or stderr
-    assert!(!stdout_str.contains("canary-rejected-pass-555"));
-    assert!(!stderr_str.contains("canary-rejected-pass-555"));
-
-    // Verify store load returns None (zero credentials persisted)
-    let store = FileCredentialStore::new(cred_path);
-    assert_eq!(
-        store
-            .load("rejected-json@dosi.test", Some("ws-rejected-json"))
-            .unwrap(),
-        None
-    );
-}
-
-#[test]
-fn test_cli_login_json_credential_store_failure() {
-    let dir = tempdir().unwrap();
-    // Use an existing directory path as the credential file path to force store.save error
-    let cred_dir_path = dir.path().to_path_buf();
-
-    let server_response = token_ok();
-    let (url, _rx) = canned_server(vec![server_response]);
-
-    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
-
-    let out = Command::new(exe)
-        .args([
-            "login",
-            "--username",
-            "store-fail@dosi.test",
-            "--password",
-            "canary-store-fail-pass-444",
-            "--workspace-id",
-            "ws-store-fail",
-            "--server",
-            &url,
-            "--credentials-file",
-            cred_dir_path.to_str().unwrap(),
-            "--json",
-        ])
-        .output()
-        .expect("Failed to execute login --json command");
-
-    assert_eq!(out.status.code(), Some(1));
-
-    let stdout_str = String::from_utf8_lossy(&out.stdout);
-    let stderr_str = String::from_utf8_lossy(&out.stderr);
-
-    let json: serde_json::Value = serde_json::from_str(&stdout_str).expect("Valid JSON on stdout");
-    assert_eq!(json["success"], false);
-    assert!(
-        json["error"]
-            .as_str()
-            .unwrap()
-            .contains("Failed to securely store credentials"),
-        "Expected store save error, got: {:?}",
-        json["error"]
-    );
-
-    assert!(!stdout_str.contains("canary-store-fail-pass-444"));
-    assert!(!stderr_str.contains("canary-store-fail-pass-444"));
-}
-
-#[test]
-fn test_cli_logout_json_scoped_success_and_idempotence() {
-    let dir = tempdir().unwrap();
-    let cred_path = dir.path().join("credentials.json");
-    let store = FileCredentialStore::new(cred_path.clone());
-
-    let mut creds = Credentials::new("logout-user@dosi.test", Some("pass123".to_string()));
-    creds.workspace_id = Some("ws-scoped".to_string());
-    creds.server_url = Some("https://api.dosi.app".to_string());
-    creds.access_token = Some("valid-token".to_string());
-    creds.device_signing_key = Some(vec![1, 2, 3]);
-    store.save(&creds).unwrap();
-
-    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
-
-    // 1. Scoped logout with --json
-    let out = Command::new(exe)
-        .args([
-            "logout",
-            "--account-id",
-            "logout-user@dosi.test",
-            "--workspace-id",
-            "ws-scoped",
-            "--credentials-file",
-            cred_path.to_str().unwrap(),
-            "--json",
-        ])
-        .output()
-        .expect("Failed to execute logout --json command");
-
-    assert_eq!(out.status.code(), Some(0));
-
-    let stdout_str = String::from_utf8_lossy(&out.stdout);
-    let json: serde_json::Value = serde_json::from_str(&stdout_str).expect("Valid JSON on stdout");
-    assert_eq!(json["success"], true);
-    assert_eq!(json["account_id"], "logout-user@dosi.test");
-    assert_eq!(json["workspace_id"], "ws-scoped");
-    assert_eq!(json["cleared_all_workspaces"], false);
-    assert!(json["store_backend"].is_string());
-    assert!(json.get("error").is_none() || json["error"].is_null());
-
-    // Assert credentials cleared
-    assert_eq!(
-        store
-            .load("logout-user@dosi.test", Some("ws-scoped"))
-            .unwrap(),
-        None
-    );
-
-    // 2. Idempotent re-invocation: same logout --json succeeds cleanly
-    let out_again = Command::new(exe)
-        .args([
-            "logout",
-            "--account-id",
-            "logout-user@dosi.test",
-            "--workspace-id",
-            "ws-scoped",
-            "--credentials-file",
-            cred_path.to_str().unwrap(),
-            "--json",
-        ])
-        .output()
-        .expect("Failed to execute idempotent logout --json command");
-
-    assert_eq!(out_again.status.code(), Some(0));
-    let stdout_again = String::from_utf8_lossy(&out_again.stdout);
-    let json_again: serde_json::Value =
-        serde_json::from_str(&stdout_again).expect("Valid JSON on idempotent logout stdout");
-    assert_eq!(json_again["success"], true);
-}
-
-#[test]
-fn test_cli_logout_json_preserves_cross_workspace_credentials() {
-    let dir = tempdir().unwrap();
-    let cred_path = dir.path().join("credentials.json");
-    let store = FileCredentialStore::new(cred_path.clone());
-
-    // Save ws-alpha
-    let mut cred_alpha = Credentials::new("multi-ws@dosi.test", Some("pass-alpha".to_string()));
-    cred_alpha.workspace_id = Some("ws-alpha".to_string());
-    cred_alpha.access_token = Some("token-alpha".to_string());
-    store.save(&cred_alpha).unwrap();
-
-    // Save ws-beta
-    let mut cred_beta = Credentials::new("multi-ws@dosi.test", Some("pass-beta".to_string()));
-    cred_beta.workspace_id = Some("ws-beta".to_string());
-    cred_beta.access_token = Some("token-beta".to_string());
-    store.save(&cred_beta).unwrap();
-
-    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
-
-    // Clear ws-alpha only
-    let out = Command::new(exe)
-        .args([
-            "logout",
-            "--account-id",
-            "multi-ws@dosi.test",
-            "--workspace-id",
-            "ws-alpha",
-            "--credentials-file",
-            cred_path.to_str().unwrap(),
-            "--json",
-        ])
-        .output()
-        .expect("Failed to execute logout --json");
-
-    assert_eq!(out.status.code(), Some(0));
-
-    // ws-alpha must be gone
-    assert_eq!(
-        store.load("multi-ws@dosi.test", Some("ws-alpha")).unwrap(),
-        None
-    );
-
-    // ws-beta must remain intact
-    let loaded_beta = store
-        .load("multi-ws@dosi.test", Some("ws-beta"))
-        .unwrap()
-        .expect("ws-beta credentials must remain untouched");
-    assert_eq!(loaded_beta.access_token.as_deref(), Some("token-beta"));
-}
-
-#[test]
-fn test_cli_login_and_logout_json_errors_and_canary_redaction() {
-    let dir = tempdir().unwrap();
-    let cred_path = dir.path().join("credentials.json");
-    let exe = env!("CARGO_BIN_EXE_dosi-tracker-linux");
-
-    let canary_pos = "CANARY_SECRET_POS_VAL_12345";
-    let canary_flag_val = "CANARY_SECRET_FLAG_VAL_67890";
-
-    // 1. logout --json missing required --account-id
-    let out_missing_acc = Command::new(exe)
-        .args([
-            "logout",
-            "--workspace-id",
-            "ws-test",
-            "--credentials-file",
-            cred_path.to_str().unwrap(),
-            "--json",
-        ])
-        .output()
-        .expect("Failed to execute logout --json");
-
-    assert_eq!(out_missing_acc.status.code(), Some(1));
-    let stdout_missing = String::from_utf8_lossy(&out_missing_acc.stdout);
-    let json_missing: serde_json::Value =
-        serde_json::from_str(&stdout_missing).expect("Valid JSON on stdout");
-    assert_eq!(json_missing["success"], false);
-    assert!(json_missing["error"]
-        .as_str()
-        .unwrap()
-        .contains("Missing required option: --account-id"));
-
-    // 2. logout --json with secret positional argument and secret-valued flag
-    let out_logout_canaries = Command::new(exe)
-        .args([
-            "logout",
-            "--account-id",
-            "user@dosi.test",
-            canary_pos,
-            &format!("--bogus-option={}", canary_flag_val),
-            "--json",
-        ])
-        .output()
-        .expect("Failed to execute logout --json");
-
-    assert_eq!(out_logout_canaries.status.code(), Some(1));
-    let stdout_logout_canary = String::from_utf8_lossy(&out_logout_canaries.stdout);
-    let stderr_logout_canary = String::from_utf8_lossy(&out_logout_canaries.stderr);
-    let json_logout_canary: serde_json::Value =
-        serde_json::from_str(&stdout_logout_canary).expect("Valid JSON on stdout");
-    assert_eq!(json_logout_canary["success"], false);
-
-    assert!(!stdout_logout_canary.contains(canary_pos));
-    assert!(!stderr_logout_canary.contains(canary_pos));
-    assert!(!stdout_logout_canary.contains(canary_flag_val));
-    assert!(!stderr_logout_canary.contains(canary_flag_val));
-
-    // 3. login --json missing required options
-    let out_login_missing = Command::new(exe)
-        .args(["login", "--json"])
-        .output()
-        .expect("Failed to execute login --json");
-
-    assert_eq!(out_login_missing.status.code(), Some(1));
-    let stdout_login_missing = String::from_utf8_lossy(&out_login_missing.stdout);
-    let json_login_missing: serde_json::Value =
-        serde_json::from_str(&stdout_login_missing).expect("Valid JSON on stdout");
-    assert_eq!(json_login_missing["success"], false);
-    assert!(json_login_missing["error"]
-        .as_str()
-        .unwrap()
-        .contains("Missing required option"));
-
-    // 4. login --json with secret positional argument and secret-valued flag
-    let out_login_canaries = Command::new(exe)
-        .args([
-            "login",
-            "--username",
-            "user@dosi.test",
-            canary_pos,
-            &format!("--unrecognized-flag={}", canary_flag_val),
-            "--json",
-        ])
-        .output()
-        .expect("Failed to execute login --json");
-
-    assert_eq!(out_login_canaries.status.code(), Some(1));
-    let stdout_login_canary = String::from_utf8_lossy(&out_login_canaries.stdout);
-    let stderr_login_canary = String::from_utf8_lossy(&out_login_canaries.stderr);
-    let json_login_canary: serde_json::Value =
-        serde_json::from_str(&stdout_login_canary).expect("Valid JSON on stdout");
-    assert_eq!(json_login_canary["success"], false);
-
-    assert!(!stdout_login_canary.contains(canary_pos));
-    assert!(!stderr_login_canary.contains(canary_pos));
-    assert!(!stdout_login_canary.contains(canary_flag_val));
-    assert!(!stderr_login_canary.contains(canary_flag_val));
-}
+// ---- Transport scope binding (library level) ------------------------------------------------
 
 #[test]
 fn test_transport_scope_binding_account_mismatch_same_workspace() {

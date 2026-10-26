@@ -4,6 +4,7 @@ use std::process::Command;
 use chrono::{Duration, Utc};
 use dosi_tracker_linux::outbox::{
     ActivityEnvelope, EnqueueResult, Outbox, OutboxError, OutboxLimits, OutboxScope,
+    OUTBOX_SCHEMA_VERSION,
 };
 use tempfile::tempdir;
 
@@ -410,7 +411,7 @@ fn test_doctor_and_help_remain_strictly_nonmutating() {
 
     fs::create_dir_all(&fake_home).unwrap();
 
-    let bin_path = env!("CARGO_BIN_EXE_dosi-tracker-linux");
+    let bin_path = env!("CARGO_BIN_EXE_dosi-tracker");
 
     // Run doctor command
     let doctor_status = Command::new(bin_path)
@@ -739,15 +740,16 @@ fn test_future_store_version_fails_closed_without_downgrade() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("future.db");
 
-    // Manually create SQLite file stamped with future user_version = 2
+    // Manually create SQLite file stamped with future user_version = 3 (this
+    // build writes store version 2)
     {
         let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.pragma_update(None, "user_version", 2).unwrap();
+        conn.pragma_update(None, "user_version", 3).unwrap();
     }
 
     let res = Outbox::open(&db_path, OutboxLimits::default());
     assert!(
-        matches!(res.unwrap_err(), OutboxError::UnsupportedStoreVersion(2)),
+        matches!(res.unwrap_err(), OutboxError::UnsupportedStoreVersion(3)),
         "Expected UnsupportedStoreVersion for future store"
     );
 
@@ -756,11 +758,11 @@ fn test_future_store_version_fails_closed_without_downgrade() {
     let ver: u32 = conn
         .query_row("PRAGMA user_version;", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(ver, 2, "Future version must not be downgraded");
+    assert_eq!(ver, 3, "Future version must not be downgraded");
 }
 
 #[test]
-fn test_store_version_1_persisted_and_reopened_cleanly() {
+fn test_current_store_version_persisted_and_reopened_cleanly() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("version1.db");
     let scope = OutboxScope::new("user-1", "workspace-1").unwrap();
@@ -777,7 +779,11 @@ fn test_store_version_1_persisted_and_reopened_cleanly() {
     let ver: u32 = conn
         .query_row("PRAGMA user_version;", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(ver, 1, "Store version 1 must be stamped on database");
+    assert_eq!(
+        ver, OUTBOX_SCHEMA_VERSION,
+        "The current store version (2) must be stamped on database"
+    );
+    assert_eq!(OUTBOX_SCHEMA_VERSION, 2);
 
     // Reopen via Outbox
     let reopened = Outbox::open(&db_path, OutboxLimits::default()).unwrap();
@@ -1125,4 +1131,64 @@ fn test_outbox_lock_poisoning_returns_recoverable_error() {
 
     let err_count = outbox.count(Some(&scope)).unwrap_err();
     assert!(matches!(err_count, OutboxError::LockPoisoned));
+}
+
+#[test]
+fn test_parked_v1_rows_leave_the_queue_without_being_deleted() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("outbox.db");
+    let outbox = Outbox::open(&db_path, OutboxLimits::default()).unwrap();
+    let scope = OutboxScope::new("user-1", "workspace-1").unwrap();
+    outbox
+        .enqueue(&scope, &synthetic_envelope("act-refused", Some("Refused")))
+        .unwrap();
+    outbox
+        .enqueue(&scope, &synthetic_envelope("act-next", Some("Next")))
+        .unwrap();
+
+    outbox
+        .park(&scope, "act-refused", "Overlaps another block.")
+        .unwrap();
+
+    let pending = outbox.peek_pending(&scope, 10).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].client_activity_id, "act-next");
+    assert_eq!(outbox.pending_count(&scope).unwrap(), 1);
+    assert_eq!(
+        outbox.count(Some(&scope)).unwrap(),
+        2,
+        "parked rows are kept"
+    );
+
+    // A parked row takes no more attempts and cannot be acknowledged twice.
+    assert!(matches!(
+        outbox.mark_attempt_failed(&scope, "act-refused", "again"),
+        Err(OutboxError::RecordNotFound { .. })
+    ));
+    // Parking another scope's row is refused.
+    let other = OutboxScope::new("user-2", "workspace-1").unwrap();
+    assert!(matches!(
+        outbox.park(&other, "act-next", "x"),
+        Err(OutboxError::RecordNotFound { .. })
+    ));
+
+    // The state survives a reopen.
+    drop(outbox);
+    let reopened = Outbox::open(&db_path, OutboxLimits::default()).unwrap();
+    assert_eq!(reopened.peek_pending(&scope, 10).unwrap().len(), 1);
+    let summary = reopened.queue_summary("user-1").unwrap();
+    assert_eq!((summary.pending, summary.parked), (1, 1));
+}
+
+#[test]
+fn test_garbage_files_are_refused_as_corrupt_and_left_untouched() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("outbox.db");
+    fs::write(&db_path, b"\x00\x01garbage that is not SQLite").unwrap();
+    let err = Outbox::open(&db_path, OutboxLimits::default()).unwrap_err();
+    assert!(matches!(err, OutboxError::CorruptDatabase(_)), "{err}");
+    assert_eq!(
+        fs::read(&db_path).unwrap(),
+        b"\x00\x01garbage that is not SQLite"
+    );
 }

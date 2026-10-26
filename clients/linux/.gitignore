@@ -1,0 +1,4 @@
+# Cargo output (the root .gitignore also lists it).
+/target/
+# The root .gitignore drops every bin/ directory; the GUI binary lives in src/bin.
+!/src/bin/

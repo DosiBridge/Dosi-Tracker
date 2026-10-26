@@ -1,9 +1,13 @@
 //! Integration and invariant tests for the Linux rootless installer lifecycle.
 //!
 //! Enforces:
-//! - Static safety: no `sudo`, no `curl | sh`, no network downloads, no autostart.
-//! - Execution of rootless installer script in isolated temporary prefixes.
-//! - Manifest generation and ownership tracking.
+//! - Static safety: no `sudo`, no `curl | sh`, no network downloads, nothing
+//!   enabled (no autostart entry, no `systemctl enable/start`; the only
+//!   systemctl call is `systemctl --user daemon-reload`).
+//! - Execution of the rootless installer in isolated temporary prefixes
+//!   (`tests/test_installer_lifecycle.sh`, Linux only).
+//! - Manifest format 2 generation, inventory confinement, format 1 migration,
+//!   update/rollback, uninstall and purge.
 //! - Preservation of foreign/unrelated files and user configuration.
 
 use std::fs;
@@ -62,15 +66,45 @@ fn installer_static_safety_and_hygiene_invariants() {
         "install.sh must not contain curl-pipe-shell patterns"
     );
 
-    // Invariant: No autostart or systemd service installation
+    // Invariant: nothing is enabled or started by the installer. The only
+    // systemctl call reloads the user manager after the unit file changed.
+    for line in content.lines() {
+        let code = line.trim();
+        if code.starts_with('#') || !code.contains("systemctl") {
+            continue;
+        }
+        if code.starts_with("if command -v systemctl") {
+            continue;
+        }
+        assert!(
+            code.contains("systemctl --user daemon-reload"),
+            "install.sh may only run `systemctl --user daemon-reload`: {code}"
+        );
+    }
     assert!(
-        !content.contains("systemctl"),
-        "install.sh must not register systemd services in this slice"
+        !content.contains("/etc/systemd") && !content.contains("/etc/xdg"),
+        "install.sh must not write to system directories"
     );
     assert!(
-        !content.contains("/etc/systemd"),
-        "install.sh must not write to systemd directories"
+        !content.contains(".config/autostart"),
+        "install.sh must never write an autostart entry"
     );
+    // `service enable` (the user's choice) is only ever suggested, never run:
+    // no line invokes a binary (a path variable, the bare program name, or
+    // the quiet runner) with it.
+    for line in content.lines() {
+        let code = line.trim();
+        if code.starts_with('#') || !code.contains("service enable") {
+            continue;
+        }
+        assert!(
+            !code.contains("}\" service enable")
+                && !code.contains("} service enable")
+                && !code.starts_with("dosi-tracker service enable")
+                && !code.starts_with("run_cli_quiet"),
+            "install.sh must not run `service enable`: {code}"
+        );
+    }
 
     // Invariant: Uninstall script exists and delegates
     let uninstall_path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -117,6 +151,9 @@ fn installer_help_and_version_invocations_exit_zero() {
     assert!(help_str.contains("rollback"));
     assert!(help_str.contains("uninstall"));
     assert!(help_str.contains("INVARIANTS:"));
+    assert!(help_str.contains("--server"));
+    assert!(help_str.contains("--purge"));
+    assert!(help_str.contains("Never enables anything"));
 
     // 2. --version
     let ver_output = Command::new(&bash)
@@ -129,9 +166,30 @@ fn installer_help_and_version_invocations_exit_zero() {
         "install.sh --version must exit 0"
     );
     let ver_str = String::from_utf8_lossy(&ver_output.stdout);
-    assert!(ver_str.contains("dosi-tracker-linux installer version 0.1.0"));
+    assert!(ver_str.contains(&format!(
+        "dosi-tracker installer version {}",
+        env!("CARGO_PKG_VERSION")
+    )));
+
+    // 3. Usage errors exit 2 before anything runs.
+    for args in [
+        &["--no-such-flag"][..],
+        &["install", "--purge"][..],
+        &["uninstall", "--server", "https://tracker.example.com"][..],
+        &["install", "--prefix"][..],
+    ] {
+        let output = Command::new(&bash)
+            .arg(&script_path)
+            .args(args)
+            .output()
+            .expect("failed executing install.sh");
+        assert_eq!(output.status.code(), Some(2), "install.sh {args:?}");
+    }
 }
 
+/// The full lifecycle suite (it builds the release binaries and runs the
+/// installer against fakes and the real CLI); the installer is Linux-only.
+#[cfg(target_os = "linux")]
 #[test]
 fn installer_lifecycle_full_suite_passes() {
     let bash = match find_bash_interpreter() {

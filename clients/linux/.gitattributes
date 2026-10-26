@@ -1,0 +1,5 @@
+# The Linux agent is built and tested on Linux (also from a Windows checkout
+# bind-mounted into Docker): keep LF in the working tree so scripts run.
+* text=auto eol=lf
+*.png binary
+*.jpg binary

@@ -1,0 +1,28 @@
+[Unit]
+Description=Dosi Tracker agent (per-user time tracking; never runs as root)
+Documentation=https://github.com/DosiBridge/Dosi-Tracker/tree/main/clients/linux#readme
+After=graphical-session.target
+PartOf=graphical-session.target
+ConditionUser=!root
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=notify
+NotifyAccess=main
+EnvironmentFile=-%t/dosi-tracker-session.env
+ExecStart=@BINDIR@/dosi-tracker daemon --systemd
+Restart=on-failure
+RestartSec=10s
+RestartForceExitStatus=75
+TimeoutStopSec=30s
+KillMode=mixed
+UMask=0077
+NoNewPrivileges=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+# No ProtectSystem/ProtectHome/PrivateTmp: user managers cannot always create mount namespaces
+# (Ubuntu 24.04 AppArmor userns restrictions). No [Install]: started by the autostart hook or the CLI.

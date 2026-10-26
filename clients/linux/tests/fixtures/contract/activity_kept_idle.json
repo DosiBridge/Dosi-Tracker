@@ -1,0 +1,29 @@
+{
+  "clientActivityId": "2d7a5c33-4d15-4d2e-85c3-3a6d9d4b0b33",
+  "projectId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "startedAt": "2026-10-05T11:00:00Z",
+  "endedAt": "2026-10-05T11:03:00Z",
+  "description": "Whiteboard session",
+  "productivity": 0,
+  "mouseClicks": 0,
+  "keyboardHits": 0,
+  "activeWindows": [],
+  "runningPrograms": [],
+  "timeline": [
+    { "minute": 0, "keyboardHits": 0, "mouseClicks": 0, "active": false, "activeSeconds": 0 },
+    { "minute": 1, "keyboardHits": 0, "mouseClicks": 0, "active": false, "activeSeconds": 0 },
+    { "minute": 2, "keyboardHits": 0, "mouseClicks": 0, "active": false, "activeSeconds": 0 }
+  ],
+  "platform": "linux",
+  "osVersion": "Ubuntu 22.04.5 LTS (Linux 6.8.0-45-generic)",
+  "agentVersion": "0.1.0",
+  "deviceId": "5b0c1b9e-8f2c-4a43-9a51-0c7f6f2d9b11",
+  "deviceName": "workstation-1",
+  "timeZone": "Asia/Dhaka",
+  "utcOffsetMinutes": 360,
+  "idleSeconds": 180,
+  "endReason": "idle",
+  "sentAt": "2026-10-05T11:03:05Z",
+  "injectedInputEvents": 0,
+  "payloadSignature": "c2lnbmF0dXJl"
+}
