@@ -44,8 +44,8 @@ container's environment there).
 #### AI assist (off by default)
 
 AI assist will send aggregated tracker data to an OpenAI-protocol provider, only in workspaces whose owner turns it on.
-So far the server has the provider configuration, the workspace settings and the usage views; no feature calls the
-provider yet. It is off unless `AI__Enabled=true`.
+So far the server has the provider configuration, the workspace settings, the usage views and the toolkit that
+prepares requests and checks answers; no feature calls the provider yet. It is off unless `AI__Enabled=true`.
 
 - **Owners opt in** (`PUT /api/app/ai-assist/settings`) after acknowledging the current disclosure version
   (`"1.{AI:Disclosure:Version}"`); turning on window titles or task notes needs the same acknowledgement. Every change
@@ -59,6 +59,13 @@ provider yet. It is off unless `AI__Enabled=true`.
 - **The usage ledger** (`AppAiUsageRecords`) holds one row per served request (feature, tokens, cost, outcome; never a
   prompt, an answer or a name). Rows older than `AI__Usage__RetentionDays` (400) are deleted daily. A deleted
   workspace's ledger and consent history are purged with the rest of its data.
+- **What a request may carry** (`Application/AiAssist/Context`, `Prompts`, `Output`): people only as handles (`M1`…,
+  the reader as `ME`), every value as a server-formatted fact (`F1`…), and project, app, task, title and note text
+  only after it is sanitized (no tags, placeholders, links, paths, addresses, long numbers, credentials or
+  instruction-shaped phrases). Answers must cite those ids instead of writing numbers or names, use no judging terms,
+  links or markup, and are rendered from the reader's own data. Golden tests pin the exact messages.
+- **Data quality** (`GET /api/app/reporting/data-quality`, a regular report, scoped like the others): per member, the
+  blocks, tracked and unmeasured minutes, the largest device clock skew and the blocks with software-generated input.
 
 At start-up the host logs one line with the provider state (`Disabled`,
 `Configured`, or what is missing). The key is never logged, and it must never be written into a tracked file:

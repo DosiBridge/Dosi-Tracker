@@ -1,5 +1,6 @@
 using System.Net;
 using Dosi.Tracker.AiAssist;
+using Dosi.Tracker.AiAssist.Prompts;
 using Dosi.Tracker.AiAssist.Provider;
 using Microsoft.Extensions.Options;
 using Shouldly;
@@ -33,6 +34,16 @@ public class AiAssistRegistrationTests : TrackerTestBase<TrackerHttpApiServerTes
         options.Enabled.ShouldBeFalse();
         options.OpenAI.AllowedHosts.ShouldBe("api.openai.com");
         options.Quotas.For("Free").MonthlyRequests.ShouldBe(50);
+    }
+
+    [Fact]
+    public void Prompts_Are_Delimited_With_Random_Nonces()
+    {
+        var nonces = GetRequiredService<INonceSource>();
+
+        nonces.ShouldBeOfType<RandomNonceSource>();
+        nonces.ShouldBeSameAs(GetRequiredService<INonceSource>());
+        GetRequiredService<AiPromptBuilder>().ShouldNotBeNull();
     }
 
     [Theory]
