@@ -6,9 +6,10 @@ import Foundation
 // per-state glyph, the session timer as its title while tracking, a tooltip
 // with the status and today's total, and the everyday actions one click away
 // — the same menu as the Windows tray: status, today / this week, Open,
-// Pause / Resume, timed breaks, Switch project, Set task…, Sync now, Open web
-// dashboard, Settings, Start at login, Quit. The menu is rebuilt each time it
-// opens, so it always shows the current state.
+// Pause / Resume, timed breaks, Switch project, Switch workspace, Set task…,
+// Sync now, Open web dashboard, Privacy consent, Settings, Start at login,
+// Quit. The menu is rebuilt each time it opens, so it always shows the
+// current state.
 
 @MainActor
 final class StatusItemController: NSObject, NSMenuDelegate {
@@ -40,9 +41,10 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         // The title is a clock: refreshed every second (only changes touch
         // the menu bar).
         let ticker = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
-            // The timer's block is @Sendable: the hop re-captures `self`
-            // weakly instead of reaching into the outer closure's capture.
-            Task { @MainActor [weak self] in
+            // The timer is scheduled on the main run loop, so it fires on the
+            // main thread: refresh in place instead of re-capturing the weak
+            // `self` in a task (Swift 5.10 rejects that capture).
+            MainActor.assumeIsolated {
                 self?.refresh()
             }
         }
@@ -151,6 +153,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         if signedIn {
             let totals = model.liveTotals(now: now)
             menu.addItem(info("Today \(Formatting.secondsLabel(totals.today)) · This week \(Formatting.secondsLabel(totals.week))"))
+        } else if status == .choosingWorkspace {
+            menu.addItem(info("Choose a workspace to start tracking"))
         } else {
             menu.addItem(info(status == .signInExpired ? "Enter your password to continue" : "Sign in to start tracking"))
         }
@@ -164,8 +168,12 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         switch status {
         case .signedOut, .signInExpired:
             menu.addItem(action("Sign in…", #selector(openSignIn)))
+        case .choosingWorkspace:
+            menu.addItem(action("Choose a workspace…", #selector(openWorkspaces)))
         case .choosingProject:
             menu.addItem(action("Choose a project…", #selector(openChooser), enabled: !snapshot.projects.isEmpty))
+        case .consentRequired:
+            menu.addItem(action("Choose what to record…", #selector(openConsent)))
         case .paused, .onBreak:
             menu.addItem(action(model.pendingAction == .resuming ? "Resuming…" : "Resume tracking",
                                 #selector(toggleTracking), enabled: idle))
@@ -204,6 +212,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         projects.submenu = projectMenu
         projects.isEnabled = signedIn && idle && !snapshot.projects.isEmpty
         menu.addItem(projects)
+        menu.addItem(action("Switch workspace…", #selector(switchWorkspace), enabled: signedIn && idle))
 
         let note = snapshot.taskNote
         let shortNote = note.count > 40 ? String(note.prefix(40)) + "…" : note
@@ -214,6 +223,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
         menu.addItem(.separator())
         menu.addItem(action("Open web dashboard", #selector(openDashboard)))
+        menu.addItem(action("Privacy consent…", #selector(openConsent), enabled: signedIn))
         menu.addItem(action("Settings…", #selector(openSettings), key: ","))
         let login = action("Start at login", #selector(toggleStartAtLogin), enabled: model.loginItem != .unavailable)
         login.state = model.startsAtLogin ? .on : .off
@@ -226,6 +236,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private func addWarnings(to menu: NSMenu, _ snapshot: TrackerSnapshot) {
         if case .stopped(let reason) = snapshot.status {
             menu.addItem(info("⚠︎ \(reason)"))
+        }
+        if snapshot.status == .consentRequired {
+            menu.addItem(action("⚠︎ Nothing is recorded until you choose what may be…", #selector(openConsent)))
         }
         if let issue = snapshot.uploadIssue {
             menu.addItem(info("⚠︎ \(issue.message)"))
@@ -273,12 +286,30 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         windows.showChooseProject()
     }
 
+    @objc private func openWorkspaces() {
+        windows.showChooseWorkspace()
+        if model.snapshot.workspaceChoices.isEmpty && !model.snapshot.findingWorkspaces {
+            model.switchWorkspace()
+        }
+    }
+
+    @objc private func switchWorkspace() {
+        model.switchWorkspace()
+        windows.showChooseWorkspace()
+    }
+
     @objc private func openActivity() {
         windows.showMain(tab: .activity)
     }
 
     @objc private func openSettings() {
         windows.showMain(tab: .settings)
+    }
+
+    /// The consent card: on the Timer tab while tracking waits for it,
+    /// otherwise in Settings.
+    @objc private func openConsent() {
+        windows.showMain(tab: model.snapshot.status == .consentRequired ? .timer : .settings)
     }
 
     @objc private func toggleTracking() {

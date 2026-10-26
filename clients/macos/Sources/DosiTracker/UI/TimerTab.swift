@@ -16,6 +16,10 @@ struct TimerTab: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
+            if snapshot.status == .consentRequired {
+                // Tracking waits for this: asked in place, not buried in Settings.
+                ConsentCard(model: model, asking: true)
+            }
             sessionCard
             TimelineView(.periodic(from: .now, by: 1)) { context in
                 VStack(alignment: .leading, spacing: 12) {
@@ -216,23 +220,23 @@ struct TimerTab: View {
                         let interval = Double(max(snapshot.intervalMinutes, 1) * 60)
                         ProgressBar(fraction: now.timeIntervalSince(started) / interval)
                         if let live = model.liveBlock(now: now) {
-                            if snapshot.capture.measuresInput {
+                            if snapshot.effectiveCapture.measuresInput {
                                 MinuteBars(minutes: live.minutes, capacity: snapshot.intervalMinutes)
                             }
                             HStack(spacing: 8) {
                                 if let percent = live.activityPercent {
                                     Metric(label: "Active", value: "\(percent)%", color: Theme.activity(percent))
                                 }
-                                if snapshot.capture.keyboard {
+                                if snapshot.effectiveCapture.keyboard {
                                     Metric(label: "Keys", value: "\(live.keyPresses)")
                                 }
-                                if snapshot.capture.mouse {
+                                if snapshot.effectiveCapture.mouse {
                                     Metric(label: "Clicks", value: "\(live.clicks)")
                                 }
                                 Metric(label: "Since", value: Formatting.time(started))
                             }
                         }
-                        if snapshot.capture.activeWindow, let app = model.currentAppName {
+                        if snapshot.effectiveCapture.activeWindow, let app = model.currentAppName {
                             Divider()
                             HStack(spacing: 6) {
                                 Image(systemName: "macwindow").foregroundStyle(.secondary)
@@ -281,7 +285,7 @@ struct TimerTab: View {
         if let clock = snapshot.clockWarning {
             Banner(.warning, "\(clock). Set the date and time automatically in System Settings → General → Date & Time.")
         }
-        if snapshot.status.isSignedIn && snapshot.capture.measuresInput && model.inputCapture != .running {
+        if model.inputCaptureBlocked {
             Banner(.warning, "Keyboard and mouse activity is not being measured: allow Dosi Tracker in System Settings → Privacy & Security → Input Monitoring.")
         }
         ForEach(model.missingPermissions.filter { $0 != .inputMonitoring }, id: \.self) { permission in
@@ -358,10 +362,14 @@ struct ClockReadout {
             return idle("Offline", .warning, "Waiting for the server or a project. Work is kept on this Mac.")
         case .choosingProject:
             return idle("Choose a project", .info, "Pick the project you are working on to start tracking.")
+        case .choosingWorkspace:
+            return idle("Choose a workspace", .info, "Pick the workspace you track in to start tracking.")
         case .signedOut:
             return idle("Signed out", .neutral, "")
         case .signInExpired:
             return idle("Sign-in expired", .danger, "Enter your password to continue.")
+        case .consentRequired:
+            return idle("Consent required", .warning, "Choose above what Dosi Tracker may record on this Mac to start tracking.")
         case .stopped:
             return idle("Stopped", .danger, "Nothing is recorded right now.")
         }

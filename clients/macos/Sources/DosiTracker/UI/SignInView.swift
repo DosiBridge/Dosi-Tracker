@@ -1,17 +1,18 @@
 import DosiTrackerCore
 import SwiftUI
 
-// The sign-in window (port of the Windows agent's `ui/login.rs`): workspace,
-// email and password, the server address under "Advanced", Enter submits, a
-// show/hide password toggle, and the server's own reason when it refuses.
-// After "Sign-in expired" the workspace and email are prefilled and only the
-// password is asked for; when the server demands a new password, the form
-// asks for it.
+// The sign-in window (port of the Windows agent's `ui/login.rs`): email and
+// password — the workspace is picked after signing in, from the ones the
+// account belongs to — the server address under "Advanced" (shown first, and
+// required, when the build names no server; opened by itself after a failure
+// that points at the address), Enter submits, a show/hide password toggle,
+// and the server's own reason when it refuses.
+// After "Sign-in expired" the email is prefilled and only the password is
+// asked for; when the server demands a new password, the form asks for it.
 
 struct SignInView: View {
     @ObservedObject var model: AppModel
 
-    @State private var workspace = ""
     @State private var email = ""
     @State private var password = ""
     @State private var newPassword = ""
@@ -24,7 +25,6 @@ struct SignInView: View {
     @FocusState private var focus: Field?
 
     private enum Field: Hashable {
-        case workspace
         case email
         case password
     }
@@ -33,10 +33,18 @@ struct SignInView: View {
 
     private var mustChangePassword: Bool { snapshot.passwordChangeToken != nil }
 
+    /// No server is configured: the address is asked for up front.
+    private var asksForServer: Bool {
+        !snapshot.serverURLIsConfigured && !snapshot.serverURLIsManaged
+    }
+
     private var canSubmit: Bool {
         guard !snapshot.signingIn, !email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               !password.isEmpty
         else {
+            return false
+        }
+        if asksForServer && server.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return false
         }
         return !mustChangePassword || !newPassword.isEmpty
@@ -51,12 +59,17 @@ struct SignInView: View {
                 }
                 Card {
                     VStack(alignment: .leading, spacing: 12) {
+                        if asksForServer {
+                            serverField
+                        }
                         accountFields
                         passwordField
                         if mustChangePassword {
                             newPasswordFields
                         }
-                        advanced
+                        if !asksForServer {
+                            advanced
+                        }
                         if let error = localError ?? snapshot.loginError {
                             Banner(.danger, error)
                         }
@@ -77,6 +90,12 @@ struct SignInView: View {
                 prefill()
             }
         }
+        .onChange(of: snapshot.loginNeedsServer) { _, needsServer in
+            // The failure points at the address: show it.
+            if needsServer {
+                showAdvanced = true
+            }
+        }
     }
 
     // MARK: Parts
@@ -85,7 +104,7 @@ struct SignInView: View {
         VStack(spacing: 8) {
             LogoMark(size: 52)
             Text("Welcome to Dosi Tracker").font(.title2.weight(.semibold))
-            Text("Sign in to your workspace to start tracking.")
+            Text("Sign in with your work email to start tracking.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
         }
@@ -94,12 +113,6 @@ struct SignInView: View {
 
     private var accountFields: some View {
         VStack(alignment: .leading, spacing: 12) {
-            field("Workspace") {
-                TextField("", text: $workspace, prompt: Text("e.g. acme"))
-                    .textFieldStyle(.roundedBorder)
-                    .focused($focus, equals: .workspace)
-                    .onSubmit(submit)
-            }
             field("Email") {
                 TextField("", text: $email, prompt: Text("you@company.com"))
                     .textFieldStyle(.roundedBorder)
@@ -155,21 +168,25 @@ struct SignInView: View {
 
     private var advanced: some View {
         DisclosureGroup("Advanced", isExpanded: $showAdvanced) {
-            VStack(alignment: .leading, spacing: 6) {
-                field("Server address") {
-                    TextField("", text: $server, prompt: Text("https://tracker.example.com"))
-                        .textFieldStyle(.roundedBorder)
-                        .disabled(snapshot.serverURLIsManaged)
-                        .onSubmit(submit)
-                }
-                Text(serverHint)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            .padding(.top, 6)
+            serverField
+                .padding(.top, 6)
         }
         .font(.callout)
+    }
+
+    private var serverField: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            field("Server address") {
+                TextField("", text: $server, prompt: Text("https://tracker.example.com"))
+                    .textFieldStyle(.roundedBorder)
+                    .disabled(snapshot.serverURLIsManaged)
+                    .onSubmit(submit)
+            }
+            Text(serverHint)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
     }
 
     private var serverHint: String {
@@ -199,8 +216,8 @@ struct SignInView: View {
         let shown = server.trimmingCharacters(in: .whitespacesAndNewlines)
         let address = Formatting.host(shown.isEmpty || snapshot.serverURLIsManaged ? snapshot.serverURL : shown)
         return VStack(spacing: 4) {
-            Text("Your workspace admin decides what is captured.")
-            Text("Server: \(address)")
+            Text("Your workspace admin decides what may be captured; you choose what this Mac records.")
+            Text("Server: \(address.isEmpty ? "not set" : address)")
                 .foregroundStyle(.tertiary)
         }
         .font(.caption)
@@ -215,21 +232,23 @@ struct SignInView: View {
         }
     }
 
-    /// The last workspace, email and server; after "Sign-in expired" only the
-    /// password is left to type.
+    /// The last email and server; after "Sign-in expired" only the password
+    /// is left to type.
     private func prefill() {
         guard !prefilled else { return }
         prefilled = true
-        if workspace.isEmpty {
-            workspace = snapshot.workspace.isEmpty ? snapshot.suggestedWorkspace : snapshot.workspace
-        }
         if email.isEmpty {
             email = snapshot.displayName.isEmpty ? snapshot.suggestedUsername : snapshot.displayName
         }
         if server.isEmpty {
             server = snapshot.suggestedServerURL
         }
-        focus = email.isEmpty ? (workspace.isEmpty ? .workspace : .email) : .password
+        // A failure that pointed at the address, or an address never given:
+        // the field is shown, not folded away.
+        if snapshot.loginNeedsServer {
+            showAdvanced = true
+        }
+        focus = email.isEmpty ? .email : .password
     }
 
     private func submit() {
@@ -241,7 +260,6 @@ struct SignInView: View {
         }
         let typedServer = server.trimmingCharacters(in: .whitespacesAndNewlines)
         model.signIn(
-            workspace: workspace,
             email: email,
             password: password,
             server: typedServer.isEmpty || snapshot.serverURLIsManaged ? nil : typedServer,

@@ -107,10 +107,12 @@ public enum ActivityMath {
             ))
         }
         for ms in keyPresses {
-            timeline[bucketOf(second: EpochTime.floorDiv(ms, 1000), start: start, minutes: minutes)].keyboardHits += 1
+            let bucket = bucketOf(second: EpochTime.floorDiv(ms, 1000), start: start, minutes: minutes)
+            timeline[bucket].keyboardHits = (timeline[bucket].keyboardHits ?? 0) + 1
         }
         for ms in clicks {
-            timeline[bucketOf(second: EpochTime.floorDiv(ms, 1000), start: start, minutes: minutes)].mouseClicks += 1
+            let bucket = bucketOf(second: EpochTime.floorDiv(ms, 1000), start: start, minutes: minutes)
+            timeline[bucket].mouseClicks = (timeline[bucket].mouseClicks ?? 0) + 1
         }
         return timeline
     }

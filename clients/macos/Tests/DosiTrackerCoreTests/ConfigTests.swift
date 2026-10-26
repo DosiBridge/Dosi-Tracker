@@ -18,8 +18,9 @@ final class ConfigTests: XCTestCase {
         super.tearDown()
     }
 
-    private func ok(_ input: String, file: StaticString = #filePath, line: UInt = #line) -> String? {
-        switch Config.validateServerURL(input) {
+    private func ok(_ input: String, allowInsecureHTTP: Bool = false, file: StaticString = #filePath,
+                    line: UInt = #line) -> String? {
+        switch Config.validateServerURL(input, allowInsecureHTTP: allowInsecureHTTP) {
         case .success(let url):
             return url.absoluteString
         case .failure(let error):
@@ -38,7 +39,7 @@ final class ConfigTests: XCTestCase {
     func testServerURLsAreNormalized() {
         XCTAssertEqual(ok("https://tracker.example.com/"), "https://tracker.example.com")
         XCTAssertEqual(ok("  HTTPS://Tracker.Example.com:8443/// "), "https://tracker.example.com:8443")
-        XCTAssertEqual(ok("http://10.0.0.5:6006"), "http://10.0.0.5:6006")
+        XCTAssertEqual(ok("http://127.0.0.1:6006"), "http://127.0.0.1:6006")
         // A bare host (what people type) is https.
         XCTAssertEqual(ok("tracker.example.com"), "https://tracker.example.com")
         XCTAssertEqual(ok("localhost:6006"), "https://localhost:6006")
@@ -46,17 +47,29 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(ok("https://example.com:443/tracker/"), "https://example.com/tracker")
         XCTAssertEqual(ok("http://localhost:80"), "http://localhost")
         XCTAssertEqual(ok("http://[::1]:6006/"), "http://[::1]:6006")
-        XCTAssertEqual(ok("http://tracker-dev:6006"), "http://tracker-dev:6006")
-        XCTAssertEqual(ok("http://build-mac.local:6006"), "http://build-mac.local:6006")
+        XCTAssertEqual(ok("http://tracker-dev:6006", allowInsecureHTTP: true), "http://tracker-dev:6006")
     }
 
-    /// App Transport Security refuses cleartext to internet hosts: say so at
-    /// once instead of failing every request with a certificate message.
-    func testPlainHttpIsOnlyForLocalServers() {
+    /// Cleartext only to this Mac (loopback): the password and every block
+    /// would otherwise cross the network readable. Anything else needs the
+    /// administrator's explicit opt-in.
+    func testPlainHttpIsOnlyForThisMacUnlessAnAdministratorAllowsIt() {
         XCTAssertEqual(refusal("http://tracker.corp.example.com"), .requiresHTTPS)
         XCTAssertEqual(refusal("http://example.com:80"), .requiresHTTPS)
         XCTAssertEqual(ok("https://tracker.corp.example.com"), "https://tracker.corp.example.com")
-        XCTAssertEqual(ok("http://192.168.1.20:6006"), "http://192.168.1.20:6006")
+        // Not this Mac: the local network, Bonjour and bare names are refused too.
+        for remote in ["http://192.168.1.20:6006", "http://10.0.0.5:6006", "http://tracker-dev:6006",
+                       "http://build-mac.local:6006", "http://[fe80::1]:6006", "http://128.0.0.1",
+                       "http://localhost.example.com"] {
+            XCTAssertEqual(refusal(remote), .requiresHTTPS, remote)
+        }
+        // This Mac.
+        for loopback in ["http://localhost:6006", "http://127.0.0.1:6006", "http://127.10.0.1", "http://[::1]",
+                         "http://api.localhost:6006"] {
+            XCTAssertNotNil(ok(loopback), loopback)
+        }
+        // The administrator's opt-in.
+        XCTAssertEqual(ok("http://192.168.1.20:6006", allowInsecureHTTP: true), "http://192.168.1.20:6006")
         XCTAssertEqual(refusal("http://192.168.1.example"), .requiresHTTPS)
         XCTAssertTrue(ServerURLError.requiresHTTPS.userMessage.contains("https://"))
         XCTAssertTrue(ApiError.transport(TransportFailure(
@@ -89,6 +102,33 @@ final class ConfigTests: XCTestCase {
         XCTAssertFalse(config.capture.webcam)
         XCTAssertFalse(config.blurScreenshots)
         XCTAssertFalse(config.serverURLIsManaged)
+        XCTAssertFalse(config.allowInsecureHTTP)
+        // The development addresses are placeholders, never a configured server.
+        XCTAssertFalse(config.serverURLIsConfigured)
+        XCTAssertFalse(config.dashboardURLIsConfigured)
+    }
+
+    func testAServerCountsAsConfiguredOnlyWhenSomeSourceNamesIt() {
+        // Baked into the build.
+        var config = Config.resolve(infoDictionary: [Config.Key.apiBaseURL: "https://tracker.example.com"],
+                                    defaults: defaults, savedServerURL: nil)
+        XCTAssertTrue(config.serverURLIsConfigured)
+        XCTAssertFalse(config.dashboardURLIsConfigured)
+        // Saved at sign-in.
+        config = Config.resolve(infoDictionary: [:], defaults: defaults, savedServerURL: "https://saved.example.com")
+        XCTAssertTrue(config.serverURLIsConfigured)
+        // A preference or a profile.
+        defaults.set("https://preferred.example.com", forKey: Config.Key.apiBaseURL)
+        defaults.set("https://app.example.com", forKey: Config.Key.dashboardURL)
+        config = Config.resolve(infoDictionary: [:], defaults: defaults, savedServerURL: nil)
+        XCTAssertTrue(config.serverURLIsConfigured)
+        XCTAssertTrue(config.dashboardURLIsConfigured)
+        // An unusable value configures nothing.
+        defaults.removeObject(forKey: Config.Key.apiBaseURL)
+        config = Config.resolve(infoDictionary: [Config.Key.apiBaseURL: "ftp://tracker.example.com"], defaults: defaults,
+                                savedServerURL: "ftp://saved")
+        XCTAssertFalse(config.serverURLIsConfigured)
+        XCTAssertEqual(config.apiBaseURL, Config.defaultAPIBaseURL)
     }
 
     func testLaterSourcesWinKeyByKey() {
@@ -110,6 +150,27 @@ final class ConfigTests: XCTestCase {
         // Untouched keys keep their defaults.
         XCTAssertTrue(config.capture.keyboard && config.capture.mouse)
         XCTAssertTrue(config.capture.activeWindow && config.capture.runningPrograms)
+    }
+
+    func testTheInsecureHttpOptInComesFromTheAdministratorsConfiguration() {
+        // Without it, a configured http:// server is ignored...
+        var config = Config.resolve(infoDictionary: [Config.Key.apiBaseURL: "http://10.1.2.3:6006"], defaults: defaults,
+                                    savedServerURL: "http://10.9.9.9")
+        XCTAssertFalse(config.allowInsecureHTTP)
+        XCTAssertEqual(config.apiBaseURL, Config.defaultAPIBaseURL)
+        // ...with it, the configured and the saved one are used.
+        defaults.set(true, forKey: Config.Key.allowInsecureHTTP)
+        config = Config.resolve(infoDictionary: [Config.Key.apiBaseURL: "http://10.1.2.3:6006"], defaults: defaults,
+                                savedServerURL: nil)
+        XCTAssertTrue(config.allowInsecureHTTP)
+        XCTAssertEqual(config.apiBaseURL.absoluteString, "http://10.1.2.3:6006")
+        config = Config.resolve(infoDictionary: [:], defaults: defaults, savedServerURL: "http://10.9.9.9")
+        XCTAssertEqual(config.apiBaseURL.absoluteString, "http://10.9.9.9")
+        // The dashboard only opens in the browser: any http(s) address will do.
+        defaults.removeObject(forKey: Config.Key.allowInsecureHTTP)
+        config = Config.resolve(infoDictionary: [Config.Key.dashboardURL: "http://dash.example.com"], defaults: defaults,
+                                savedServerURL: nil)
+        XCTAssertEqual(config.dashboardURL.absoluteString, "http://dash.example.com")
     }
 
     func testTheServerSavedAtSignInOverridesTheConfiguration() {

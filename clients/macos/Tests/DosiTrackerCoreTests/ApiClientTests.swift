@@ -2,18 +2,35 @@ import XCTest
 @testable import DosiTrackerCore
 
 /// The API client against a canned server (ports of the Windows agent's
-/// `api.rs` tests, through URLProtocol instead of a local socket).
+/// `api.rs` tests, through URLProtocol instead of a local socket), per the
+/// cross-agent contract: no tenant on the token request, this install's
+/// `device_id` with every grant, the workspace named by `X-Workspace-Id`.
 final class ApiClientTests: XCTestCase {
-    private func client(_ server: MockServer, workspace: String = "acme", offlineAccess: Bool = true,
+    private let deviceId = "5b0c1b9e-8f2c-4a43-9a51-0c7f6f2d9b11"
+    private let acme = "3f2a1b0c-0000-4000-8000-00000000a001"
+    private let globex = "3f2a1b0c-0000-4000-8000-00000000b002"
+
+    private func client(_ server: MockServer, workspaceId: String? = "3f2a1b0c-0000-4000-8000-00000000a001",
+                        refreshToken: String? = nil, offlineAccess: Bool = true,
                         now: @escaping @Sendable () -> Date = { Date() }) -> ApiClient {
         ApiClient(
             baseURL: URL(string: server.baseURL.absoluteString + "/")!,
-            account: ApiClient.Account(workspace: workspace, username: "alice@acme.com", password: "p@ss word"),
+            identity: ApiClient.Identity(username: " alice@acme.com ", deviceId: deviceId, workspaceId: workspaceId,
+                                         refreshToken: refreshToken),
             session: MockServer.session(),
             requestsOfflineAccess: offlineAccess,
             userAgent: "DosiTracker/9.9.9 (macOS 14.5)",
             now: now
         )
+    }
+
+    /// A client signed in with the password (the first canned reply is the
+    /// token).
+    private func signedIn(_ server: MockServer, workspaceId: String? = "3f2a1b0c-0000-4000-8000-00000000a001")
+        async throws -> ApiClient {
+        let api = client(server, workspaceId: workspaceId)
+        try await api.signIn(password: "p@ss word")
+        return api
     }
 
     private func sampleActivity() -> ActivityPayload {
@@ -27,37 +44,33 @@ final class ApiClientTests: XCTestCase {
 
     // MARK: Sign-in
 
-    func testSignInUsesThePasswordGrantWithTheTenantInTheQuery() async throws {
-        let server = MockServer([.tokenOK()])
-        try await client(server).signIn()
+    func testThePasswordGrantSendsNoTenantAndThisInstallsDeviceId() async throws {
+        let server = MockServer([.tokenOK(refreshToken: "r1")])
+        let api = client(server, workspaceId: nil)
+        try await api.signIn(password: "p@ss word")
         let request = try XCTUnwrap(server.requests.first)
         XCTAssertEqual(request.method, "POST")
-        XCTAssertEqual(request.url.absoluteString, "https://\(server.host)/connect/token?__tenant=acme",
-                       "no double slash; the tenant travels in the query, not the body")
+        XCTAssertEqual(request.url.absoluteString, "https://\(server.host)/connect/token",
+                       "no double slash, and no __tenant: the workspace never travels with the sign-in")
+        XCTAssertNil(request.url.query)
         XCTAssertEqual(request.header("Content-Type"), "application/x-www-form-urlencoded")
+        XCTAssertNil(request.header(ApiClient.workspaceHeader))
         XCTAssertEqual(request.formFields, [
             "grant_type": "password",
             "username": "alice@acme.com",
             "password": "p@ss word",
             "client_id": "Tracker_App",
             "scope": "Tracker offline_access",
+            "device_id": deviceId,
         ])
-        XCTAssertNil(request.formFields["__tenant"])
-    }
-
-    func testWorkspaceNamesArePercentEncodedAndAHostAccountHasNoTenant() async throws {
-        let server = MockServer([.tokenOK(), .tokenOK()])
-        try await client(server, workspace: " Acme Corp/EU ").signIn()
-        try await client(server, workspace: "").signIn()
-        XCTAssertTrue(server.requests[0].url.absoluteString.hasSuffix("/connect/token?__tenant=Acme%20Corp%2FEU"))
-        XCTAssertNil(server.requests[1].url.query)
-        XCTAssertEqual(PercentEncoding.encode("plain-name_1.x~"), "plain-name_1.x~")
+        let refresh = await api.currentRefreshToken()
+        XCTAssertEqual(refresh, "r1")
     }
 
     func testRefusedCredentialsAreARejectedSignInWithTheServersReason() async throws {
         let server = MockServer([.json(400, #"{"error":"invalid_grant","error_description":"Invalid username or password!"}"#)])
         do {
-            try await client(server).signIn()
+            try await client(server).signIn(password: "wrong")
             XCTFail("the server refuses")
         } catch let error as ApiError {
             guard case .authRejected(let rejection) = error else { return XCTFail("\(error)") }
@@ -70,7 +83,7 @@ final class ApiClientTests: XCTestCase {
         for reply in [MockReply.empty(503), .json(429, "{}", headers: ["Retry-After": "60"]), .json(400, #"{"error":"invalid_client"}"#)] {
             let server = MockServer([reply])
             do {
-                try await client(server).signIn()
+                try await client(server).signIn(password: "pw")
                 XCTFail("the server fails")
             } catch let error as ApiError {
                 guard case .tokenFailed(let failure) = error else { return XCTFail("\(error)") }
@@ -85,22 +98,25 @@ final class ApiClientTests: XCTestCase {
 
     func testAnUnreachableServerIsOffline() async throws {
         let server = MockServer([.offline(), .offline(), .offline()])
-        let api = client(server)
+        let api = client(server, refreshToken: "r1")
         do {
-            try await api.signIn()
+            try await api.signIn(password: "pw")
             XCTFail("nothing answers")
         } catch let error as ApiError {
             XCTAssertTrue(error.isTransport)
             XCTAssertTrue(error.userMessage.contains("Cannot reach the server"))
         }
-        let upload = await api.uploadActivity(sampleActivity())
+        let resumed = client(server, refreshToken: "r1")
+        let upload = await resumed.uploadActivity(sampleActivity())
         XCTAssertEqual(UploadPolicy.decide(upload), .retry(RetryPlan(reason: .offline)))
         do {
-            _ = try await api.myProjects()
+            _ = try await resumed.myProjects()
             XCTFail("nothing answers")
         } catch let error as ApiError {
             XCTAssertTrue(error.isTransport)
         }
+        let kept = await resumed.currentRefreshToken()
+        XCTAssertEqual(kept, "r1", "offline says nothing about the sign-in: the token is kept")
     }
 
     func testAServerThatRefusesOfflineAccessIsAskedAgainWithoutIt() async throws {
@@ -109,10 +125,10 @@ final class ApiClientTests: XCTestCase {
             .tokenOK(),
             .json(200, "[]"),
         ])
-        let api = client(server)
-        try await api.signIn()
+        let api = try await signedIn(server)
         XCTAssertEqual(server.requests[0].formFields["scope"], "Tracker offline_access")
         XCTAssertEqual(server.requests[1].formFields["scope"], "Tracker")
+        XCTAssertEqual(server.requests[1].formFields["device_id"], deviceId)
         _ = try await api.myProjects()
         XCTAssertEqual(server.requests.count, 3)
     }
@@ -125,42 +141,263 @@ final class ApiClientTests: XCTestCase {
         let api = client(server)
         var change: ApiClient.PasswordChange?
         do {
-            try await api.signIn()
+            try await api.signIn(password: "old-pw")
         } catch ApiError.authRejected(let rejection) {
             XCTAssertEqual(rejection.kind, .mustChangePassword)
             let token = try XCTUnwrap(rejection.changePasswordToken)
             change = ApiClient.PasswordChange(changePasswordToken: token, newPassword: "N3w-secret")
         }
-        try await api.signIn(passwordChange: try XCTUnwrap(change))
+        try await api.signIn(password: "old-pw", passwordChange: try XCTUnwrap(change))
         let fields = server.requests[1].formFields
         XCTAssertEqual(fields["ChangePasswordToken"], "cpt-1")
         XCTAssertEqual(fields["NewPassword"], "N3w-secret")
-        let account = await api.currentAccount()
-        XCTAssertEqual(account.password, "N3w-secret", "the new password is what gets saved")
+        XCTAssertEqual(fields["device_id"], deviceId)
+    }
+
+    // MARK: Workspaces
+
+    func testTheWorkspacesAreListedWithoutAWorkspaceHeader() async throws {
+        let mine = """
+            [{"id":"\(acme)","name":"Acme","role":"owner","planName":"Team","isOwner":true,"isArchived":false},
+             {"id":"\(globex)","name":"Globex","role":"member","isOwner":false,"isArchived":true,"archivedTime":"2026-09-01T00:00:00Z"}]
+            """
+        let server = MockServer([.tokenOK(), .json(200, mine)])
+        let api = try await signedIn(server, workspaceId: acme)
+        let list = try await api.workspaces()
+        let request = server.requests[1]
+        XCTAssertEqual(request.method, "GET")
+        XCTAssertEqual(request.path, "/api/app/workspaces/mine")
+        XCTAssertNil(request.header(ApiClient.workspaceHeader), "the list is never scoped to a workspace")
+        XCTAssertEqual(request.header("Authorization"), "Bearer t0k3n")
+        XCTAssertEqual(list.map { $0.name }, ["Acme", "Globex"])
+        XCTAssertEqual(list[0].roleLabel, "Owner")
+        XCTAssertEqual(list[0].planName, "Team")
+        XCTAssertTrue(list[1].isArchived)
+        XCTAssertEqual(list[1].roleLabel, "Member")
+        // ABP's paged shape reads too.
+        XCTAssertEqual(try Workspace.decodeList(from: Data(#"{"items":[{"id":"w1"}]}"#.utf8)).first?.displayName,
+                       "Unnamed workspace")
+    }
+
+    func testAWorkspaceIsChosenAsTheContractSays() {
+        let a = Workspace(id: acme, name: "Acme", role: "owner")
+        let b = Workspace(id: globex, name: "Globex", role: "member")
+        let archived = Workspace(id: "w-archived", name: "Old", isArchived: true)
+        // Exactly one active workspace: chosen for the user.
+        XCTAssertEqual(WorkspaceSelection.resolve([a, archived], preferred: nil), .selected(a))
+        // Several: the one tracked before (ids compare like GUIDs), else ask.
+        XCTAssertEqual(WorkspaceSelection.resolve([a, b], preferred: globex.uppercased()), .selected(b))
+        XCTAssertEqual(WorkspaceSelection.resolve([a, b], preferred: nil), .choose([a, b]))
+        XCTAssertEqual(WorkspaceSelection.resolve([a, b], preferred: "gone"), .choose([a, b]))
+        // Archived ones are never offered, even when asked for.
+        XCTAssertEqual(WorkspaceSelection.resolve([a, b, archived], preferred: "w-archived"), .choose([a, b]))
+        XCTAssertEqual(WorkspaceSelection.resolve([archived], preferred: "w-archived"), WorkspaceSelection.noWorkspace)
+        XCTAssertEqual(WorkspaceSelection.resolve([], preferred: nil), WorkspaceSelection.noWorkspace)
+    }
+
+    /// After the server ended access to the workspace tracked in, the user
+    /// picks the next one: never taken for them, not even the only one left.
+    func testAfterALostWorkspaceTheUserAlwaysChooses() {
+        let a = Workspace(id: acme, name: "Acme", role: "owner")
+        let b = Workspace(id: globex, name: "Globex", role: "member")
+        let archived = Workspace(id: "w-archived", name: "Old", isArchived: true)
+        XCTAssertEqual(WorkspaceSelection.resolve([a, archived], preferred: nil, autoSelect: false), .choose([a]))
+        XCTAssertEqual(WorkspaceSelection.resolve([a, b], preferred: acme, autoSelect: false), .choose([a, b]))
+        XCTAssertEqual(WorkspaceSelection.resolve([archived], preferred: nil, autoSelect: false),
+                       WorkspaceSelection.noWorkspace)
+        XCTAssertEqual(WorkspaceSelection.resolve([], preferred: nil, autoSelect: false), WorkspaceSelection.noWorkspace)
+    }
+
+    func testEveryWorkspaceScopedCallNamesTheWorkspace() async throws {
+        let server = MockServer([
+            .tokenOK(),
+            .json(200, "[]"),
+            .json(200, "{}"),
+            .json(200, #"{"serverTime":"2026-10-05T10:00:00Z"}"#),
+            .json(200, #"{"totalTrackedMinutes":1}"#),
+            .json(200, #"{"items":[]}"#),
+            .json(200, #"{"currentUser":{"isAuthenticated":true,"id":"u1"}}"#),
+            .json(200, "{}"),
+        ])
+        let api = try await signedIn(server, workspaceId: acme)
+        _ = try await api.myProjects()
+        _ = await api.uploadActivity(sampleActivity())
+        _ = try await api.sendHeartbeat(Heartbeat(deviceId: deviceId, status: .tracking), timeout: 5)
+        _ = try await api.summary(from: Date().addingTimeInterval(-60), to: Date(), timeZone: nil)
+        _ = try await api.presence()
+        _ = try await api.currentUserId()
+        // A queued row goes to its own workspace, whatever the current one is.
+        _ = await api.uploadActivity(sampleActivity(), workspaceId: globex)
+
+        let requests = server.requests
+        XCTAssertEqual(requests.map { $0.path }, [
+            "/connect/token", "/api/app/project/my-projects", "/api/app/activity", "/api/app/presence/heartbeat",
+            "/api/app/reporting/summary", "/api/app/presence/team", "/api/abp/application-configuration",
+            "/api/app/activity",
+        ])
+        for request in requests[1...5] {
+            XCTAssertEqual(request.header(ApiClient.workspaceHeader), acme, request.path)
+        }
+        XCTAssertNil(requests[0].header(ApiClient.workspaceHeader), "the token request")
+        XCTAssertNil(requests[6].header(ApiClient.workspaceHeader), "the ABP configuration is not workspace-scoped")
+        XCTAssertEqual(requests[7].header(ApiClient.workspaceHeader), globex)
+    }
+
+    func testSwitchingWorkspaceKeepsTheSignIn() async throws {
+        let server = MockServer([.tokenOK(), .json(200, "[]"), .json(200, "[]")])
+        let api = try await signedIn(server, workspaceId: acme)
+        _ = try await api.myProjects()
+        api.useWorkspace(globex)
+        _ = try await api.myProjects()
+        XCTAssertEqual(server.requests.count, 3, "no new sign-in")
+        XCTAssertEqual(server.requests[2].header(ApiClient.workspaceHeader), globex)
+        XCTAssertEqual(api.currentWorkspaceId(), globex)
+    }
+
+    func testAScopedCallWithoutAChosenWorkspaceNeverReachesTheServer() async throws {
+        let server = MockServer([.tokenOK()])
+        let api = try await signedIn(server, workspaceId: nil)
+        do {
+            _ = try await api.myProjects()
+            XCTFail("no workspace is chosen")
+        } catch let error as ApiError {
+            guard case .invalidConfiguration = error else { return XCTFail("\(error)") }
+        }
+        XCTAssertEqual(server.requests.count, 1)
+    }
+
+    // MARK: Tokens
+
+    func testAnExpiredTokenIsRenewedWithTheRotatedRefreshTokenAndTheDeviceId() async throws {
+        let server = MockServer([
+            .tokenOK("first", refreshToken: "r1"),
+            .empty(401),
+            .tokenOK("second", refreshToken: "r2"),
+            .json(200, "{}"),
+        ])
+        let api = try await signedIn(server)
+        let rotated = RotatedTokens()
+        api.observeRefreshTokens { token in await rotated.add(token) }
+        let result = await api.uploadActivity(sampleActivity())
+        XCTAssertEqual(result, .accepted(status: 200))
+        let refresh = server.requests[2].formFields
+        XCTAssertEqual(refresh["grant_type"], "refresh_token")
+        XCTAssertEqual(refresh["refresh_token"], "r1")
+        XCTAssertEqual(refresh["device_id"], deviceId)
+        XCTAssertNil(refresh["password"], "the password is never re-sent")
+        XCTAssertNil(server.requests[2].header(ApiClient.workspaceHeader))
+        XCTAssertEqual(server.requests[3].header("Authorization"), "Bearer second")
+        let kept = await api.currentRefreshToken()
+        XCTAssertEqual(kept, "r2", "the rotated refresh token is kept")
+        let seen = await rotated.all
+        XCTAssertEqual(seen, ["r2"], "and reported, so the saved sign-in holds it")
+    }
+
+    func testASavedRefreshTokenResumesWithoutThePassword() async throws {
+        let server = MockServer([.tokenOK("resumed", refreshToken: "r9"), .json(200, "[]")])
+        let api = client(server, refreshToken: "r8")
+        _ = try await api.myProjects()
+        let renewal = server.requests[0].formFields
+        XCTAssertEqual(renewal["grant_type"], "refresh_token")
+        XCTAssertEqual(renewal["refresh_token"], "r8")
+        XCTAssertEqual(renewal["device_id"], deviceId)
+        XCTAssertEqual(server.requests[1].header("Authorization"), "Bearer resumed")
+    }
+
+    /// A refused refresh token ends the sign-in: the user signs in again; the
+    /// password is never tried behind their back.
+    func testARefusedRefreshTokenMeansSignInExpiredNeverAPasswordRetry() async throws {
+        let server = MockServer([
+            .tokenOK("first", refreshToken: "r1"),
+            .empty(401),
+            .json(400, #"{"error":"invalid_grant","error_description":"The refresh token is no longer valid."}"#),
+        ])
+        let api = try await signedIn(server)
+        let result = await api.uploadActivity(sampleActivity())
+        guard case .signInExpired(let rejection) = UploadPolicy.decide(result) else {
+            return XCTFail("expected sign-in expired, got \(result)")
+        }
+        XCTAssertEqual(rejection.userMessage, "The refresh token is no longer valid.")
+        XCTAssertEqual(server.requests.count, 3, "no password grant follows")
+        XCTAssertEqual(server.requests.filter { $0.formFields["grant_type"] == "password" }.count, 1,
+                       "only the user's own sign-in")
+        let kept = await api.currentRefreshToken()
+        XCTAssertNil(kept, "the refused token is dropped")
+
+        // Nothing is tried again until the user signs in.
+        let again = await api.uploadActivity(sampleActivity())
+        XCTAssertEqual(UploadPolicy.decide(again), .signInExpired(AuthRejection.sessionEnded))
+        XCTAssertEqual(server.requests.count, 3)
+    }
+
+    func testWithoutARefreshTokenTheSignInEndsWithTheAccessToken() async throws {
+        let server = MockServer([.tokenOK("only", expiresIn: 3600)])
+        let clock = TestClock(utc("2026-10-05T10:00:00Z"))
+        let api = client(server, now: { clock.now })
+        try await api.signIn(password: "pw")
+        // An hour later the access token has run out, and nothing can renew it.
+        clock.advance(3600)
+        let result = await api.uploadActivity(sampleActivity())
+        XCTAssertEqual(UploadPolicy.decide(result), .signInExpired(AuthRejection.sessionEnded))
+        XCTAssertEqual(server.requests.count, 1)
+        XCTAssertTrue(AuthRejection.sessionEnded.userMessage.contains("Sign in again"))
+    }
+
+    func testSigningOutForgetsTheTokens() async throws {
+        let server = MockServer([.tokenOK(refreshToken: "r1")])
+        let api = try await signedIn(server)
+        await api.signOut()
+        let token = await api.currentRefreshToken()
+        XCTAssertNil(token)
+        let hasAccess = await api.hasAccessToken()
+        XCTAssertFalse(hasAccess)
+    }
+
+    // MARK: Redirects
+
+    func testRedirectsAreNeverFollowed() async throws {
+        let session = ApiClient.makeSession()
+        XCTAssertTrue(session.delegate is RedirectRefusal)
+        let original = URL(string: "https://tracker.example.com/api/app/activity")!
+        let task = session.dataTask(with: original)
+        let response = try XCTUnwrap(HTTPURLResponse(url: original, statusCode: 302, httpVersion: "HTTP/1.1",
+                                                     headerFields: ["Location": "https://elsewhere.example.net/"]))
+        let next = await RedirectRefusal().urlSession(session, task: task, willPerformHTTPRedirection: response,
+                                                      newRequest: URLRequest(url: URL(string: "https://elsewhere.example.net/")!))
+        XCTAssertNil(next, "the 3xx answer is returned as it is")
+        task.cancel()
+        session.invalidateAndCancel()
+
+        // A redirect answer fails the call with a clear reason.
+        XCTAssertTrue(ApiError.http(HTTPFailure(status: 301)).userMessage.contains("redirect"))
+        XCTAssertTrue(TokenFailure(status: 307, error: nil, errorDescription: nil).userMessage.contains("redirect"))
+        guard case .retry = UploadPolicy.decide(status: 302, error: nil, retryAfter: nil) else {
+            return XCTFail("a redirect is never a park")
+        }
     }
 
     // MARK: Uploads
 
-    func testA401UploadSignsInAgainAndResendsWithSentAt() async throws {
+    func testA401UploadRenewsTheTokenAndResendsWithSentAt() async throws {
         let server = MockServer([
-            .tokenOK(),
+            .tokenOK(refreshToken: "r1"),
             .empty(401),
-            .tokenOK(),
+            .tokenOK(refreshToken: "r2"),
             .json(200, "{}", headers: ["Date": "Mon, 05 Oct 2026 10:00:00 GMT"]),
         ])
-        let api = client(server)
+        let api = try await signedIn(server)
         let result = await api.uploadActivity(sampleActivity())
         XCTAssertEqual(result, .accepted(status: 200))
 
         let requests = server.requests
         XCTAssertEqual(requests.count, 4)
-        XCTAssertTrue(requests[0].url.absoluteString.hasSuffix("/connect/token?__tenant=acme"))
         XCTAssertEqual(requests[1].path, "/api/app/activity")
         XCTAssertEqual(requests[1].method, "POST")
         XCTAssertEqual(requests[2].path, "/connect/token")
         let upload = requests[3]
         XCTAssertEqual(upload.header("Authorization"), "Bearer t0k3n")
         XCTAssertEqual(upload.header("User-Agent"), "DosiTracker/9.9.9 (macOS 14.5)")
+        XCTAssertEqual(upload.header(ApiClient.workspaceHeader), acme)
         XCTAssertTrue(upload.header("Content-Type")?.hasPrefix("application/json") ?? false)
         let json = jsonDictionary(upload.body)
         let sentAt = try XCTUnwrap(json["sentAt"] as? String, "sentAt is stamped at send time")
@@ -171,62 +408,46 @@ final class ApiClientTests: XCTestCase {
         XCTAssertNotNil(reading)
     }
 
-    func testTheRefreshTokenRenewsTheAccessTokenBeforeThePasswordIsUsedAgain() async throws {
-        let server = MockServer([
-            .tokenOK("first", refreshToken: "r1"),
-            .empty(401),
-            .tokenOK("second", refreshToken: "r2"),
-            .json(200, "{}"),
-        ])
-        let result = await client(server).uploadActivity(sampleActivity())
-        XCTAssertEqual(result, .accepted(status: 200))
-        let refresh = server.requests[2].formFields
-        XCTAssertEqual(refresh["grant_type"], "refresh_token")
-        XCTAssertEqual(refresh["refresh_token"], "r1")
-        XCTAssertNil(refresh["password"], "the password is not re-sent")
-        XCTAssertEqual(server.requests[3].header("Authorization"), "Bearer second")
-    }
-
-    func testARejectedRefreshTokenFallsBackToThePassword() async throws {
-        let server = MockServer([
-            .tokenOK("first", refreshToken: "r1"),
-            .empty(401),
-            .json(400, #"{"error":"invalid_grant","error_description":"The refresh token is no longer valid."}"#),
-            .tokenOK("second"),
-            .json(200, "{}"),
-        ])
-        let result = await client(server).uploadActivity(sampleActivity())
-        XCTAssertEqual(result, .accepted(status: 200))
-        XCTAssertEqual(server.requests[3].formFields["grant_type"], "password")
-    }
-
-    func testRefusedCredentialsDuringAnUploadMeanSignInExpired() async throws {
-        let server = MockServer([
-            .json(400, #"{"error":"invalid_grant","error_description":"Invalid username or password!"}"#),
-        ])
-        let result = await client(server).uploadActivity(sampleActivity())
-        guard case .signInExpired(let rejection) = UploadPolicy.decide(result) else {
-            return XCTFail("expected sign-in expired, got \(result)")
-        }
-        XCTAssertEqual(rejection.userMessage, "Invalid username or password!")
-    }
-
     func testAnOversizedUploadAsksForItsCapturesToBeStripped() async throws {
         let server = MockServer([.tokenOK(), .empty(413)])
-        let result = await client(server).uploadActivity(sampleActivity())
+        let api = try await signedIn(server)
+        let result = await api.uploadActivity(sampleActivity())
         XCTAssertEqual(UploadPolicy.decide(result), .stripCapturesAndResend(reason: "HTTP 413"))
     }
 
     func testThrottledUploadsCarryTheRetryAfter() async throws {
         let server = MockServer([.tokenOK(), .empty(429, headers: ["Retry-After": "90"])])
-        let result = await client(server).uploadActivity(sampleActivity())
+        let api = try await signedIn(server)
+        let result = await api.uploadActivity(sampleActivity())
         XCTAssertEqual(UploadPolicy.decide(result), .retry(RetryPlan(reason: .throttled, after: 90)))
     }
 
     func testBusinessErrorsKeepTheAbpBody() async throws {
         let server = MockServer([.tokenOK(), .json(409, abp("Tracker:ActivityOverlaps", "Overlaps another block."))])
-        let result = await client(server).uploadActivity(sampleActivity())
+        let api = try await signedIn(server)
+        let result = await api.uploadActivity(sampleActivity())
         XCTAssertEqual(UploadPolicy.decide(result), .park(reason: "Overlaps another block."))
+    }
+
+    func testARevokedDeviceOrALostWorkspaceIsAnAccessLoss() async throws {
+        let cases: [(Int, String, AccessLoss.Kind)] = [
+            (403, "Tracker:DeviceRevoked", .deviceRevoked),
+            (403, "Tracker:NotWorkspaceMember", .notWorkspaceMember),
+            (403, "Tracker:WorkspaceArchived", .workspaceArchived),
+            (400, "Tracker:WorkspaceRequired", .workspaceRequired),
+        ]
+        for (status, code, kind) in cases {
+            let server = MockServer([.tokenOK(), .json(status, abp(code, "Refused.")), .json(status, abp(code, "Refused."))])
+            let api = try await signedIn(server)
+            let result = await api.uploadActivity(sampleActivity())
+            XCTAssertEqual(UploadPolicy.decide(result), .accessLost(AccessLoss(kind: kind, message: "Refused.")), code)
+            do {
+                _ = try await api.sendHeartbeat(Heartbeat(deviceId: deviceId, status: .tracking), timeout: 5)
+                XCTFail("refused")
+            } catch let error as ApiError {
+                XCTAssertEqual(AccessLoss.of(error)?.kind, kind, code)
+            }
+        }
     }
 
     // MARK: Projects, totals, presence
@@ -242,7 +463,7 @@ final class ApiClientTests: XCTestCase {
             .json(200, projects),
             .json(403, abp("Volo.Authorization:010001", "Authorization failed!")),
         ])
-        let api = client(server)
+        let api = try await signedIn(server)
         let list = try await api.myProjects()
         XCTAssertEqual(list.first?.idleThresholdMinutes, 15)
         XCTAssertEqual(list.first?.blurScreenshots, true)
@@ -255,6 +476,7 @@ final class ApiClientTests: XCTestCase {
         } catch let error as ApiError {
             XCTAssertEqual(error.status, 403)
             XCTAssertEqual(error.userMessage, "Authorization failed!")
+            XCTAssertNil(AccessLoss.of(error), "an authorization failure is not an access loss")
         }
         XCTAssertTrue(server.requests[2].url.absoluteString.contains("TimeZone=Asia%2FDhaka"))
     }
@@ -263,7 +485,9 @@ final class ApiClientTests: XCTestCase {
         let server = MockServer([.tokenOK(), .json(200, #"{"totalTrackedMinutes":90.5,"averageProductivity":null}"#)])
         let from = utc("2026-09-29T18:00:00Z")
         let to = utc("2026-09-30T10:29:24.976Z")
-        let summary = try await client(server).summary(from: from, to: to, timeZone: "America/Argentina/Buenos_Aires")
+        let api = try await signedIn(server)
+        let summary = try await api.summary(from: from, to: to,
+                                                                     timeZone: "America/Argentina/Buenos_Aires")
         XCTAssertEqual(summary.totalTrackedMinutes, 90.5)
 
         // What the server sees after decoding must still parse to the same instants.
@@ -290,7 +514,7 @@ final class ApiClientTests: XCTestCase {
             .json(200, #"{"totalTrackedMinutes":120}"#),
             .json(200, #"{"totalTrackedMinutes":600}"#),
         ])
-        let api = client(server)
+        let api = try await signedIn(server)
         let id = try await api.currentUserId()
         XCTAssertEqual(id, userId)
         let today = try await api.summary(from: Date().addingTimeInterval(-3600), to: Date(), timeZone: "UTC", userId: id)
@@ -311,10 +535,11 @@ final class ApiClientTests: XCTestCase {
 
     func testHeartbeatsPostTheContractBodyAndReadTheServerTime() async throws {
         let server = MockServer([.tokenOK(), .json(200, #"{"serverTime":"2026-10-05T10:00:00Z"}"#)])
-        let heartbeat = Heartbeat(deviceId: "5b0c1b9e-8f2c-4a43-9a51-0c7f6f2d9b11", deviceName: "Mac", platform: "macos",
+        let heartbeat = Heartbeat(deviceId: deviceId, deviceName: "Mac", platform: "macos",
                                   agentVersion: "0.2.0", status: .tracking, projectId: "p1", currentApp: "Xcode",
                                   timeZone: "Asia/Dhaka", utcOffsetMinutes: 360)
-        let result = try await client(server).sendHeartbeat(heartbeat, timeout: 5)
+        let api = try await signedIn(server)
+        let result = try await api.sendHeartbeat(heartbeat, timeout: 5)
         XCTAssertEqual(result.serverTime, utc("2026-10-05T10:00:00Z"))
         let request = server.requests[1]
         XCTAssertEqual(request.path, "/api/app/presence/heartbeat")
@@ -330,7 +555,8 @@ final class ApiClientTests: XCTestCase {
             .tokenOK(),
             .json(200, #"{"items":[{"userId":"u1","userName":"alice","deviceId":"d1","status":"paused","online":true}]}"#),
         ])
-        let devices = try await client(server).presence()
+        let api = try await signedIn(server)
+        let devices = try await api.presence()
         XCTAssertEqual(devices.map { $0.presenceStatus }, [.paused])
         XCTAssertEqual(server.requests[1].path, "/api/app/presence/team")
         XCTAssertEqual(server.requests[1].method, "GET")
@@ -339,9 +565,10 @@ final class ApiClientTests: XCTestCase {
     func testHeartbeatsAreBoundedByTheirTimeout() async throws {
         let server = MockServer([.tokenOK(), .hanging()])
         let heartbeat = Heartbeat(deviceId: UUID().uuidString.lowercased(), status: .stopped)
+        let api = try await signedIn(server)
         let started = Date()
         do {
-            _ = try await client(server).sendHeartbeat(heartbeat, timeout: 0.8)
+            _ = try await api.sendHeartbeat(heartbeat, timeout: 0.8)
             XCTFail("the server never answers")
         } catch let error as ApiError {
             XCTAssertTrue(error.isTransport)
@@ -351,7 +578,8 @@ final class ApiClientTests: XCTestCase {
 
     func testAHeartbeatWhoseAnswerCannotBeReadStillCounts() async throws {
         let server = MockServer([.tokenOK(), .json(200, "not json")])
-        let result = try await client(server).sendHeartbeat(Heartbeat(deviceId: "d", status: .idle), timeout: 5)
+        let api = try await signedIn(server)
+        let result = try await api.sendHeartbeat(Heartbeat(deviceId: "d", status: .idle), timeout: 5)
         XCTAssertNil(result.serverTime)
     }
 
@@ -361,6 +589,7 @@ final class ApiClientTests: XCTestCase {
         let device = utc("2026-10-05T10:00:00Z")
         let server = MockServer([.tokenOK(), .json(200, "[]", headers: ["Date": "Mon, 05 Oct 2026 10:03:30 GMT"])])
         let api = client(server, now: { device })
+        try await api.signIn(password: "pw")
         _ = try await api.myProjects()
         let reading = await api.lastClockReading()
         XCTAssertEqual(reading?.offsetSeconds, 210)
@@ -424,10 +653,42 @@ final class ApiClientTests: XCTestCase {
         }
     }
 
-    func testTheAccountNeverPrintsItsPassword() {
-        let account = ApiClient.Account(workspace: "Acme", username: "alice@acme.com", password: "s3cr3t")
-        XCTAssertFalse("\(account)".contains("s3cr3t"))
-        XCTAssertFalse(String(reflecting: account).contains("s3cr3t"))
-        XCTAssertEqual(ApiClient.Account(workspace: " ", username: "root", password: "x").description, "root @ (host)")
+    func testTheIdentityNeverPrintsItsRefreshToken() {
+        let identity = ApiClient.Identity(username: "alice@acme.com", deviceId: deviceId, workspaceId: acme,
+                                          refreshToken: "refresh-fixture-9")
+        XCTAssertFalse("\(identity)".contains("refresh-fixture-9"))
+        XCTAssertFalse(String(reflecting: identity).contains("refresh-fixture-9"))
+        XCTAssertEqual(ApiClient.Identity(username: "root", deviceId: deviceId).description, "root @ (no workspace)")
+    }
+}
+
+/// Refresh tokens reported by a client, in order.
+private actor RotatedTokens {
+    private(set) var all: [String] = []
+
+    func add(_ token: String) {
+        all.append(token)
+    }
+}
+
+/// A device clock the test moves.
+private final class TestClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current: Date
+
+    init(_ start: Date) {
+        current = start
+    }
+
+    var now: Date {
+        lock.lock()
+        defer { lock.unlock() }
+        return current
+    }
+
+    func advance(_ seconds: TimeInterval) {
+        lock.lock()
+        current = current.addingTimeInterval(seconds)
+        lock.unlock()
     }
 }

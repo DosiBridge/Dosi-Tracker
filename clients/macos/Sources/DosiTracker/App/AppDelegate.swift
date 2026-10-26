@@ -209,9 +209,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         showObserver = DistributedNotificationCenter.default().addObserver(
             forName: SingleInstance.showWindowNotification, object: nil, queue: .main
         ) { [weak self] _ in
-            // The observer's block is @Sendable: the hop re-captures `self`
-            // weakly instead of reaching into the outer closure's capture.
-            Task { @MainActor [weak self] in
+            // The observer runs on the main queue (`queue: .main`), so the
+            // window is shown in place: no task re-capturing the weak `self`
+            // (Swift 5.10 rejects that as a captured var in concurrent code).
+            MainActor.assumeIsolated {
                 self?.windows?.showPrimary()
             }
         }

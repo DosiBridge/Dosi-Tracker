@@ -203,6 +203,41 @@ final class BlockTimelineTests: XCTestCase {
         XCTAssertEqual(blocks.stretch?.block.plannedEnd, at("10:15:00"))
     }
 
+    func testAChangedConsentAdjustsTheOpenBlockAndMeasuredInputOnlyNarrows() throws {
+        var blocks = started(10, idle: 5)
+        var narrower = policy(10, idle: 5, screenshot: false)
+        narrower.permissions.keyboard = false
+        narrower.blurScreenshots = true
+        blocks.adjustOpenBlock(to: narrower)
+        let open = try XCTUnwrap(blocks.stretch?.block)
+        XCTAssertEqual(open.startedAt, at("10:00:00"), "its timing stays")
+        XCTAssertEqual(open.plannedEnd, at("10:10:00"))
+        XCTAssertEqual(open.captureAt, at("10:05:00"))
+        XCTAssertEqual(open.description, "Invoices")
+        XCTAssertFalse(open.policy.permissions.keyboard)
+        XCTAssertFalse(open.policy.permissions.screenshot)
+        XCTAssertTrue(open.policy.permissions.mouse)
+        XCTAssertTrue(open.policy.blurScreenshots)
+        XCTAssertNil(blocks.captureDue(now: at("10:06:00")), "no screenshot once it is withdrawn")
+
+        // Consent given again: a screenshot (taken after the change) may be
+        // taken again; the keyboard, unmeasured so far, stays unmeasured, and
+        // the blur stays.
+        var wider = policy(10, idle: 5)
+        wider.permissions.runningPrograms = true
+        blocks.adjustOpenBlock(to: wider)
+        let adjusted = try XCTUnwrap(blocks.stretch?.block.policy)
+        XCTAssertFalse(adjusted.permissions.keyboard)
+        XCTAssertTrue(adjusted.permissions.screenshot)
+        XCTAssertTrue(adjusted.permissions.runningPrograms)
+        XCTAssertTrue(adjusted.blurScreenshots)
+        XCTAssertNotNil(blocks.captureDue(now: at("10:06:00")))
+
+        var stopped = BlockTimeline()
+        stopped.adjustOpenBlock(to: narrower)
+        XCTAssertNil(stopped.stretch, "nothing to adjust while not tracking")
+    }
+
     func testTheScreenshotMomentIsRandomWithinTenToNinetyPercent() {
         let start = at("10:00:00")
         XCTAssertEqual(BlockTimeline.captureMoment(startedAt: start, interval: 600, fraction: 0), at("10:01:00"))

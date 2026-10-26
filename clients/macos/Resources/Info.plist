@@ -9,9 +9,10 @@
   * LSUIElement: a menu-bar agent, no Dock icon.
   * NSCameraUsageDescription: required before the camera may be used at all
     (macOS ends a process that touches the camera without it).
-  * NSAppTransportSecurity / NSAllowsLocalNetworking: http:// is allowed only
-    to local servers (localhost, IP addresses, .local and unqualified names);
-    Config.validateServerURL refuses http:// to other hosts.
+  * NSAppTransportSecurity / NSAllowsLocalNetworking: the system allows
+    cleartext only to local servers; Config.validateServerURL is stricter and
+    refuses http:// to anything but this Mac (loopback) unless an
+    administrator sets DosiAllowInsecureHTTP.
   * Screen Recording, Input Monitoring and Accessibility take no usage string;
     macOS asks for them by the app's name.
   * DosiApiBaseURL / DosiDashboardURL may be added at build time

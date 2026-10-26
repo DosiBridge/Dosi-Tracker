@@ -159,16 +159,21 @@ public enum BlockAssembler {
     ///
     /// Activity is "not measured" — `productivity`, `idleSeconds` and
     /// `injectedInputEvents` left out, and no per-minute timeline (whose
-    /// `active: false` minutes would read as idle) — when the project records
+    /// `active: false` minutes would read as idle) — when the block records
     /// neither keyboard nor mouse, or the input capture was not working for
-    /// the whole block. A capture is attached only when the project allows it,
-    /// blurred when it must be (the server would drop an unblurred one), and
-    /// within the server's size limits.
+    /// the whole block. Each count is measured on its own: `keyboardHits`
+    /// (in the block, each minute and each window) is nil unless the keyboard
+    /// is recorded and the capture worked, and `mouseClicks` likewise — never
+    /// a 0 for input nobody measured. A capture is attached only when the
+    /// project allows it, blurred when it must be (the server would drop an
+    /// unblurred one), and within the server's size limits.
     public static func build(_ block: BlockSpec, measured: Measurements, device: DeviceInfo, zone: BlockZone) -> ActivityPayload {
         let permissions = block.permissions
         let start = EpochTime.seconds(block.startedAt)
         let end = EpochTime.seconds(block.endedAt)
-        let inputMeasured = permissions.measuresInput && measured.inputAvailable
+        let keyboardMeasured = permissions.keyboard && measured.inputAvailable
+        let mouseMeasured = permissions.mouse && measured.inputAvailable
+        let inputMeasured = keyboardMeasured || mouseMeasured
 
         let activeWindows: [WindowInfo]
         if !permissions.activeWindow {
@@ -181,14 +186,24 @@ public enum BlockAssembler {
                 activeWindows = []
             }
         } else {
-            activeWindows = UsageRecorder.appUsage(measured.slices, keyPresses: measured.keyPresses, clicks: measured.clicks)
+            var rows = UsageRecorder.appUsage(measured.slices, keyPresses: measured.keyPresses, clicks: measured.clicks)
+            for index in rows.indices {
+                if !keyboardMeasured { rows[index].keyboardHits = nil }
+                if !mouseMeasured { rows[index].mouseClicks = nil }
+            }
+            activeWindows = rows
         }
 
-        let timeline = inputMeasured
-            ? ActivityMath.minuteTimeline(start: start, end: end, slices: measured.slices,
-                                          keyPresses: measured.keyPresses, clicks: measured.clicks,
-                                          activeSeconds: measured.activeSeconds)
-            : []
+        var timeline: [ActivityMinute] = []
+        if inputMeasured {
+            timeline = ActivityMath.minuteTimeline(start: start, end: end, slices: measured.slices,
+                                                   keyPresses: measured.keyPresses, clicks: measured.clicks,
+                                                   activeSeconds: measured.activeSeconds)
+            for index in timeline.indices {
+                if !keyboardMeasured { timeline[index].keyboardHits = nil }
+                if !mouseMeasured { timeline[index].mouseClicks = nil }
+            }
+        }
 
         var payload = ActivityPayload(
             projectId: block.projectId,
@@ -197,8 +212,8 @@ public enum BlockAssembler {
             productivity: inputMeasured
                 ? ActivityMath.activityPercent(activeSeconds: measured.activeSeconds, start: start, end: end)
                 : nil,
-            mouseClicks: measured.clicks.count,
-            keyboardHits: measured.keyPresses.count,
+            mouseClicks: mouseMeasured ? measured.clicks.count : nil,
+            keyboardHits: keyboardMeasured ? measured.keyPresses.count : nil,
             description: cleanDescription(block.taskNote),
             activeWindows: activeWindows,
             runningPrograms: permissions.runningPrograms ? Array(measured.runningPrograms.prefix(maxRunningPrograms)) : [],

@@ -17,7 +17,7 @@ enum ConfigFile {
     ///
     /// ```json
     /// { "apiBaseURL": "https://…", "dashboardURL": "https://…", "intervalMinutes": 10,
-    ///   "blurScreenshots": false,
+    ///   "blurScreenshots": false, "allowInsecureHTTP": false,
     ///   "capture": { "screenshot": true, "webcam": false, "keyboard": true, "mouse": true,
     ///                "activeWindow": true, "runningPrograms": true } }
     /// ```
@@ -35,6 +35,7 @@ enum ConfigFile {
             ("dashboardURL", Config.Key.dashboardURL),
             ("intervalMinutes", Config.Key.intervalMinutes),
             ("blurScreenshots", Config.Key.blurScreenshots),
+            ("allowInsecureHTTP", Config.Key.allowInsecureHTTP),
         ]
         for (name, key) in top {
             if let value = object[name] {

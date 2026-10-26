@@ -11,6 +11,10 @@ import Foundation
 enum TrackerStatus: Equatable, Sendable {
     /// No saved sign-in: the sign-in window is shown.
     case signedOut
+    /// Signed in to the server, but no workspace is chosen to track in: after
+    /// signing in with several, or after losing access to the one tracked in
+    /// (removed, archived). Nothing is tracked and no heartbeat is sent.
+    case choosingWorkspace
     /// Signed in, waiting for the server's first answer (no project list yet).
     case connecting
     /// Signed in, but no project is chosen: several and none remembered, the
@@ -36,6 +40,11 @@ enum TrackerStatus: Equatable, Sendable {
     /// The server no longer accepts the saved password. Tracking stopped; the
     /// queue is kept and uploads once the password is entered again.
     case signInExpired
+    /// Signed in, but the user has not chosen what may be recorded on this
+    /// Mac (or revoked it): nothing is captured until they do. It counts as
+    /// signed in — signing out, switching project and uploading what is
+    /// already queued all work — and the presence heartbeat says `stopped`.
+    case consentRequired
     /// Nothing can be recorded (the local queue cannot be opened); the text
     /// says why.
     case stopped(String)
@@ -45,6 +54,8 @@ enum TrackerStatus: Equatable, Sendable {
         switch self {
         case .signedOut:
             return "Signed out"
+        case .choosingWorkspace:
+            return "Choose a workspace"
         case .connecting:
             return "Connecting…"
         case .choosingProject:
@@ -65,6 +76,8 @@ enum TrackerStatus: Equatable, Sendable {
             return "Offline — will retry"
         case .signInExpired:
             return "Sign-in expired"
+        case .consentRequired:
+            return "Consent required"
         case .stopped:
             return "Stopped"
         }
@@ -87,9 +100,9 @@ enum TrackerStatus: Equatable, Sendable {
             return .locked
         case .choosingProject:
             return .choosing
-        case .stopped:
+        case .stopped, .consentRequired:
             return .stopped
-        case .signedOut, .signInExpired, .connecting, .offline:
+        case .signedOut, .signInExpired, .connecting, .offline, .choosingWorkspace:
             return nil
         }
     }
@@ -116,10 +129,12 @@ enum TrackerStatus: Equatable, Sendable {
         self == .signedOut || self == .signInExpired
     }
 
-    /// Signed in with a usable account (an expired one does not count).
+    /// Signed in with a usable account in a workspace (an expired one, or
+    /// one still choosing its workspace, does not count; one waiting for the
+    /// user's consent does).
     var isSignedIn: Bool {
         switch self {
-        case .signedOut, .signInExpired, .stopped:
+        case .signedOut, .signInExpired, .stopped, .choosingWorkspace:
             return false
         default:
             return true
@@ -132,6 +147,8 @@ struct StatusFacts: Equatable, Sendable {
     /// The local queue is unusable: nothing can be recorded (why).
     var storageFailure: String?
     var signedIn = false
+    /// Signed in to the server without a workspace yet.
+    var choosingWorkspace = false
     var signInExpired = false
     var paused = false
     /// The pause is a timed break.
@@ -145,6 +162,7 @@ struct StatusFacts: Equatable, Sendable {
     /// Asleep, or the session is ending (shutdown, restart, log out).
     var suspended = false
     var away = false
+    /// The user consented to at least one kind of capture on this Mac.
     var consentGranted = false
     var tracking = false
 
@@ -153,10 +171,15 @@ struct StatusFacts: Equatable, Sendable {
             return .stopped(failure)
         }
         if !signedIn {
-            return .signedOut
+            return choosingWorkspace ? .choosingWorkspace : .signedOut
         }
         if signInExpired {
             return .signInExpired
+        }
+        // Before anything else that keeps tracking off: nothing starts
+        // without it (as on Windows).
+        if !consentGranted {
+            return .consentRequired
         }
         if paused {
             return timedBreak ? .onBreak : .paused
@@ -166,9 +189,6 @@ struct StatusFacts: Equatable, Sendable {
                 return .choosingProject
             }
             return contacting ? .connecting : .offline
-        }
-        if !consentGranted {
-            return .stopped("Consent required")
         }
         if suspended {
             return .asleep

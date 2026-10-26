@@ -159,6 +159,31 @@ final class ModelsCodingTests: XCTestCase {
         assertJSONEqual(try encode(legacy), #"{"minute":0,"keyboardHits":3,"mouseClicks":1,"active":true}"#)
     }
 
+    func testUnmeasuredCountsTravelAsNullAndSurviveTheQueue() throws {
+        var payload = block()
+        payload.keyboardHits = nil
+        payload.mouseClicks = 4
+        payload.timeline = [ActivityMinute(minute: 0, keyboardHits: nil, mouseClicks: 4, active: true)]
+        let data = try encode(payload)
+        let json = jsonDictionary(data)
+        XCTAssertTrue(json["keyboardHits"] is NSNull, "never left out, never a made-up 0")
+        XCTAssertEqual(json["mouseClicks"] as? Int, 4)
+        let minute = try XCTUnwrap((json["timeline"] as? [[String: Any]])?.first)
+        XCTAssertTrue(minute["keyboardHits"] is NSNull)
+
+        // A queued row reads back the same.
+        let back = try WireJSON.decoder().decode(ActivityPayload.self, from: data)
+        XCTAssertNil(back.keyboardHits)
+        XCTAssertEqual(back.mouseClicks, 4)
+        XCTAssertNil(back.timeline.first?.keyboardHits)
+
+        // Rows queued by older builds, which always measured, read as 0.
+        let older = #"{"projectId":"p","clientActivityId":"c","startedAt":"2026-10-05T10:00:00Z","endedAt":"2026-10-05T10:10:00Z"}"#
+        let legacy = try WireJSON.decoder().decode(ActivityPayload.self, from: Data(older.utf8))
+        XCTAssertEqual(legacy.keyboardHits, 0)
+        XCTAssertEqual(legacy.mouseClicks, 0)
+    }
+
     func testProjectPolicyFieldsDefaultLikeTheServer() throws {
         let olderServer = """
             [{"id":"p","title":"Website","intervalMinutes":10,"allowScreenshot":true,"allowWebcam":false,

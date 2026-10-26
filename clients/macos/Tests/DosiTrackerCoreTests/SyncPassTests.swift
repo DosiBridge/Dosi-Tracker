@@ -167,6 +167,25 @@ final class SyncPassTests: XCTestCase {
         XCTAssertEqual(try queue.pendingCount(owner: owner), 2, "the queue is kept for the next sign-in")
     }
 
+    func testARevokedDeviceOrALostWorkspaceStopsThePassAndKeepsEveryRow() async throws {
+        for (status, code) in [(403, UploadPolicy.Code.deviceRevoked), (403, UploadPolicy.Code.notWorkspaceMember),
+                               (403, UploadPolicy.Code.workspaceArchived), (400, UploadPolicy.Code.workspaceRequired)] {
+            try queue.reassignOwner(from: owner, to: "done")
+            let ids = try enqueue(["p1", "p2"])
+            let server = FakeServer()
+            server.answers["p1"] = [http(status, code, "No access.")]
+            let report = await run(server)
+            guard case .some(.accessLost(let loss)) = report.stop else {
+                return XCTFail("\(code): expected an access loss, got \(String(describing: report.stop))")
+            }
+            XCTAssertEqual(loss.message, "No access.")
+            XCTAssertEqual(server.sent.count, 1, "\(code): nothing more is sent")
+            XCTAssertTrue(report.parked.isEmpty, "\(code): never parked as rejected")
+            XCTAssertEqual(try queue.pendingCount(owner: owner), 2, "\(code): the rows wait")
+            XCTAssertEqual(try queue.recentRows(owner: owner, limit: 5).first { $0.id == ids[0] }?.reason, "No access.")
+        }
+    }
+
     func testAPassIsBoundedAndReadsInBatches() async throws {
         try enqueue((0..<7).map { "p\($0)" })
         let server = FakeServer()

@@ -88,6 +88,28 @@ public enum ApiError: Error, Equatable, Sendable {
         return false
     }
 
+    /// The failure points at the server address itself: nothing answered
+    /// there (or its certificate is not trusted), it redirected, or what
+    /// answered is not the API (a 404, a page that is not JSON). The sign-in
+    /// form then opens the address field.
+    public var concernsServerAddress: Bool {
+        switch self {
+        case .invalidConfiguration, .transport, .invalidResponse:
+            return true
+        case .http(let failure):
+            return ApiError.isWrongAddress(status: failure.status)
+        case .tokenFailed(let failure):
+            return ApiError.isWrongAddress(status: failure.status)
+        case .authRejected, .encoding:
+            return false
+        }
+    }
+
+    /// A redirect, or no such endpoint: the address is not the API's.
+    private static func isWrongAddress(status: Int) -> Bool {
+        (300...399).contains(status) || status == 404
+    }
+
     /// The HTTP status, when there was a response.
     public var status: Int? {
         switch self {
@@ -100,6 +122,13 @@ public enum ApiError: Error, Equatable, Sendable {
         default:
             return nil
         }
+    }
+
+    /// A 3xx answer: redirects are never followed, so the address must be the
+    /// API's own.
+    static func redirectMessage(status: Int) -> String {
+        "The server answered with a redirect (HTTP \(status)), which Dosi Tracker never follows. "
+            + "Use the API server's own https:// address."
     }
 
     /// What to tell the user (sign-in form, status line).
@@ -124,6 +153,8 @@ public enum ApiError: Error, Equatable, Sendable {
             return failure.userMessage
         case .http(let failure):
             switch failure.status {
+            case 300...399:
+                return ApiError.redirectMessage(status: failure.status)
             case 429:
                 return "The server is busy. Try again in a minute."
             case 500...599:

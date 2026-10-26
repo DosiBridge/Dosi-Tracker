@@ -99,11 +99,11 @@ struct StatusVisual {
         switch status {
         case .tracking:
             return StatusVisual(tone: .success, label: status.label)
-        case .paused, .onBreak, .away, .locked, .asleep:
+        case .paused, .onBreak, .away, .locked, .asleep, .consentRequired:
             return StatusVisual(tone: .warning, label: status.label)
         case .offline:
             return StatusVisual(tone: .warning, label: "Offline")
-        case .connecting, .choosingProject:
+        case .connecting, .choosingProject, .choosingWorkspace:
             return StatusVisual(tone: .info, label: status.label)
         case .signedOut:
             return StatusVisual(tone: .neutral, label: status.label)

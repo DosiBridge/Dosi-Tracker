@@ -105,9 +105,10 @@ enum WorkerRules {
     }
 }
 
-/// What the current project captures — the server's policy combined with the
-/// local configuration. Shown read-only in the window; the live view also
-/// hides input counts the project does not record.
+/// Which captures are on: what the current project captures (the server's
+/// policy combined with the local configuration), or what a block records
+/// (that, narrowed to the user's consent). Shown read-only in the window; the
+/// live view also hides input counts that are not recorded.
 struct CaptureFlags: Equatable, Sendable {
     var screenshot: Bool
     var webcam: Bool
@@ -135,6 +136,14 @@ struct CaptureFlags: Equatable, Sendable {
         self.init(screenshot: permissions.screenshot, webcam: permissions.webcam, keyboard: permissions.keyboard,
                   mouse: permissions.mouse, activeWindow: permissions.activeWindow,
                   runningPrograms: permissions.runningPrograms, blurScreenshots: session.blurScreenshots)
+    }
+
+    /// The flags of what a block records under `policy`.
+    init(policy: BlockPolicy) {
+        let permissions = policy.permissions
+        self.init(screenshot: permissions.screenshot, webcam: permissions.webcam, keyboard: permissions.keyboard,
+                  mouse: permissions.mouse, activeWindow: permissions.activeWindow,
+                  runningPrograms: permissions.runningPrograms, blurScreenshots: policy.blurScreenshots)
     }
 
     /// The flags of consented permissions.
