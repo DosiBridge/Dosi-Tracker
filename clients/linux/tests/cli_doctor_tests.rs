@@ -321,9 +321,9 @@ fn cli_version_names_the_dosi_tracker_binary() {
     }
 }
 
-#[cfg(feature = "gui")]
+#[cfg(all(feature = "gui", target_os = "linux"))]
 #[test]
-fn gui_placeholder_prints_its_version_and_refuses_everything_else() {
+fn gui_prints_its_version_and_needs_a_display() {
     let gui = env!("CARGO_BIN_EXE_dosi-tracker-gui");
     let output = Command::new(gui)
         .arg("--version")
@@ -336,16 +336,26 @@ fn gui_placeholder_prints_its_version_and_refuses_everything_else() {
         concat!("dosi-tracker-gui ", env!("CARGO_PKG_VERSION"))
     );
 
-    for args in [&[][..], &["--preview", "main"][..]] {
-        let output = Command::new(gui)
-            .args(args)
-            .env_clear()
-            .output()
-            .expect("failed to execute GUI binary");
-        assert_eq!(output.status.code(), Some(1), "{args:?}");
-        assert!(output.stdout.is_empty());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("GUI not available in this build"));
-    }
+    // No display in the environment: the window explains it and exits 9.
+    let temp = tempfile::tempdir().unwrap();
+    let output = Command::new(gui)
+        .env_clear()
+        .env("HOME", temp.path())
+        .env("XDG_RUNTIME_DIR", temp.path())
+        .output()
+        .expect("failed to execute GUI binary");
+    assert_eq!(output.status.code(), Some(9));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no graphical display"));
+
+    // Unknown arguments are usage errors, and their values are not echoed.
+    let output = Command::new(gui)
+        .args(["--password", "gui-canary-pw"])
+        .env_clear()
+        .output()
+        .expect("failed to execute GUI binary");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("gui-canary-pw"));
 }
 
 #[test]

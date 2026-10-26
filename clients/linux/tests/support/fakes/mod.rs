@@ -12,6 +12,7 @@ pub mod notifications;
 pub mod portal;
 #[cfg(target_os = "linux")]
 pub mod screensaver;
+#[cfg(target_os = "linux")]
 pub mod sni_watcher;
 #[cfg(target_os = "linux")]
 pub mod systemd_shim;
