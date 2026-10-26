@@ -217,6 +217,7 @@ export function AttendanceReport() {
 
   return (
     <ReportShell
+      aiExplain={{ slug: "attendance", query: { from: period.from, to: period.to, projectId, userId: memberId, timeZone } }}
       title="Attendance"
       description="Days present and absent, typical start and finish times, and weekend work per member."
       actions={

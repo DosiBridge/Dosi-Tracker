@@ -58,6 +58,7 @@ import { BlurredChip, EndReasonChip } from "@/components/activities/session-meta
 import { HourlyChart } from "@/components/dashboard/charts";
 import { AppGlyph, ScreenMockView } from "@/components/screen-mock";
 import { useSession } from "@/components/session-provider";
+import { AiDaySummaryCard } from "@/components/ai/ai-day-summary-card";
 import { getAllPagesApi } from "@/hooks/useApi";
 import { useReportingZone } from "@/hooks/use-reporting-zone";
 import { brand } from "@/lib/brand";
@@ -824,6 +825,9 @@ export default function MonitorPage() {
               value={summary.lastMin !== null ? fmtMin(summary.lastMin) : "—"}
             />
           </div>
+
+          {/* Only once the day itself loaded (live: never while pending or after a failed read — those return above). */}
+          <AiDaySummaryCard userId={activeUserId} date={iso} timeZone={tz} />
 
           <Card>
             <CardHeader>

@@ -277,6 +277,7 @@ export function ProjectsReport() {
 
   return (
     <ReportShell
+      aiExplain={{ slug: "projects", query: { from: period.from, to: period.to, projectId, userId: memberId, timeZone } }}
       title="Project Breakdown"
       description="Time, share and labour cost per project, archived projects included."
       actions={<ExportMenu onExportCSV={exportCsv} disabled={pending || !hasTime} />}

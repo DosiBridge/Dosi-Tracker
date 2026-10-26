@@ -17,6 +17,8 @@ test("dashboard layout is stable @visual", async ({ page, context }) => {
   await primeSession(context, { userId: "u1", workspaceId: "w1" });
   await page.goto("/dashboard");
   await expect(page.getByText("Organization overview for today.")).toBeVisible();
+  // AI assist's sample card arrives in its own chunk: wait for it, so the shot never races the download.
+  await expect(page.getByRole("button", { name: "Generate" })).toBeVisible();
   await expect(page).toHaveScreenshot("dashboard.png", {
     mask: [page.getByRole("heading", { level: 1 })],
   });

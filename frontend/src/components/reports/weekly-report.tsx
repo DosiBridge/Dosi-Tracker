@@ -249,6 +249,7 @@ export function WeeklyReport() {
 
   return (
     <ReportShell
+      aiExplain={{ slug: "weekly", query: { from: period.from, to: period.to, projectId, userId: memberId, timeZone } }}
       title="Weekly Summary"
       description="The week at a glance per member: hours, activity, idle time, days worked and the busiest day."
       actions={<ExportMenu onExportCSV={exportCsv} disabled={pending || rows.length === 0} />}

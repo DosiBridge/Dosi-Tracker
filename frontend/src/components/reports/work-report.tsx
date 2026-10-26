@@ -442,6 +442,7 @@ export function WorkReport() {
 
   return (
     <ReportShell
+      aiExplain={{ slug: "work-report", query: { from: period.from, to: period.to, projectId, userId: memberId, timeZone } }}
       title="Work Report"
       description="Hours worked per day, ready to share — copy a summary, export a CSV, or save it as a PDF."
       actions={

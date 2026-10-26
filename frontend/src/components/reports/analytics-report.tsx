@@ -543,6 +543,7 @@ export function AnalyticsReport() {
 
   return (
     <ReportShell
+      aiExplain={{ slug: "analytics", query: { from: period.from, to: period.to, projectId, userId: memberId, timeZone } }}
       title="Work Analytics"
       description="When, how and on what your team works — trends, work rhythm, focus, projects and people, in charts."
       actions={

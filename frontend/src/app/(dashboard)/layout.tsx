@@ -7,6 +7,7 @@ import { Sidebar } from "@/components/layout/sidebar";
 import { Topbar } from "@/components/layout/topbar";
 import { CommandPalette } from "@/components/command-palette";
 import { AiAssistantProvider } from "@/components/ai/ai-provider";
+import { AiCardsPreload } from "@/components/ai/ai-cards-preload";
 import { ToastViewport } from "@/components/toast";
 import { RoleGuard } from "@/components/role-guard";
 import { PageEnter } from "@/components/motion/reveal";
@@ -32,6 +33,7 @@ function DashboardShell({ children }: { children: React.ReactNode }) {
   return (
     // AI assist's context (status, results, drawer): scoped to the workspace, reset by a switch.
     <AiAssistantProvider>
+      <AiCardsPreload />
       <div className="min-h-screen">
         {/* Keyboard users otherwise tab through ~16 nav stops on every page
             before reaching content. Visible only while focused. */}
