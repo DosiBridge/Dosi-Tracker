@@ -341,6 +341,11 @@ fn reset_inner(ctx: &Ctx, yes: bool) -> Result<Done, CliError> {
 
 pub fn uninstall(ctx: &Ctx, purge: bool, yes: bool) -> u8 {
     ctx.out("uninstall").run(|| {
+        // Every uninstall path (package or tarball, purge or not) must remove
+        // the managed login entry it created; otherwise it is left pointing at
+        // a program that is about to be deleted. Best-effort: an unmanaged or
+        // already-absent entry is not an error here.
+        let _ = svc::disable_autostart(&ctx.paths.autostart_entry());
         let exe = exe()?;
         let prefix = exe
             .parent()
@@ -379,4 +384,61 @@ pub fn uninstall(ctx: &Ctx, purge: bool, yes: bool) -> u8 {
             format!("Dosi Tracker was installed as a package; remove it with: {command}"),
         ))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::paths::LinuxPaths;
+
+    fn test_ctx(home: &Path) -> Ctx {
+        Ctx {
+            json: true,
+            quiet: true,
+            verbose: 0,
+            no_start: true,
+            socket_override: None,
+            paths: LinuxPaths::resolve(Some(home), None, None, None),
+            env: Vec::new(),
+        }
+    }
+
+    /// `uninstall()` always removes the managed login entry it created,
+    /// even on the "installed as a package" path (no `uninstall.sh` to
+    /// delegate to): without this, following the documented "run reset,
+    /// then remove the package" flow would leave a dangling autostart
+    /// entry pointing at a now-uninstalled binary.
+    #[test]
+    fn uninstall_disables_autostart_on_the_package_path() {
+        let home = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(home.path());
+        let entry = ctx.paths.autostart_entry();
+
+        // Write a managed autostart entry as `service enable` would.
+        svc::enable_autostart(&entry, Path::new("/opt/dosi/bin/dosi-tracker")).unwrap();
+        assert!(entry.is_file(), "precondition: autostart entry exists");
+
+        // No `uninstall.sh` exists next to this test binary, so `uninstall()`
+        // takes the "installed as a package" branch; it must still have
+        // disabled autostart before reaching that branch.
+        let code = uninstall(&ctx, false, true);
+        assert_eq!(code, 0, "uninstall() should report success");
+        assert!(
+            !entry.exists(),
+            "the managed autostart entry must be removed on every uninstall path"
+        );
+    }
+
+    /// An unmanaged (foreign) autostart entry is never touched.
+    #[test]
+    fn uninstall_leaves_an_unmanaged_autostart_entry_alone() {
+        let home = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(home.path());
+        let entry = ctx.paths.autostart_entry();
+        std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
+        std::fs::write(&entry, "[Desktop Entry]\nExec=/usr/bin/something-else\n").unwrap();
+
+        let _ = uninstall(&ctx, false, true);
+        assert!(entry.is_file(), "an unmanaged entry must be left alone");
+    }
 }
