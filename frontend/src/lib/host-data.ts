@@ -36,9 +36,9 @@ export interface TenantMetrics {
 export function tenantMetrics(ws: Workspace): TenantMetrics {
   const ds = datasetFor(ws.id);
   const seatHolders = ds.users.filter((u) => u.role === "owner" || u.role === "admin" || u.role === "worker");
-  const activeUsers = seatHolders.filter((u) => u.productivity > 0);
+  const activeUsers = seatHolders.filter((u) => (u.productivity ?? 0) > 0);
   const avgProductivity = activeUsers.length
-    ? Math.round(activeUsers.reduce((s, u) => s + u.productivity, 0) / activeUsers.length)
+    ? Math.round(activeUsers.reduce((s, u) => s + (u.productivity ?? 0), 0) / activeUsers.length)
     : 0;
   return {
     members: seatHolders.length,

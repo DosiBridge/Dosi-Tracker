@@ -18,7 +18,7 @@ import {
   activeMinutes,
   activitiesOnDay,
   activitiesOnZonedDay,
-  averageProductivity,
+  activityPercent,
   durationMinutes,
   inRange,
   minutesForProject,
@@ -611,7 +611,9 @@ export function mapTeamMember(dto: ApiTeamMemberDto, activities: Activity[], now
     status,
     timezone: deviceZone ?? "UTC",
     trackedToday: Math.round(totalMinutes(todays)),
-    productivity: averageProductivity(todays),
+    // Null when today's rows weren't measured (consent off, Wayland, …) or
+    // there are none — never a fabricated 0% (see metrics.ts: activityPercent).
+    productivity: activityPercent(todays),
     joinedAt: "",
   };
 }

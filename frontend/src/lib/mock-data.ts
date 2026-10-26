@@ -371,7 +371,7 @@ function buildActivities(): Activity[] {
           description: pick(descriptions),
           // Centered on the member's own score so the per-member "activity %"
           // a report computes from these rows matches what /team shows.
-          productivity: Math.min(99, Math.max(30, user.productivity + between(-10, 8))),
+          productivity: Math.min(99, Math.max(30, (user.productivity ?? 50) + between(-10, 8))),
           // Input volume scales with how long the block actually ran.
           mouseClicks: Math.round(session.minutes * between(3, 11)),
           keyboardHits: Math.round(session.minutes * between(12, 60)),

@@ -472,7 +472,16 @@ describe("projects and roster", () => {
 
     const gone = mapTeamMember({ userId: "u1", isActive: false }, rows, NOW);
     expect(gone.status).toBe("offline");
-    expect(mapTeamMember({ userId: "nobody" }, rows, NOW)).toMatchObject({ trackedToday: 0, productivity: 0, status: "offline", email: "" });
+    expect(mapTeamMember({ userId: "nobody" }, rows, NOW)).toMatchObject({ trackedToday: 0, productivity: null, status: "offline", email: "" });
+  });
+
+  it("mapTeamMember: a member who tracked time today with unmeasured input reads null, never a fabricated 0%", () => {
+    const rows = [
+      act({ userId: "u1", startedAt: "2026-09-23T14:00:00.000Z", endedAt: "2026-09-23T14:50:00.000Z", productivity: 0, activityMeasured: false }),
+    ];
+    const u1 = mapTeamMember({ userId: "u1" }, rows, NOW);
+    expect(u1.trackedToday).toBe(50); // time was tracked
+    expect(u1.productivity).toBeNull(); // but its input was never measured — not 0%
   });
 
   it("mapTeamMember counts 'today' in the reporting zone, not UTC", () => {

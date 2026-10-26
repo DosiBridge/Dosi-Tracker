@@ -138,7 +138,7 @@ function genActivities(users: User[], projects: Project[], seedNum: number): Act
           startedAt: session.startedAt.toISOString(),
           endedAt: session.endedAt.toISOString(),
           description: pick(descriptions),
-          productivity: Math.min(99, Math.max(30, user.productivity + between(-10, 8))),
+          productivity: Math.min(99, Math.max(30, (user.productivity ?? 50) + between(-10, 8))),
           mouseClicks: Math.round(session.minutes * between(3, 11)),
           keyboardHits: Math.round(session.minutes * between(12, 60)),
           activeWindows: active,
@@ -228,7 +228,7 @@ function deriveSplit(users: User[]): ProductivitySplit[] {
   return trackedMembers(users)
     .map((u) => {
       const total = u.trackedToday;
-      const productive = Math.round((total * u.productivity) / 100);
+      const productive = Math.round((total * (u.productivity ?? 0)) / 100);
       const remaining = total - productive;
       const unproductive = Math.round(remaining * 0.35);
       const neutral = remaining - unproductive;

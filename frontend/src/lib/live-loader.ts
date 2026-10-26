@@ -523,7 +523,9 @@ export async function loadLiveSession(get: LiveGetter, now: Date = new Date(), o
   const withToday = (u: User): User => {
     const today = totals.today?.users.get(u.id);
     if (!totals.today) return u;
-    return { ...u, trackedToday: Math.round(today?.minutes ?? 0), productivity: today?.activity ?? 0 };
+    // today?.activity is already null when nothing was measured (or the user
+    // has no row at all today) — never coalesce that to a fabricated 0%.
+    return { ...u, trackedToday: Math.round(today?.minutes ?? 0), productivity: today?.activity ?? null };
   };
 
   // The viewer's role and name come from their identity (authoritative);

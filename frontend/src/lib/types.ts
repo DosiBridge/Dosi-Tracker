@@ -33,8 +33,8 @@ export interface User {
   timezone: string;
   /** minutes tracked today */
   trackedToday: number;
-  /** 0-100 */
-  productivity: number;
+  /** Today's Activity %, 0-100; null when today's input wasn't measured (metrics.ts: activityPercent). */
+  productivity: number | null;
   joinedAt: string;
 }
 

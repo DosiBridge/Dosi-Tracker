@@ -396,11 +396,11 @@ export function trackedMinutesByUser(list: Activity[] = activities) {
 }
 
 export function insights(): Insight[] {
-  const activeUsers = users.filter((u) => u.productivity > 0);
+  const activeUsers = users.filter((u) => (u.productivity ?? 0) > 0);
   if (!activeUsers.length) return [];
-  const topPerformer = [...activeUsers].sort((a, b) => b.productivity - a.productivity)[0];
+  const topPerformer = [...activeUsers].sort((a, b) => (b.productivity ?? 0) - (a.productivity ?? 0))[0];
   const mostTracked = [...activeUsers].sort((a, b) => b.trackedToday - a.trackedToday)[0];
-  const needsAttention = [...activeUsers].sort((a, b) => a.productivity - b.productivity)[0];
+  const needsAttention = [...activeUsers].sort((a, b) => (a.productivity ?? 0) - (b.productivity ?? 0))[0];
   const cats = categoryTotals();
   const totalCat = cats.productive + cats.neutral + cats.unproductive || 1;
   const focusRatio = Math.round((cats.productive / totalCat) * 100);
