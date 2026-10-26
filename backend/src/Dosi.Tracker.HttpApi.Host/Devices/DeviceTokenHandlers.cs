@@ -100,9 +100,24 @@ public sealed class AttachDeviceBinding : IOpenIddictServerHandler<ProcessSignIn
         }
 
         var authorizationId = context.Principal.GetAuthorizationId();
-        if (!string.IsNullOrEmpty(authorizationId))
+        if (string.IsNullOrEmpty(authorizationId))
         {
-            await _sessionManager.BindAsync(authorizationId, deviceId);
+            return;
+        }
+
+        // A brand-new sign-in's authorization can still be mid-write elsewhere in OpenIddict's own pipeline (it
+        // was only just created a few handlers earlier) when BindAsync reads it, so its first attempt can lose a
+        // concurrency race against that write. Re-reading and retrying — same as any optimistic-concurrency
+        // caller — picks up the now-current row; it never retries a real rejection (BindAsync returns true as
+        // soon as the row already carries a device, including the one this call tried to write).
+        for (var attempt = 1; attempt <= MaxBindAttempts; attempt++)
+        {
+            if (await _sessionManager.BindAsync(authorizationId, deviceId))
+            {
+                return;
+            }
         }
     }
+
+    private const int MaxBindAttempts = 3;
 }
