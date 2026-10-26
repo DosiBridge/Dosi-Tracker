@@ -31,27 +31,44 @@ public class DeviceSessionManager : DomainService
 
     /// <summary>Records <paramref name="deviceId"/> on the authorization <paramref name="authorizationId"/> (written
     /// only when it is not recorded yet). An authorization of another device keeps its device: the token request
-    /// was refused before it could reach this point.</summary>
-    public virtual async Task BindAsync(string authorizationId, Guid deviceId)
+    /// was refused before it could reach this point. Read-modify-write against a concurrency-stamped row: a caller
+    /// racing another write to the same authorization (see <see cref="AttachDeviceBinding"/>, which retries this on
+    /// that conflict) gets <see cref="BindConflict"/> rather than a swallowed or silently stale write.</summary>
+    public virtual async Task<bool> BindAsync(string authorizationId, Guid deviceId)
     {
         var authorization = await _authorizationManager.FindByIdAsync(authorizationId);
         if (authorization == null)
         {
-            return;
+            return true;
         }
 
         var properties = await _authorizationManager.GetPropertiesAsync(authorization);
         if (FindDevice(properties) != null)
         {
-            return;
+            return true;
         }
 
         var descriptor = new OpenIddictAuthorizationDescriptor();
         await _authorizationManager.PopulateAsync(descriptor, authorization);
         descriptor.Properties[DeviceConsts.AuthorizationProperty] =
             JsonSerializer.SerializeToElement(DeviceTokenBinding.Format(deviceId));
-        await _authorizationManager.UpdateAsync(authorization, descriptor);
+
+        try
+        {
+            await _authorizationManager.UpdateAsync(authorization, descriptor);
+            return true;
+        }
+        catch (Exception ex) when (IsConcurrencyConflict(ex))
+        {
+            return false;
+        }
     }
+
+    /// <summary>True for the EF Core concurrency-token mismatch ABP's own <c>AbpDbContext.SaveChangesAsync</c> wraps
+    /// (<c>Microsoft.EntityFrameworkCore.DbUpdateConcurrencyException</c>), matched by name so this domain service —
+    /// which must stay persistence-agnostic — names no EF Core type.</summary>
+    private static bool IsConcurrencyConflict(Exception ex) =>
+        ex.GetType().FullName == "Microsoft.EntityFrameworkCore.DbUpdateConcurrencyException";
 
     /// <summary>The device recorded on <paramref name="authorizationId"/>, or null (unknown or unbound).</summary>
     public virtual async Task<Guid?> FindBoundDeviceAsync(string authorizationId)
