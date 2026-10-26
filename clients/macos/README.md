@@ -441,7 +441,9 @@ It talks to the backend as every agent does (the cross-agent contract):
 - **Terminal answers** — 403 `Tracker:DeviceRevoked` (also forgets the saved
   sign-in), `Tracker:NotWorkspaceMember`, `Tracker:WorkspaceArchived` and 400
   `Tracker:WorkspaceRequired` stop capture and heartbeats for that workspace;
-  its queued rows wait.
+  its queued rows wait. The next workspace is then always chosen by you, even
+  when only one is left or it is the only one offered after a relaunch: it may
+  belong to another organisation, so nothing is taken on your behalf.
 - **Transport** — `https://` only (`http://` only to this Mac, unless
   `DosiAllowInsecureHTTP`), and redirects are never followed.
 - **Projects** — `GET /api/app/project/my-projects`: the projects you track, with
