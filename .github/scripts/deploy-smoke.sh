@@ -194,7 +194,10 @@ docker start "${api_container}" >/dev/null
 http() {
   local mode="$1" method="$2" path="$3"
   shift 3
-  local -a args=(-sS -X "${method}" -H "Accept: application/json" -w '\n%{http_code}')
+  # Response headers go to stderr (-D), so they land in the job log without joining the captured response
+  # body+status (command substitution only captures stdout) — essential for diagnosing a redirect, whose body
+  # is normally empty.
+  local -a args=(-sS -X "${method}" -H "Accept: application/json" -D /dev/stderr -w '\n%{http_code}')
   if [[ "${mode}" == "proxy" ]]; then
     args+=(-H "X-Forwarded-Proto: https")
   fi
