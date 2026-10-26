@@ -34,6 +34,38 @@ Emails are queued as ABP background jobs (table `AbpBackgroundJobs`) and retried
 server fails. For local testing, point SMTP at a mail catcher such as Mailpit (`Settings__Abp.Mailing.Smtp.Host=localhost`,
 `…Port=1025`, `…EnableSsl=false`).
 
+**Local secrets.** The tracked `appsettings.Development.json` holds template values only. Put your local database
+password (and an AI key, if you try AI assist) in the git-ignored
+`src/Dosi.Tracker.HttpApi.Host/appsettings.secrets.json`, for example
+`{ "ConnectionStrings": { "Default": "Host=localhost;Port=5432;Database=Tracker;User ID=postgres;Password=<yours>;" } }`.
+It is copied to `bin` but never into a publish folder, so it cannot reach a container image (it would override the
+container's environment there).
+
+#### AI assist (off by default)
+
+AI assist will send aggregated tracker data to an OpenAI-protocol provider, only in workspaces whose owner turns it on.
+So far the server has the provider configuration only; no feature calls it yet. It is off unless `AI__Enabled=true`.
+At start-up the host logs one line with the provider state (`Disabled`,
+`Configured`, or what is missing). The key is never logged, and it must never be written into a tracked file:
+the start-up guard refuses an `AI:OpenAI:ApiKey` read from `appsettings.json`, and a test fails on any settings file
+under `backend/` that carries one.
+
+| Setting | Purpose | Default |
+|---|---|---|
+| `AI__Enabled` | The hard switch (read at start-up) | `false` |
+| `AI__Provider` | `OpenAI`, `AzureOpenAI` (v1 API; `Model` is the deployment name) or `OpenAICompatible` | `OpenAI` |
+| `AI__OpenAI__ApiKey` | The provider key: environment, `appsettings.secrets.json` or a secret store only | none |
+| `AI__OpenAI__Model` | The default model, e.g. `gpt-5.4-mini` (works with strict structured output and `AI__ReasoningEffort=low`) or `gpt-4.1-mini` (leave `ReasoningEffort` unset) | none: AI stays off |
+| `AI__OpenAI__BaseUrl`, `__AllowedHosts` | Endpoint, required for Azure and compatible servers; absolute https (plain http only for localhost in Development) and its host must be in the comma-separated allowlist | OpenAI's own, `api.openai.com` |
+| `AI__OpenAI__OrganizationId`, `__ProjectId` | Sent as OpenAI's organization and project headers | none |
+| `AI__RequestTimeoutSeconds`, `AI__MaxRetries` | Per-attempt timeout; retries of 408, 429, every 5xx (OpenAI's edge answers 520 now and then) and network errors, with exponential back-off. A Retry-After longer than 10 s is reported instead of waited for | `30`, `2` |
+| `AI__ReasoningEffort`, `AI__Temperature` | Sent only when set (reasoning models reject a temperature) | none |
+| `AI__Features__<Feature>__Enabled`, `__Model`, `__MaxOutputTokens` | Per feature: `PeriodSummary`, `MemberDaySummary`, `ReportExplanation`, `DataQualityReview`, `NoteSuggestions`, `TaskDrafts`, `Ask` | on, the default model, per feature |
+| `AI__Pricing__<n>__Model`, `__InputPer1M`, `__CachedInputPer1M`, `__OutputPer1M` | USD per million tokens, for cost estimates and the USD budget | none |
+
+List the models your key can use locally (`GET https://api.openai.com/v1/models`), never in CI. Prefer a dedicated
+OpenAI project per environment with a project-scoped key, a model allowlist and a monthly budget.
+
 
 ### Before running the application
 
