@@ -1,4 +1,10 @@
-import { AI_FEATURE_IDS, type AiFeatureStatusDto, type AiInsightFeatureId, type AiScope, type AiStatusDto } from "./ai-contract";
+import {
+  AI_FEATURE_IDS,
+  type AiFeatureStatusDto,
+  type AiInsightFeatureId,
+  type AiScope,
+  type AiStatusDto,
+} from "./ai-contract";
 import { NOW } from "./demo-clock";
 import type { Role } from "./types";
 
@@ -11,6 +17,9 @@ import type { Role } from "./types";
 
 /** The demo's own disclosure version (a server sends "{code}.{operator}"). */
 export const DEMO_DISCLOSURE_VERSION = "1.0";
+
+/** The processor a demo names: none, since nothing leaves the browser. */
+export const DEMO_PROVIDER = "Demo (no AI provider)";
 
 const FEATURE_SCOPES: Partial<Record<AiInsightFeatureId, { team: AiScope[]; self: AiScope[] }>> = {
   "period-summary": { team: ["team", "self"], self: ["self"] },
@@ -37,7 +46,7 @@ export function demoAiStatus(role: Role): AiStatusDto {
     reason: tracked ? null : "role-not-allowed",
     workspaceEnabled: true,
     canManage: role === "owner",
-    providerDisplayName: "Demo (no AI provider)",
+    providerDisplayName: DEMO_PROVIDER,
     disclosureVersion: DEMO_DISCLOSURE_VERSION,
     allowWindowTitles: false,
     allowNotes: false,

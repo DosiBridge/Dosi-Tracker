@@ -5,6 +5,8 @@ import {
   type AiRouteId,
   type AiScope,
   type AiStatusDto,
+  type AiWorkspaceSettingsDto,
+  type UpdateAiWorkspaceSettingsDto,
 } from "./ai-contract";
 import { reportCatalog } from "./reports-data";
 import { formatInZone } from "./time-zone";
@@ -153,6 +155,126 @@ export function aiSetupNotice(status: AiStatusDto | null | undefined, role: Role
   if (status.reason !== "workspace-disabled" && status.reason !== "reconsent-required") return null;
   if (owner && status.canManage) return "turn-on";
   return role === "admin" ? "ask-owner" : null;
+}
+
+/* ----------------------------- Status lines ----------------------------- */
+
+export interface AiStatusLine {
+  /** "On", "Off", "Paused", "Unavailable" or "Sample": visible text, never colour alone. */
+  label: string;
+  tone: "success" | "muted" | "warning" | "info";
+  /** One sentence on what that means. */
+  text: string;
+}
+
+/**
+ * The one-line state of AI assist in this workspace, for Settings (the owner's
+ * card and everyone's privacy note). `demo` is a demo session: its "AI" is
+ * sample text built in the browser.
+ */
+export function aiStatusLine(status: AiStatusDto | null | undefined, options: { demo?: boolean } = {}): AiStatusLine {
+  if (options.demo) {
+    return { label: "Sample", tone: "info", text: "In the demo, AI output is sample text built from the demo data; nothing is sent anywhere." };
+  }
+  if (!status || status.reason === "not-configured" || status.reason === "platform-disabled") {
+    return { label: "Unavailable", tone: "muted", text: `${AI_COPY.serverUnavailable} Nothing is sent to an AI provider.` };
+  }
+  const provider = status.providerDisplayName ? ` with ${status.providerDisplayName}` : "";
+  switch (status.reason) {
+    case "subscription-inactive":
+      return { label: "Paused", tone: "warning", text: "This workspace's subscription isn't active, so AI assist is paused." };
+    case "workspace-disabled":
+      return { label: "Off", tone: "muted", text: "AI assist is off in this workspace. Nothing is sent to an AI provider." };
+    case "reconsent-required":
+      return {
+        label: "Paused",
+        tone: "warning",
+        text: "The AI disclosure changed. AI assist stays paused until the workspace owner reviews it.",
+      };
+    case "quota-exhausted":
+      return { label: "On", tone: "success", text: `AI assist is on${provider}. This month's AI allowance is used.` };
+  }
+  return status.workspaceEnabled
+    ? { label: "On", tone: "success", text: `AI assist is on in this workspace. Summaries are written${provider} when someone presses Generate.` }
+    : { label: "Off", tone: "muted", text: "AI assist is off in this workspace. Nothing is sent to an AI provider." };
+}
+
+/** What each feature is called on the privacy note ("what you can use"). */
+export const AI_FEATURE_LABELS: Record<AiFeatureId, string> = {
+  "period-summary": "Week summaries",
+  "member-day-summary": "Day summaries",
+  "report-explanation": "Report explanations",
+  "data-quality-review": "Tracking checks",
+  "note-suggestions": "Note suggestions",
+  "task-drafts": "Task drafts",
+  ask: "Ask AI",
+};
+
+/** The features the server allows this caller, by name, in the status's order; empty when none (or no status). */
+export function allowedAiFeatures(status: AiStatusDto | null | undefined): string[] {
+  if (!status) return [];
+  return status.features
+    .filter((f) => f.allowed && Object.prototype.hasOwnProperty.call(AI_FEATURE_LABELS, f.featureId))
+    .map((f) => AI_FEATURE_LABELS[f.featureId as AiFeatureId]);
+}
+
+/* ----------------------------- Settings (§5.3, §8) ----------------------------- */
+
+/** The owner's switches, as saved. */
+export type AiSettingsFlags = Pick<
+  UpdateAiWorkspaceSettingsDto,
+  "isEnabled" | "allowManagers" | "allowMemberSelfService" | "allowWindowTitles" | "allowNotes"
+>;
+
+/** Why a change needs the owner to acknowledge the current disclosure first. */
+export type AiAcknowledgementReason = "enable" | "reconsent" | "window-titles" | "notes";
+
+/** Whether the owner's acknowledged disclosure is the server's current one. */
+export function aiConsentCurrent(settings: Pick<AiWorkspaceSettingsDto, "consentVersion" | "disclosure">): boolean {
+  return settings.consentVersion !== null && settings.consentVersion === settings.disclosure.version;
+}
+
+/** The workspace counts as on: switched on, with the current disclosure acknowledged. */
+export function aiEffectivelyOn(settings: Pick<AiWorkspaceSettingsDto, "isEnabled" | "consentVersion" | "disclosure">): boolean {
+  return settings.isEnabled && aiConsentCurrent(settings);
+}
+
+/**
+ * What the server will ask an acknowledgement for when `next` replaces
+ * `current` (§5.3): turning AI assist on, saving while it stays on with an
+ * outdated acknowledgement (re-consent), or turning window titles or task
+ * notes on. Empty when the change can be saved as it is.
+ */
+export function aiAcknowledgementReasons(current: AiSettingsFlags, next: AiSettingsFlags, consentCurrent: boolean): AiAcknowledgementReason[] {
+  const reasons: AiAcknowledgementReason[] = [];
+  if (next.isEnabled && !current.isEnabled) reasons.push("enable");
+  else if (next.isEnabled && !consentCurrent) reasons.push("reconsent");
+  if (next.allowWindowTitles && !current.allowWindowTitles) reasons.push("window-titles");
+  if (next.allowNotes && !current.allowNotes) reasons.push("notes");
+  return reasons;
+}
+
+/** The PUT body: the switches, plus the disclosure version when the change needs it acknowledged. */
+export function aiSettingsUpdate(next: AiSettingsFlags, acknowledgedVersion: string | null): UpdateAiWorkspaceSettingsDto {
+  return {
+    isEnabled: next.isEnabled,
+    allowManagers: next.allowManagers,
+    allowMemberSelfService: next.allowMemberSelfService,
+    allowWindowTitles: next.allowWindowTitles,
+    allowNotes: next.allowNotes,
+    acknowledgedDisclosureVersion: acknowledgedVersion,
+  };
+}
+
+/** The switches of a saved settings record. */
+export function aiSettingsFlags(settings: AiSettingsFlags): AiSettingsFlags {
+  return {
+    isEnabled: settings.isEnabled,
+    allowManagers: settings.allowManagers,
+    allowMemberSelfService: settings.allowMemberSelfService,
+    allowWindowTitles: settings.allowWindowTitles,
+    allowNotes: settings.allowNotes,
+  };
 }
 
 /* ----------------------------- Errors ----------------------------- */

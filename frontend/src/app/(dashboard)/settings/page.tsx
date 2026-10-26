@@ -1,7 +1,9 @@
 "use client";
 
-import { useCallback, useEffect, useId, useMemo, useState, useSyncExternalStore } from "react";
+import { Suspense, useCallback, useEffect, useId, useMemo, useState, useSyncExternalStore } from "react";
+import dynamic from "next/dynamic";
 import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 import { User, Palette, Bell, Check, Monitor, Moon, Sun, Eye, Building2, KeyRound, Globe } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -13,6 +15,7 @@ import { toast } from "@/components/toast";
 import { useTheme } from "@/components/theme-provider";
 import { useSession } from "@/components/session-provider";
 import { TrackingFields } from "@/components/projects/tracking-fields";
+import { AiPrivacyNote } from "@/components/ai/ai-privacy-note";
 import { BUILT_IN_PROJECT_DEFAULTS, normalizeNewProjectDefaults, validateTrackingSettings } from "@/components/projects/project-form";
 import { requestErrorStatus, requestErrorText } from "@/components/layout/request-error";
 import {
@@ -54,6 +57,18 @@ interface ProfileForm {
 
 const DEMO_NOTE = "Demo workspace — nothing was saved. Sign in to your workspace to keep changes.";
 
+// The owner's AI settings (and its disclosure dialog) download only when the Workspace tab opens.
+const AiSettingsCard = dynamic(() => import("@/components/ai/ai-settings-card").then((m) => m.AiSettingsCard), {
+  ssr: false,
+  loading: () => (
+    <p role="status" className="text-sm text-muted-foreground">
+      Loading AI settings…
+    </p>
+  ),
+});
+
+const isTabKey = (value: string | null): value is TabKey => allTabs.some((t) => t.key === value);
+
 function profileFormOf(p: Record<string, unknown>): ProfileForm {
   const s = (v: unknown) => (typeof v === "string" ? v : "");
   return { userName: s(p.userName), name: s(p.name), surname: s(p.surname), email: s(p.email), phoneNumber: s(p.phoneNumber) };
@@ -67,9 +82,25 @@ function useHydrated(): boolean {
 }
 
 export default function SettingsPage() {
+  // The ?tab= preselection reads the URL; outside a Suspense boundary that would keep the whole page from prerendering.
+  return (
+    <Suspense fallback={<div className="py-16 text-center text-sm text-muted-foreground">Loading settings…</div>}>
+      <SettingsContent />
+    </Suspense>
+  );
+}
+
+function SettingsContent() {
   const { user: currentUser, isLive: live, refreshSession } = useSession();
   const tabs = allTabs.filter((t) => t.roles.includes(currentUser.role));
-  const [tab, setTab] = useState<TabKey>("profile");
+  // `?tab=workspace` (a link from AI assist, or the privacy note) opens that tab when this role has it; anything else is ignored.
+  const requested = useSearchParams().get("tab");
+  const [chosen, setChosen] = useState<{ tab: TabKey; requested: string | null } | null>(null);
+  const allowed = (key: string | null): key is TabKey => isTabKey(key) && tabs.some((t) => t.key === key);
+  // A newer link wins over an earlier click; a tab this role can't open never shows.
+  const picked = chosen && chosen.requested === requested && allowed(chosen.tab) ? chosen.tab : null;
+  const tab: TabKey = picked ?? (allowed(requested) ? requested : "profile");
+  const setTab = (next: TabKey) => setChosen({ tab: next, requested });
   const zone = useReportingZone(live);
 
   function onTabKeyDown(event: React.KeyboardEvent<HTMLDivElement>) {
@@ -134,8 +165,18 @@ export default function SettingsPage() {
             </>
           )}
           {tab === "security" && <SecurityCard live={live} />}
-          {tab === "workspace" && <WorkspaceCard live={live} onSaved={zone.refresh} />}
-          {tab === "privacy" && <PrivacyCard role={currentUser.role} />}
+          {tab === "workspace" && (
+            <>
+              <WorkspaceCard live={live} onSaved={zone.refresh} />
+              <AiSettingsCard demoNote={DEMO_NOTE} />
+            </>
+          )}
+          {tab === "privacy" && (
+            <>
+              <PrivacyCard role={currentUser.role} />
+              <AiPrivacyNote />
+            </>
+          )}
           {tab === "appearance" && (
             <Card>
               <CardHeader>

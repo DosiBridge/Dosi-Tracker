@@ -1,3 +1,4 @@
+import type { PlatformAiOverviewDto } from "./ai-contract";
 import type { User } from "./types";
 import {
   invoicesFor,
@@ -224,3 +225,43 @@ export function ownerOf(ws: Workspace): User | undefined {
 }
 
 export { planById };
+
+/* ----------------------------- AI assist (demo) ----------------------------- */
+
+/**
+ * DEMO ONLY: the host console's AI card for the demo platform — a fixed,
+ * deterministic sample (no provider is configured or called). Each tenant's
+ * share is seeded from its id, so the table reads the same on every visit.
+ */
+export function demoPlatformAiOverview(workspaces: Workspace[]): PlatformAiOverviewDto {
+  const monthStart = new Date(Date.UTC(NOW.getUTCFullYear(), NOW.getUTCMonth(), 1)).toISOString();
+  const rows = workspaces.map((ws) => {
+    let seed = 0;
+    for (const ch of ws.id) seed = (seed * 31 + ch.charCodeAt(0)) | 0;
+    const rand = mulberry32(seed);
+    const requests = 20 + Math.round(rand() * 180);
+    const tokens = requests * (1_200 + Math.round(rand() * 400));
+    return { workspaceId: ws.id, workspaceName: ws.name, requests, tokens, estimatedCostUsd: Math.round(tokens * 0.0000012 * 100) / 100 };
+  });
+  const top = [...rows].sort((a, b) => b.tokens - a.tokens || a.workspaceName.localeCompare(b.workspaceName)).slice(0, 10);
+  const requests = rows.reduce((s, r) => s + r.requests, 0);
+  const tokens = rows.reduce((s, r) => s + r.tokens, 0);
+  return {
+    providerState: "configured",
+    providerDisplayName: "Sample AI provider",
+    defaultModel: null,
+    configEnabled: true,
+    runtimeEnabled: true,
+    breakerState: "closed",
+    monthStart,
+    requests,
+    inputTokens: Math.round(tokens * 0.8),
+    outputTokens: tokens - Math.round(tokens * 0.8),
+    estimatedCostUsd: Math.round(rows.reduce((s, r) => s + r.estimatedCostUsd, 0) * 100) / 100,
+    budgetTokens: 5_000_000,
+    budgetUsd: 50,
+    fallbackRate: 0.02,
+    errorRate: 0.004,
+    topWorkspaces: top,
+  };
+}

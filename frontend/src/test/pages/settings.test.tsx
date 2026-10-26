@@ -21,6 +21,10 @@ import userEvent from "@testing-library/user-event";
 import { axe } from "jest-axe";
 import SettingsPage from "@/app/(dashboard)/settings/page";
 import { renderAsRole, resetPrototypeState } from "@/test/harness";
+import { AiAssistantProvider } from "@/components/ai/ai-provider";
+import { resetAiStatusCacheForTests } from "@/hooks/use-ai-status";
+import { demoAiSettings } from "@/lib/ai-demo-settings";
+import { demoAiStatus } from "@/lib/ai-demo-status";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "https://localhost:6006";
 
@@ -527,5 +531,148 @@ describe("settings page — accessibility", () => {
     await screen.findByLabelText(/default time zone/i);
     const panel = within(container).getByRole("tabpanel");
     expect(await axe(panel)).toHaveNoViolations();
+  });
+});
+
+/* ----------------------------- AI assist (FE-02) ----------------------------- */
+
+describe("settings page — AI assist", () => {
+  beforeEach(() => resetAiStatusCacheForTests());
+
+  /** The page as the dashboard layout mounts it: inside the AI assist provider. */
+  const renderSettings = (role: "owner" | "admin" | "worker" | "client", route?: string) =>
+    renderAsRole(
+      <AiAssistantProvider>
+        <SettingsPage />
+      </AiAssistantProvider>,
+      role,
+      { route, withToasts: true },
+    );
+
+  const selectedTab = () => screen.getAllByRole("tab").find((t) => t.getAttribute("aria-selected") === "true");
+
+  it("gives the owner the AI settings on the Workspace tab, after the workspace defaults", async () => {
+    fetchMock.mockRejectedValue(new Error("no backend in demo mode"));
+    const user = userEvent.setup();
+    renderSettings("owner");
+    await openTab(user, /workspace/i);
+    const master = await screen.findByRole("switch", { name: /Use AI assist in this workspace/ });
+    const panel = screen.getByRole("tabpanel");
+    const defaults = within(panel).getByText("Workspace defaults");
+    // The AI card comes after the workspace defaults.
+    expect(defaults.compareDocumentPosition(master) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(within(panel).getByRole("switch", { name: /Include window titles \(off by default\)/ })).toBeInTheDocument();
+    expect(within(panel).getByRole("switch", { name: /Include task notes \(off by default\)/ })).toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each(["admin", "worker"] as const)("shows a %s only the AI privacy note, never the AI settings", async (role) => {
+    fetchMock.mockRejectedValue(new Error("no backend in demo mode"));
+    const user = userEvent.setup();
+    renderSettings(role);
+    expect(screen.queryByRole("tab", { name: /workspace/i })).toBeNull();
+    await openTab(user, /privacy/i);
+    const panel = screen.getByRole("tabpanel");
+    expect(within(panel).getByRole("region", { name: "AI assist" })).toBeInTheDocument();
+    expect(within(panel).getByText("What may be sent")).toBeInTheDocument();
+    expect(within(panel).queryByRole("switch")).toBeNull();
+    expect(within(panel).queryByRole("link", { name: /full AI disclosure/ })).toBeNull();
+  });
+
+  it("opens the tab named in ?tab= when the role has it", () => {
+    fetchMock.mockRejectedValue(new Error("no backend in demo mode"));
+    renderSettings("worker", "/settings?tab=privacy");
+    expect(selectedTab()).toHaveAccessibleName(/privacy/i);
+    expect(screen.getByRole("region", { name: "AI assist" })).toBeInTheDocument();
+  });
+
+  it("ignores ?tab= for a tab the role can't open, or one that doesn't exist", () => {
+    fetchMock.mockRejectedValue(new Error("no backend in demo mode"));
+    const { unmount } = renderSettings("worker", "/settings?tab=workspace");
+    expect(selectedTab()).toHaveAccessibleName(/profile/i);
+    unmount();
+    renderSettings("owner", "/settings?tab=nonsense");
+    expect(selectedTab()).toHaveAccessibleName(/profile/i);
+  });
+
+  it("still moves to another tab when the person clicks one after a preselection", async () => {
+    fetchMock.mockRejectedValue(new Error("no backend in demo mode"));
+    const user = userEvent.setup();
+    renderSettings("owner", "/settings?tab=workspace");
+    expect(selectedTab()).toHaveAccessibleName(/workspace/i);
+    await openTab(user, /appearance/i);
+    expect(selectedTab()).toHaveAccessibleName(/appearance/i);
+  });
+
+  it("tells a live owner when the server has no AI assist (status 404)", async () => {
+    stubLiveBackend();
+    const base = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (input, init) =>
+      String(input).includes("/api/app/ai-assist/") ? jsonResponse({}, { status: 404, statusText: "Not Found" }) : base(input, init),
+    );
+    localStorage.setItem("dosi-token", "live-token");
+    renderSettings("owner", "/settings?tab=workspace");
+    expect(await screen.findByText("AI assist isn't available on this server right now.")).toBeInTheDocument();
+    expect(screen.queryByRole("switch", { name: /Use AI assist/ })).toBeNull();
+  });
+
+  it("turns AI assist on for a live owner only after the disclosure is acknowledged, then reads the status again", async () => {
+    stubLiveBackend();
+    const base = fetchMock.getMockImplementation()!;
+    let enabled = false;
+    const off = demoAiSettings();
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      if (url.endsWith("/api/app/ai-assist/status")) {
+        return jsonResponse({ ...demoAiStatus("owner"), workspaceEnabled: enabled, available: enabled, reason: enabled ? null : "workspace-disabled" });
+      }
+      if (url.endsWith("/api/app/ai-assist/settings") && method === "GET") return jsonResponse({ ...off, isEnabled: false, consentVersion: null });
+      if (url.endsWith("/api/app/ai-assist/settings") && method === "PUT") {
+        enabled = true;
+        const body = JSON.parse(String(init?.body));
+        return jsonResponse({ ...off, ...body, consentVersion: body.acknowledgedDisclosureVersion });
+      }
+      if (url.endsWith("/api/app/ai-assist/usage")) {
+        return jsonResponse({
+          monthStart: "2026-07-01T00:00:00Z",
+          resetsAt: "2026-08-01T00:00:00Z",
+          requestsUsed: 0,
+          requestsLimit: null,
+          tokensUsed: 0,
+          tokensLimit: null,
+          myRequestsToday: 0,
+          myDailyLimit: null,
+        });
+      }
+      return base(input, init);
+    });
+    localStorage.setItem("dosi-token", "live-token");
+    const user = userEvent.setup();
+    renderSettings("owner", "/settings?tab=workspace");
+
+    await user.click(await screen.findByRole("switch", { name: /Use AI assist in this workspace/ }));
+    const dialog = await screen.findByRole("dialog", { name: "Turn on AI assist" });
+    const enable = within(dialog).getByRole("button", { name: "Turn on AI assist" });
+    expect(enable).toBeDisabled();
+    await user.click(within(dialog).getByRole("checkbox"));
+    await user.click(enable);
+
+    await waitFor(() => expect(callsTo("/api/app/ai-assist/settings", "PUT")).toHaveLength(1));
+    const body = JSON.parse(String(callsTo("/api/app/ai-assist/settings", "PUT")[0][1]?.body));
+    expect(body).toMatchObject({ isEnabled: true, acknowledgedDisclosureVersion: off.disclosure.version });
+    // The saved settings change the status: it is read again.
+    await waitFor(() => expect(callsTo("/api/app/ai-assist/status", "GET").length).toBeGreaterThanOrEqual(2));
+    expect(await screen.findByText("AI settings saved")).toBeInTheDocument();
+  });
+
+  it("a11y: the AI settings and privacy note have no axe violations", async () => {
+    fetchMock.mockRejectedValue(new Error("no backend in demo mode"));
+    const { container, unmount } = renderSettings("owner", "/settings?tab=workspace");
+    await screen.findByRole("switch", { name: /Use AI assist/ });
+    expect(await axe(within(container).getByRole("tabpanel"))).toHaveNoViolations();
+    unmount();
+    const second = renderSettings("worker", "/settings?tab=privacy");
+    expect(await axe(within(second.container).getByRole("tabpanel"))).toHaveNoViolations();
   });
 });
