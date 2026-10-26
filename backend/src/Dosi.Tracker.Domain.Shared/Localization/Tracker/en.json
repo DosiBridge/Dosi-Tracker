@@ -65,6 +65,18 @@
     "Tracker:InvalidPassword": "The password is not correct.",
     "Tracker:EmailConfirmationInvalid": "This email confirmation link is invalid or has expired. Request a new one.",
     "Tracker:BillingDisabled": "Billing is turned off on this server: every workspace is active and has no plan to change.",
-    "Tracker:PlanChangeNotAllowed": "Owners can switch to a free plan themselves. Contact support to change to a paid plan."
+    "Tracker:PlanChangeNotAllowed": "Owners can switch to a free plan themselves. Contact support to change to a paid plan.",
+    "Tracker:AiNotConfigured": "AI assist isn't available on this server.",
+    "Tracker:AiPlatformDisabled": "AI assist is turned off for the platform right now.",
+    "Tracker:AiDisabled": "AI assist is off for this workspace.",
+    "Tracker:AiFeatureDisabled": "This AI feature isn't available to you.",
+    "Tracker:AiQuotaExceeded": "The AI allowance for this period has been used. It renews on {resetsAt}.",
+    "Tracker:AiRateLimited": "Too many AI requests. Try again in {retryAfterSeconds} seconds.",
+    "Tracker:AiProviderUnavailable": "The AI service is slow or unavailable. Try again in a minute.",
+    "Tracker:AiOutputInvalid": "The AI couldn't produce a reliable answer. Try again.",
+    "Tracker:AiRangeTooLarge": "Choose {maxDays} days or fewer for AI summaries.",
+    "Tracker:AiDisclosureNotAccepted": "Review and accept the AI disclosure (version {version}) to turn on AI assist.",
+    "Tracker:AiConversationExpired": "This conversation ended. Start a new one.",
+    "AiAssist:Disclaimer": "AI-generated from your tracker data. Figures come from the tracker; the wording can be wrong - check before acting. Not for decisions about people on its own."
   }
 }

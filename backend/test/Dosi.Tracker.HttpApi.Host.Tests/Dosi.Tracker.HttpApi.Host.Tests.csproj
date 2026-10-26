@@ -29,6 +29,16 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- The host's AI provider: the configuration rules, and the OpenAI glue (retries, strict schemas, error
+         translation). The OpenAI tests give the SDK an in-memory transport that answers only scripted responses, so
+         no test can reach a provider. -->
+    <Compile Include="..\..\src\Dosi.Tracker.HttpApi.Host\AiAssist\AiProviderConfigValidator.cs" Link="AiAssist\Host\AiProviderConfigValidator.cs" />
+    <Compile Include="..\..\src\Dosi.Tracker.HttpApi.Host\AiAssist\OpenAiChatClientProvider.cs" Link="AiAssist\Host\OpenAiChatClientProvider.cs" />
+    <Compile Include="..\..\src\Dosi.Tracker.HttpApi.Host\AiAssist\OpenAiPolicyChatClient.cs" Link="AiAssist\Host\OpenAiPolicyChatClient.cs" />
+    <Compile Include="..\..\src\Dosi.Tracker.HttpApi.Host\AiAssist\OpenAiRetryPolicy.cs" Link="AiAssist\Host\OpenAiRetryPolicy.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
     <!-- For the HTTP routes ABP derives from the application services (Teams/TeamRoutesTests). -->
     <ProjectReference Include="..\..\src\Dosi.Tracker.Application\Dosi.Tracker.Application.csproj" />
     <!-- Controllers that serve contract routes the auto API can't name (Routes/ContractRoutesTests). -->
@@ -40,6 +50,8 @@
     <!-- The account endpoints the web calls (self-service password change); TrackerHttpApiModule depends on this module. -->
     <PackageReference Include="Volo.Abp.Account.HttpApi" Version="10.5.0" />
     <PackageReference Include="Microsoft.AspNetCore.TestHost" Version="10.0.8" />
+    <!-- Same version as the host (AiAssist above). -->
+    <PackageReference Include="Microsoft.Extensions.AI.OpenAI" Version="10.11.0" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
     <PackageReference Include="Shouldly" Version="4.3.0" />
     <PackageReference Include="xunit" Version="2.9.3" />

@@ -83,6 +83,10 @@ public class TrackerDomainModule : AbpModule
         context.Services.AddOptions<Erasure.DataErasureOptions>()
             .Configure<IConfiguration>((options, configuration) =>
                 configuration.GetSection(Erasure.DataErasureOptions.SectionName).Bind(options));
+        // AI assist (section "AI"; off by default). The provider key is not part of these options.
+        context.Services.AddOptions<AiAssist.AiOptions>()
+            .Configure<IConfiguration>((options, configuration) =>
+                configuration.GetSection(AiAssist.AiOptions.SectionName).Bind(options));
 
         // Email goes through Emailing.TrackerEmailSender, which sends nothing (and only logs that it did not) until an SMTP
         // host is configured, so a deployment without SMTP — and every development machine — never fails on email.

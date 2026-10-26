@@ -193,6 +193,55 @@ public sealed class ProductionSecretsGuardTests : IDisposable
         ProductionSecretsGuard.FindProblems(Build(tracked, overrides)).ShouldBeEmpty();
     }
 
+    /// <summary>A tracked file whose non-AI secrets are all overridden later, so only the AI key decides.</summary>
+    private static Dictionary<string, string?> SafeOverrides() => new()
+    {
+        [ProductionSecretsGuard.ConnectionStringKey] = "Host=db;Password=from-env;",
+        [ProductionSecretsGuard.CertificatePassPhraseKey] = "from-env",
+        [ProductionSecretsGuard.StringEncryptionPassPhraseKey] = "from-env"
+    };
+
+    private static string TrackedWithAi(string aiOpenAiJson) =>
+        $$"""
+        {
+          "ConnectionStrings": { "Default": "x" },
+          "AuthServer": { "CertificatePassPhrase": "x" },
+          "StringEncryption": { "DefaultPassPhrase": "x" },
+          "AI": { "Enabled": true, "OpenAI": {{aiOpenAiJson}} }
+        }
+        """;
+
+    [Fact]
+    public void An_Ai_Key_Committed_To_The_Tracked_File_Is_Rejected_Without_Echoing_It()
+    {
+        const string fakeKey = "test-not-a-key";
+        var config = Build(TrackedWithAi($$"""{ "ApiKey": "{{fakeKey}}", "Model": "fake-model" }"""), SafeOverrides());
+
+        var problem = ProductionSecretsGuard.FindProblems(config).ShouldHaveSingleItem();
+
+        problem.ShouldContain(ProductionSecretsGuard.AiApiKeyKey);
+        problem.ShouldContain("tracked appsettings.json");
+        problem.ShouldNotContain(fakeKey);
+    }
+
+    [Fact]
+    public void An_Ai_Key_From_A_Later_Provider_Is_Accepted()
+    {
+        var overrides = SafeOverrides();
+        overrides[ProductionSecretsGuard.AiApiKeyKey] = "test-not-a-key-from-env";
+
+        // Also when the tracked file carries an (empty or placeholder) key that the environment overrides.
+        ProductionSecretsGuard.FindProblems(Build(TrackedWithAi("""{ "Model": "fake-model" }"""), overrides)).ShouldBeEmpty();
+        ProductionSecretsGuard.FindProblems(Build(TrackedWithAi("""{ "ApiKey": "test-not-a-key" }"""), overrides)).ShouldBeEmpty();
+    }
+
+    [Fact]
+    public void An_Absent_Or_Empty_Ai_Key_Is_No_Problem()
+    {
+        ProductionSecretsGuard.FindProblems(Build(TrackedWithAi("""{ "Model": "" }"""), SafeOverrides())).ShouldBeEmpty();
+        ProductionSecretsGuard.FindProblems(Build(TrackedWithAi("""{ "ApiKey": "" }"""), SafeOverrides())).ShouldBeEmpty();
+    }
+
     private string WriteCertificate(string subject, DateTimeOffset notBefore, DateTimeOffset notAfter, string passphrase)
     {
         using var key = RSA.Create(2048);

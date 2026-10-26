@@ -4,6 +4,8 @@ using System.IO;
 using System.Linq;
 using System.Security.Cryptography.X509Certificates;
 using System.Threading.Tasks;
+using Dosi.Tracker.AiAssist;
+using Dosi.Tracker.AiAssist.Provider;
 using Dosi.Tracker.Billing;
 using Dosi.Tracker.Activities.Retention;
 using Dosi.Tracker.Compatibility;
@@ -165,6 +167,7 @@ public class TrackerHttpApiHostModule : AbpModule
         ConfigureDataProtection(context, configuration);
         ConfigureBlobStoring(context, configuration);
         context.Services.AddTrackerDataRetention(configuration);
+        context.Services.AddTrackerAiAssist();
         ConfigureRequestSizeLimits(context);
         ConfigureAuditing();
         ConfigureLegacyAgentCompatibility();
@@ -510,6 +513,8 @@ public class TrackerHttpApiHostModule : AbpModule
                 builder
                     .WithOrigins(origins)
                     .WithAbpExposedHeaders()
+                    // Rate-limited answers (sign-in, AI assist) say when to retry; the cross-origin web app needs to read it.
+                    .WithExposedHeaders("Retry-After")
                     .SetIsOriginAllowedToAllowWildcardSubdomains()
                     .AllowAnyHeader()
                     .AllowAnyMethod()
@@ -600,6 +605,9 @@ public class TrackerHttpApiHostModule : AbpModule
     {
         // Runs the synchronous OnApplicationInitialization (middleware pipeline) first.
         await base.OnApplicationInitializationAsync(context);
+
+        // Built now, so the AI provider's state is logged at start-up (and a configured key is read only once).
+        context.ServiceProvider.GetRequiredService<IAiChatClientProvider>();
 
         // Trials and invoices exist only on a deployment that bills (Billing:Enabled; off by default).
         if (context.ServiceProvider.GetRequiredService<IOptions<BillingOptions>>().Value.Enabled)

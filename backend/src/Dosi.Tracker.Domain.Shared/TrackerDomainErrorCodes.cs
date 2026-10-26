@@ -84,4 +84,45 @@ public static class TrackerDomainErrorCodes
 
     /// <summary>Owners may only move to a free plan by themselves; paid plans are changed by the platform.</summary>
     public const string PlanChangeNotAllowed = "Tracker:PlanChangeNotAllowed";
+
+    // AI assist. error.data carries the fields named below, and never the provider's own text.
+
+    /// <summary>AI assist is off on this server, or its provider key or model is missing (503).</summary>
+    public const string AiNotConfigured = "Tracker:AiNotConfigured";
+
+    /// <summary>The platform operator turned AI assist off at runtime (503).</summary>
+    public const string AiPlatformDisabled = "Tracker:AiPlatformDisabled";
+
+    /// <summary>The workspace has not turned AI assist on, or its consent predates the current disclosure (409,
+    /// <c>data.reason</c>: off / reconsent).</summary>
+    public const string AiDisabled = "Tracker:AiDisabled";
+
+    /// <summary>The feature is not available to this caller (403, <c>data.reason</c>: operator / role /
+    /// self-service-off).</summary>
+    public const string AiFeatureDisabled = "Tracker:AiFeatureDisabled";
+
+    /// <summary>The AI allowance for the period is used up (429, <c>data.scope</c>: user-day / workspace-month /
+    /// platform-month; <c>data.resetsAt</c>).</summary>
+    public const string AiQuotaExceeded = "Tracker:AiQuotaExceeded";
+
+    /// <summary>Too many AI requests in a short time, or one is already running (429, <c>data.reason</c>: minute / busy;
+    /// <c>data.retryAfterSeconds</c>).</summary>
+    public const string AiRateLimited = "Tracker:AiRateLimited";
+
+    /// <summary>The AI provider failed and the feature has no fallback (503, <c>data.kind</c>: timeout / error /
+    /// rate-limited / circuit-open; <c>data.retryAfterSeconds</c> when known).</summary>
+    public const string AiProviderUnavailable = "Tracker:AiProviderUnavailable";
+
+    /// <summary>The model's output failed validation and the feature has no fallback (502).</summary>
+    public const string AiOutputInvalid = "Tracker:AiOutputInvalid";
+
+    /// <summary>The range is longer than the feature allows (400, <c>data.maxDays</c>).</summary>
+    public const string AiRangeTooLarge = "Tracker:AiRangeTooLarge";
+
+    /// <summary>Turning AI assist on (or widening what it sends) without acknowledging the current disclosure (400,
+    /// <c>data.version</c>).</summary>
+    public const string AiDisclosureNotAccepted = "Tracker:AiDisclosureNotAccepted";
+
+    /// <summary>The Ask AI conversation is missing, expired, someone else's, or predates a consent change (409).</summary>
+    public const string AiConversationExpired = "Tracker:AiConversationExpired";
 }

@@ -15,8 +15,8 @@ namespace Dosi.Tracker.Security;
 /// <item>a secret must not be a well-known value: the ABP template's passphrases, or a database password published in
 /// this repository or used as a stock default (<see cref="KnownDatabasePasswords"/>);</item>
 /// <item>a secret must not be supplied by the tracked <c>appsettings.json</c> itself — it has to be overridden by an
-/// environment variable, <c>appsettings.secrets.json</c>, a key vault, etc. (the SMTP and S3 secrets only when they are
-/// set at all);</item>
+/// environment variable, <c>appsettings.secrets.json</c>, a key vault, etc. (the SMTP, S3 and AI provider secrets only
+/// when they are set at all);</item>
 /// <item>the OpenIddict certificate must not be a localhost development certificate (as <c>dotnet dev-certs</c> makes)
 /// or expired (<see cref="FindCertificateProblems"/>).</item>
 /// </list>
@@ -30,6 +30,10 @@ public static class ProductionSecretsGuard
     public const string SmtpPasswordKey = "Email:SmtpPassword";
     public const string SmtpPasswordSettingKey = "Settings:Abp.Mailing.Smtp.Password";
     public const string S3SecretKey = "S3:SecretAccessKey";
+
+    /// <summary>The AI provider's API key (<c>AI__OpenAI__ApiKey</c>). Never in a tracked file; problems name the key,
+    /// never its value.</summary>
+    public const string AiApiKeyKey = "AI:OpenAI:ApiKey";
 
     /// <summary>The committed (tracked) settings file that must never be the source of a production secret.</summary>
     public const string TrackedSettingsFileName = "appsettings.json";
@@ -53,7 +57,8 @@ public static class ProductionSecretsGuard
     {
         SmtpPasswordKey,
         SmtpPasswordSettingKey,
-        S3SecretKey
+        S3SecretKey,
+        AiApiKeyKey
     };
 
     /// <summary>Returns a human-readable problem per offending secret; empty when the configuration is safe.</summary>

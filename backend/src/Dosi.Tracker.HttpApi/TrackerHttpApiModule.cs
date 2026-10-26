@@ -97,6 +97,19 @@ public class TrackerHttpApiModule : AbpModule
             options.Map(TrackerDomainErrorCodes.EmailConfirmationInvalid, HttpStatusCode.BadRequest);
             options.Map(TrackerDomainErrorCodes.BillingDisabled, HttpStatusCode.Conflict);
             options.Map(TrackerDomainErrorCodes.PlanChangeNotAllowed, HttpStatusCode.Forbidden);
+
+            // AI assist: 503 is "this server cannot do it now", 429 carries when to retry.
+            options.Map(TrackerDomainErrorCodes.AiNotConfigured, HttpStatusCode.ServiceUnavailable);
+            options.Map(TrackerDomainErrorCodes.AiPlatformDisabled, HttpStatusCode.ServiceUnavailable);
+            options.Map(TrackerDomainErrorCodes.AiDisabled, HttpStatusCode.Conflict);
+            options.Map(TrackerDomainErrorCodes.AiFeatureDisabled, HttpStatusCode.Forbidden);
+            options.Map(TrackerDomainErrorCodes.AiQuotaExceeded, HttpStatusCode.TooManyRequests);
+            options.Map(TrackerDomainErrorCodes.AiRateLimited, HttpStatusCode.TooManyRequests);
+            options.Map(TrackerDomainErrorCodes.AiProviderUnavailable, HttpStatusCode.ServiceUnavailable);
+            options.Map(TrackerDomainErrorCodes.AiOutputInvalid, HttpStatusCode.BadGateway);
+            options.Map(TrackerDomainErrorCodes.AiRangeTooLarge, HttpStatusCode.BadRequest);
+            options.Map(TrackerDomainErrorCodes.AiDisclosureNotAccepted, HttpStatusCode.BadRequest);
+            options.Map(TrackerDomainErrorCodes.AiConversationExpired, HttpStatusCode.Conflict);
         });
     }
 }
