@@ -37,6 +37,8 @@ const UNMEASURED = "aaaaaaaa-0000-0000-0000-000000000002";
 const SCREEN = "aaaaaaaa-0000-0000-0000-000000000101";
 const THUMB = "aaaaaaaa-0000-0000-0000-000000000102";
 const WEBCAM = "aaaaaaaa-0000-0000-0000-000000000103";
+const SCREEN_B = "aaaaaaaa-0000-0000-0000-000000000104";
+const THUMB_B = "aaaaaaaa-0000-0000-0000-000000000105";
 
 function member(id: string, name: string, role: User["role"]): User {
   return { id, name, email: `${id}@real.example`, role, designation: "", status: "offline", timezone: "UTC", trackedToday: 0, productivity: 0, joinedAt: "" };
@@ -64,6 +66,20 @@ function row(over: Partial<ApiActivityDto> & { creationTime?: string } = {}): Ap
     ],
     ...({ creationTime: new Date(end + 30_000).toISOString() } as object),
     ...over,
+  } as ApiActivityDto;
+}
+
+/** A block whose interval took two screenshots — one per screen+thumb pair. */
+function rowWithTwoScreenshots(): ApiActivityDto {
+  return {
+    ...row(),
+    captures: [
+      { id: SCREEN, kind: "screen" },
+      { id: THUMB, kind: "thumb" },
+      { id: SCREEN_B, kind: "screen" },
+      { id: THUMB_B, kind: "thumb" },
+      { id: WEBCAM, kind: "webcam" },
+    ],
   } as ApiActivityDto;
 }
 
@@ -188,6 +204,38 @@ describe("owners and managers (Tracker.Activities.Delete)", () => {
     dialog = screen.queryByRole("dialog", { name: "Delete this webcam frame?" }) as HTMLElement;
     expect(dialog).toBeNull();
     expect(within(drawer).getByRole("button", { name: /^delete webcam frame/i })).toBeInTheDocument();
+  });
+
+  it("deleting one of several screenshots leaves the list tile showing the others, not 'no screenshot'", async () => {
+    goLive([rowWithTwoScreenshots()], owner, { "Tracker.Activities.Delete": true });
+    vi.mocked(getApi).mockImplementation(async (endpoint: string) =>
+      endpoint.startsWith("/api/app/activity/screenshots/")
+        ? [
+            { id: SCREEN, kind: "screen", capturedAt: "2026-01-01T10:00:00.000Z", contentType: "image/jpeg" },
+            { id: SCREEN_B, kind: "screen", capturedAt: "2026-01-01T10:10:00.000Z", contentType: "image/jpeg" },
+          ]
+        : [],
+    );
+    const user = userEvent.setup();
+    renderPage();
+    const card = await screen.findByRole("button", { name: /^Open session: .*Release notes/ });
+    expect(within(card).queryByText(/no screenshot for this session/i)).not.toBeInTheDocument();
+
+    const drawer = await openDrawer(user, /^Open session: .*Release notes/);
+    // Both screenshots loaded (oldest, SCREEN, first); delete that one.
+    const deleteButtons = await within(drawer).findAllByRole("button", { name: /^delete screenshot/i });
+    expect(deleteButtons).toHaveLength(2);
+    await user.click(deleteButtons[0]);
+    const dialog = screen.getByRole("dialog", { name: "Delete this screenshot?" });
+    await user.type(within(dialog).getByLabelText(/reason/i), "Wrong window");
+    await user.click(within(dialog).getByRole("button", { name: "Delete capture" }));
+    await waitFor(() => expect(deleteCaptureApi).toHaveBeenLastCalledWith(SCREEN, "Wrong window"));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Delete this screenshot?" })).not.toBeInTheDocument());
+    // The drawer still has the other screenshot (its own, separately-fetched list).
+    expect(within(drawer).getAllByRole("button", { name: /^delete screenshot/i })).toHaveLength(1);
+    // So does the list tile behind it: the other screen+thumb pair wasn't erased with it.
+    const cardAfter = await screen.findByRole("button", { name: /^Open session: .*Release notes/ });
+    expect(within(cardAfter).queryByText(/no screenshot for this session/i)).not.toBeInTheDocument();
   });
 
   it("a11y: the drawer with deletion controls has no violations", async () => {

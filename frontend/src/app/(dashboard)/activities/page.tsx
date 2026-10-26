@@ -153,11 +153,13 @@ function ActivitiesPageInner() {
       alive = false;
     };
   }, [isLive, canDeleteActivities]);
-  // Deleted on this page: blocks leave the list at once, and so do deleted captures (a screen goes with its thumbnail).
-  const [erased, setErased] = useState<{ blocks: ReadonlySet<string>; captures: ReadonlySet<string>; screensOf: ReadonlySet<string> }>(() => ({
+  // Deleted on this page: blocks leave the list at once, and so does a deleted
+  // capture's OWN id — never the rest of its block's captures. A block may
+  // hold several screen+thumb pairs (one per screenshot interval over its
+  // duration); erasing one must not blank the tile for the others still there.
+  const [erased, setErased] = useState<{ blocks: ReadonlySet<string>; captures: ReadonlySet<string> }>(() => ({
     blocks: new Set(),
     captures: new Set(),
-    screensOf: new Set(),
   }));
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -269,16 +271,13 @@ function ActivitiesPageInner() {
   const list = useMemo(() => {
     const all = isLive ? (liveActivities ?? []) : demoActivities;
     const rows = erased.blocks.size ? all.filter((a) => !erased.blocks.has(a.id)) : all;
-    const withCaptures =
-      erased.captures.size || erased.screensOf.size
-        ? rows.map((a) => {
-            if (!a.captures?.length) return a;
-            const captures = a.captures.filter(
-              (c) => !erased.captures.has(c.id) && !(erased.screensOf.has(a.id) && (c.kind === "screen" || c.kind === "thumb")),
-            );
-            return captures.length === a.captures.length ? a : { ...a, captures, hasWebcam: captures.some((c) => c.kind === "webcam") };
-          })
-        : rows;
+    const withCaptures = erased.captures.size
+      ? rows.map((a) => {
+          if (!a.captures?.length) return a;
+          const captures = a.captures.filter((c) => !erased.captures.has(c.id));
+          return captures.length === a.captures.length ? a : { ...a, captures, hasWebcam: captures.some((c) => c.kind === "webcam") };
+        })
+      : rows;
     if (notes.size === 0) return withCaptures;
     return withCaptures.map((a) => (notes.has(a.id) ? { ...a, description: notes.get(a.id) ?? DEFAULT_SESSION_DESCRIPTION } : a));
   }, [isLive, liveActivities, notes, erased]);
@@ -366,11 +365,11 @@ function ActivitiesPageInner() {
       },
       onDeleteCapture: async (capture, reason) => {
         if (isLive) await erase(() => deleteCaptureApi(capture.id, reason), "Couldn't delete the capture. Try again.");
-        setErased((e) =>
-          capture.kind === "screen"
-            ? { ...e, captures: new Set(e.captures).add(capture.id), screensOf: new Set(e.screensOf).add(a.id) }
-            : { ...e, captures: new Set(e.captures).add(capture.id) },
-        );
+        // Only this capture's own id leaves the block's list — its paired thumb
+        // (deleted server-side too, but under an id this page never learns) may
+        // linger stale; CaptureThumb already falls back past a failed id to the
+        // next candidate, then to the app glyph, so it never shows deleted bytes.
+        setErased((e) => ({ ...e, captures: new Set(e.captures).add(capture.id) }));
         toast({ tone: "success", title: capture.kind === "webcam" ? "Webcam frame deleted" : "Screenshot deleted" });
       },
     }),
