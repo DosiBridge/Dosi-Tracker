@@ -20,6 +20,8 @@ using Microsoft.AspNetCore.Mvc;
 using Volo.Abp.BackgroundWorkers;
 using Microsoft.Extensions.Options;
 using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Authentication.Cookies;
+using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Cors;
 using Microsoft.AspNetCore.HttpOverrides;
@@ -415,6 +417,25 @@ public class TrackerHttpApiHostModule : AbpModule
         context.Services.Configure<AbpClaimsPrincipalFactoryOptions>(options =>
         {
             options.IsDynamicClaimsEnabled = true;
+        });
+
+        // This host has no browser sign-in flow that a human ever reaches: the product's login UI is the
+        // Next.js dashboard, and desktop agents are headless API clients. Left at its ASP.NET Core Identity
+        // default, a missing or rejected bearer token answers with a 302 to the (unused) Account/Login page
+        // instead of 401, which breaks every API caller that checks the status code. Every unauthenticated
+        // or forbidden request gets the status code an API expects; nothing here is ever redirected.
+        context.Services.Configure<CookieAuthenticationOptions>(IdentityConstants.ApplicationScheme, options =>
+        {
+            options.Events.OnRedirectToLogin = ctx =>
+            {
+                ctx.Response.StatusCode = StatusCodes.Status401Unauthorized;
+                return Task.CompletedTask;
+            };
+            options.Events.OnRedirectToAccessDenied = ctx =>
+            {
+                ctx.Response.StatusCode = StatusCodes.Status403Forbidden;
+                return Task.CompletedTask;
+            };
         });
     }
 
