@@ -82,4 +82,4 @@ The platform is **not** hardened for production multi-tenant monitoring data.
 
 ## Reporting
 
-Security issues: follow the repo’s preferred channel (GitHub Security Advisories if enabled; otherwise private contact in README). Do not file public issues with exploit detail for unpatched production deploys.
+Found a vulnerability? See [`/SECURITY.md`](../SECURITY.md) at the repository root for the disclosure process (private GitHub Security Advisory, response times, scope, safe harbor). Do not file public issues with exploit detail for unpatched production deploys.
