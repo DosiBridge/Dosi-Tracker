@@ -19,4 +19,26 @@
     <Content Remove="$(UserProfile)\.nuget\packages\*\*\contentFiles\any\*\*.abppkg*" />
   </ItemGroup>
 
+  <!--
+    Transitive dependencies pinned above the version the NuGet vulnerability audit flags (CI step "NuGet
+    vulnerability audit"). None of these are referenced directly; each comes in through an ABP/OpenIddict
+    package, so the floor is raised here, in the props every project imports, rather than guessed per project.
+    Re-check with "dotnet list package, vulnerable, include-transitive" after bumping the package that actually
+    owns one of these (e.g. Volo.Abp.TextTemplating.Scriban for Scriban) and drop the pin once its own floor has
+    moved past it.
+  -->
+  <ItemGroup>
+    <!-- Via MagicOnion.Serialization.MessagePack (ABP's SignalR distributed-event transport). -->
+    <PackageReference Include="MessagePack" Version="3.1.12" />
+    <!-- Via Volo.Abp.TextTemplating.Scriban. -->
+    <PackageReference Include="Scriban" Version="7.5.3" />
+    <!-- Via ABP's Swagger/OpenAPI setup; stays on the 2.x line Swashbuckle expects. -->
+    <PackageReference Include="Microsoft.OpenApi" Version="2.13.0" />
+    <!-- Via Microsoft.Data.Sqlite (EF Core's SQLite provider, used by the agents' local queue tests). -->
+    <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" Version="2.1.14" />
+    <!-- Out-of-band .NET packages; the SDK's own copy lags the patched release. -->
+    <PackageReference Include="System.Security.Cryptography.Pkcs" Version="10.0.14" />
+    <PackageReference Include="System.Security.Cryptography.Xml" Version="10.0.14" />
+  </ItemGroup>
+
 </Project>
