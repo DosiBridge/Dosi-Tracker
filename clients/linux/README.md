@@ -1,191 +1,450 @@
-# Dosi-Tracker Linux Desktop Agent (`dosi-tracker`)
+# Dosi Tracker for Linux
 
-Lightweight, privacy-first, rootless desktop agent foundation for Linux written in Rust.
+The Linux agent of Dosi Tracker, a team time-tracking service. It records your
+working time in blocks and, only with your consent on this computer, activity
+details, and uploads them to your workspace's Dosi Tracker server.
 
-## 1. Current Status
+It is three programs in one package:
 
-| Attribute | State | Details |
+- `dosi-tracker`: the command line, and the agent itself (`dosi-tracker daemon`), which
+  runs per user as a systemd user service;
+- the tray icon, shown by the agent where the desktop has a tray;
+- `dosi-tracker-gui`: the window ("Dosi Tracker" in your applications menu).
+
+It never runs as root, never reads what you type, and starts nothing by itself
+after installation.
+
+- [Install](#install)
+- [First run](#first-run)
+- [The window and the tray](#the-window-and-the-tray)
+- [What is recorded](#what-is-recorded)
+- [Permissions](#permissions)
+- [Command line](#command-line)
+- [Files and locations](#files-and-locations)
+- [Configuration](#configuration)
+- [Troubleshooting](#troubleshooting)
+- [Upgrade, uninstall and purge](#upgrade-uninstall-and-purge)
+- [Development](#development)
+
+## Install
+
+Release artifacts (x86_64, glibc 2.35 or newer) are attached to the `linux-vX.Y.Z`
+releases on the [GitHub releases page](https://github.com/DosiBridge/Dosi-Tracker/releases),
+as versioned files (`dosi-tracker-X.Y.Z-x86_64-linux-gnu.tar.gz`,
+`dosi-tracker_X.Y.Z-1_amd64.deb`, `dosi-tracker-X.Y.Z-1.x86_64.rpm`) and as the same
+files under version-less names. The version-less names are the ones download links
+use with GitHub's latest-release address,
+`https://github.com/DosiBridge/Dosi-Tracker/releases/latest/download/<name>`:
+
+| Artifact | File | For |
 |---|---|---|
-| **Crate** | `dosi-tracker-linux` v0.1.0 | Located in [`clients/linux`](./); binaries `dosi-tracker` (CLI and daemon) and `dosi-tracker-gui` (the window, feature `gui`) |
-| **Release Tier** | `v1` (in progress) | Daemon, full CLI, doctor v2, tray and window delivered; packages follow |
-| **Telemetry Adapters** | First Bounded Slice Delivered | X11 EWMH active window + `/proc` running-apps inventory wired with consent gating; Wayland honest unsupported (Phase 2 first slice) |
-| **Privilege Model** | Strictly Rootless | Runs as normal user. Refuses `sudo`, `root`, `setuid`, `evdev`, and `uinput` |
-| **Offline Storage** | Transactional SQLite | Durable outbox queue with raw identity bounding and read-only inspection |
-| **Credential Store** | SecretService + opt-in 0600 file | One Freedesktop SecretService item per account (`org.freedesktop.secrets` over session D-Bus, `workspace_id` attribute empty); the password only in the keyring and only when remembered; a locked keyring is reported (`Locked`) and only unlocked on an explicit prompt; mock transport injection seam (`SecretServiceTransport`) for deterministic protocol testing; the owner-only 0600 file store (`credentials.store = "file"`, an explicit opt-in) never holds a password; `auto` never falls back to it: without a Secret Service the agent refuses to sign in (exit 9) and doctor says why. The foundation's plaintext `~/.config/dosi-tracker/credentials.json` is reported by doctor and deleted after the next sign-in |
-| **Transport & Auth** | Real HTTP Delivery Transport | Reqwest rustls, OpenIddict password grant (`POST /connect/token` with the install's `device_id`, no tenant parameter, no workspace header), workspace discovery (`GET /api/app/workspaces/mine`), `X-Workspace-Id` on workspace-scoped calls, pre-expiry refresh with rotation listener, bounded 401 retry, Windows upload-outcome table plus DeviceRevoked/WorkspaceArchived/WorkspaceRequired, park-and-continue, 413 strip-and-resend, heartbeat; no default server, `http://` only to loopback unless `allow_insecure_http`, redirects never followed |
-| **Payload Signing** | HMAC-SHA256 (32 bytes) | URL_SAFE_NO_PAD base64url tag over canonical JSON, mirroring Windows byte semantics and test vectors |
-| **Agent Core** | Worker ported and run by the daemon | `agent::{state, blocks, session, power}` ported from the Windows agent with their tests (statuses add `no_session` and `device_revoked`; effective permissions = project AND consent AND config AND what the session can provide); `agent::config` layers `/etc/dosi-tracker/config.toml` < `$XDG_CONFIG_HOME/dosi-tracker/config.toml` < `DOSI__*` (capture switches only narrow, blur only adds; no built-in server); `agent::session_store` keeps `session.json` (0600) with the 7-day project cache; `tracking::system` creates a random device id in `device.json` once (never the machine id). `agent::worker` (the `dosi-worker` loop), `agent::control` (sign-in, `workspaces/mine`, projects, heartbeats, totals, device status) and `agent::uploader` (`dosi-uploader`: one transport per workspace scope, Windows back-off, park-and-continue; a workspace or device the server calls terminal has its queued rows parked) are ported with the Windows tests plus the Linux cases: manual mode never starts or resumes by itself and pauses after `tracking.manual_max_hours`, `no_session` never tracks, a locked keyring tracks offline and keeps blocks in memory until the unlock, a refused refresh is "sign-in expired" (never a silent password sign-in), rotated refresh tokens are saved by a persister thread. `tracking::tracker` is the production machine: one consent lifecycle shared with the gate, XI2 and the usage sampler started only while tracking, idle from XI2 / MIT-SCREEN-SAVER / Mutter / ScreenSaver / logind, screenshots on `dosi-capture` validated against the lifecycle; `tracking::build` turns the measurements into the payload with unmeasured fields null or left out |
-| **Session & Desktop** | logind first | `tracking::session_probe` accepts only our own active local X11/Wayland session (never an X11 display on Wayland); `agent::session_events` turns logind/screensaver lock, inactive-session, sleep and shutdown signals into one event each and holds a logind delay inhibitor only while tracking (released after the save ack, at most 1.5 s / 2 s); `agent::notify` talks to `org.freedesktop.Notifications` |
-| **Service Integration** | systemd user unit + opt-in autostart | `packaging/systemd/dosi-tracker.service.in` (`Type=notify`, hardened, no `[Install]`) and `packaging/desktop/autostart.desktop.in`; `service` writes and removes only entries marked `X-DosiTracker-Managed=true`, writes the session env file (0600) before `systemctl --user --no-block start`, restarts on a new login session, and falls back to `dosi-tracker daemon --detach` without a user manager (the hook marks the start with `DOSI_LAUNCH=login`). `dosi-tracker service enable/disable/start/stop/restart/status` drive it |
-| **Daemon & IPC** | `dosi-tracker daemon` | `agent::daemon`: refuses root (exit 9), umask 077, needs `XDG_RUNTIME_DIR` (exit 9), holds `daemon.lock` for life (a second daemon exits 8), logs to the journal under `--systemd`/`JOURNAL_STREAM` or to daily files in `$XDG_STATE_HOME/dosi-tracker/logs` (7 kept; never titles, tokens or passwords); wires the worker, session events, the notice relay (notices, Keep/Discard away question, consent receipts, a resident "tracking" notification when there is no tray) and the IPC server; `READY=1`/`STATUS`/`STOPPING` to systemd; SIGTERM/SIGINT/SIGHUP save the block, send the `stopped` farewell and exit within 20 s; a replaced executable restarts at the next block boundary (exit 75, re-exec when detached). `ipc`: protocol v1, JSON lines (1 MiB cap) on a 0600 socket in a 0700 runtime dir, peer uid checked before any byte is read, `hello` first, at most 16 clients, idle clients dropped after 5 min, state events coalesced to 4/s |
-| **Tray** | Daemon-owned StatusNotifierItem (feature `tray`) | `agent::tray`: a ksni item on `dosi-tray` with the ported Windows `TrayView` (status line, today/this week, Open, Pause/Resume/Sign in…/Choose a project…, Take a break 15 min/30 min/1 hour, Switch project, Set task…, Sync now/Upload queued, Open web dashboard, Settings…, Start at login, Quit); badge pixmaps (16/22/24/32/48 px ARGB32) painted in code, `NeedsAttention` for the away question and an expired sign-in; refreshed from the snapshot's change counter; menu actions are worker commands. The owner of `org.kde.StatusNotifierWatcher` is followed into `indicator.tray` (without a host the relay posts the resident "tracking" notification). Open/Settings start `dosi-tracker-gui` in its own `systemd-run --user --scope`, else in a new session |
-| **Window** | `dosi-tracker-gui` (feature `gui`) | `gui`: egui thin client of the daemon, ported from the Windows window: connect page ("isn't running" with Start / Start when I log in), sign-in (server under Advanced, remembered password only in the keyring, sign-in-expired password form, keyring unlock, the file-store explanation without a keyring), workspace and project pickers, consent with this desktop's availability (Wayland limits, Test screenshot permission, webcam not available), timer, activity (week chart, latest screenshot exactly as queued, recent and earlier blocks, purge), settings (start at login, goals, what is recorded, consent history, this device, account, service, diagnostics). Every action is one IPC request; a dead daemon shows the connect page (reconnect 0.5 s to 5 s), another protocol major makes it read-only with a restart banner. One window per user (`gui.lock`; a second launch asks the daemon to `ui.show` it); closing it never stops tracking. X11 by default when `DISPLAY` is set, `--backend wayland`, `gui.backend` or `DOSI_GUI_BACKEND` otherwise; refuses root; SIGTERM closes it cleanly |
-| **CI Gate** | Dedicated GitHub workflow | `.github/workflows/linux.yml` runs `ci/check.sh` inside the `ci/Dockerfile` image (ubuntu:22.04, glibc 2.35) |
+| Tarball (no root) | `dosi-tracker-linux-x86_64.tar.gz` | any distribution; installs into `~/.local` |
+| Debian package | `dosi-tracker_amd64.deb` | Ubuntu 22.04 and 24.04, Debian 12 and 13 |
+| RPM package | `dosi-tracker.x86_64.rpm` | Fedora 43 and 44 |
+| Checksums | `SHA256SUMS` | all of the above |
 
----
+These are the distributions CI installs the artifacts on (Arch Linux through the
+tarball). Older systems (Ubuntu 20.04, Debian 11, RHEL 8 and 9) have an older glibc and
+need a source build.
 
-## 2. Privacy & Security Invariants
-
-1. **Strictly Rootless & Unprivileged**:
-   The agent runs entirely in user space. Escalation to `root` or `sudo`, access to `/dev/input/event*` (evdev), and `/dev/uinput` are strictly prohibited. Any solution requiring elevated privileges is rejected.
-2. **Anti-Keylogger Policy**:
-   Only keyboard event **counts** and active time percentages are recorded. Keycodes, keystroke sequences, and text content are never captured or reconstructed.
-3. **Default-Deny Consent Core**:
-   All capabilities are disabled by default. Widening requires explicit user action and successful disk persistence (`ConsentStore`). Failures during persistence immediately revoke memory permissions to prevent unauthorized collection. ABA lifecycle tickets invalidate stale authorization across permission cycles.
-4. **Truthful Diagnostics & Non-Mutating Inspection**:
-   The diagnostic CLI (`doctor`) and status CLI (`status`) report capabilities and store statuses honestly. Missing databases, configurations, or credentials are never created by diagnostic or inspection commands.
-5. **Strict Secret Redaction**:
-   Passwords, bearer access tokens, refresh tokens, and raw signing key bytes are never leaked to logs, error messages, stdout, or JSON inspection outputs.
-
----
-
-## 3. Installation & Lifecycle
-
-### Prerequisites
-- Linux distribution (Ubuntu 22.04+, Fedora 38+, Arch Linux, Debian 12+)
-- Rust toolchain 1.92+ (CI pins 1.97.1); SQLite is bundled, no `-dev` packages are needed
-- Standard POSIX shell (`bash`)
-
-### Rootless Source Installation
-The installer script compiles and activates the agent strictly inside a user-owned prefix without touching system directories:
+Check the download first:
 
 ```bash
-# Install to default user prefix (~/.local/opt/dosi-tracker)
-bash clients/linux/scripts/install.sh install
-
-# Or install to an explicit user prefix
-bash clients/linux/scripts/install.sh install --prefix "$HOME/apps/dosi-tracker"
+sha256sum -c --ignore-missing SHA256SUMS
 ```
 
-The installer verifies prefix boundary confinement, validates manifest ownership (`manifest.json`), stages artifacts atomically (`.staging.<pid>`), and preserves user configuration and consent at `~/.config/dosi-tracker`.
+**Tarball** (rootless; needs `python3`, which validates the installer's manifest):
 
-### Verification
 ```bash
-# Check installed binary status
-~/.local/opt/dosi-tracker/bin/dosi-tracker doctor
+tar -xzf dosi-tracker-linux-x86_64.tar.gz
+./dosi-tracker-*/install.sh --server https://tracker.example.com
 ```
 
-### Uninstallation
-```bash
-# Uninstall managed files (preserves user configuration and consent files)
-bash clients/linux/scripts/uninstall.sh
+It installs into `~/.local` (`--prefix DIR` for another place): the two programs in
+`~/.local/bin`, the user unit, the applications-menu entry, icons and shell
+completions. `--server` and `--dashboard` are saved with `dosi-tracker config set`
+(an invalid address stops the installer with exit 2 before anything changes). The
+installer refuses root, records every file it writes in
+`~/.local/lib/dosi-tracker/install/manifest.json`, and never overwrites or deletes a
+file it does not own.
 
-# Or with custom prefix
-bash clients/linux/scripts/uninstall.sh --prefix "$HOME/apps/dosi-tracker"
+**Debian and Ubuntu**:
+
+```bash
+sudo apt install ./dosi-tracker_amd64.deb
 ```
 
----
-
-## 4. Command Line (`dosi-tracker`)
-
-Every command takes `--json` (exactly one `dosi-tracker.cli/1` document on stdout; JSON Lines for `status --watch` and `logs -f`), `-q`, `-v` and `--no-start`. Commands that change something start the agent when it is not running (`systemctl --user start dosi-tracker.service`, else a detached `dosi-tracker daemon --detach`); `--no-start` or `DOSI_NO_AUTOSTART=1` turn that off (exit 3). `status`, `doctor`, `queue status`, `consent show` and `config show/get/path` never start it and never create a file: with the agent down they show what the local files say (`status` then exits 3).
+**Fedora**:
 
 ```bash
-dosi-tracker service enable --now                   # start at every login (never done by installers)
-dosi-tracker login --server https://tracker.example.com --email you@example.com
-                                                    # Password: (no echo), then choose the workspace
+sudo dnf install ./dosi-tracker.x86_64.rpm
+```
+
+The packages have no install scripts: they put the programs in `/usr/bin`, the user
+unit in `/usr/lib/systemd/user` (installed, not enabled), and the menu entry, icons,
+AppStream metadata and completions under `/usr/share`. They recommend the libraries
+the window loads at run time (EGL/GL, xkbcommon-x11, Xcursor, Xrandr, Xi), the
+screenshot portal and a keyring; the command line and the agent work without them.
+
+Administrators can preset the server for every user in `/etc/dosi-tracker/config.toml`
+(see [Configuration](#configuration)) and, if the agent should start for everyone at
+login, add their own `/etc/xdg/autostart` entry running
+`/usr/bin/dosi-tracker service session-start`. Neither the packages nor the installer
+do that.
+
+## First run
+
+Nothing runs until you start it. Inside your desktop session:
+
+```bash
+dosi-tracker service enable --now     # start the agent now and at every login
+dosi-tracker login                    # asks for the server (unless set), email and password
+dosi-tracker consent show             # what may be recorded on this computer, and why not
 dosi-tracker consent grant --keyboard --mouse --active-window --running-programs --screenshots
+dosi-tracker project list
 dosi-tracker project use "Website Redesign"
-dosi-tracker status                                 # status --watch streams every change
-dosi-tracker break 15m ; dosi-tracker resume ; dosi-tracker sync
-dosi-tracker away keep                              # or: away discard
-dosi-tracker logout
+dosi-tracker start
+dosi-tracker status
+```
 
-# Automation: the password from stdin (or --password-file, a 0600/0400 file of yours)
+- `login` reads the password without echo, then lists your workspaces (archived ones
+  are not offered) and asks you to choose when there is more than one. `--server`,
+  `--email` and `--workspace NAME_OR_ID` skip the questions. Passwords are never
+  accepted on the command line; for scripts use `--password-stdin` or
+  `--password-file FILE` (a file of yours, mode 0600 or 0400).
+- `consent grant` replaces the previous choice and asks for confirmation (`--yes` skips
+  it). `--time-only` records time blocks only. What is actually recorded is your
+  consent AND the project's policy AND the local configuration AND what this desktop
+  can provide; `dosi-tracker capabilities` shows the result with the reason for
+  everything that is off.
+- `service enable --now` writes `~/.config/autostart/io.github.dosibridge.DosiTracker.desktop`,
+  which starts the agent through the systemd user unit at every login (or, without a
+  user manager, as a background process). `dosi-tracker service disable --now` undoes it.
+
+The same flow works from the window: open "Dosi Tracker" from the applications menu.
+
+For automation (the password comes from stdin, here from a variable):
+
+```bash
 printf '%s\n' "$PW" | dosi-tracker --json login --server https://tracker.example.com \
   --email bot@example.com --workspace Acme --password-stdin
 dosi-tracker consent grant --time-only --yes && dosi-tracker --json start
 ```
 
-Passwords are never accepted on the command line: `--password` and `-p` exit 2 without echoing the value.
+## The window and the tray
+
+**The window** (`dosi-tracker-gui`, or `dosi-tracker gui`) is a client of the agent: it
+shows the agent's state and sends your actions to it, so closing the window never stops
+tracking. Only one window opens per user; starting it again brings the open one to
+the front. It has the sign-in, workspace and project pickers, consent with what this
+desktop can provide, the timer with breaks and today/week totals against your goals,
+recent blocks with the latest screenshot exactly as queued, and settings (start at
+login, goals, what is recorded, consent history, this device, account, service, logs).
+When the agent is not running it says so and offers Start and "Start when I log in".
+It uses X11 (XWayland) when `DISPLAY` is set, otherwise Wayland; `--backend wayland`,
+`DOSI_GUI_BACKEND` or `gui.backend` choose.
+
+**The tray icon** belongs to the agent (StatusNotifierItem) and shows the state as a
+badge: green tracking, amber paused or away or locked, grey offline or choosing, red
+stopped or sign-in expired or device removed. Its menu has pause/resume, breaks, project
+switching, the task note, sync, the dashboard, settings, start at login and quit.
+
+| Desktop | Tray |
+|---|---|
+| KDE Plasma 5.27 and 6 (X11 and Wayland) | built in |
+| Ubuntu GNOME | built in (the Ubuntu AppIndicators extension is on by default) |
+| Fedora, Debian and Arch GNOME | only with the AppIndicator extension, see [Permissions](#permissions) |
+| XFCE 4.16+, Cinnamon, LXQt, Budgie, MATE | the panel's status-notifier applet |
+| Sway, Hyprland | waybar's tray module |
+
+Without a tray, the agent keeps a "Dosi Tracker is tracking ..." notification on screen
+while tracking, and the applications-menu entry has Pause, Resume and Sync actions. A
+tracking session that starts by itself at login needs a way to show it is on (a
+notification server); an explicit `dosi-tracker start` always works and warns when
+nothing on screen can show that tracking is on.
+
+## What is recorded
+
+Everything below needs your consent for that kind of detail and a project policy that
+asks for it. A value that cannot be measured is sent as not measured (`null`), never as
+`0`; the window shows it as "—".
+
+| Detail | X11 session | Wayland session (GNOME, KDE, wlroots) |
+|---|---|---|
+| Time blocks: start, end, project, task note, why the block ended, computer name, OS, time zone | yes | yes |
+| Keyboard activity: key presses counted per minute (never which key) | yes (XInput 2 raw events; repeats and synthetic XTEST input are not counted as yours) | not measured |
+| Mouse activity: clicks counted per minute (wheel and movement only mark activity) | yes | not measured |
+| Activity %, idle seconds, per-minute timeline | yes, when input was measured for the whole block | not measured |
+| Active window title and program, per-app time | yes | not measured |
+| Running programs (names of your own programs with a window or in an app scope) | yes | yes |
+| Screenshot of the screen with the active window, plus a thumbnail; optionally blurred | yes | through the desktop's screenshot permission (portal) |
+| Idle and away detection (stays on this computer) | XInput 2, else MIT-SCREEN-SAVER | GNOME Mutter, `org.freedesktop.ScreenSaver` or logind; none: manual mode |
+| Webcam | not available on Linux in this version (cannot be granted) | same |
+
+Never recorded: what you type (no key codes, text or passwords), the clipboard, pointer
+positions, sub-second timing, titles of background windows, command lines, other
+users' processes, the microphone, your files, hardware identifiers. Nothing is
+recorded while tracking is paused, the screen is locked, the session is inactive or
+you are signed out; lock, sleep and logout end the current block without a screenshot.
+
+The device id is a random UUID created once in `~/.local/share/dosi-tracker/device.json`
+(never the machine id). For full detail on a Wayland desktop, choose the X11 session at
+the login screen ("Ubuntu on Xorg", "Plasma (X11)"); Dosi Tracker never uses root or
+input devices to get around Wayland's isolation.
+
+Servers that do not yet accept `null` counts refuse such blocks; they are kept as
+"not accepted" (`dosi-tracker queue list --parked`) for 14 days instead of being sent
+with invented zeros.
+
+## Permissions
+
+- **Screenshots on Wayland** go through `org.freedesktop.portal.Screenshot` (package
+  `xdg-desktop-portal` plus your desktop's backend). The first screenshot may show the
+  desktop's permission dialog; consent to screenshots asks for it right away, while you
+  are there. If you refuse, screenshots stay off ("denied") without asking again until
+  you run `dosi-tracker capture retry` or use "Test screenshot permission" in the
+  window. The portal's temporary file is deleted after reading.
+- **The keyring** keeps your sign-in (refresh token, the device's signing key and, if you
+  keep "remember the password", the password) in one Secret Service item: GNOME
+  Keyring, KWallet with its Secret Service interface enabled, or KeePassXC with Secret
+  Service integration on. A locked keyring is never unlocked behind your back:
+  `dosi-tracker unlock` or the window's Unlock button shows the keyring's own prompt.
+  Without any Secret Service, sign-in is refused (exit 9) unless you choose the file
+  store: `dosi-tracker config set credentials.store file` keeps the refresh token (never
+  the password) in a 0600 file, and `doctor` warns about it.
+- **The tray on GNOME** outside Ubuntu needs the AppIndicator extension:
+
+  ```bash
+  sudo dnf install gnome-shell-extension-appindicator     # Fedora
+  sudo apt install gnome-shell-extension-appindicator     # Debian
+  gnome-extensions enable appindicatorsupport@rgcjonas.gmail.com
+  ```
+
+  Log out and in once afterwards.
+
+## Command line
+
+```bash
+dosi-tracker --help
+dosi-tracker status --watch          # every change, as it happens
+dosi-tracker pause --for 30m
+dosi-tracker break 15m
+dosi-tracker resume
+dosi-tracker sync
+dosi-tracker away keep               # or: dosi-tracker away discard
+dosi-tracker task set Reviewing the release notes
+dosi-tracker workspace list
+dosi-tracker workspace use Acme
+dosi-tracker whoami
+dosi-tracker queue status
+dosi-tracker queue list --parked
+dosi-tracker device show
+dosi-tracker doctor --strict
+dosi-tracker logs -f
+dosi-tracker open dashboard
+dosi-tracker completions bash > ~/.local/share/bash-completion/completions/dosi-tracker
+```
 
 | Area | Commands |
 |---|---|
-| Service | `service enable [--now]`, `service disable [--now]`, `service start/stop/restart/status`, `daemon [--systemd] [--detach] [--log-level L]`, `uninstall [--purge] [--yes]`, `reset [--yes]` |
-| Account | `login [--server URL] [--email E] [--workspace NAME/ID] [--password-stdin / --password-file P] [--no-remember-password] [--allow-insecure-http]`, `logout [--discard-unsent --yes]`, `unlock`, `whoami`, `workspace list`, `workspace use NAME/ID` |
-| Tracking | `start`, `stop`, `pause [--for 15m]`, `break DURATION`, `resume`, `sync`, `away keep/discard`, `project list [--refresh]`, `project use ID/TITLE`, `task show/set TEXT/clear`, `status [--watch]` |
-| Privacy | `consent show`, `consent grant [--all] [--keyboard] [--mouse] [--active-window] [--running-programs] [--screenshots] [--blur/--no-blur] [--time-only] [--yes]` (the webcam cannot be granted in this version), `consent revoke [--purge-queue] [--yes]`, `capabilities`, `capture retry` |
-| Data | `queue status` (read-only), `queue list [--parked] [--limit N]`, `queue purge --pending/--parked/--all --yes`, `device show` |
-| Config & diagnostics | `config show/path/get K/set K V/unset K`, `doctor [--json] [--strict]`, `logs [-f] [-n N]`, `open dashboard/logs/data`, `completions bash/zsh/fish`, `gui`, `version` |
+| Service | `service enable [--now]`, `service disable [--now]`, `service start`, `service stop`, `service restart`, `service status`, `daemon [--systemd] [--detach] [--log-level L]`, `uninstall [--purge] [--yes]`, `reset [--yes]` |
+| Account | `login [--server URL] [--email E] [--workspace NAME_OR_ID] [--password-stdin \| --password-file P] [--no-remember-password] [--allow-insecure-http]`, `logout [--discard-unsent --yes]`, `unlock`, `whoami`, `workspace list`, `workspace use NAME_OR_ID` |
+| Tracking | `start`, `stop` (pause until resumed), `pause [--for DURATION]`, `break DURATION`, `resume`, `sync`, `away keep`, `away discard`, `project list [--refresh]`, `project use ID_OR_TITLE`, `task show`, `task set TEXT`, `task clear`, `status [--watch]` |
+| Privacy | `consent show`, `consent grant [--all] [--keyboard] [--mouse] [--active-window] [--running-programs] [--screenshots] [--blur \| --no-blur] [--time-only] [--yes]`, `consent revoke [--purge-queue] [--yes]` (works without the agent), `capabilities`, `capture retry` |
+| Data | `queue status`, `queue list [--parked] [--limit N]`, `queue purge --pending \| --parked \| --all --yes`, `device show` |
+| Configuration and help | `config show`, `config path`, `config get KEY`, `config set KEY VALUE`, `config unset KEY`, `doctor [--json] [--strict]`, `logs [-f] [-n N]`, `open dashboard \| logs \| data`, `completions bash \| zsh \| fish`, `gui`, `version` |
 
-Exit codes: 0 success (also when already in that state), 1 failed, 2 usage (including a password on argv or missing input without a terminal), 3 the agent is not running / protocol mismatch, 4 not signed in / refused / expired / keyring locked, 5 consent required or capability unavailable, 6 server unreachable, 7 a choice is required or the named thing does not exist, 8 precondition (no project, another account signed in, no graphical session, device removed, nothing to keep), 9 unsupported environment (root, no `XDG_RUNTIME_DIR`, unsafe permissions, no Secret Service without the file-store opt-in), 75 daemon restart after an upgrade.
+- Every command takes `--json`: exactly one document
+  `{"schema":"dosi-tracker.cli/1","command":...,"ok":true,"changed":...,"result":{...}}`
+  on stdout (`{"ok":false,"error":{"code","message","hint","exit_code"}}` on failure;
+  JSON Lines for `status --watch` and `logs -f`). Prompts and warnings go to stderr.
+- Commands that change something start the agent when it is not running; `--no-start`
+  or `DOSI_NO_AUTOSTART=1` turn that off. `status`, `doctor`, `queue status`,
+  `consent show` and `config show/get/path` never start it and never create a file;
+  with the agent down they show what the local files say.
+- Exit codes: 0 success (also "already so"), 1 failed, 2 usage (also a password on the
+  command line, or a question without a terminal), 3 the agent is not running, 4 not
+  signed in / sign-in refused or expired / keyring locked, 5 consent required or
+  capability unavailable, 6 server unreachable, 7 a choice is needed or the name was
+  not found, 8 precondition (no project, another account, no graphical session, device
+  removed), 9 unsupported environment (root, no `XDG_RUNTIME_DIR`, unsafe permissions,
+  no Secret Service), 75 the agent restarts after an upgrade.
 
-`doctor` keeps every v1 JSON field and adds `schema` (`dosi-tracker.doctor/2`), live read-only `probes` (logind session, idle source, X11 extensions, Screenshot portal, Secret Service and its lock state, tray host, notification server, GUI libraries, unit and autostart, the running agent, the legacy plaintext credentials file) and `problems`; `--strict` exits 1 when one blocks tracking.
+## Files and locations
 
-The hidden foundation inspector `outbox status --db P --account-id A --workspace-id W [--json]` keeps its exact output: a bounded, strictly read-only look at one scope that never creates, migrates or checkpoints the database.
+| Path | What | Mode |
+|---|---|---|
+| `/etc/dosi-tracker/config.toml` | administrator defaults (optional) | root 0644 |
+| `~/.config/dosi-tracker/config.toml` | your configuration | 0600 |
+| `~/.config/dosi-tracker/consent.json` | your consent | 0600 |
+| `~/.config/autostart/io.github.dosibridge.DosiTracker.desktop` | start at login; written only by `service enable` | 0600 |
+| `~/.local/state/dosi-tracker/session.json` | account, workspace, project, pause, task note (no secrets) | 0600 |
+| `~/.local/state/dosi-tracker/consent-log.jsonl` | every consent change | 0600 |
+| `~/.local/state/dosi-tracker/logs/` | daily logs, 7 kept (under systemd: the journal) | 0700 |
+| `~/.local/share/dosi-tracker/outbox.db` | blocks waiting to upload | 0600 |
+| `~/.local/share/dosi-tracker/device.json` | this install's device id | 0600 |
+| `~/.local/share/dosi-tracker/credentials.json` | only with `credentials.store = "file"` | 0600 |
+| `$XDG_RUNTIME_DIR/dosi-tracker/` | the agent's socket and locks | 0700 |
+| `$XDG_RUNTIME_DIR/dosi-tracker-session.env` | the desktop session's variables for the unit | 0600 |
 
-### Local CI (Docker)
-The same image and stages run locally and in `.github/workflows/linux.yml`. Builds go to named volumes, never to the checkout's `target/`:
+`~/.config`, `~/.local/state` and `~/.local/share` follow `XDG_CONFIG_HOME`,
+`XDG_STATE_HOME` and `XDG_DATA_HOME`. Logs never contain window titles, program names,
+image bytes, tokens or passwords. `dosi-tracker config path` prints the actual paths.
+
+## Configuration
+
+Layers, lowest first: built-in defaults, `/etc/dosi-tracker/config.toml`,
+`~/.config/dosi-tracker/config.toml`, then `DOSI__*` environment variables
+(`DOSI__API_BASE_URL=https://...`, `DOSI__CAPTURE__SCREENSHOT=false`). The `[capture]`
+switches only restrict (a `false` in any layer cannot be turned back on by a later
+one) and `blur_screenshots` only adds. Every key, its default and its range are in
+[`config.example.toml`](config.example.toml).
+
+```bash
+dosi-tracker config show
+dosi-tracker config set api_base_url https://tracker.example.com
+dosi-tracker config set capture.screenshot false
+dosi-tracker config unset capture.screenshot
+dosi-tracker service restart          # the agent reads its configuration at start
+```
+
+There is no built-in server address. Plain `http://` is accepted only for this computer
+(loopback) unless `allow_insecure_http = true` (`login --allow-insecure-http` sets it);
+TLS certificates are always verified and redirects are never followed.
+
+## Troubleshooting
+
+Start with `dosi-tracker doctor` (`--json` for scripts). It changes nothing and checks
+the login session, the idle source, X11 extensions, the screenshot portal, the
+keyring and its lock state, the tray host, the notification server, the window's
+libraries, the unit and the login entry, the running agent and its queue.
+
+- **"Keyring locked" or sign-in refused with exit 9.** Unlock with `dosi-tracker unlock`.
+  On window managers without a keyring, install and start `gnome-keyring` (or
+  KeePassXC with Secret Service integration), or opt into the file store (see
+  [Permissions](#permissions)). While the keyring is locked the agent keeps tracking
+  offline on the cached projects and uploads after the unlock.
+- **Keyboard, mouse or window details missing on Wayland.** Expected: see
+  [What is recorded](#what-is-recorded). `dosi-tracker capabilities` names the reason.
+- **Screenshots "denied" or "needs approval".** Run `dosi-tracker capture retry` and
+  answer the desktop's dialog; check that `xdg-desktop-portal` and your desktop's portal
+  backend are installed.
+- **The agent says `no_session`, or it started without a display.** Some desktops do not
+  pass `DISPLAY`/`WAYLAND_DISPLAY` to the systemd user manager. The login entry written
+  by `service enable` hands them over at every login; after enabling, log out and in
+  once, or run `dosi-tracker service session-start` in a terminal inside the desktop
+  session. Over SSH or on a text console the agent never tracks.
+- **The window does not open.** The window loads EGL/GL, xkbcommon-x11, Xcursor, Xrandr
+  and Xi at run time (`doctor` lists what is missing):
+
+  ```bash
+  sudo apt install libegl1 libxkbcommon-x11-0 libxcursor1 libxrandr2 libxi6 libx11-xcb1
+  sudo dnf install mesa-libEGL libxkbcommon-x11 libXcursor libXrandr libXi
+  ```
+
+  The command line and the tray do not need them.
+- **Manual mode.** When the desktop offers no idle source (some wlroots compositors),
+  the agent cannot tell when you are away: tracking never starts or resumes by itself,
+  pauses after `tracking.manual_max_hours` (10 by default), and the window shows a
+  banner. Pause when you stop working; lock, sleep and logout still end blocks.
+- **Blocks not uploading.** `dosi-tracker status` shows the upload issue and
+  `dosi-tracker queue list --parked` the blocks the server did not accept, with its
+  reason. `dosi-tracker sync` retries now.
+- **Logs.** `dosi-tracker logs -f`, or `journalctl --user -u dosi-tracker -f` when the
+  agent runs under systemd.
+
+## Upgrade, uninstall and purge
+
+**Upgrade.** Packages: install the new `.deb`/`.rpm` the same way; a running agent
+notices that its program was replaced and restarts at the end of the current block.
+Tarball: run the new tarball's installer with `update`; it stops the agent (the block is
+saved), swaps the files, restarts the agent if it was running, checks the result and
+puts the previous version back if anything fails. `rollback` returns to the version the
+last update replaced.
+
+```bash
+./dosi-tracker-*/install.sh update
+./dosi-tracker-*/install.sh rollback
+```
+
+An installation made by the earlier source-build installer (`share/dosi-tracker/manifest.json`)
+is taken over by `install.sh`.
+
+**Uninstall** keeps your configuration, consent and queued blocks, so a reinstall
+continues where you left off:
+
+```bash
+dosi-tracker uninstall                  # tarball: runs ~/.local/lib/dosi-tracker/install/uninstall.sh
+sudo apt remove dosi-tracker            # Debian and Ubuntu packages
+sudo dnf remove dosi-tracker            # Fedora package
+```
+
+For packages, `dosi-tracker uninstall` prints the package command instead of running
+`sudo`. Removing a package removes only the package's files; per-user data stays.
+
+**Purge** also signs out, deletes the keyring item and removes the configuration,
+consent, state, logs and the queue, including blocks that were not uploaded (their
+count is shown first):
+
+```bash
+dosi-tracker uninstall --purge          # asks first; --yes in scripts
+dosi-tracker reset                      # the same deletion, keeping the programs
+```
+
+Run `dosi-tracker reset` before removing a package if you want your data gone too.
+
+## Development
+
+The crate is `clients/linux` (`dosi-tracker-linux`, Rust 1.92 or newer). Build and
+install from a checkout with `bash scripts/install.sh install` (it runs
+`cargo build --locked --release --bins`; SQLite is bundled and no `-dev` packages are
+needed).
+
+Every check runs in the CI image (`ci/Dockerfile`: Ubuntu 22.04, glibc 2.35, the pinned
+toolchain, Xvfb, private D-Bus buses and the packaging validators), locally exactly as in
+`.github/workflows/linux.yml`. Builds go to named volumes, never to the checkout:
 
 ```bash
 R="$(git rev-parse --show-toplevel)"
 docker build -t dosi-linux-ci:22.04 -f "$R/clients/linux/ci/Dockerfile" "$R/clients/linux/ci"
-docker run --rm --user builder -v "$R:/repo" -v dosi-linux-target:/target \
+dr() { docker run --rm --user builder -v "$R:/repo" -v dosi-linux-target:/target \
   -v dosi-linux-cargo:/usr/local/cargo/registry -e CARGO_TARGET_DIR=/target \
-  -w /repo/clients/linux dosi-linux-ci:22.04 bash ci/check.sh all
+  -w /repo/clients/linux dosi-linux-ci:22.04 "$@"; }
+dr bash ci/check.sh all                 # fmt clippy test harness installer release
+dr bash ci/check.sh package             # tarball, .deb, .rpm and SHA256SUMS in /target/dist
 ```
 
-Stages: `fmt`, `clippy`, `test`, `harness` (ignored display/bus tests inside `ci/xvfb-session.sh`), `installer`, `release`, `all`. On Git Bash for Windows prefix `docker` with `MSYS_NO_PATHCONV=1`.
+On Git Bash for Windows, prefix `docker` with `MSYS_NO_PATHCONV=1`. The stages:
 
----
+| Stage | Runs |
+|---|---|
+| `fmt` | `cargo fmt --check` |
+| `clippy` | `-D warnings` for the default, `--no-default-features` and `--all-features` builds |
+| `test` | `cargo test`, then with `--features test-support` (fakes, scripted daemon) |
+| `harness` | the ignored display and D-Bus tests inside `ci/xvfb-session.sh` (Xvfb, openbox, private buses; only synthetic input) |
+| `installer` | `tests/test_installer_lifecycle.sh` as a non-root user |
+| `release` | release build and tests, the shared-library allowlist, `--version`, `doctor --json`, no test hooks in the binaries, fail-closed CLI checks |
+| `package` | `packaging/build-dist.sh` with pinned `cargo-deb` and `cargo-generate-rpm`, package contents, validators, every `dosi-tracker` command of this README, a tarball install |
 
-## 5. Platform Capability & Architecture Matrix
+The distro smoke test installs the artifacts on stock images, as CI's `package-smoke`
+job does:
 
-| Capability | X11 Protocol | Wayland Compositor | Implementation Status |
-|---|---|---|---|
-| **Active Window** | Supported via `_NET_ACTIVE_WINDOW` & `WM_CLASS` | **UNSUPPORTED** (reported as `null` / unsupported) | **Delivered in Phase 2** (`X11ActiveWindowProvider`, `WaylandActiveWindowProvider`, root normalization, priority title fallback) |
-| **Running Applications** | Own-user `/proc` processes that own a `_NET_CLIENT_LIST` window | Own-user `/proc` processes in a systemd app scope (`app.slice/app-*.scope` / `app-*.service`) | **Sensor delivered** (`ProcFsRunningAppsProvider` with a mandatory `ProcessScope`: own euid only, never the agent itself, 200 cap, deduplication, `PF_KTHREAD` filtering); used by the worker through `tracking::tracker` |
-| **Screen Capture** | `GetImage` of the RandR monitor showing most of the active window (fallback: whole root), 24/32-bit visuals (`X11ScreenSource`) | `org.freedesktop.portal.Screenshot`, non-interactive; returned file deleted; refusal = Denied until an explicit retry; 30 s timeout = needs approval (`PortalScreenSource`) | **Sensor delivered**; shared encoder (`tracking::capture`: ≤1920 px JPEG ladder within 8 MB, 480 px thumbnail within 512 KB, unreadable blur); used by the worker through `tracking::tracker` |
-| **Keyboard Counting** | XInput 2.2 raw key presses on the root for master devices; keycodes never read; auto-repeat dropped; XTEST counted as injected only (`X11InputListener` → `InputLog`) | **UNSUPPORTED** (reported as `null`) | **Sensor delivered**; used by the worker through `tracking::tracker` |
-| **Mouse Counting** | XInput 2.2 raw buttons 1-3/8-9 as clicks; wheel and motion as activity only; XTEST counted as injected only | **UNSUPPORTED** (reported as `null`) | **Sensor delivered**; used by the worker through `tracking::tracker` |
-| **Idle Detection (local only)** | Last physical XI2 input, else MIT-SCREEN-SAVER (`X11ScreenSaverIdleSource`) | Mutter IdleMonitor, `org.freedesktop.ScreenSaver`, logind `IdleHint` (`probe_idle_sources`); none = manual mode | **Sensor delivered**; used by the worker through `tracking::tracker` |
-| **Webcam Photo** | Architecturally possible via V4L2 (`/dev/video*`) | Architecturally possible via V4L2 / PipeWire camera portal | Not in v1: consent to it is refused (planned for v1.1) |
-| **Credential Storage** | Freedesktop Secret Service (D-Bus) | Freedesktop Secret Service (D-Bus) | **Delivered** (account-level items; opt-in owner-only 0600 file store without the password, with a doctor warning) |
-| **Backend Sync & Transport** | Real HTTP Delivery Transport | Real HTTP Delivery Transport | **Delivered** (`HttpDeliveryTransport::new_shared` per workspace scope, driven by the daemon's uploader; `dosi-tracker sync` uploads at once) |
-| **Payload Signing** | HMAC-SHA256 (32 bytes) | HMAC-SHA256 (32 bytes) | **Delivered in Phase 1** (Windows byte semantics parity) |
+```bash
+for img in ubuntu:22.04 ubuntu:24.04 debian:12 debian:13 fedora:43 fedora:44 archlinux:latest; do
+  docker run --rm -v dosi-linux-target:/target:ro -v "$R/clients/linux/packaging:/pkg:ro" \
+    "$img" bash /pkg/smoke.sh /target/dist || break
+done
+```
 
----
+Releases are made by pushing a `linux-vX.Y.Z` tag that matches the crate version (and
+has a `<release>` entry in the AppStream metainfo); the workflow runs every check,
+builds and smoke-tests the artifacts and publishes them with `SHA256SUMS` as a GitHub
+release. That release is not marked "latest": the latest-release address belongs to the
+product release that carries every platform's downloads.
 
-## 6. Implementation Roadmap
-
-- **Phase 0 (Completed Foundation & Hygiene)**:
-  - Scoped GitHub Actions CI workflow (`.github/workflows/linux.yml`, Docker image `ci/Dockerfile`, stages in `ci/check.sh`).
-  - Strict formatting and clippy gates (`cargo fmt --check`; `cargo clippy --locked --all-targets -- -D warnings` for the default, `--no-default-features` and `--all-features` sets).
-  - Safe scoped SQLite progress handler wrapper (`ScopedProgressHandler`) with guaranteed RAII deregistration.
-  - Graceful recoverable mutex poisoning handling in outbox (`OutboxError::LockPoisoned`).
-  - Documentation and test count synchronization across repository.
-- **Phase 1 (Delivered Foundation: Identity, Real Transport, Signed Queue)**:
-  - Freedesktop Secret Service credential storage per account and workspace over session D-Bus (`org.freedesktop.secrets`) matching standard `SearchItems`, `OpenSession`, `Unlock`, `GetSecret`, `CreateItem`, and `Delete` interfaces with fail-closed prompt handling, accompanied by `SecretServiceTransport` injected seam and `MockSecretServiceTransport` protocol fake for deterministic testing without live keyring access; owner-only `0600` private file fallback with atomic replacement durability and explicit `doctor` diagnostic warning.
-  - OpenIddict OAuth2 password grant authentication (`POST /connect/token`, `client_id=Tracker_App`, scope `Tracker offline_access`, the install's `device_id`; no tenant parameter and no workspace header).
-  - Outbox store v2 (migrated from v1 in one transaction): captures in their own table, signed rows (HMAC over the payload and capture digests) verified before upload, parking of refused rows with park-and-continue sync, Windows queue limits, `open_or_recover`, 0700/0600 files; the read-only inspector reads v1 and v2 stores and reports `parked_count` and `capture_bytes`.
-  - Pre-expiry token refresh buffer (60s early renewal) and bounded 401 retry / re-authentication.
-  - Per-device 32-byte HMAC-SHA256 payload signing matching Windows byte semantics (`URL_SAFE_NO_PAD` base64url tag).
-  - Concrete `HttpDeliveryTransport` implementing `DeliveryTransport` contract with exact ack deletion, transient failure retention and retry counter incrementation, auth-required halt, and mismatched ack halt.
-  - Strict transport identity binding: `HttpDeliveryTransport` is bound to its authenticated account and workspace (`OutboxScope`) under exact canonicalization rules (`account_id: trim().to_lowercase()`, `workspace_id: trim().to_string()`), failing closed if unscoped or empty across all constructors (`new`, `from_credentials`, `from_store`), and rejecting mismatched queued scopes before any authentication, token refresh, or network transmission, preserving the queued row and retry metadata in SQLite without accidental acknowledgment or cross-tenant exposure.
-  - Production transport initialization from persisted credentials (`HttpDeliveryTransport::from_store` / `from_credentials`), proving production upload reuses credentials, tokens, and signing key saved by CLI `login`.
-  - Heartbeat presence primitive (`POST /api/app/presence/heartbeat`) on 60s cadence.
-  - The foundation's `login`/`logout`/`status` commands, replaced by the daemon-backed CLI (section 4).
-  - *Evidence & Boundaries:* Verified by `tests/cli_identity_transport_signing_tests.rs`: `dosi-tracker login` (password on stdin, through the daemon) against a stateful fake backend, then a v2 transport built from the credentials it saved (`HttpDeliveryTransport::new_shared`): signed delivery and ack deletion, HTTP 503 and TCP socket interruption keeping the row. Independent native QA remains pending.
-- **Phase 2 (Native Consent-Gated Capture Adapters - FIRST BOUNDED SLICE & DEEP CORRECTIONS DELIVERED)**:
-  - **Delivered Bounded Slice & Deep Corrections**:
-    - Native consent-gated capture adapters with fakeable traits matching Windows (`AcquisitionProvider`, `ActiveWindowProvider`, `RunningAppsProvider`, `ConsentGatedTracker`, `FakeAcquisitionProvider`).
-    - Real unprivileged X11 property transport via pure-Rust `x11rb v0.14.0` (`SysX11Transport`, `SysX11PropertyReader`), lazy connection behind affirmative consent gate (zero display socket or window queries during provider construction or `doctor` diagnostics), wire-level reply parsing (`GetPropertyReply::try_parse`), bounded decoding of `_NET_ACTIVE_WINDOW` (normalizing root window focus `id == root` to `None` with zero subsequent property queries), UTF-8 `_NET_WM_NAME` priority decoding with `WM_NAME` fallback queried only if preferred is absent, empty, NUL-only, or whitespace-only, `WM_CLASS`, and `_NET_WM_PID` mapped to `/proc/[pid]/exe`, with graceful unfocused handling (`_NET_ACTIVE_WINDOW = 0` / None).
-    - User-space `/proc` process inventory scanner (`ProcFsRunningAppsProvider`) with injectable `ProcFsReader` seam, resilient to vanished PIDs (ENOENT), extracting pure executable filenames (`file_name`), native unbracketed kernel-thread detection via `/proc/[pid]/stat` `PF_KTHREAD` (`0x0020_0000`) robustly indexing fields after `stat_line.rfind(')')`, preserving bracketed user applications (`[editor]`, `[custom-app]`, `[unstat-task]`) when flags are clear or thread status is unavailable, provenance-aware aggregation (`aggregate_running_programs`) with case-insensitive first-seen deduplication and 200 cap, and empty titles / null usage metrics.
-    - Truthful, honest Wayland unsupported behavior (`WaylandActiveWindowProvider`) reporting architectural unprivileged limits (`TrackingError::UnsupportedSession`) without synthetic or fabricated telemetry.
-    - Wired into capability architecture and `doctor` support reporting (`DiagnosticStatus::Supported` under X11/procfs; `DiagnosticStatus::Unsupported` under Wayland; `adapters.window_sampler` derived directly from `active_window.adapter_status`).
-    - Deterministic test harness (`tracking_native_adapter_tests`): default deny, capability-specific consent, wrapper-level in-flight pause->resume and revoke->regrant ABA generation mismatch invalidation, unsupported sessions, parsing/aggregation, and error paths.
-  - **Sensors delivered (L3; wired into the worker in L5)**:
-    - XInput 2.2 counts-only listener with a 125-minute ring of per-second buckets (`InputLog`), the ported Windows activity %, minute timeline and per-app usage math (`tracking::input`, `tracking::usage`, 3 s `UsageSampler` with a synchronous stop).
-    - X11 `GetImage` and Wayland Screenshot-portal screen sources with the ported Windows JPEG/thumbnail/blur encoder.
-    - X11 MIT-SCREEN-SAVER and Wayland D-Bus idle sources; explicit display and bus injection everywhere (nothing reads `DISPLAY` or `DBUS_SESSION_BUS_ADDRESS`).
-    - Tests: crafted XI2 wire events, capture encoding, fake portal / idle services on private buses, and `tests/x11_xvfb_it.rs` against the harness Xvfb (`xdotool` input is counted as injected only).
-  - **Remaining Phase 2 Backlog (OPEN)**:
-    - Separate opt-in V4L2 webcam (deferred to v1.1).
-- **Phase 3 (Worker, Presence, Session & Configuration - DELIVERED)**:
-  - Interval capture worker with ABA generation tickets, the background uploader, logind lock/sleep/shutdown handling, idle detection.
-  - The daemon (single instance through `daemon.lock`, IPC protocol v1 over a same-uid Unix socket), XDG `config.toml` with `DOSI__*` overrides, the rootless systemd user unit.
-- **Phase 4 (CLI Surface & Packaging - CLI DELIVERED, PACKAGING OPEN)**:
-  - The full CLI with `--json` envelopes and stable exit codes (section 4), doctor v2.
-  - The daemon-owned tray and the `dosi-tracker-gui` window (tests: `gui_viewmodel_tests`, `tray_fake_watcher_tests` against a fake StatusNotifierWatcher, and `gui_smoke_it` under the harness Xvfb).
-  - Open: `.deb`/`.rpm`/tarball packaging and their CI jobs.
-
+Layout: `src/agent` (daemon, worker, uploader, tray), `src/tracking` (session
+detection and sensors), `src/ipc` (the agent's socket protocol), `src/cli`, `src/gui`
+(feature `gui`), `packaging/` (unit, desktop entries, icons, AppStream metadata,
+`build-dist.sh`, `smoke.sh`), `scripts/` (installer), `tests/` (integration suites and
+fakes) and `ci/`. The icons are rendered by `packaging/icons/render-icons.py` from the
+same geometry as the SVG.

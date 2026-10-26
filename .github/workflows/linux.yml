@@ -2,10 +2,15 @@ name: Linux agent
 
 # Every stage runs in the clients/linux/ci/Dockerfile image (ubuntu:22.04,
 # glibc 2.35, pinned Rust), exactly as `bash ci/check.sh <stage>` does locally.
+# The package job builds the release artifacts, package-smoke installs them on
+# stock distro images (packaging/smoke.sh), and a `linux-vX.Y.Z` tag publishes
+# them as a GitHub release.
 
 on:
   push:
     branches: [main, master, develop]
+    # Path filters do not apply to tag pushes.
+    tags: ["linux-v*"]
     paths:
       - "clients/linux/**"
       - ".github/workflows/linux.yml"
@@ -87,3 +92,123 @@ jobs:
             -e CARGO_TARGET_DIR=/target \
             -w /repo/clients/linux \
             "$CI_IMAGE" bash ci/check.sh harness
+
+  package:
+    name: Linux packages (tarball, .deb, .rpm, SHA256SUMS)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      # Its own key: the registry volume also holds the pinned cargo-deb and
+      # cargo-generate-rpm that ci/check.sh installs.
+      - name: Cache cargo registry and packaging tools
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/cargo-registry
+          key: linux-cargo-package-${{ hashFiles('clients/linux/Cargo.lock', 'clients/linux/ci/check.sh') }}
+          restore-keys: linux-cargo-package-
+
+      - name: Build CI image
+        run: >
+          docker build --build-arg BUILDER_UID="$(id -u)"
+          -t "$CI_IMAGE" -f clients/linux/ci/Dockerfile clients/linux/ci
+
+      - name: ci/check.sh package
+        run: |
+          mkdir -p "$RUNNER_TEMP/cargo-registry" "$RUNNER_TEMP/linux-target"
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          docker run --rm --user builder \
+            -v "$GITHUB_WORKSPACE:/repo" \
+            -v "$RUNNER_TEMP/linux-target:/target" \
+            -v "$RUNNER_TEMP/cargo-registry:/usr/local/cargo/registry" \
+            -e CARGO_TARGET_DIR=/target \
+            -e SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
+            -w /repo/clients/linux \
+            "$CI_IMAGE" bash ci/check.sh package
+
+      - name: Upload the artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux-dist
+          path: ${{ runner.temp }}/linux-target/dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  package-smoke:
+    name: Package smoke (${{ matrix.image }})
+    needs: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # apt for Ubuntu/Debian, dnf for Fedora, the tarball as a non-root user on Arch.
+        image:
+          - ubuntu:22.04
+          - ubuntu:24.04
+          - debian:12
+          - debian:13
+          - fedora:43
+          - fedora:44
+          - archlinux:latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Download the artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: linux-dist
+          path: ${{ runner.temp }}/dist
+
+      - name: packaging/smoke.sh
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          docker run --rm \
+            -v "$RUNNER_TEMP/dist:/dist:ro" \
+            -v "$GITHUB_WORKSPACE/clients/linux/packaging:/pkg:ro" \
+            "$IMAGE" bash /pkg/smoke.sh /dist
+
+  release:
+    name: Publish the Linux release
+    if: startsWith(github.ref, 'refs/tags/linux-v')
+    needs: [check, harness, package-smoke]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download the artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: linux-dist
+          path: dist
+
+      - name: Check the tag against the artifacts
+        run: |
+          version="${GITHUB_REF_NAME#linux-v}"
+          for f in "dosi-tracker-${version}-x86_64-linux-gnu.tar.gz" \
+                   "dosi-tracker_${version}-1_amd64.deb" \
+                   "dosi-tracker-${version}-1.x86_64.rpm" \
+                   dosi-tracker-linux-x86_64.tar.gz dosi-tracker_amd64.deb \
+                   dosi-tracker.x86_64.rpm SHA256SUMS; do
+            if [ ! -s "dist/$f" ]; then
+              echo "::error::dist/$f is missing: does the tag match the crate version?"
+              exit 1
+            fi
+          done
+          (cd dist && sha256sum -c SHA256SUMS)
+
+      # Not marked latest: /releases/latest/download/<name> belongs to the
+      # product release that carries every platform's artifacts.
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --latest=false \
+            --title "Dosi Tracker for Linux ${GITHUB_REF_NAME#linux-v}" \
+            --notes "Tarball (rootless, ~/.local), .deb (Ubuntu 22.04/24.04, Debian 12/13) and .rpm (Fedora 43/44) for x86_64, each also under a version-less name, with SHA256SUMS. Verify with: sha256sum -c --ignore-missing SHA256SUMS. Install and first-run steps: clients/linux/README.md."

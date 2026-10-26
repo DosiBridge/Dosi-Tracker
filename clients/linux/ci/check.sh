@@ -5,6 +5,7 @@
 #
 #   bash ci/check.sh all
 #   bash ci/check.sh fmt clippy test installer release
+#   bash ci/check.sh package
 #
 # Stages:
 #   fmt        cargo fmt --check
@@ -16,7 +17,14 @@
 #              --version, doctor --json, the outbox fail-closed checks, no
 #              test hooks in the binary, and argv passwords / status
 #              without an agent failing closed
-#   all        fmt clippy test harness installer release
+#   package    release build, then packaging/build-dist.sh (tarball, .deb and
+#              .rpm with the pinned cargo-deb/cargo-generate-rpm, version-less
+#              copies and SHA256SUMS in <target>/dist), then: checksums,
+#              package metadata and contents (no maintainer scripts, nothing
+#              under /etc, the unit installed but not enabled), the
+#              validators, every dosi-tracker command in the README parses,
+#              and a rootless install and uninstall from the tarball
+#   all        fmt clippy test harness installer release (package is separate)
 #
 # An unknown stage exits 2 before anything runs.
 
@@ -72,7 +80,8 @@ stage_installer() {
   if [ "$(id -u)" -eq 0 ]; then
     die "the installer suite must run as a non-root user (the installer refuses root)"
   fi
-  bash tests/test_installer_lifecycle.sh
+  # The suite builds the release binaries (LTO): bound the parallel links.
+  CARGO_BUILD_JOBS="$(lto_jobs)" bash tests/test_installer_lifecycle.sh
 }
 
 # A fresh, empty HOME/XDG tree with nothing of the caller's session in it.
@@ -213,6 +222,210 @@ check_cli_fails_closed() {
   rm -rf "${home}"
 }
 
+# Packaging tools, pinned and built from crates.io with --locked into the cargo
+# registry volume (so CI and local runs reuse them).
+CARGO_DEB_VERSION="3.8.0"
+CARGO_GENERATE_RPM_VERSION="0.21.1"
+
+install_packaging_tools() {
+  local root="${PACKAGING_TOOLS_ROOT:-${CARGO_HOME:-${HOME}/.cargo}/registry/tools}"
+  export PATH="${root}/bin:${PATH}"
+  local tool name version
+  for tool in "cargo-deb@${CARGO_DEB_VERSION}" "cargo-generate-rpm@${CARGO_GENERATE_RPM_VERSION}"; do
+    name="${tool%@*}"
+    version="${tool#*@}"
+    if [ "$("${root}/bin/${name}" --version 2>/dev/null)" = "${name} ${version}" ]; then
+      continue
+    fi
+    log "installing ${tool} into ${root}"
+    CARGO_TARGET_DIR="${TARGET_DIR}/packaging-tools" \
+      cargo install --locked --force --root "${root}" "${tool}"
+  done
+}
+
+# Every `dosi-tracker ...` command in the README's shell blocks names a real
+# subcommand path: walk it with --help, descending only while the current
+# command has subcommands.
+check_readme_commands() {
+  local bin="$1"
+  python3 - "${bin}" README.md <<'PY'
+import re
+import shlex
+import subprocess
+import sys
+
+binary, readme = sys.argv[1], sys.argv[2]
+GLOBAL_FLAGS = {"--json", "--no-start", "-q", "--quiet", "-v", "--verbose", "--no-color"}
+lines, in_block, current = [], False, ""
+for raw in open(readme, encoding="utf-8"):
+    fence = re.match(r"^\s*```(\w*)", raw)
+    if fence:
+        in_block = not in_block and fence.group(1) in ("bash", "sh", "shell", "console")
+        continue
+    if not in_block:
+        continue
+    text = raw.rstrip("\n")
+    if text.rstrip().endswith("\\"):
+        current += text.rstrip()[:-1] + " "
+        continue
+    lines.append(current + text)
+    current = ""
+
+checked = 0
+failures = []
+for line in lines:
+    lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    lexer.commenters = "#"
+    try:
+        tokens = list(lexer)
+    except ValueError as e:
+        failures.append("%s: %s" % (line, e))
+        continue
+    segment = []
+    for token in tokens + [";"]:
+        if token in ("|", "||", "&&", ";", "&"):
+            if segment and segment[0].split("/")[-1] == "dosi-tracker":
+                path = []
+                for word in segment[1:]:
+                    if word in GLOBAL_FLAGS:
+                        continue
+                    if word.startswith("-"):
+                        break
+                    help_text = subprocess.run(
+                        [binary] + path + ["--help"], capture_output=True, text=True
+                    ).stdout
+                    if "Commands:" not in help_text:
+                        break
+                    path.append(word)
+                result = subprocess.run([binary] + path + ["--help"], capture_output=True, text=True)
+                checked += 1
+                if result.returncode != 0:
+                    failures.append("%s  ->  dosi-tracker %s --help exited %d: %s" % (
+                        " ".join(segment), " ".join(path), result.returncode, result.stderr.strip()))
+            segment = []
+        else:
+            segment.append(token)
+if failures:
+    print("README commands that do not parse:", *failures, sep="\n  ", file=sys.stderr)
+    sys.exit(1)
+if checked < 20:
+    print("only %d dosi-tracker commands found in README.md" % checked, file=sys.stderr)
+    sys.exit(1)
+print("README: %d dosi-tracker commands checked" % checked)
+PY
+}
+
+# The installed file list of a package ($1, one path per line) has exactly the
+# design 15.2 /usr layout and nothing under /etc.
+check_package_files() {
+  local list="$1" kind="$2"
+  local app="io.github.dosibridge.DosiTracker" path size
+  local zsh_dir="/usr/share/zsh/vendor-completions"
+  [ "${kind}" = "rpm" ] && zsh_dir="/usr/share/zsh/site-functions"
+  for path in /usr/bin/dosi-tracker /usr/bin/dosi-tracker-gui \
+    /usr/lib/systemd/user/dosi-tracker.service \
+    "/usr/share/applications/${app}.desktop" "/usr/share/metainfo/${app}.metainfo.xml" \
+    "/usr/share/icons/hicolor/scalable/apps/${app}.svg" \
+    /usr/share/bash-completion/completions/dosi-tracker "${zsh_dir}/_dosi-tracker" \
+    /usr/share/fish/vendor_completions.d/dosi-tracker.fish; do
+    grep -qx "${path}" "${list}" || die "${kind}: ${path} is missing"
+  done
+  for size in 16x16 22x22 24x24 32x32 48x48 64x64 128x128 256x256 512x512; do
+    grep -qx "/usr/share/icons/hicolor/${size}/apps/${app}.png" "${list}" || die "${kind}: ${size} icon is missing"
+  done
+  if grep -E '^/etc(/|$)' "${list}"; then
+    die "${kind}: installs files under /etc (no /etc/xdg/autostart, no system config)"
+  fi
+  if grep -E '\.wants/|/systemd/system/' "${list}"; then
+    die "${kind}: enables a unit or installs a system unit"
+  fi
+}
+
+stage_package() {
+  install_packaging_tools
+  local jobs
+  jobs="$(lto_jobs)"
+  log "release build (${jobs} jobs)"
+  cargo build --locked --release --bins -j "${jobs}"
+
+  log "packaging/build-dist.sh"
+  bash packaging/build-dist.sh
+
+  local dist="${DIST_DIR:-${TARGET_DIR}/dist}"
+  local version
+  version="$("${TARGET_DIR}/release/dosi-tracker" --version | awk '{print $2}')"
+  local tarball="dosi-tracker-${version}-x86_64-linux-gnu.tar.gz"
+  local deb="dosi-tracker_${version}-1_amd64.deb"
+  local rpm="dosi-tracker-${version}-1.x86_64.rpm"
+
+  log "checksums"
+  local f
+  for f in "${tarball}" "${deb}" "${rpm}" dosi-tracker-linux-x86_64.tar.gz dosi-tracker_amd64.deb dosi-tracker.x86_64.rpm; do
+    [ -s "${dist}/${f}" ] || die "missing artifact ${f}"
+    grep -q "  ${f}\$" "${dist}/SHA256SUMS" || die "${f} is not in SHA256SUMS"
+  done
+  (cd "${dist}" && sha256sum -c SHA256SUMS)
+  cmp "${dist}/${tarball}" "${dist}/dosi-tracker-linux-x86_64.tar.gz"
+  cmp "${dist}/${deb}" "${dist}/dosi-tracker_amd64.deb"
+  cmp "${dist}/${rpm}" "${dist}/dosi-tracker.x86_64.rpm"
+
+  local scratch
+  scratch="$(mktemp -d)"
+  log "deb: metadata and contents"
+  dpkg-deb --info "${dist}/${deb}"
+  [ "$(dpkg-deb --field "${dist}/${deb}" Package)" = "dosi-tracker" ] || die "deb Package is not dosi-tracker"
+  [ "$(dpkg-deb --field "${dist}/${deb}" Version)" = "${version}-1" ] || die "deb Version is not ${version}-1"
+  dpkg-deb --field "${dist}/${deb}" Depends | grep -q 'libc6' || die "deb Depends lacks libc6"
+  dpkg-deb --field "${dist}/${deb}" Recommends | grep -q 'xdg-desktop-portal' || die "deb Recommends is incomplete"
+  dpkg-deb --field "${dist}/${deb}" Suggests | grep -q 'gnome-shell-extension-appindicator' || die "deb Suggests is incomplete"
+  dpkg-deb --control "${dist}/${deb}" "${scratch}/control"
+  for f in preinst postinst prerm postrm config triggers; do
+    [ ! -e "${scratch}/control/${f}" ] || die "the deb has a maintainer script: ${f}"
+  done
+  dpkg-deb --fsys-tarfile "${dist}/${deb}" | tar -t | sed 's|^\./|/|' | grep -v '/$' | sort > "${scratch}/deb.files"
+  check_package_files "${scratch}/deb.files" deb
+
+  log "rpm: metadata and contents"
+  rpm -qip "${dist}/${rpm}"
+  [ "$(rpm -qp --queryformat '%{NAME} %{VERSION}-%{RELEASE}' "${dist}/${rpm}")" = "dosi-tracker ${version}-1" ] \
+    || die "rpm name/version is not dosi-tracker ${version}-1"
+  [ -z "$(rpm -qp --scripts "${dist}/${rpm}")" ] || die "the rpm has scriptlets"
+  rpm -qp --recommends "${dist}/${rpm}" | grep -q 'mesa-libEGL' || die "rpm Recommends is incomplete"
+  rpm -qp --requires "${dist}/${rpm}" | grep -q 'libc.so.6' || die "rpm Requires lacks libc"
+  rpm -qlp "${dist}/${rpm}" | sort > "${scratch}/rpm.files"
+  check_package_files "${scratch}/rpm.files" rpm
+
+  log "validators"
+  desktop-file-validate "packaging/desktop/io.github.dosibridge.DosiTracker.desktop"
+  desktop-file-validate "${TARGET_DIR}/release/dist-assets/usr/io.github.dosibridge.DosiTracker.desktop"
+  appstreamcli validate --no-net packaging/metainfo/io.github.dosibridge.DosiTracker.metainfo.xml
+  shellcheck -x scripts/*.sh ci/*.sh packaging/*.sh tests/test_installer_lifecycle.sh
+
+  log "README commands parse"
+  check_readme_commands "${TARGET_DIR}/release/dosi-tracker"
+
+  log "tarball: rootless install and uninstall"
+  tar -xzf "${dist}/${tarball}" -C "${scratch}"
+  local tree="${scratch}/dosi-tracker-${version}"
+  cmp "${tree}/install.sh" scripts/install.sh || die "the tarball's install.sh differs from scripts/install.sh"
+  if tar -tzf "${dist}/${tarball}" | grep -Eq '(^|/)(etc|\.git|target)/'; then
+    die "the tarball carries files it must not"
+  fi
+  local home="${scratch}/home"
+  mkdir -p "${home}"
+  isolated_env "${home}" bash "${tree}/install.sh" >/dev/null
+  isolated_env "${home}" "${home}/.local/bin/dosi-tracker" --version
+  isolated_env "${home}" "${home}/.local/bin/dosi-tracker-gui" --version
+  [ -f "${home}/.local/share/systemd/user/dosi-tracker.service" ] || die "the tarball install has no user unit"
+  [ ! -e "${home}/.config/autostart" ] || die "the tarball install wrote an autostart entry"
+  isolated_env "${home}" bash "${home}/.local/lib/dosi-tracker/install/uninstall.sh" --yes >/dev/null
+  if [ -n "$(find "${home}/.local" -type f)" ]; then
+    die "files left after uninstall: $(find "${home}/.local" -type f)"
+  fi
+  rm -rf "${scratch}"
+}
+
 run_stage() {
   case "$1" in
     fmt) stage_fmt ;;
@@ -221,6 +434,7 @@ run_stage() {
     harness) stage_harness ;;
     installer) stage_installer ;;
     release) stage_release ;;
+    package) stage_package ;;
     all)
       stage_fmt
       stage_clippy
@@ -234,13 +448,13 @@ run_stage() {
 
 main() {
   if [ "$#" -eq 0 ]; then
-    echo "usage: bash ci/check.sh <fmt|clippy|test|harness|installer|release|all>..." >&2
+    echo "usage: bash ci/check.sh <fmt|clippy|test|harness|installer|release|package|all>..." >&2
     exit 2
   fi
   local stage
   for stage in "$@"; do
     case "${stage}" in
-      fmt | clippy | test | harness | installer | release | all) ;;
+      fmt | clippy | test | harness | installer | release | package | all) ;;
       *)
         echo "ci/check.sh: unknown stage '${stage}'" >&2
         exit 2
