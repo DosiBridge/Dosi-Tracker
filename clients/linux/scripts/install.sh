@@ -1217,6 +1217,10 @@ do_uninstall() {
       echo "Error: 'dosi-tracker reset' failed; nothing was uninstalled." >&2
       exit 1
     fi
+    # The agent must not keep running from deleted files, and the managed
+    # login entry must not keep pointing at a program that is about to be
+    # removed, exactly as the non-purge branch below ensures.
+    run_cli_quiet "${cur_bin}" service disable || true
   else
     # The agent must not keep running from deleted files; stop it gracefully and
     # remove the managed login entry that would start a program that is gone.

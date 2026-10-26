@@ -1066,17 +1066,24 @@ test_purge_and_plain_uninstall() {
     [ -f "${HOME}/.local/state/dosi-tracker/sentinel" ] || exit 1
 
     bash "${INSTALLER}" install --prefix "${prefix}" --source-bin "${REAL_BIN}" >/dev/null || exit 1
+    local autostart="${HOME}/.config/autostart/${APP_ID}.desktop"
+    "${prefix}/bin/dosi-tracker" service enable >/dev/null || exit 1
+    [ -f "${autostart}" ] || exit 1
     # No terminal and no --yes: refused with exit 2, nothing removed.
     code=0
     bash "${INSTALLER}" uninstall --prefix "${prefix}" --purge </dev/null >/dev/null 2>&1 || code=$?
     [ "${code}" = "2" ] || exit 1
     [ -x "${prefix}/bin/dosi-tracker" ] && [ -f "${HOME}/.local/share/dosi-tracker/sentinel" ] || exit 1
+    [ -f "${autostart}" ] || exit 1
 
     bash "${INSTALLER}" uninstall --prefix "${prefix}" --purge --yes </dev/null >/dev/null || exit 1
     [ ! -e "${prefix}/bin/dosi-tracker" ] || exit 1
     [ ! -e "${HOME}/.config/dosi-tracker" ] || exit 1
     [ ! -e "${HOME}/.local/share/dosi-tracker" ] || exit 1
     [ ! -e "${HOME}/.local/state/dosi-tracker" ] || exit 1
+    # The login autostart entry must not survive a purge either: it would
+    # otherwise point at a binary that purge is about to delete.
+    [ ! -e "${autostart}" ] || exit 1
   ) || ok=0
   rm -rf "${temp_dir}"
   [ "${ok}" = "1" ]
