@@ -48,6 +48,18 @@
     "/api/app/team/invitations",
     "/api/app/team/{id}/invitation",
     "/api/app/platform/change-workspace-plan",
-    "/api/app/platform/workspace-subscriptions"
+    "/api/app/platform/workspace-subscriptions",
+    "/api/app/ai-assist",
+    "/api/app/platform-ai",
+    "/api/account/send-password-reset-code",
+    "/api/account/verify-password-reset-token",
+    "/api/account/reset-password",
+    "/api/app/my-account",
+    "/api/app/device",
+    "/api/app/workspace/billing-mode",
+    "/api/app/billing/change-plan",
+    "/api/app/billing/cancel",
+    "/api/app/team/{id}/resend-invitation",
+    "/api/app/team/send-password-reset"
   ]
 }

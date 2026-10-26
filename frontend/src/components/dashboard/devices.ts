@@ -6,6 +6,7 @@ import {
   type DeviceReportRowDto,
   type PresenceDto,
   type PresenceStatus,
+  type WorkspaceDeviceDto,
 } from "@/lib/api-contract";
 import { normalizeUtcIso } from "@/lib/live-dataset";
 import { agoLabel } from "@/lib/live-session";
@@ -21,6 +22,9 @@ import type { Activity, User, UserStatus } from "@/lib/types";
  *  - the device report (GET /api/app/reporting/devices): the time each device
  *    uploaded over a range, which also finds devices whose agent is too old
  *    to send heartbeats.
+ *
+ *  - the device registry (GET /api/app/device): every install that sent a
+ *    heartbeat, revoked ones included, with who revoked it and why.
  *
  * They are merged per member and device. An agent whose version is older than
  * the newest one seen in the workspace is flagged so it can be updated. Pure
@@ -49,6 +53,10 @@ export interface DeviceRow {
   trackedMinutes: number;
   /** The agent is older than the newest version seen in the workspace. */
   outdated: boolean;
+  /** Revoked in this workspace: signed out, and refused until an owner or manager restores it. */
+  revoked: boolean;
+  revokedAt: string | null;
+  revokeReason: string | null;
 }
 
 /* ----------------------------- Agent versions ----------------------------- */
@@ -129,6 +137,7 @@ export function buildDeviceRows(
   report: readonly DeviceReportRowDto[],
   nameOf: (userId: string, hint: string | null) => string,
   now: Date,
+  registry: readonly WorkspaceDeviceDto[] = [],
 ): DeviceRow[] {
   const rows = new Map<string, DeviceRow>();
   const rowFor = (userId: string, deviceId: string | null, hint: string | null): DeviceRow => {
@@ -150,6 +159,9 @@ export function buildDeviceRows(
         lastSeenAt: null,
         trackedMinutes: 0,
         outdated: false,
+        revoked: false,
+        revokedAt: null,
+        revokeReason: null,
       };
       rows.set(key, row);
     }
@@ -184,6 +196,22 @@ export function buildDeviceRows(
     row.lastSeenAt = later(row.lastSeenAt, seen);
   }
 
+  // The registry says which installs are revoked (and keeps one whose heartbeats aged out of presence).
+  for (const d of registry) {
+    if (!d || typeof d.userId !== "string" || !text(d.deviceId)) continue;
+    const row = rowFor(d.userId, text(d.deviceId), text(d.name) ?? text(d.userName));
+    row.deviceName = row.deviceName ?? text(d.deviceName);
+    row.platform = row.platform ?? platformOf(d.platform);
+    row.osVersion = row.osVersion ?? text(d.osVersion);
+    row.agentVersion = row.agentVersion ?? text(d.agentVersion);
+    row.lastSeenAt = later(row.lastSeenAt, normalizeUtcIso(d.lastSeenAt));
+    row.revoked = d.isRevoked === true;
+    row.revokedAt = row.revoked ? normalizeUtcIso(d.revokedAt) : null;
+    row.revokeReason = row.revoked ? text(d.reason) : null;
+    // A revoked install is refused: whatever its last heartbeat said, it is not working here now.
+    if (row.revoked) row.online = false;
+  }
+
   const newest = newestAgentVersion([...rows.values()].map((r) => r.agentVersion));
   const list = [...rows.values()].map((r) => ({
     ...r,
@@ -208,7 +236,8 @@ export function osText(row: Pick<DeviceRow, "platform" | "osVersion">): string {
  * break"…), "Offline · last seen 3h ago" otherwise, or — for an agent that
  * never sent a heartbeat — when it last uploaded.
  */
-export function deviceStatusText(row: Pick<DeviceRow, "status" | "online" | "lastSeenAt">, now: Date): string {
+export function deviceStatusText(row: Pick<DeviceRow, "status" | "online" | "lastSeenAt"> & { revoked?: boolean }, now: Date): string {
+  if (row.revoked) return "Revoked · signed out";
   if (row.status !== null && row.online) return presenceStatusLabel(row.status);
   const seen = row.lastSeenAt ? agoLabel(row.lastSeenAt, now) : null;
   if (row.status === null) return seen ? `No live status · last upload ${seen}` : "No live status";
@@ -216,8 +245,8 @@ export function deviceStatusText(row: Pick<DeviceRow, "status" | "online" | "las
 }
 
 /** The tone of the status cell's dot. */
-export function deviceStatusTone(row: Pick<DeviceRow, "status" | "online">): "tracking" | "away" | "offline" {
-  if (!row.online || row.status === null) return "offline";
+export function deviceStatusTone(row: Pick<DeviceRow, "status" | "online"> & { revoked?: boolean }): "tracking" | "away" | "offline" {
+  if (row.revoked || !row.online || row.status === null) return "offline";
   return row.status === "tracking" ? "tracking" : "away";
 }
 
@@ -314,4 +343,27 @@ export function demoDeviceSources(
     }
   }
   return { presence, report };
+}
+
+/* ----------------------------- Revocation ----------------------------- */
+
+/**
+ * Whether the viewer may revoke or restore a member's device (E2E-09): owners
+ * and managers (Tracker.Devices.Manage) for anyone but an owner, owners for
+ * owners too. A member revokes only their own (and never restores).
+ */
+export function deviceActions(input: {
+  canManageDevices: boolean;
+  viewerIsOwner: boolean;
+  viewerId: string;
+  rowUserId: string;
+  rowUserIsOwner: boolean;
+  revoked: boolean;
+  /** The install has an id the server knows (an agent too old to send one can't be revoked). */
+  hasDeviceId: boolean;
+}): { revoke: boolean; restore: boolean } {
+  if (!input.hasDeviceId) return { revoke: false, restore: false };
+  const manages = input.canManageDevices && (input.viewerIsOwner || !input.rowUserIsOwner);
+  const own = input.rowUserId === input.viewerId;
+  return { revoke: !input.revoked && (manages || own), restore: input.revoked && manages };
 }

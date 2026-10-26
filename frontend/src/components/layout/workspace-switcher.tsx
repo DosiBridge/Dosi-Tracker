@@ -8,7 +8,8 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { useSession } from "@/components/session-provider";
-import { planById, planNameFor, statusLabel, type PlanId } from "@/lib/saas-data";
+import { billingEnabledFor, planById, planNameFor, statusLabel, type PlanId } from "@/lib/saas-data";
+import { useBillingMode } from "@/hooks/use-billing-mode";
 import { toast } from "@/components/toast";
 import { cn } from "@/lib/utils";
 import { archiveWorkspaceApi, createWorkspaceApi, getApi, getMyWorkspacesApi, leaveWorkspaceApi } from "@/hooks/useApi";
@@ -94,9 +95,11 @@ export function WorkspaceSwitcher({ collapsed }: { collapsed: boolean }) {
           <>
             <span className="min-w-0 flex-1 text-left">
               <span className="block truncate text-sm font-semibold">{workspace.name}</span>
-              <span className="block truncate text-[11px] text-muted-foreground">
-                {planNameFor(workspace)} · {statusLabel[workspace.status]}
-              </span>
+              {billingEnabledFor(workspace) && (
+                <span className="block truncate text-[11px] text-muted-foreground">
+                  {planNameFor(workspace)} · {statusLabel[workspace.status]}
+                </span>
+              )}
             </span>
             <ChevronsUpDown className="h-4 w-4 shrink-0 text-muted-foreground" />
           </>
@@ -328,7 +331,7 @@ function ArchiveWorkspaceDialog({ open, workspace, onClose }: { open: boolean; w
       onConfirm={() => void archive()}
       busy={busy}
       title={`Archive ${workspace.name}?`}
-      description="This workspace will be archived and hidden from normal switching. You can restore it at any time, and its projects, activities, and settings will be preserved. Subscription billing is not cancelled."
+      description="This workspace will be archived and hidden from normal switching. You can restore it at any time, and its projects, activities, and settings will be preserved. Archived workspaces are not invoiced."
       confirmLabel="Archive workspace"
       tone="danger"
     />
@@ -387,6 +390,8 @@ function cheapestPlan(plans: ApiPlanDto[]): ApiPlanDto | undefined {
 
 /** Name + plan, then POST /api/app/workspaces and switch to it. */
 export function CreateWorkspaceForm({ onCancel, submitLabel = "Create workspace" }: { onCancel?: () => void; submitLabel?: string }) {
+  // No plans to pick while the deployment doesn't bill (the server then ignores the plan).
+  const billing = useBillingMode();
   const [name, setName] = useState("");
   const [plans, setPlans] = useState<ApiPlanDto[]>([]);
   const [planId, setPlanId] = useState("");
@@ -418,7 +423,7 @@ export function CreateWorkspaceForm({ onCancel, submitLabel = "Create workspace"
     setError(null);
     let created: { id: string; name: string };
     try {
-      created = await createWorkspaceApi(trimmed, planId || null);
+      created = await createWorkspaceApi(trimmed, billing.enabled === false ? null : planId || null);
     } catch (err) {
       const e = errorFields(err);
       setError(
@@ -438,7 +443,7 @@ export function CreateWorkspaceForm({ onCancel, submitLabel = "Create workspace"
         <label htmlFor="create-ws-name" className="text-sm font-medium">Workspace name</label>
         <Input id="create-ws-name" value={name} onChange={(e) => setName(e.target.value)} placeholder="Acme Corp" autoFocus required />
       </div>
-      {plans.length > 0 && (
+      {plans.length > 0 && billing.enabled !== false && (
         <div className="space-y-1.5">
           <label htmlFor="create-ws-plan" className="text-sm font-medium">Plan</label>
           <Select id="create-ws-plan" value={planId} onChange={(e) => setPlanId(e.target.value)}>

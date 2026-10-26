@@ -13,14 +13,17 @@ export function Drawer({
   title,
   children,
   className,
+  initialFocus,
 }: {
   open: boolean;
   onClose: () => void;
   title: string;
   children: React.ReactNode;
   className?: string;
+  /** The control focus starts on when the drawer opens (default: the first one). */
+  initialFocus?: React.RefObject<HTMLElement | null>;
 }) {
-  const dialogRef = useDialogFocus<HTMLDivElement>(open);
+  const dialogRef = useDialogFocus<HTMLDivElement>(open, initialFocus);
 
   useEffect(() => {
     if (!open) return;

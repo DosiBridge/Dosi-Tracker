@@ -24,6 +24,9 @@ import {
 } from "@/components/dashboard/charts";
 import { AppGlyph, ScreenMockView } from "@/components/screen-mock";
 import { useSession } from "@/components/session-provider";
+import { AiEnableCta } from "@/components/ai/ai-enable-cta";
+import { AiPeriodSummaryCard } from "@/components/ai/ai-period-summary-card";
+import { useAiAssistant } from "@/components/ai/ai-provider";
 import { activities, hourlyToday, projectById, projectDistribution, summary, topApps, userById, users } from "@/lib/tenant-data";
 import { brand, greeting } from "@/lib/brand";
 import { formatDuration, colorFromString } from "@/lib/utils";
@@ -83,6 +86,11 @@ export function AdminDashboard({
   const [live, setLive] = useState<LiveDashboard | null>(null);
   const [liveLoading, setLiveLoading] = useState(false);
   const [liveError, setLiveError] = useState<string | null>(null);
+  // AI assist's week: Monday to today in the reporting zone, on the session's clock (the demo's frozen one).
+  const aiWeek = useMemo(() => zonedPeriod("week", referenceNow(), zone.timeZone), [zone.timeZone]);
+  const { status: aiStatus } = useAiAssistant();
+  // The team's week when the server allows this manager the team scope, else their own.
+  const aiScope = aiStatus?.features.find((f) => f.featureId === "period-summary")?.scopes.includes("team") === false ? "self" : "team";
 
   const load = useCallback(async () => {
     const tz = zone.timeZone;
@@ -277,6 +285,9 @@ export function AdminDashboard({
           sub="Monday to today"
         />
       </Stagger>
+
+      <AiEnableCta />
+      {zone.ready && <AiPeriodSummaryCard scope={aiScope} from={aiWeek.from} to={aiWeek.to} timeZone={zone.timeZone} />}
 
       <Reveal delay={120}>
         <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">

@@ -21,8 +21,9 @@ import { ThemeToggle } from "@/components/ui/theme-toggle";
 import { Avatar } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { useSession } from "@/components/session-provider";
+import { AiLauncher } from "@/components/ai/ai-launcher";
 import { roleLabels } from "@/lib/roles";
-import { planNameFor, statusLabel } from "@/lib/saas-data";
+import { billingEnabledFor, planNameFor, statusLabel } from "@/lib/saas-data";
 import { notifications as seedNotifications } from "@/lib/tenant-data";
 import { type AppNotification, type NotificationType } from "@/lib/reports-data";
 import { mapApiNotifications } from "@/lib/live-dataset";
@@ -159,8 +160,8 @@ export function Topbar({ onMenuClick }: { onMenuClick: () => void }) {
           <Search className="h-4 w-4" />
         </button>
 
-        {/* Plan — quiet text chip, same height as icon tray */}
-        {currentUser.role === "owner" ? (
+        {/* Plan — quiet text chip, same height as icon tray (none while the deployment doesn't bill) */}
+        {!billingEnabledFor(workspace) ? null : currentUser.role === "owner" ? (
           <Link
             href="/billing"
             className={cn(
@@ -185,6 +186,7 @@ export function Topbar({ onMenuClick }: { onMenuClick: () => void }) {
 
         {/* Unified icon tray — one surface, equal targets */}
         <div className="flex h-9 items-center gap-0.5 rounded-xl border border-border/80 bg-card px-0.5 shadow-[0_1px_0_rgba(12,21,36,0.04)]">
+          <AiLauncher className={iconBtn} />
           <ThemeToggle className="h-8 w-8 rounded-lg border-0 bg-transparent shadow-none" />
 
           <div className="relative">

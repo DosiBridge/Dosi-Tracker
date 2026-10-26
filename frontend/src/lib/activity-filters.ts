@@ -1,6 +1,6 @@
 import { activities, projectById, projects, userById } from "./tenant-data";
 import type { Activity } from "./types";
-import { NOW } from "./mock-data";
+import { NOW } from "./demo-clock";
 import type { RangeKey } from "./reports-data";
 import { appKey, canonicalAppName } from "./apps";
 import {
@@ -234,6 +234,9 @@ export function applyActivityFilters(list: Activity[], f: ActivityFilters, conte
     if (ma !== mb) return ma ? -1 : 1;
     return ma ? direction * (a.productivity - b.productivity) : 0;
   };
+  // Most input first; a block whose input wasn't counted sorts after every measured one (never as 0).
+  const inputOf = (x: Activity) =>
+    x.mouseClicks === null && x.keyboardHits === null ? -1 : (x.mouseClicks ?? 0) + (x.keyboardHits ?? 0);
   out.sort((a, b) => {
     switch (f.sort) {
       case "oldest":
@@ -243,7 +246,7 @@ export function applyActivityFilters(list: Activity[], f: ActivityFilters, conte
       case "prod-low":
         return byActivity(a, b, 1);
       case "active-high":
-        return b.mouseClicks + b.keyboardHits - (a.mouseClicks + a.keyboardHits);
+        return inputOf(b) - inputOf(a);
       default:
         return byEnd(b) - byEnd(a);
     }

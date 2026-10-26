@@ -30,6 +30,10 @@ export default defineConfig({
     // like flakes but are pure starvation. This is a time allowance, not a
     // relaxed assertion — every expectation still executes and must pass.
     testTimeout: 15_000,
+    // The suite renders the seeded demo tenants (src/test/setup.ts installs them), so it
+    // runs as a demo-mode deployment would. Tests of the live and signed-out paths
+    // switch it off themselves (vi.stubEnv / a rendered runtime-config block).
+    env: { DOSI_DEMO_MODE: "1" },
     coverage: {
       provider: "v8",
       reporter: ["text-summary", "cobertura", "html"],

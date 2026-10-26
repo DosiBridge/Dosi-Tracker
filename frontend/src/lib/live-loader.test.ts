@@ -312,11 +312,32 @@ describe("exact totals from the server", () => {
     );
     const sam = data.users.find((u) => u.id === WORKER);
     expect(sam).toMatchObject({ trackedToday: 480, productivity: 64 }); // not the 30 minutes of rows held
-    expect(data.users.find((u) => u.id === OWNER)).toMatchObject({ trackedToday: 0, productivity: 0 });
+    expect(data.users.find((u) => u.id === OWNER)).toMatchObject({ trackedToday: 0, productivity: null });
     expect(data.totals.today?.totalMinutes).toBe(515);
     expect(data.totals.projects.week?.get(P1)).toBe(2400);
     expect(data.totals.projects.month?.get(P1)).toBe(9100);
     expect(data.totals.projects.window?.get(P1)).toBe(12000);
+  });
+
+  it("a member who tracked time today but wasn't measured reads null, never a fabricated 0%", async () => {
+    const server = activityServer([block("a1", 2 * HOUR, 30)]);
+    const data = await loadLiveSession(
+      backend({
+        members: team,
+        projects: [{ id: P1, title: "Apollo" }],
+        ...plan,
+        summaries: {
+          today: { totalTrackedMinutes: 480, averageProductivity: null, perUser: [{ userId: WORKER, trackedMinutes: 480, averageProductivity: null }], perProject: [] },
+          week: { totalTrackedMinutes: 0, perUser: [], perProject: [] },
+          month: { totalTrackedMinutes: 0, perUser: [], perProject: [] },
+          window: { totalTrackedMinutes: 0, perUser: [], perProject: [] },
+        },
+      }),
+      NOW,
+      { getPage: server.getPage, browserZone: "UTC" },
+    );
+    const sam = data.users.find((u) => u.id === WORKER);
+    expect(sam).toMatchObject({ trackedToday: 480, productivity: null }); // tracked, but not measured — not 0%
   });
 
   it("sends the reporting zone with every summary call", async () => {

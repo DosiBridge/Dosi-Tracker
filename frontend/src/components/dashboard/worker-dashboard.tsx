@@ -13,6 +13,7 @@ import { appsFromUsage, arrayOf, trendFromSeries } from "@/components/dashboard/
 import type { TrendPoint } from "@/components/dashboard/charts";
 import { AppGlyph, ScreenMockView } from "@/components/screen-mock";
 import { useSession } from "@/components/session-provider";
+import { AiPeriodSummaryCard } from "@/components/ai/ai-period-summary-card";
 import { activitiesForUser, projectById, projects } from "@/lib/tenant-data";
 import { agoLabel, referenceNow } from "@/lib/live-session";
 import { deriveDailyTrend } from "@/lib/live-dataset";
@@ -70,6 +71,8 @@ export function WorkerDashboard({ user }: { user: User }) {
   const [live, setLive] = useState<LiveFigures | null>(null);
   const [liveLoading, setLiveLoading] = useState(false);
   const [liveError, setLiveError] = useState(false);
+  // AI assist's week: Monday to today in the reporting zone, on the session's clock (the demo's frozen one).
+  const aiWeek = useMemo(() => zonedPeriod("week", referenceNow(), zone.timeZone), [zone.timeZone]);
 
   const load = useCallback(async () => {
     const tz = zone.timeZone;
@@ -299,6 +302,8 @@ export function WorkerDashboard({ user }: { user: User }) {
           </Card>
         </div>
       </Reveal>
+
+      {zone.ready && <AiPeriodSummaryCard scope="self" from={aiWeek.from} to={aiWeek.to} timeZone={zone.timeZone} />}
 
       <Reveal delay={140}>
         <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">

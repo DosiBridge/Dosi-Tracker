@@ -181,7 +181,7 @@ const SEED_DAYS = 6;
 const EMPTY_BLOCKS: Block[] = [];
 
 const EMPTY_AGGREGATES: ReportAggregates = {
-  totals: { minutes: 0, sessions: 0, activity: null, idleMinutes: null, keys: 0, clicks: 0 },
+  totals: { minutes: 0, sessions: 0, activity: null, idleMinutes: null, keys: null, clicks: null },
   daily: [],
   members: [],
   projects: [],
@@ -430,7 +430,7 @@ export function AnalyticsReport() {
           ["Hour", "Hours (decimal)", "Activity %", "Key presses", "Clicks"],
           hourTotals(cells).map((h) => {
             const p = profile[h.hour];
-            return [hourRangeLabel(h.hour), decimalHours(h.minutes), h.minutes > 0 && p.activity !== null ? p.activity : "", p.keys, p.clicks];
+            return [hourRangeLabel(h.hour), decimalHours(h.minutes), h.minutes > 0 && p.activity !== null ? p.activity : "", p.keys ?? "", p.clicks ?? ""];
           }),
         ),
     },
@@ -486,8 +486,9 @@ export function AnalyticsReport() {
         d.idleMinutes === null ? "" : decimalHours(d.idleMinutes),
         d.sessions,
         d.members,
-        d.keys,
-        d.clicks,
+        // Not measured is a blank cell, never 0.
+        d.keys ?? "",
+        d.clicks ?? "",
       ]),
     );
   }
@@ -543,6 +544,7 @@ export function AnalyticsReport() {
 
   return (
     <ReportShell
+      aiExplain={{ slug: "analytics", query: { from: period.from, to: period.to, projectId, userId: memberId, timeZone } }}
       title="Work Analytics"
       description="When, how and on what your team works — trends, work rhythm, focus, projects and people, in charts."
       actions={

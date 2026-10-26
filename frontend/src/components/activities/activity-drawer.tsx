@@ -20,6 +20,7 @@ import {
   Maximize2,
   MousePointerClick,
   Timer,
+  Trash2,
   Video,
 } from "lucide-react";
 import { Avatar } from "@/components/ui/avatar";
@@ -29,6 +30,7 @@ import { ScreenMockView } from "@/components/screen-mock";
 import { ActivityTimeline } from "@/components/activities/activity-timeline";
 import { captureContentEndpoint } from "@/components/activities/capture-thumb";
 import { NoteEditor, type NoteEditing } from "@/components/activities/note-editor";
+import { ErasureDialog } from "@/components/activities/erasure-dialog";
 import { BlurredChip, EndReasonChip, LiveBadge } from "@/components/activities/session-meta";
 import { ViewHint, activityValue } from "@/components/activities/session-card";
 import { getApi, getAuthedBlobUrl, isLiveSession } from "@/hooks/useApi";
@@ -48,6 +50,8 @@ import {
   type SessionDetails,
 } from "@/lib/activity-report";
 import { appColor } from "@/lib/apps";
+import { INPUT_COUNT_METRIC, formatCount } from "@/lib/metrics";
+import type { BlockErasure } from "@/lib/erasure";
 import { captureExtension, platformLabel } from "@/lib/api-contract";
 import { mapApiCaptureMetas, type CaptureMeta } from "@/lib/live-dataset";
 import { userById } from "@/lib/tenant-data";
@@ -65,6 +69,19 @@ export interface ProjectLabel {
   title: string;
   color: string;
 }
+
+/**
+ * What the viewer may delete of the block shown (lib/erasure blockErasure),
+ * and how. Each handler resolves once deleted and rejects with an Error whose
+ * message is shown in the dialog.
+ */
+export interface ActivityErasureControls {
+  rights: BlockErasure;
+  onDeleteBlock: (reason: string) => Promise<void>;
+  onDeleteCapture: (capture: { id: string; kind: "screen" | "webcam" }, reason: string | null) => Promise<void>;
+}
+
+type Erasing = { kind: "block" } | { kind: "capture"; capture: { id: string; kind: "screen" | "webcam"; when: string | null } };
 
 interface CaptureView extends CaptureMeta {
   url: string;
@@ -119,6 +136,7 @@ export function ActivityDrawer({
   timeZone,
   onClose,
   onViewScreenshot,
+  erasure,
 }: {
   activity: Activity | null;
   project: ProjectLabel | null;
@@ -135,6 +153,8 @@ export function ActivityDrawer({
   onClose: () => void;
   /** open this block in the full-screen screenshot viewer; omitted when it has nothing to view */
   onViewScreenshot?: () => void;
+  /** deleting the block or its captures; omitted (or with no rights): nothing to delete */
+  erasure?: ActivityErasureControls;
 }) {
   const a = activity;
   const u = a ? userById(a.userId) : null;
@@ -186,10 +206,20 @@ export function ActivityDrawer({
     };
   }, [activityId]);
 
+  const [erasing, setErasing] = useState<Erasing | null>(null);
+  // Captures deleted while the drawer is open: they leave the view at once.
+  const [removed, setRemoved] = useState<ReadonlySet<string>>(() => new Set());
+
   const current = live && load?.key === activityId ? load : null;
   const capturesLoading = live && !current?.done;
-  const screenCaptures = current?.captures.filter((c) => c.kind === "screen") ?? [];
-  const webcamCaptures = current?.captures.filter((c) => c.kind === "webcam") ?? [];
+  const kept = current?.captures.filter((c) => !removed.has(c.id)) ?? [];
+  const screenCaptures = kept.filter((c) => c.kind === "screen");
+  const webcamCaptures = kept.filter((c) => c.kind === "webcam");
+  const rights = erasure?.rights;
+  // Real captures only: the demo's previews are drawings, not stored images.
+  const canDeleteCaptures = live && !!rights && rights.captures !== "none";
+  const askDeleteCapture = (c: CaptureView) =>
+    canDeleteCaptures ? () => setErasing({ kind: "capture", capture: { id: c.id, kind: c.kind, when: c.capturedAt ? formatClock(c.capturedAt, timeZone) : null } }) : undefined;
 
   const totalSeconds = a ? blockSeconds(a) : 0;
   const slots = useMemo(() => (a ? timelineSlots(a) : []), [a]);
@@ -220,7 +250,7 @@ export function ActivityDrawer({
               )}
             </div>
             <div className="rounded-xl border border-border p-3">
-              <NoteEditor note={noteText} editing={note} />
+              <NoteEditor note={noteText} editing={note} suggest={{ activityId: a.id }} />
               <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1.5 text-xs text-muted-foreground">
                 <span className="inline-flex items-center gap-1.5">
                   <CalendarDays className="h-3.5 w-3.5" aria-hidden />
@@ -245,7 +275,7 @@ export function ActivityDrawer({
               screenCaptures.length > 0 ? (
                 <div className="space-y-4">
                   {screenCaptures.map((c) => (
-                    <CaptureFigure key={c.id} capture={c} onView={onViewScreenshot} timeZone={timeZone} />
+                    <CaptureFigure key={c.id} capture={c} onView={onViewScreenshot} timeZone={timeZone} onDelete={askDeleteCapture(c)} />
                   ))}
                 </div>
               ) : (
@@ -278,13 +308,22 @@ export function ActivityDrawer({
                 <Section icon={Video} title="Webcam (opt-in)">
                   <div className="flex flex-wrap gap-2">
                     {webcamCaptures.map((c) => (
-                      // eslint-disable-next-line @next/next/no-img-element
-                      <img
-                        key={c.id}
-                        src={c.url}
-                        alt={c.capturedAt ? `Webcam frame, ${formatClock(c.capturedAt, timeZone)}` : "Webcam frame"}
-                        className="aspect-video w-40 rounded-lg border border-border object-cover"
-                      />
+                      <figure key={c.id} className="space-y-1">
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img
+                          src={c.url}
+                          alt={c.capturedAt ? `Webcam frame, ${formatClock(c.capturedAt, timeZone)}` : "Webcam frame"}
+                          className="aspect-video w-40 rounded-lg border border-border object-cover"
+                        />
+                        {canDeleteCaptures && (
+                          <figcaption>
+                            <button type="button" onClick={askDeleteCapture(c)} className={DELETE_LINK}>
+                              <Trash2 className="h-3.5 w-3.5" aria-hidden /> Delete{" "}
+                              <span className="sr-only">webcam frame{c.capturedAt ? ` from ${formatClock(c.capturedAt, timeZone)}` : ""}</span>
+                            </button>
+                          </figcaption>
+                        )}
+                      </figure>
                     ))}
                   </div>
                 </Section>
@@ -310,8 +349,8 @@ export function ActivityDrawer({
               {details?.idleSeconds !== null && details?.idleSeconds !== undefined && (
                 <Stat icon={Hourglass} label="Idle" value={formatSeconds(Math.min(details.idleSeconds, totalSeconds))} />
               )}
-              <Stat icon={Keyboard} label="Keyboard presses" value={count(a.keyboardHits)} />
-              <Stat icon={MousePointerClick} label="Mouse clicks" value={count(a.mouseClicks)} />
+              <Stat icon={Keyboard} label="Keyboard presses" value={formatCount(a.keyboardHits, count, INPUT_COUNT_METRIC.notMeasured)} />
+              <Stat icon={MousePointerClick} label="Mouse clicks" value={formatCount(a.mouseClicks, count, INPUT_COUNT_METRIC.notMeasured)} />
             </div>
             <p className="text-xs text-muted-foreground">
               {activityPercent === null
@@ -355,7 +394,64 @@ export function ActivityDrawer({
               </div>
             </Section>
           )}
+
+          {rights?.captures === "own" && live && (
+            <p className="text-xs text-muted-foreground">
+              You can delete this block&apos;s captures yourself
+              {rights.ownUntil ? ` until ${formatClock(new Date(rights.ownUntil).toISOString(), timeZone)}` : ""}. After that, ask a
+              workspace owner or manager.
+            </p>
+          )}
+
+          {rights?.block && erasure && (
+            <section aria-labelledby="delete-block-heading" className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-danger/30 bg-danger/5 p-3">
+              <div className="min-w-0 text-sm">
+                <h3 id="delete-block-heading" className="font-medium text-danger-on-tint">
+                  Delete this time block
+                </h3>
+                <p className="text-xs text-muted-foreground">The block and all its captures go for everyone, with the reason recorded.</p>
+              </div>
+              <button type="button" onClick={() => setErasing({ kind: "block" })} className={cn(DELETE_LINK, "rounded-lg border border-danger/40 px-3 py-1.5")}>
+                <Trash2 className="h-3.5 w-3.5" aria-hidden /> Delete block…
+              </button>
+            </section>
+          )}
         </div>
+      )}
+
+      {a && erasure && erasing?.kind === "block" && (
+        <ErasureDialog
+          title="Delete this time block?"
+          consequences={[
+            `${formatTimeRange(a, timeZone)} (${formatSeconds(totalSeconds)}) is removed from every report, timesheet and payroll figure.`,
+            "Its screenshots and webcam frames are deleted from storage.",
+            "The desktop agent can't upload it again. This can't be undone.",
+          ]}
+          reasonRequired
+          confirmLabel="Delete block"
+          onClose={() => setErasing(null)}
+          onConfirm={async (reason) => {
+            await erasure.onDeleteBlock(reason ?? "");
+            setErasing(null);
+          }}
+        />
+      )}
+      {erasure && erasing?.kind === "capture" && (
+        <ErasureDialog
+          title={erasing.capture.kind === "webcam" ? "Delete this webcam frame?" : "Delete this screenshot?"}
+          consequences={[
+            `${erasing.capture.when ? `The ${erasing.capture.kind === "webcam" ? "frame" : "capture"} from ${erasing.capture.when}` : "It"} is deleted from storage for everyone${erasing.capture.kind === "screen" ? ", with its thumbnail" : ""}.`,
+            "The time block itself stays. This can't be undone.",
+          ]}
+          reasonRequired={rights?.captures === "any"}
+          confirmLabel="Delete capture"
+          onClose={() => setErasing(null)}
+          onConfirm={async (reason) => {
+            await erasure.onDeleteCapture({ id: erasing.capture.id, kind: erasing.capture.kind }, reason);
+            setRemoved((prev) => new Set(prev).add(erasing.capture.id));
+            setErasing(null);
+          }}
+        />
       )}
     </Drawer>
   );
@@ -448,6 +544,10 @@ function DeviceSection({
   );
 }
 
+/** A small destructive text button (delete a capture, a block). */
+const DELETE_LINK =
+  "inline-flex shrink-0 items-center gap-1 text-xs font-medium text-danger-on-tint hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring";
+
 /** An always-visible "View large" chip on a screenshot that opens the viewer. */
 function ViewLargeBadge() {
   return (
@@ -465,7 +565,18 @@ function ViewLargeBadge() {
  * (and the caption keeps a new-tab link); without it, the image itself opens
  * the capture at full resolution in a new tab. Downloadable either way.
  */
-function CaptureFigure({ capture: c, onView, timeZone }: { capture: CaptureView; onView?: () => void; timeZone?: string }) {
+function CaptureFigure({
+  capture: c,
+  onView,
+  timeZone,
+  onDelete,
+}: {
+  capture: CaptureView;
+  onView?: () => void;
+  timeZone?: string;
+  /** Offer to delete this capture (omitted: the viewer may not). */
+  onDelete?: () => void;
+}) {
   const when = c.capturedAt ? formatClock(c.capturedAt, timeZone) : null;
   const details = [
     when ? `Captured ${when}` : "Screen capture",
@@ -522,6 +633,12 @@ function CaptureFigure({ capture: c, onView, timeZone }: { capture: CaptureView;
           <a href={c.url} download={captureFileName(c, timeZone)} className={captionLink}>
             <Download className="h-3.5 w-3.5" aria-hidden /> Download
           </a>
+          {onDelete && (
+            <button type="button" onClick={onDelete} className={DELETE_LINK}>
+              <Trash2 className="h-3.5 w-3.5" aria-hidden /> Delete{" "}
+              <span className="sr-only">screenshot{when ? ` from ${when}` : ""}</span>
+            </button>
+          )}
         </span>
       </figcaption>
     </figure>

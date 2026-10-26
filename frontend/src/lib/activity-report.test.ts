@@ -113,7 +113,8 @@ describe("timeline slots", () => {
     });
     expect(slots).toEqual([
       { minute: 0, keyboardHits: 12, mouseClicks: 3, active: true, appName: "code.exe", at: "2026-09-23T14:00:00.000Z", total: 15, missing: false },
-      { minute: 1, keyboardHits: 0, mouseClicks: 0, active: false, at: "2026-09-23T14:01:00.000Z", total: 0, missing: true },
+      // A minute the agent never sent has no counts at all: not measured, never 0.
+      { minute: 1, keyboardHits: null, mouseClicks: null, active: false, at: "2026-09-23T14:01:00.000Z", total: 0, missing: true },
       { minute: 2, keyboardHits: 0, mouseClicks: 0, active: false, at: "2026-09-23T14:02:00.000Z", total: 0, missing: false },
     ]);
   });
@@ -131,7 +132,24 @@ describe("timeline slots", () => {
     const summary = summarizeTimeline(slots);
     expect(summary).toMatchObject({ minutes: 4, activeMinutes: 3, keyboardHits: 52, mouseClicks: 5 });
     expect(summary.peak?.minute).toBe(1);
-    expect(summarizeTimeline([])).toEqual({ minutes: 0, activeMinutes: 0, keyboardHits: 0, mouseClicks: 0, peak: undefined });
+    expect(summarizeTimeline([])).toEqual({ minutes: 0, activeMinutes: 0, keyboardHits: null, mouseClicks: null, peak: undefined });
+  });
+
+  it("adds only the measured minutes' counts and keeps an unmeasured timeline not measured", () => {
+    const partly = summarizeTimeline(
+      timelineSlots({
+        startedAt,
+        timeline: [
+          { minute: 0, keyboardHits: 7, mouseClicks: null, active: true },
+          { minute: 1, keyboardHits: null, mouseClicks: null, active: true },
+          { minute: 2, keyboardHits: 0, mouseClicks: null, active: false },
+        ],
+      }),
+    );
+    expect(partly).toMatchObject({ keyboardHits: 7, mouseClicks: null });
+    const unmeasured = timelineSlots({ startedAt, timeline: [{ minute: 0, keyboardHits: null, mouseClicks: null, active: true }] });
+    expect(unmeasured[0]).toMatchObject({ total: 0, missing: false });
+    expect(summarizeTimeline(unmeasured)).toMatchObject({ keyboardHits: null, mouseClicks: null, peak: undefined });
   });
 
   it("thins axis labels so a long block never crowds the axis", () => {

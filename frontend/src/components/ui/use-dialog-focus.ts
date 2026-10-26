@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, type RefObject } from "react";
 import { FLOATING_LAYER_SELECTOR, FOCUSABLE_SELECTOR as FOCUSABLE } from "./floating";
 
 /*
@@ -48,8 +48,10 @@ export function lockBodyScroll(): () => void {
  *
  * Attach the returned ref to the dialog element, which should also carry
  * `tabIndex={-1}` so it can hold focus when it contains no focusable children.
+ * `initialFocus` names the control to start on (a composer, say) instead of
+ * the first one; it is skipped while disabled or outside the dialog.
  */
-export function useDialogFocus<T extends HTMLElement>(open: boolean) {
+export function useDialogFocus<T extends HTMLElement>(open: boolean, initialFocus?: RefObject<HTMLElement | null>) {
   const ref = useRef<T>(null);
 
   useEffect(() => {
@@ -77,7 +79,9 @@ export function useDialogFocus<T extends HTMLElement>(open: boolean) {
         (el) => !el.hasAttribute("disabled") && el.getAttribute("aria-hidden") !== "true",
       );
 
-    (focusable()[0] ?? dialog).focus();
+    const preferred = initialFocus?.current;
+    const start = preferred && dialog.contains(preferred) && !preferred.hasAttribute("disabled") ? preferred : focusable()[0];
+    (start ?? dialog).focus();
 
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key !== "Tab") return;
@@ -120,7 +124,7 @@ export function useDialogFocus<T extends HTMLElement>(open: boolean) {
       // focus deliberately on close, leave it alone.
       if (restoreTo?.isConnected) restoreTo.focus();
     };
-  }, [open]);
+  }, [open, initialFocus]);
 
   return ref;
 }

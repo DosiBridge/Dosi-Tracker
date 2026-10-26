@@ -127,14 +127,15 @@ describe("parseTimeline — per-minute buckets", () => {
       ]),
     ).toEqual([
       { minute: 0, keyboardHits: 0, mouseClicks: 0, active: false },
-      { minute: 1, keyboardHits: 3, mouseClicks: 0, active: true },
-      { minute: 2, keyboardHits: 9, mouseClicks: 0, active: true },
+      // A count the bucket doesn't carry was not measured: null, never 0.
+      { minute: 1, keyboardHits: 3, mouseClicks: null, active: true },
+      { minute: 2, keyboardHits: 9, mouseClicks: null, active: true },
     ]);
   });
   it("drops buckets without a valid minute index", () => {
     expect(
       parseTimeline([{ KeyboardHits: 1 }, { Minute: -1 }, { Minute: 1.5 }, { Minute: "x" }, { Minute: 24 * 60 }, null, [1], { Minute: "3", Active: true }]),
-    ).toEqual([{ minute: 3, keyboardHits: 0, mouseClicks: 0, active: true }]);
+    ).toEqual([{ minute: 3, keyboardHits: null, mouseClicks: null, active: true }]);
   });
   it.each([[undefined], [null], [""], ["[]"], ["{broken"], ['{"Minute":0}'], [42]])("returns [] for %j (never throws)", (raw) => {
     expect(parseTimeline(raw)).toEqual([]);
@@ -277,7 +278,8 @@ describe("mapApiActivity", () => {
     const a = mapApiActivity(
       dto({ productivity: 250, mouseClicks: -3, keyboardHits: null, description: "  ", activeWindowsJson: "{broken", runningProgramsJson: undefined }),
     );
-    expect(a).toMatchObject({ productivity: 100, mouseClicks: 0, keyboardHits: 0, description: "Tracked session", activeWindows: [], runningPrograms: [] });
+    // A negative count clamps to 0; a null one was not measured and stays null (API-05).
+    expect(a).toMatchObject({ productivity: 100, mouseClicks: 0, keyboardHits: null, description: "Tracked session", activeWindows: [], runningPrograms: [] });
     expect(a?.screen.app).toBe("Desktop");
   });
 
@@ -397,9 +399,9 @@ describe("agent data v2 (contract §5)", () => {
         { Minute: 2, Active: false },
       ]),
     ).toEqual([
-      { minute: 0, keyboardHits: 0, mouseClicks: 0, active: true, activeSeconds: 42 },
-      { minute: 1, keyboardHits: 0, mouseClicks: 0, active: true, activeSeconds: 90 },
-      { minute: 2, keyboardHits: 0, mouseClicks: 0, active: false },
+      { minute: 0, keyboardHits: null, mouseClicks: null, active: true, activeSeconds: 42 },
+      { minute: 1, keyboardHits: null, mouseClicks: null, active: true, activeSeconds: 90 },
+      { minute: 2, keyboardHits: null, mouseClicks: null, active: false },
     ]);
   });
 
@@ -470,7 +472,16 @@ describe("projects and roster", () => {
 
     const gone = mapTeamMember({ userId: "u1", isActive: false }, rows, NOW);
     expect(gone.status).toBe("offline");
-    expect(mapTeamMember({ userId: "nobody" }, rows, NOW)).toMatchObject({ trackedToday: 0, productivity: 0, status: "offline", email: "" });
+    expect(mapTeamMember({ userId: "nobody" }, rows, NOW)).toMatchObject({ trackedToday: 0, productivity: null, status: "offline", email: "" });
+  });
+
+  it("mapTeamMember: a member who tracked time today with unmeasured input reads null, never a fabricated 0%", () => {
+    const rows = [
+      act({ userId: "u1", startedAt: "2026-09-23T14:00:00.000Z", endedAt: "2026-09-23T14:50:00.000Z", productivity: 0, activityMeasured: false }),
+    ];
+    const u1 = mapTeamMember({ userId: "u1" }, rows, NOW);
+    expect(u1.trackedToday).toBe(50); // time was tracked
+    expect(u1.productivity).toBeNull(); // but its input was never measured — not 0%
   });
 
   it("mapTeamMember counts 'today' in the reporting zone, not UTC", () => {

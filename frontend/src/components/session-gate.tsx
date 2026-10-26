@@ -16,7 +16,9 @@ import { signInFailureMessage, type SignInFailure } from "@/lib/sign-in";
  * sees a frame of demo people while their real identity loads, and shows an
  * honest error (with retry) when the backend can't be reached, instead of
  * quietly falling back to demo data. After a sign-out it shows a neutral
- * screen until /login loads — never the demo workspace.
+ * screen until /login loads — never the demo workspace. A visitor with no
+ * token in a deployment without demo mode (status "anonymous": the session
+ * cookie alone proves nothing) is signed out and sent to /login the same way.
  *
  * While the shell is up it also looks after the sign-in itself: a few
  * minutes before a session that can't renew itself runs out it says so, and
@@ -35,7 +37,13 @@ export function SessionGate({ area, children }: { area: "tenant" | "host"; child
     if (wrongArea) router.replace(area === "tenant" ? "/host" : "/dashboard");
   }, [wrongArea, area, router]);
 
-  if (status === "signedout") {
+  // A session cookie with no token behind it (stale, or set by hand) outside demo mode:
+  // a signed-out visitor. Clear the cookie (or /login would bounce straight back) and leave.
+  useEffect(() => {
+    if (status === "anonymous") logout();
+  }, [status, logout]);
+
+  if (status === "signedout" || status === "anonymous") {
     return (
       <div className="flex min-h-screen flex-col items-center justify-center gap-3 p-4" role="status" aria-live="polite">
         <div className="flex items-center gap-2 text-sm text-muted-foreground">
@@ -241,7 +249,7 @@ function ReauthDialog({ expired, onDone }: { expired: boolean; onDone: () => voi
           </div>
           {failure && (
             <p id={errorId} role="alert" className="rounded-lg bg-danger/10 px-3 py-2 text-sm text-danger-on-tint">
-              {signInFailureMessage(failure, { workspace: reauthIdentity?.workspace })}
+              {signInFailureMessage(failure)}
             </p>
           )}
           <div className="flex flex-wrap justify-end gap-2 pt-1">

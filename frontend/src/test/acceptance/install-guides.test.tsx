@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { afterEach, describe, it, expect, vi } from "vitest";
 import { render, screen, within } from "@testing-library/react";
 import { axe } from "jest-axe";
 import { renderWithProviders } from "@/test/harness";
@@ -7,6 +7,16 @@ import InstallOverviewPage from "@/app/install/page";
 import LinuxInstallPage from "@/app/install/linux/page";
 import MacOsInstallPage from "@/app/install/macos/page";
 import WindowsInstallPage from "@/app/install/windows/page";
+import { DEFAULT_DOWNLOAD_BASE_URL, DEV_API_BASE_URL } from "@/lib/runtime-config";
+
+const DOWNLOADS = DEFAULT_DOWNLOAD_BASE_URL;
+
+/** Every line of every command block on the page. */
+const commandLines = () => Array.from(document.querySelectorAll("pre code")).map((c) => c.textContent ?? "");
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
 
 describe("Public Installation & Onboarding Guides", () => {
   describe("InstallLayout", () => {
@@ -14,81 +24,71 @@ describe("Public Installation & Onboarding Guides", () => {
       renderWithProviders(
         <InstallLayout>
           <div>Guide Content</div>
-        </InstallLayout>
+        </InstallLayout>,
       );
 
-      // Skip link
       const skipLink = screen.getByRole("link", { name: /skip to main content/i });
       expect(skipLink).toHaveAttribute("href", "#install-main-content");
 
-      // Brand
       expect(screen.getByText("Dosi-Tracker")).toBeInTheDocument();
       expect(screen.getByText("Installation Guides")).toBeInTheDocument();
 
-      // Navigation links
       const nav = screen.getByRole("navigation", { name: /operating system guides/i });
       expect(within(nav).getByRole("link", { name: /overview & matrix/i })).toHaveAttribute("href", "/install");
       expect(within(nav).getByRole("link", { name: /linux \(x11 & wayland\)/i })).toHaveAttribute("href", "/install/linux");
       expect(within(nav).getByRole("link", { name: /macos \(apple silicon & intel\)/i })).toHaveAttribute("href", "/install/macos");
       expect(within(nav).getByRole("link", { name: /windows desktop/i })).toHaveAttribute("href", "/install/windows");
 
-      // Footer
       expect(screen.getByText(/Transparent Client Invariants: No root\/administrator requirements/i)).toBeInTheDocument();
       expect(screen.getByText(/Keystroke content is never recorded/i)).toBeInTheDocument();
     });
   });
 
   describe("InstallOverviewPage", () => {
-    it("renders comparison cards with truthful status: Linux Headless Foundation, Windows Source & NSIS", () => {
+    it("offers a download and a guide for every platform, from the released asset names", () => {
       render(<InstallOverviewPage />);
+      expect(screen.getByRole("heading", { level: 1, name: /desktop agent installation/i })).toBeInTheDocument();
 
-      expect(screen.getByRole("heading", { level: 1, name: /desktop agent installation & capabilities/i })).toBeInTheDocument();
-
-      // Linux Card
-      const linuxHeading = screen.getByRole("heading", { level: 2, name: /^linux$/i });
-      const linuxCard = linuxHeading.closest(".card-elev, [class*='rounded']")!;
-      expect(within(linuxCard as HTMLElement).getByText("Headless Foundation")).toBeInTheDocument();
-      expect(within(linuxCard as HTMLElement).getByText(/Headless foundation crate in clients\/linux/i)).toBeInTheDocument();
-      expect(within(linuxCard as HTMLElement).getByRole("link", { name: /linux foundation & specification/i })).toHaveAttribute("href", "/install/linux");
-      // Negative oracle: must NOT claim "Source Preview" or pre-built binaries
-      expect(within(linuxCard as HTMLElement).queryByText(/^Source Preview$/i)).not.toBeInTheDocument();
-
-      // macOS Card
-      const macHeading = screen.getByRole("heading", { level: 2, name: /^macos$/i });
-      const macCard = macHeading.closest(".card-elev, [class*='rounded']")!;
-      expect(within(macCard as HTMLElement).getByText(/Source Build Only/i)).toBeInTheDocument();
-      expect(within(macCard as HTMLElement).getByText(/Apple Silicon \(arm64\) and Intel \(x86_64\)/i)).toBeInTheDocument();
-      expect(within(macCard as HTMLElement).getByRole("link", { name: /macos setup guide/i })).toHaveAttribute("href", "/install/macos");
-
-      // Windows Card
-      const winHeading = screen.getByRole("heading", { level: 2, name: /^windows$/i });
-      const winCard = winHeading.closest(".card-elev, [class*='rounded']")!;
-      expect(within(winCard as HTMLElement).getByText(/Source Crate & NSIS Script/i)).toBeInTheDocument();
-      expect(within(winCard as HTMLElement).getByText(/pre-built binaries are unreleased/i)).toBeInTheDocument();
-      expect(within(winCard as HTMLElement).getByRole("link", { name: /windows setup guide/i })).toHaveAttribute("href", "/install/windows");
-      // Negative oracle: must NOT claim pre-built installer
-      expect(within(winCard as HTMLElement).queryByText(/^Pre-Built Installer$/i)).not.toBeInTheDocument();
+      const expected = {
+        windows: ["Windows", "dosi-tracker-setup.exe"],
+        macos: ["macOS", "DosiTracker-macos.zip"],
+        linux: ["Linux", "dosi-tracker_amd64.deb"],
+      } as const;
+      for (const [platform, [name, file]] of Object.entries(expected)) {
+        const card = screen.getByRole("region", { name: new RegExp(`^${name}$`, "i") });
+        expect(within(card).getByRole("link", { name: new RegExp(`download for ${name}`, "i") })).toHaveAttribute("href", `${DOWNLOADS}/${file}`);
+        expect(within(card).getByRole("link", { name: new RegExp(`${name} setup guide`, "i") })).toHaveAttribute("href", `/install/${platform}`);
+      }
+      // The Linux card lists every Linux package.
+      const linux = screen.getByRole("region", { name: /^linux$/i });
+      expect(within(linux).getByText(/Debian package/)).toBeInTheDocument();
+      expect(within(linux).getByText(/RPM package/)).toBeInTheDocument();
+      expect(within(linux).getByText(/Tarball/)).toBeInTheDocument();
     });
 
-    it("renders capability matrix with truthful Linux Foundation status and Windows compilation status", () => {
+    it("states what each platform can measure, with Wayland's limits as not measured, and no internal test names", () => {
       render(<InstallOverviewPage />);
+      const table = screen.getByRole("table", { name: /agent capabilities by platform/i });
+      expect(within(table).getByText(/counts and window titles not measured \(null\)/i)).toBeInTheDocument();
+      expect(within(table).getByText(/DPAPI/)).toBeInTheDocument();
+      expect(within(table).getByText(/login Keychain/)).toBeInTheDocument();
+      expect(table.textContent).not.toMatch(/FakeDriver|NOT_IMPLEMENTED|Planned/);
+    });
 
-      const table = screen.getByRole("table");
-      expect(table).toBeInTheDocument();
+    it("tells agents' users what to sign in with: no workspace name", () => {
+      render(<InstallOverviewPage />);
+      const box = screen.getByRole("heading", { name: /signing in to an agent/i }).parentElement!;
+      expect(box.textContent).toContain(DEV_API_BASE_URL);
+      expect(box.textContent).not.toMatch(/workspace name/i);
+    });
 
-      // Linux rows must explicitly say Source Foundation and FOUNDATION ONLY
-      expect(within(table).getAllByText(/Source Foundation \(clients\/linux\)/i).length).toBe(2);
-      expect(within(table).getAllByText(/FOUNDATION ONLY \(Sensor-Free Crate; 101 Tests Passed on Host; Native Runtime Unverified\)/i).length).toBe(2);
-
-      // Windows row must show Compilation Only
-      expect(within(table).getByText(/COMPILATION ONLY/i)).toBeInTheDocument();
-
-      // Negative oracle: table must NOT label pre-built NSIS executable
-      expect(within(table).queryByText("Pre-Built Setup EXE (NSIS)")).not.toBeInTheDocument();
-
-      // Check zero admin privileges across all
-      const noAdminCells = within(table).getAllByText(/No \(/i);
-      expect(noAdminCells.length).toBe(4); // Linux X11, Linux Wayland, macOS, Windows
+    it("follows the deployment's download location", () => {
+      vi.stubEnv("DOSI_DOWNLOAD_BASE_URL", "https://files.example.com/agents");
+      render(<InstallOverviewPage />);
+      expect(screen.getByRole("link", { name: /download for windows/i })).toHaveAttribute(
+        "href",
+        "https://files.example.com/agents/dosi-tracker-setup.exe",
+      );
     });
 
     it("has no axe violations", async () => {
@@ -98,58 +98,58 @@ describe("Public Installation & Onboarding Guides", () => {
   });
 
   describe("LinuxInstallPage", () => {
-    it("clearly discloses client is headless foundation with doctor command and consent core", () => {
+    it("installs from the .deb, the .rpm or the rootless tarball, by their released names", () => {
       render(<LinuxInstallPage />);
+      expect(screen.getByRole("heading", { level: 1, name: /linux desktop agent guide/i })).toBeInTheDocument();
 
-      expect(screen.getByRole("heading", { level: 1, name: /linux desktop agent foundation & specification/i })).toBeInTheDocument();
-      expect(screen.getByText("Headless Source Foundation (No Native Collection / Sync Yet)")).toBeInTheDocument();
-      expect(screen.getByText("Status: Headless Source Foundation (Diagnostic CLI & Consent Core)")).toBeInTheDocument();
-      expect(screen.getByText(/first finite headless Linux implementation slice in/i)).toBeInTheDocument();
-      expect(screen.getByRole("heading", { name: /Implemented Diagnostic Command Syntax/i })).toBeInTheDocument();
-      expect(screen.getByText("cargo run --bin dosi-tracker-linux -- doctor")).toBeInTheDocument();
-      expect(screen.getByText("cargo run --bin dosi-tracker-linux -- doctor --json")).toBeInTheDocument();
+      const downloads = screen.getByRole("list", { name: /linux downloads/i });
+      expect(within(downloads).getByRole("link", { name: /debian package/i })).toHaveAttribute("href", `${DOWNLOADS}/dosi-tracker_amd64.deb`);
+      expect(within(downloads).getByRole("link", { name: /rpm package/i })).toHaveAttribute("href", `${DOWNLOADS}/dosi-tracker.x86_64.rpm`);
+      expect(within(downloads).getByRole("link", { name: /tarball/i })).toHaveAttribute("href", `${DOWNLOADS}/dosi-tracker-linux-x86_64.tar.gz`);
+      expect(screen.getByRole("link", { name: "SHA256SUMS" })).toHaveAttribute("href", `${DOWNLOADS}/SHA256SUMS`);
 
-      // Rootless installer lifecycle commands
-      expect(screen.getByRole("heading", { name: /Rootless Source-Build Installation Lifecycle/i })).toBeInTheDocument();
-      expect(screen.getByText("bash clients/linux/scripts/install.sh install")).toBeInTheDocument();
-      expect(screen.getByText("bash clients/linux/scripts/install.sh update")).toBeInTheDocument();
-      expect(screen.getByText("bash clients/linux/scripts/install.sh rollback")).toBeInTheDocument();
-      expect(screen.getByText("bash clients/linux/scripts/uninstall.sh")).toBeInTheDocument();
-      expect(screen.getByText("~/.local/bin/dosi-tracker-linux doctor [--json]")).toBeInTheDocument();
+      const lines = commandLines();
+      expect(lines).toContain("sudo apt install ./dosi-tracker_amd64.deb");
+      expect(lines).toContain("sudo dnf install ./dosi-tracker.x86_64.rpm");
+      expect(lines).toContain("tar -xzf dosi-tracker-linux-x86_64.tar.gz");
+      expect(lines).toContain(`./install.sh --server ${DEV_API_BASE_URL}`);
+      expect(lines).toContain("sha256sum -c --ignore-missing SHA256SUMS");
     });
 
-    it("details planned Wayland portal consent and anti-keylogger invariants", () => {
+    it("walks through the real first-run CLI flow and names the GUI", () => {
       render(<LinuxInstallPage />);
-
-      // Wayland ScreenCast planned spec
-      expect(screen.getByText(/org.freedesktop.portal.ScreenCast/i)).toBeInTheDocument();
-      expect(screen.getByText(/interactive OS dialog/i)).toBeInTheDocument();
-      expect(screen.getByText(/Global Input Activity: UNSUPPORTED \(null\)/i)).toBeInTheDocument();
-      expect(screen.getByText(/Active Window Title: UNSUPPORTED \(null\)/i)).toBeInTheDocument();
-
-      // Unprivileged security policy
-      expect(screen.getByRole("heading", { name: /Unprivileged Execution Invariant \(Anti-Keylogger Policy\)/i })).toBeInTheDocument();
-      expect(screen.getByText(/exclusively as an unprivileged user process/i)).toBeInTheDocument();
-      expect(screen.getByText(/unrestricted hardware keylogger/i)).toBeInTheDocument();
-      expect(screen.getByText(/refuses to implement or recommend evdev workarounds/i)).toBeInTheDocument();
-
-      // Roadmap
-      expect(screen.getByRole("heading", { name: /Linux Implementation Roadmap & Finite Next Slices/i })).toBeInTheDocument();
-      expect(screen.getByText(/Slice 1 \(Delivered\):/i)).toBeInTheDocument();
-      expect(screen.getByText(/Slice 2 \(Next\):/i)).toBeInTheDocument();
+      const lines = commandLines();
+      for (const command of [
+        "dosi-tracker service enable --now",
+        `dosi-tracker login --server ${DEV_API_BASE_URL}`,
+        "dosi-tracker consent grant --keyboard --mouse --active-window --running-programs --screenshots",
+        'dosi-tracker project use "<project>"',
+        "dosi-tracker status",
+        "dosi-tracker uninstall",
+        "sudo apt remove dosi-tracker",
+        "sudo dnf remove dosi-tracker",
+      ]) {
+        expect(lines, command).toContain(command);
+      }
+      const everyday = screen.getByRole("table", { name: /everyday dosi-tracker commands/i });
+      for (const command of ["dosi-tracker pause --for 30m", "dosi-tracker resume", "dosi-tracker stop", "dosi-tracker sync", "dosi-tracker doctor"]) {
+        expect(within(everyday).getByText(command)).toBeInTheDocument();
+      }
+      expect(screen.getAllByText("dosi-tracker-gui").length).toBeGreaterThan(0);
+      expect(screen.getByText(/Passwords are never accepted on the command line/i)).toBeInTheDocument();
     });
 
-    it("does not present fake CLI commands, operational setup, or uninstallation scripts (Negative Oracles)", () => {
+    it("is honest about Wayland: not measured (null), never zero, and no root or input-device workarounds", () => {
       render(<LinuxInstallPage />);
-
-      // Negative Oracles: Asserting absence of fabricated capabilities
-      expect(screen.queryByText(/dosi-tracker pause/i)).not.toBeInTheDocument();
-      expect(screen.queryByText(/dosi-tracker resume/i)).not.toBeInTheDocument();
-      expect(screen.queryByText(/dosi-tracker stop/i)).not.toBeInTheDocument();
-      expect(screen.queryByText(/dosi-tracker status/i)).not.toBeInTheDocument();
-      expect(screen.queryByText(/Implemented through org\.freedesktop\.portal/i)).not.toBeInTheDocument();
-      expect(screen.queryByText(/rm -rf ~\/\\.config\/dosi-tracker/i)).not.toBeInTheDocument();
-      expect(screen.queryByText(/api_base_url = "https:\/\/tracker-api\.example\.com"/i)).not.toBeInTheDocument();
+      const matrix = screen.getByRole("table", { name: /capture on x11 and wayland/i });
+      const wayland = within(matrix).getByRole("rowheader", { name: /keyboard and mouse counts/i }).closest("tr")!;
+      expect(within(wayland).getByText("Not measured (null)")).toBeInTheDocument();
+      expect(within(matrix).getAllByText("Not available yet")).toHaveLength(2); // webcam
+      expect(screen.getByText(/never as a fabricated zero/i)).toBeInTheDocument();
+      expect(screen.getByText(/refuses to run as root and never reads input devices/i)).toBeInTheDocument();
+      // Negative oracles: no stale "foundation" claims, no password on argv.
+      expect(document.body.textContent).not.toMatch(/NOT_IMPLEMENTED|Headless Source Foundation|dosi-tracker-linux(?!-x86_64\.tar\.gz)/);
+      expect(commandLines().join("\n")).not.toMatch(/--password(?!-stdin|-file)/);
     });
 
     it("has no axe violations", async () => {
@@ -159,36 +159,35 @@ describe("Public Installation & Onboarding Guides", () => {
   });
 
   describe("MacOsInstallPage", () => {
-    it("states Sonoma/Sequoia requirements, Apple Silicon & Intel support, and source build status", () => {
+    it("downloads the released zip and states the requirements", () => {
       render(<MacOsInstallPage />);
-
       expect(screen.getByRole("heading", { level: 1, name: /macos desktop agent guide/i })).toBeInTheDocument();
-      expect(screen.getByText(/Source Build Only \(Xcode 15\+\)/i)).toBeInTheDocument();
-      expect(screen.getByText(/Apple Silicon:/i)).toBeInTheDocument();
-      expect(screen.getByText(/Intel:/i)).toBeInTheDocument();
-      expect(screen.getAllByText(/macOS 14 Sonoma/i).length).toBeGreaterThanOrEqual(1);
-      expect(screen.getByText(/Developer ID Notarization Status/i)).toBeInTheDocument();
+      expect(screen.getByRole("link", { name: /macos app \(zip\)/i })).toHaveAttribute("href", `${DOWNLOADS}/DosiTracker-macos.zip`);
+      expect(screen.getAllByText(/macOS 14 Sonoma or later, Apple silicon or Intel/i).length).toBeGreaterThan(0);
+      expect(commandLines()).toContain("shasum -a 256 DosiTracker-macos.zip");
     });
 
-    it("provides step-by-step Gatekeeper approval and TCC privacy permissions", () => {
+    it("explains Gatekeeper, every permission and the Keychain", () => {
       render(<MacOsInstallPage />);
-
-      // Gatekeeper steps
-      expect(screen.getByText(/First Launch: Approving in macOS Gatekeeper/i)).toBeInTheDocument();
-      expect(screen.getByText(/Open Anyway/i)).toBeInTheDocument();
-
-      // TCC permissions table
-      expect(screen.getByText("Screen Recording")).toBeInTheDocument();
-      expect(screen.getByText("Input Monitoring")).toBeInTheDocument();
-      expect(screen.getByText(/reported honestly as unmeasured \(null\)/i)).toBeInTheDocument();
-      expect(screen.getByText("Accessibility")).toBeInTheDocument();
-
-      // Keychain
+      expect(screen.getByText(/Open Anyway/)).toBeInTheDocument();
+      const permissions = screen.getByRole("table", { name: /macos permissions/i });
+      for (const name of ["Screen Recording", "Input Monitoring", "Accessibility", "Camera", "Notifications"]) {
+        expect(within(permissions).getByRole("rowheader", { name })).toBeInTheDocument();
+      }
+      expect(within(permissions).getByText(/reported honestly as unmeasured \(null\)/i)).toBeInTheDocument();
       expect(screen.getByText(/macOS Login Keychain/i)).toBeInTheDocument();
-      expect(screen.getAllByText(/com\.dosibridge\.tracker/i).length).toBeGreaterThanOrEqual(1);
+      expect(screen.getAllByText(/com\.dosibridge\.tracker/).length).toBeGreaterThan(0);
+      expect(commandLines()).toContain("tccutil reset ScreenCapture com.dosibridge.tracker");
+      expect(commandLines()).toContain(`defaults write com.dosibridge.tracker DosiApiBaseURL "${DEV_API_BASE_URL}"`);
+    });
 
-      // Troubleshooting
-      expect(screen.getByText(/tccutil reset ScreenCapture com\.dosibridge\.tracker/i)).toBeInTheDocument();
+    it("builds from source with the steps that really work", () => {
+      render(<MacOsInstallPage />);
+      const lines = commandLines();
+      expect(lines).toContain("bash scripts/build-app.sh");
+      expect(lines).toContain('cp -R ".build/dist/Dosi Tracker.app" /Applications/');
+      // The old, broken steps are gone.
+      expect(lines.join("\n")).not.toMatch(/\.\/scripts\/build-app\.sh|\.build\/artifacts/);
     });
 
     it("has no axe violations", async () => {
@@ -198,36 +197,43 @@ describe("Public Installation & Onboarding Guides", () => {
   });
 
   describe("WindowsInstallPage", () => {
-    it("states Source Crate & NSIS script status, unreleased pre-built binaries, SmartScreen, and DPAPI", () => {
+    it("downloads the released installer and explains SmartScreen and sign-in", () => {
       render(<WindowsInstallPage />);
-
       expect(screen.getByRole("heading", { level: 1, name: /windows desktop agent guide/i })).toBeInTheDocument();
-      expect(screen.getByText(/Source Crate & NSIS Build Script/i)).toBeInTheDocument();
-      expect(screen.getByText(/Pre-built release binary installers are/i)).toBeInTheDocument();
-      expect(screen.getByText(/cargo check --bin dosi-tracker/i)).toBeInTheDocument();
-      expect(screen.getByText(/Version 1809 or newer/i)).toBeInTheDocument();
-      expect(screen.getAllByText(/Windows 11/i).length).toBeGreaterThanOrEqual(1);
-      expect(screen.getByText(/x86_64-pc-windows-msvc/i)).toBeInTheDocument();
+      expect(screen.getByRole("link", { name: /windows installer/i })).toHaveAttribute("href", `${DOWNLOADS}/dosi-tracker-setup.exe`);
+      expect(screen.getAllByText(/Windows 10 \(1809 or newer\) or Windows 11/).length).toBeGreaterThan(0);
+      expect(screen.getByText("Run anyway")).toBeInTheDocument();
+      expect(screen.getAllByText(DEV_API_BASE_URL).length).toBeGreaterThan(0);
+    });
 
-      // SmartScreen
-      expect(screen.getByText(/Windows SmartScreen Approval/i)).toBeInTheDocument();
-      expect(screen.getByText(/Run anyway/i)).toBeInTheDocument();
+    it("documents silent deployment with this site's server address", () => {
+      render(<WindowsInstallPage />);
+      expect(commandLines()).toContain(`dosi-tracker-setup.exe /S /SERVER=${DEV_API_BASE_URL}`);
+      const switches = screen.getByRole("table", { name: /installer switches/i });
+      for (const name of ["/S", "/SERVER=<url>", "/DASHBOARD=<url>", "/D=<folder>"]) {
+        expect(within(switches).getByRole("rowheader", { name })).toBeInTheDocument();
+      }
+    });
 
-      // Silent install
-      expect(screen.getByText(/Silent Enterprise & Managed Deployment/i)).toBeInTheDocument();
-      expect(screen.getAllByText(/\/S/).length).toBeGreaterThanOrEqual(1);
-      expect(screen.getByText(/\/SERVER=<url>/)).toBeInTheDocument();
+    it("names the real data locations, DPAPI, quitting and uninstalling", () => {
+      render(<WindowsInstallPage />);
+      const files = screen.getByRole("table", { name: /agent files on windows/i });
+      expect(within(files).getByText(String.raw`%LOCALAPPDATA%\DosiTracker\dosi-tracker.db`)).toBeInTheDocument();
+      expect(within(files).getByText(/CryptProtectData/)).toBeInTheDocument();
+      expect(document.body.textContent).not.toContain("queue.db");
+      const lines = commandLines();
+      expect(lines).toContain(String.raw`"%LOCALAPPDATA%\Programs\DosiTracker\dosi-tracker.exe" --quit`);
+      expect(lines).toContain(String.raw`"%LOCALAPPDATA%\Programs\DosiTracker\uninstall.exe" /S /KEEPDATA`);
+    });
 
-      // DPAPI
-      expect(screen.getByText(/Windows Data Protection API \(DPAPI\) Keying/i)).toBeInTheDocument();
-      expect(screen.getByText(/CryptProtectData/i)).toBeInTheDocument();
-
-      // Graceful quit & uninstall
-      expect(screen.getByText(/dosi-tracker\.exe --quit/i)).toBeInTheDocument();
-      expect(screen.getByText(/%LOCALAPPDATA%\\Programs\\DosiTracker\\uninstall\.exe/i)).toBeInTheDocument();
-
-      // Negative oracle: must NOT claim pre-built installer
-      expect(screen.queryByText(/^Pre-Built Installer \(NSIS\)$/i)).not.toBeInTheDocument();
+    it("says when this site has no server address configured instead of inventing one", () => {
+      vi.stubEnv("NODE_ENV", "production");
+      vi.stubEnv("DOSI_API_URL", "");
+      vi.stubEnv("NEXT_PUBLIC_API_URL", "");
+      vi.stubEnv("DOSI_DEMO_MODE", "");
+      render(<WindowsInstallPage />);
+      expect(commandLines()).toContain("dosi-tracker-setup.exe /S /SERVER=<server address>");
+      expect(screen.queryByText(DEV_API_BASE_URL)).not.toBeInTheDocument();
     });
 
     it("has no axe violations", async () => {

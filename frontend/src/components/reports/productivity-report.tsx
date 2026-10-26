@@ -214,6 +214,7 @@ export function ProductivityReport() {
 
   return (
     <ReportShell
+      aiExplain={{ slug: "productivity", query: { from: period.from, to: period.to, projectId, userId: memberId, timeZone } }}
       title="Productivity"
       description="Active and idle time per member, and time spent in productive, neutral and unproductive apps."
       actions={<ExportMenu onExportCSV={exportCsv} disabled={pending || rows.length === 0} />}

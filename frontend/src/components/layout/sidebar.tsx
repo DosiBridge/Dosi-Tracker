@@ -20,6 +20,7 @@ import { Avatar } from "@/components/ui/avatar";
 import { WorkspaceSwitcher } from "@/components/layout/workspace-switcher";
 import { useSession } from "@/components/session-provider";
 import { canAccess, roleLabels } from "@/lib/roles";
+import { billingEnabledFor } from "@/lib/saas-data";
 
 const nav = [
   { href: "/dashboard", label: "Dashboard", icon: LayoutDashboard, group: "Overview" },
@@ -47,8 +48,10 @@ export function Sidebar({
   onMobileClose: () => void;
 }) {
   const pathname = usePathname();
-  const { user: currentUser } = useSession();
-  const visibleNav = nav.filter((item) => canAccess(currentUser.role, item.href));
+  const { user: currentUser, workspace } = useSession();
+  // A deployment that doesn't bill has no plan or invoices to show.
+  const billing = billingEnabledFor(workspace);
+  const visibleNav = nav.filter((item) => canAccess(currentUser.role, item.href) && (billing || item.href !== "/billing"));
   // Mobile drawer is always expanded; rail collapse is desktop-only.
   const compact = collapsed && !mobileOpen;
 

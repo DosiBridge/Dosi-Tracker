@@ -1,0 +1,713 @@
+import {
+  type AiDataQualityKind,
+  type AiFeatureId,
+  type AiPage,
+  type AiResultMetaDto,
+  type AiRouteId,
+  type AiScope,
+  type AiStatusDto,
+  type AiWorkspaceSettingsDto,
+  type UpdateAiWorkspaceSettingsDto,
+} from "./ai-contract";
+import { PROJECT_TASK_LIMITS } from "./api-contract";
+import { reportCatalog } from "./reports-data";
+import { formatInZone } from "./time-zone";
+import type { Role } from "./types";
+
+/* ============================================================================
+ * AI ASSIST, the web's side: when a card shows (the gating matrix of the AI
+ * assist specification §18.3), what a failed request tells the person, where
+ * a result may link (§5.9), and the copy every AI surface shares.
+ *
+ * Pure: no React, no network. The server computes who may use what
+ * (`features[].allowed`, `scopes`); nothing here re-derives a permission, it
+ * only reads the status the server sent.
+ *
+ * Copy rule: no AI text names a credential or a configuration key. Say "AI
+ * provider connection".
+ * ========================================================================== */
+
+/* ----------------------------- Copy ----------------------------- */
+
+/** Under every AI result. */
+export const DISCLAIMER =
+  "AI-generated from your tracker data. Figures come from the tracker; the wording can be wrong - check before acting. Not for decisions about people on its own.";
+
+/** Under every demo result instead of the disclaimer. */
+export const DEMO_NOTE = "Demo - sample AI output from the demo data; nothing was sent anywhere.";
+
+/** What AI assist sends, and never sends (the server's disclosure in Settings is the authoritative, localized list). */
+export const WHATS_SENT = {
+  always: [
+    "Tracked durations, idle time, activity % (the share of minutes with keyboard or mouse input) and first and last activity times",
+    "Project names and task titles",
+    "App names",
+    "Agent platform and version (agent health only)",
+    "Your Ask AI questions as you type them",
+  ],
+  whenAllowed: ["Window titles", "Task notes"],
+  never: [
+    "Screenshots and webcam images",
+    "Keystrokes (only counts are recorded, and counts are not sent either)",
+    "Member names, emails and user names (replaced with aliases)",
+    "Device names, IP addresses and OS versions",
+    "Pay rates and amounts",
+    "The workspace name",
+  ],
+} as const;
+
+/** The card copy of §18.3. */
+export const AI_COPY = {
+  generate: "Generate",
+  regenerate: "Regenerate",
+  cancel: "Cancel",
+  retry: "Retry",
+  loading: "Writing summary...",
+  slow: "Still working - you can cancel.",
+  ready: "Summary ready",
+  noData: "Nothing was tracked for this period.",
+  aiBadge: "AI",
+  fallbackBadge: "Basic summary",
+  sampleBadge: "Sample",
+  fallbackNote: "AI is unavailable right now - this summary is built directly from your data.",
+  cachedNote: "reused, no new data",
+  whatsSent: "What's sent?",
+  figuresUsed: "Show the figures used",
+  serverUnavailable: "AI assist isn't available on this server right now.",
+  turnOn: "Turn on AI assist",
+  askOwner: "Your workspace owner can turn on AI assist",
+} as const;
+
+/** "Generate stays enabled" note while the month's allowance is used up. */
+export function quotaNote(resetsAt: string | null | undefined, timeZone = "UTC"): string {
+  const date = formatAiDate(resetsAt, timeZone);
+  return `This month's AI allowance is used; only summaries generated earlier can be shown.${date ? ` Renews ${date}.` : ""}`;
+}
+
+/** "Fri 1 Aug" for an ISO instant read in a zone; null when unreadable. */
+export function formatAiDate(iso: string | null | undefined, timeZone = "UTC"): string | null {
+  const at = typeof iso === "string" ? Date.parse(iso) : NaN;
+  if (!Number.isFinite(at)) return null;
+  return formatInZone(at, timeZone, { weekday: "short", day: "numeric", month: "short" }).replace(",", "");
+}
+
+/* ----------------------------- Availability (§18.3) ----------------------------- */
+
+/**
+ * Why a card shows as it does:
+ *  - "ready": Generate;
+ *  - "quota": Generate stays enabled with the quota note (the server answers
+ *    with earlier summaries, or AiQuotaExceeded);
+ *  - "unavailable": no status (older server, failed read), not configured,
+ *    switched off for the platform, or the subscription isn't usable;
+ *  - "workspace-off" / "reconsent": the workspace hasn't opted in (the owner
+ *    sees a separate "Turn on" prompt, see aiSetupNotice);
+ *  - "not-allowed": this feature, or this scope, is not for this caller.
+ */
+export type AiAvailabilityReason = "ready" | "quota" | "unavailable" | "workspace-off" | "reconsent" | "not-allowed";
+
+export interface AiAvailability {
+  /** Render the card at all. Hidden is the default for anything not plainly allowed ("no broken buttons"). */
+  visible: boolean;
+  /** Generate can be pressed: every visible card's can (the server answers an exhausted quota itself). */
+  enabled: boolean;
+  reason: AiAvailabilityReason;
+}
+
+const HIDDEN_BY_STATUS: Partial<Record<NonNullable<AiStatusDto["reason"]>, AiAvailabilityReason>> = {
+  "not-configured": "unavailable",
+  "platform-disabled": "unavailable",
+  "subscription-inactive": "unavailable",
+  "workspace-disabled": "workspace-off",
+  "reconsent-required": "reconsent",
+  "role-not-allowed": "not-allowed",
+  "self-service-off": "not-allowed",
+};
+
+const hidden = (reason: AiAvailabilityReason): AiAvailability => ({ visible: false, enabled: false, reason });
+
+/** Whether a feature's card shows for this caller, from the server's status alone. */
+export function aiAvailability(status: AiStatusDto | null | undefined, featureId: AiFeatureId, scope?: AiScope): AiAvailability {
+  if (!status) return hidden("unavailable");
+  const blocked = status.reason ? HIDDEN_BY_STATUS[status.reason] : undefined;
+  if (blocked) return hidden(blocked);
+  const quota = status.reason === "quota-exhausted";
+  // Not available for a reason the web doesn't know (a newer server): hide rather than guess.
+  if (!status.available && !quota) return hidden("unavailable");
+  const feature = status.features.find((f) => f.featureId === featureId);
+  if (!feature?.allowed) return hidden("not-allowed");
+  if (scope && !feature.scopes.includes(scope)) return hidden("not-allowed");
+  return { visible: true, enabled: true, reason: quota ? "quota" : "ready" };
+}
+
+/**
+ * The prompt about AI assist itself (not a feature card):
+ *  - "server-unavailable": the owner's Settings > Workspace note (nothing elsewhere);
+ *  - "turn-on": the owner's dismissible "Turn on AI assist" (workspace off or re-consent needed);
+ *  - "ask-owner": a manager's dismissible "Your workspace owner can turn on AI assist";
+ *  - null: nothing to say (ready, or a member or client, who never see either).
+ */
+export type AiSetupNotice = "server-unavailable" | "turn-on" | "ask-owner" | null;
+
+export function aiSetupNotice(status: AiStatusDto | null | undefined, role: Role): AiSetupNotice {
+  const owner = role === "owner";
+  if (!status || status.reason === "not-configured" || status.reason === "platform-disabled") {
+    return owner ? "server-unavailable" : null;
+  }
+  if (status.reason !== "workspace-disabled" && status.reason !== "reconsent-required") return null;
+  if (owner && status.canManage) return "turn-on";
+  return role === "admin" ? "ask-owner" : null;
+}
+
+/* ----------------------------- Status lines ----------------------------- */
+
+export interface AiStatusLine {
+  /** "On", "Off", "Paused", "Unavailable" or "Sample": visible text, never colour alone. */
+  label: string;
+  tone: "success" | "muted" | "warning" | "info";
+  /** One sentence on what that means. */
+  text: string;
+}
+
+/**
+ * The one-line state of AI assist in this workspace, for Settings (the owner's
+ * card and everyone's privacy note). `demo` is a demo session: its "AI" is
+ * sample text built in the browser.
+ */
+export function aiStatusLine(status: AiStatusDto | null | undefined, options: { demo?: boolean } = {}): AiStatusLine {
+  if (options.demo) {
+    return { label: "Sample", tone: "info", text: "In the demo, AI output is sample text built from the demo data; nothing is sent anywhere." };
+  }
+  if (!status || status.reason === "not-configured" || status.reason === "platform-disabled") {
+    return { label: "Unavailable", tone: "muted", text: `${AI_COPY.serverUnavailable} Nothing is sent to an AI provider.` };
+  }
+  const provider = status.providerDisplayName ? ` with ${status.providerDisplayName}` : "";
+  switch (status.reason) {
+    case "subscription-inactive":
+      return { label: "Paused", tone: "warning", text: "This workspace's subscription isn't active, so AI assist is paused." };
+    case "workspace-disabled":
+      return { label: "Off", tone: "muted", text: "AI assist is off in this workspace. Nothing is sent to an AI provider." };
+    case "reconsent-required":
+      return {
+        label: "Paused",
+        tone: "warning",
+        text: "The AI disclosure changed. AI assist stays paused until the workspace owner reviews it.",
+      };
+    case "quota-exhausted":
+      return { label: "On", tone: "success", text: `AI assist is on${provider}. This month's AI allowance is used.` };
+  }
+  return status.workspaceEnabled
+    ? { label: "On", tone: "success", text: `AI assist is on in this workspace. Summaries are written${provider} when someone presses Generate.` }
+    : { label: "Off", tone: "muted", text: "AI assist is off in this workspace. Nothing is sent to an AI provider." };
+}
+
+/** What each feature is called on the privacy note ("what you can use"). */
+export const AI_FEATURE_LABELS: Record<AiFeatureId, string> = {
+  "period-summary": "Week summaries",
+  "member-day-summary": "Day summaries",
+  "report-explanation": "Report explanations",
+  "data-quality-review": "Tracking checks",
+  "note-suggestions": "Note suggestions",
+  "task-drafts": "Task drafts",
+  ask: "Ask AI",
+};
+
+/** The features the server allows this caller, by name, in the status's order; empty when none (or no status). */
+export function allowedAiFeatures(status: AiStatusDto | null | undefined): string[] {
+  if (!status) return [];
+  return status.features
+    .filter((f) => f.allowed && Object.prototype.hasOwnProperty.call(AI_FEATURE_LABELS, f.featureId))
+    .map((f) => AI_FEATURE_LABELS[f.featureId as AiFeatureId]);
+}
+
+/* ----------------------------- Settings (§5.3, §8) ----------------------------- */
+
+/** The owner's switches, as saved. */
+export type AiSettingsFlags = Pick<
+  UpdateAiWorkspaceSettingsDto,
+  "isEnabled" | "allowManagers" | "allowMemberSelfService" | "allowWindowTitles" | "allowNotes"
+>;
+
+/** Why a change needs the owner to acknowledge the current disclosure first. */
+export type AiAcknowledgementReason = "enable" | "reconsent" | "window-titles" | "notes";
+
+/** Whether the owner's acknowledged disclosure is the server's current one. */
+export function aiConsentCurrent(settings: Pick<AiWorkspaceSettingsDto, "consentVersion" | "disclosure">): boolean {
+  return settings.consentVersion !== null && settings.consentVersion === settings.disclosure.version;
+}
+
+/** The workspace counts as on: switched on, with the current disclosure acknowledged. */
+export function aiEffectivelyOn(settings: Pick<AiWorkspaceSettingsDto, "isEnabled" | "consentVersion" | "disclosure">): boolean {
+  return settings.isEnabled && aiConsentCurrent(settings);
+}
+
+/**
+ * What the server will ask an acknowledgement for when `next` replaces
+ * `current` (§5.3): turning AI assist on, saving while it stays on with an
+ * outdated acknowledgement (re-consent), or turning window titles or task
+ * notes on. Empty when the change can be saved as it is.
+ */
+export function aiAcknowledgementReasons(current: AiSettingsFlags, next: AiSettingsFlags, consentCurrent: boolean): AiAcknowledgementReason[] {
+  const reasons: AiAcknowledgementReason[] = [];
+  if (next.isEnabled && !current.isEnabled) reasons.push("enable");
+  else if (next.isEnabled && !consentCurrent) reasons.push("reconsent");
+  if (next.allowWindowTitles && !current.allowWindowTitles) reasons.push("window-titles");
+  if (next.allowNotes && !current.allowNotes) reasons.push("notes");
+  return reasons;
+}
+
+/** The PUT body: the switches, plus the disclosure version when the change needs it acknowledged. */
+export function aiSettingsUpdate(next: AiSettingsFlags, acknowledgedVersion: string | null): UpdateAiWorkspaceSettingsDto {
+  return {
+    isEnabled: next.isEnabled,
+    allowManagers: next.allowManagers,
+    allowMemberSelfService: next.allowMemberSelfService,
+    allowWindowTitles: next.allowWindowTitles,
+    allowNotes: next.allowNotes,
+    acknowledgedDisclosureVersion: acknowledgedVersion,
+  };
+}
+
+/** The switches of a saved settings record. */
+export function aiSettingsFlags(settings: AiSettingsFlags): AiSettingsFlags {
+  return {
+    isEnabled: settings.isEnabled,
+    allowManagers: settings.allowManagers,
+    allowMemberSelfService: settings.allowMemberSelfService,
+    allowWindowTitles: settings.allowWindowTitles,
+    allowNotes: settings.allowNotes,
+  };
+}
+
+/* ----------------------------- Errors ----------------------------- */
+
+/** Shown when the request never reached the server (the same words as components/layout/request-error). */
+export const AI_UNREACHABLE_TEXT = "Couldn't reach the server. Check your connection and try again.";
+const AI_FORBIDDEN_TEXT = "You don't have permission to do that.";
+
+export type AiErrorKind =
+  | "not-configured"
+  | "platform-disabled"
+  | "disabled"
+  | "feature-disabled"
+  | "quota"
+  | "rate-limited"
+  | "provider-unavailable"
+  | "output-invalid"
+  | "range-too-large"
+  | "disclosure"
+  | "conversation-expired"
+  | "subscription-inactive"
+  | "forbidden"
+  | "unreachable"
+  | "unknown";
+
+export interface AiErrorState {
+  kind: AiErrorKind;
+  /** One sentence for the card's alert. */
+  message: string;
+  /** Wait this long before retrying, when the server said. */
+  retryAfterSeconds: number | null;
+  /** When an exhausted allowance renews (ISO), when the server said. */
+  resetsAt: string | null;
+  /** Show Retry. */
+  retryable: boolean;
+}
+
+/** The fields of hooks/useApi's ApiError this module reads (lib can't import the hook layer). */
+interface ErrorLike {
+  name?: unknown;
+  status?: unknown;
+  code?: unknown;
+  serverMessage?: unknown;
+  retryAfterSeconds?: unknown;
+  data?: unknown;
+  validationErrors?: unknown;
+}
+
+const str = (value: unknown): string | null => (typeof value === "string" && value.trim() !== "" ? value : null);
+const num = (value: unknown): number | null => (typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.ceil(value) : null);
+
+function waitText(seconds: number | null): string {
+  if (seconds === null) return "Try again in a moment.";
+  return `Try again in ${seconds} ${seconds === 1 ? "second" : "seconds"}.`;
+}
+
+/** What a failed AI request tells the person. `timeZone` reads the renewal date of an exhausted allowance. */
+export function aiErrorState(error: unknown, options: { timeZone?: string; fallback?: string } = {}): AiErrorState {
+  const fallback = options.fallback ?? "Couldn't generate the summary.";
+  const state = (kind: AiErrorKind, message: string, retryable: boolean, extra: Partial<AiErrorState> = {}): AiErrorState => ({
+    kind,
+    message,
+    retryable,
+    retryAfterSeconds: null,
+    resetsAt: null,
+    ...extra,
+  });
+
+  const e = (error && typeof error === "object" ? error : {}) as ErrorLike;
+  if (e.name === "ApiUnreachableError" || error instanceof TypeError) return state("unreachable", AI_UNREACHABLE_TEXT, true);
+  if (typeof e.status !== "number") return state("unknown", fallback, true);
+
+  const status = e.status;
+  const data = (e.data && typeof e.data === "object" ? e.data : {}) as Record<string, unknown>;
+  const reason = str(data.reason);
+  const retryAfter = num(data.retryAfterSeconds) ?? num(e.retryAfterSeconds);
+  switch (str(e.code)) {
+    case "Tracker:AiNotConfigured":
+      return state("not-configured", "AI assist isn't available on this server.", false);
+    case "Tracker:AiPlatformDisabled":
+      return state("platform-disabled", "AI assist is turned off for the platform right now.", false);
+    case "Tracker:AiDisabled":
+      return state(
+        "disabled",
+        reason === "reconsent"
+          ? "AI assist is paused until the workspace owner reviews the updated AI disclosure."
+          : "AI assist is off for this workspace.",
+        false,
+      );
+    case "Tracker:AiFeatureDisabled":
+      return state("feature-disabled", "This AI feature isn't available to you.", false);
+    case "Tracker:AiQuotaExceeded": {
+      const resetsAt = str(data.resetsAt);
+      const date = formatAiDate(resetsAt, options.timeZone);
+      return state(
+        "quota",
+        `The AI allowance for this period has been used.${date ? ` It renews on ${date}.` : ""}`,
+        false,
+        { resetsAt },
+      );
+    }
+    case "Tracker:AiRateLimited":
+      return state(
+        "rate-limited",
+        `${reason === "busy" ? "Another AI request is still running." : "Too many AI requests."} ${waitText(retryAfter)}`,
+        true,
+        { retryAfterSeconds: retryAfter },
+      );
+    case "Tracker:AiProviderUnavailable":
+      return state("provider-unavailable", "The AI service is slow or unavailable. Try again in a minute.", true, {
+        retryAfterSeconds: retryAfter,
+      });
+    case "Tracker:AiOutputInvalid":
+      return state("output-invalid", "The AI couldn't produce a reliable answer. Try again.", true);
+    case "Tracker:AiRangeTooLarge": {
+      const maxDays = num(data.maxDays);
+      return state("range-too-large", `Choose ${maxDays ?? "fewer"} days${maxDays === null ? "" : " or fewer"} for AI summaries.`, false);
+    }
+    case "Tracker:AiDisclosureNotAccepted": {
+      const version = str(data.version);
+      return state("disclosure", `Review and accept the AI disclosure${version ? ` (version ${version})` : ""} to turn on AI assist.`, false);
+    }
+    case "Tracker:AiConversationExpired":
+      return state("conversation-expired", "This conversation ended. Start a new one.", false);
+    case "Tracker:SubscriptionInactive":
+      return state("subscription-inactive", "This workspace's subscription isn't active, so AI assist is paused.", false);
+  }
+
+  // Not an AI code: the same order as components/layout/request-error's requestErrorText.
+  const rules = Array.isArray(e.validationErrors)
+    ? e.validationErrors.map((v) => str((v as { message?: unknown } | null)?.message)).filter((m): m is string => m !== null)
+    : [];
+  const retryable = status >= 500 || status === 429 || status === 408;
+  if (rules.length > 0) return state("unknown", rules.join(" "), false);
+  const serverMessage = str(e.serverMessage);
+  if (serverMessage) return state(status === 403 ? "forbidden" : "unknown", serverMessage, retryable, { retryAfterSeconds: retryAfter });
+  if (status === 403) return state("forbidden", AI_FORBIDDEN_TEXT, false);
+  return state("unknown", `${fallback} (HTTP ${status})`, retryable, { retryAfterSeconds: retryAfter });
+}
+
+/* ----------------------------- Route ids (§5.9) ----------------------------- */
+
+const FIXED_ROUTES: Record<string, string> = {
+  dashboard: "/dashboard",
+  monitor: "/monitor",
+  timesheet: "/timesheet",
+  team: "/team",
+  projects: "/projects",
+  activities: "/activities",
+  download: "/download",
+  "install.windows": "/install/windows",
+  "install.macos": "/install/macos",
+  "install.linux": "/install/linux",
+  settings: "/settings",
+  "settings.workspace": "/settings?tab=workspace",
+  "settings.privacy": "/settings?tab=privacy",
+  reports: "/reports",
+  billing: "/billing",
+};
+
+/** A route argument the web accepts: an id (GUID or demo id), never a path. */
+const ROUTE_ARG = /^[A-Za-z0-9-]{1,64}$/;
+
+/**
+ * The href of an allowlisted route id; null for anything else (an unknown id,
+ * a report the catalog doesn't have, a project link without a usable id).
+ * Callers still check `canAccess(role, href)` before rendering a link.
+ */
+export function routeIdToHref(routeId: string | null | undefined, arg?: string | null): string | null {
+  if (!routeId) return null;
+  if (Object.prototype.hasOwnProperty.call(FIXED_ROUTES, routeId)) return FIXED_ROUTES[routeId];
+  if (routeId === "projects.detail") return arg && ROUTE_ARG.test(arg) ? `/projects/${arg}` : null;
+  if (routeId.startsWith("reports.")) {
+    const slug = routeId.slice("reports.".length);
+    return reportCatalog.some((r) => r.slug === slug) ? `/reports/${slug}` : null;
+  }
+  return null;
+}
+
+/** Narrow a server string to a known route id. */
+export function isAiRouteId(value: string | null | undefined): value is AiRouteId {
+  return routeIdToHref(value, "x") !== null;
+}
+
+/* ----------------------------- Data categories ----------------------------- */
+
+const CATEGORY_LABELS: Record<string, string> = {
+  durations: "Tracked durations",
+  times: "Start and end times",
+  "activity-percent": "Activity % (share of minutes with input)",
+  "project-names": "Project names",
+  "task-titles": "Task titles",
+  "task-notes": "Task notes",
+  "app-names": "App names",
+  "window-titles": "Window titles",
+  "agent-info": "Agent platform and version",
+  "help-content": "Help articles",
+};
+
+/** The words for a result's `meta.dataCategories` entry; an unknown one is spelled out from its id. */
+export function dataCategoryLabel(category: string): string {
+  if (Object.prototype.hasOwnProperty.call(CATEGORY_LABELS, category)) return CATEGORY_LABELS[category];
+  const words = category.replace(/[-_]+/g, " ").trim();
+  return words ? words[0].toUpperCase() + words.slice(1) : "Other data";
+}
+
+/* ----------------------------- Result helpers ----------------------------- */
+
+/** The badge of a result: the AI badge, the muted "Basic summary" or "Sample", or none (nothing tracked). */
+export function resultBadge(meta: Pick<AiResultMetaDto, "status"> | null | undefined): { label: string; tone: "info" | "muted" } | null {
+  switch (meta?.status) {
+    case "no-data":
+      return null;
+    case "fallback":
+      return { label: AI_COPY.fallbackBadge, tone: "muted" };
+    case "demo":
+      return { label: AI_COPY.sampleBadge, tone: "muted" };
+    default:
+      return { label: AI_COPY.aiBadge, tone: "info" };
+  }
+}
+
+/* ----------------------------- Prompt chips ----------------------------- */
+
+export interface AiPromptChip {
+  /** Stable id: demo answers are keyed by it (lib/ai-demo demoAnswer). */
+  id: string;
+  /** The question, as sent. */
+  label: string;
+}
+
+/**
+ * The setup assistant's questions ("Ask the setup assistant" on the setup
+ * checklist and the Download page): answered from the curated help articles.
+ */
+export const AI_SETUP_HELP_CHIPS: readonly AiPromptChip[] = [
+  { id: "help-install-macos", label: "How do I install the agent on macOS?" },
+  { id: "help-ai-sent", label: "What does AI assist send to the provider?" },
+  { id: "help-install", label: "How do I install the desktop agent?" },
+  { id: "help-not-measured", label: "Why does activity say \"not measured\"?" },
+];
+
+const HELP_CHIPS: readonly AiPromptChip[] = AI_SETUP_HELP_CHIPS;
+const INSTALL_CHIP = AI_SETUP_HELP_CHIPS[2];
+
+/** The suggested questions of each page's Ask AI drawer. */
+export const AI_PROMPT_CHIPS: Record<AiPage, readonly AiPromptChip[]> = {
+  dashboard: [
+    { id: "week-overview", label: "How did this week go?" },
+    { id: "top-projects", label: "Which projects took the most time this week?" },
+  ],
+  monitor: [
+    { id: "day-overview", label: "Summarise today's tracked time" },
+    { id: "top-apps", label: "Which apps were used most today?" },
+  ],
+  timesheet: [
+    { id: "week-overview", label: "How did this week go?" },
+    { id: "data-gaps", label: "Are there gaps in this week's tracking?" },
+  ],
+  reports: [
+    { id: "week-overview", label: "How did this week go?" },
+    { id: "top-projects", label: "Which projects took the most time this week?" },
+  ],
+  projects: [{ id: "top-projects", label: "Which projects took the most time this week?" }],
+  activities: [{ id: "top-apps", label: "Which apps were used most today?" }],
+  team: [{ id: "data-gaps", label: "Are there gaps in this week's tracking?" }, INSTALL_CHIP],
+  settings: HELP_CHIPS,
+  download: HELP_CHIPS,
+  other: [{ id: "week-overview", label: "How did this week go?" }, INSTALL_CHIP],
+};
+
+const PAGE_OF_SECTION: Record<string, AiPage> = {
+  dashboard: "dashboard",
+  insights: "dashboard",
+  monitor: "monitor",
+  timesheet: "timesheet",
+  reports: "reports",
+  projects: "projects",
+  activities: "activities",
+  screenshots: "activities",
+  team: "team",
+  settings: "settings",
+  download: "download",
+};
+
+/** The Ask AI page a path belongs to ("/reports/weekly" → "reports"); "other" for anything else. */
+export function aiPageForPath(pathname: string | null | undefined): AiPage {
+  const section = (pathname ?? "").split(/[?#]/)[0].split("/").filter(Boolean)[0] ?? "dashboard";
+  return Object.prototype.hasOwnProperty.call(PAGE_OF_SECTION, section) ? PAGE_OF_SECTION[section] : "other";
+}
+
+/* ----------------------------- Ask AI ----------------------------- */
+
+/** The most a question may say (the server's AiAskInput cap). */
+export const AI_QUESTION_MAX_LENGTH = 1000;
+
+/** Under the drawer's heading and on every answer. */
+export const AI_ANSWER_LABEL = "AI-generated, may be inaccurate";
+
+/**
+ * What the Ask AI launcher offers this caller (§18.3):
+ *  - "ready": the assistant;
+ *  - "quota": the assistant, with the allowance note (answers may be refused);
+ *  - "turn-on": the owner of a workspace that hasn't opted in: an explainer
+ *    with "Review and turn on";
+ *  - null: nothing (no AI on the server, Ask AI not allowed, or a manager or
+ *    member of a workspace with AI off).
+ */
+export type AiAssistantMode = "ready" | "quota" | "turn-on" | null;
+
+export function aiAssistantMode(status: AiStatusDto | null | undefined, role: Role): AiAssistantMode {
+  const ask = aiAvailability(status, "ask");
+  if (ask.visible) return ask.reason === "quota" ? "quota" : "ready";
+  return aiSetupNotice(status, role) === "turn-on" ? "turn-on" : null;
+}
+
+/**
+ * The drawer's scope chip: whose activity the assistant can look up. The
+ * team's for an owner or manager the server lets see the team (its period
+ * summary offers the team scope), otherwise only the caller's own.
+ */
+export function aiAskScopeLabel(status: AiStatusDto | null | undefined, role: Role): "Team" | "Only your activity" {
+  if (role !== "owner" && role !== "admin") return "Only your activity";
+  const period = status?.features.find((f) => f.featureId === "period-summary");
+  return period && period.allowed && !period.scopes.includes("team") ? "Only your activity" : "Team";
+}
+
+/** A piece of an answer: a paragraph, or the list its "- " lines make. */
+export type AiAnswerBlock = { kind: "paragraph"; text: string } | { kind: "list"; items: string[] };
+
+/**
+ * An answer's plain text as paragraphs and lists (§5.5): consecutive lines
+ * starting "- " are one list, other lines one paragraph each, blank lines
+ * dropped. Nothing else is interpreted: no markup, no links.
+ */
+export function aiAnswerBlocks(answer: string | null | undefined): AiAnswerBlock[] {
+  const blocks: AiAnswerBlock[] = [];
+  for (const raw of (answer ?? "").split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    // "- item", and a bare "- " whose item is empty (dropped).
+    if (/^- /.test(raw.trimStart())) {
+      const item = line.slice(1).trim();
+      if (!item) continue;
+      const last = blocks[blocks.length - 1];
+      if (last?.kind === "list") last.items.push(item);
+      else blocks.push({ kind: "list", items: [item] });
+    } else {
+      blocks.push({ kind: "paragraph", text: line });
+    }
+  }
+  return blocks;
+}
+
+/* ----------------------------- Data quality ----------------------------- */
+
+/** "Week review" on the timesheet: the checks that apply to the team and to one member. */
+export const TIMESHEET_DATA_QUALITY_KINDS: readonly AiDataQualityKind[] = ["data-gap", "clock-skew", "unmeasured-activity", "software-input"];
+
+/** "Agent health" on the team page: the agents' side of tracking (team only). */
+export const AGENT_HEALTH_KINDS: readonly AiDataQualityKind[] = ["data-gap", "clock-skew", "never-tracked", "outdated-agent"];
+
+/** A finding's severity in words (shown with an icon: never colour alone). */
+export function dataQualitySeverityLabel(severity: string): string {
+  return severity === "notice" ? "Worth a look" : "For information";
+}
+
+const DATA_QUALITY_ACTIONS: Record<string, string> = {
+  "check-agent-running": "Check the desktop agent",
+  "check-os-permissions": "Review the agent's permissions",
+  "send-install-link": "Get the install link",
+  "update-agent": "Get the latest agent",
+  "sync-device-clock": "How to sync the clock",
+};
+
+/** The words of a finding's action button; "Open" for an action the web doesn't know yet. */
+export function dataQualityActionLabel(actionId: string | null | undefined): string {
+  return actionId && Object.prototype.hasOwnProperty.call(DATA_QUALITY_ACTIONS, actionId) ? DATA_QUALITY_ACTIONS[actionId] : "Open";
+}
+
+/* ----------------------------- Task drafts ----------------------------- */
+
+/** The goal a task draft request describes: 3 to 500 characters (the server's AiTaskDraftsInput). */
+export const AI_GOAL_MIN_LENGTH = 3;
+export const AI_GOAL_MAX_LENGTH = 500;
+/** How many drafts may be asked for (default 5). */
+export const AI_MAX_TASK_DRAFTS = 8;
+
+/**
+ * Why an edited draft can't be saved as a task, in the existing task form's
+ * words (the project-task limits); null when it can.
+ */
+export function taskDraftProblem(title: string, description: string): string | null {
+  const trimmed = title.trim();
+  if (!trimmed) return "The task needs a title.";
+  if (trimmed.length > PROJECT_TASK_LIMITS.titleMaxLength) return `The title cannot exceed ${PROJECT_TASK_LIMITS.titleMaxLength} characters.`;
+  if (description.length > PROJECT_TASK_LIMITS.descriptionMaxLength) {
+    return `The description cannot exceed ${PROJECT_TASK_LIMITS.descriptionMaxLength} characters.`;
+  }
+  return null;
+}
+
+/** "3 tasks selected", for the dialog's live count. */
+export function selectedTasksText(count: number): string {
+  return `${count} ${count === 1 ? "task" : "tasks"} selected`;
+}
+
+/* ----------------------------- Cache keys ----------------------------- */
+
+function canonical(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonical);
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(value).sort()) {
+      const v = (value as Record<string, unknown>)[key];
+      if (v !== undefined) out[key] = canonical(v);
+    }
+    return out;
+  }
+  return value;
+}
+
+/**
+ * A deterministic key for a request input: key order doesn't matter and
+ * undefined fields are dropped, so `{a:1,b:undefined}` and `{a:1}` agree.
+ */
+export function stableKey(input: unknown): string {
+  return JSON.stringify(canonical(input)) ?? "";
+}
+
+/** Where a result is kept for this page view: one entry per workspace, feature and input. */
+export function aiResultCacheKey(workspaceId: string, featureId: AiFeatureId, input: unknown): string {
+  return `${workspaceId}|${featureId}|${stableKey(input)}`;
+}

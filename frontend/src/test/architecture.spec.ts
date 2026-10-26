@@ -465,8 +465,20 @@ describe("architecture spec: secret scanning", () => {
       // self-service change. Paths, never credentials —
       // the passwords travel in the request body / response, never in source.
       "/api/account/my-profile/change-password",
-      // "Forgot password?" guidance; \u0000 is the support-address placeholder.
-      "Contact your workspace owner to reset your password. Workspace owners: email \u0000.",
+      // Account recovery (FE-09): ABP's anonymous account ROUTES and the web
+      // app's own recovery PAGES the emailed links open (backend WebAppLinks).
+      // Paths, never credentials: the new value travels in the request body.
+      "/api/account/send-password-reset-code",
+      "/api/account/verify-password-reset-token",
+      "/api/account/reset-password",
+      "/api/app/team/send-password-reset",
+      "/forgot-password",
+      "/reset-password",
+      // A backend business error CODE (TrackerDomainErrorCodes): the confirming
+      // value given for a sensitive change was wrong. A name, not a value.
+      "Tracker:InvalidPassword",
+      // UI copy for that code (lib/erasure): names the field, carries no value.
+      "That isn't your current password.",
       // HTML autocomplete tokens on password FIELDS (sign-in, the session's
       // re-authentication dialog, Settings → Security, the change-at-sign-in
       // step): they tell password managers which saved value goes in the box.
@@ -476,6 +488,11 @@ describe("architecture spec: secret scanning", () => {
       // replace its password (lib/sign-in.ts recognises them): reason codes.
       "ShouldChangePasswordOnNextLogin",
       "PeriodicallyChangePassword",
+      // A provider-state VALUE of the host console's AI overview
+      // (lib/ai-contract PlatformAiProviderState, AI assist spec §5.6): the
+      // server says its AI provider connection is incomplete. A wire enum,
+      // never a credential; the console's copy says "AI provider connection".
+      "missing-api-key",
     ]);
     const violations: string[] = [];
     let hitsSeen = 0;
@@ -515,6 +532,8 @@ describe("architecture spec: route-permission consistency", () => {
    *  - "/login"  → the public sign-in page; it must be reachable logged-out.
    *  - "/workspaces" → the workspace chooser: signed in, but before any workspace (so before any role).
    *  - "/invite/[token]" → an invitation link; it must open logged-out.
+   *  - "/forgot-password", "/reset-password", "/confirm-email" → account
+   *      recovery and the pages emailed links open; they must open logged-out.
    *  - "/install", "/install/linux", "/install/macos", "/install/windows" →
    *      public desktop installation & capability guides reachable logged-out.
    */
@@ -523,6 +542,9 @@ describe("architecture spec: route-permission consistency", () => {
     "/login",
     "/workspaces",
     "/invite/[token]",
+    "/forgot-password",
+    "/reset-password",
+    "/confirm-email",
     "/install",
     "/install/linux",
     "/install/macos",

@@ -1,4 +1,4 @@
-import { NOW } from "./mock-data";
+import { NOW } from "./demo-clock";
 import { reconcileSegmentProductivity, trimSegmentsToTarget } from "./metrics";
 import { isLiveDataset, projects, userById } from "./tenant-data";
 import { appCategory, appColor } from "./apps";
@@ -31,8 +31,9 @@ export interface DaySegment {
   windowTitle: string;
   projectId: string | null;
   productivity: number; // 0 for idle/break
-  mouseClicks: number;
-  keyboardHits: number;
+  /** Null when the block's input wasn't counted (live rows); never a fabricated 0. */
+  mouseClicks: number | null;
+  keyboardHits: number | null;
   screen: ScreenMock;
   /** Open browser tabs — only present when `app` is a web browser. */
   tabs?: BrowserTab[];
@@ -280,6 +281,9 @@ export function buildDayTimeline(userId: string, iso: string): DaySegment[] {
   if (typeof iso !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(iso)) return [];
   const user = userById(userId);
   if (!user || user.role === "client") return [];
+  // Demo users always have a measured score; this generator never sees a live
+  // (possibly null) one, but stays defensive since `User.productivity` is nullable.
+  const baseProductivity = user.productivity ?? 50;
 
   const rand = mulberry32(hashStr(`${userId}:${iso}`));
   const between = (min: number, max: number) => Math.floor(rand() * (max - min + 1)) + min;
@@ -334,7 +338,7 @@ export function buildDayTimeline(userId: string, iso: string): DaySegment[] {
       // Meeting
       const dur = between(25, 55);
       const proj = pick(projPool);
-      const prod = Math.min(96, Math.max(35, user.productivity - between(5, 20)));
+      const prod = Math.min(96, Math.max(35, baseProductivity - between(5, 20)));
       const kb = Math.round((dur * prod * (5 + rand() * 6)) / 100);
       const ms = Math.round((dur * prod * (2 + rand() * 3)) / 100);
       const title = pick(appMeta.Zoom.titles) ?? "Meeting";
@@ -352,7 +356,7 @@ export function buildDayTimeline(userId: string, iso: string): DaySegment[] {
       const app = pick(apps) ?? defaultApps[0];
       const meta = appMeta[app] ?? appMeta["Google Chrome"];
       const proj = pick(projPool);
-      const base = user.productivity + between(-18, 12);
+      const base = baseProductivity + between(-18, 12);
       const prod = Math.min(99, Math.max(28, meta.category === "unproductive" ? between(20, 45) : base));
       const kb = Math.round((dur * prod * (18 + rand() * 26)) / 100);
       const ms = Math.round((dur * prod * (5 + rand() * 12)) / 100);
@@ -381,7 +385,7 @@ export function buildDayTimeline(userId: string, iso: string): DaySegment[] {
     ref: s,
   }));
   trimSegmentsToTarget(reconcilable, target);
-  reconcileSegmentProductivity(reconcilable, user.productivity);
+  reconcileSegmentProductivity(reconcilable, baseProductivity);
 
   const kept = new Set(reconcilable.map((r) => r.ref));
   for (const r of reconcilable) {

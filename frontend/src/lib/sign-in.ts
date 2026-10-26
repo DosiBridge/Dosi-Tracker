@@ -1,12 +1,13 @@
 import { parseApiErrorBody, parseRetryAfter } from "./api-contract";
+import { apiUrl } from "./runtime-config";
 
 /* ============================================================================
  * SIGN-IN FAILURES — what went wrong, in words that send people the right way.
  *
  * "Wrong password" is the right answer only when the server actually rejected
- * the credentials. A rate limit, a locked or deactivated account, a workspace
- * name that doesn't exist, an outage, a browser that blocks site data and an
- * account that must change its password each need a different next step, and
+ * the credentials. A rate limit, a locked or deactivated account, a server
+ * address that is set up wrong, an outage, a browser that blocks site data and
+ * an account that must change its password each need a different next step, and
  * blaming the password for them sends people to reset passwords that were
  * fine.
  *
@@ -21,15 +22,15 @@ import { parseApiErrorBody, parseRetryAfter } from "./api-contract";
  *   - must change the password ........... 400 invalid_grant, "ShouldChangePasswordOnNextLogin"
  *                                          or "PeriodicallyChangePassword", plus a
  *                                          one-time `changePasswordToken`
- * and ABP's tenant resolution answers 404 before any of that when the
- * workspace name is unknown or the workspace is inactive.
+ * Accounts are global (no workspace is named at sign-in), so a 404 can only
+ * mean the configured API address doesn't point at a Dosi-Tracker server.
  * ========================================================================== */
 
 export type SignInFailureKind =
-  /** The email or password didn't match (or the account isn't in that workspace). */
+  /** The email or password didn't match. */
   | "invalid"
-  /** No active workspace has that name. */
-  | "unknown-workspace"
+  /** This site's API address is missing or doesn't lead to a Dosi-Tracker server (an operator's fix). */
+  | "misconfigured"
   /** Locked after too many failed attempts. */
   | "locked"
   /** Deactivated by the workspace. */
@@ -95,12 +96,14 @@ export function classifySignInError(err: unknown): SignInFailure {
       return { kind: "unreachable" };
     case "StorageUnavailableError":
       return { kind: "storage" };
+    case "ApiNotConfiguredError":
+      return { kind: "misconfigured" };
     case "SignInServerError":
       return { kind: "server", status, detail: asText(e.errorDescription) };
     case "InvalidCredentialsError": {
       const code = asText(e.error);
       const description = asText(e.errorDescription);
-      if (status === 404) return { kind: "unknown-workspace", status };
+      if (status === 404) return { kind: "misconfigured", status };
       if (code === "account_locked") return { kind: "locked", status };
       if (code === "account_inactive") return { kind: "inactive", status };
       if (description && CHANGE_REQUIRED.has(description)) return { kind: "change-required", status };
@@ -124,24 +127,23 @@ export function formatWait(seconds: number): string {
 }
 
 /**
- * The sentence to show for a failure. `workspace` names the workspace the
- * person typed (for "unknown workspace"); `secondsLeft` overrides the wait of
- * a rate-limited failure while a countdown runs.
+ * The sentence to show for a failure. `secondsLeft` overrides the wait of a
+ * rate-limited failure while a countdown runs.
  */
-export function signInFailureMessage(failure: SignInFailure, options: { workspace?: string | null; secondsLeft?: number } = {}): string {
+export function signInFailureMessage(failure: SignInFailure, options: { secondsLeft?: number } = {}): string {
   switch (failure.kind) {
     case "invalid":
       return "That email or password didn't match. Check them and try again.";
-    case "unknown-workspace":
-      return options.workspace
-        ? `We couldn't find an active workspace named “${options.workspace}”. Check the spelling — it's the name the workspace was created with.`
-        : "We couldn't find that workspace. Check the name it was created with.";
+    case "misconfigured":
+      return failure.status
+        ? `This site's server address doesn't lead to a Dosi-Tracker server (HTTP ${failure.status}). Ask whoever runs this site to check its API address.`
+        : "This site isn't connected to a Dosi-Tracker server yet. Ask whoever runs it to set its API address.";
     case "locked":
-      return "This account is locked after too many failed sign-in attempts. Wait a few minutes and try again, or ask your workspace owner to unlock it.";
+      return "This account is locked after too many failed sign-in attempts. Wait a few minutes, then try again.";
     case "inactive":
       return "This account has been deactivated. Ask your workspace owner to reactivate it.";
     case "confirm":
-      return "This account's email address hasn't been confirmed yet. Ask your workspace owner to confirm it, then sign in again.";
+      return "This account's email address hasn't been confirmed yet. Open the confirmation link we emailed you, then sign in again.";
     case "change-required":
       return "This account has to finish setting up its sign-in on the sign-in page before it can continue.";
     case "two-factor":
@@ -161,23 +163,21 @@ export function signInFailureMessage(failure: SignInFailure, options: { workspac
 }
 
 /** Which form field a failure points at, so the page can move focus there. */
-export function failureField(failure: SignInFailure): "workspace" | "credentials" | null {
-  if (failure.kind === "unknown-workspace") return "workspace";
-  if (failure.kind === "invalid") return "credentials";
-  return null;
+export function failureField(failure: SignInFailure): "credentials" | null {
+  return failure.kind === "invalid" ? "credentials" : null;
 }
 
 /* ----------------------------- Change at sign-in ----------------------------- */
 
-/** The API host the web talks to (the same setting hooks/useApi reads). */
-export const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "https://localhost:6006";
-
 /** The OAuth client the web signs in as and the scopes it asks for (as hooks/useApi's loginApi does). */
 export const WEB_SIGN_IN_CLIENT = { clientId: "Tracker_App", scope: "openid profile email roles offline_access Tracker" } as const;
 
-/** The token endpoint. Accounts are global: no workspace is named at sign-in. */
-export function tokenEndpoint(baseUrl: string = API_BASE_URL): string {
-  return `${baseUrl}/connect/token`;
+/**
+ * The token endpoint on this deployment's API (lib/runtime-config), or on
+ * `baseUrl`. Accounts are global: no workspace is named at sign-in.
+ */
+export function tokenEndpoint(baseUrl?: string): string {
+  return baseUrl ? `${baseUrl.replace(/\/+$/, "")}/connect/token` : apiUrl("/connect/token");
 }
 
 export interface ChangeAtSignInRequest {

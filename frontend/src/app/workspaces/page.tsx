@@ -7,12 +7,16 @@ import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { ThemeToggle } from "@/components/ui/theme-toggle";
 import { CreateWorkspaceForm } from "@/components/layout/workspace-switcher";
+import { MyInvitations } from "@/components/workspaces/my-invitations";
+import { DeleteWorkspaceDialog } from "@/components/workspaces/delete-workspace-dialog";
 import { useSession } from "@/components/session-provider";
 import { toast } from "@/components/toast";
 import { archiveWorkspaceApi, getMyWorkspacesApi, restoreWorkspaceApi } from "@/hooks/useApi";
 import { clearCurrentWorkspace, currentWorkspaceId, switchToWorkspace } from "@/lib/live-session";
 import { dropLiveDatasets } from "@/lib/tenant-data";
 import { isWorkspaceOwner, workspaceInitial, workspaceRoleLabel, type WorkspaceMembership } from "@/lib/sign-in";
+import { purgeDateLabel } from "@/lib/erasure";
+import type { DeletedWorkspaceDto } from "@/lib/api-contract";
 
 interface ErrorShape {
   serverMessage?: string | null;
@@ -31,6 +35,7 @@ export default function WorkspacesPage() {
   const [creating, setCreating] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [archivingWorkspace, setArchivingWorkspace] = useState<WorkspaceMembership | null>(null);
+  const [deletingWorkspace, setDeletingWorkspace] = useState<WorkspaceMembership | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [refreshError, setRefreshError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -91,6 +96,22 @@ export default function WorkspacesPage() {
     } finally {
       setBusyId(null);
     }
+  }
+
+  /** Deleted: it is gone for everyone at once; leave it if it was open, and say when its data goes for good. */
+  function handleDeleted(w: WorkspaceMembership, result: DeletedWorkspaceDto | null) {
+    setDeletingWorkspace(null);
+    setMine((prev) => (prev ? prev.filter((item) => item.id.toLowerCase() !== w.id.toLowerCase()) : prev));
+    if (currentWorkspaceId()?.toLowerCase() === w.id.toLowerCase()) {
+      clearCurrentWorkspace();
+      dropLiveDatasets();
+    }
+    const purge = purgeDateLabel(result?.purgeAfter);
+    toast({
+      title: "Workspace deleted",
+      description: purge ? `${w.name} is gone. Its tracked data is erased for good on ${purge}.` : `${w.name} is gone.`,
+      tone: "info",
+    });
   }
 
   async function handleArchive(w: WorkspaceMembership) {
@@ -157,15 +178,22 @@ export default function WorkspacesPage() {
             </h1>
             <p className="mt-1 mb-6 text-sm text-muted-foreground">
               {empty
-                ? "You're not in any workspace yet. Create one to start tracking — or ask a workspace owner for an invitation."
+                ? "You're not in any workspace yet. Create one to start tracking — or accept an invitation from a workspace owner."
                 : "You'll be its owner."}
             </p>
+            {empty && (
+              <div className="mb-6">
+                <MyInvitations onJoined={switchToWorkspace} onChanged={() => void reloadMine()} />
+              </div>
+            )}
             <CreateWorkspaceForm onCancel={empty ? undefined : () => setCreating(false)} />
           </>
         ) : (
           <>
             <h1 className="font-display text-2xl font-bold tracking-tight">Choose a workspace</h1>
             <p className="mt-1 text-sm text-muted-foreground">You can switch any time from the sidebar.</p>
+
+            <MyInvitations onJoined={switchToWorkspace} onChanged={() => void reloadMine()} />
 
             {actionError && (
               <p role="alert" className="mt-3 rounded-lg bg-danger/10 px-3 py-2 text-sm font-medium text-danger-on-tint">
@@ -221,6 +249,19 @@ export default function WorkspacesPage() {
                               {busyId === w.id ? "Restoring…" : "Restore"}
                             </Button>
                           )}
+                          {owner && (
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="sm"
+                              disabled={busyId === w.id}
+                              onClick={() => setDeletingWorkspace(w)}
+                              className="text-xs text-muted-foreground hover:text-danger-on-tint"
+                              title={`Delete ${w.name}`}
+                            >
+                              Delete
+                            </Button>
+                          )}
                         </div>
                       </div>
                     ) : (
@@ -253,6 +294,19 @@ export default function WorkspacesPage() {
                             Archive
                           </Button>
                         )}
+                        {owner && (
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            disabled={busyId === w.id}
+                            onClick={() => setDeletingWorkspace(w)}
+                            className="text-xs text-muted-foreground hover:text-danger-on-tint shrink-0"
+                            title={`Delete ${w.name}`}
+                          >
+                            Delete
+                          </Button>
+                        )}
                       </div>
                     )}
                   </li>
@@ -272,9 +326,18 @@ export default function WorkspacesPage() {
             onConfirm={() => void handleArchive(archivingWorkspace)}
             busy={busyId === archivingWorkspace.id}
             title={`Archive ${archivingWorkspace.name}?`}
-            description="This workspace will be archived and hidden from normal switching. You can restore it at any time, and its projects, activities, and settings will be preserved. Subscription billing is not cancelled."
+            description="This workspace will be archived and hidden from normal switching. You can restore it at any time, and its projects, activities, and settings will be preserved. Archived workspaces are not invoiced."
             confirmLabel="Archive workspace"
             tone="danger"
+          />
+        )}
+
+        {deletingWorkspace && (
+          <DeleteWorkspaceDialog
+            workspace={deletingWorkspace}
+            live
+            onClose={() => setDeletingWorkspace(null)}
+            onDeleted={(result) => handleDeleted(deletingWorkspace, result)}
           />
         )}
 

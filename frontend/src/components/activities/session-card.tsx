@@ -18,6 +18,7 @@ import {
   type SessionDetails,
 } from "@/lib/activity-report";
 import { appColor } from "@/lib/apps";
+import { INPUT_COUNT_METRIC } from "@/lib/metrics";
 import { thumbnailCaptureIds } from "@/lib/live-dataset";
 import type { Activity, UserStatus } from "@/lib/types";
 import { cn, formatCompact, scoreTone } from "@/lib/utils";
@@ -185,21 +186,33 @@ export function ActivityMeter({ value, className }: { value: number | null; clas
   );
 }
 
-/** Keys and clicks, labelled for hover and screen readers. */
+/** Keys and clicks, labelled for hover and screen readers; an unmeasured count reads "Not measured", never 0. */
 function InputCounts({ activity: a }: { activity: Activity }) {
+  const title = (value: number | null, what: string) =>
+    value === null ? `${what}: ${INPUT_COUNT_METRIC.notMeasured.toLowerCase()}` : `${value.toLocaleString()} ${what.toLowerCase()}`;
   return (
     <div className="flex shrink-0 items-center gap-3 text-xs text-muted-foreground">
-      <span className="flex items-center gap-1" title={`${a.keyboardHits.toLocaleString()} key presses`}>
+      <span className="flex items-center gap-1" title={title(a.keyboardHits, "Key presses")}>
         <Keyboard className="h-3.5 w-3.5" aria-hidden />
         <span className="sr-only">Key presses: </span>
-        {formatCompact(a.keyboardHits)}
+        {a.keyboardHits === null ? <NotMeasuredCount /> : formatCompact(a.keyboardHits)}
       </span>
-      <span className="flex items-center gap-1" title={`${a.mouseClicks.toLocaleString()} mouse clicks`}>
+      <span className="flex items-center gap-1" title={title(a.mouseClicks, "Mouse clicks")}>
         <MousePointerClick className="h-3.5 w-3.5" aria-hidden />
         <span className="sr-only">Mouse clicks: </span>
-        {formatCompact(a.mouseClicks)}
+        {a.mouseClicks === null ? <NotMeasuredCount /> : formatCompact(a.mouseClicks)}
       </span>
     </div>
+  );
+}
+
+/** "—" on screen, "Not measured" for screen readers. */
+export function NotMeasuredCount() {
+  return (
+    <>
+      <span aria-hidden>{INPUT_COUNT_METRIC.placeholder}</span>
+      <span className="sr-only">{INPUT_COUNT_METRIC.notMeasured}</span>
+    </>
   );
 }
 

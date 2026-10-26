@@ -60,6 +60,10 @@ export const PERMISSION = {
   viewAllActivities: "Tracker.Activities.ViewAll",
   manageTeam: "Tracker.Team.Manage",
   platform: "Tracker.Platform",
+  /** Delete members' time blocks and captures (owners and managers). */
+  deleteActivities: "Tracker.Activities.Delete",
+  /** Revoke and restore members' desktop agent installs (owners and managers). */
+  manageDevices: "Tracker.Devices.Manage",
 } as const;
 
 function granted(config: AppConfiguration, policy: string): boolean {
@@ -208,6 +212,8 @@ export function buildLiveWorkspace(
   plans: ApiPlanDto[] | null,
   now: Date,
   counts: { seatsUsed: number; projectsUsed: number } = { seatsUsed: 0, projectsUsed: 0 },
+  /** GET /api/app/workspace/billing-mode; null when the server can't say (billing then counts as on). */
+  billing: { enabled: boolean } | null = null,
 ): Workspace {
   const name = (config.currentWorkspace?.name ?? config.currentTenant?.name ?? "").trim() || (isHostConfig(config) ? "Platform" : "Workspace");
   const plan = subscription?.planId ? (plans ?? []).find((p) => p.id === subscription.planId) ?? null : null;
@@ -227,10 +233,12 @@ export function buildLiveWorkspace(
     storageUsedGb: 0,
     live: {
       known: !!plan,
+      planId: subscription?.planId ?? null,
       planName: plan?.name ?? null,
       pricePerUser: typeof plan?.pricePerUser === "number" ? plan.pricePerUser : null,
       seatLimit: maxSeats === null ? null : maxSeats <= 0 ? Number.POSITIVE_INFINITY : maxSeats,
       trialEndsAt: subscription?.trialEndsAt ?? null,
+      ...(billing ? { billingEnabled: billing.enabled } : {}),
     },
   };
 }

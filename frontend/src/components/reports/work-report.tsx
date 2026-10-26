@@ -166,7 +166,7 @@ const FORMAT_KEYS = HOURS_FORMATS.map((f) => f.key);
 const EMPTY_BLOCKS: Block[] = [];
 
 const EMPTY_AGGREGATES: ReportAggregates = {
-  totals: { minutes: 0, sessions: 0, activity: null, idleMinutes: null, keys: 0, clicks: 0 },
+  totals: { minutes: 0, sessions: 0, activity: null, idleMinutes: null, keys: null, clicks: null },
   daily: [],
   members: [],
   projects: [],
@@ -442,6 +442,7 @@ export function WorkReport() {
 
   return (
     <ReportShell
+      aiExplain={{ slug: "work-report", query: { from: period.from, to: period.to, projectId, userId: memberId, timeZone } }}
       title="Work Report"
       description="Hours worked per day, ready to share — copy a summary, export a CSV, or save it as a PDF."
       actions={

@@ -2,6 +2,7 @@ import type { Activity, ActivityCoverage, Project, User, UserStatus } from "./ty
 import type { Workspace } from "./saas-data";
 import {
   API_ROUTES,
+  BILLING_MODE_ROUTE,
   MAX_PAGE_SIZE,
   collectPages,
   projectMembersRoute,
@@ -115,8 +116,8 @@ export interface LiveSessionData {
   identity: LiveIdentity;
   /** Exact per-period totals from the server (null where unavailable). */
   totals: { projects: ProjectTotals; today: SummaryTotals | null };
-  /** The plan as loaded, reused by pulses (null where the call failed). */
-  plan: { subscription: ApiSubscriptionDto | null; plans: ApiPlanDto[] | null };
+  /** The plan as loaded, reused by pulses (null where the call failed); `billing` is the deployment's billing mode. */
+  plan: { subscription: ApiSubscriptionDto | null; plans: ApiPlanDto[] | null; billing?: { enabled: boolean } | null };
   /**
    * The viewer's granted permissions (ABP `auth.grantedPolicies`, re-read on
    * every load), so screens can tell who may see what without asking again;
@@ -154,6 +155,7 @@ export const LIVE_ENDPOINTS = {
   projects: "/api/app/project?MaxResultCount=1000",
   subscription: "/api/app/workspace/current-subscription",
   plans: "/api/app/workspace/available-plans",
+  billingMode: BILLING_MODE_ROUTE,
   presence: API_ROUTES.presenceTeam,
   myPreferences: API_ROUTES.myPreferences,
   workspaceSettings: API_ROUTES.workspaceSettings,
@@ -176,6 +178,11 @@ export interface LiveLoadOptions {
   getPage?: LivePageGetter;
   /** The previous load: a pulse merges into it (ignored when it belongs to someone else). */
   previous?: LiveSessionData | null;
+  /**
+   * Read the subscription, plans and billing mode again even on a pulse (after
+   * the owner changed or canceled the plan); otherwise a pulse reuses them.
+   */
+  freshPlan?: boolean;
   /** The browser's zone, the last fallback for the reporting zone (default: read from the platform). */
   browserZone?: string;
   /**
@@ -454,25 +461,26 @@ export async function loadLiveSession(get: LiveGetter, now: Date = new Date(), o
       timeZone: previous?.timeZone ?? browserZone,
       identity,
       totals: { projects: {}, today: null },
-      plan: { subscription: null, plans: null },
+      plan: { subscription: null, plans: null, billing: null },
       grantedPolicies: grantedPoliciesOf(cfg),
       loadedAt,
     };
   }
 
   const getPage: LivePageGetter = options.getPage ?? (async (endpoint) => toPagedResult<unknown>(await get(endpoint)));
-  const reusePlan = previous && previous.plan.subscription && previous.plan.plans;
+  const reusePlan = !options.freshPlan && previous && previous.plan.subscription && previous.plan.plans;
   const reuseRows = previous && !previous.warnings.includes("activity");
 
   const zoneP = previous ? Promise.resolve(previous.timeZone) : reportingZone(get, browserZone);
   // The totals need the zone (where "today" and "this month" begin) but not the rows: start them as soon as it's known.
   const totalsP = zoneP.then((zone) => loadTotals(get, periodsFor(now, zone, windowFrom), zone));
-  const [rawMembers, rawProjects, rawPresence, rawSubscription, rawPlans, rows, timeZone, totals] = await Promise.all([
+  const [rawMembers, rawProjects, rawPresence, rawSubscription, rawPlans, rawBilling, rows, timeZone, totals] = await Promise.all([
     soft(get(LIVE_ENDPOINTS.members)),
     soft(get(LIVE_ENDPOINTS.projects)),
     soft(get(LIVE_ENDPOINTS.presence)),
     reusePlan ? Promise.resolve(previous.plan.subscription) : soft(get(LIVE_ENDPOINTS.subscription)),
     reusePlan ? Promise.resolve(previous.plan.plans) : soft(get(LIVE_ENDPOINTS.plans)),
+    reusePlan && previous.plan.billing ? Promise.resolve(previous.plan.billing) : soft(get(LIVE_ENDPOINTS.billingMode)),
     reuseRows ? pulseRows(getPage, previous, windowFrom, now) : loadAllRows(getPage, windowFrom, now),
     zoneP,
     totalsP,
@@ -486,7 +494,10 @@ export async function loadLiveSession(get: LiveGetter, now: Date = new Date(), o
   if (!membersOk) warnings.push("team");
   const subscription = rawSubscription && typeof rawSubscription === "object" ? (rawSubscription as ApiSubscriptionDto) : null;
   const plans = Array.isArray(rawPlans) ? (rawPlans as ApiPlanDto[]) : null;
-  if (!subscription || !plans) warnings.push("plan");
+  // Billing off: there is no plan to miss. An older server (no such endpoint) bills as before.
+  const enabledFlag = rawBilling && typeof rawBilling === "object" ? (rawBilling as { enabled?: unknown }).enabled : undefined;
+  const billing = typeof enabledFlag === "boolean" ? { enabled: enabledFlag } : null;
+  if ((!subscription || !plans) && billing?.enabled !== false) warnings.push("plan");
 
   const activities = rows.activities;
   const members = (membersOk ? rawMembers : []).filter(
@@ -512,7 +523,9 @@ export async function loadLiveSession(get: LiveGetter, now: Date = new Date(), o
   const withToday = (u: User): User => {
     const today = totals.today?.users.get(u.id);
     if (!totals.today) return u;
-    return { ...u, trackedToday: Math.round(today?.minutes ?? 0), productivity: today?.activity ?? 0 };
+    // today?.activity is already null when nothing was measured (or the user
+    // has no row at all today) — never coalesce that to a fabricated 0%.
+    return { ...u, trackedToday: Math.round(today?.minutes ?? 0), productivity: today?.activity ?? null };
   };
 
   // The viewer's role and name come from their identity (authoritative);
@@ -573,10 +586,14 @@ export async function loadLiveSession(get: LiveGetter, now: Date = new Date(), o
   const seatHolders = members.filter((m) => Array.isArray(m.projectIds) && m.projectIds.length > 0).length;
   const seatsUsed = Math.max(1, members.length ? seatHolders : 1);
 
-  const workspace = buildLiveWorkspace(cfg, subscription, plans, now, {
-    seatsUsed,
-    projectsUsed: projects.filter((p) => !p.archived).length,
-  });
+  const workspace = buildLiveWorkspace(
+    cfg,
+    subscription,
+    plans,
+    now,
+    { seatsUsed, projectsUsed: projects.filter((p) => !p.archived).length },
+    billing,
+  );
 
   // A pulse that couldn't re-read the roster or projects keeps what it had rather than blanking the screen.
   const keepUsers = !membersOk && previous ? previous.users : users;
@@ -593,7 +610,7 @@ export async function loadLiveSession(get: LiveGetter, now: Date = new Date(), o
     timeZone,
     identity,
     totals,
-    plan: { subscription, plans },
+    plan: { subscription, plans, billing },
     grantedPolicies: grantedPoliciesOf(cfg),
     loadedAt,
   };

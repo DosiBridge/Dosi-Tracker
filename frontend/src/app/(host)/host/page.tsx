@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import dynamic from "next/dynamic";
 import Link from "next/link";
 import { DollarSign, Building2, Users, Sparkles, ArrowRight, Receipt, CheckCircle2 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -13,6 +14,9 @@ import { brand } from "@/lib/brand";
 import { planBreakdown, platformOverview } from "@/lib/host-data";
 import { colorFromString } from "@/lib/utils";
 import { getApi } from "@/hooks/useApi";
+
+// AI assist's card downloads on its own, after the platform's figures.
+const PlatformAiCard = dynamic(() => import("@/components/host/platform-ai-card").then((m) => m.PlatformAiCard), { ssr: false });
 
 const usd = (n: number) => `$${Math.round(n).toLocaleString()}`;
 
@@ -185,6 +189,8 @@ export default function HostOverviewPage() {
           </CardContent>
         </Card>
       </div>
+
+      <PlatformAiCard />
     </PageStack>
   );
 }

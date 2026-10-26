@@ -1,17 +1,18 @@
 "use client";
 
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { Radar, Eye, EyeOff, Loader2, ArrowLeft, Building2, KeyRound, ShieldAlert } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Input, Select } from "@/components/ui/input";
+import { Input } from "@/components/ui/input";
 import { ThemeToggle } from "@/components/ui/theme-toggle";
 import { LoginHero } from "@/components/motion/login-hero";
 import { ApiError, loginApi, registerWorkspaceApi } from "@/hooks/useApi";
-import { resolveLanding, safeNext } from "@/hooks/workspace-landing";
+import { resolveLanding } from "@/hooks/workspace-landing";
+import { safeRedirectPath } from "@/lib/safe-redirect";
 import { useSession } from "@/components/session-provider";
 import { landingFor } from "@/lib/roles";
-import { SUPPORT_EMAIL } from "@/lib/brand";
 import { isStorageAvailable, setCurrentWorkspace } from "@/lib/live-session";
 import {
   WEB_SIGN_IN_CLIENT,
@@ -23,15 +24,10 @@ import {
   tokenEndpoint,
   type SignInFailure,
 } from "@/lib/sign-in";
-import type { PlanId } from "@/lib/saas-data";
+import { SignupPlanPicker } from "@/components/auth/signup-plan-picker";
 
-// Backend plan names (seeded by PlanDataSeedContributor).
-const PLAN_NAME: Record<PlanId, string> = {
-  free: "Free",
-  starter: "Starter",
-  business: "Business",
-  enterprise: "Business",
-};
+/** Where "Forgot password?" leads (FE-09). */
+const RECOVERY_PAGE = "/forgot-password";
 
 /** ABP Identity's default minimum; the server's own rules are reported if it asks for more. */
 const MIN_NEW_SECRET_LENGTH = 6;
@@ -63,7 +59,8 @@ export default function LoginPage() {
   const [show, setShow] = useState(false);
   const [loading, setLoading] = useState<string | null>(null);
   const [wsName, setWsName] = useState("");
-  const [wsPlan, setWsPlan] = useState<PlanId>("free");
+  /** The server's plan id the new workspace starts on; null: none chosen (billing off, or the server's default). */
+  const [wsPlan, setWsPlan] = useState<string | null>(null);
   const [failure, setFailure] = useState<SignInFailure | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [infoMsg, setInfoMsg] = useState<string | null>(null);
@@ -86,7 +83,7 @@ export default function LoginPage() {
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const id = window.setTimeout(() => {
-      setNext(safeNext(params.get("next")));
+      setNext(safeRedirectPath(params.get("next")));
       const invite = params.get("invite");
       if (invite) setInviteToken(invite);
       const prefill = params.get("email");
@@ -245,7 +242,7 @@ export default function LoginPage() {
         surname: surname.trim() || undefined,
         email: email.trim(),
         password,
-        ...(inviteToken ? { inviteToken } : { workspaceName: wsName.trim(), planName: PLAN_NAME[wsPlan] }),
+        ...(inviteToken ? { inviteToken } : { workspaceName: wsName.trim(), ...(wsPlan ? { planId: wsPlan } : {}) }),
       });
       workspaceId = result?.workspaceId || undefined;
     } catch (err) {
@@ -280,6 +277,11 @@ export default function LoginPage() {
   }
 
   const errorText = errorMsg ?? (failure ? signInFailureMessage(failure) : null);
+  // The recovery page starts from the address typed here, and comes back to `next` afterwards.
+  const recoveryQuery = new URLSearchParams();
+  if (email.trim()) recoveryQuery.set("email", email.trim());
+  if (next) recoveryQuery.set("next", next);
+  const recoveryHref = `${RECOVERY_PAGE}${recoveryQuery.size ? `?${recoveryQuery.toString()}` : ""}`;
   const errorId = "login-error";
   const describedBy = errorText ? errorId : undefined;
   const credentialsInvalid = failure?.kind === "invalid";
@@ -415,14 +417,7 @@ export default function LoginPage() {
                       <label htmlFor="signup-workspace-name" className="text-sm font-medium">Workspace name</label>
                       <Input id="signup-workspace-name" value={wsName} onChange={(e) => setWsName(e.target.value)} placeholder="Acme Corp" autoComplete="organization" required />
                     </div>
-                    <div className="space-y-1.5">
-                      <label htmlFor="signup-plan" className="text-sm font-medium">Choose a plan</label>
-                      <Select id="signup-plan" value={wsPlan} onChange={(e) => setWsPlan(e.target.value as PlanId)}>
-                        <option value="free">Free — $0 · up to 3 seats</option>
-                        <option value="starter">Starter — $6/user/mo · 14-day trial</option>
-                        <option value="business">Business — $12/user/mo · 14-day trial</option>
-                      </Select>
-                    </div>
+                    <SignupPlanPicker onChange={setWsPlan} />
                   </>
                 )}
                 {errorText && <ErrorNote id={errorId}>{errorText}</ErrorNote>}
@@ -466,19 +461,12 @@ export default function LoginPage() {
                 <div className="space-y-1.5">
                   <div className="flex items-center justify-between">
                     <label htmlFor="login-password" className="text-sm font-medium">Password</label>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setErrorMsg(null);
-                        setFailure(null);
-                        setInfoMsg(
-                          `Contact your workspace owner to reset your password. Workspace owners: email ${SUPPORT_EMAIL}.`,
-                        );
-                      }}
+                    <Link
+                      href={recoveryHref}
                       className="rounded text-xs text-primary-strong hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                     >
                       Forgot password?
-                    </button>
+                    </Link>
                   </div>
                   <div className="relative">
                     <Input

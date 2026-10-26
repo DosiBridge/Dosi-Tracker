@@ -7,7 +7,7 @@ import { render, screen, waitFor } from "@testing-library/react";
 import { axe } from "jest-axe";
 import { reportCatalog } from "@/lib/reports-data";
 import { canAccess } from "@/lib/roles";
-import { resetTenantDataForTests } from "@/lib/tenant-data";
+import { resetTenantDataForTests } from "@/lib/demo-tenants";
 import type { Role } from "@/lib/types";
 
 const session = vi.hoisted(() => ({

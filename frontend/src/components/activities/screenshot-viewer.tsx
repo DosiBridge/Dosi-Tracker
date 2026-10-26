@@ -24,7 +24,7 @@ import { ScreenMockView } from "@/components/screen-mock";
 import { CaptureThumb, captureContentEndpoint } from "@/components/activities/capture-thumb";
 import { ActivityTimeline } from "@/components/activities/activity-timeline";
 import { NoteEditor, type NoteEditing } from "@/components/activities/note-editor";
-import { ActivityMeter, activityValue, type CardMember, type CardProject } from "@/components/activities/session-card";
+import { ActivityMeter, NotMeasuredCount, activityValue, type CardMember, type CardProject } from "@/components/activities/session-card";
 import { BlurredChip, DeviceTag, EndReasonChip, IdleTime, LiveBadge, OverlayChip } from "@/components/activities/session-meta";
 import { getAuthedBlob } from "@/hooks/useApi";
 import { captureExtension } from "@/lib/api-contract";
@@ -340,13 +340,13 @@ function SlideDetails({ item, timeZone, onOpenDetails }: { item: ViewerItem; tim
           <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
             <Keyboard className="h-3.5 w-3.5" aria-hidden /> Key presses
           </p>
-          <p className="mt-1 text-lg font-semibold tabular-nums">{a.keyboardHits.toLocaleString()}</p>
+          <p className="mt-1 text-lg font-semibold tabular-nums">{a.keyboardHits === null ? <NotMeasuredCount /> : a.keyboardHits.toLocaleString()}</p>
         </div>
         <div className="rounded-xl border border-border p-3">
           <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
             <MousePointerClick className="h-3.5 w-3.5" aria-hidden /> Mouse clicks
           </p>
-          <p className="mt-1 text-lg font-semibold tabular-nums">{a.mouseClicks.toLocaleString()}</p>
+          <p className="mt-1 text-lg font-semibold tabular-nums">{a.mouseClicks === null ? <NotMeasuredCount /> : a.mouseClicks.toLocaleString()}</p>
         </div>
       </div>
 

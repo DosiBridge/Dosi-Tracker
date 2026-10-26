@@ -5,7 +5,9 @@
 //  - NO localStorage JWT exists (the live-backend hydration path is skipped),
 //  - every request to the real API origin is aborted, so a locally running
 //    backend can never leak nondeterminism into the suite.
-// The app then renders its deterministic seeded demo data (frozen NOW clock).
+// The app then renders its deterministic seeded demo data (frozen NOW clock),
+// because playwright.config.ts starts the server with DOSI_DEMO_MODE=1. A
+// deployment without it signs such a visitor out instead.
 //
 // Tests must be order-independent: each test gets a fresh context, and state
 // the app persists (localStorage) dies with the context. Never chain tests.

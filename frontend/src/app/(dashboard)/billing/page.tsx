@@ -12,11 +12,13 @@ import {
   AlertTriangle,
   Building2,
   Mail,
+  CircleSlash,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Progress } from "@/components/ui/progress";
 import { DataTable, type Column } from "@/components/ui/data-table";
 import { ExportMenu } from "@/components/reports/export-menu";
@@ -25,6 +27,7 @@ import { PageHeader, PageStack } from "@/components/ui/page-header";
 import { useSession } from "@/components/session-provider";
 import { toast } from "@/components/toast";
 import {
+  billingEnabledFor,
   fmtLimit,
   invoicesFor,
   liveSeatsUsed,
@@ -40,7 +43,8 @@ import {
   type SubscriptionStatus,
 } from "@/lib/saas-data";
 import { SUPPORT_EMAIL } from "@/lib/brand";
-import { getApi } from "@/hooks/useApi";
+import { cancelMySubscriptionApi, changeMyPlanApi, getApi } from "@/hooks/useApi";
+import { billingErrorText, canCancelSubscription, fittingFreePlan, planAction, type PlanAction } from "@/lib/billing-plans";
 import { normalizeUtcIso } from "@/lib/live-dataset";
 import { exportRecords } from "@/lib/export";
 import { cn } from "@/lib/utils";
@@ -86,7 +90,12 @@ interface PlanCard {
   tagline: string;
   features: string[];
   highlight: boolean;
+  /** Live: what the owner can do about it (switch to a free plan, ask for a paid one). */
+  action?: PlanAction;
 }
+
+/** A self-service change waiting for the owner's confirmation. */
+type Pending = { kind: "switch"; planId: string; name: string } | { kind: "cancel" };
 
 /** Backend invoice statuses are paid / pending / failed; show pending ones as due once past their due date. */
 function toInvoice(inv: ApiInvoice, planName: string, now: number): InvoiceRow {
@@ -144,7 +153,11 @@ function mailtoChange(workspaceName: string, planName?: string): string {
 }
 
 export default function BillingPage() {
-  const { workspace, isLive } = useSession();
+  const { workspace, isLive, refreshSession, status: sessionStatus } = useSession();
+  // A deployment that doesn't bill (Billing:Enabled off): every workspace is active, there is nothing to show or pay.
+  const billingOn = billingEnabledFor(workspace);
+  const [pending, setPending] = useState<Pending | null>(null);
+  const [changing, setChanging] = useState(false);
 
   // LIVE: real invoices and the backend's own plan list. The current plan,
   // status and seat usage come from the session's live workspace (built from
@@ -176,10 +189,11 @@ export default function BillingPage() {
   }, [workspace]);
 
   useEffect(() => {
-    if (!isLive) return;
+    // Wait for the real workspace: the placeholder shown while it loads can't say whether this deployment bills.
+    if (!isLive || sessionStatus !== "ready" || !billingOn) return;
     // eslint-disable-next-line react-hooks/set-state-in-effect -- data fetch defers its own setState; see docs/QUALITY.md §10
     void loadLive();
-  }, [isLive, loadLive]);
+  }, [isLive, sessionStatus, billingOn, loadLive]);
 
   const demoPlan = planById(workspace.planId);
   const planName = planNameFor(workspace);
@@ -192,9 +206,44 @@ export default function BillingPage() {
   const invoices: InvoiceRow[] = isLive ? (liveInvoices ?? []) : invoicesFor(workspace);
   const hasPeriods = invoices.some((r) => r.period);
 
+  const seats = liveSeatsUsed(workspace);
+  const currentPlanId = workspace.live?.planId ?? null;
+  const sortedPlans = [...(livePlans ?? [])].sort((a, b) => Number(a.pricePerUser ?? 0) - Number(b.pricePerUser ?? 0));
+  const freeChoice = isLive ? fittingFreePlan(sortedPlans, seats, currentPlanId) : null;
+  const canCancel = isLive && canCancelSubscription({ pricePerUser, status });
+
+  /** Run the confirmed change, then re-read the subscription (the session's workspace is rebuilt from it). */
+  async function applyPending() {
+    if (!pending) return;
+    setChanging(true);
+    try {
+      if (pending.kind === "switch") await changeMyPlanApi(pending.planId);
+      else await cancelMySubscriptionApi();
+      toast({
+        tone: "success",
+        title: pending.kind === "switch" ? `Moved to ${pending.name}` : "Subscription canceled",
+        description:
+          pending.kind === "switch"
+            ? "The workspace is active on the new plan."
+            : "No more invoices will be issued. Time tracking pauses until you switch to a free plan.",
+      });
+      setPending(null);
+      await refreshSession({ silent: true, freshPlan: true });
+      void loadLive();
+    } catch (err) {
+      toast({
+        tone: "danger",
+        title: pending.kind === "switch" ? "Couldn't change the plan" : "Couldn't cancel the subscription",
+        description: billingErrorText(err, "Try again in a moment."),
+      });
+      setPending(null);
+    } finally {
+      setChanging(false);
+    }
+  }
+
   const planCards: PlanCard[] = isLive
-    ? [...(livePlans ?? [])]
-        .sort((a, b) => Number(a.pricePerUser ?? 0) - Number(b.pricePerUser ?? 0))
+    ? sortedPlans
         .map((p) => ({
           key: p.id,
           name: p.name ?? "Plan",
@@ -205,6 +254,7 @@ export default function BillingPage() {
             p.trialDays ? `${p.trialDays}-day free trial` : "No trial needed",
           ],
           highlight: false,
+          action: planAction(p, { currentPlanId, seatsUsed: seats }),
         }))
     : plans.map((p) => ({
         key: p.id,
@@ -214,7 +264,9 @@ export default function BillingPage() {
         features: p.features,
         highlight: !!p.highlight,
       }));
-  const currentIdx = planCards.findIndex((p) => p.name.toLowerCase() === planName.toLowerCase());
+  const currentIdx = currentPlanId
+    ? planCards.findIndex((p) => p.key === currentPlanId)
+    : planCards.findIndex((p) => p.name.toLowerCase() === planName.toLowerCase());
 
   function changePlan(name: string, isUpgrade: boolean) {
     toast({
@@ -251,6 +303,37 @@ export default function BillingPage() {
     ]);
   }
 
+  if (isLive && !billingOn) {
+    return (
+      <PageStack>
+        <PageHeader eyebrow="Workspace" title="Billing & Plan" description={<>Billing for <span className="font-medium text-foreground">{workspace.name}</span>.</>} />
+        <Card className="flex items-start gap-3 p-5">
+          <CircleSlash aria-hidden className="mt-0.5 h-5 w-5 shrink-0 text-muted-foreground" />
+          <div className="min-w-0 space-y-1">
+            <h2 className="text-sm font-semibold">Billing is turned off on this server</h2>
+            <p className="text-sm text-muted-foreground">
+              Every workspace here is active, with no plans, seat limits, trials or invoices. There is nothing to pay or change.
+            </p>
+          </div>
+        </Card>
+      </PageStack>
+    );
+  }
+
+  const confirmCopy =
+    pending?.kind === "switch"
+      ? {
+          title: `Switch to ${pending.name}?`,
+          description: `The workspace moves to the ${pending.name} plan now and stays active. Its seat limit applies from now on.`,
+          confirmLabel: `Switch to ${pending.name}`,
+        }
+      : {
+          title: `Cancel the ${planName} subscription?`,
+          description:
+            "No more invoices are issued, and time tracking pauses for everyone until you switch to a free plan or the platform reactivates the workspace. Invoices already issued are still owed. Your data is kept.",
+          confirmLabel: "Cancel subscription",
+        };
+
   return (
     <PageStack>
       <PageHeader
@@ -270,13 +353,24 @@ export default function BillingPage() {
           <div className="min-w-0 flex-1">
             <div className="text-sm font-medium">Your {planName} trial ends in {cycleDays} days</div>
             <div className="text-xs text-muted-foreground">
-              {isLive ? `To keep your plan after the trial, email ${SUPPORT_EMAIL}.` : "Add a payment method to keep monitoring without interruption."}
+              {isLive
+                ? freeChoice
+                  ? `To keep tracking after the trial, switch to ${freeChoice.name ?? "a free plan"} — or email ${SUPPORT_EMAIL} to keep ${planName}.`
+                  : `To keep your plan after the trial, email ${SUPPORT_EMAIL}.`
+                : "Add a payment method to keep monitoring without interruption."}
             </div>
           </div>
           {isLive ? (
-            <a href={mailtoChange(workspace.name, planName)} className={linkButtonClass("primary", "sm")}>
-              <Mail aria-hidden className="h-4 w-4" /> Contact support
-            </a>
+            <div className="flex flex-wrap gap-2">
+              {freeChoice && (
+                <Button size="sm" onClick={() => setPending({ kind: "switch", planId: freeChoice.id, name: freeChoice.name ?? "the free plan" })}>
+                  Switch to {freeChoice.name ?? "free"}
+                </Button>
+              )}
+              <a href={mailtoChange(workspace.name, planName)} className={linkButtonClass(freeChoice ? "outline" : "primary", "sm")}>
+                <Mail aria-hidden className="h-4 w-4" /> Contact support
+              </a>
+            </div>
           ) : (
             <Button size="sm" onClick={() => changePlan(planName, true)}>Add payment method</Button>
           )}
@@ -291,7 +385,12 @@ export default function BillingPage() {
             <div className="text-sm font-medium text-danger-on-tint">{ATTENTION_COPY[status]?.title}</div>
             <div className="text-xs text-muted-foreground">{ATTENTION_COPY[status]?.detail}</div>
           </div>
-          <a href={mailtoChange(workspace.name)} className={linkButtonClass("primary", "sm")}>
+          {freeChoice && (
+            <Button size="sm" onClick={() => setPending({ kind: "switch", planId: freeChoice.id, name: freeChoice.name ?? "the free plan" })}>
+              Switch to {freeChoice.name ?? "free"}
+            </Button>
+          )}
+          <a href={mailtoChange(workspace.name)} className={linkButtonClass(freeChoice ? "outline" : "primary", "sm")}>
             <Mail aria-hidden className="h-4 w-4" /> Contact support
           </a>
         </Card>
@@ -328,6 +427,14 @@ export default function BillingPage() {
                 </div>
               </div>
             </div>
+            {canCancel && (
+              <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-border pt-4">
+                <p className="text-xs text-muted-foreground">Cancel any time: no more invoices; tracking pauses until a free plan.</p>
+                <Button size="sm" variant="outline" className="border-danger/40 text-danger-on-tint hover:bg-danger/10" onClick={() => setPending({ kind: "cancel" })}>
+                  Cancel subscription
+                </Button>
+              </div>
+            )}
           </CardContent>
         </Card>
 
@@ -423,6 +530,19 @@ export default function BillingPage() {
                 <div className="mt-4">
                   {isCurrent ? (
                     <Button variant="outline" className="w-full" disabled>Current plan</Button>
+                  ) : isLive && p.action?.kind === "switch" ? (
+                    <Button variant="outline" className="w-full" onClick={() => setPending({ kind: "switch", planId: p.key, name: p.name })}>
+                      Switch to {p.name}
+                    </Button>
+                  ) : isLive && p.action?.kind === "too-small" ? (
+                    <div className="space-y-1.5">
+                      <Button variant="outline" className="w-full" disabled>
+                        Switch to {p.name}
+                      </Button>
+                      <p className="text-xs text-muted-foreground">
+                        Your team uses {seats} seats; {p.name} allows {p.action.maxSeats}.
+                      </p>
+                    </div>
                   ) : isLive ? (
                     <a href={mailtoChange(workspace.name, p.name)} className={cn(linkButtonClass(isUpgrade ? "primary" : "outline", "md"), "w-full")} title={PAYMENTS_NOTICE}>
                       <Mail aria-hidden className="h-4 w-4" /> Request {isUpgrade ? "upgrade" : "switch"}
@@ -465,6 +585,17 @@ export default function BillingPage() {
           )}
         </CardContent>
       </Card>
+
+      <ConfirmDialog
+        open={!!pending}
+        onCancel={() => setPending(null)}
+        onConfirm={() => void applyPending()}
+        title={confirmCopy.title}
+        description={confirmCopy.description}
+        confirmLabel={confirmCopy.confirmLabel}
+        tone={pending?.kind === "cancel" ? "danger" : "primary"}
+        busy={changing}
+      />
 
       <div className="flex items-center gap-2 text-xs text-muted-foreground">
         <Building2 className="h-3.5 w-3.5" />

@@ -170,6 +170,7 @@ export function AppsReport() {
 
   return (
     <ReportShell
+      aiExplain={{ slug: "apps-urls", query: { from: period.from, to: period.to, projectId, userId: memberId, timeZone } }}
       title="Apps & Websites"
       description="The applications your team works in, by time, by member and by category."
       actions={<ExportMenu onExportCSV={exportCsv} disabled={pending || rows.length === 0} />}

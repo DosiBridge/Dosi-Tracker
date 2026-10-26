@@ -8,6 +8,7 @@ import {
   type AgentPlatform,
 } from "./api-contract";
 import { addZonedDays, browserTimeZone, formatDayKey, formatInZone, zonedDayKey, zonedParts } from "./time-zone";
+import { sumCounts } from "./metrics";
 
 /* ============================================================================
  * ACTIVITY REPORT — pure derivations behind one block's detail view.
@@ -163,8 +164,8 @@ export function timelineSlots(activity: Pick<Activity, "startedAt" | "timeline">
     const b = byMinute.get(minute);
     slots.push(
       b
-        ? { ...b, at, total: b.keyboardHits + b.mouseClicks, missing: false }
-        : { minute, keyboardHits: 0, mouseClicks: 0, active: false, at, total: 0, missing: true },
+        ? { ...b, at, total: (b.keyboardHits ?? 0) + (b.mouseClicks ?? 0), missing: false }
+        : { minute, keyboardHits: null, mouseClicks: null, active: false, at, total: 0, missing: true },
     );
   }
   return slots;
@@ -173,8 +174,9 @@ export function timelineSlots(activity: Pick<Activity, "startedAt" | "timeline">
 export interface TimelineSummary {
   minutes: number;
   activeMinutes: number;
-  keyboardHits: number;
-  mouseClicks: number;
+  /** the measured minutes' input added up; null when no minute measured it */
+  keyboardHits: number | null;
+  mouseClicks: number | null;
   /** the minute with the most input (undefined when there was none) */
   peak?: TimelineSlot;
 }
@@ -185,8 +187,8 @@ export function summarizeTimeline(slots: TimelineSlot[]): TimelineSummary {
   return {
     minutes: slots.length,
     activeMinutes: slots.filter((s) => s.active).length,
-    keyboardHits: slots.reduce((sum, s) => sum + s.keyboardHits, 0),
-    mouseClicks: slots.reduce((sum, s) => sum + s.mouseClicks, 0),
+    keyboardHits: sumCounts(slots.map((s) => s.keyboardHits)),
+    mouseClicks: sumCounts(slots.map((s) => s.mouseClicks)),
     peak,
   };
 }

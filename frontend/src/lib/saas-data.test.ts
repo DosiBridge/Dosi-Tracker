@@ -2,8 +2,6 @@ import { describe, it, expect } from "vitest";
 import {
   plans,
   planById,
-  workspaces,
-  primaryWorkspace,
   workspaceUsage,
   liveSeatsUsed,
   monthlyCost,
@@ -16,6 +14,7 @@ import {
   type SubscriptionStatus,
 } from "./saas-data";
 import { NOW } from "./mock-data";
+import { primaryWorkspace, workspaces } from "./demo-tenants";
 import { countSeats } from "./roles";
 import { datasetFor } from "./tenant-data";
 import { buildUser, buildWorkspace } from "@/test/factories";

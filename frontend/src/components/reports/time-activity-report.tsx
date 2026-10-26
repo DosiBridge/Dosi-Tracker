@@ -219,6 +219,7 @@ export function TimeActivityReport() {
 
   return (
     <ReportShell
+      aiExplain={{ slug: "time-activity", query: { from: period.from, to: period.to, projectId, userId: memberId, timeZone } }}
       title="Time & Activity"
       description="Hours, activity (keyboard and mouse) and idle time per member, day by day."
       actions={<ExportMenu onExportCSV={exportCsv} disabled={pending || rows.length === 0} />}

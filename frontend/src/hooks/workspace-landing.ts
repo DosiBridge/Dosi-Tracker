@@ -24,9 +24,3 @@ export async function resolveLanding(): Promise<Landing> {
   }
   return choice.kind === "select" ? "dashboard" : "chooser";
 }
-
-/** A same-site path to return to after signing in (`?next=`), or null. */
-export function safeNext(raw: string | null | undefined): string | null {
-  if (!raw || !raw.startsWith("/") || raw.startsWith("//")) return null;
-  return raw;
-}

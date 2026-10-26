@@ -27,7 +27,13 @@ function json(body: unknown, status = 200): Response {
 let fetchMock: ReturnType<typeof vi.fn<typeof fetch>>;
 let assign: ReturnType<typeof vi.fn>;
 
-function backend(opts: { info?: unknown; infoStatus?: number; email?: string | null; accept?: { body: unknown; status?: number } } = {}) {
+function backend(opts: {
+  info?: unknown;
+  infoStatus?: number;
+  email?: string | null;
+  accept?: { body: unknown; status?: number };
+  decline?: { body: unknown; status?: number };
+} = {}) {
   fetchMock.mockImplementation(async (input, init) => {
     const url = String(input).replace(API, "");
     const method = init?.method ?? "GET";
@@ -36,6 +42,9 @@ function backend(opts: { info?: unknown; infoStatus?: number; email?: string | n
     }
     if (url === "/api/app/invitations/tok-1/accept" && method === "POST") {
       return json(opts.accept?.body ?? { workspaceId: WS, workspaceName: "RealCo", role: "member" }, opts.accept?.status ?? 200);
+    }
+    if (url === "/api/app/invitations/tok-1/decline" && method === "POST") {
+      return json(opts.decline?.body ?? {}, opts.decline?.status ?? 200);
     }
     if (url.startsWith("/api/abp/application-configuration")) {
       return json({ currentUser: { isAuthenticated: true, id: "u1", email: opts.email ?? "sam@realco.test", roles: [] }, auth: { grantedPolicies: {} } });
@@ -84,6 +93,27 @@ describe("invite page", () => {
     await user.click(await screen.findByRole("button", { name: /accept invitation/i }));
     await waitFor(() => expect(assign).toHaveBeenCalledWith("/dashboard"));
     expect(localStorage.getItem("dosi-workspace")).toBe(WS);
+  });
+
+  it("signed in with the invited email: Decline says no, joins nothing and points back to the chooser", async () => {
+    localStorage.setItem("dosi-token", "jwt");
+    backend();
+    const user = userEvent.setup();
+    render(<InviteView token="tok-1" />);
+    await user.click(await screen.findByRole("button", { name: /^decline$/i }));
+    expect(await screen.findByRole("status")).toHaveTextContent(/you declined the invitation/i);
+    expect(screen.getByRole("link", { name: /go to your workspaces/i })).toHaveAttribute("href", "/workspaces");
+    expect(fetchMock.mock.calls.some(([u, i]) => String(u).endsWith("/tok-1/accept") && i?.method === "POST")).toBe(false);
+    expect(localStorage.getItem("dosi-workspace")).toBeNull();
+  });
+
+  it("a refused decline (already used) is explained", async () => {
+    localStorage.setItem("dosi-token", "jwt");
+    backend({ decline: { body: { error: { code: "Tracker:InvitationExpired", message: "gone" } }, status: 410 } });
+    const user = userEvent.setup();
+    render(<InviteView token="tok-1" />);
+    await user.click(await screen.findByRole("button", { name: /^decline$/i }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(/no longer valid/i);
   });
 
   it("signed in as someone else: explains the mismatch and offers to sign out", async () => {

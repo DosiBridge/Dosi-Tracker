@@ -18,7 +18,7 @@ import {
   activeMinutes,
   activitiesOnDay,
   activitiesOnZonedDay,
-  averageProductivity,
+  activityPercent,
   durationMinutes,
   inRange,
   minutesForProject,
@@ -169,7 +169,7 @@ function field(rec: Record<string, unknown>, name: string): unknown {
 
 /** A reported, non-negative whole count — or undefined when the field is absent or not a number. */
 function optionalCount(value: unknown): number | undefined {
-  if (value === undefined || value === null || value === "") return undefined;
+  if (value === undefined || value === null || (typeof value === "string" && value.trim() === "")) return undefined;
   const n = typeof value === "number" ? value : Number(value);
   return Number.isFinite(n) ? Math.max(0, Math.round(n)) : undefined;
 }
@@ -240,14 +240,15 @@ export function parseTimeline(raw: unknown): ActivityMinute[] {
   for (const rec of recordsOf(raw)) {
     const minute = num(field(rec, "minute"), Number.NaN);
     if (!Number.isInteger(minute) || minute < 0 || minute >= MAX_TIMELINE_MINUTES) continue;
-    const keyboardHits = optionalCount(field(rec, "keyboardHits")) ?? 0;
-    const mouseClicks = optionalCount(field(rec, "mouseClicks")) ?? 0;
+    // A count the agent didn't measure stays null (never a fabricated 0).
+    const keyboardHits = optionalCount(field(rec, "keyboardHits")) ?? null;
+    const mouseClicks = optionalCount(field(rec, "mouseClicks")) ?? null;
     const flag = field(rec, "active");
     const bucket: ActivityMinute = {
       minute,
       keyboardHits,
       mouseClicks,
-      active: typeof flag === "boolean" ? flag : keyboardHits + mouseClicks > 0,
+      active: typeof flag === "boolean" ? flag : (keyboardHits ?? 0) + (mouseClicks ?? 0) > 0,
     };
     const appName = str(field(rec, "appName")).trim();
     if (appName) bucket.appName = appName;
@@ -440,8 +441,9 @@ export function mapApiActivity(dto: ApiActivityDto | null | undefined): Activity
     endedAt,
     description: str(dto.description).trim() || DEFAULT_SESSION_DESCRIPTION,
     productivity: measured ? Math.min(100, Math.max(0, Math.round(num(dto.productivity)))) : 0,
-    mouseClicks: Math.max(0, Math.round(num(dto.mouseClicks))),
-    keyboardHits: Math.max(0, Math.round(num(dto.keyboardHits))),
+    // Null when the block's input wasn't counted (consent off, Wayland…): never read as 0.
+    mouseClicks: optionalCount(dto.mouseClicks) ?? null,
+    keyboardHits: optionalCount(dto.keyboardHits) ?? null,
     activeWindows: active,
     runningPrograms: running,
     screen: screenFor(active),
@@ -450,9 +452,15 @@ export function mapApiActivity(dto: ApiActivityDto | null | undefined): Activity
     timeline: parseTimeline(dto.timelineJson),
     captures,
     note: normalizeActivityNote(dto.description),
+    ...(uploadedAtOf(dto) ? { uploadedAt: uploadedAtOf(dto) as string } : {}),
     ...(measured ? {} : { activityMeasured: false }),
     ...agentContext(dto, blockSeconds),
   };
+}
+
+/** When the server received the block (its creationTime), or null when it didn't say. */
+function uploadedAtOf(dto: ApiActivityDto): string | null {
+  return normalizeUtcIso((dto as { creationTime?: unknown }).creationTime);
 }
 
 /** Map + filter a list payload; anything that is not an array maps to []. */
@@ -603,7 +611,9 @@ export function mapTeamMember(dto: ApiTeamMemberDto, activities: Activity[], now
     status,
     timezone: deviceZone ?? "UTC",
     trackedToday: Math.round(totalMinutes(todays)),
-    productivity: averageProductivity(todays),
+    // Null when today's rows weren't measured (consent off, Wayland, …) or
+    // there are none — never a fabricated 0% (see metrics.ts: activityPercent).
+    productivity: activityPercent(todays),
     joinedAt: "",
   };
 }

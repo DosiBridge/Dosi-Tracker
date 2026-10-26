@@ -46,6 +46,7 @@ import {
 } from "@/components/projects/project-form";
 import { editRulesFor, memberNameOf, membershipErrorText, projectRoleLabel, projectRoleOf } from "@/components/projects/membership";
 import { ProjectTasksSection } from "@/components/projects/project-tasks";
+import { AiPeriodSummaryCard } from "@/components/ai/ai-period-summary-card";
 import { requestErrorText } from "@/components/layout/request-error";
 import { activitiesForProject, projectById, userById, users } from "@/lib/tenant-data";
 import { averageProductivity, durationMinutes } from "@/lib/metrics";
@@ -385,6 +386,9 @@ export default function ProjectDetailPage() {
     { label: "Members", value: String(memberRows.length), icon: Users },
   ];
 
+  /** "Project pulse" covers the last 7 days, today included, in the reporting zone. */
+  const pulsePeriod = zonedPeriod("7d", now, zone.timeZone);
+
   const isPrivileged = user.role === "owner" || user.role === "admin";
   const myProjectMembership = apiMembers?.find((m) => m.userId === user.id);
   const isProjectMember = Boolean(myProjectMembership);
@@ -665,6 +669,17 @@ export default function ProjectDetailPage() {
         isLive={project.live}
         canMutate={canMutateTasks}
       />
+
+      {/* "Project pulse": an AI summary of the project's last 7 days, for whoever sees the team's figures */}
+      {canManage && zone.ready && (
+        <AiPeriodSummaryCard
+          scope="team"
+          projectId={project.id}
+          from={pulsePeriod.from}
+          to={pulsePeriod.to}
+          timeZone={zone.timeZone}
+        />
+      )}
 
       {/* Recent activity */}
       <Card>

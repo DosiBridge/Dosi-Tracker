@@ -33,8 +33,8 @@ export interface User {
   timezone: string;
   /** minutes tracked today */
   trackedToday: number;
-  /** 0-100 */
-  productivity: number;
+  /** Today's Activity %, 0-100; null when today's input wasn't measured (metrics.ts: activityPercent). */
+  productivity: number | null;
   joinedAt: string;
 }
 
@@ -89,8 +89,10 @@ export interface WindowInfo {
 export interface ActivityMinute {
   /** 0-based bucket index from `startedAt` (the last bucket may run slightly long) */
   minute: number;
-  keyboardHits: number;
-  mouseClicks: number;
+  /** Key presses in the minute; null when not measured (never a fabricated 0). */
+  keyboardHits: number | null;
+  /** Mouse clicks in the minute; null when not measured. */
+  mouseClicks: number | null;
   /** false when the member was idle for the whole minute */
   active: boolean;
   /** the app focused for most of the minute, when known */
@@ -126,8 +128,14 @@ export interface Activity {
    * unmeasured block shows "Not measured" instead of a false 0%.
    */
   productivity: number;
-  mouseClicks: number;
-  keyboardHits: number;
+  /**
+   * Mouse clicks / key presses of the block (counts only, never which keys).
+   * Null when not measured — no consent, a session that can't count input, or
+   * a project that allows neither — and 0 only when measured as zero; show
+   * null as "—" / "Not measured" (metrics.ts: INPUT_COUNT_METRIC).
+   */
+  mouseClicks: number | null;
+  keyboardHits: number | null;
   activeWindows: WindowInfo[];
   runningPrograms: WindowInfo[];
   /** synthetic screenshot descriptor rendered client-side */
@@ -166,6 +174,8 @@ export interface Activity {
   clockSkewSeconds?: number;
   /** Software-injected input seen during the block (excluded from the counts and Activity %). */
   injectedInputEvents?: number;
+  /** When the server received the block (ActivityDto.creationTime; live rows): members' capture deletion window counts from it. */
+  uploadedAt?: string;
 }
 
 export interface ScreenMock {

@@ -1,7 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
-import { CheckCircle2, Circle, Loader2, Pencil, Plus } from "lucide-react";
+import dynamic from "next/dynamic";
+import { CheckCircle2, Circle, Loader2, Pencil, Plus, Sparkles } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -9,6 +10,8 @@ import { Modal } from "@/components/ui/modal";
 import { Input } from "@/components/ui/input";
 import { toast } from "@/components/toast";
 import { requestErrorText } from "@/components/layout/request-error";
+import { useAiAssistant } from "@/components/ai/ai-provider";
+import { aiAvailability } from "@/lib/ai-assist";
 import { currentWorkspaceId } from "@/lib/live-session";
 import {
   PROJECT_TASK_LIMITS,
@@ -21,6 +24,9 @@ import {
   getProjectTasksApi,
   updateProjectTaskApi,
 } from "@/hooks/useApi";
+
+// "Draft tasks with AI" downloads when it is first opened (AI assist spec §18.1).
+const TaskDraftDialog = dynamic(() => import("@/components/ai/task-draft-dialog").then((m) => m.TaskDraftDialog), { ssr: false });
 
 export type TaskFilter = "all" | "open" | "completed";
 
@@ -76,6 +82,10 @@ export function ProjectTasksSection({
   const [busyTaskId, setBusyTaskId] = useState<string | null>(null);
   const [createModalOpen, setCreateModalOpen] = useState(false);
   const [editingTask, setEditingTask] = useState<ProjectTaskDto | null>(null);
+  const [draftingOpen, setDraftingOpen] = useState(false);
+  // AI task drafts: offered only where tasks can be added and the server allows this caller the feature.
+  const { status: aiStatus } = useAiAssistant();
+  const canDraft = canMutate && !projectArchived && aiAvailability(aiStatus, "task-drafts").visible;
 
   // Monotonic generation counters for publication safety (accessed only outside render)
   const scopeGenRef = useRef(0);
@@ -114,6 +124,7 @@ export function ProjectTasksSection({
     setBusyTaskId(null);
     setCreateModalOpen(false);
     setEditingTask(null);
+    setDraftingOpen(false);
   }
 
   // Sync latest scope & query generation refs outside render
@@ -383,6 +394,11 @@ export function ProjectTasksSection({
             </div>
           )}
 
+          {canDraft && (
+            <Button size="sm" variant="outline" onClick={() => setDraftingOpen(true)}>
+              <Sparkles aria-hidden className="h-3.5 w-3.5" /> Draft tasks with AI
+            </Button>
+          )}
           {canMutate && !projectArchived && (
             <Button size="sm" onClick={() => setCreateModalOpen(true)}>
               <Plus className="h-3.5 w-3.5" /> Add task
@@ -629,6 +645,18 @@ export function ProjectTasksSection({
               }
               setRefreshWarning("Task was created, but we couldn't refresh the list. Retry to update.");
             }
+          }}
+        />
+      )}
+
+      {/* AI task drafts: reviewed, then saved one by one through the same create endpoint */}
+      {draftingOpen && (
+        <TaskDraftDialog
+          projectId={projectId}
+          existingTasks={tasks}
+          onClose={() => setDraftingOpen(false)}
+          onCreated={() => {
+            if (isLive) void loadTasks();
           }}
         />
       )}

@@ -278,6 +278,7 @@ export function DevicesReport() {
 
   return (
     <ReportShell
+      aiExplain={{ slug: "devices", query: { from: period.from, to: period.to, projectId, userId: memberId, timeZone } }}
       title="Devices & Agents"
       description="Every computer running the desktop agent: platform, agent version, live status and time tracked."
       actions={<ExportMenu onExportCSV={exportCsv} disabled={pending || rows.length === 0} />}

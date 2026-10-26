@@ -13,10 +13,13 @@ import { axe } from "jest-axe";
 import DownloadPage from "@/app/(dashboard)/download/page";
 import { Sidebar } from "@/components/layout/sidebar";
 import { CommandPalette } from "@/components/command-palette";
-import { AGENT_SERVER_URL } from "@/components/dashboard/agent-setup";
+import { agentServerUrl } from "@/components/dashboard/agent-setup";
+import { DEFAULT_DOWNLOAD_BASE_URL } from "@/lib/runtime-config";
 import { renderAsRole, renderWithProviders, resetPrototypeState } from "@/test/harness";
 
-const API = (process.env.NEXT_PUBLIC_API_URL || "https://localhost:6006").replace(/\/+$/, "");
+const API = agentServerUrl()!;
+const DOWNLOADS = DEFAULT_DOWNLOAD_BASE_URL;
+const AGENT_SERVER_URL = API;
 
 let fetchMock: ReturnType<typeof vi.fn<typeof fetch>>;
 let platformSpy: ReturnType<typeof vi.spyOn> | null = null;
@@ -36,6 +39,7 @@ afterEach(() => {
   platformSpy?.mockRestore();
   platformSpy = null;
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
 });
 
 function browseFrom(platform: string) {
@@ -107,38 +111,60 @@ describe("Feature: Connecting a desktop agent", () => {
       const mac = screen.getByRole("region", { name: /macos/i });
       const text = mac.textContent ?? "";
       expect(text).toContain("Screen Recording — for screenshots");
-      expect(text).toContain("Accessibility — to count keyboard and mouse activity");
+      expect(text).toContain("Input Monitoring — to count keyboard and mouse activity (never what you type)");
+      expect(text).toContain("Accessibility — to read the active window's title");
       expect(text).toContain("Camera — only if your project turns on webcam photos");
-      expect(text).not.toMatch(/Accessibilityin/);
+      expect(text).not.toMatch(/Accessibilityto|Monitoringto/);
       expect(text).toContain("System Settings → Privacy & Security");
+      expect(within(mac).getByRole("link", { name: /download for macos/i })).toHaveAttribute("href", `${DOWNLOADS}/DosiTracker-macos.zip`);
       expect(within(mac).getByRole("link", { name: /macos setup guide/i })).toHaveAttribute("href", "/install/macos");
     });
 
-    it("Given the Download page Then Windows names the installer and needs no special permissions", () => {
+    it("Given the Download page Then Windows downloads the released installer and needs no special permissions", () => {
       renderAsRole(<DownloadPage />, "worker", { route: "/download" });
 
       const windows = screen.getByRole("region", { name: /windows/i });
-      expect(within(windows).getByText("dosi-tracker-setup-<version>.exe")).toBeInTheDocument();
+      expect(within(windows).getAllByText("dosi-tracker-setup.exe").length).toBeGreaterThan(0);
       expect(within(windows).getByText(/asks for no special permissions/i)).toBeInTheDocument();
-      expect(within(windows).getByRole("link", { name: /download for windows/i })).toHaveAttribute("rel", expect.stringContaining("noopener"));
-      expect(within(windows).getByRole("link", { name: /windows setup & packaging guide/i })).toHaveAttribute("href", "/install/windows");
+      expect(within(windows).getByRole("link", { name: /download for windows/i })).toHaveAttribute("href", `${DOWNLOADS}/dosi-tracker-setup.exe`);
+      expect(within(windows).getByRole("link", { name: /windows setup guide/i })).toHaveAttribute("href", "/install/windows");
     });
 
-    it("Given the Download page Then Linux card clearly discloses client is not implemented and links to architecture specification", () => {
+    it("Given the Download page Then Linux offers the .deb, .rpm and tarball and the real commands", () => {
       renderAsRole(<DownloadPage />, "worker", { route: "/download" });
 
       const linux = screen.getByRole("region", { name: /linux/i });
-      expect(within(linux).getByText(/Client Not Implemented \(Architecture Planned\)/i)).toBeInTheDocument();
-      expect(within(linux).getByText(/no Linux client implementation in the repository/i)).toBeInTheDocument();
-      expect(within(linux).getByText(/no root, sudo, or evdev keylogging/i)).toBeInTheDocument();
-      expect(within(linux).getByRole("link", { name: /linux architecture specification/i })).toHaveAttribute("href", "/install/linux");
-      // Negative oracle: must NOT tell the user to configure a nonexistent client or config.toml
-      expect(within(linux).queryByText(/config\.toml/i)).not.toBeInTheDocument();
+      expect(within(linux).getByRole("link", { name: /download for linux/i })).toHaveAttribute("href", `${DOWNLOADS}/dosi-tracker_amd64.deb`);
+      expect(within(linux).getByRole("link", { name: /rpm package/i })).toHaveAttribute("href", `${DOWNLOADS}/dosi-tracker.x86_64.rpm`);
+      expect(within(linux).getByRole("link", { name: /tarball/i })).toHaveAttribute("href", `${DOWNLOADS}/dosi-tracker-linux-x86_64.tar.gz`);
+      expect(within(linux).getByText("sudo apt install ./dosi-tracker_amd64.deb")).toBeInTheDocument();
+      expect(within(linux).getByText("dosi-tracker service enable --now")).toBeInTheDocument();
+      expect(within(linux).getByText("dosi-tracker-gui")).toBeInTheDocument();
+      expect(within(linux).getByText(/never as root/i)).toBeInTheDocument();
+      expect(within(linux).getByText(/reported as not measured/i)).toBeInTheDocument();
+      expect(within(linux).getByRole("link", { name: /linux setup guide/i })).toHaveAttribute("href", "/install/linux");
+      // Negative oracle: the old "no Linux client exists" claim is gone.
+      expect(within(linux).queryByText(/not implemented/i)).not.toBeInTheDocument();
     });
 
-    it("Given the Download page Then it provides a link to the complete multi-platform installation guides & matrix", () => {
+    it("Given the Download page Then the checksums download from the same place as the agents", () => {
       renderAsRole(<DownloadPage />, "worker", { route: "/download" });
-      expect(screen.getByRole("link", { name: /view installation guides & matrix/i })).toHaveAttribute("href", "/install");
+      expect(screen.getByRole("link", { name: /checksums/i })).toHaveAttribute("href", `${DOWNLOADS}/SHA256SUMS`);
+      expect(screen.getByRole("link", { name: /release notes/i })).toHaveAttribute("href", "https://github.com/DosiBridge/Dosi-Tracker/releases");
+    });
+
+    it("Given a deployment with its own download server Then every link points there", () => {
+      vi.stubEnv("DOSI_DOWNLOAD_BASE_URL", "https://files.example.com/agents/");
+      renderAsRole(<DownloadPage />, "worker", { route: "/download" });
+      expect(screen.getByRole("link", { name: /download for windows/i })).toHaveAttribute("href", "https://files.example.com/agents/dosi-tracker-setup.exe");
+      expect(screen.getByRole("link", { name: /checksums/i })).toHaveAttribute("href", "https://files.example.com/agents/SHA256SUMS");
+      // Not GitHub: there is no releases page to link.
+      expect(screen.queryByRole("link", { name: /release notes/i })).not.toBeInTheDocument();
+    });
+
+    it("Given the Download page Then it links the complete installation guides", () => {
+      renderAsRole(<DownloadPage />, "worker", { route: "/download" });
+      expect(screen.getByRole("link", { name: /installation guides/i })).toHaveAttribute("href", "/install");
     });
 
     it("a11y: the Download page has no axe violations", async () => {

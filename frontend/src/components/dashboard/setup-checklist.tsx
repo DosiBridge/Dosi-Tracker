@@ -3,8 +3,11 @@
 import Link from "next/link";
 import { CheckCircle2, Circle, Download, FolderPlus, UserPlus, ArrowRight } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { AiSetupHelpButton } from "@/components/ai/ai-setup-help-button";
 import { projects, users, activities } from "@/lib/tenant-data";
 import { isTrackedMember } from "@/lib/roles";
+import { billingEnabledFor } from "@/lib/saas-data";
+import { useSession } from "@/components/session-provider";
 import { cn } from "@/lib/utils";
 import { linkButtonClass } from "./link-button";
 
@@ -14,6 +17,8 @@ import { linkButtonClass } from "./link-button";
  * agent tracks time ON one — so the project comes first.
  */
 export function SetupChecklist({ isOwner }: { isOwner: boolean }) {
+  const { workspace } = useSession();
+  const billing = billingEnabledFor(workspace);
   const hasProject = projects.some((p) => !p.archived);
   // "Invite your team" is done only once someone besides the owner is on the
   // roster — a workspace of one has not invited anybody yet.
@@ -62,11 +67,14 @@ export function SetupChecklist({ isOwner }: { isOwner: boolean }) {
               {remaining} {remaining === 1 ? "step" : "steps"} left — create a project, invite people to it, then install the agent.
             </p>
           </div>
-          {isOwner && (
-            <Link href="/billing" className="text-xs text-muted-foreground hover:text-foreground hover:underline">
-              Plan & billing later →
-            </Link>
-          )}
+          <div className="flex flex-wrap items-center gap-3">
+            <AiSetupHelpButton />
+            {isOwner && billing && (
+              <Link href="/billing" className="text-xs text-muted-foreground hover:text-foreground hover:underline">
+                Plan & billing later →
+              </Link>
+            )}
+          </div>
         </div>
       </CardHeader>
       <CardContent>

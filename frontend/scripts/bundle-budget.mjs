@@ -21,8 +21,18 @@ const MAX_SINGLE_CHUNK_KB = Number(process.env.BUDGET_MAX_CHUNK_KB ?? 480);
 // primitives); recharts was moved behind ONE dynamic import (components/charts)
 // so its ~420 KB is shipped once instead of once per route group, and about
 // 300 KB of the total are Turbopack's per-route copies of small shared modules
-// (page header, data table…), which no config option controls. 2400 KB keeps
+// (page header, data table…), which no config option controlled then. 2400 KB keeps
 // ~5% headroom; the largest-chunk limit is unchanged.
+//
+// 2026-10, AI assist (FE-02/FE-03): Next 16's experimental.turbopackChunking does
+// control that duplication. With minChunkSize 15 000 (next.config.ts) the copies
+// fell from ~440 KB to ~300 KB, so the build with AI assist's cards, settings,
+// host card and demo output measures 2330 KB: the budget is unchanged.
+//
+// 2026-10, journey UI (F5: recovery pages, invitations, devices, deletion,
+// retention, billing modes): at minChunkSize 15 000 the build measured 2480 KB,
+// ~340 KB of it per-route copies again. Lowering it to 6 000 (next.config.ts)
+// measured 2344 KB with the same JavaScript per page; the budget is unchanged.
 const MAX_TOTAL_KB = Number(process.env.BUDGET_MAX_TOTAL_KB ?? 2400);
 
 function walk(dir) {

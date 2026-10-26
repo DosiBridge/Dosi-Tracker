@@ -13,6 +13,7 @@ import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { EmptyState } from "@/components/ui/empty-state";
 import { PageHeader } from "@/components/ui/page-header";
+import { ReportExplainer } from "@/components/ai/report-explainer";
 import { useSession } from "@/components/session-provider";
 import { usePrefersReducedMotion } from "@/hooks/use-count-up";
 import { useIsMdUp } from "@/hooks/use-media-query";
@@ -21,6 +22,7 @@ import { useStoredChoice } from "@/hooks/use-stored-choice";
 import { referenceNow } from "@/lib/live-session";
 import { filterActivitiesByRange } from "@/lib/reports-data";
 import { activities } from "@/lib/tenant-data";
+import type { ReportingQuery } from "@/lib/api-contract";
 import { ALL, resolveReportPeriod, type DayBar, type ReportPeriod, type ReportPeriodPreset } from "@/lib/report-math";
 import {
   HOURS_FORMATS,
@@ -60,11 +62,18 @@ export function ReportShell({
   title,
   description,
   actions,
+  aiExplain,
   children,
 }: {
   title: string;
   description?: string;
   actions?: React.ReactNode;
+  /**
+   * The report's catalog slug and the query its figures come from: offers
+   * "Explain this report" (AI assist) for exactly that period and those
+   * filters, to anyone the server allows it. Never on pay reports.
+   */
+  aiExplain?: { slug: string; query: ReportingQuery } | null;
   children: React.ReactNode;
 }) {
   return (
@@ -73,6 +82,7 @@ export function ReportShell({
         <ArrowLeft className="h-4 w-4" /> All reports
       </Link>
       <PageHeader title={title} description={description} actions={actions} eyebrow="Report" />
+      {aiExplain && <ReportExplainer slug={aiExplain.slug} query={aiExplain.query} />}
       {children}
     </div>
   );

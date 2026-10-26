@@ -10,6 +10,7 @@ import {
   timelineTickStep,
   type TimelineSlot,
 } from "@/lib/activity-report";
+import { INPUT_COUNT_METRIC, formatCount } from "@/lib/metrics";
 import type { Activity } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -24,6 +25,8 @@ const MOUSE_FILL = "bg-[#eb6834] dark:bg-[#d95926]";
 const IDLE_FILL = "bg-muted-foreground/15";
 
 const n = (value: number) => value.toLocaleString("en");
+/** A count, or "not measured" in words (never a fabricated 0). */
+const said = (value: number | null, what: string) => (value === null ? `${what} not measured` : `${n(value)} ${what}`);
 
 function slotStatus(slot: TimelineSlot): string {
   if (slot.missing) return "No data";
@@ -35,7 +38,7 @@ function describeSlot(slot: TimelineSlot, timeZone?: string): string {
   const app = slot.appName ? ` in ${friendlyAppName(slot.appName)}` : "";
   if (slot.missing) return `${formatClock(slot.at, timeZone)}: no data`;
   if (!slot.active && slot.total === 0) return `${formatClock(slot.at, timeZone)}: idle`;
-  return `${formatClock(slot.at, timeZone)}: ${n(slot.keyboardHits)} keyboard, ${n(slot.mouseClicks)} mouse${app}`;
+  return `${formatClock(slot.at, timeZone)}: ${said(slot.keyboardHits, "keyboard")}, ${said(slot.mouseClicks, "mouse")}${app}`;
 }
 
 /**
@@ -65,7 +68,7 @@ export function ActivityTimeline({
   const label =
     `Input per minute, ${formatClock(activity.startedAt, timeZone)} to ${formatClock(activity.endedAt, timeZone)}: ` +
     `active ${summary.activeMinutes} of ${summary.minutes} minutes, ` +
-    `${n(summary.keyboardHits)} keyboard presses and ${n(summary.mouseClicks)} mouse clicks` +
+    `${said(summary.keyboardHits, "keyboard presses")} and ${said(summary.mouseClicks, "mouse clicks")}` +
     (summary.peak ? `; busiest minute ${formatClock(summary.peak.at, timeZone)} with ${n(summary.peak.total)} inputs.` : ".");
 
   function onKeyDown(e: React.KeyboardEvent) {
@@ -187,8 +190,8 @@ export function ActivityTimeline({
                 <tr key={slot.minute} className="border-t border-border">
                   <td className="whitespace-nowrap px-3 py-1.5 tabular-nums">{formatClock(slot.at, timeZone)}</td>
                   <td className="px-3 py-1.5">{slotStatus(slot)}</td>
-                  <td className="px-3 py-1.5 text-right tabular-nums">{slot.missing ? "—" : n(slot.keyboardHits)}</td>
-                  <td className="px-3 py-1.5 text-right tabular-nums">{slot.missing ? "—" : n(slot.mouseClicks)}</td>
+                  <td className="px-3 py-1.5 text-right tabular-nums">{formatCount(slot.keyboardHits, n)}</td>
+                  <td className="px-3 py-1.5 text-right tabular-nums">{formatCount(slot.mouseClicks, n)}</td>
                   <td className="max-w-[10rem] truncate px-3 py-1.5 text-muted-foreground" title={slot.appName}>
                     {slot.appName ? friendlyAppName(slot.appName) : "—"}
                   </td>
@@ -215,8 +218,10 @@ function Column({
   onEnter: () => void;
 }) {
   const pct = (v: number) => `${(v / max) * 100}%`;
-  const hasMouse = slot.mouseClicks > 0;
-  const hasKeys = slot.keyboardHits > 0;
+  const mouse = slot.mouseClicks ?? 0;
+  const keys = slot.keyboardHits ?? 0;
+  const hasMouse = mouse > 0;
+  const hasKeys = keys > 0;
   return (
     // The whole column is the hover target, not just the painted bar.
     <div onPointerEnter={onEnter} className="relative flex h-full min-w-0 flex-1 justify-center">
@@ -234,11 +239,11 @@ function Column({
           emphasis === "dim" && "opacity-40",
         )}
       >
-        {hasMouse && <div className={cn("rounded-t-[4px]", MOUSE_FILL)} style={{ height: pct(slot.mouseClicks), minHeight: 2 }} />}
+        {hasMouse && <div className={cn("rounded-t-[4px]", MOUSE_FILL)} style={{ height: pct(mouse), minHeight: 2 }} />}
         {hasKeys && (
           <div
             className={cn(KEYBOARD_FILL, hasMouse ? "mt-0.5" : "rounded-t-[4px]")}
-            style={{ height: pct(slot.keyboardHits), minHeight: 2 }}
+            style={{ height: pct(keys), minHeight: 2 }}
           />
         )}
         {/* Active with no clicks or keys (e.g. reading, scrolling): a stub, so it doesn't read as idle. */}
@@ -257,11 +262,13 @@ function LegendKey({ className, label }: { className: string; label: string }) {
   );
 }
 
-function TipRow({ className, value, label }: { className: string; value: number; label: string }) {
+function TipRow({ className, value, label }: { className: string; value: number | null; label: string }) {
   return (
     <div className="flex items-center gap-1.5">
       <span className={cn("h-0.5 w-3 rounded-full", className)} aria-hidden />
-      <span className="font-semibold tabular-nums text-foreground">{n(value)}</span>
+      <span className="font-semibold tabular-nums text-foreground" title={value === null ? INPUT_COUNT_METRIC.notMeasured : undefined}>
+        {formatCount(value, n)}
+      </span>
       <span className="text-muted-foreground">{label}</span>
     </div>
   );

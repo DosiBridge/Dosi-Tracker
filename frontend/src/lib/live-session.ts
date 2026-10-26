@@ -1,4 +1,4 @@
-import { NOW } from "./mock-data";
+import { NOW } from "./demo-clock";
 
 /* ============================================================================
  * LIVE vs DEMO — the one probe every surface uses.
@@ -6,8 +6,10 @@ import { NOW } from "./mock-data";
  * A session is LIVE when the browser holds a real backend bearer token (written
  * by `loginApi`). In a live session the app must show ONLY real data or honest
  * empty / error states — never the built-in demo dataset (demo people, demo
- * companies, demo cards, demo notifications). Demo mode (no token) keeps the
- * seeded dataset so the product can be explored offline and tested.
+ * companies, demo cards, demo notifications). Without a token a visitor sees
+ * the seeded demo only where the deployment turned demo mode on
+ * (DOSI_DEMO_MODE, for exploring offline and the E2E suite); everywhere else
+ * they are signed out.
  *
  * Pages used to re-implement `localStorage.getItem("dosi-token")` inline; call
  * `isLiveSession()` instead so the rule lives in exactly one place.
@@ -105,7 +107,7 @@ export function isStorageAvailable(): boolean {
 
 /** True when a real backend session token is present (browser only). */
 export function isLiveSession(): boolean {
-  // Storage can be blocked (privacy mode, sandboxed iframe): no token → demo.
+  // Storage can be blocked (privacy mode, sandboxed iframe): no token → not live.
   return !!readStorage(TOKEN_STORAGE_KEY);
 }
 

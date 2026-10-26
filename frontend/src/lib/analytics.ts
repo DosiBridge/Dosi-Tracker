@@ -2,6 +2,7 @@ import type { Activity, WindowInfo } from "./types";
 import { END_REASON_LABELS, normalizeActivityNote, platformLabel, type ActivityEndReason, type AgentPlatform } from "./api-contract";
 import { OTHER_APPS_NAME, appColor, appKey, friendlyAppName } from "./apps";
 import { normalizeUtcIso, parseTimeline, parseWindowList } from "./live-dataset";
+import { addCounts, inputCountOf } from "./metrics";
 import { formatUtcOffset, isValidTimeZone, normalizeTimeZone, startOfZonedDay, utcOffsetMinutes } from "./time-zone";
 import {
   aggregateTracked,
@@ -294,8 +295,9 @@ export function blocksFromApi(rows: readonly unknown[]): Block[] {
       minutes,
       activity,
       idleMinutes: blockIdleMinutes({ minutes, idleSeconds: dto.idleSeconds, timeline: parseTimeline(dto.timelineJson), activity }),
-      keys: Math.max(0, finite(dto.keyboardHits)),
-      clicks: Math.max(0, finite(dto.mouseClicks)),
+      // Unmeasured input stays null (consent off, Wayland…), never a fabricated 0.
+      keys: inputCountOf(dto.keyboardHits),
+      clicks: inputCountOf(dto.mouseClicks),
       apps: appsOf(windows),
       note: normalizeActivityNote(typeof dto.description === "string" ? dto.description : null),
       ...extrasOf(dto),
@@ -424,20 +426,21 @@ export interface HourStat {
   minutes: number;
   /** Activity of the measured minutes, 0–100; null when none were measured. */
   activity: number | null;
-  keys: number;
-  clicks: number;
+  /** Key presses / clicks of the hour; null when not measured (or the source doesn't carry them). */
+  keys: number | null;
+  clicks: number | null;
 }
 
-/** Minutes per hour of day, from the weekday × hour cells (no activity: the cells don't carry it). */
+/** Minutes per hour of day, from the weekday × hour cells (no activity or input: the cells don't carry them). */
 export function hourTotals(cells: readonly HourCell[]): HourStat[] {
-  const totals = Array.from({ length: 24 }, (_, hour) => ({ hour, minutes: 0, activity: null as number | null, keys: 0, clicks: 0 }));
+  const totals = Array.from({ length: 24 }, (_, hour): HourStat => ({ hour, minutes: 0, activity: null, keys: null, clicks: null }));
   for (const c of cells) totals[c.hour].minutes += c.minutes;
   return totals;
 }
 
 /** Totals per hour of day of the reporting zone, from blocks: time, measured activity and input. */
 export function hourProfile(blocks: readonly Block[], calendar: ZoneCalendar): HourStat[] {
-  const acc = Array.from({ length: 24 }, (_, hour) => ({ hour, minutes: 0, weighted: 0, measured: 0, keys: 0, clicks: 0 }));
+  const acc = Array.from({ length: 24 }, (_, hour) => ({ hour, minutes: 0, weighted: 0, measured: 0, keys: null as number | null, clicks: null as number | null }));
   for (const b of blocks) {
     for (const p of hourPieces(b.start, b.end, calendar)) {
       const e = acc[p.hour];
@@ -447,16 +450,16 @@ export function hourProfile(blocks: readonly Block[], calendar: ZoneCalendar): H
         e.weighted += p.minutes * b.activity;
         e.measured += p.minutes;
       }
-      e.keys += b.keys * share;
-      e.clicks += b.clicks * share;
+      e.keys = addCounts(e.keys, b.keys === null ? null : b.keys * share);
+      e.clicks = addCounts(e.clicks, b.clicks === null ? null : b.clicks * share);
     }
   }
   return acc.map((e) => ({
     hour: e.hour,
     minutes: e.minutes,
     activity: e.measured > 0 ? Math.round(e.weighted / e.measured) : null,
-    keys: Math.round(e.keys),
-    clicks: Math.round(e.clicks),
+    keys: e.keys === null ? null : Math.round(e.keys),
+    clicks: e.clicks === null ? null : Math.round(e.clicks),
   }));
 }
 
@@ -491,8 +494,9 @@ export interface DayStat {
   idleMinutes: number | null;
   /** Blocks that started this day. */
   sessions: number;
-  keys: number;
-  clicks: number;
+  /** Null when nothing that day measured them. */
+  keys: number | null;
+  clicks: number | null;
   /** Distinct members with time this day. */
   members: number;
 }
@@ -518,8 +522,8 @@ export function dayStats(agg: ReportAggregates, days: readonly string[]): DaySta
       activity: minutes > 0 ? (d?.activity ?? null) : null,
       idleMinutes: d ? d.idleMinutes : null,
       sessions: d?.sessions ?? 0,
-      keys: d?.keys ?? 0,
-      clicks: d?.clicks ?? 0,
+      keys: d ? d.keys : null,
+      clicks: d ? d.clicks : null,
       members: members.get(day)?.size ?? 0,
     };
   });
@@ -809,9 +813,10 @@ export interface MemberStat {
   /** Mean / longest stretch length in minutes; null when none of their blocks were loaded. */
   avgStretch: number | null;
   longestStretch: number | null;
-  keys: number;
-  clicks: number;
-  /** Key presses + clicks per tracked hour of their loaded blocks; null without any. */
+  /** Their loaded blocks' key presses / clicks; null when none of them measured input. */
+  keys: number | null;
+  clicks: number | null;
+  /** Key presses + clicks per tracked hour of the loaded blocks that measured input; null without any. */
   inputPerHour: number | null;
   /**
    * How steady the member's daily hours are, 0–100 (100 = the same every
@@ -837,11 +842,13 @@ export function memberStats(agg: ReportAggregates, blocks: readonly Block[], day
     if (list) list.push(s);
     else own.set(s.userId, [s]);
   }
-  const input = new Map<string, { keys: number; clicks: number; minutes: number }>();
+  // Only blocks that counted input add to it, minutes included: an unmeasured block must not dilute the rate.
+  const input = new Map<string, { keys: number | null; clicks: number | null; minutes: number }>();
   for (const b of blocks) {
-    const e = input.get(b.userId) ?? { keys: 0, clicks: 0, minutes: 0 };
-    e.keys += b.keys;
-    e.clicks += b.clicks;
+    if (b.keys === null && b.clicks === null) continue;
+    const e = input.get(b.userId) ?? { keys: null, clicks: null, minutes: 0 };
+    e.keys = addCounts(e.keys, b.keys);
+    e.clicks = addCounts(e.clicks, b.clicks);
     e.minutes += b.minutes;
     input.set(b.userId, e);
   }
@@ -884,9 +891,9 @@ export function memberStats(agg: ReportAggregates, blocks: readonly Block[], day
         daily,
         avgStretch: sits.length ? sits.reduce((s, x) => s + x.minutes, 0) / sits.length : null,
         longestStretch: sits.length ? sits.reduce((mx, x) => Math.max(mx, x.minutes), 0) : null,
-        keys: Math.round(io?.keys ?? 0),
-        clicks: Math.round(io?.clicks ?? 0),
-        inputPerHour: io && io.minutes > 0 ? Math.round(((io.keys + io.clicks) / io.minutes) * 60) : null,
+        keys: io && io.keys !== null ? Math.round(io.keys) : null,
+        clicks: io && io.clicks !== null ? Math.round(io.clicks) : null,
+        inputPerHour: io && io.minutes > 0 ? Math.round((((io.keys ?? 0) + (io.clicks ?? 0)) / io.minutes) * 60) : null,
         consistency,
         typicalStart: meanOf(spans.map((s) => s.start)),
         typicalEnd: meanOf(spans.map((s) => s.end)),
@@ -1577,7 +1584,7 @@ export interface AnalyticsSummary {
   /** Mean / longest continuous stretch (minutes) of the loaded blocks; null without any. */
   avgStretch: number | null;
   longestStretch: number | null;
-  /** Key presses + clicks per tracked hour; null without time. */
+  /** Key presses + clicks per tracked hour; null without time or without any measured input. */
   inputPerHour: number | null;
   peakHour: number | null;
   /** Monday-first index of the weekday with the most time; null without time. */
@@ -1598,7 +1605,10 @@ export function summarize(agg: ReportAggregates, days: readonly string[], blocks
     daysWorked: agg.daily.filter((d) => inPeriod.has(d.day) && d.minutes > 0).length,
     avgStretch: stretches.length ? stretches.reduce((s, x) => s + x.minutes, 0) / stretches.length : null,
     longestStretch: stretches.length ? stretches.reduce((m, x) => Math.max(m, x.minutes), 0) : null,
-    inputPerHour: totals.minutes > 0 ? Math.round(((totals.keys + totals.clicks) / totals.minutes) * 60) : null,
+    inputPerHour:
+      totals.minutes > 0 && (totals.keys !== null || totals.clicks !== null)
+        ? Math.round((((totals.keys ?? 0) + (totals.clicks ?? 0)) / totals.minutes) * 60)
+        : null,
     peakHour: peakHour(hourTotals(cells)),
     busiestWeekday: busiestWeekday(cells),
   };

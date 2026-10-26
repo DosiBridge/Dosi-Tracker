@@ -1,4 +1,4 @@
-import { NOW, projects, users } from "./mock-data";
+import { NOW } from "./demo-clock";
 import { countSeats } from "./roles";
 import { datasetFor } from "./tenant-data";
 
@@ -112,63 +112,55 @@ export interface Workspace {
 export interface LivePlanInfo {
   /** The subscription's plan was found in the backend plan list. */
   known: boolean;
+  /** The subscription's plan id (absent when there is no subscription, or on older data). */
+  planId?: string | null;
   planName: string | null;
   pricePerUser: number | null;
   /** Infinity = unlimited; null = unknown. */
   seatLimit: number | null;
   trialEndsAt: string | null;
+  /**
+   * Whether this deployment bills workspaces (GET /api/app/workspace/billing-mode).
+   * False: every workspace is active, with no plans, seat limits, trials or
+   * invoices — the app shows none of them. Absent (an older server, or the call
+   * failed): billing is on, as it always was.
+   */
+  billingEnabled?: boolean;
 }
 
-const activeMembers = countSeats(users);
-const activeProjects = projects.filter((p) => !p.archived).length;
+/* ----------------------------- Demo workspaces ----------------------------- */
+// The demo tenants (lib/demo-tenants) register their workspaces here when a
+// deployment with demo mode on loads them. A live deployment never does, so it
+// has none: there is no demo workspace to fall back to.
 
-export const workspaces: Workspace[] = [
-  {
-    id: "w1",
-    name: "Dosi Labs",
-    slug: "dosi-labs",
-    planId: "business",
-    status: "active",
-    color: "#6d5efc",
-    createdAt: "2025-04-02",
-    cycleDays: 18,
-    seatsUsed: activeMembers,
-    projectsUsed: activeProjects,
-    storageUsedGb: 128,
-    isPrimary: true,
-  },
-  {
-    id: "w2",
-    name: "Acme Studio",
-    slug: "acme-studio",
-    planId: "starter",
-    status: "trialing",
-    color: "#ec4899",
-    createdAt: "2026-06-28",
-    cycleDays: 9,
-    seatsUsed: 4,
-    projectsUsed: 3,
-    storageUsedGb: 6,
-  },
-  {
-    id: "w3",
-    name: "Nimbus Co",
-    slug: "nimbus",
-    planId: "free",
-    status: "active",
-    color: "#0ea5e9",
-    createdAt: "2026-05-15",
-    cycleDays: 0,
-    seatsUsed: 3,
-    projectsUsed: 2,
-    storageUsedGb: 0.6,
-  },
-];
+let demoSeed: readonly Workspace[] = [];
 
-export const primaryWorkspace = workspaces.find((w) => w.isPrimary) ?? workspaces[0];
+/** Make `list` the demo's workspaces (lib/demo-tenants, when demo mode loads it). */
+export function registerDemoWorkspaces(list: readonly Workspace[]): void {
+  demoSeed = list;
+}
+
+/** The demo's seeded workspaces; empty unless demo mode loaded them. */
+export function demoWorkspaces(): readonly Workspace[] {
+  return demoSeed;
+}
+
+/** The demo workspace a new demo visitor opens, or null outside demo mode. */
+export function primaryDemoWorkspace(): Workspace | null {
+  return demoSeed.find((w) => w.isPrimary) ?? demoSeed[0] ?? null;
+}
 
 /** Shown for a live workspace whose plan couldn't be loaded. */
 export const UNKNOWN_PLAN_NAME = "Unknown plan";
+
+/**
+ * Whether the workspace is billed at all: a live workspace on a deployment
+ * with billing off is not (no plans, trials, seat limits or invoices to show);
+ * the demo is.
+ */
+export function billingEnabledFor(ws: Workspace): boolean {
+  return ws.live?.billingEnabled !== false;
+}
 
 /**
  * Seat ceiling for a workspace: the backend's plan for a live tenant, else the
@@ -177,6 +169,8 @@ export const UNKNOWN_PLAN_NAME = "Unknown plan";
  * guess (which blocked invites with "limit reached" on paid workspaces).
  */
 export function seatLimitFor(ws: Workspace): number {
+  // Billing off: plans limit no seats (backend Billing:Enabled = false).
+  if (ws.live && !billingEnabledFor(ws)) return INF;
   if (ws.live) return ws.live.known ? (ws.live.seatLimit ?? INF) : INF;
   return planById(ws.planId).seats;
 }

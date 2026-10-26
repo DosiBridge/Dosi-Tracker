@@ -7,6 +7,7 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import { screen, within, fireEvent } from "@testing-library/react";
 import { axe } from "jest-axe";
 import { Topbar } from "@/components/layout/topbar";
+import { AiAssistantProvider } from "@/components/ai/ai-provider";
 import { datasetFor } from "@/lib/tenant-data";
 import { renderAsRole, renderForWorkspace, renderWithProviders, resetPrototypeState } from "@/test/harness";
 
@@ -120,6 +121,38 @@ describe("Topbar chrome", () => {
   it("a11y: topbar with notification and account menus open has no axe violations", async () => {
     const { container } = renderAsRole(<Topbar onMenuClick={noop} />, "owner");
     fireEvent.click(screen.getByRole("button", { name: "Notifications" }));
+    expect(await axe(container)).toHaveNoViolations();
+  });
+});
+
+describe("Topbar Ask AI launcher", () => {
+  const withAi = (ui: React.ReactNode) => <AiAssistantProvider>{ui}</AiAssistantProvider>;
+
+  it("sits before the theme toggle, opens Ask AI, and adds no keyboard shortcut", () => {
+    renderAsRole(withAi(<Topbar onMenuClick={noop} />), "owner");
+    const launcher = screen.getByRole("button", { name: "Ask AI" });
+    expect(launcher.compareDocumentPosition(screen.getByRole("button", { name: "Toggle theme" })) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(launcher).toHaveAttribute("aria-expanded", "false");
+    // Ctrl+J is the browser's Downloads: nothing of ours listens for it.
+    fireEvent.keyDown(window, { key: "j", ctrlKey: true });
+    expect(launcher).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(launcher);
+    expect(launcher).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("follows the server's status: a member gets it, a client doesn't, and nobody without the AI context", () => {
+    const worker = renderAsRole(withAi(<Topbar onMenuClick={noop} />), "worker");
+    expect(screen.getByRole("button", { name: "Ask AI" })).toBeInTheDocument();
+    worker.unmount();
+    const client = renderAsRole(withAi(<Topbar onMenuClick={noop} />), "client");
+    expect(screen.queryByRole("button", { name: "Ask AI" })).not.toBeInTheDocument();
+    client.unmount();
+    renderAsRole(<Topbar onMenuClick={noop} />, "owner");
+    expect(screen.queryByRole("button", { name: "Ask AI" })).not.toBeInTheDocument();
+  });
+
+  it("a11y: topbar with the Ask AI launcher has no axe violations", async () => {
+    const { container } = renderAsRole(withAi(<Topbar onMenuClick={noop} />), "owner");
     expect(await axe(container)).toHaveNoViolations();
   });
 });
