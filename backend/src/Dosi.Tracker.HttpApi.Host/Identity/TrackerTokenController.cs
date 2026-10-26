@@ -2,18 +2,18 @@ using System;
 using System.Linq;
 using System.Security.Claims;
 using System.Threading.Tasks;
+using Dosi.Tracker.EntityFrameworkCore;
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.Extensions.Logging;
+using Microsoft.EntityFrameworkCore;
 using OpenIddict.Abstractions;
 using OpenIddict.Server.AspNetCore;
 using Volo.Abp;
-using Volo.Abp.Data;
 using Volo.Abp.DependencyInjection;
+using Volo.Abp.EntityFrameworkCore;
 using Volo.Abp.Identity;
 using Volo.Abp.OpenIddict;
 using Volo.Abp.OpenIddict.Controllers;
 using Volo.Abp.Security.Claims;
-using Volo.Abp.Uow;
 
 namespace Dosi.Tracker.Identity;
 
@@ -31,10 +31,16 @@ namespace Dosi.Tracker.Identity;
 ///
 /// Every grant type (password, refresh, authorization code, device code, client credentials) funnels into this
 /// one shared method for its final steps, so overriding only it covers all of them. The override reproduces
-/// the base method exactly, except for the last step: recording the sign-in time now happens in its own,
-/// separate, immediately-completing unit of work against a freshly reloaded user, with exactly this one known
-/// concurrency conflict caught and ignored — the ABP team's own recommended interim fix. A lost race there
-/// costs only a "last signed in at" timestamp; it must never cost the sign-in itself.
+/// the base method exactly, except for the last step. ABP's own recommended interim fix — recording the sign-
+/// in time in a separate, immediately-completing unit of work — was tried first here and confirmed, against a
+/// real deploy, to deadlock instead: that separate transaction waits on the row lock the request's OWN still-
+/// open outer transaction already holds on this same user (from the access-failed-count reset above), and
+/// never gets it until that outer transaction ends — which only happens after this method returns. Recording
+/// the timestamp with a raw, targeted UPDATE instead avoids every part of that: it runs on the request's own
+/// connection and transaction (no second transaction to deadlock against), and it never touches EF Core's
+/// change tracker or its concurrency-token check at all, so it cannot raise the conflict ABP's bug report
+/// describes by construction. "Last signed in at" is a last-write-wins field by nature — a second, genuinely
+/// concurrent sign-in simply overwriting it a moment later is correct, not a bug to guard against.
 ///
 /// Remove this override once the fix lands in the ABP framework (tracked upstream in support question #10828).
 /// </summary>
@@ -78,22 +84,11 @@ public class TrackerTokenController : TokenController
 
     private async Task RecordLastSignInTimeAsync(Guid userId)
     {
-        try
-        {
-            using var uow = LazyServiceProvider.LazyGetRequiredService<IUnitOfWorkManager>().Begin(requiresNew: true);
+        var dbContext = await LazyServiceProvider
+            .LazyGetRequiredService<IDbContextProvider<TrackerDbContext>>()
+            .GetDbContextAsync();
 
-            var freshUser = await UserManager.GetByIdAsync(userId);
-            freshUser.SetLastSignInTime(DateTimeOffset.UtcNow);
-            await UserManager.UpdateAsync(freshUser);
-
-            await uow.CompleteAsync();
-        }
-        catch (AbpDbConcurrencyException ex)
-        {
-            Logger.LogInformation(
-                "Could not record the last sign-in time for user {UserId}: {Message} (the sign-in still succeeds).",
-                userId,
-                ex.Message);
-        }
+        await dbContext.Database.ExecuteSqlInterpolatedAsync(
+            $"UPDATE \"AbpUsers\" SET \"LastSignInTime\" = {DateTimeOffset.UtcNow} WHERE \"Id\" = {userId}");
     }
 }
