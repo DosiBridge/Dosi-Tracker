@@ -616,12 +616,14 @@ fn test_doctor_and_help_remain_strictly_nonmutating_and_offline() {
     assert!(doc_out.status.success());
     let doc_str = String::from_utf8_lossy(&doc_out.stdout);
 
-    // Verify backend_sync is reported truthfully as NOT_IMPLEMENTED
+    // backend_sync is reported truthfully: the daemon's uploader exists now
+    // (the foundation said NOT_IMPLEMENTED before it did).
     let parsed: serde_json::Value = serde_json::from_str(&doc_str).unwrap();
     assert_eq!(
-        parsed["adapters"]["backend_sync"], "NOT_IMPLEMENTED",
-        "backend_sync adapter must remain truthfully reported as NOT_IMPLEMENTED"
+        parsed["adapters"]["backend_sync"], "SUPPORTED",
+        "backend_sync adapter must be truthfully reported as SUPPORTED"
     );
+    assert_eq!(parsed["adapters"]["webcam_capture"], "NOT_IMPLEMENTED");
     assert_eq!(parsed["privacy_invariants"]["unprivileged_process"], true);
     assert_eq!(
         parsed["privacy_invariants"]["zero_synthetic_telemetry"],

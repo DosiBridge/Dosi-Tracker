@@ -1,0 +1,250 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "dosi-tracker/doctor.v2.json",
+  "title": "dosi-tracker doctor --json, report v2",
+  "description": "Every v1 field plus schema, probes and problems.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "client", "session", "desktop_environment", "user", "paths", "capabilities", "adapters",
+               "privacy_invariants", "credential_store", "probes", "problems"],
+  "properties": {
+    "schema": { "const": "dosi-tracker.doctor/2" },
+    "client": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "release_tier"],
+      "properties": {
+        "name": { "const": "dosi-tracker-linux" },
+        "version": { "type": "string" },
+        "release_tier": { "type": "string" }
+      }
+    },
+    "session": {},
+    "desktop_environment": { "type": ["string", "null"] },
+    "user": { "type": ["string", "null"] },
+    "paths": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["config_dir", "data_dir", "state_dir", "consent_file", "config_dir_exists", "data_dir_exists",
+                   "state_dir_exists", "consent_file_exists"],
+      "properties": {
+        "config_dir": { "type": "string" },
+        "data_dir": { "type": "string" },
+        "state_dir": { "type": "string" },
+        "consent_file": { "type": "string" },
+        "config_dir_exists": { "type": "boolean" },
+        "data_dir_exists": { "type": "boolean" },
+        "state_dir_exists": { "type": "boolean" },
+        "consent_file_exists": { "type": "boolean" }
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["screen_capture", "keyboard_counting", "mouse_counting", "active_window", "running_programs", "webcam_photo"],
+      "properties": {
+        "screen_capture": { "$ref": "#/$defs/capability" },
+        "keyboard_counting": { "$ref": "#/$defs/capability" },
+        "mouse_counting": { "$ref": "#/$defs/capability" },
+        "active_window": { "$ref": "#/$defs/capability" },
+        "running_programs": { "$ref": "#/$defs/capability" },
+        "webcam_photo": { "$ref": "#/$defs/capability" }
+      }
+    },
+    "adapters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["screen_capture", "input_counter", "window_sampler", "webcam_capture", "offline_queue", "backend_sync"],
+      "properties": {
+        "screen_capture": { "$ref": "#/$defs/status" },
+        "input_counter": { "$ref": "#/$defs/status" },
+        "window_sampler": { "$ref": "#/$defs/status" },
+        "webcam_capture": { "$ref": "#/$defs/status" },
+        "offline_queue": { "$ref": "#/$defs/status" },
+        "backend_sync": { "$ref": "#/$defs/status" }
+      }
+    },
+    "privacy_invariants": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unprivileged_process", "anti_keylogger_policy", "zero_synthetic_telemetry", "default_deny_consent"],
+      "properties": {
+        "unprivileged_process": { "const": true },
+        "anti_keylogger_policy": { "const": true },
+        "zero_synthetic_telemetry": { "const": true },
+        "default_deny_consent": { "const": true }
+      }
+    },
+    "credential_store": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["backend", "path", "fallback_active", "warning"],
+      "properties": {
+        "backend": { "enum": ["SecretService", "FileFallback", "Unavailable"] },
+        "path": { "type": ["string", "null"] },
+        "fallback_active": { "type": "boolean" },
+        "warning": { "type": ["string", "null"] }
+      }
+    },
+    "probes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["running_as_root", "runtime_dir", "session_bus", "logind", "idle_source", "x11", "portal",
+                   "secret_service", "sni_watcher", "notifications", "gui_libraries", "service", "daemon",
+                   "queue", "legacy_credentials_file", "file_store_warning", "config_issues"],
+      "properties": {
+        "running_as_root": { "type": "boolean" },
+        "runtime_dir": { "type": ["string", "null"] },
+        "session_bus": { "type": "boolean" },
+        "logind": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["reachable", "session_kind", "source", "session_id", "desktop", "reason"],
+          "properties": {
+            "reachable": { "type": "boolean" },
+            "session_kind": { "enum": ["x11", "wayland", "tty", "none"] },
+            "source": { "enum": ["logind", "environment"] },
+            "session_id": { "type": ["string", "null"] },
+            "desktop": { "type": ["string", "null"] },
+            "reason": { "type": ["string", "null"] }
+          }
+        },
+        "idle_source": { "enum": [null, "xi2", "x11-screensaver", "mutter", "screensaver", "logind"] },
+        "x11": {
+          "anyOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["display", "connected", "xinput", "screensaver", "randr", "error"],
+              "properties": {
+                "display": { "type": "string" },
+                "connected": { "type": "boolean" },
+                "xinput": { "type": ["string", "null"] },
+                "screensaver": { "type": "boolean" },
+                "randr": { "type": "boolean" },
+                "error": { "type": ["string", "null"] }
+              }
+            }
+          ]
+        },
+        "portal": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["present", "screenshot_version"],
+          "properties": {
+            "present": { "type": "boolean" },
+            "screenshot_version": { "type": ["integer", "null"] }
+          }
+        },
+        "secret_service": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["owner", "activatable", "locked"],
+          "properties": {
+            "owner": { "type": "boolean" },
+            "activatable": { "type": "boolean" },
+            "locked": { "type": ["boolean", "null"] }
+          }
+        },
+        "sni_watcher": { "$ref": "#/$defs/bus_name" },
+        "notifications": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["owner", "server"],
+          "properties": {
+            "owner": { "type": "boolean" },
+            "server": { "type": ["string", "null"] }
+          }
+        },
+        "gui_libraries": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "found"],
+            "properties": { "name": { "type": "string" }, "found": { "type": "boolean" } }
+          }
+        },
+        "service": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["user_manager", "unit_loaded", "unit_active", "autostart_enabled"],
+          "properties": {
+            "user_manager": { "type": "boolean" },
+            "unit_loaded": { "type": "boolean" },
+            "unit_active": { "type": "boolean" },
+            "autostart_enabled": { "type": "boolean" }
+          }
+        },
+        "daemon": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["running", "version", "pid", "protocol", "error"],
+          "properties": {
+            "running": { "type": "boolean" },
+            "version": { "type": ["string", "null"] },
+            "pid": { "type": ["integer", "null"] },
+            "protocol": { "type": ["integer", "null"] },
+            "error": { "type": ["string", "null"] }
+          }
+        },
+        "queue": {
+          "anyOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["workspace_id", "pending", "parked", "error"],
+              "properties": {
+                "workspace_id": { "type": "string" },
+                "pending": { "type": "integer", "minimum": 0 },
+                "parked": { "type": "integer", "minimum": 0 },
+                "error": { "type": ["string", "null"] }
+              }
+            }
+          ]
+        },
+        "legacy_credentials_file": { "type": ["string", "null"] },
+        "file_store_warning": { "type": ["string", "null"] },
+        "config_issues": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "problems": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "code", "message"],
+        "properties": {
+          "severity": { "enum": ["blocking", "warning"] },
+          "code": { "type": "string" },
+          "message": { "type": "string" },
+          "hint": { "type": "string" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "status": { "enum": ["NOT_IMPLEMENTED", "UNSUPPORTED", "SUPPORTED", "NOT_CHECKED"] },
+    "capability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["adapter_status", "architectural_support", "architectural_notes", "adapter_notes"],
+      "properties": {
+        "adapter_status": { "$ref": "#/$defs/status" },
+        "architectural_support": {
+          "enum": ["SUPPORTED_UNCONFINED", "SUPPORTED_VIA_PORTAL", "UNSUPPORTED_ON_WAYLAND", "NO_DISPLAY_SERVER", "SUPPORTED_PROC_FS", "SUPPORTED_V4L2"]
+        },
+        "architectural_notes": { "type": "string" },
+        "adapter_notes": { "type": "string" }
+      }
+    },
+    "bus_name": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["owner", "activatable"],
+      "properties": { "owner": { "type": "boolean" }, "activatable": { "type": "boolean" } }
+    }
+  }
+}

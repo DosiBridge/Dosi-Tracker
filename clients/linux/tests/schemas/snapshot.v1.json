@@ -1,0 +1,266 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "dosi-tracker/snapshot.v1.json",
+  "title": "Dosi Tracker IPC snapshot, protocol v1",
+  "description": "The serde mirror of SharedState as state.get and the state event carry it. No secret and no image bytes: additional properties are refused.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "status", "pending_action", "display_name", "workspace", "server_url", "server_reachable",
+    "projects", "selected_project", "tracked_today_secs", "tracked_week_secs", "week_day_secs",
+    "week_days_fetched", "last_productivity", "interval_minutes", "idle_threshold_minutes",
+    "capture", "task_note", "recent_blocks", "last_screenshot_at", "tracking_since",
+    "block_started_at", "next_capture_at", "unsaved_since", "paused_since", "resume_at",
+    "away_since", "away_prompt", "last_sync", "pending_uploads", "rejected_uploads", "queue_rows",
+    "upload_issue", "clock_skew_minutes", "last_error", "login_error", "login_error_kind",
+    "signing_in", "workspace_choices", "finding_workspaces", "workspace_note", "workspace_lost",
+    "notices", "consent", "consent_error", "consent_unsynced", "capabilities", "session",
+    "indicator", "credentials_locked", "manual_mode", "daemon"
+  ],
+  "properties": {
+    "status": {
+      "enum": ["signed_out", "connecting", "tracking", "paused", "offline", "stopped", "away", "locked",
+               "choose_project", "sign_in_expired", "consent_required", "no_session", "device_revoked"]
+    },
+    "pending_action": { "enum": [null, "pausing", "resuming"] },
+    "display_name": { "type": "string" },
+    "workspace": { "type": "string" },
+    "server_url": { "type": "string" },
+    "server_reachable": { "type": "boolean" },
+    "projects": { "type": "array", "items": { "$ref": "#/$defs/project" } },
+    "selected_project": { "type": ["string", "null"] },
+    "tracked_today_secs": { "type": "number", "minimum": 0 },
+    "tracked_week_secs": { "type": "number", "minimum": 0 },
+    "week_day_secs": { "type": "array", "items": { "type": "number", "minimum": 0 } },
+    "week_days_fetched": { "type": ["array", "null"], "items": { "$ref": "#/$defs/time" } },
+    "last_productivity": { "type": ["integer", "null"], "minimum": 0, "maximum": 100 },
+    "interval_minutes": { "type": "integer", "minimum": 1 },
+    "idle_threshold_minutes": { "type": ["integer", "null"], "minimum": 0 },
+    "capture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["screenshot", "webcam", "keyboard", "mouse", "active_window", "running_programs", "blur_screenshots"],
+      "properties": {
+        "screenshot": { "type": "boolean" },
+        "webcam": { "type": "boolean" },
+        "keyboard": { "type": "boolean" },
+        "mouse": { "type": "boolean" },
+        "active_window": { "type": "boolean" },
+        "running_programs": { "type": "boolean" },
+        "blur_screenshots": { "type": "boolean" }
+      }
+    },
+    "task_note": { "type": "string" },
+    "recent_blocks": { "type": "array", "items": { "$ref": "#/$defs/recent_block" } },
+    "last_screenshot_at": { "$ref": "#/$defs/time_or_null" },
+    "tracking_since": { "$ref": "#/$defs/time_or_null" },
+    "block_started_at": { "$ref": "#/$defs/time_or_null" },
+    "next_capture_at": { "$ref": "#/$defs/time_or_null" },
+    "unsaved_since": { "$ref": "#/$defs/time_or_null" },
+    "paused_since": { "$ref": "#/$defs/time_or_null" },
+    "resume_at": { "$ref": "#/$defs/time_or_null" },
+    "away_since": { "$ref": "#/$defs/time_or_null" },
+    "away_prompt": {
+      "anyOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["from", "to", "project_title"],
+          "properties": {
+            "from": { "$ref": "#/$defs/time" },
+            "to": { "$ref": "#/$defs/time" },
+            "project_title": { "type": "string" }
+          }
+        }
+      ]
+    },
+    "last_sync": { "$ref": "#/$defs/time_or_null" },
+    "pending_uploads": { "type": "integer", "minimum": 0 },
+    "rejected_uploads": { "type": "integer", "minimum": 0 },
+    "queue_rows": { "type": "array", "items": { "$ref": "#/$defs/queue_row" } },
+    "upload_issue": {
+      "anyOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "required": ["kind", "next_attempt_at"],
+          "properties": {
+            "kind": { "enum": ["retrying", "subscription_inactive", "clock_ahead"] },
+            "next_attempt_at": { "$ref": "#/$defs/time" },
+            "reason": { "type": "string" },
+            "message": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "clock_skew_minutes": { "type": ["integer", "null"] },
+    "last_error": { "type": ["string", "null"] },
+    "login_error": { "type": ["string", "null"] },
+    "login_error_kind": {
+      "enum": [null, "refused", "offline", "server", "invalid_server", "no_server", "no_workspace", "archived_workspace", "expired"]
+    },
+    "signing_in": { "type": "boolean" },
+    "workspace_choices": { "type": "array", "items": { "$ref": "#/$defs/workspace_choice" } },
+    "finding_workspaces": { "type": "boolean" },
+    "workspace_note": { "type": ["string", "null"] },
+    "workspace_lost": { "type": ["string", "null"] },
+    "notices": { "type": "array", "items": { "$ref": "#/$defs/notice" } },
+    "consent": { "$ref": "#/$defs/consent" },
+    "consent_error": { "type": ["string", "null"] },
+    "consent_unsynced": { "type": "boolean" },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["keyboard", "mouse", "active_window", "running_programs", "screenshot", "webcam"],
+      "properties": {
+        "keyboard": { "$ref": "#/$defs/capability" },
+        "mouse": { "$ref": "#/$defs/capability" },
+        "active_window": { "$ref": "#/$defs/capability" },
+        "running_programs": { "$ref": "#/$defs/capability" },
+        "screenshot": { "$ref": "#/$defs/capability" },
+        "webcam": { "$ref": "#/$defs/capability" }
+      }
+    },
+    "session": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "desktop", "idle_source"],
+      "properties": {
+        "kind": { "enum": ["x11", "wayland", "tty", "none"] },
+        "desktop": { "type": ["string", "null"] },
+        "idle_source": { "type": ["string", "null"] }
+      }
+    },
+    "indicator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tray", "notifications"],
+      "properties": {
+        "tray": { "type": "boolean" },
+        "notifications": { "type": "boolean" }
+      }
+    },
+    "credentials_locked": { "type": "boolean" },
+    "manual_mode": { "type": "boolean" },
+    "daemon": {
+      "anyOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["version", "pid"],
+          "properties": {
+            "version": { "type": "string" },
+            "pid": { "type": "integer", "minimum": 1 }
+          }
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "time": { "type": "string" },
+    "time_or_null": { "type": ["string", "null"] },
+    "count": { "type": ["integer", "null"], "minimum": 0 },
+    "project": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "title"],
+      "properties": { "id": { "type": "string" }, "title": { "type": "string" } }
+    },
+    "recent_block": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["row_id", "project", "started_at", "ended_at", "productivity", "keyboard_hits", "mouse_clicks", "screenshot", "upload"],
+      "properties": {
+        "row_id": { "type": "integer" },
+        "project": { "type": "string" },
+        "started_at": { "$ref": "#/$defs/time" },
+        "ended_at": { "$ref": "#/$defs/time" },
+        "productivity": { "type": ["integer", "null"], "minimum": 0, "maximum": 100 },
+        "keyboard_hits": { "$ref": "#/$defs/count" },
+        "mouse_clicks": { "$ref": "#/$defs/count" },
+        "screenshot": { "type": "boolean" },
+        "upload": { "enum": ["queued", "uploaded", "rejected"] }
+      }
+    },
+    "queue_row": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "project_id", "started_at", "ended_at", "status", "reason", "has_captures"],
+      "properties": {
+        "id": { "type": "integer" },
+        "project_id": { "type": ["string", "null"] },
+        "started_at": { "$ref": "#/$defs/time_or_null" },
+        "ended_at": { "$ref": "#/$defs/time_or_null" },
+        "status": { "enum": ["queued", "parked"] },
+        "reason": { "type": ["string", "null"] },
+        "has_captures": { "type": "boolean" }
+      }
+    },
+    "workspace_choice": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "role", "is_current"],
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "role": { "type": ["string", "null"] },
+        "is_current": { "type": "boolean" }
+      }
+    },
+    "notice": {
+      "type": "object",
+      "required": ["id", "at", "kind"],
+      "properties": {
+        "id": { "type": "integer", "minimum": 1 },
+        "at": { "$ref": "#/$defs/time" },
+        "kind": {
+          "type": "object",
+          "required": ["kind"],
+          "properties": { "kind": { "type": "string" } }
+        }
+      }
+    },
+    "consent": {
+      "anyOf": [
+        { "enum": ["Absent", "Revoked"] },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["Granted"],
+          "properties": {
+            "Granted": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["screenshot", "webcam", "keyboard", "mouse", "active_window", "running_programs", "blur_screenshots"],
+              "properties": {
+                "screenshot": { "type": "boolean" },
+                "webcam": { "const": false },
+                "keyboard": { "type": "boolean" },
+                "mouse": { "type": "boolean" },
+                "active_window": { "type": "boolean" },
+                "running_programs": { "type": "boolean" },
+                "blur_screenshots": { "type": "boolean" }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "capability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "reason", "consented", "project_allows", "config_allows", "backend"],
+      "properties": {
+        "state": { "enum": ["on", "off_by_you", "off_by_workspace", "off_by_config", "unsupported", "needs_approval", "denied", "unavailable", "paused"] },
+        "reason": { "type": ["string", "null"] },
+        "consented": { "type": "boolean" },
+        "project_allows": { "type": "boolean" },
+        "config_allows": { "type": "boolean" },
+        "backend": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

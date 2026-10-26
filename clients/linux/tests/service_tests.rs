@@ -171,6 +171,10 @@ fn session_start_writes_the_env_file_then_starts_the_unit() {
     assert!(text.contains("XDG_SESSION_ID=\"2\"\n"));
     assert!(text.contains("DBUS_SESSION_BUS_ADDRESS=\"unix:path=/run/user/1000/bus\"\n"));
     assert!(!text.contains("HOME="), "only session variables");
+    assert!(
+        text.contains("DOSI_LAUNCH=\"login\""),
+        "the daemon can tell a login start: {text}"
+    );
     assert_eq!(
         std::fs::metadata(&env_file).unwrap().permissions().mode() & 0o777,
         0o600

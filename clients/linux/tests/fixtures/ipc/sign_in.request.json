@@ -1,0 +1,1 @@
+{"v":1,"id":3,"method":"auth.sign_in","params":{"server":"https://tracker.acme.test","email":"ayesha@acme.test","password":"<the password>","workspace":"Acme","remember_password":true}}

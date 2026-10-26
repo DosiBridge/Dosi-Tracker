@@ -9,9 +9,12 @@
 // Each test binary uses a different subset of these helpers.
 #![allow(dead_code)]
 
+#[cfg(unix)]
+pub mod agent;
 pub mod fake_backend;
 pub mod fake_daemon;
 pub mod fakes;
 pub mod private_bus;
+pub mod schema;
 pub mod xdg;
 pub mod xvfb;
