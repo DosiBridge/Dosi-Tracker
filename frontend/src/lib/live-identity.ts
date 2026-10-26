@@ -60,6 +60,10 @@ export const PERMISSION = {
   viewAllActivities: "Tracker.Activities.ViewAll",
   manageTeam: "Tracker.Team.Manage",
   platform: "Tracker.Platform",
+  /** Delete members' time blocks and captures (owners and managers). */
+  deleteActivities: "Tracker.Activities.Delete",
+  /** Revoke and restore members' desktop agent installs (owners and managers). */
+  manageDevices: "Tracker.Devices.Manage",
 } as const;
 
 function granted(config: AppConfiguration, policy: string): boolean {

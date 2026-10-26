@@ -67,6 +67,32 @@ const AiSettingsCard = dynamic(() => import("@/components/ai/ai-settings-card").
   ),
 });
 
+// The journeys' cards (devices, account deletion, retention, workspace deletion) load with their tab, not with the page.
+const cardLoading = (what: string) =>
+  function CardLoading() {
+    return (
+      <p role="status" className="text-sm text-muted-foreground">
+        Loading {what}…
+      </p>
+    );
+  };
+const MyDevicesCard = dynamic(() => import("@/components/settings/my-devices-card").then((m) => m.MyDevicesCard), {
+  ssr: false,
+  loading: cardLoading("your devices"),
+});
+const DeleteAccountCard = dynamic(() => import("@/components/settings/delete-account-card").then((m) => m.DeleteAccountCard), {
+  ssr: false,
+  loading: cardLoading("account options"),
+});
+const RetentionCard = dynamic(() => import("@/components/settings/retention-card").then((m) => m.RetentionCard), {
+  ssr: false,
+  loading: cardLoading("retention settings"),
+});
+const WorkspaceDangerCard = dynamic(() => import("@/components/settings/workspace-danger-card").then((m) => m.WorkspaceDangerCard), {
+  ssr: false,
+  loading: cardLoading("workspace options"),
+});
+
 const isTabKey = (value: string | null): value is TabKey => allTabs.some((t) => t.key === value);
 
 function profileFormOf(p: Record<string, unknown>): ProfileForm {
@@ -91,7 +117,7 @@ export default function SettingsPage() {
 }
 
 function SettingsContent() {
-  const { user: currentUser, isLive: live, refreshSession } = useSession();
+  const { user: currentUser, isLive: live, refreshSession, logout, workspace } = useSession();
   const tabs = allTabs.filter((t) => t.roles.includes(currentUser.role));
   // `?tab=workspace` (a link from AI assist, or the privacy note) opens that tab when this role has it; anything else is ignored.
   const requested = useSearchParams().get("tab");
@@ -164,11 +190,21 @@ function SettingsContent() {
               <TimeZoneCard live={live} zone={zone} />
             </>
           )}
-          {tab === "security" && <SecurityCard live={live} />}
+          {tab === "security" && (
+            <>
+              <SecurityCard live={live} />
+              {currentUser.role !== "client" && (
+                <MyDevicesCard live={live} userId={currentUser.id} manager={currentUser.role === "owner" || currentUser.role === "admin"} />
+              )}
+              <DeleteAccountCard live={live} onDeleted={logout} />
+            </>
+          )}
           {tab === "workspace" && (
             <>
               <WorkspaceCard live={live} onSaved={zone.refresh} />
+              <RetentionCard live={live} demoNote={DEMO_NOTE} />
               <AiSettingsCard demoNote={DEMO_NOTE} />
+              <WorkspaceDangerCard live={live} workspaceName={workspace.name} demoNote={DEMO_NOTE} />
             </>
           )}
           {tab === "privacy" && (

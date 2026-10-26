@@ -31,7 +31,7 @@ import { EmptyState } from "@/components/ui/empty-state";
 import { PageHeader, PageStack } from "@/components/ui/page-header";
 import { SearchField, SegmentedControl, Toolbar } from "@/components/ui/toolbar";
 import { ActivityRing } from "@/components/dashboard/activity-ring";
-import { DevicesPanel } from "@/components/dashboard/devices-panel";
+import { DevicesPanel, type DeviceViewer } from "@/components/dashboard/devices-panel";
 import { memberPresence } from "@/components/dashboard/devices";
 import { CopyButton } from "@/components/dashboard/agent-setup";
 import { linkButtonClass } from "@/components/dashboard/link-button";
@@ -69,6 +69,7 @@ import {
 } from "@/hooks/useApi";
 import { useReportingZone } from "@/hooks/use-reporting-zone";
 import { mapTeamMember, type ApiTeamMemberDto } from "@/lib/live-dataset";
+import { PERMISSION } from "@/lib/live-identity";
 import { referenceNow } from "@/lib/live-session";
 import { AGENT_HEALTH_KINDS } from "@/lib/ai-assist";
 import {
@@ -168,7 +169,7 @@ function pluralMembers(n: number): string {
 }
 
 export default function TeamPage() {
-  const { user, workspace, isLive, refreshSession } = useSession();
+  const { user, workspace, isLive, refreshSession, livePolicies } = useSession();
   const zone = useReportingZone(isLive);
   const [view, setView] = useState<"members" | "devices">("members");
   const [query, setQuery] = useState("");
@@ -382,6 +383,16 @@ export default function TeamPage() {
   const nameOf = useCallback(
     (userId: string, hint: string | null) => members.find((m) => m.id === userId)?.name ?? hint ?? "Team member",
     [members],
+  );
+  // Revoking and restoring devices: the real grant when live (an older server has none: read-only), by role in the demo.
+  const deviceViewer = useMemo<DeviceViewer>(
+    () => ({
+      id: user.id,
+      isOwner: user.role === "owner",
+      canManageDevices: isLive ? livePolicies?.[PERMISSION.manageDevices] === true : canManage,
+      isOwnerId: (userId: string) => members.find((m) => m.id === userId)?.isOwner ?? false,
+    }),
+    [user.id, user.role, isLive, livePolicies, canManage, members],
   );
 
   async function addMember(input: CreateProjectMemberDto) {
@@ -602,7 +613,7 @@ export default function TeamPage() {
             {isLive && canManage && <PendingInvitations key={invitesKey} />}
           </>
         ) : (
-          <DevicesPanel live={isLive} zone={zone} nameOf={nameOf} />
+          <DevicesPanel live={isLive} zone={zone} nameOf={nameOf} viewer={deviceViewer} />
         )}
       </div>
 

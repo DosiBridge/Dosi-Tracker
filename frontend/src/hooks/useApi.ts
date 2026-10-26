@@ -930,7 +930,14 @@ export const confirmEmailApi = async (input: ConfirmEmailDto): Promise<void> => 
 export const sendEmailConfirmationApi = (): Promise<EmailConfirmationSentDto> => postApi(MY_ACCOUNT_ROUTES.sendEmailConfirmation, {});
 
 /** Whether the signed-in person can delete their account now, and which workspaces stop them. */
-export const getAccountDeletionCheckApi = (): Promise<AccountDeletionCheckDto> => getApi(MY_ACCOUNT_ROUTES.deletionCheck);
+export const getAccountDeletionCheckApi = async (): Promise<AccountDeletionCheckDto> => {
+  const raw = (await getApi(MY_ACCOUNT_ROUTES.deletionCheck)) as Partial<AccountDeletionCheckDto> | null;
+  const soleOwnerOf = Array.isArray(raw?.soleOwnerOf)
+    ? raw.soleOwnerOf.filter((w) => w && typeof w.id === 'string').map((w) => ({ id: w.id, name: typeof w.name === 'string' ? w.name : 'A workspace' }))
+    : [];
+  // Read defensively: a field the server left out never unlocks the deletion.
+  return { canDelete: raw?.canDelete === true, isPlatformAdministrator: raw?.isPlatformAdministrator === true, soleOwnerOf };
+};
 
 /** Delete the signed-in person's account, confirmed with their current secret (403 Tracker:InvalidPassword). */
 export const deleteMyAccountApi = async (currentSecret: string): Promise<void> => {

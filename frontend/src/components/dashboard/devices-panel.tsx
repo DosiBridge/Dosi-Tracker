@@ -1,21 +1,24 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Laptop, Monitor, MonitorSmartphone, RotateCw, Search } from "lucide-react";
+import { Laptop, Monitor, MonitorSmartphone, RotateCw, Search, ShieldCheck, ShieldOff } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { EmptyState } from "@/components/ui/empty-state";
-import { getDeviceReport, getTeamPresence } from "@/hooks/useApi";
-import { platformLabel, type DeviceReportRowDto, type PresenceDto } from "@/lib/api-contract";
+import { toast } from "@/components/toast";
+import { getDeviceReport, getTeamPresence, getWorkspaceDevicesApi, restoreMemberDeviceApi, revokeMemberDeviceApi, revokeMyDeviceApi } from "@/hooks/useApi";
+import { platformLabel, type DeviceReportRowDto, type PresenceDto, type WorkspaceDeviceDto } from "@/lib/api-contract";
 import { referenceNow } from "@/lib/live-session";
 import { formatInZone, zonedPeriod } from "@/lib/time-zone";
 import { activities, users } from "@/lib/tenant-data";
 import { cn, formatDuration } from "@/lib/utils";
 import { requestErrorText } from "@/components/layout/request-error";
+import { RevokeDeviceDialog } from "./revoke-device-dialog";
 import {
   buildDeviceRows,
+  deviceActions,
   demoDeviceSources,
   deviceStatusText,
   deviceStatusTone,
@@ -36,7 +39,9 @@ const REPORT_DAYS = 30;
 /** How often the live list refreshes while it is visible. */
 const REFRESH_MS = 60_000;
 
-const platformIcon: Record<string, LucideIcon> = { windows: Monitor, macos: Laptop };
+const platformIcon: Record<string, LucideIcon> = { windows: Monitor, macos: Laptop, linux: Monitor };
+
+const DEMO_NOTE = "Demo workspace — this lasts until you reload.";
 
 const toneDot: Record<ReturnType<typeof deviceStatusTone>, string> = {
   tracking: "bg-success",
@@ -47,24 +52,43 @@ const toneDot: Record<ReturnType<typeof deviceStatusTone>, string> = {
 interface Sources {
   presence: PresenceDto[];
   report: DeviceReportRowDto[];
+  /** The device registry; null on a server without it (revocation isn't offered then). */
+  registry: WorkspaceDeviceDto[] | null;
   /** Which source failed (the other still renders). */
   presenceFailed: boolean;
   reportFailed: boolean;
   loadedAt: Date;
 }
 
+/** Who is looking: what they may revoke or restore (deviceActions). */
+export interface DeviceViewer {
+  id: string;
+  isOwner: boolean;
+  /** Tracker.Devices.Manage (owners and managers). */
+  canManageDevices: boolean;
+  /** Whether a member is an owner of the workspace (only owners touch an owner's devices). */
+  isOwnerId: (userId: string) => boolean;
+}
+
 export function DevicesPanel({
   live,
   zone,
   nameOf,
+  viewer,
 }: {
   live: boolean;
   /** The reporting zone (useReportingZone): the report's days and the "last seen" times are read in it. */
   zone: { timeZone: string; ready: boolean };
   /** The roster's name for a member id (the hint is the name the server sent). */
   nameOf: (userId: string, hint: string | null) => string;
+  /** Omitted: the list is read-only. */
+  viewer?: DeviceViewer;
 }) {
   const [sources, setSources] = useState<Sources | null>(null);
+  const [revoking, setRevoking] = useState<DeviceRow | null>(null);
+  const [restoring, setRestoring] = useState<string | null>(null);
+  // The demo's revocations, by row key (they last until the next reload).
+  const [demoRevoked, setDemoRevoked] = useState<ReadonlyMap<string, string | null>>(() => new Map());
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(live);
   const [query, setQuery] = useState("");
@@ -74,9 +98,10 @@ export function DevicesPanel({
     setLoading(true);
     const now = new Date();
     const range = zonedPeriod("30d", now, zone.timeZone);
-    const [presence, report] = await Promise.allSettled([
+    const [presence, report, registry] = await Promise.allSettled([
       getTeamPresence(),
       getDeviceReport({ from: range.from, to: range.to, timeZone: zone.timeZone }),
+      getWorkspaceDevicesApi(),
     ]);
     if (presence.status === "rejected" && report.status === "rejected") {
       setError(requestErrorText(presence.reason, "Couldn't load devices from the server."));
@@ -86,6 +111,7 @@ export function DevicesPanel({
       setSources({
         presence: presence.status === "fulfilled" ? presence.value : [],
         report: report.status === "fulfilled" ? report.value : [],
+        registry: registry.status === "fulfilled" ? registry.value : null,
         presenceFailed: presence.status === "rejected",
         reportFailed: report.status === "rejected",
         loadedAt: new Date(),
@@ -109,14 +135,95 @@ export function DevicesPanel({
   const rows = useMemo<DeviceRow[]>(() => {
     if (!live) {
       const demo = demoDeviceSources(users, activities, referenceNow());
-      return buildDeviceRows(demo.presence, demo.report, nameOf, referenceNow());
+      return buildDeviceRows(demo.presence, demo.report, nameOf, referenceNow()).map((r) =>
+        demoRevoked.has(r.key) ? { ...r, revoked: true, online: false, revokedAt: referenceNow().toISOString(), revokeReason: demoRevoked.get(r.key) ?? null } : r,
+      );
     }
-    return sources ? buildDeviceRows(sources.presence, sources.report, nameOf, sources.loadedAt) : [];
-  }, [live, sources, nameOf]);
+    return sources ? buildDeviceRows(sources.presence, sources.report, nameOf, sources.loadedAt, sources.registry ?? []) : [];
+  }, [live, sources, nameOf, demoRevoked]);
+
+  // Revocation needs the registry (a newer server) in a live session.
+  const canAct = !!viewer && (!live || !!sources?.registry);
+  const actionsFor = (r: DeviceRow) =>
+    canAct && viewer
+      ? deviceActions({
+          canManageDevices: viewer.canManageDevices,
+          viewerIsOwner: viewer.isOwner,
+          viewerId: viewer.id,
+          rowUserId: r.userId,
+          rowUserIsOwner: viewer.isOwnerId(r.userId),
+          revoked: r.revoked,
+          hasDeviceId: !!r.deviceId,
+        })
+      : { revoke: false, restore: false };
+  const showActions = rows.some((r) => {
+    const a = actionsFor(r);
+    return a.revoke || a.restore;
+  });
+  const deviceLabel = (r: DeviceRow) => r.deviceName ?? (r.deviceId ? "Unnamed device" : "Unknown device");
+
+  async function revoke(r: DeviceRow, reason: string | null) {
+    if (!live) {
+      setDemoRevoked((m) => new Map(m).set(r.key, reason));
+      toast({ title: `${deviceLabel(r)} revoked`, description: DEMO_NOTE });
+      setRevoking(null);
+      return;
+    }
+    try {
+      if (r.userId === viewer?.id && !viewer.canManageDevices) await revokeMyDeviceApi(r.deviceId as string, reason);
+      else await revokeMemberDeviceApi(r.userId, r.deviceId as string, reason);
+    } catch (err) {
+      throw new Error(requestErrorText(err, "Couldn't revoke the device. Try again."));
+    }
+    setRevoking(null);
+    toast({ tone: "success", title: `${deviceLabel(r)} revoked`, description: "It was signed out and can't track in this workspace any more." });
+    void load();
+  }
+
+  async function restore(r: DeviceRow) {
+    if (!live) {
+      setDemoRevoked((m) => {
+        const next = new Map(m);
+        next.delete(r.key);
+        return next;
+      });
+      toast({ title: `${deviceLabel(r)} restored`, description: DEMO_NOTE });
+      return;
+    }
+    setRestoring(r.key);
+    try {
+      await restoreMemberDeviceApi(r.userId, r.deviceId as string);
+      toast({ tone: "success", title: `${deviceLabel(r)} restored`, description: "Its agent can sign in again." });
+      void load();
+    } catch (err) {
+      toast({ tone: "danger", title: "Couldn't restore the device", description: requestErrorText(err, "Try again.") });
+    } finally {
+      setRestoring(null);
+    }
+  }
+
+  const actionButtons = (r: DeviceRow) => {
+    const a = actionsFor(r);
+    if (a.revoke) {
+      return (
+        <Button size="sm" variant="ghost" className="text-danger-on-tint hover:bg-danger/10" onClick={() => setRevoking(r)} aria-label={`Revoke ${deviceLabel(r)} (${r.memberName})`}>
+          <ShieldOff aria-hidden className="h-3.5 w-3.5" /> Revoke
+        </Button>
+      );
+    }
+    if (a.restore) {
+      return (
+        <Button size="sm" variant="outline" onClick={() => void restore(r)} disabled={restoring === r.key} aria-label={`Restore ${deviceLabel(r)} (${r.memberName})`}>
+          <ShieldCheck aria-hidden className="h-3.5 w-3.5" /> {restoring === r.key ? "Restoring…" : "Restore"}
+        </Button>
+      );
+    }
+    return null;
+  };
 
   const newest = newestAgentVersion(rows.map((r) => r.agentVersion));
   const onlineCount = rows.filter((r) => r.online).length;
-  const outdatedCount = rows.filter((r) => r.outdated).length;
+  const outdatedCount = rows.filter((r) => r.outdated && !r.revoked).length;
   const filtered = rows.filter((r) => {
     if (onlyOutdated && !r.outdated) return false;
     const q = query.trim().toLowerCase();
@@ -223,6 +330,7 @@ export function DevicesPanel({
               <li key={r.key}>
                 <Card className="p-4">
                   <DeviceSummary row={r} now={now} lastSeenTitle={lastSeenTitle(r.lastSeenAt)} />
+                  {showActions && actionButtons(r) && <div className="mt-3 flex justify-end">{actionButtons(r)}</div>}
                 </Card>
               </li>
             ))}
@@ -240,6 +348,11 @@ export function DevicesPanel({
                     <th scope="col" className="px-4 py-3 font-semibold">Agent</th>
                     <th scope="col" className="px-4 py-3 font-semibold">Status</th>
                     <th scope="col" className="px-4 py-3 text-right font-semibold">Tracked ({REPORT_DAYS} days)</th>
+                    {showActions && (
+                      <th scope="col" className="px-4 py-3 text-right font-semibold">
+                        <span className="sr-only">Actions</span>
+                      </th>
+                    )}
                   </tr>
                 </thead>
                 <tbody>
@@ -272,8 +385,10 @@ export function DevicesPanel({
                             <span>{deviceStatusText(r, now)}</span>
                           </span>
                           {r.online && r.projectTitle && <span className="mt-0.5 block text-xs text-muted-foreground">{r.projectTitle}</span>}
+                          {r.revoked && r.revokeReason && <span className="mt-0.5 block text-xs text-muted-foreground">Reason: {r.revokeReason}</span>}
                         </td>
                         <td className="px-4 py-3 text-right tabular-nums">{formatDuration(r.trackedMinutes)}</td>
+                        {showActions && <td className="px-4 py-2 text-right">{actionButtons(r)}</td>}
                       </tr>
                     );
                   })}
@@ -283,11 +398,21 @@ export function DevicesPanel({
           </Card>
         </>
       ) : null}
+
+      {revoking && (
+        <RevokeDeviceDialog
+          device={{ name: deviceLabel(revoking), memberName: revoking.memberName }}
+          own={revoking.userId === viewer?.id}
+          onClose={() => setRevoking(null)}
+          onConfirm={(reason) => revoke(revoking, reason)}
+        />
+      )}
     </div>
   );
 }
 
 function VersionCell({ row, newest }: { row: DeviceRow; newest: string | null }) {
+  if (row.revoked) return <Badge tone="danger">Revoked</Badge>;
   if (!row.agentVersion) return <span className="text-xs text-muted-foreground">Not reported</span>;
   return (
     <span className="flex flex-wrap items-center gap-1.5">
