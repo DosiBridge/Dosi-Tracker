@@ -84,9 +84,16 @@ impl LinuxPaths {
 
     /// The same paths with `$XDG_RUNTIME_DIR` set (or cleared). An empty or
     /// relative value is ignored, as the XDG specification requires.
+    ///
+    /// `XDG_RUNTIME_DIR` is always a POSIX path, so a leading `/` counts as
+    /// absolute here even when this crate is built or tested on a non-Unix
+    /// host, where [`Path::is_absolute`] alone would not consider
+    /// `/run/user/1000` absolute (and would instead accept only a
+    /// host-native absolute path, which a real temp directory in tests
+    /// still is).
     pub fn with_runtime_dir(mut self, xdg_runtime_dir: Option<&Path>) -> Self {
         self.runtime_base = xdg_runtime_dir
-            .filter(|p| p.is_absolute())
+            .filter(|p| p.is_absolute() || p.to_str().is_some_and(|s| s.starts_with('/')))
             .map(Path::to_path_buf);
         self
     }
