@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { Radar, Eye, EyeOff, Loader2, ArrowLeft, Building2, KeyRound, ShieldAlert } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -12,7 +13,6 @@ import { resolveLanding } from "@/hooks/workspace-landing";
 import { safeRedirectPath } from "@/lib/safe-redirect";
 import { useSession } from "@/components/session-provider";
 import { landingFor } from "@/lib/roles";
-import { SUPPORT_EMAIL } from "@/lib/brand";
 import { isStorageAvailable, setCurrentWorkspace } from "@/lib/live-session";
 import {
   WEB_SIGN_IN_CLIENT,
@@ -33,6 +33,9 @@ const PLAN_NAME: Record<PlanId, string> = {
   business: "Business",
   enterprise: "Business",
 };
+
+/** Where "Forgot password?" leads (FE-09). */
+const RECOVERY_PAGE = "/forgot-password";
 
 /** ABP Identity's default minimum; the server's own rules are reported if it asks for more. */
 const MIN_NEW_SECRET_LENGTH = 6;
@@ -281,6 +284,11 @@ export default function LoginPage() {
   }
 
   const errorText = errorMsg ?? (failure ? signInFailureMessage(failure) : null);
+  // The recovery page starts from the address typed here, and comes back to `next` afterwards.
+  const recoveryQuery = new URLSearchParams();
+  if (email.trim()) recoveryQuery.set("email", email.trim());
+  if (next) recoveryQuery.set("next", next);
+  const recoveryHref = `${RECOVERY_PAGE}${recoveryQuery.size ? `?${recoveryQuery.toString()}` : ""}`;
   const errorId = "login-error";
   const describedBy = errorText ? errorId : undefined;
   const credentialsInvalid = failure?.kind === "invalid";
@@ -467,19 +475,12 @@ export default function LoginPage() {
                 <div className="space-y-1.5">
                   <div className="flex items-center justify-between">
                     <label htmlFor="login-password" className="text-sm font-medium">Password</label>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setErrorMsg(null);
-                        setFailure(null);
-                        setInfoMsg(
-                          `Contact your workspace owner to reset your password. Workspace owners: email ${SUPPORT_EMAIL}.`,
-                        );
-                      }}
+                    <Link
+                      href={recoveryHref}
                       className="rounded text-xs text-primary-strong hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                     >
                       Forgot password?
-                    </button>
+                    </Link>
                   </div>
                   <div className="relative">
                     <Input

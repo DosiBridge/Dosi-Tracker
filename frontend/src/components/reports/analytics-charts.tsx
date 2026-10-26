@@ -27,6 +27,7 @@ import {
   type WorkWindow,
 } from "@/lib/analytics";
 import { formatActivity } from "@/lib/work-report";
+import { INPUT_COUNT_METRIC } from "@/lib/metrics";
 import { cn } from "@/lib/utils";
 
 /* ============================================================================
@@ -879,7 +880,12 @@ export function HourActivityChart({ profile, fmt }: { profile: HourStat[]; fmt: 
                   rows={[
                     ["Hours", fmt(row.stat.minutes), "var(--primary)"],
                     ["Activity", formatActivity(row.activity), "var(--success)"],
-                    ["Key presses + clicks", (row.stat.keys + row.stat.clicks).toLocaleString("en")],
+                    [
+                      "Key presses + clicks",
+                      row.stat.keys === null && row.stat.clicks === null
+                        ? INPUT_COUNT_METRIC.notMeasured
+                        : ((row.stat.keys ?? 0) + (row.stat.clicks ?? 0)).toLocaleString("en"),
+                    ],
                   ]}
                 />
               ) : null;

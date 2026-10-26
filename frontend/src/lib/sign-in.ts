@@ -139,11 +139,11 @@ export function signInFailureMessage(failure: SignInFailure, options: { secondsL
         ? `This site's server address doesn't lead to a Dosi-Tracker server (HTTP ${failure.status}). Ask whoever runs this site to check its API address.`
         : "This site isn't connected to a Dosi-Tracker server yet. Ask whoever runs it to set its API address.";
     case "locked":
-      return "This account is locked after too many failed sign-in attempts. Wait a few minutes and try again, or ask your workspace owner to unlock it.";
+      return "This account is locked after too many failed sign-in attempts. Wait a few minutes, then try again.";
     case "inactive":
       return "This account has been deactivated. Ask your workspace owner to reactivate it.";
     case "confirm":
-      return "This account's email address hasn't been confirmed yet. Ask your workspace owner to confirm it, then sign in again.";
+      return "This account's email address hasn't been confirmed yet. Open the confirmation link we emailed you, then sign in again.";
     case "change-required":
       return "This account has to finish setting up its sign-in on the sign-in page before it can continue.";
     case "two-factor":

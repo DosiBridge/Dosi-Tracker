@@ -85,7 +85,7 @@ describe("AI_ERROR_STATUS", () => {
   });
 
   it("keeps the AI codes out of the core contract's map", () => {
-    expect(Object.keys(TRACKER_ERROR_STATUS)).toHaveLength(29);
+    expect(Object.keys(TRACKER_ERROR_STATUS)).toHaveLength(45);
     for (const code of Object.keys(AI_ERROR_STATUS)) expect(code in TRACKER_ERROR_STATUS).toBe(false);
   });
 

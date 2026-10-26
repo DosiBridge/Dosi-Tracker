@@ -166,7 +166,7 @@ const FORMAT_KEYS = HOURS_FORMATS.map((f) => f.key);
 const EMPTY_BLOCKS: Block[] = [];
 
 const EMPTY_AGGREGATES: ReportAggregates = {
-  totals: { minutes: 0, sessions: 0, activity: null, idleMinutes: null, keys: 0, clicks: 0 },
+  totals: { minutes: 0, sessions: 0, activity: null, idleMinutes: null, keys: null, clicks: null },
   daily: [],
   members: [],
   projects: [],

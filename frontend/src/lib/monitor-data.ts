@@ -31,8 +31,9 @@ export interface DaySegment {
   windowTitle: string;
   projectId: string | null;
   productivity: number; // 0 for idle/break
-  mouseClicks: number;
-  keyboardHits: number;
+  /** Null when the block's input wasn't counted (live rows); never a fabricated 0. */
+  mouseClicks: number | null;
+  keyboardHits: number | null;
   screen: ScreenMock;
   /** Open browser tabs — only present when `app` is a web browser. */
   tabs?: BrowserTab[];

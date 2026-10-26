@@ -76,6 +76,38 @@ import {
   type WorkspaceSubscriptionDto,
   type UpdateProjectMemberDto,
   type WorkspaceSettingsDto,
+  ACCOUNT_RECOVERY_ROUTES,
+  BILLING_MODE_ROUTE,
+  BILLING_ROUTES,
+  DEVICE_ROUTES,
+  MY_ACCOUNT_ROUTES,
+  MY_INVITATIONS_ROUTE,
+  acceptMyInvitationRoute,
+  activityRetentionRoute,
+  captureRetentionRoute,
+  declineInvitationRoute,
+  declineMyInvitationRoute,
+  deleteActivityRoute,
+  deleteCaptureRoute,
+  deleteWorkspaceRoute,
+  memberRecoveryEmailRoute,
+  resendInvitationRoute,
+  type AccountDeletionCheckDto,
+  type ActivityErasureDto,
+  type BillingModeDto,
+  type ConfirmEmailDto,
+  type DeletedWorkspaceDto,
+  type DeviceRevocationDto,
+  type DeviceStatusDto,
+  type EmailConfirmationSentDto,
+  type MyInvitationDto,
+  type MyInvitationsDto,
+  type RecoveryEmailSentDto,
+  type ResetCredentialDto,
+  type RetentionPolicyDto,
+  type SendResetCodeDto,
+  type SubscriptionDto,
+  type WorkspaceDeviceDto,
 } from '@/lib/api-contract';
 
 export { isLiveSession };
@@ -312,8 +344,9 @@ const UNSCOPED_PREFIXES = [
   '/connect/token',
   WORKSPACE_ROUTES.create, // also covers /mine and /{id}/leave
   WORKSPACE_ROUTES.register,
-  '/api/app/invitations',
+  '/api/app/invitations', // also covers /mine
   '/api/account/my-profile',
+  '/api/app/my-account', // the person's own account (recovery itself is anonymous)
 ];
 
 /** The X-Workspace-Id for a request: the current workspace, except on unscoped routes. */
@@ -381,11 +414,14 @@ const handleUnauthorized = (res: Response) => {
 };
 
 /**
- * The current workspace was refused (no longer a member, or none chosen): forget
- * it and go choose another.
+ * The current workspace was refused (no longer a member — it may have been
+ * deleted —, archived since it was opened, or none chosen): forget it and go
+ * choose another.
  */
 const handleWorkspaceRefused = (status: number, code: string | null) => {
-  const refused = (status === 403 && code === 'Tracker:NotWorkspaceMember') || (status === 400 && code === 'Tracker:WorkspaceRequired');
+  const refused =
+    (status === 403 && (code === 'Tracker:NotWorkspaceMember' || code === 'Tracker:WorkspaceArchived')) ||
+    (status === 400 && code === 'Tracker:WorkspaceRequired');
   if (!refused || typeof window === 'undefined') return;
   clearCurrentWorkspace();
   redirectToWorkspaceChooser();
@@ -824,3 +860,166 @@ export const createProjectTaskApi = (input: CreateProjectTaskDto): Promise<Proje
 export const updateProjectTaskApi = (id: string, input: UpdateProjectTaskDto): Promise<ProjectTaskDto> =>
   putApi(projectTaskRoute(id), input) as Promise<ProjectTaskDto>;
 
+/* ----------------------------- Journeys ----------------------------- */
+// Invitations the signed-in person answers, account recovery and deletion,
+// devices, deleting tracked data, retention and billing (contract §7 and the
+// backend's B1–B3 journeys). Each throws ApiError on a refused request: read
+// `code` for the business rule.
+
+/** The name ABP's reset-code request must carry (its emailer builds the link to this web app either way). */
+export const RECOVERY_APP_NAME = 'Dosi-Tracker web';
+
+/** True when the server has no such endpoint (an older backend): callers hide the feature rather than fail. */
+const isMissingEndpoint = (err: unknown): boolean => err instanceof ApiError && (err.status === 404 || err.status === 405);
+
+/**
+ * The signed-in person's pending invitations; null from a server that can't
+ * list them (older backend). Read whole, not through getApi: unwrapping
+ * `items` would lose `emailConfirmed`, which says why the list is empty.
+ */
+export const getMyInvitationsApi = async (): Promise<MyInvitationsDto | null> => {
+  const res = await send(MY_INVITATIONS_ROUTE);
+  if (!res.ok) {
+    const err = await apiFailure('API GET Error', res);
+    if (isMissingEndpoint(err)) return null;
+    throw err;
+  }
+  const raw = (await res.json()) as Partial<MyInvitationsDto> | null;
+  const items = Array.isArray(raw?.items) ? (raw.items as MyInvitationDto[]).filter((i) => i && typeof i.id === 'string') : [];
+  return { emailConfirmed: raw?.emailConfirmed !== false, items };
+};
+
+/** Accept one of the caller's invitations (403 Tracker:EmailNotConfirmed while the email is unverified). */
+export const acceptMyInvitationApi = (invitationId: string): Promise<AcceptInvitationResultDto> =>
+  postApi(acceptMyInvitationRoute(invitationId), {});
+
+/** Decline one of the caller's invitations. */
+export const declineMyInvitationApi = async (invitationId: string): Promise<void> => {
+  await postApi(declineMyInvitationRoute(invitationId), {});
+};
+
+/** Decline an invitation opened from its link, as the signed-in invitee. */
+export const declineInvitationApi = async (token: string): Promise<void> => {
+  await postApi(declineInvitationRoute(token), {});
+};
+
+/**
+ * Ask for a recovery email (anonymous). The server answers 204 whether or not
+ * the address has an account, so the page must say the same either way.
+ */
+export const sendRecoveryEmailApi = async (email: string, returnUrl?: string | null): Promise<void> => {
+  const body: SendResetCodeDto = { email, appName: RECOVERY_APP_NAME, ...(returnUrl ? { returnUrl } : {}) };
+  await anonymous(ACCOUNT_RECOVERY_ROUTES.sendResetCode, { method: 'POST', body });
+};
+
+/** Whether an emailed reset link is still usable (anonymous). */
+export const verifyRecoveryLinkApi = async (userId: string, resetToken: string): Promise<boolean> =>
+  (await anonymous<boolean | null>(ACCOUNT_RECOVERY_ROUTES.verifyResetToken, { method: 'POST', body: { userId, resetToken } })) === true;
+
+/** Choose a new sign-in secret from an emailed link (anonymous). A completed reset also confirms the address. */
+export const completeRecoveryApi = async (input: ResetCredentialDto): Promise<void> => {
+  await anonymous(ACCOUNT_RECOVERY_ROUTES.resetPassword, { method: 'POST', body: input });
+};
+
+/** Confirm an email address from its emailed link (anonymous; 400 Tracker:EmailConfirmationInvalid). */
+export const confirmEmailApi = async (input: ConfirmEmailDto): Promise<void> => {
+  await anonymous(MY_ACCOUNT_ROUTES.confirmEmail, { method: 'POST', body: input });
+};
+
+/** Email the signed-in person a link that confirms their address. */
+export const sendEmailConfirmationApi = (): Promise<EmailConfirmationSentDto> => postApi(MY_ACCOUNT_ROUTES.sendEmailConfirmation, {});
+
+/** Whether the signed-in person can delete their account now, and which workspaces stop them. */
+export const getAccountDeletionCheckApi = (): Promise<AccountDeletionCheckDto> => getApi(MY_ACCOUNT_ROUTES.deletionCheck);
+
+/** Delete the signed-in person's account, confirmed with their current secret (403 Tracker:InvalidPassword). */
+export const deleteMyAccountApi = async (currentSecret: string): Promise<void> => {
+  await postApi(MY_ACCOUNT_ROUTES.delete, { password: currentSecret });
+};
+
+/** The workspace's agent installs (the caller's own, or everyone's for owners and managers); null on an older server. */
+export const getWorkspaceDevicesApi = async (): Promise<WorkspaceDeviceDto[] | null> => {
+  try {
+    return listOf<WorkspaceDeviceDto>(await getApi(DEVICE_ROUTES.list));
+  } catch (err) {
+    if (isMissingEndpoint(err)) return null;
+    throw err;
+  }
+};
+
+/** Revoke one of the caller's own devices: it is signed out and refused in this workspace. */
+export const revokeMyDeviceApi = (deviceId: string, reason: string | null): Promise<DeviceRevocationDto> =>
+  postApi(DEVICE_ROUTES.revoke, { deviceId, reason });
+
+/** Revoke a member's device (owners and managers; only owners may touch an owner's). */
+export const revokeMemberDeviceApi = (userId: string, deviceId: string, reason: string | null): Promise<DeviceRevocationDto> =>
+  postApi(DEVICE_ROUTES.revokeMember, { userId, deviceId, reason });
+
+/** Lift a device's revocation; the install signs in again. */
+export const restoreMemberDeviceApi = (userId: string, deviceId: string): Promise<DeviceStatusDto> =>
+  postApi(DEVICE_ROUTES.restore, { userId, deviceId });
+
+/** Delete a block with all its captures (Tracker.Activities.Delete), giving a reason. */
+export const deleteActivityApi = (activityId: string, reason: string): Promise<ActivityErasureDto> =>
+  postApi(deleteActivityRoute(activityId), { reason });
+
+/** Delete one capture; the reason is required from owners and managers, optional for a member's own. */
+export const deleteCaptureApi = (captureId: string, reason: string | null): Promise<ActivityErasureDto> =>
+  postApi(deleteCaptureRoute(captureId), { reason });
+
+/** Delete a workspace (owners), confirmed by its name typed exactly. */
+export const deleteWorkspaceApi = (workspaceId: string, confirmationName: string): Promise<DeletedWorkspaceDto> =>
+  postApi(deleteWorkspaceRoute(workspaceId), { confirmationName });
+
+/** How long the workspace keeps captures; null on an older server. */
+export const getCaptureRetentionApi = async (workspaceId: string): Promise<RetentionPolicyDto | null> => {
+  try {
+    return (await getApi(captureRetentionRoute(workspaceId))) as RetentionPolicyDto;
+  } catch (err) {
+    if (isMissingEndpoint(err)) return null;
+    throw err;
+  }
+};
+
+export const updateCaptureRetentionApi = (workspaceId: string, policy: RetentionPolicyDto): Promise<RetentionPolicyDto> =>
+  putApi(captureRetentionRoute(workspaceId), { isEnabled: policy.isEnabled, retentionDays: policy.retentionDays });
+
+/** How long the workspace keeps tracked time blocks; null on an older server. */
+export const getActivityRetentionApi = async (workspaceId: string): Promise<RetentionPolicyDto | null> => {
+  try {
+    return (await getApi(activityRetentionRoute(workspaceId))) as RetentionPolicyDto;
+  } catch (err) {
+    if (isMissingEndpoint(err)) return null;
+    throw err;
+  }
+};
+
+export const updateActivityRetentionApi = (workspaceId: string, policy: RetentionPolicyDto): Promise<RetentionPolicyDto> =>
+  putApi(activityRetentionRoute(workspaceId), { isEnabled: policy.isEnabled, retentionDays: policy.retentionDays });
+
+/**
+ * Whether this deployment bills workspaces (anonymous). Null when the server
+ * can't say: an older backend, which always billed, so callers keep the
+ * billing pages.
+ */
+export const getBillingModeApi = async (): Promise<BillingModeDto | null> => {
+  try {
+    const mode = await anonymous<Partial<BillingModeDto> | null>(BILLING_MODE_ROUTE);
+    return typeof mode?.enabled === 'boolean' ? { enabled: mode.enabled } : null;
+  } catch (err) {
+    if (isMissingEndpoint(err)) return null;
+    throw err;
+  }
+};
+
+/** Owner: move to a free plan the team fits (403 Tracker:PlanChangeNotAllowed for a paid plan, 409 Tracker:SeatLimitReached). */
+export const changeMyPlanApi = (planId: string): Promise<SubscriptionDto> => postApi(BILLING_ROUTES.changePlan, { planId });
+
+/** Owner: cancel the paid subscription. */
+export const cancelMySubscriptionApi = (): Promise<SubscriptionDto> => postApi(BILLING_ROUTES.cancel, {});
+
+/** Renew a pending (or expired) invitation: a new link and expiry, emailed again when the server sends email. */
+export const resendInvitationApi = (invitationId: string): Promise<InviteMemberResultDto> => postApi(resendInvitationRoute(invitationId), {});
+
+/** Owner: email an active member a recovery link (it goes only to their own address). */
+export const sendMemberRecoveryEmailApi = (userId: string): Promise<RecoveryEmailSentDto> => postApi(memberRecoveryEmailRoute(userId), {});

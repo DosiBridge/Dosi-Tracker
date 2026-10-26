@@ -231,14 +231,17 @@ describe("login page — sign-in form", () => {
     expect(screen.queryByText(/didn't match/i)).not.toBeInTheDocument();
   });
 
-  it("'Forgot password?' explains who can reset it (owner, or support for owners) without calling it an error", async () => {
+  it("'Forgot password?' leads to self-service recovery with the typed address, never to a vendor mailbox (FE-09)", async () => {
     const user = userEvent.setup();
     renderWithProviders(<LoginPage />, { route: "/login" });
 
-    await user.click(screen.getByRole("button", { name: /forgot password/i }));
-    const note = screen.getByRole("status");
-    expect(note).toHaveTextContent(/contact your workspace owner/i);
-    expect(note).toHaveTextContent(/support@/i);
+    expect(screen.getByRole("link", { name: /forgot password/i })).toHaveAttribute("href", "/forgot-password");
+    await user.type(screen.getByLabelText("Email"), "ana@acme.example");
+    expect(screen.getByRole("link", { name: /forgot password/i })).toHaveAttribute(
+      "href",
+      "/forgot-password?email=ana%40acme.example",
+    );
+    expect(screen.queryByText(/support@/i)).not.toBeInTheDocument();
     expect(fetchMock).not.toHaveBeenCalled();
   });
 

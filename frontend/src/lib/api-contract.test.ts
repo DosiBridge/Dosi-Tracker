@@ -65,6 +65,23 @@ import {
   withPaging,
   type PagedResultDto,
   type ReportingEndpoint,
+  ACCOUNT_RECOVERY_ROUTES,
+  ACTIVITY_ERASURES_ROUTE,
+  BILLING_MODE_ROUTE,
+  BILLING_ROUTES,
+  DEVICE_ROUTES,
+  MEMBER_RECOVERY_EMAIL_ROUTE,
+  MY_ACCOUNT_ROUTES,
+  MY_INVITATIONS_ROUTE,
+  acceptMyInvitationRoute,
+  activityRetentionRoute,
+  captureRetentionRoute,
+  declineMyInvitationRoute,
+  deleteActivityRoute,
+  deleteCaptureRoute,
+  deleteWorkspaceRoute,
+  memberRecoveryEmailRoute,
+  resendInvitationRoute,
 } from "./api-contract";
 
 const FROM = new Date("2026-07-01T00:00:00.000Z");
@@ -111,8 +128,40 @@ describe("routes", () => {
       PROJECT_TASK_ROUTES.collection,
       projectTaskRoute("task-1"),
       projectTasksRoute({ projectId: "p1" }),
+      // The journeys (invitations, recovery, devices, erasure, retention, billing).
+      MY_INVITATIONS_ROUTE,
+      acceptMyInvitationRoute("i1"),
+      declineMyInvitationRoute("i1"),
+      declineInvitationRoute("tok"),
+      ...Object.values(ACCOUNT_RECOVERY_ROUTES),
+      ...Object.values(MY_ACCOUNT_ROUTES),
+      ...Object.values(DEVICE_ROUTES),
+      deleteActivityRoute("a1"),
+      deleteCaptureRoute("c1"),
+      ACTIVITY_ERASURES_ROUTE,
+      deleteWorkspaceRoute("w1"),
+      captureRetentionRoute("w1"),
+      activityRetentionRoute("w1"),
+      BILLING_MODE_ROUTE,
+      ...Object.values(BILLING_ROUTES),
+      resendInvitationRoute("i1"),
+      memberRecoveryEmailRoute("u1"),
     ];
     expect(routes.filter((r) => !served(r))).toEqual([]);
+  });
+
+  it("builds the journeys' routes where the backend binds their ids (B1-B3 controllers)", () => {
+    expect(acceptMyInvitationRoute("i 1")).toBe("/api/app/invitations/mine/i%201/accept");
+    expect(declineMyInvitationRoute("i1")).toBe("/api/app/invitations/mine/i1/decline");
+    expect(deleteActivityRoute("a/1")).toBe("/api/app/activity/a%2F1/delete");
+    expect(deleteCaptureRoute("c1")).toBe("/api/app/activity/capture/c1/delete");
+    expect(deleteWorkspaceRoute("w1")).toBe("/api/app/workspaces/w1/delete");
+    expect(captureRetentionRoute("w1")).toBe("/api/app/workspaces/w1/capture-retention");
+    expect(activityRetentionRoute("w1")).toBe("/api/app/workspaces/w1/activity-retention");
+    expect(resendInvitationRoute("i1")).toBe("/api/app/team/i1/resend-invitation");
+    expect(memberRecoveryEmailRoute("u&1")).toBe(`${MEMBER_RECOVERY_EMAIL_ROUTE}?userId=u%261`);
+    expect(DEVICE_ROUTES.revokeMember).toBe("/api/app/device/revoke-member");
+    expect(BILLING_ROUTES.cancel).toBe("/api/app/billing/cancel");
   });
 
   it("builds the platform's subscription routes with the workspace in the query", () => {
@@ -437,7 +486,14 @@ describe("labels and rules", () => {
     expect(TRACKER_ERROR_STATUS["Tracker:RoleNotAllowed"]).toBe(403);
     expect(TRACKER_ERROR_STATUS["Tracker:InvalidUser"]).toBe(404);
     expect(TRACKER_ERROR_STATUS["Tracker:ActivityInFuture"]).toBe(425);
-    expect(Object.keys(TRACKER_ERROR_STATUS)).toHaveLength(29);
+    expect(Object.keys(TRACKER_ERROR_STATUS)).toHaveLength(45);
+    // The journeys' codes (devices, erasure, recovery, billing) with the statuses the server maps them to.
+    expect(TRACKER_ERROR_STATUS["Tracker:DeviceRevoked"]).toBe(403);
+    expect(TRACKER_ERROR_STATUS["Tracker:WorkspaceArchived"]).toBe(403);
+    expect(TRACKER_ERROR_STATUS["Tracker:ActivityDeleted"]).toBe(410);
+    expect(TRACKER_ERROR_STATUS["Tracker:SoleWorkspaceOwner"]).toBe(409);
+    expect(TRACKER_ERROR_STATUS["Tracker:BillingDisabled"]).toBe(409);
+    expect(TRACKER_ERROR_STATUS["Tracker:EmailNotConfirmed"]).toBe(403);
     expect(TRACKER_ERROR_STATUS["Tracker:NotWorkspaceMember"]).toBe(403);
   });
 });

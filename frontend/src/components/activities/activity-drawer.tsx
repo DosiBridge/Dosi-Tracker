@@ -48,6 +48,7 @@ import {
   type SessionDetails,
 } from "@/lib/activity-report";
 import { appColor } from "@/lib/apps";
+import { INPUT_COUNT_METRIC, formatCount } from "@/lib/metrics";
 import { captureExtension, platformLabel } from "@/lib/api-contract";
 import { mapApiCaptureMetas, type CaptureMeta } from "@/lib/live-dataset";
 import { userById } from "@/lib/tenant-data";
@@ -310,8 +311,8 @@ export function ActivityDrawer({
               {details?.idleSeconds !== null && details?.idleSeconds !== undefined && (
                 <Stat icon={Hourglass} label="Idle" value={formatSeconds(Math.min(details.idleSeconds, totalSeconds))} />
               )}
-              <Stat icon={Keyboard} label="Keyboard presses" value={count(a.keyboardHits)} />
-              <Stat icon={MousePointerClick} label="Mouse clicks" value={count(a.mouseClicks)} />
+              <Stat icon={Keyboard} label="Keyboard presses" value={formatCount(a.keyboardHits, count, INPUT_COUNT_METRIC.notMeasured)} />
+              <Stat icon={MousePointerClick} label="Mouse clicks" value={formatCount(a.mouseClicks, count, INPUT_COUNT_METRIC.notMeasured)} />
             </div>
             <p className="text-xs text-muted-foreground">
               {activityPercent === null

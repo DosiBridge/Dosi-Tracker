@@ -27,8 +27,9 @@ const activityArb: fc.Arbitrary<Activity> = fc
     projectId: fc.constantFrom(...projectPool),
     minutesAgo: fc.integer({ min: 0, max: 40 * 24 * 60 }),
     productivity: fc.integer({ min: 0, max: 100 }),
-    mouseClicks: fc.integer({ min: 0, max: 1000 }),
-    keyboardHits: fc.integer({ min: 0, max: 5000 }),
+    // null = not measured (consent off, Wayland): the sort must still hold.
+    mouseClicks: fc.option(fc.integer({ min: 0, max: 1000 }), { nil: null }),
+    keyboardHits: fc.option(fc.integer({ min: 0, max: 5000 }), { nil: null }),
     online: fc.boolean(),
     hasWebcam: fc.boolean(),
     app: fc.constantFrom(...appPool),
@@ -181,7 +182,9 @@ describe("applyActivityFilters — combined filters mean intersection", () => {
 
 describe("applyActivityFilters — sort contract holds for every mode on any input", () => {
   const endMs = (a: Activity) => new Date(a.endedAt).getTime();
-  const activityScore = (a: Activity) => a.mouseClicks + a.keyboardHits;
+  // Unmeasured input (both counts null) ranks below every measured block, a measured 0 included.
+  const activityScore = (a: Activity) =>
+    a.mouseClicks === null && a.keyboardHits === null ? -1 : (a.mouseClicks ?? 0) + (a.keyboardHits ?? 0);
 
   const orderings: Record<ActivitySort, (a: Activity, b: Activity) => boolean> = {
     recent: (a, b) => endMs(a) >= endMs(b),

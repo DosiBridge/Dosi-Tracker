@@ -101,10 +101,16 @@ function memberStat(over: Partial<MemberStat> & Pick<MemberStat, "userId">): Mem
 /* ----------------------------- Blocks: how the fields arrive ----------------------------- */
 
 describe("blocks — fields in every shape a server or an older agent sends them", () => {
-  it("reads counts sent as numeric text; a blank or missing count is 0, never NaN", () => {
-    const [a, b] = blocksFromApi([dto("a", `${DAY}T09:00:00Z`, 10, { keyboardHits: "42", mouseClicks: "  " }), dto("b", `${DAY}T10:00:00Z`, 10)]);
-    expect(a).toMatchObject({ keys: 42, clicks: 0 });
-    expect(b).toMatchObject({ keys: 0, clicks: 0 });
+  it("reads counts sent as numeric text; a blank, missing or null count is not measured (null), never 0 or NaN", () => {
+    const [a, b, c] = blocksFromApi([
+      dto("a", `${DAY}T09:00:00Z`, 10, { keyboardHits: "42", mouseClicks: "  " }),
+      dto("b", `${DAY}T10:00:00Z`, 10),
+      dto("c", `${DAY}T11:00:00Z`, 10, { keyboardHits: 0, mouseClicks: null }),
+    ]);
+    expect(a).toMatchObject({ keys: 42, clicks: null });
+    expect(b).toMatchObject({ keys: null, clicks: null });
+    // A measured zero stays zero.
+    expect(c).toMatchObject({ keys: 0, clicks: null });
   });
 
   it("reads a UTC offset sent as text, and blank device fields as not reported", () => {

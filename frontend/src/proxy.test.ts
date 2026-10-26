@@ -61,7 +61,15 @@ describe("proxy route gate", () => {
     expect(locationOf(proxy(req("/healthz", false)))).toBeNull();
   });
 
+  it("lets anyone open the account recovery and email confirmation pages, signed in or not (FE-09)", () => {
+    for (const path of ["/forgot-password", "/reset-password", "/confirm-email"]) {
+      expect(locationOf(proxy(req(path, false, "userId=x&token=y")))).toBeNull();
+      expect(locationOf(proxy(req(path, true)))).toBeNull();
+    }
+  });
+
   it("does not treat look-alike paths as public", () => {
+    expect(locationOf(proxy(req("/reset-password/extra", false)))).toMatch(/\/login$/);
     expect(locationOf(proxy(req("/installer", false)))).toMatch(/\/login$/);
     expect(locationOf(proxy(req("/invite", false)))).toMatch(/\/login$/);
     expect(locationOf(proxy(req("/healthz/extra", false)))).toMatch(/\/login$/);

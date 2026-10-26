@@ -55,6 +55,7 @@ import {
 import { useTeamPresence, useVisibleInterval } from "@/components/monitor/use-team-presence";
 import { CaptureThumb } from "@/components/activities/capture-thumb";
 import { BlurredChip, EndReasonChip } from "@/components/activities/session-meta";
+import { NotMeasuredCount } from "@/components/activities/session-card";
 import { HourlyChart } from "@/components/dashboard/charts";
 import { AppGlyph, ScreenMockView } from "@/components/screen-mock";
 import { useSession } from "@/components/session-provider";
@@ -1265,12 +1266,12 @@ function SegmentDetailModal({
               )}
               <div className="flex flex-wrap gap-x-4 gap-y-1 text-muted-foreground">
                 <span className="flex items-center gap-1">
-                  <MousePointerClick className="h-3.5 w-3.5" />
-                  {seg.mouseClicks.toLocaleString()} clicks
+                  <MousePointerClick className="h-3.5 w-3.5" aria-hidden />
+                  {seg.mouseClicks === null ? "Clicks not measured" : `${seg.mouseClicks.toLocaleString()} clicks`}
                 </span>
                 <span className="flex items-center gap-1">
-                  <Keyboard className="h-3.5 w-3.5" />
-                  {seg.keyboardHits.toLocaleString()} keys
+                  <Keyboard className="h-3.5 w-3.5" aria-hidden />
+                  {seg.keyboardHits === null ? "Keys not measured" : `${seg.keyboardHits.toLocaleString()} keys`}
                 </span>
               </div>
             </div>
@@ -1501,13 +1502,15 @@ function TimelineRow({ seg, live = false }: { seg: DaySegment; live?: boolean })
                   {formatDuration(seg.idleMinutes)} idle
                 </span>
               )}
-              <span className="flex items-center gap-1">
-                <MousePointerClick className="h-3 w-3" />
-                {seg.mouseClicks.toLocaleString()}
+              <span className="flex items-center gap-1" title={seg.mouseClicks === null ? "Mouse clicks not measured" : "Mouse clicks"}>
+                <MousePointerClick className="h-3 w-3" aria-hidden />
+                <span className="sr-only">Mouse clicks: </span>
+                {seg.mouseClicks === null ? <NotMeasuredCount /> : seg.mouseClicks.toLocaleString()}
               </span>
-              <span className="flex items-center gap-1">
-                <Keyboard className="h-3 w-3" />
-                {seg.keyboardHits.toLocaleString()}
+              <span className="flex items-center gap-1" title={seg.keyboardHits === null ? "Key presses not measured" : "Key presses"}>
+                <Keyboard className="h-3 w-3" aria-hidden />
+                <span className="sr-only">Key presses: </span>
+                {seg.keyboardHits === null ? <NotMeasuredCount /> : seg.keyboardHits.toLocaleString()}
               </span>
             </div>
 

@@ -727,7 +727,7 @@ describe("aggregateTracked — the backend's rules over blocks", () => {
 
   it("is empty — with nothing measured — for no blocks", () => {
     const none = aggregateTracked([], utcDay);
-    expect(none.totals).toEqual({ minutes: 0, sessions: 0, activity: null, idleMinutes: null, keys: 0, clicks: 0 });
+    expect(none.totals).toEqual({ minutes: 0, sessions: 0, activity: null, idleMinutes: null, keys: null, clicks: null });
     expect(none.daily).toEqual([]);
     expect(none.memberProjects).toEqual([]);
   });
@@ -767,6 +767,16 @@ describe("blockIdleMinutes — the agents' idle rule", () => {
     expect(trackedRowFromActivity(buildActivity({ startedAt: "2026-07-14T14:10:00Z", endedAt: "2026-07-14T14:00:00Z" }))).toBeNull();
   });
 
+  it("a row whose input was not counted keeps its counts null, and aggregates add only the measured ones", () => {
+    const unmeasured = trackedRowFromActivity(buildActivity({ keyboardHits: null, mouseClicks: null }));
+    expect(unmeasured).toMatchObject({ keys: null, clicks: null });
+    const measured = trackedRowFromActivity(buildActivity({ keyboardHits: 5, mouseClicks: 0, startedAt: "2026-07-14T15:00:00Z", endedAt: "2026-07-14T15:10:00Z" }));
+    const agg = aggregateTracked([unmeasured!, measured!], utcDay);
+    expect(agg.totals).toMatchObject({ keys: 5, clicks: 0, sessions: 2 });
+    expect(aggregateTracked([unmeasured!], utcDay).totals).toMatchObject({ keys: null, clicks: null });
+    expect(aggregateTracked([unmeasured!], utcDay).daily[0]).toMatchObject({ keys: null, clicks: null });
+  });
+
   it("a row flagged as unmeasured is 'not measured', not 0 %; reported idle seconds win", () => {
     const unmeasured = { ...buildActivity({ productivity: 0 }), activityMeasured: false } as Parameters<typeof trackedRowFromActivity>[0];
     expect(trackedRowFromActivity(unmeasured)).toMatchObject({ activity: null, idleMinutes: null });
@@ -800,7 +810,16 @@ describe("parsing the reporting payloads", () => {
     expect(s.totals.activity).toBe(73.27);
     expect(s.members[0]).toMatchObject({ name: "ana", idleMinutes: null, activity: 0 });
     expect(s.memberProjects).toBeNull();
-    expect(parseSummary(null)).toEqual({ totals: { minutes: 0, sessions: 0, activity: null, idleMinutes: null, keys: 0, clicks: 0 }, members: [], projects: [], memberProjects: null });
+    expect(parseSummary(null)).toEqual({ totals: { minutes: 0, sessions: 0, activity: null, idleMinutes: null, keys: null, clicks: null }, members: [], projects: [], memberProjects: null });
+  });
+
+  it("reads totals over no measured block as not measured (null), and a measured zero as 0", () => {
+    const none = parseSummary({ totalKeyboardHits: 0, totalMouseClicks: 0, keyboardMeasuredActivities: 0, mouseMeasuredActivities: 0, totalActivities: 3 });
+    expect(none.totals).toMatchObject({ keys: null, clicks: null, sessions: 3 });
+    const partly = parseSummary({ totalKeyboardHits: 0, totalMouseClicks: 12, keyboardMeasuredActivities: 2, mouseMeasuredActivities: 1 });
+    expect(partly.totals).toMatchObject({ keys: 0, clicks: 12 });
+    // An older server says nothing about measurement: its numbers stand.
+    expect(parseSummary({ totalKeyboardHits: 4, totalMouseClicks: 0 }).totals).toMatchObject({ keys: 4, clicks: 0 });
   });
 
   it("reads the daily series as calendar days of the requested zone", () => {
@@ -808,12 +827,15 @@ describe("parsing the reporting payloads", () => {
       parseDailySeries([
         { date: "2026-07-14T00:00:00", trackedMinutes: 90, activityCount: 6, averageProductivity: 72, idleMinutes: 8, keyboardHits: 40, mouseClicks: 4 },
         { date: "2026-07-15T00:00:00", trackedMinutes: 0, activityCount: 0, averageProductivity: null },
+        { date: "2026-07-16T00:00:00", trackedMinutes: 30, activityCount: 3, keyboardHits: 0, mouseClicks: 0, keyboardMeasuredActivities: 0, mouseMeasuredActivities: 2 },
         { date: "garbage", trackedMinutes: 9 },
         7,
       ]),
     ).toEqual([
       { day: "2026-07-14", minutes: 90, sessions: 6, activity: 72, idleMinutes: 8, keys: 40, clicks: 4 },
-      { day: "2026-07-15", minutes: 0, sessions: 0, activity: null, idleMinutes: null, keys: 0, clicks: 0 },
+      { day: "2026-07-15", minutes: 0, sessions: 0, activity: null, idleMinutes: null, keys: null, clicks: null },
+      // Nothing that day counted keys: not measured, while its clicks were measured as zero.
+      { day: "2026-07-16", minutes: 30, sessions: 3, activity: null, idleMinutes: null, keys: null, clicks: 0 },
     ]);
     expect(parseDailySeries({ not: "an array" })).toEqual([]);
   });

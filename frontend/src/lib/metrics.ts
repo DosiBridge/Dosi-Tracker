@@ -248,6 +248,65 @@ export function totalIdleMinutes(activities: Activity[]): number {
   return minutes;
 }
 
+/* ----------------------------- Input counts ----------------------------- */
+
+/**
+ * KEY PRESSES / MOUSE CLICKS: how many there were, never which keys or where
+ * (the agents count, they never record). A count is NULL when it was not
+ * measured — no consent, a session that can't count input (Wayland), or a
+ * project that allows neither — and 0 only when it was measured as zero
+ * (contract §1, API-05). Sums add the measured values only and stay null
+ * when nothing in the set was measured: show "—" / "Not measured", never 0.
+ */
+export const INPUT_COUNT_METRIC = {
+  /** A count, or a set of counts, that was not measured. */
+  notMeasured: "Not measured",
+  /** Table cells and chart values that have no measured count. */
+  placeholder: "—",
+} as const;
+
+/** A wire or stored count as a non-negative whole number, or null when it is absent or not a number. */
+export function inputCountOf(value: unknown): number | null {
+  if (value === undefined || value === null || (typeof value === "string" && value.trim() === "")) return null;
+  const n = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(n) ? Math.max(0, Math.round(n)) : null;
+}
+
+/** Two counts added: null only when neither was measured. */
+export function addCounts(a: number | null | undefined, b: number | null | undefined): number | null {
+  const x = typeof a === "number" && Number.isFinite(a) ? a : null;
+  const y = typeof b === "number" && Number.isFinite(b) ? b : null;
+  if (x === null) return y;
+  return y === null ? x : x + y;
+}
+
+/** The measured counts of a set added up; null when none of them was measured. */
+export function sumCounts(values: Iterable<number | null | undefined>): number | null {
+  let total: number | null = null;
+  for (const v of values) total = addCounts(total, v);
+  return total;
+}
+
+/** "1,204", or "—" (or `unmeasured`, e.g. "Not measured" on a tile) when the count was not measured. */
+export function formatCount(
+  value: number | null | undefined,
+  format: (n: number) => string = (n) => n.toLocaleString("en"),
+  unmeasured: string = INPUT_COUNT_METRIC.placeholder,
+): string {
+  return typeof value === "number" && Number.isFinite(value) ? format(value) : unmeasured;
+}
+
+/**
+ * A server total of counts (`totalKeyboardHits`, a day's `mouseClicks`) read
+ * with how many blocks measured it (`keyboardMeasuredActivities`, newer
+ * servers): none measured is null, never the 0 the total then holds. An older
+ * server that sends no measured count keeps its number.
+ */
+export function serverCount(total: unknown, measuredBlocks: unknown): number | null {
+  if (typeof measuredBlocks === "number" && Number.isFinite(measuredBlocks) && measuredBlocks <= 0) return null;
+  return inputCountOf(total);
+}
+
 /** How many distinct UTC days a member logged any time on. */
 export function distinctActiveDays(activities: Activity[], userId: string): number {
   const days = new Set<string>();

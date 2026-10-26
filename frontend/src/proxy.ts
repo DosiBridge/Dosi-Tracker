@@ -4,10 +4,17 @@ import { apiOrigin, resolveRuntimeConfig } from "@/lib/runtime-config";
 import { safeRedirectPath } from "@/lib/safe-redirect";
 import { NONCE_HEADER, contentSecurityPolicy, createNonce } from "@/lib/security-headers";
 
-/** Pages anyone may open without a session: invitation links, the install guides, the health probe. */
+/**
+ * Pages emailed links open (account recovery and email confirmation): public,
+ * and reachable with or without a session.
+ */
+const ACCOUNT_LINK_PAGES = new Set(["/forgot-password", "/reset-password", "/confirm-email"]);
+
+/** Pages anyone may open without a session: invitation links, account links, the install guides, the health probe. */
 function isPublic(pathname: string): boolean {
   return (
     pathname.startsWith("/invite/") ||
+    ACCOUNT_LINK_PAGES.has(pathname) ||
     pathname === "/install" ||
     pathname.startsWith("/install/") ||
     pathname === "/healthz"

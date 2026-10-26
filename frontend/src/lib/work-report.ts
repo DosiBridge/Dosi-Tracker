@@ -1,6 +1,7 @@
 import type { Activity } from "./types";
 import { normalizeActivityNote } from "./api-contract";
 import { normalizeUtcIso } from "./live-dataset";
+import { addCounts, inputCountOf, serverCount } from "./metrics";
 import { addZonedDays, countDays, isDayKey, zonedDayKey, zonedDayRange, zonedParts, zonedPeriod } from "./time-zone";
 
 /* ============================================================================
@@ -956,8 +957,9 @@ export interface TrackedRow {
   activity: number | null;
   /** Minutes without input; null when not measured. */
   idleMinutes: number | null;
-  keys: number;
-  clicks: number;
+  /** Key presses / clicks; null when not measured (never a fabricated 0). */
+  keys: number | null;
+  clicks: number | null;
 }
 
 export interface ReportTotals {
@@ -966,8 +968,9 @@ export interface ReportTotals {
   /** Weighted by measured minutes; null when nothing was measured. */
   activity: number | null;
   idleMinutes: number | null;
-  keys: number;
-  clicks: number;
+  /** The measured blocks' key presses / clicks; null when no block measured them. */
+  keys: number | null;
+  clicks: number | null;
 }
 
 export interface DailyAggregate {
@@ -978,8 +981,9 @@ export interface DailyAggregate {
   /** The minutes `activity` was measured over, when the source knows them (blocks do; the server's series doesn't say). */
   measuredMinutes?: number;
   idleMinutes: number | null;
-  keys: number;
-  clicks: number;
+  /** Null when nothing that day measured them. */
+  keys: number | null;
+  clicks: number | null;
 }
 
 export interface MemberAggregate {
@@ -1043,17 +1047,17 @@ interface Acc {
   measured: number;
   idle: number;
   idleKnown: boolean;
-  keys: number;
-  clicks: number;
+  keys: number | null;
+  clicks: number | null;
 }
 
-const freshAcc = (): Acc => ({ minutes: 0, sessions: 0, weighted: 0, measured: 0, idle: 0, idleKnown: false, keys: 0, clicks: 0 });
+const freshAcc = (): Acc => ({ minutes: 0, sessions: 0, weighted: 0, measured: 0, idle: 0, idleKnown: false, keys: null, clicks: null });
 
 function addTo(acc: Acc, row: TrackedRow): void {
   acc.minutes += row.minutes;
   acc.sessions += 1;
-  acc.keys += row.keys;
-  acc.clicks += row.clicks;
+  acc.keys = addCounts(acc.keys, row.keys);
+  acc.clicks = addCounts(acc.clicks, row.clicks);
   if (row.activity !== null) {
     acc.weighted += row.minutes * row.activity;
     acc.measured += row.minutes;
@@ -1071,6 +1075,7 @@ function round2(value: number): number {
 
 const accActivity = (acc: Acc): number | null => (acc.measured > 0 ? round2(acc.weighted / acc.measured) : null);
 const accIdle = (acc: Acc): number | null => (acc.idleKnown ? round2(acc.idle) : null);
+const roundCount = (value: number | null): number | null => (value === null ? null : Math.round(value));
 const byMinutes = <T extends { minutes: number }>(a: T, b: T) => b.minutes - a.minutes;
 
 /**
@@ -1121,8 +1126,8 @@ export function aggregateTracked(rows: readonly TrackedRow[], dayOf: (ms: number
       sessions: total.sessions,
       activity: accActivity(total),
       idleMinutes: accIdle(total),
-      keys: Math.round(total.keys),
-      clicks: Math.round(total.clicks),
+      keys: roundCount(total.keys),
+      clicks: roundCount(total.clicks),
     },
     daily: [...daily.entries()]
       .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
@@ -1133,8 +1138,8 @@ export function aggregateTracked(rows: readonly TrackedRow[], dayOf: (ms: number
         activity: accActivity(acc),
         measuredMinutes: round2(acc.measured),
         idleMinutes: accIdle(acc),
-        keys: Math.round(acc.keys),
-        clicks: Math.round(acc.clicks),
+        keys: roundCount(acc.keys),
+        clicks: roundCount(acc.clicks),
       })),
     members: [...members.entries()]
       .map(([userId, acc]) => ({
@@ -1223,11 +1228,6 @@ interface ActivityExtras {
   activityMeasured?: boolean;
 }
 
-function nonNegative(value: unknown): number {
-  const n = toNumber(value);
-  return Number.isFinite(n) && n > 0 ? n : 0;
-}
-
 /**
  * A demo or tenant activity as a tracked row; null when its times are
  * unusable. Its idle time follows {@link blockIdleMinutes}, falling back to the
@@ -1256,8 +1256,8 @@ export function trackedRowFromActivity(activity: Activity): TrackedRow | null {
       activity: measured,
       fromActivity: true,
     }),
-    keys: nonNegative(activity.keyboardHits),
-    clicks: nonNegative(activity.mouseClicks),
+    keys: inputCountOf(activity.keyboardHits),
+    clicks: inputCountOf(activity.mouseClicks),
   };
 }
 
@@ -1296,8 +1296,9 @@ export function parseSummary(payload: unknown): Pick<ReportAggregates, "totals" 
       sessions: cleanCount(s.totalActivities),
       activity: optionalPercent(s.averageProductivity),
       idleMinutes: optionalMinutes(s.totalIdleMinutes),
-      keys: cleanCount(s.totalKeyboardHits),
-      clicks: cleanCount(s.totalMouseClicks),
+      // A total over no measured block is "not measured", never 0 (newer servers say how many measured).
+      keys: serverCount(s.totalKeyboardHits, s.keyboardMeasuredActivities),
+      clicks: serverCount(s.totalMouseClicks, s.mouseMeasuredActivities),
     },
     members: rowsOf(s.perUser).flatMap((u) => {
       const userId = idOf(u.userId);
@@ -1350,8 +1351,8 @@ export function parseDailySeries(payload: unknown): DailyAggregate[] {
         sessions: cleanCount(d.activityCount),
         activity: optionalPercent(d.averageProductivity),
         idleMinutes: optionalMinutes(d.idleMinutes),
-        keys: cleanCount(d.keyboardHits),
-        clicks: cleanCount(d.mouseClicks),
+        keys: serverCount(d.keyboardHits, d.keyboardMeasuredActivities),
+        clicks: serverCount(d.mouseClicks, d.mouseMeasuredActivities),
       },
     ];
   });

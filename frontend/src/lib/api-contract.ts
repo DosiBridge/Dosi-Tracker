@@ -73,6 +73,22 @@ export const TRACKER_ERROR_STATUS = {
   "Tracker:InvitationNotFound": 404,
   "Tracker:InvitationExpired": 410,
   "Tracker:InvitationEmailMismatch": 403,
+  "Tracker:WorkspaceArchived": 403,
+  "Tracker:EmailNotConfirmed": 403,
+  "Tracker:ExportExceedsLimit": 400,
+  "Tracker:DeviceRevoked": 403,
+  "Tracker:DeviceNotObserved": 400,
+  "Tracker:DeviceNotFound": 404,
+  "Tracker:DeviceIdRequired": 400,
+  "Tracker:ActivityDeleted": 410,
+  "Tracker:CaptureDeleteNotAllowed": 403,
+  "Tracker:WorkspaceDeleteConfirmationMismatch": 400,
+  "Tracker:SoleWorkspaceOwner": 409,
+  "Tracker:AccountDeletionNotAllowed": 403,
+  "Tracker:InvalidPassword": 403,
+  "Tracker:EmailConfirmationInvalid": 400,
+  "Tracker:BillingDisabled": 409,
+  "Tracker:PlanChangeNotAllowed": 403,
 } as const;
 
 export type TrackerErrorCode = keyof typeof TRACKER_ERROR_STATUS;
@@ -298,8 +314,9 @@ export interface WindowInfoDto {
 /** One minute of a block's timeline (also the stored TimelineJson shape). */
 export interface ActivityMinuteDto {
   minute: number;
-  keyboardHits: number;
-  mouseClicks: number;
+  /** Null when not measured (no consent, or a session that can't count input); 0 only when measured as zero. */
+  keyboardHits: number | null;
+  mouseClicks: number | null;
   active: boolean;
   appName?: string | null;
   /** Seconds of the minute with any input, 0–90 (newer agents). */
@@ -314,8 +331,9 @@ export interface CreateActivityDto {
   endedAt: string;
   /** 0–100; null = not measured (input capture unavailable or not allowed). */
   productivity: number | null;
-  mouseClicks: number;
-  keyboardHits: number;
+  /** Counts only, never which keys. Null = not measured (consent off, unsupported session such as Wayland); 0 = measured as zero. */
+  mouseClicks: number | null;
+  keyboardHits: number | null;
   description?: string | null;
   activeWindows: WindowInfoDto[];
   runningPrograms: WindowInfoDto[];
@@ -612,8 +630,9 @@ export interface ActivityDto {
   endedAt: string;
   /** 0–100, or null when the block's input was not measured. */
   productivity: number | null;
-  mouseClicks: number;
-  keyboardHits: number;
+  /** Null when not measured (never a fabricated 0). */
+  mouseClicks: number | null;
+  keyboardHits: number | null;
   description?: string | null;
   activeWindowsJson?: string;
   runningProgramsJson?: string;
@@ -745,8 +764,12 @@ export interface ReportSummaryDto {
   totalTrackedMinutes: number;
   /** Minute-weighted over measured blocks; null when nothing was measured. */
   averageProductivity: number | null;
+  /** Clicks / key presses of the blocks that measured them: with no measured block it is 0 meaning "not measured". */
   totalMouseClicks: number;
   totalKeyboardHits: number;
+  /** How many blocks measured clicks / key presses (newer servers): 0 makes the totals above "not measured". */
+  mouseMeasuredActivities?: number;
+  keyboardMeasuredActivities?: number;
   totalIdleMinutes?: number;
   perUser: UserReportRowDto[];
   perProject: ProjectReportRowDto[];
@@ -782,6 +805,9 @@ export interface DailyReportRowDto {
   averageProductivity: number | null;
   mouseClicks: number;
   keyboardHits: number;
+  /** How many of the day's blocks measured clicks / key presses (newer servers; 0 = not measured that day). */
+  mouseMeasuredActivities?: number;
+  keyboardMeasuredActivities?: number;
 }
 
 export interface UserDailyReportRowDto {
@@ -941,8 +967,12 @@ export interface InviteMemberDto {
 }
 
 /**
- * POST /api/app/team/invite-member result. An existing account is `added` at
- * once; anyone else gets an invitation link (`invitePath`, "/invite/{token}").
+ * POST /api/app/team/invite-member (and resend-invitation) result. Nobody joins
+ * a workspace without accepting: `added` is true only when the person was
+ * ALREADY an active member and was put on the project at once. Everyone else,
+ * with an account or without (the answer never says which), gets a pending
+ * invitation (`invitePath`, "/invite/{token}", shown only here) that they
+ * accept themselves; `emailSent` says whether this server also emailed it.
  */
 export interface InviteMemberResultDto {
   added: boolean;
@@ -951,6 +981,8 @@ export interface InviteMemberResultDto {
   invitationId?: string | null;
   invitePath?: string | null;
   expiresAt?: string | null;
+  /** The invitation was emailed (false when this server sends no email: share the link yourself). Older servers: absent. */
+  emailSent?: boolean;
 }
 
 /** PUT /api/app/team/member?projectId=&userId= body. A new rate applies from now on (rates are effective-dated). */
@@ -1014,7 +1046,16 @@ export interface NewProjectDefaultsDto {
 export interface WorkspaceSettingsDto {
   defaultTimeZone: string | null;
   newProjectDefaults: NewProjectDefaultsDto;
+  /**
+   * Minutes after upload during which members may delete their own captures
+   * (0: they can't; owners and managers always can). Null in an update keeps
+   * it; absent on older servers.
+   */
+  memberCaptureDeleteMinutes?: number | null;
 }
+
+/** Bounds of WorkspaceSettingsDto.memberCaptureDeleteMinutes (backend MemberCaptureDeletion). */
+export const MEMBER_CAPTURE_DELETE_LIMITS = { min: 0, max: 7 * 24 * 60, default: 60 } as const;
 
 /** GET/PUT /api/app/workspace/my-preferences (any member). */
 export interface MyPreferencesDto {
@@ -1224,6 +1265,8 @@ export interface WorkspaceRegistrationResultDto {
   workspaceId: string;
   workspaceName: string;
   userName: string;
+  /** An email asking to confirm the address was sent (false when this server sends no email). */
+  emailConfirmationSent?: boolean;
 }
 
 /** POST (platform): move a workspace to another plan. */
@@ -1264,4 +1307,237 @@ export interface WorkspaceSubscriptionDto {
 /** POST (host): record an invoice as paid. */
 export function markInvoicePaidRoute(invoiceId: string): string {
   return `/api/app/platform/mark-invoice-paid?invoiceId=${encodeURIComponent(invoiceId)}`;
+}
+
+/* ----------------------------- Journeys: invitations, recovery, devices, erasure, billing, retention ----------------------------- */
+
+/** GET /api/app/invitations/mine: the signed-in person's pending invitations (no X-Workspace-Id). */
+export const MY_INVITATIONS_ROUTE = "/api/app/invitations/mine";
+
+/** POST: accept one of the caller's invitations by its id (403 Tracker:EmailNotConfirmed while the email is unverified). */
+export function acceptMyInvitationRoute(invitationId: string): string {
+  return `${MY_INVITATIONS_ROUTE}/${encodeURIComponent(invitationId)}/accept`;
+}
+
+/** POST: decline one of the caller's invitations by its id. */
+export function declineMyInvitationRoute(invitationId: string): string {
+  return `${MY_INVITATIONS_ROUTE}/${encodeURIComponent(invitationId)}/decline`;
+}
+
+/** A pending invitation addressed to the signed-in person's (verified) email. */
+export interface MyInvitationDto {
+  id: string;
+  workspaceId: string;
+  workspaceName: string;
+  /** The workspace role it grants: owner | manager | member. */
+  role: string;
+  expiresAt: string;
+  creationTime?: string | null;
+}
+
+/** GET /api/app/invitations/mine. Matched by email, so listed only once the email is verified. */
+export interface MyInvitationsDto {
+  /** False: `items` is empty until the address is confirmed (an invitation link still works). */
+  emailConfirmed: boolean;
+  items: MyInvitationDto[];
+}
+
+/** ABP's account API for recovery (anonymous; it answers the same whether or not the address has an account). */
+export const ACCOUNT_RECOVERY_ROUTES = {
+  sendResetCode: "/api/account/send-password-reset-code",
+  verifyResetToken: "/api/account/verify-password-reset-token",
+  resetPassword: "/api/account/reset-password",
+} as const;
+
+/** The reset-code request body. ABP requires `appName`; the server builds the link to this web app. */
+export interface SendResetCodeDto {
+  email: string;
+  appName: string;
+  /** A path on this web app to return to afterwards (the server keeps only a local path). */
+  returnUrl?: string | null;
+}
+
+/** The reset body, from the emailed /reset-password?userId=&resetToken= link (the new value travels as `password`). */
+export interface ResetCredentialDto {
+  userId: string;
+  resetToken: string;
+  password: string;
+}
+
+/** The signed-in person's own account (no X-Workspace-Id). */
+export const MY_ACCOUNT_ROUTES = {
+  sendEmailConfirmation: "/api/app/my-account/send-email-confirmation",
+  confirmEmail: "/api/app/my-account/confirm-email",
+  deletionCheck: "/api/app/my-account/deletion-check",
+  delete: "/api/app/my-account/delete",
+} as const;
+
+export interface EmailConfirmationSentDto {
+  alreadyConfirmed: boolean;
+  /** False when this server sends no email. */
+  emailSent: boolean;
+}
+
+/** POST /api/app/my-account/confirm-email body (anonymous; from the emailed /confirm-email?userId=&token= link). */
+export interface ConfirmEmailDto {
+  userId: string;
+  token: string;
+}
+
+/** GET /api/app/my-account/deletion-check. */
+export interface AccountDeletionCheckDto {
+  canDelete: boolean;
+  isPlatformAdministrator: boolean;
+  /** Workspaces the caller is the only owner of: make someone else an owner, or delete them, first. */
+  soleOwnerOf: { id: string; name: string }[];
+}
+
+/** Desktop agent installs of the current workspace (docs/agent-api-contract.md). */
+export const DEVICE_ROUTES = {
+  /** GET: the caller's devices, or everyone's with Tracker.Devices.Manage (revoked ones included). */
+  list: "/api/app/device",
+  /** POST { deviceId, reason }: revoke one of the caller's own devices. */
+  revoke: "/api/app/device/revoke",
+  /** POST { userId, deviceId, reason }: revoke a member's device (owners and managers; only owners touch an owner's). */
+  revokeMember: "/api/app/device/revoke-member",
+  /** POST { userId, deviceId }: lift a revocation (the install then signs in again). */
+  restore: "/api/app/device/restore",
+} as const;
+
+/** Longest revocation reason the server keeps (DeviceConsts.MaxReasonLength). */
+export const DEVICE_REASON_MAX_LENGTH = 256;
+
+/** GET /api/app/device item: an install that sent a heartbeat, or one that is revoked. */
+export interface WorkspaceDeviceDto {
+  userId: string;
+  userName?: string | null;
+  name?: string | null;
+  deviceId: string;
+  deviceName?: string | null;
+  platform?: AgentPlatform | null;
+  osVersion?: string | null;
+  agentVersion?: string | null;
+  /** The latest heartbeat (server time); null when only the revocation remains. */
+  lastSeenAt?: string | null;
+  isRevoked: boolean;
+  revokedAt?: string | null;
+  revokedByUserId?: string | null;
+  reason?: string | null;
+}
+
+export interface DeviceRevocationDto {
+  id: string;
+  workspaceId: string;
+  userId: string;
+  deviceId: string;
+  revokedAt: string;
+  reason?: string | null;
+  revokedByUserId?: string | null;
+}
+
+export interface DeviceStatusDto {
+  deviceId: string;
+  isRevoked: boolean;
+  revokedAt?: string | null;
+  reason?: string | null;
+}
+
+/** POST (Tracker.Activities.Delete): delete a block with all its captures, giving a reason. */
+export function deleteActivityRoute(activityId: string): string {
+  return `/api/app/activity/${encodeURIComponent(activityId)}/delete`;
+}
+
+/** POST: delete one capture (a screen image goes with its thumbnail); the block stays. */
+export function deleteCaptureRoute(captureId: string): string {
+  return `/api/app/activity/capture/${encodeURIComponent(captureId)}/delete`;
+}
+
+/** GET: the record of deletions, newest first (the workspace's for owners and managers, your own data's otherwise). */
+export const ACTIVITY_ERASURES_ROUTE = "/api/app/activity/erasures";
+
+/** Reason limits of a deletion (backend ActivityErasureLimits). */
+export const ERASURE_REASON_LIMITS = { min: 3, max: 512 } as const;
+
+/** One deletion of tracked data: what was deleted, never what it contained. */
+export interface ActivityErasureDto {
+  id: string;
+  activityId: string;
+  userId: string;
+  projectId: string;
+  startedAt: string;
+  endedAt: string;
+  /** "block" (with its captures) or "capture". */
+  scope: string;
+  captureKinds?: string | null;
+  captureCount: number;
+  reason?: string | null;
+  deletedBy?: string | null;
+  deletionTime: string;
+}
+
+/** POST (owners): delete a workspace, confirmed by typing its name (400 Tracker:WorkspaceDeleteConfirmationMismatch). */
+export function deleteWorkspaceRoute(workspaceId: string): string {
+  return `/api/app/workspaces/${encodeURIComponent(workspaceId)}/delete`;
+}
+
+/** A deleted workspace: gone at once for everyone, its data purged after `purgeAfter`. */
+export interface DeletedWorkspaceDto {
+  id: string;
+  deletionTime: string;
+  purgeAfter: string;
+}
+
+/** GET/PUT: how long the workspace keeps screen and webcam captures (members read, owners change). */
+export function captureRetentionRoute(workspaceId: string): string {
+  return `/api/app/workspaces/${encodeURIComponent(workspaceId)}/capture-retention`;
+}
+
+/** GET/PUT: how long the workspace keeps tracked time blocks. */
+export function activityRetentionRoute(workspaceId: string): string {
+  return `/api/app/workspaces/${encodeURIComponent(workspaceId)}/activity-retention`;
+}
+
+/** A workspace retention policy. Off by default; `isEnforced` (read-only) is whether this server runs the sweeps at all. */
+export interface RetentionPolicyDto {
+  isEnabled: boolean;
+  retentionDays: number;
+  isEnforced?: boolean;
+}
+
+/** Bounds of the two policies (backend WorkspaceCaptureRetentionDto / ActivityRetentionLimits). */
+export const RETENTION_LIMITS = {
+  capture: { min: 1, max: 730, default: 30 },
+  activity: { min: 90, max: 3650, default: 365 },
+} as const;
+
+/** GET (anonymous): whether this deployment bills workspaces at all. */
+export const BILLING_MODE_ROUTE = "/api/app/workspace/billing-mode";
+
+export interface BillingModeDto {
+  enabled: boolean;
+}
+
+/** Owner self-service billing (while billing is on; 409 Tracker:BillingDisabled otherwise). */
+export const BILLING_ROUTES = {
+  /** POST { planId }: move to a FREE plan the team fits (403 Tracker:PlanChangeNotAllowed for a paid one). */
+  changePlan: "/api/app/billing/change-plan",
+  /** POST: cancel the paid subscription (tracking pauses until a free plan or the platform reactivates it). */
+  cancel: "/api/app/billing/cancel",
+} as const;
+
+/** POST: renew a pending (or expired) invitation: a new link and expiry, emailed again when the server sends email. */
+export function resendInvitationRoute(invitationId: string): string {
+  return `/api/app/team/${encodeURIComponent(invitationId)}/resend-invitation`;
+}
+
+/** POST (owners): email an active member a link to choose a new sign-in secret; the owner never sees the link. */
+export function memberRecoveryEmailRoute(userId: string): string {
+  return `${MEMBER_RECOVERY_EMAIL_ROUTE}?userId=${encodeURIComponent(userId)}`;
+}
+
+/** The owner's "email them a reset link" endpoint (contract §7). */
+export const MEMBER_RECOVERY_EMAIL_ROUTE = "/api/app/team/send-password-reset";
+
+export interface RecoveryEmailSentDto {
+  emailSent: boolean;
 }
