@@ -82,6 +82,19 @@ impl Xterm {
             .stderr(Stdio::null())
             .spawn()
             .expect("xterm");
+        // Xvfb hands a new client the resource ids of the last one, and
+        // openbox leaves _NET_ACTIVE_WINDOW on a window that went away: the
+        // new xterm can look active by title before openbox manages it. Only
+        // a window in _NET_CLIENT_LIST is managed (mapped, framed, focusable).
+        let pid = child.id();
+        let owners = provider(harness);
+        wait_for("openbox to manage the xterm", || {
+            owners
+                .client_list_pids()
+                .ok()
+                .filter(|pids| pids.contains(&pid))
+                .map(|_| ())
+        });
         Self { child, _xdg: xdg }
     }
 
