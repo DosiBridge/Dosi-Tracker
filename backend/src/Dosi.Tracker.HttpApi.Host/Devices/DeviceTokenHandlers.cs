@@ -1,3 +1,4 @@
+using System;
 using System.Threading.Tasks;
 using OpenIddict.Abstractions;
 using OpenIddict.Server;
@@ -107,17 +108,25 @@ public sealed class AttachDeviceBinding : IOpenIddictServerHandler<ProcessSignIn
 
         // A brand-new sign-in's authorization can still be mid-write elsewhere in OpenIddict's own pipeline (it
         // was only just created a few handlers earlier) when BindAsync reads it, so its first attempt can lose a
-        // concurrency race against that write. Re-reading and retrying — same as any optimistic-concurrency
-        // caller — picks up the now-current row; it never retries a real rejection (BindAsync returns true as
-        // soon as the row already carries a device, including the one this call tried to write).
+        // concurrency race against that write. Confirmed in a real deploy: the first bind after a fresh
+        // migration raced this way, succeeded on retry once, then needed more than one retry on a later run — so
+        // this backs off a little between attempts rather than retrying as fast as possible, to give whatever
+        // else is writing room to finish. Re-reading and retrying — same as any optimistic-concurrency caller —
+        // picks up the now-current row; it never retries a real rejection (BindAsync returns true as soon as the
+        // row already carries a device, including the one this call tried to write).
         for (var attempt = 1; attempt <= MaxBindAttempts; attempt++)
         {
             if (await _sessionManager.BindAsync(authorizationId, deviceId))
             {
                 return;
             }
+
+            if (attempt < MaxBindAttempts)
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(25 * attempt));
+            }
         }
     }
 
-    private const int MaxBindAttempts = 3;
+    private const int MaxBindAttempts = 8;
 }
