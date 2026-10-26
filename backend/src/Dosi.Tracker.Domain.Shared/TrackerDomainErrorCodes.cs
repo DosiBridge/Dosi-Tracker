@@ -39,8 +39,90 @@ public static class TrackerDomainErrorCodes
     public const string InvitationExpired = "Tracker:InvitationExpired";
     public const string InvitationEmailMismatch = "Tracker:InvitationEmailMismatch";
     public const string AlreadyWorkspaceMember = "Tracker:AlreadyWorkspaceMember";
+
+    /// <summary>The action matches the caller by their account's email, which is not verified yet.</summary>
+    public const string EmailNotConfirmed = "Tracker:EmailNotConfirmed";
+
     public const string ExportExceedsLimit = "Tracker:ExportExceedsLimit";
+    /// <summary>The device (the token's, or the one the request names) is revoked in this workspace. Terminal for an
+    /// agent: its sessions were revoked with it.</summary>
     public const string DeviceRevoked = "Tracker:DeviceRevoked";
+
     public const string DeviceNotObserved = "Tracker:DeviceNotObserved";
+
+    /// <summary>No revocation of that device exists to restore.</summary>
     public const string DeviceNotFound = "Tracker:DeviceNotFound";
+
+    /// <summary>An upload or heartbeat names no device: neither its token is device-bound nor its body has a deviceId.</summary>
+    public const string DeviceIdRequired = "Tracker:DeviceIdRequired";
+
+    /// <summary>The uploaded block was deleted from the workspace by an owner or manager (410). An agent drops the row:
+    /// resending it can never succeed.</summary>
+    public const string ActivityDeleted = "Tracker:ActivityDeleted";
+
+    /// <summary>A member may delete their own captures only within the workspace's window after upload, and only while
+    /// the owner allows it at all.</summary>
+    public const string CaptureDeleteNotAllowed = "Tracker:CaptureDeleteNotAllowed";
+
+    /// <summary>The typed confirmation of a workspace deletion is not the workspace's name.</summary>
+    public const string WorkspaceDeleteConfirmationMismatch = "Tracker:WorkspaceDeleteConfirmationMismatch";
+
+    /// <summary>The account is the only owner of a workspace: transfer ownership or delete the workspace first.</summary>
+    public const string SoleWorkspaceOwner = "Tracker:SoleWorkspaceOwner";
+
+    /// <summary>A platform administrator's account cannot be deleted by self-service.</summary>
+    public const string AccountDeletionNotAllowed = "Tracker:AccountDeletionNotAllowed";
+
+    /// <summary>The password that confirms a sensitive change is wrong.</summary>
+    public const string InvalidPassword = "Tracker:InvalidPassword";
+
+    /// <summary>The email confirmation link is invalid or expired.</summary>
+    public const string EmailConfirmationInvalid = "Tracker:EmailConfirmationInvalid";
+
+    /// <summary>Billing is turned off on this deployment (<c>Billing:Enabled</c>): there is no plan to change or cancel.</summary>
+    public const string BillingDisabled = "Tracker:BillingDisabled";
+
+    /// <summary>Owners may only move to a free plan by themselves; paid plans are changed by the platform.</summary>
+    public const string PlanChangeNotAllowed = "Tracker:PlanChangeNotAllowed";
+
+    // AI assist. error.data carries the fields named below, and never the provider's own text.
+
+    /// <summary>AI assist is off on this server, or its provider key or model is missing (503).</summary>
+    public const string AiNotConfigured = "Tracker:AiNotConfigured";
+
+    /// <summary>The platform operator turned AI assist off at runtime (503).</summary>
+    public const string AiPlatformDisabled = "Tracker:AiPlatformDisabled";
+
+    /// <summary>The workspace has not turned AI assist on, or its consent predates the current disclosure (409,
+    /// <c>data.reason</c>: off / reconsent).</summary>
+    public const string AiDisabled = "Tracker:AiDisabled";
+
+    /// <summary>The feature is not available to this caller (403, <c>data.reason</c>: operator / role /
+    /// self-service-off).</summary>
+    public const string AiFeatureDisabled = "Tracker:AiFeatureDisabled";
+
+    /// <summary>The AI allowance for the period is used up (429, <c>data.scope</c>: user-day / workspace-month /
+    /// platform-month; <c>data.resetsAt</c>).</summary>
+    public const string AiQuotaExceeded = "Tracker:AiQuotaExceeded";
+
+    /// <summary>Too many AI requests in a short time, or one is already running (429, <c>data.reason</c>: minute / busy;
+    /// <c>data.retryAfterSeconds</c>).</summary>
+    public const string AiRateLimited = "Tracker:AiRateLimited";
+
+    /// <summary>The AI provider failed and the feature has no fallback (503, <c>data.kind</c>: timeout / error /
+    /// rate-limited / circuit-open; <c>data.retryAfterSeconds</c> when known).</summary>
+    public const string AiProviderUnavailable = "Tracker:AiProviderUnavailable";
+
+    /// <summary>The model's output failed validation and the feature has no fallback (502).</summary>
+    public const string AiOutputInvalid = "Tracker:AiOutputInvalid";
+
+    /// <summary>The range is longer than the feature allows (400, <c>data.maxDays</c>).</summary>
+    public const string AiRangeTooLarge = "Tracker:AiRangeTooLarge";
+
+    /// <summary>Turning AI assist on (or widening what it sends) without acknowledging the current disclosure (400,
+    /// <c>data.version</c>).</summary>
+    public const string AiDisclosureNotAccepted = "Tracker:AiDisclosureNotAccepted";
+
+    /// <summary>The Ask AI conversation is missing, expired, someone else's, or predates a consent change (409).</summary>
+    public const string AiConversationExpired = "Tracker:AiConversationExpired";
 }

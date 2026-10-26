@@ -15,6 +15,11 @@ public class WorkspaceSettingsDto
 
     [Required]
     public NewProjectDefaultsDto NewProjectDefaults { get; set; } = new();
+
+    /// <summary>Minutes after upload during which members may delete their own captures (0: they cannot; owners and
+    /// managers always can). Null in an update leaves it unchanged.</summary>
+    [Range(0, MemberCaptureDeletion.MaxWindowMinutes)]
+    public int? MemberCaptureDeleteMinutes { get; set; }
 }
 
 /// <summary>What a new project starts with; the same rules as the project's own settings.</summary>

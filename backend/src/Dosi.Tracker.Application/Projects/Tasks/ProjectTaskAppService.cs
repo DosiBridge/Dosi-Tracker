@@ -3,15 +3,11 @@ using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
 using System.Linq;
 using System.Threading.Tasks;
-using Dosi.Tracker.Permissions;
-using Dosi.Tracker.Teams;
 using Dosi.Tracker.Workspaces;
 using Microsoft.AspNetCore.Authorization;
-using Volo.Abp;
 using Volo.Abp.Application.Dtos;
 using Volo.Abp.Domain.Entities;
 using Volo.Abp.Domain.Repositories;
-using Volo.Abp.Users;
 using Volo.Abp.Validation;
 
 namespace Dosi.Tracker.Projects;
@@ -22,16 +18,16 @@ public class ProjectTaskAppService : TrackerAppService, IProjectTaskAppService
 {
     private readonly IRepository<ProjectTask, Guid> _taskRepository;
     private readonly IRepository<Project, Guid> _projectRepository;
-    private readonly IRepository<ProjectMember, Guid> _memberRepository;
+    private readonly ProjectTaskRules _rules;
 
     public ProjectTaskAppService(
         IRepository<ProjectTask, Guid> taskRepository,
         IRepository<Project, Guid> projectRepository,
-        IRepository<ProjectMember, Guid> memberRepository)
+        ProjectTaskRules rules)
     {
         _taskRepository = taskRepository;
         _projectRepository = projectRepository;
-        _memberRepository = memberRepository;
+        _rules = rules;
     }
 
     public async Task<ProjectTaskDto> GetAsync(Guid id)
@@ -48,7 +44,7 @@ public class ProjectTaskAppService : TrackerAppService, IProjectTaskAppService
             throw new EntityNotFoundException(typeof(ProjectTask), id);
         }
 
-        await CheckCanReadProjectAsync(project);
+        await _rules.EnsureCanReadProjectAsync(project);
 
         return ToDto(task);
     }
@@ -69,7 +65,7 @@ public class ProjectTaskAppService : TrackerAppService, IProjectTaskAppService
             throw new EntityNotFoundException(typeof(Project), input.ProjectId);
         }
 
-        await CheckCanReadProjectAsync(project);
+        await _rules.EnsureCanReadProjectAsync(project);
 
         var query = (await _taskRepository.GetQueryableAsync())
             .Where(t => t.ProjectId == input.ProjectId);
@@ -116,7 +112,7 @@ public class ProjectTaskAppService : TrackerAppService, IProjectTaskAppService
             throw new EntityNotFoundException(typeof(Project), input.ProjectId);
         }
 
-        await CheckCanMutateProjectTasksAsync(project);
+        await _rules.EnsureCanMutateProjectTasksAsync(project);
 
         var workspaceId = CurrentWorkspace.GetId();
         var title = input.Title.Trim();
@@ -154,7 +150,7 @@ public class ProjectTaskAppService : TrackerAppService, IProjectTaskAppService
             throw new EntityNotFoundException(typeof(Project), task.ProjectId);
         }
 
-        await CheckCanMutateProjectTasksAsync(project);
+        await _rules.EnsureCanMutateProjectTasksAsync(project);
 
         task.SetTitle(input.Title.Trim());
         task.SetDescription(string.IsNullOrWhiteSpace(input.Description) ? null : input.Description.Trim());
@@ -171,47 +167,6 @@ public class ProjectTaskAppService : TrackerAppService, IProjectTaskAppService
         await _taskRepository.UpdateAsync(task, autoSave: true);
 
         return ToDto(task);
-    }
-
-    private async Task CheckCanReadProjectAsync(Project project)
-    {
-        if (await AuthorizationService.IsGrantedAsync(TrackerPermissions.Projects.Edit) ||
-            await AuthorizationService.IsGrantedAsync(TrackerPermissions.Activities.ViewAll))
-        {
-            return;
-        }
-
-        var userId = CurrentUser.GetId();
-        var isMember = await _memberRepository.AnyAsync(m => m.ProjectId == project.Id && m.UserId == userId);
-        if (!isMember)
-        {
-            throw new EntityNotFoundException(typeof(Project), project.Id);
-        }
-    }
-
-    private async Task CheckCanMutateProjectTasksAsync(Project project)
-    {
-        if (project.IsArchived)
-        {
-            throw new BusinessException(TrackerDomainErrorCodes.ProjectArchived);
-        }
-
-        if (await AuthorizationService.IsGrantedAsync(TrackerPermissions.Projects.Edit))
-        {
-            return;
-        }
-
-        var userId = CurrentUser.GetId();
-        var member = await _memberRepository.FirstOrDefaultAsync(m => m.ProjectId == project.Id && m.UserId == userId);
-        if (member == null)
-        {
-            throw new BusinessException(TrackerDomainErrorCodes.NotProjectMember);
-        }
-
-        if (ProjectMemberRoles.IsClient(member.Role))
-        {
-            throw new BusinessException(TrackerDomainErrorCodes.RoleNotAllowed);
-        }
     }
 
     private static void ValidateInput(string? title, string? description)

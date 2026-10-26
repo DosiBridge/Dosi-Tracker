@@ -111,6 +111,10 @@ public abstract class WorkspaceHttpTestBase<TStartupModule> : TrackerApplication
     {
         public const string SchemeName = "TestAuth";
 
+        /// <summary>Makes the synthetic token device-bound, like a desktop agent's: its value becomes the
+        /// <c>device_id</c> claim.</summary>
+        public const string DeviceHeaderName = "X-Test-Device-Id";
+
         public TestAuthHandler(
             IOptionsMonitor<AuthenticationSchemeOptions> options,
             Microsoft.Extensions.Logging.ILoggerFactory logger,
@@ -153,6 +157,11 @@ public abstract class WorkspaceHttpTestBase<TStartupModule> : TrackerApplication
                 new Claim(AbpClaimTypes.UserId, userId.ToString()),
                 new Claim(ClaimTypes.NameIdentifier, userId.ToString())
             }, SchemeName);
+
+            if (Request.Headers.TryGetValue(DeviceHeaderName, out var deviceHeader))
+            {
+                identity.AddClaim(new Claim(Dosi.Tracker.Devices.DeviceConsts.TokenClaimType, deviceHeader.ToString()));
+            }
 
             var principal = new ClaimsPrincipal(identity);
             var ticket = new AuthenticationTicket(principal, SchemeName);

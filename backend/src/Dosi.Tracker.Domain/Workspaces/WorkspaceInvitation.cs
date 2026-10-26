@@ -5,8 +5,9 @@ using Volo.Abp.Domain.Entities.Auditing;
 
 namespace Dosi.Tracker.Workspaces;
 
-/// <summary>An invitation to join a workspace, sent to an email address that has no account yet. Only the hash of
-/// its token is stored.</summary>
+/// <summary>An invitation to join a workspace, addressed to an email address whether or not it has an account: nobody
+/// joins a workspace without accepting. It is accepted with its token, or by a signed-in account whose verified email
+/// is the invited one. Only the hash of its token is stored.</summary>
 public class WorkspaceInvitation : CreationAuditedAggregateRoot<Guid>
 {
     public Guid WorkspaceId { get; private set; }
@@ -55,6 +56,18 @@ public class WorkspaceInvitation : CreationAuditedAggregateRoot<Guid>
     public bool IsUsable(DateTime now) => AcceptedAt == null && ExpiresAt > now;
 
     public bool IsFor(string? email) => email != null && NormalizeEmail(email) == NormalizedEmail;
+
+    /// <summary>Gives the (pending) invitation a new token and expiry: the old link stops working.</summary>
+    public void Renew(string tokenHash, DateTime expiresAt)
+    {
+        if (AcceptedAt != null)
+        {
+            throw new InvalidOperationException("An accepted invitation cannot be renewed.");
+        }
+
+        TokenHash = tokenHash;
+        ExpiresAt = expiresAt;
+    }
 
     public void MarkAccepted(Guid userId, DateTime now)
     {

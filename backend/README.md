@@ -11,7 +11,123 @@ This is a layered startup solution based on [Domain Driven Design (DDD)](https:/
 
 ### Configurations
 
-The solution comes with a default configuration that works out of the box. However, you may consider to change the following configuration before running your solution:
+The solution comes with a default configuration that works out of the box for development. The API host reads every
+setting from configuration, so in a deployment set them as environment variables (`Section__Key`) or in a secret
+store — never in the tracked `appsettings.json`. Outside `Development` the host **refuses to start** while a secret is
+a well-known value (the template passphrases, a database password published in this repository or a stock default),
+is read from the tracked `appsettings.json`, or while `openiddict.pfx` is a localhost development certificate or has
+expired.
+
+| Setting | Purpose | Default |
+|---|---|---|
+| `App__ClientUrl` | The web app's address; emailed links (invitations, password reset, email confirmation, billing) open it | the first `App__CorsOrigins` entry |
+| `App__CorsOrigins` | Browser origins the API admits, comma-separated (`https://app.example.com`, `https://*.example.com`); `*` is refused | `http://localhost:6005` |
+| `App__ForwardedHeaders__KnownNetworks` / `__KnownProxies` | Reverse proxies trusted for `X-Forwarded-For`/`-Proto` (CIDR / IPs). Behind a proxy that is not on the same host, set it, or sign-ins fail as plain HTTP; the host warns at start-up when HTTPS is required and nothing is trusted | loopback only |
+| `Billing__Enabled` | Bill workspaces (trials, seat limits, invoices, owner downgrade/cancel). Off, every workspace is active and has no limits | `false` |
+| `Settings__Abp.Mailing.Smtp.Host`, `…Port`, `…UserName`, `…EnableSsl` | SMTP server for the emails. Until a host is set, nothing is sent and the host logs that an email was not sent | none |
+| `Email__SmtpPassword` | SMTP password in plain text (environment or secret store only); alternatively the setting `Abp.Mailing.Smtp.Password`, encrypted with `StringEncryption__DefaultPassPhrase` | none |
+| `Settings__Abp.Mailing.DefaultFromAddress`, `…DefaultFromDisplayName` | Sender of the emails | ABP's defaults |
+| `DataErasure__IsEnabled`, `__PeriodMinutes`, `__WorkspaceGraceDays`, `__BatchSize` | The erasure sweep: purges deleted workspaces (captures and files included) after the grace period and scrubs deleted accounts | on, 60, 7, 200 |
+| `DataProtection__KeysDirectory`, `__ApplicationName` | Data Protection keys (sign-in cookies, password-reset and confirmation tokens) are kept in the database table `AppDataProtectionKeys`; a directory instead when set. The application name must be the same on every instance | database, `Dosi.Tracker` |
+
+Emails are queued as ABP background jobs (table `AbpBackgroundJobs`) and retried with a growing delay when the SMTP
+server fails. For local testing, point SMTP at a mail catcher such as Mailpit (`Settings__Abp.Mailing.Smtp.Host=localhost`,
+`…Port=1025`, `…EnableSsl=false`).
+
+**Local secrets.** The tracked `appsettings.Development.json` holds template values only. Put your local database
+password (and an AI key, if you try AI assist) in the git-ignored
+`src/Dosi.Tracker.HttpApi.Host/appsettings.secrets.json`, for example
+`{ "ConnectionStrings": { "Default": "Host=localhost;Port=5432;Database=Tracker;User ID=postgres;Password=<yours>;" } }`.
+It is copied to `bin` but never into a publish folder, so it cannot reach a container image (it would override the
+container's environment there).
+
+#### AI assist (off by default)
+
+AI assist sends aggregated tracker data to an OpenAI-protocol provider, only in workspaces whose owner turns it on,
+and only when someone clicks an AI card (nothing generates on its own). The server has the provider configuration, the
+workspace settings, the usage views, the toolkit that prepares requests and checks answers, the request pipeline, the
+read layer and the six AI cards below; Ask AI is not served yet. It is off unless `AI__Enabled=true`.
+
+- **Owners opt in** (`PUT /api/app/ai-assist/settings`) after acknowledging the current disclosure version
+  (`"1.{AI:Disclosure:Version}"`); turning on window titles or task notes needs the same acknowledgement. Every change
+  is kept in the consent history (`AppAiConsentEvents`), and every active member gets an in-app notification when AI
+  assist starts or may send more of their data. Only the workspace's own setting counts: a global or configured value
+  can never turn it on. Raising `AI__Disclosure__Version` asks every owner to consent again.
+- **Everyone reads** `GET /api/app/ai-assist/status` (what is available to them and why not) and
+  `GET /api/app/ai-assist/usage`; owners and managers read the settings.
+- **The platform console** (`/api/app/platform-ai/overview`, `PUT /api/app/platform-ai/status`) shows the provider state
+  and the month's usage across workspaces, and switches AI assist off everywhere at once without a restart.
+- **The usage ledger** (`AppAiUsageRecords`) holds one row per served request (feature, tokens, cost, outcome; never a
+  prompt, an answer or a name). Rows older than `AI__Usage__RetentionDays` (400) are deleted daily. A deleted
+  workspace's ledger and consent history are purged with the rest of its data.
+- **What a request may carry** (`Application/AiAssist/Context`, `Prompts`, `Output`): people only as handles (`M1`…,
+  the reader as `ME`), every value as a server-formatted fact (`F1`…), and project, app, task, title and note text
+  only after it is sanitized (no tags, placeholders, links, paths, addresses, long numbers, credentials or
+  instruction-shaped phrases). Answers must cite those ids instead of writing numbers or names, use no judging terms,
+  links or markup, and are rendered from the reader's own data. Golden tests pin the exact messages.
+- **Data quality** (`GET /api/app/reporting/data-quality`, a regular report, scoped like the others): per member, the
+  blocks, tracked and unmeasured minutes, the largest device clock skew and the blocks with software-generated input.
+- **The request pipeline** (`Application/AiAssist/Pipeline`) runs every AI card the same way: the access checks, the
+  feature's own scope check (refused, never narrowed), the per-minute limit, the data read as the caller, "no data"
+  without a call, the result cache (keyed by the data's hash, the workspace, the reader's scope and when AI assist was
+  turned on; a regenerate skips it at most 3 times a day per feature and subject), the daily, monthly and platform
+  allowances, one request in flight per member, `AI__Concurrency__Global` / `__PerWorkspace` provider calls per
+  instance, and a circuit breaker (5 transient failures within a minute pause the provider for a minute; a rejected
+  key pauses it for 10 minutes and logs a Critical line). The provider call has one deadline
+  (`AI__RequestTimeoutSeconds`, retries included) and up to `AI__RepairAttempts` repair turns; a failure, the deadline
+  or an open breaker gives the feature's deterministic fallback. Every served request writes one ledger row in its own
+  short transaction, refusals write none, and AI-calling methods must not hold a database transaction. Metrics are on
+  the `Dosi.Tracker.AI` meter (`ai.requests`, `ai.tokens`, `ai.latency_ms`, `ai.injection_flags`).
+- **The AI cards** (`Application/AiAssist/Features`, all `POST /api/app/ai-assist/...`):
+  - `period-summary`: the team, one project ("project pulse", with its task counts) or the caller's own time, at most
+    31 days; members carry their tracked time only (at most 12 by name, the rest folded), never their activity %.
+  - `member-day-summary`: one local day of the caller, or of another member for owners and managers who see the team.
+  - `report-explanation`: the nine reports of the web app's catalog (never payroll), owners and managers only, at most
+    366 days (weeks above 31 days, months above 92); device names and OS versions are never read.
+  - `data-quality-review`: fixed rules (`DataQualityRules`: gaps of three weekdays or more, device clocks over five
+    minutes off, more than 30% of time without activity measurement, three or more blocks with software-generated
+    input, and for teams members who never tracked and outdated agents) find at most 20 candidates; the model only
+    picks and explains at most five, and items naming anything else are dropped. No candidates, no call.
+  - `note-suggestions`: up to three notes for a block whose note the caller could save; nothing is written.
+  - `task-drafts`: drafts for a project whose tasks the caller could add; nothing is created. It has no fallback: an
+    answer that stays invalid is `Tracker:AiOutputInvalid` (502).
+  - `feedback`: helpful / not helpful on one of the caller's own results (204; anyone else's id is a 404).
+
+  Window titles and notes are sent only when the owner allows them (day summaries and note suggestions). When the
+  provider fails or an answer stays invalid, every card but task drafts answers with a deterministic summary built from
+  the same figures (`meta.status` `fallback`). The task-drafts goal is kept out of the audit log.
+- **The read layer** (`Application/AiAssist/Read`) is the only way AI reads workspace data: the reporting, activity,
+  team, project and task app services, called as the caller, projected to models without emails, device names, OS
+  versions, input counts, timelines, captures or pay. A caller who does not see the team reads only their own data,
+  and asking about someone else is refused. Window titles and notes are read only when the owner allows them. An
+  architecture test keeps repositories out of it.
+
+At start-up the host logs one line with the provider state (`Disabled`,
+`Configured`, or what is missing). The key is never logged, and it must never be written into a tracked file:
+the start-up guard refuses an `AI:OpenAI:ApiKey` read from `appsettings.json`, and a test fails on any settings file
+under `backend/` that carries one.
+
+| Setting | Purpose | Default |
+|---|---|---|
+| `AI__Enabled` | The hard switch (read at start-up) | `false` |
+| `AI__Provider` | `OpenAI`, `AzureOpenAI` (v1 API; `Model` is the deployment name) or `OpenAICompatible` | `OpenAI` |
+| `AI__OpenAI__ApiKey` | The provider key: environment, `appsettings.secrets.json` or a secret store only | none |
+| `AI__OpenAI__Model` | The default model, e.g. `gpt-5.4-mini` (works with strict structured output and `AI__ReasoningEffort=low`) or `gpt-4.1-mini` (leave `ReasoningEffort` unset) | none: AI stays off |
+| `AI__OpenAI__BaseUrl`, `__AllowedHosts` | Endpoint, required for Azure and compatible servers; absolute https (plain http only for localhost in Development) and its host must be in the comma-separated allowlist | OpenAI's own, `api.openai.com` |
+| `AI__OpenAI__OrganizationId`, `__ProjectId` | Sent as OpenAI's organization and project headers | none |
+| `AI__RequestTimeoutSeconds`, `AI__MaxRetries` | Per-attempt timeout; retries of 408, 429, every 5xx (OpenAI's edge answers 520 now and then) and network errors, with exponential back-off. A Retry-After longer than 10 s is reported instead of waited for | `30`, `2` |
+| `AI__ReasoningEffort`, `AI__Temperature` | Sent only when set (reasoning models reject a temperature) | none |
+| `AI__Features__<Feature>__Enabled`, `__Model`, `__MaxOutputTokens` | Per feature: `PeriodSummary`, `MemberDaySummary`, `ReportExplanation`, `DataQualityReview`, `NoteSuggestions`, `TaskDrafts`, `Ask` | on, the default model, per feature |
+| `AI__Pricing__<n>__Model`, `__InputPer1M`, `__CachedInputPer1M`, `__OutputPer1M` | USD per million tokens, for cost estimates and the USD budget | none |
+| `AI__Quotas__Default__*`, `AI__Quotas__Plans__<Plan>__*` | `MonthlyRequests`, `MonthlyTokens`, `UserDailyRequests`, `UserPerMinute`, by plan name (built in: Free, Starter, Business; anything else uses Default: 200 / 800,000 / 20 / 4) | see text |
+| `AI__Disclosure__ProviderDisplayName`, `__ProcessingRegion`, `__RetentionNote`, `__Version` | What owners are shown before they opt in; raise `Version` to ask for consent again | `OpenAI`, none, none, `0` |
+| `AI__RepairAttempts`, `AI__StructuredOutput` | Repair turns after invalid output (0-3); `JsonSchema` (strict) or `JsonObject` for servers without json_schema | `1`, `JsonSchema` |
+| `AI__Concurrency__Global`, `__PerWorkspace` | Provider calls in flight per API instance; a request waits at most 2 s for a slot | `16`, `3` |
+| `AI__Budget__MonthlyTokenLimit`, `__MonthlyUsdLimit` | The platform-wide monthly ceiling (USD only for priced models) | `20000000`, none |
+| `AI__Usage__RetentionDays` | How long usage-ledger rows are kept | `400` |
+
+List the models your key can use locally (`GET https://api.openai.com/v1/models`), never in CI. Prefer a dedicated
+OpenAI project per environment with a project-scoped key, a model allowlist and a monthly budget.
 
 
 ### Before running the application
@@ -27,7 +143,7 @@ The first DbMigrator run on an empty database creates the platform administrator
 
 `AgentDataV2` and `AgentDataV2Followup` also bring existing data in line with the new rules (PostgreSQL only):
 
-* Subscriptions are enforced from now on: a workspace whose trial ended cannot record time or grow its team until the host activates it (`POST /api/app/platform/activate-subscription`). Workspaces whose trial had already ended before the upgrade (status `past_due`, nothing invoiced) get a new 14-day trial from the moment of the upgrade, so their owners are reminded three days before it ends and told when it ended, and the host can activate the paying ones first.
+* Subscriptions are enforced from now on (on a deployment with `Billing__Enabled=true`): a workspace whose trial ended cannot record time or grow its team until the host activates it (`POST /api/app/platform/activate-subscription`). Workspaces whose trial had already ended before the upgrade (status `past_due`, nothing invoiced) get a new 14-day trial from the moment of the upgrade, so their owners are reminded three days before it ends and told when it ended, and the host can activate the paying ones first.
 * The Identity `manager` role is taken from everyone who no longer holds an Admin/Manager membership on an existing project.
 * Duplicate memberships are merged (the oldest stays), and every membership's rate matches its latest rate-history entry.
 * Activity of blocks that never measured input (projects that allow neither keyboard nor mouse, agents that sent no timeline) becomes "not measured" instead of 0%.
@@ -36,13 +152,17 @@ The first DbMigrator run on an empty database creates the platform administrator
 
 In the production environment, you need to use a production signing certificate. ABP Framework sets up signing and encryption certificates in your application and expects an `openiddict.pfx` file in your application.
 
-To generate a signing certificate, you can use the following command:
+To generate a self-signed signing certificate (named for your API host, not `localhost`, and protected with a
+passphrase of your own, which you then supply as `AuthServer__CertificatePassPhrase`):
 
 ```bash
-dotnet dev-certs https -v -ep openiddict.pfx -p 3f027835-7c52-4bf7-bc1f-77582ca37aef
+openssl req -x509 -newkey rsa:3072 -sha256 -days 730 -nodes -subj "/CN=api.example.com" -keyout openiddict.key -out openiddict.crt
+openssl pkcs12 -export -inkey openiddict.key -in openiddict.crt -out openiddict.pfx
 ```
 
-> `3f027835-7c52-4bf7-bc1f-77582ca37aef` is the password of the certificate, you can change it to any password you want.
+The host refuses a `dotnet dev-certs` certificate (subject `localhost`), an expired certificate and the template
+passphrase outside `Development`. Renew the certificate before it expires: every token signed with it becomes
+invalid when it is replaced.
 
 It is recommended to use **two** RSA certificates, distinct from the certificate(s) used for HTTPS: one for encryption, one for signing.
 

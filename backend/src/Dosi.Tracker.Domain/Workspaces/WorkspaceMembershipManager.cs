@@ -99,10 +99,18 @@ public class WorkspaceMembershipManager : TrackerDomainService
         return _memberRepository.FirstOrDefaultAsync(m => m.WorkspaceId == workspaceId && m.UserId == userId);
     }
 
+    /// <summary>The user's active membership of the workspace; null when there is none or the workspace was deleted
+    /// (its memberships are kept until its data is purged, but grant nothing).</summary>
     public virtual async Task<WorkspaceMember?> FindActiveAsync(Guid workspaceId, Guid userId)
     {
         var member = await FindAsync(workspaceId, userId);
-        return member is { IsActive: true } ? member : null;
+        if (member is not { IsActive: true })
+        {
+            return null;
+        }
+
+        var workspaces = LazyServiceProvider.LazyGetRequiredService<IRepository<Workspace, Guid>>();
+        return await workspaces.AnyAsync(w => w.Id == workspaceId) ? member : null;
     }
 
     public virtual async Task<bool> IsActiveMemberAsync(Guid workspaceId, Guid userId)

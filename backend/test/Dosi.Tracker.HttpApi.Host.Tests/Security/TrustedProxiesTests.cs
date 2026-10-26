@@ -72,4 +72,20 @@ public class TrustedProxiesTests
         Should.Throw<InvalidOperationException>(() => Configure(new Dictionary<string, string?> { [key] = value }))
             .Message.ShouldContain(key);
     }
+
+    [Theory]
+    [InlineData(null, null, false)]
+    [InlineData("10.0.0.5", null, true)]
+    [InlineData(null, "10.0.0.0/8", true)]
+    [InlineData(" ", " ", false)]
+    public void Configured_Proxies_Are_Detected_So_The_Host_Can_Warn_Without_Them(string? proxies, string? networks, bool expected)
+    {
+        var configuration = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            ["App:ForwardedHeaders:KnownProxies"] = proxies,
+            ["App:ForwardedHeaders:KnownNetworks"] = networks
+        }).Build();
+
+        TrustedProxies.HasConfiguredProxies(configuration).ShouldBe(expected);
+    }
 }

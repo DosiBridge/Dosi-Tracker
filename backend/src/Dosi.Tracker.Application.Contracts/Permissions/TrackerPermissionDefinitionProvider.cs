@@ -19,9 +19,13 @@ public class TrackerPermissionDefinitionProvider : PermissionDefinitionProvider
 
         var activities = group.AddPermission(TrackerPermissions.Activities.Default, L("Permission:Activities"));
         activities.AddChild(TrackerPermissions.Activities.ViewAll, L("Permission:Activities.ViewAll"));
+        activities.AddChild(TrackerPermissions.Activities.Delete, L("Permission:Activities.Delete"));
 
         var team = group.AddPermission(TrackerPermissions.Team.Default, L("Permission:Team"));
         team.AddChild(TrackerPermissions.Team.Manage, L("Permission:Team.Manage"));
+
+        var devices = group.AddPermission(TrackerPermissions.Devices.Default, L("Permission:Devices"));
+        devices.AddChild(TrackerPermissions.Devices.Manage, L("Permission:Devices.Manage"));
 
         group.AddPermission(TrackerPermissions.Billing.Default, L("Permission:Billing"));
         group.AddPermission(TrackerPermissions.Reporting.Default, L("Permission:Reporting"));

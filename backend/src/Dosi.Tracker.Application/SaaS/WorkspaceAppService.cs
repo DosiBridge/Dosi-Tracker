@@ -3,13 +3,17 @@ using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
 using System.Linq;
 using System.Threading.Tasks;
+using Dosi.Tracker.Activities;
 using Dosi.Tracker.Activities.Retention;
+using Dosi.Tracker.Billing;
+using Dosi.Tracker.Erasure;
 using Dosi.Tracker.Identity;
 using Dosi.Tracker.Projects;
 using Dosi.Tracker.Settings;
 using Dosi.Tracker.Teams;
 using Dosi.Tracker.Workspaces;
 using Microsoft.AspNetCore.Authorization;
+using Microsoft.Extensions.Options;
 using Volo.Abp;
 using Volo.Abp.Application.Dtos;
 using Volo.Abp.Authorization;
@@ -40,6 +44,8 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
     private readonly ProjectMembershipManager _projectMemberships;
     private readonly SeatCounter _seatCounter;
     private readonly IdentityUserManager _userManager;
+    private readonly IOptions<CaptureRetentionOptions> _captureRetentionOptions;
+    private readonly IOptions<ActivityRetentionOptions> _activityRetentionOptions;
 
     public WorkspaceAppService(
         IRepository<Subscription, Guid> subscriptionRepository,
@@ -54,7 +60,9 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
         WorkspaceJoiner joiner,
         ProjectMembershipManager projectMemberships,
         SeatCounter seatCounter,
-        IdentityUserManager userManager)
+        IdentityUserManager userManager,
+        IOptions<CaptureRetentionOptions> captureRetentionOptions,
+        IOptions<ActivityRetentionOptions> activityRetentionOptions)
     {
         _subscriptionRepository = subscriptionRepository;
         _planRepository = planRepository;
@@ -69,6 +77,8 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
         _projectMemberships = projectMemberships;
         _seatCounter = seatCounter;
         _userManager = userManager;
+        _captureRetentionOptions = captureRetentionOptions;
+        _activityRetentionOptions = activityRetentionOptions;
     }
 
     public async Task<SubscriptionDto?> GetCurrentSubscriptionAsync()
@@ -97,6 +107,14 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
         }
 
         return new ListResultDto<PlanDto>(dtos);
+    }
+
+    /// <summary>Anonymous: the sign-up page and the web app hide plans and billing while this deployment does not bill.</summary>
+    [AllowAnonymous]
+    [WorkspaceNotRequired]
+    public Task<BillingModeDto> GetBillingModeAsync()
+    {
+        return Task.FromResult(new BillingModeDto { Enabled = IsBillingEnabled });
     }
 
     [AllowAnonymous]
@@ -130,7 +148,8 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
         {
             WorkspaceId = workspace.Id,
             WorkspaceName = workspace.Name,
-            UserName = user.UserName
+            UserName = user.UserName,
+            EmailConfirmationSent = await SendEmailConfirmationAsync(user)
         };
     }
 
@@ -160,7 +179,8 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
             {
                 WorkspaceId = workspace.Id,
                 WorkspaceName = workspace.Name,
-                UserName = user.UserName
+                UserName = user.UserName,
+                EmailConfirmationSent = await SendEmailConfirmationAsync(user)
             };
         }
     }
@@ -277,6 +297,27 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
 
     [WorkspaceNotRequired]
     [RemoteService(IsEnabled = false)]
+    public async Task<DeletedWorkspaceDto> DeleteAsync(Guid id, DeleteWorkspaceDto input)
+    {
+        Check.NotNull(input, nameof(input));
+        var userId = CurrentUser.GetId();
+
+        using var uow = UnitOfWorkManager.Begin(new AbpUnitOfWorkOptions(isTransactional: true), requiresNew: true);
+        var workspace = await _workspaceManager.DeleteAsync(id, userId, input.ConfirmationName);
+        await uow.CompleteAsync();
+
+        var deletionTime = workspace.DeletionTime ?? Clock.Now;
+        var graceDays = LazyServiceProvider.LazyGetRequiredService<IOptions<DataErasureOptions>>().Value.WorkspaceGraceDays;
+        return new DeletedWorkspaceDto
+        {
+            Id = workspace.Id,
+            DeletionTime = deletionTime,
+            PurgeAfter = deletionTime.AddDays(Math.Max(0, graceDays))
+        };
+    }
+
+    [WorkspaceNotRequired]
+    [RemoteService(IsEnabled = false)]
     public async Task<WorkspaceCaptureRetentionDto> GetCaptureRetentionAsync(Guid id)
     {
         var userId = CurrentUser.GetId();
@@ -290,7 +331,8 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
         return new WorkspaceCaptureRetentionDto
         {
             IsEnabled = isEnabled,
-            RetentionDays = days
+            RetentionDays = days,
+            IsEnforced = _captureRetentionOptions.Value.IsEnabled
         };
     }
 
@@ -325,7 +367,58 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
         return new WorkspaceCaptureRetentionDto
         {
             IsEnabled = input.IsEnabled,
-            RetentionDays = input.RetentionDays
+            RetentionDays = input.RetentionDays,
+            IsEnforced = _captureRetentionOptions.Value.IsEnabled
+        };
+    }
+
+    [WorkspaceNotRequired]
+    [RemoteService(IsEnabled = false)]
+    public async Task<WorkspaceActivityRetentionDto> GetActivityRetentionAsync(Guid id)
+    {
+        if (await _memberships.FindActiveAsync(id, CurrentUser.GetId()) == null)
+        {
+            throw new AbpAuthorizationException("Only an active member of the workspace can view its activity retention policy.");
+        }
+
+        var (isEnabled, days) = await _workspaceSettings.GetActivityRetentionPolicyAsync(id);
+        return new WorkspaceActivityRetentionDto
+        {
+            IsEnabled = isEnabled,
+            RetentionDays = days,
+            IsEnforced = _activityRetentionOptions.Value.IsEnabled
+        };
+    }
+
+    [WorkspaceNotRequired]
+    [RemoteService(IsEnabled = false)]
+    public async Task<WorkspaceActivityRetentionDto> UpdateActivityRetentionAsync(Guid id, WorkspaceActivityRetentionDto input)
+    {
+        Check.NotNull(input, nameof(input));
+
+        if (input.RetentionDays < ActivityRetentionLimits.MinDays || input.RetentionDays > ActivityRetentionLimits.MaxDays)
+        {
+            throw new AbpValidationException(new List<ValidationResult>
+            {
+                new($"Retention days must be between {ActivityRetentionLimits.MinDays} and {ActivityRetentionLimits.MaxDays}.",
+                    new[] { nameof(WorkspaceActivityRetentionDto.RetentionDays) })
+            });
+        }
+
+        var member = await _memberships.FindActiveAsync(id, CurrentUser.GetId());
+        if (member is not { IsOwner: true })
+        {
+            throw new AbpAuthorizationException("Only an active owner of the workspace can change its activity retention policy.");
+        }
+
+        await _workspaceSettings.SetActivityRetentionPolicyAsync(id, input.IsEnabled, input.RetentionDays);
+        ActivityRetentionWorker.ResetCursor(id);
+
+        return new WorkspaceActivityRetentionDto
+        {
+            IsEnabled = input.IsEnabled,
+            RetentionDays = input.RetentionDays,
+            IsEnforced = _activityRetentionOptions.Value.IsEnabled
         };
     }
 
@@ -384,6 +477,91 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
 
         await _invitationRepository.DeleteAsync(invitation);
     }
+
+    [WorkspaceNotRequired]
+    [RemoteService(IsEnabled = false)]
+    public async Task<MyInvitationsDto> GetMyInvitationsAsync()
+    {
+        var user = await _userManager.GetByIdAsync(CurrentUser.GetId());
+        if (!IsVerifiedEmail(user))
+        {
+            return new MyInvitationsDto { EmailConfirmed = false };
+        }
+
+        var normalizedEmail = WorkspaceInvitation.NormalizeEmail(user.Email);
+        var now = Clock.Now;
+        var invitations = await _invitationRepository.GetQueryableAsync();
+        var workspaces = await _workspaceRepository.GetQueryableAsync();
+        var rows = await AsyncExecuter.ToListAsync(
+            from i in invitations
+            join w in workspaces on i.WorkspaceId equals w.Id
+            where i.NormalizedEmail == normalizedEmail && i.AcceptedAt == null && i.ExpiresAt > now && !w.IsArchived
+            orderby i.CreationTime descending
+            select new MyInvitationDto
+            {
+                Id = i.Id,
+                WorkspaceId = w.Id,
+                WorkspaceName = w.Name,
+                Role = i.Role,
+                ExpiresAt = i.ExpiresAt,
+                CreationTime = i.CreationTime
+            });
+
+        return new MyInvitationsDto { EmailConfirmed = true, Items = rows };
+    }
+
+    [WorkspaceNotRequired]
+    [RemoteService(IsEnabled = false)]
+    public async Task<AcceptInvitationResultDto> AcceptMyInvitationAsync(Guid id)
+    {
+        var (invitation, user) = await GetMyUsableInvitationAsync(id);
+
+        using (CurrentWorkspace.Change(invitation.WorkspaceId))
+        {
+            await using var seatLock = await _seatCounter.LockAsync();
+            using var uow = UnitOfWorkManager.Begin(requiresNew: true, isTransactional: true);
+            var workspace = await AcceptAsync(invitation, user.Id);
+            var role = (await _memberships.FindActiveAsync(workspace.Id, user.Id))!.Role;
+            await uow.CompleteAsync();
+
+            return new AcceptInvitationResultDto { WorkspaceId = workspace.Id, WorkspaceName = workspace.Name, Role = role };
+        }
+    }
+
+    [WorkspaceNotRequired]
+    [RemoteService(IsEnabled = false)]
+    public async Task DeclineMyInvitationAsync(Guid id)
+    {
+        var (invitation, _) = await GetMyUsableInvitationAsync(id);
+        await _invitationRepository.DeleteAsync(invitation);
+    }
+
+    /// <summary>An invitation the caller may answer without its token: it is usable and addressed to the caller's
+    /// verified email. Any other invitation is reported as not found, so ids reveal nothing.</summary>
+    private async Task<(WorkspaceInvitation Invitation, IdentityUser User)> GetMyUsableInvitationAsync(Guid id)
+    {
+        var user = await _userManager.GetByIdAsync(CurrentUser.GetId());
+        if (!IsVerifiedEmail(user))
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.EmailNotConfirmed);
+        }
+
+        var invitation = await _invitationRepository.FindAsync(id);
+        if (invitation == null || !invitation.IsFor(user.Email))
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.InvitationNotFound);
+        }
+
+        if (!invitation.IsUsable(Clock.Now))
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.InvitationExpired);
+        }
+
+        return (invitation, user);
+    }
+
+    /// <summary>Only a verified email may stand in for an invitation's token: anyone can sign up with any address.</summary>
+    private static bool IsVerifiedEmail(IdentityUser user) => user.EmailConfirmed && !user.Email.IsNullOrWhiteSpace();
 
     /// <summary>Joins the invitation's workspace (the current one) and uses the invitation up.</summary>
     private async Task<Workspace> AcceptAsync(WorkspaceInvitation invitation, Guid userId)
@@ -445,7 +623,8 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
         return new WorkspaceSettingsDto
         {
             DefaultTimeZone = await _workspaceSettings.GetDefaultTimeZoneAsync(),
-            NewProjectDefaults = ToDto(await _workspaceSettings.GetNewProjectDefaultsAsync())
+            NewProjectDefaults = ToDto(await _workspaceSettings.GetNewProjectDefaultsAsync()),
+            MemberCaptureDeleteMinutes = await _workspaceSettings.GetMemberCaptureDeleteMinutesAsync()
         };
     }
 
@@ -463,11 +642,16 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
 
         await _workspaceSettings.SetDefaultTimeZoneAsync(timeZone);
         await _workspaceSettings.SetNewProjectDefaultsAsync(defaults);
+        if (input.MemberCaptureDeleteMinutes.HasValue)
+        {
+            await _workspaceSettings.SetMemberCaptureDeleteMinutesAsync(input.MemberCaptureDeleteMinutes.Value);
+        }
 
         return new WorkspaceSettingsDto
         {
             DefaultTimeZone = timeZone,
-            NewProjectDefaults = ToDto(defaults)
+            NewProjectDefaults = ToDto(defaults),
+            MemberCaptureDeleteMinutes = await _workspaceSettings.GetMemberCaptureDeleteMinutesAsync()
         };
     }
 
@@ -489,9 +673,16 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
     }
 
     /// <summary>The plan chosen at sign-up: by id, else by name, else the default (Free). Self-service accepts free
-    /// plans and plans with a trial; a paid plan without one would start active with nothing paid.</summary>
+    /// plans and plans with a trial; a paid plan without one would start active with nothing paid. While billing is off
+    /// the choice is ignored: every new workspace gets the default plan (which then limits nothing).</summary>
     private async Task<Plan> GetSignUpPlanAsync(Guid? planId, string? planNameInput)
     {
+        if (!IsBillingEnabled)
+        {
+            planId = null;
+            planNameInput = null;
+        }
+
         Plan? plan;
         string member;
         if (planId.HasValue)
@@ -526,6 +717,14 @@ public class WorkspaceAppService : TrackerAppService, IWorkspaceAppService
         }
 
         return plan;
+    }
+
+    private bool IsBillingEnabled => LazyServiceProvider.LazyGetRequiredService<IOptions<BillingOptions>>().Value.Enabled;
+
+    /// <summary>Emails a new account the link that confirms its address (best effort).</summary>
+    private Task<bool> SendEmailConfirmationAsync(IdentityUser user)
+    {
+        return LazyServiceProvider.LazyGetRequiredService<AccountLinkEmails>().SendEmailConfirmationAsync(user);
     }
 
     private static NewProjectDefaultsDto ToDto(NewProjectDefaults defaults)

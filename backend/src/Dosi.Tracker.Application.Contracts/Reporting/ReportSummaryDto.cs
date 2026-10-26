@@ -61,8 +61,18 @@ public class ReportSummaryDto
     /// as a plain number, so the API host answers it 0 instead of null.)</summary>
     public double? AverageProductivity { get; set; }
 
+    /// <summary>Clicks of the blocks that measured them (see <see cref="MouseMeasuredActivities"/>); a block that did
+    /// not count clicks adds nothing, so 0 with no measured block means "not measured", not "no clicks".</summary>
     public long TotalMouseClicks { get; set; }
+
+    /// <summary>Keystrokes of the blocks that measured them (see <see cref="KeyboardMeasuredActivities"/>).</summary>
     public long TotalKeyboardHits { get; set; }
+
+    /// <summary>How many of the <see cref="TotalActivities"/> measured mouse clicks.</summary>
+    public int MouseMeasuredActivities { get; set; }
+
+    /// <summary>How many of the <see cref="TotalActivities"/> measured keystrokes.</summary>
+    public int KeyboardMeasuredActivities { get; set; }
 
     public List<UserReportRowDto> PerUser { get; set; } = new();
     public List<ProjectReportRowDto> PerProject { get; set; } = new();
@@ -155,8 +165,17 @@ public class DailyReportRowDto
     /// <summary>Null when nothing tracked that day measured activity.</summary>
     public double? AverageProductivity { get; set; }
 
+    /// <summary>Clicks of the day's blocks that measured them; see <see cref="MouseMeasuredActivities"/>.</summary>
     public long MouseClicks { get; set; }
+
+    /// <summary>Keystrokes of the day's blocks that measured them; see <see cref="KeyboardMeasuredActivities"/>.</summary>
     public long KeyboardHits { get; set; }
+
+    /// <summary>How many of the day's blocks measured mouse clicks (0: the day's clicks were not measured).</summary>
+    public int MouseMeasuredActivities { get; set; }
+
+    /// <summary>How many of the day's blocks measured keystrokes.</summary>
+    public int KeyboardMeasuredActivities { get; set; }
 }
 
 /// <summary>One member's tracked work on one local day (only days with activity are returned).</summary>

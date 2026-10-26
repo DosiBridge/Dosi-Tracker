@@ -1,5 +1,6 @@
 using System;
 using System.Threading.Tasks;
+using Dosi.Tracker.Activities;
 using Volo.Abp;
 using Dosi.Tracker.Workspaces;
 using Volo.Abp.SettingManagement;
@@ -66,6 +67,20 @@ public class WorkspaceSettingsManager : TrackerDomainService
         await SetAsync(TrackerSettings.Workspace.NewProject.AllowRunningPrograms, SettingValueFormat.Write(defaults.AllowRunningPrograms));
         await SetAsync(TrackerSettings.Workspace.NewProject.BlurScreenshots, SettingValueFormat.Write(defaults.BlurScreenshots));
         await SetAsync(TrackerSettings.Workspace.NewProject.IdleThresholdMinutes, SettingValueFormat.Write(defaults.IdleThresholdMinutes));
+    }
+
+    /// <summary>Minutes after upload during which members may delete their own captures in the current workspace
+    /// (<see cref="MemberCaptureDeletion"/>); an unreadable or out-of-range value reads as the default.</summary>
+    public virtual async Task<int> GetMemberCaptureDeleteMinutesAsync()
+    {
+        var minutes = await GetIntAsync(TrackerSettings.Workspace.MemberCaptureDeleteMinutes, MemberCaptureDeletion.DefaultWindowMinutes);
+        return minutes is >= 0 and <= MemberCaptureDeletion.MaxWindowMinutes ? minutes : MemberCaptureDeletion.DefaultWindowMinutes;
+    }
+
+    public virtual Task SetMemberCaptureDeleteMinutesAsync(int minutes)
+    {
+        Check.Range(minutes, nameof(minutes), 0, MemberCaptureDeletion.MaxWindowMinutes);
+        return SetAsync(TrackerSettings.Workspace.MemberCaptureDeleteMinutes, SettingValueFormat.Write(minutes));
     }
 
     /// <summary>The current user's own time zone preference (an IANA id), or null when not set.</summary>
@@ -145,6 +160,51 @@ public class WorkspaceSettingsManager : TrackerDomainService
 
         await _settingManager.SetAsync(
             TrackerSettings.Workspace.CaptureRetention.RetentionDays,
+            SettingValueFormat.Write(retentionDays),
+            WorkspaceSettingValueProvider.ProviderName,
+            workspaceId.ToString());
+    }
+
+    /// <summary>
+    /// The activity (time block) retention policy of the workspace. Only the workspace's own value counts (never a
+    /// platform-wide one), and an unset or malformed policy, or days outside <see cref="ActivityRetentionLimits"/>,
+    /// read as off: deleting tracked time is never the result of a default.
+    /// </summary>
+    public virtual async Task<(bool IsEnabled, int RetentionDays)> GetActivityRetentionPolicyAsync(Guid workspaceId)
+    {
+        var isEnabled = await _settingManager.GetOrNullAsync(
+            TrackerSettings.Workspace.ActivityRetention.IsEnabled,
+            WorkspaceSettingValueProvider.ProviderName,
+            workspaceId.ToString(),
+            fallback: false);
+        var days = await _settingManager.GetOrNullAsync(
+            TrackerSettings.Workspace.ActivityRetention.RetentionDays,
+            WorkspaceSettingValueProvider.ProviderName,
+            workspaceId.ToString(),
+            fallback: false);
+
+        if (!bool.TryParse(isEnabled, out var enabled) ||
+            !int.TryParse(days, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var retentionDays) ||
+            retentionDays < ActivityRetentionLimits.MinDays || retentionDays > ActivityRetentionLimits.MaxDays)
+        {
+            return (false, ActivityRetentionLimits.DefaultDays);
+        }
+
+        return (enabled, retentionDays);
+    }
+
+    public virtual async Task SetActivityRetentionPolicyAsync(Guid workspaceId, bool isEnabled, int retentionDays)
+    {
+        Check.Range(retentionDays, nameof(retentionDays), ActivityRetentionLimits.MinDays, ActivityRetentionLimits.MaxDays);
+
+        await _settingManager.SetAsync(
+            TrackerSettings.Workspace.ActivityRetention.IsEnabled,
+            SettingValueFormat.Write(isEnabled),
+            WorkspaceSettingValueProvider.ProviderName,
+            workspaceId.ToString());
+
+        await _settingManager.SetAsync(
+            TrackerSettings.Workspace.ActivityRetention.RetentionDays,
             SettingValueFormat.Write(retentionDays),
             WorkspaceSettingValueProvider.ProviderName,
             workspaceId.ToString());

@@ -6,6 +6,9 @@ public class SubscriptionSweepResult
     /// <summary>The sweep did not run because another one held the sweep lock.</summary>
     public bool Skipped { get; init; }
 
+    /// <summary>The sweep did not run because billing is off on this deployment (<see cref="Billing.BillingOptions"/>).</summary>
+    public bool BillingDisabled { get; init; }
+
     public int TrialRemindersSent { get; set; }
 
     /// <summary>Trials that ended and were marked past_due.</summary>

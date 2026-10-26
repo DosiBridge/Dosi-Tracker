@@ -7,6 +7,7 @@ using System.Threading.Tasks;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.Extensions.Logging;
+using Dosi.Tracker.Emailing;
 using Dosi.Tracker.Identity;
 using Dosi.Tracker.Notifications;
 using Dosi.Tracker.Permissions;
@@ -163,43 +164,20 @@ public class TeamAppService : TrackerAppService, ITeamAppService
 
         var email = input.Email.Trim();
         var user = await _userManager.FindByEmailAsync(email);
-        if (user != null)
+        var existing = user == null ? null : await _workspaceMemberships.FindActiveAsync(workspaceId, user.Id);
+        if (user != null && existing != null)
         {
-            if (!user.IsActive)
-            {
-                throw new BusinessException(TrackerDomainErrorCodes.InvalidUser).WithData("email", email);
-            }
-
-            var existing = await _workspaceMemberships.FindActiveAsync(workspaceId, user.Id);
-            if (existing != null && project == null)
-            {
-                throw new BusinessException(TrackerDomainErrorCodes.AlreadyWorkspaceMember).WithData("email", email);
-            }
-
-            if (existing is { IsOwner: true } && !callerIsOwner)
-            {
-                throw new BusinessException(TrackerDomainErrorCodes.RoleNotAllowed).WithData("userId", user.Id);
-            }
-
-            var hourlyRate = 0m;
-            if (project != null)
-            {
-                await EnsureNotMemberAsync(project.Id, user.Id);
-                hourlyRate = await EnsureMayAssignAsync(project.Id, user.Id, role, input.HourlyRate);
-            }
-
-            var (member, projectMember) = await _joiner.JoinAsync(user.Id, workspaceRole, project?.Id, role, hourlyRate);
-            await uow.CompleteAsync();
-
-            return new InviteMemberResultDto
-            {
-                Added = true,
-                WorkspaceRole = member.Role,
-                Member = projectMember == null ? null : ToDto(projectMember, user, includePrivateData: true)
-            };
+            // Already in this workspace (the inviter sees the team anyway): the invitation can only add a project,
+            // exactly as AddMemberAsync would.
+            return await AddExistingMemberToProjectAsync(uow, user, existing, project, workspaceRole, role, input.HourlyRate,
+                callerIsOwner);
         }
 
-        var rate = project == null ? 0m : await EnsureMayAssignAsync(project.Id, null, role, input.HourlyRate);
+        // Everyone else — no account, or an account that is not an active member here — gets a pending invitation that
+        // only the invitee can accept (by its token, or signed in with the verified invited email). The answer is the
+        // same whether or not the email has an account, so it reveals nothing about people outside the workspace.
+        // A recorded rate of a returning member on the project is kept, as it would be when they are added directly.
+        var rate = project == null ? 0m : await EnsureMayAssignAsync(project.Id, user?.Id, role, input.HourlyRate);
         var normalizedEmail = WorkspaceInvitation.NormalizeEmail(email);
         var stale = await _invitationRepository.GetListAsync(i =>
             i.WorkspaceId == workspaceId && i.NormalizedEmail == normalizedEmail && i.AcceptedAt == null);
@@ -222,13 +200,75 @@ public class TeamAppService : TrackerAppService, ITeamAppService
         await _invitationRepository.InsertAsync(invitation, autoSave: true);
         await uow.CompleteAsync();
 
+        return await PendingInvitationResultAsync(invitation, token);
+    }
+
+    /// <summary>The answer for a pending invitation — the same whether or not its address has an account — after the
+    /// invitation was emailed to it (best effort; the link is in the answer either way).</summary>
+    private async Task<InviteMemberResultDto> PendingInvitationResultAsync(WorkspaceInvitation invitation, string token)
+    {
+        var workspace = await LazyServiceProvider.LazyGetRequiredService<IRepository<Workspace, Guid>>()
+            .GetAsync(invitation.WorkspaceId);
+        var inviter = await _userRepository.FindAsync(CurrentUser.GetId());
+        var inviterName = string.Join(" ", new[] { inviter?.Name, inviter?.Surname }.Where(n => !string.IsNullOrWhiteSpace(n)));
+
+        var emailSent = await LazyServiceProvider.LazyGetRequiredService<TrackerEmailer>().QueueInvitationAsync(
+            invitation.Email,
+            workspace.Name,
+            string.IsNullOrWhiteSpace(inviterName) ? inviter?.UserName : inviterName,
+            invitation.Role,
+            token,
+            invitation.ExpiresAt);
+
         return new InviteMemberResultDto
         {
             Added = false,
             WorkspaceRole = invitation.Role,
             InvitationId = invitation.Id,
             InvitePath = "/invite/" + token,
-            ExpiresAt = invitation.ExpiresAt
+            ExpiresAt = invitation.ExpiresAt,
+            EmailSent = emailSent
+        };
+    }
+
+    /// <summary>An invitation of someone who is already an active member of this workspace: they join the project at
+    /// once (no new workspace access is granted, so no acceptance is needed). Without a project there is nothing to do.</summary>
+    private async Task<InviteMemberResultDto> AddExistingMemberToProjectAsync(
+        IUnitOfWork uow,
+        IdentityUser user,
+        WorkspaceMember existing,
+        Project? project,
+        string workspaceRole,
+        string role,
+        decimal requestedRate,
+        bool callerIsOwner)
+    {
+        if (project == null)
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.AlreadyWorkspaceMember).WithData("email", user.Email);
+        }
+
+        if (!user.IsActive)
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.InvalidUser).WithData("email", user.Email);
+        }
+
+        if (existing.IsOwner && !callerIsOwner)
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.RoleNotAllowed).WithData("userId", user.Id);
+        }
+
+        await EnsureNotMemberAsync(project.Id, user.Id);
+        var hourlyRate = await EnsureMayAssignAsync(project.Id, user.Id, role, requestedRate);
+
+        var (member, projectMember) = await _joiner.JoinAsync(user.Id, workspaceRole, project.Id, role, hourlyRate);
+        await uow.CompleteAsync();
+
+        return new InviteMemberResultDto
+        {
+            Added = true,
+            WorkspaceRole = member.Role,
+            Member = projectMember == null ? null : ToDto(projectMember, user, includePrivateData: true)
         };
     }
 
@@ -262,6 +302,53 @@ public class TeamAppService : TrackerAppService, ITeamAppService
         var invitation = await _invitationRepository.FirstOrDefaultAsync(i => i.Id == id && i.WorkspaceId == workspaceId)
                          ?? throw new EntityNotFoundException(typeof(WorkspaceInvitation), id);
         await _invitationRepository.DeleteAsync(invitation);
+    }
+
+    [Authorize(TrackerPermissions.Team.Manage)]
+    public async Task<InviteMemberResultDto> ResendInvitationAsync(Guid id)
+    {
+        var workspaceId = WorkspaceId;
+        using var uow = UnitOfWorkManager.Begin(new AbpUnitOfWorkOptions(isTransactional: true), requiresNew: true);
+        var invitation = await _invitationRepository.FirstOrDefaultAsync(i =>
+                             i.Id == id && i.WorkspaceId == workspaceId && i.AcceptedAt == null)
+                         ?? throw new EntityNotFoundException(typeof(WorkspaceInvitation), id);
+
+        // The new link grants the invitation's role to whoever registers with its address: only owners hand out more
+        // than the member role, as when inviting.
+        if (invitation.Role != WorkspaceRoles.Member && !await IsOwnerAsync(CurrentUser.GetId()))
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.RoleNotAllowed).WithData("role", invitation.Role);
+        }
+
+        var token = WorkspaceInvitation.NewToken();
+        invitation.Renew(WorkspaceInvitation.HashToken(token), Clock.Now.AddDays(WorkspaceConsts.InvitationLifetimeDays));
+        await _invitationRepository.UpdateAsync(invitation, autoSave: true);
+        await uow.CompleteAsync();
+
+        return await PendingInvitationResultAsync(invitation, token);
+    }
+
+    /// <inheritdoc />
+    /// <remarks><paramref name="userId"/> is optional only so that ABP keeps it in the query string.</remarks>
+    [Authorize(TrackerPermissions.Team.Manage)]
+    public async Task<PasswordResetSentDto> SendPasswordResetAsync([Optional] Guid userId)
+    {
+        if (!await IsOwnerAsync(CurrentUser.GetId()))
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.RoleNotAllowed).WithData("userId", userId);
+        }
+
+        var user = await _userRepository.FindAsync(userId);
+        if (user == null || !user.IsActive || await _workspaceMemberships.FindActiveAsync(WorkspaceId, userId) == null)
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.InvalidUser).WithData("userId", userId);
+        }
+
+        // The link is emailed to the member's own address only; the owner never sees it.
+        var emailSent = await LazyServiceProvider.LazyGetRequiredService<AccountLinkEmails>().SendPasswordResetAsync(user);
+        Logger.LogInformation("Owner {CallerId} had a password reset link sent to member {UserId} of workspace {WorkspaceId} ({Sent}).",
+            CurrentUser.GetId(), userId, WorkspaceId, emailSent ? "sent" : "not sent");
+        return new PasswordResetSentDto { EmailSent = emailSent };
     }
 
     [Authorize(TrackerPermissions.Team.Manage)]

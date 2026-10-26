@@ -1,25 +1,27 @@
 namespace Dosi.Tracker.Activities.Retention;
 
 /// <summary>
-/// Operational configuration for capture retention worker and policies.
-/// Default is strictly disabled (IsEnabled = false) to ensure no accidental or unapproved deletion.
+/// Platform configuration of the capture retention worker (section <c>CaptureRetention</c>, bound whatever the blob
+/// provider). The worker only ever deletes captures of workspaces whose owner opted in to a retention window
+/// (<c>PUT /api/app/workspaces/{id}/capture-retention</c>); a workspace without a policy keeps its captures. So the worker
+/// runs by default, and <see cref="IsEnabled"/> = false is the operator's switch to stop every sweep (owners then see
+/// their policy reported as not enforced).
 /// </summary>
 public class CaptureRetentionOptions
 {
-    /// <summary>
-    /// Master switch for automated capture retention worker. Defaults to false.
-    /// </summary>
-    public bool IsEnabled { get; set; } = false;
+    /// <summary>Configuration section the options are bound from.</summary>
+    public const string SectionName = "CaptureRetention";
 
     /// <summary>
-    /// Periodic worker interval in hours. Defaults to 24 hours.
+    /// Master switch for the capture retention worker. Defaults to true: owners' policies are enforced.
+    /// </summary>
+    public bool IsEnabled { get; set; } = true;
+
+    /// <summary>
+    /// Hours between sweeps; the first runs at start-up (under the sweep lock), so restarts never postpone it.
+    /// Defaults to 24 hours.
     /// </summary>
     public int PeriodHours { get; set; } = 24;
-
-    /// <summary>
-    /// Default retention window in days when automated worker runs. Defaults to 30 days.
-    /// </summary>
-    public int DefaultRetentionDays { get; set; } = 30;
 
     /// <summary>
     /// Maximum number of items processed per batch in automated sweeps.

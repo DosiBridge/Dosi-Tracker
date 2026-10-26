@@ -43,4 +43,13 @@ public interface ITeamAppService : IApplicationService
 
     /// <summary>DELETE /api/app/team/invitation/{id} — withdraws a pending invitation.</summary>
     Task DeleteInvitationAsync(Guid id);
+
+    /// <summary>POST /api/app/team/{id}/resend-invitation — renews a pending (or expired) invitation: a new link
+    /// (the old one stops working) and a new expiry, emailed again when this server sends email. Only owners resend an
+    /// invitation that grants more than the member role.</summary>
+    Task<InviteMemberResultDto> ResendInvitationAsync(Guid id);
+
+    /// <summary>POST /api/app/team/send-password-reset?userId= — owners only: emails an active member of the workspace a
+    /// link to choose a new password. The link goes only to the member's own address; the owner never sees it.</summary>
+    Task<PasswordResetSentDto> SendPasswordResetAsync(Guid userId);
 }

@@ -2,6 +2,7 @@ using System;
 using System.Linq;
 using System.Threading.Tasks;
 using Dosi.Tracker.Billing;
+using Microsoft.Extensions.Options;
 using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Domain.Services;
 using Dosi.Tracker.Workspaces;
@@ -24,6 +25,11 @@ public class SubscriptionAccessChecker : TrackerDomainService, ISubscriptionAcce
 
     public virtual async Task<bool> IsUsableAsync()
     {
+        if (!IsBillingEnabled)
+        {
+            return true; // Billing is off on this deployment: there is no paywall.
+        }
+
         var workspaceId = CurrentWorkspace.Id;
         if (workspaceId == null)
         {
@@ -51,6 +57,10 @@ public class SubscriptionAccessChecker : TrackerDomainService, ISubscriptionAcce
                 return false; // canceled, expired, suspended or unknown
         }
     }
+
+    /// <summary>Whether this deployment bills workspaces at all (<see cref="BillingOptions"/>).</summary>
+    protected bool IsBillingEnabled =>
+        LazyServiceProvider.LazyGetRequiredService<IOptions<BillingOptions>>().Value.Enabled;
 
     /// <summary>
     /// When a past_due workspace of the current tenant stops being usable:

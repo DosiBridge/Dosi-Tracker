@@ -82,10 +82,34 @@ public class TrackerHttpApiModule : AbpModule
             options.Map(TrackerDomainErrorCodes.InvitationExpired, HttpStatusCode.Gone);
             options.Map(TrackerDomainErrorCodes.InvitationEmailMismatch, HttpStatusCode.Forbidden);
             options.Map(TrackerDomainErrorCodes.AlreadyWorkspaceMember, HttpStatusCode.Conflict);
+            options.Map(TrackerDomainErrorCodes.EmailNotConfirmed, HttpStatusCode.Forbidden);
             options.Map(TrackerDomainErrorCodes.ExportExceedsLimit, HttpStatusCode.BadRequest);
             options.Map(TrackerDomainErrorCodes.DeviceRevoked, HttpStatusCode.Forbidden);
             options.Map(TrackerDomainErrorCodes.DeviceNotObserved, HttpStatusCode.BadRequest);
             options.Map(TrackerDomainErrorCodes.DeviceNotFound, HttpStatusCode.NotFound);
+            options.Map(TrackerDomainErrorCodes.DeviceIdRequired, HttpStatusCode.BadRequest);
+            options.Map(TrackerDomainErrorCodes.ActivityDeleted, HttpStatusCode.Gone);
+            options.Map(TrackerDomainErrorCodes.CaptureDeleteNotAllowed, HttpStatusCode.Forbidden);
+            options.Map(TrackerDomainErrorCodes.WorkspaceDeleteConfirmationMismatch, HttpStatusCode.BadRequest);
+            options.Map(TrackerDomainErrorCodes.SoleWorkspaceOwner, HttpStatusCode.Conflict);
+            options.Map(TrackerDomainErrorCodes.AccountDeletionNotAllowed, HttpStatusCode.Forbidden);
+            options.Map(TrackerDomainErrorCodes.InvalidPassword, HttpStatusCode.Forbidden);
+            options.Map(TrackerDomainErrorCodes.EmailConfirmationInvalid, HttpStatusCode.BadRequest);
+            options.Map(TrackerDomainErrorCodes.BillingDisabled, HttpStatusCode.Conflict);
+            options.Map(TrackerDomainErrorCodes.PlanChangeNotAllowed, HttpStatusCode.Forbidden);
+
+            // AI assist: 503 is "this server cannot do it now", 429 carries when to retry.
+            options.Map(TrackerDomainErrorCodes.AiNotConfigured, HttpStatusCode.ServiceUnavailable);
+            options.Map(TrackerDomainErrorCodes.AiPlatformDisabled, HttpStatusCode.ServiceUnavailable);
+            options.Map(TrackerDomainErrorCodes.AiDisabled, HttpStatusCode.Conflict);
+            options.Map(TrackerDomainErrorCodes.AiFeatureDisabled, HttpStatusCode.Forbidden);
+            options.Map(TrackerDomainErrorCodes.AiQuotaExceeded, HttpStatusCode.TooManyRequests);
+            options.Map(TrackerDomainErrorCodes.AiRateLimited, HttpStatusCode.TooManyRequests);
+            options.Map(TrackerDomainErrorCodes.AiProviderUnavailable, HttpStatusCode.ServiceUnavailable);
+            options.Map(TrackerDomainErrorCodes.AiOutputInvalid, HttpStatusCode.BadGateway);
+            options.Map(TrackerDomainErrorCodes.AiRangeTooLarge, HttpStatusCode.BadRequest);
+            options.Map(TrackerDomainErrorCodes.AiDisclosureNotAccepted, HttpStatusCode.BadRequest);
+            options.Map(TrackerDomainErrorCodes.AiConversationExpired, HttpStatusCode.Conflict);
         });
     }
 }

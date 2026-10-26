@@ -100,8 +100,10 @@ public abstract class TeamOwnerRulesTests<TStartupModule> : TeamTestBase<TStartu
         await TeamAppService.RemoveFromWorkspaceAsync(worker.Id);
         var back = await TeamAppService.InviteMemberAsync(new InviteMemberDto { ProjectId = projectId, Email = "worker@acme.test" });
 
-        back.Added.ShouldBeTrue();
-        back.Member!.HourlyRate.ShouldBe(40m);
+        back.Added.ShouldBeFalse();
+        await AcceptAsync(worker.Id, back);
+
+        (await GetMembershipsOfUserAsync(worker.Id)).ShouldHaveSingleItem().HourlyRate.ShouldBe(40m);
         (await GetRatesAsync(projectId, worker.Id)).ShouldHaveSingleItem().HourlyRate.ShouldBe(40m);
     }
 

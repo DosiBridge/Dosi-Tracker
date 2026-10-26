@@ -10,9 +10,10 @@ using Volo.Abp.Domain.Repositories;
 
 namespace Dosi.Tracker.Teams;
 
-/// <summary>Brings a person into a workspace (and optionally one of its projects): used when a member invites someone
-/// who has an account, and when an invitation is accepted. Runs in the target workspace; a caller that may take a
-/// seat holds <see cref="SeatCounter.LockAsync"/>.</summary>
+/// <summary>Brings a person into a workspace (and optionally one of its projects): used when the invitee accepts an
+/// invitation, and when an existing member of the workspace is invited to one of its projects. Never called for
+/// someone who has not accepted. Runs in the target workspace; a caller that may take a seat holds
+/// <see cref="SeatCounter.LockAsync"/>.</summary>
 public class WorkspaceJoiner : TrackerDomainService
 {
     private readonly WorkspaceMembershipManager _workspaceMemberships;

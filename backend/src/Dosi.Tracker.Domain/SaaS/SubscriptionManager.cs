@@ -3,7 +3,10 @@ using System.Globalization;
 using System.Linq;
 using System.Threading.Tasks;
 using Dosi.Tracker.Billing;
+using Dosi.Tracker.Emailing;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using Volo.Abp;
 using Volo.Abp.Domain.Entities;
 using Volo.Abp.Domain.Repositories;
 using Dosi.Tracker.Workspaces;
@@ -50,11 +53,12 @@ public class SubscriptionManager : TrackerDomainService
     }
 
     /// <summary>The subscription a new workspace starts with (not yet saved): a paid plan with trial days starts a
-    /// trial; a free plan, and a paid plan without a trial (which only the host can assign), is active.</summary>
+    /// trial; a free plan, and a paid plan without a trial (which only the host can assign), is active. While billing is
+    /// off (<see cref="BillingOptions"/>) every new workspace starts active: nothing would ever end its trial.</summary>
     public virtual Subscription CreateForNewWorkspace(Guid workspaceId, Plan plan)
     {
         var subscription = new Subscription(GuidGenerator.Create(), workspaceId, plan.Id);
-        if (!plan.IsFree() && plan.TrialDays > 0)
+        if (IsBillingEnabled && !plan.IsFree() && plan.TrialDays > 0)
         {
             subscription.StartTrial(Clock.Now.AddDays(plan.TrialDays));
         }
@@ -93,6 +97,51 @@ public class SubscriptionManager : TrackerDomainService
         }
 
         Logger.LogInformation("Workspace {WorkspaceId} moved to the '{Plan}' plan ({Status}).", CurrentWorkspace.Id, plan.Name, subscription.Status);
+        return subscription;
+    }
+
+    /// <summary>
+    /// Owner self-service: moves the current workspace to <paramref name="plan"/>, which must be free (a paid plan is
+    /// assigned by the platform: <c>Tracker:PlanChangeNotAllowed</c>) and must fit the workspace's occupied seats
+    /// (<c>Tracker:SeatLimitReached</c>). A canceled, past_due or trialing workspace becomes active on the free plan.
+    /// Refused with <c>Tracker:BillingDisabled</c> while billing is off. Run it under the workspace's seat lock
+    /// (<see cref="SeatCounter.LockAsync"/>), so nobody takes a seat between the check and the change.
+    /// </summary>
+    public virtual async Task<Subscription> ChangePlanByOwnerAsync(Plan plan)
+    {
+        EnsureBillingEnabled();
+        if (!plan.IsFree())
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.PlanChangeNotAllowed).WithData("plan", plan.Name);
+        }
+
+        return await ChangePlanAsync(plan);
+    }
+
+    /// <summary>Owner self-service: cancels the current workspace's paid subscription. No further invoice is generated
+    /// and time tracking pauses (a canceled subscription is not usable); invoices already issued stay owed. The owner
+    /// can resume on a free plan (<see cref="ChangePlanByOwnerAsync"/>). A free plan has nothing to cancel
+    /// (<c>Tracker:PlanChangeNotAllowed</c>), and nothing can be canceled while billing is off
+    /// (<c>Tracker:BillingDisabled</c>). Cancelling twice changes nothing.</summary>
+    public virtual async Task<Subscription> CancelByOwnerAsync()
+    {
+        EnsureBillingEnabled();
+        var subscription = await GetCurrentAsync();
+        var plan = await _planRepository.FindAsync(subscription.PlanId);
+        if (plan == null || plan.IsFree())
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.PlanChangeNotAllowed)
+                .WithData("plan", plan?.Name ?? "unknown");
+        }
+
+        if (subscription.Status != Subscription.CanceledStatus)
+        {
+            subscription.Cancel();
+            await _subscriptionRepository.UpdateAsync(subscription, autoSave: true);
+            Logger.LogInformation("The owner canceled the subscription of workspace {WorkspaceId} ('{Plan}' plan).",
+                CurrentWorkspace.Id, plan.Name);
+        }
+
         return subscription;
     }
 
@@ -209,9 +258,12 @@ public class SubscriptionManager : TrackerDomainService
         {
             subscription.MarkPastDue();
             await _subscriptionRepository.UpdateAsync(subscription);
+            var planName = await GetPlanNameAsync(subscription);
             await _ownerNotifier.NotifyAsync(
-                $"Your {await GetPlanNameAsync(subscription)} trial has ended. Time tracking is paused until the " +
+                $"Your {planName} trial has ended. Time tracking is paused until the " +
                 "subscription is activated; contact support to continue.");
+            await EmailOwnersAsync((emailer, email, workspaceName) =>
+                emailer.QueueTrialEndedAsync(email, workspaceName, planName));
 
             Logger.LogInformation(
                 "Subscription {SubscriptionId} (workspace {WorkspaceId}) trial ended; marked past_due.",
@@ -224,9 +276,13 @@ public class SubscriptionManager : TrackerDomainService
         {
             subscription.MarkTrialReminderSent();
             await _subscriptionRepository.UpdateAsync(subscription);
+            var planName = await GetPlanNameAsync(subscription);
+            var endsAt = subscription.TrialEndsAt.Value;
             await _ownerNotifier.NotifyAsync(
-                $"Your {await GetPlanNameAsync(subscription)} trial ends on {FormatDate(subscription.TrialEndsAt.Value)} " +
+                $"Your {planName} trial ends on {FormatDate(endsAt)} " +
                 "(UTC). Contact support before then to keep tracking time.");
+            await EmailOwnersAsync((emailer, email, workspaceName) =>
+                emailer.QueueTrialEndingAsync(email, workspaceName, planName, endsAt));
             return SubscriptionReviewOutcome.TrialReminderSent;
         }
 
@@ -263,6 +319,27 @@ public class SubscriptionManager : TrackerDomainService
             "Subscription {SubscriptionId} (workspace {WorkspaceId}) has {Count} overdue invoice(s); marked past_due.",
             subscription.Id, subscription.WorkspaceId, newlyOverdue.Count);
         return SubscriptionReviewOutcome.MarkedPastDue;
+    }
+
+    /// <summary>Emails every active owner of the current workspace (best effort: see <see cref="TrackerEmailer"/>).</summary>
+    private async Task EmailOwnersAsync(Func<TrackerEmailer, string, string, Task<bool>> queue)
+    {
+        var emailer = LazyServiceProvider.LazyGetRequiredService<TrackerEmailer>();
+        var (workspaceName, emails) = await _ownerNotifier.GetOwnerEmailsAsync();
+        foreach (var email in emails)
+        {
+            await queue(emailer, email, workspaceName);
+        }
+    }
+
+    private bool IsBillingEnabled => LazyServiceProvider.LazyGetRequiredService<IOptions<BillingOptions>>().Value.Enabled;
+
+    private void EnsureBillingEnabled()
+    {
+        if (!IsBillingEnabled)
+        {
+            throw new BusinessException(TrackerDomainErrorCodes.BillingDisabled);
+        }
     }
 
     private async Task<Subscription> GetCurrentAsync()

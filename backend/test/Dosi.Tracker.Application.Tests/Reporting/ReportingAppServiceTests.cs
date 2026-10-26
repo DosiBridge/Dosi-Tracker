@@ -71,6 +71,55 @@ public abstract class ReportingAppServiceTests<TStartupModule> : ReportingTestBa
     }
 
     [Fact]
+    public async Task Input_Totals_Should_Sum_Only_Measured_Blocks_And_Say_How_Many_Measured()
+    {
+        var projectId = await SeedMyProjectAsync();
+        await TrackAsync(projectId, Day.AddHours(9), 30, 80);                                // 10 clicks, 20 keys
+        await InsertAsync(Block(projectId, Day.AddHours(10), 30, configure: b =>
+        {
+            b.MouseClicks = null; // e.g. a Wayland session: not measured
+            b.KeyboardHits = null;
+        }));
+        await InsertAsync(Block(projectId, Day.AddHours(11), 30, configure: b =>
+        {
+            b.MouseClicks = 0;    // measured, no clicks
+            b.KeyboardHits = null;
+        }));
+
+        var summary = await Reporting.GetSummaryAsync(Range(Day, Day.AddDays(1)));
+
+        summary.TotalActivities.ShouldBe(3);
+        summary.TotalMouseClicks.ShouldBe(10);
+        summary.MouseMeasuredActivities.ShouldBe(2);
+        summary.TotalKeyboardHits.ShouldBe(20);
+        summary.KeyboardMeasuredActivities.ShouldBe(1);
+
+        var day = (await Reporting.GetDailySeriesAsync(Range(Day, Day.AddDays(1)))).ShouldHaveSingleItem();
+        day.MouseClicks.ShouldBe(10);
+        day.MouseMeasuredActivities.ShouldBe(2);
+        day.KeyboardHits.ShouldBe(20);
+        day.KeyboardMeasuredActivities.ShouldBe(1);
+    }
+
+    [Fact]
+    public async Task Input_Totals_Of_A_Range_Without_Measured_Blocks_Should_Be_Recognisable_As_Unmeasured()
+    {
+        var projectId = await SeedMyProjectAsync();
+        await InsertAsync(Block(projectId, Day.AddHours(9), 30, productivity: null, configure: b =>
+        {
+            b.MouseClicks = null;
+            b.KeyboardHits = null;
+        }));
+
+        var summary = await Reporting.GetSummaryAsync(Range(Day, Day.AddDays(1)));
+
+        summary.TotalActivities.ShouldBe(1);
+        summary.TotalMouseClicks.ShouldBe(0);
+        summary.MouseMeasuredActivities.ShouldBe(0); // so the 0 above reads as "not measured"
+        summary.KeyboardMeasuredActivities.ShouldBe(0);
+    }
+
+    [Fact]
     public async Task Averages_Should_Skip_Blocks_Whose_Productivity_Was_Not_Measured()
     {
         var projectId = await SeedMyProjectAsync();

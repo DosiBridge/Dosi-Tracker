@@ -25,6 +25,9 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
     /// <summary>A day inside the 45-day upload window and in the past, whenever the suite runs.</summary>
     private static readonly DateTime BaseDay = DateTime.UtcNow.Date.AddDays(-10);
 
+    /// <summary>The agent install the uploads come from (an upload must name one: Tracker:DeviceIdRequired).</summary>
+    private static readonly Guid AgentDeviceId = Guid.Parse("5d0c1f6a-3b8e-4a51-9c2e-7f40a1b2c3d4");
+
     private readonly IActivityAppService _activityAppService;
     private readonly IRepository<Activity, Guid> _activityRepository;
     private readonly IRepository<Project, Guid> _projectRepository;
@@ -74,6 +77,7 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
         {
             ProjectId = Guid.NewGuid(),
             ClientActivityId = clientActivityId ?? Guid.NewGuid(),
+            DeviceId = AgentDeviceId,
             StartedAt = start,
             EndedAt = endedAt ?? start.AddMinutes(10),
             Productivity = 80,
@@ -348,8 +352,9 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
         // Neither keyboard nor mouse may be captured: activity % is "not measured", not 0% and not the agent's figure.
         created.Productivity.ShouldBeNull();
         created.InjectedInputEvents.ShouldBeNull();
-        created.MouseClicks.ShouldBe(0);
-        created.KeyboardHits.ShouldBe(0);
+        // Counts the project does not allow are "not measured" (null), never a fabricated 0.
+        created.MouseClicks.ShouldBeNull();
+        created.KeyboardHits.ShouldBeNull();
         created.ActiveWindowsJson.ShouldBe("[]");
         created.RunningProgramsJson.ShouldBe("[]");
         (await _activityAppService.GetScreenshotsAsync(created.Id)).ShouldBeEmpty();
@@ -363,8 +368,40 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
         var created = await SubmitAsync(input, p => p.AllowKeyboard = false);
 
         created.Productivity.ShouldBe(80);
-        created.KeyboardHits.ShouldBe(0);
+        created.KeyboardHits.ShouldBeNull();
         created.MouseClicks.ShouldBe(120);
+    }
+
+    [Fact]
+    public async Task Create_Should_Store_Unmeasured_Counts_As_Null_And_Measured_Zeros_As_Zero()
+    {
+        // A Wayland session (or no input consent) cannot count input: the agent sends null.
+        var unmeasured = NewInput();
+        unmeasured.MouseClicks = null;
+        unmeasured.KeyboardHits = null;
+        unmeasured.Timeline = new List<ActivityMinuteDto> { new() { Minute = 0, Active = true } };
+
+        var created = await SubmitAsync(unmeasured);
+
+        created.MouseClicks.ShouldBeNull();
+        created.KeyboardHits.ShouldBeNull();
+        created.TimelineJson.ShouldBe("[{\"Minute\":0,\"Active\":true}]");
+
+        // A measured block without input keeps its zeros.
+        var start = unmeasured.EndedAt;
+        var idle = NewInput(startedAt: start, endedAt: start.AddMinutes(10));
+        idle.ProjectId = unmeasured.ProjectId;
+        idle.MouseClicks = 0;
+        idle.KeyboardHits = 0;
+
+        var stored = await SubmitAsync(idle);
+
+        stored.MouseClicks.ShouldBe(0);
+        stored.KeyboardHits.ShouldBe(0);
+
+        var listed = await _activityAppService.GetListAsync(new GetActivitiesInput { ProjectId = unmeasured.ProjectId });
+        listed.Items.Single(a => a.Id == created.Id).MouseClicks.ShouldBeNull();
+        listed.Items.Single(a => a.Id == stored.Id).MouseClicks.ShouldBe(0);
     }
 
     [Fact]
@@ -491,6 +528,90 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
         adjacent.ProjectId = first.ProjectId;
 
         (await SubmitAsync(adjacent)).Id.ShouldNotBe(Guid.Empty);
+    }
+
+    [Fact]
+    public async Task Create_Should_Refuse_Identical_Short_Blocks_Stacked_On_The_Same_Minute()
+    {
+        // One-minute blocks overlap each other by at most AllowedOverlap, so only the per-pair share stops a script
+        // from reporting the same minute any number of times under fresh client ids.
+        var start = BaseDay.AddDays(1).AddHours(9);
+        var first = NewInput(startedAt: start, endedAt: start.AddMinutes(1));
+        await SubmitAsync(first);
+
+        for (var copy = 0; copy < 3; copy++)
+        {
+            var stacked = NewInput(startedAt: start, endedAt: start.AddMinutes(1));
+            stacked.ProjectId = first.ProjectId;
+
+            (await Should.ThrowAsync<BusinessException>(() => SubmitAsync(stacked)))
+                .Code.ShouldBe(TrackerDomainErrorCodes.ActivityOverlaps);
+        }
+
+        (await WithUnitOfWorkAsync(() => _activityRepository.CountAsync(a => a.UserId == CurrentUserId))).ShouldBe(1);
+    }
+
+    [Fact]
+    public async Task Create_Should_Refuse_Short_Blocks_Started_Every_Second()
+    {
+        // 61-second blocks starting a second apart each overlap the previous one by exactly 60 s.
+        var start = BaseDay.AddDays(1).AddHours(10);
+        var first = NewInput(startedAt: start, endedAt: start.AddSeconds(61));
+        await SubmitAsync(first);
+
+        var next = NewInput(startedAt: start.AddSeconds(1), endedAt: start.AddSeconds(62));
+        next.ProjectId = first.ProjectId;
+
+        (await Should.ThrowAsync<BusinessException>(() => SubmitAsync(next)))
+            .Code.ShouldBe(TrackerDomainErrorCodes.ActivityOverlaps);
+    }
+
+    [Fact]
+    public async Task Create_Should_Refuse_A_Chain_Of_Two_Minute_Blocks_Overlapping_By_A_Minute()
+    {
+        // Each pair overlaps by 60 s (= AllowedOverlap), which would count every minute twice.
+        var start = BaseDay.AddDays(1).AddHours(11);
+        var first = NewInput(startedAt: start, endedAt: start.AddMinutes(2));
+        await SubmitAsync(first);
+
+        var chained = NewInput(startedAt: start.AddMinutes(1), endedAt: start.AddMinutes(3));
+        chained.ProjectId = first.ProjectId;
+        (await Should.ThrowAsync<BusinessException>(() => SubmitAsync(chained)))
+            .Code.ShouldBe(TrackerDomainErrorCodes.ActivityOverlaps);
+
+        // Up to a quarter of the shorter block (30 s here) is still tolerated jitter.
+        var jittered = NewInput(startedAt: start.AddMinutes(2).AddSeconds(-30), endedAt: start.AddMinutes(4));
+        jittered.ProjectId = first.ProjectId;
+        (await SubmitAsync(jittered)).Id.ShouldNotBe(Guid.Empty);
+    }
+
+    [Fact]
+    public async Task Create_Should_Refuse_A_Second_Block_Starting_At_The_Same_Instant()
+    {
+        var start = BaseDay.AddDays(1).AddHours(12);
+        var first = NewInput(startedAt: start, endedAt: start.AddMinutes(10));
+        await SubmitAsync(first);
+
+        // Shorter, longer or on another project: a member cannot start two blocks at once.
+        foreach (var end in new[] { start.AddSeconds(4), start.AddMinutes(10), start.AddMinutes(30) })
+        {
+            var duplicateStart = NewInput(startedAt: start, endedAt: end);
+            (await Should.ThrowAsync<BusinessException>(() => SubmitAsync(duplicateStart)))
+                .Code.ShouldBe(TrackerDomainErrorCodes.ActivityOverlaps);
+        }
+    }
+
+    [Theory]
+    [InlineData(600, 600, 60)] // two 10-minute blocks: the full minute of jitter
+    [InlineData(120, 600, 30)] // a quarter of the shorter, two-minute block
+    [InlineData(60, 60, 15)]
+    [InlineData(4, 7200, 1)]
+    public void Tolerated_Overlap_Should_Be_A_Minute_At_Most_And_A_Quarter_Of_The_Shorter_Block(int seconds, int otherSeconds, int expected)
+    {
+        ActivityAppService.ToleratedOverlap(TimeSpan.FromSeconds(seconds), TimeSpan.FromSeconds(otherSeconds))
+            .ShouldBe(TimeSpan.FromSeconds(expected));
+        ActivityAppService.ToleratedOverlap(TimeSpan.FromSeconds(otherSeconds), TimeSpan.FromSeconds(seconds))
+            .ShouldBe(TimeSpan.FromSeconds(expected));
     }
 
     [Fact]
@@ -734,7 +855,6 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
         input.Platform = "freebsd";
         input.OsVersion = "   ";
         input.AgentVersion = "\u0001\u0002";
-        input.DeviceId = Guid.Empty;
         input.TimeZone = "Mars/Olympus_Mons";
         input.UtcOffsetMinutes = 900;
         input.EndReason = "crashed";
@@ -747,12 +867,29 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
         created.Platform.ShouldBeNull();
         created.OsVersion.ShouldBeNull();
         created.AgentVersion.ShouldBeNull();
-        created.DeviceId.ShouldBeNull();
+        created.DeviceId.ShouldBe(AgentDeviceId);
         created.TimeZone.ShouldBeNull();
         created.UtcOffsetMinutes.ShouldBeNull();
         created.EndReason.ShouldBeNull();
         created.IdleSeconds.ShouldBeNull();
         created.InjectedInputEvents.ShouldBeNull();
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Create_Should_Refuse_A_Block_Naming_No_Device_Without_Storing_It(bool emptyId)
+    {
+        // Neither the caller's token (not device-bound here) nor the block names an install, so a revocation could
+        // not apply to it: refused rather than stored anonymously.
+        var input = NewInput();
+        input.DeviceId = emptyId ? Guid.Empty : null;
+
+        var exception = await Should.ThrowAsync<BusinessException>(() => SubmitAsync(input));
+
+        exception.Code.ShouldBe(TrackerDomainErrorCodes.DeviceIdRequired);
+        (await WithUnitOfWorkAsync(() => _activityRepository.AnyAsync(a => a.ClientActivityId == input.ClientActivityId)))
+            .ShouldBeFalse();
     }
 
     [Fact]
@@ -897,10 +1034,10 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
 
         created.TimelineJson.ShouldBe(
             "[{\"Minute\":0,\"KeyboardHits\":5,\"MouseClicks\":2,\"Active\":true,\"ActiveSeconds\":42}," +
-            "{\"Minute\":1,\"KeyboardHits\":0,\"MouseClicks\":0,\"Active\":false,\"ActiveSeconds\":0}," +
-            "{\"Minute\":2,\"KeyboardHits\":0,\"MouseClicks\":0,\"Active\":true}," +
-            "{\"Minute\":3,\"KeyboardHits\":0,\"MouseClicks\":0,\"Active\":true}," +
-            "{\"Minute\":4,\"KeyboardHits\":0,\"MouseClicks\":0,\"Active\":true}]");
+            "{\"Minute\":1,\"Active\":false,\"ActiveSeconds\":0}," + // no counts sent: not measured, omitted
+            "{\"Minute\":2,\"Active\":true}," +
+            "{\"Minute\":3,\"Active\":true}," +
+            "{\"Minute\":4,\"Active\":true}]");
     }
 
     [Fact]
@@ -998,7 +1135,7 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
 
         created.TimelineJson.ShouldBe(
             "[{\"Minute\":0,\"KeyboardHits\":5,\"MouseClicks\":2,\"Active\":true,\"AppName\":\"code.exe\"}," +
-            "{\"Minute\":3,\"KeyboardHits\":0,\"MouseClicks\":0,\"Active\":false,\"AppName\":\"" + new string('b', 256) + "\"}," +
+            "{\"Minute\":3,\"Active\":false,\"AppName\":\"" + new string('b', 256) + "\"}," + // negative counts: no measurement
             "{\"Minute\":10,\"KeyboardHits\":1,\"MouseClicks\":1,\"Active\":true}]");
 
         var listed = await _activityAppService.GetListAsync(new GetActivitiesInput { ProjectId = input.ProjectId });
@@ -1022,7 +1159,8 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
         });
 
         // The minute and its active flag are time data and always kept.
-        created.TimelineJson.ShouldBe("[{\"Minute\":0,\"KeyboardHits\":0,\"MouseClicks\":0,\"Active\":true}]");
+        // The minute and its active flag are kept; the counts are not stored at all (not measured, never 0).
+        created.TimelineJson.ShouldBe("[{\"Minute\":0,\"Active\":true}]");
     }
 
     [Fact]
@@ -1204,7 +1342,7 @@ public abstract class ActivityAppServiceTests<TStartupModule> : TrackerApplicati
         dto.Platform.ShouldBeNull();
         dto.OsVersion.ShouldBeNull();
         dto.AgentVersion.ShouldBeNull();
-        dto.DeviceId.ShouldBeNull();
+        dto.DeviceId.ShouldBe(AgentDeviceId); // the only context an upload must carry
         dto.DeviceName.ShouldBeNull();
         dto.TimeZone.ShouldBeNull();
         dto.UtcOffsetMinutes.ShouldBeNull();

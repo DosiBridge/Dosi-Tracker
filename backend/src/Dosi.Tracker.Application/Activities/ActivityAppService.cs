@@ -49,11 +49,18 @@ public class ActivityAppService : TrackerAppService, IActivityAppService
     /// <summary>Back-to-back blocks may overlap by up to this much (clock jitter); more is double-counting.</summary>
     public static readonly TimeSpan AllowedOverlap = TimeSpan.FromSeconds(60);
 
+    /// <summary>Two blocks may also overlap by at most this share of the shorter one. Without it, blocks of at most
+    /// <see cref="AllowedOverlap"/> could never clash (identical one-minute blocks stack without limit) and two-minute
+    /// blocks overlapping by a minute would count the same time twice. A quarter bounds what overlapping blocks can
+    /// add to a member's tracked time, and keeps far more than real clock jitter between real blocks.</summary>
+    public const double MaxOverlapShare = 0.25;
+
     /// <summary>A screen capture time reported by the agent is kept while it lies at most this far outside the block.</summary>
     public static readonly TimeSpan CaptureTimeTolerance = TimeSpan.FromSeconds(60);
 
-    /// <summary>How long after its start the owner of a block may still change its note.</summary>
-    public static readonly TimeSpan NoteEditWindow = TimeSpan.FromDays(30);
+    /// <summary>How long after its start the owner of a block may still change its note
+    /// (<see cref="ActivityNoteRules.NoteEditWindow"/>, where the rule lives).</summary>
+    public static readonly TimeSpan NoteEditWindow = ActivityNoteRules.NoteEditWindow;
 
     /// <summary>How long an upload waits for another upload of the same member to finish.</summary>
     private static readonly TimeSpan IngestLockTimeout = TimeSpan.FromSeconds(30);
@@ -65,7 +72,7 @@ public class ActivityAppService : TrackerAppService, IActivityAppService
     private readonly IRepository<Screenshot, Guid> _screenshotRepository;
     private readonly IRepository<ProjectMember, Guid> _memberRepository;
     private readonly IRepository<Project, Guid> _projectRepository;
-    private readonly IRepository<DeviceRevocation, Guid> _revocationRepository;
+    private readonly DeviceRevocationManager _revocationManager;
     private readonly IBlobContainer _blobContainer;
     private readonly ISubscriptionAccessChecker _subscriptionAccessChecker;
     private readonly IAbpDistributedLock _distributedLock;
@@ -76,7 +83,7 @@ public class ActivityAppService : TrackerAppService, IActivityAppService
         IRepository<Screenshot, Guid> screenshotRepository,
         IRepository<ProjectMember, Guid> memberRepository,
         IRepository<Project, Guid> projectRepository,
-        IRepository<DeviceRevocation, Guid> revocationRepository,
+        DeviceRevocationManager revocationManager,
         IBlobContainer blobContainer,
         ISubscriptionAccessChecker subscriptionAccessChecker,
         IAbpDistributedLock distributedLock,
@@ -86,7 +93,7 @@ public class ActivityAppService : TrackerAppService, IActivityAppService
         _screenshotRepository = screenshotRepository;
         _memberRepository = memberRepository;
         _projectRepository = projectRepository;
-        _revocationRepository = revocationRepository;
+        _revocationManager = revocationManager;
         _blobContainer = blobContainer;
         _subscriptionAccessChecker = subscriptionAccessChecker;
         _distributedLock = distributedLock;
@@ -126,20 +133,19 @@ public class ActivityAppService : TrackerAppService, IActivityAppService
             return await MapToDtoWithCapturesAsync(stored);
         }
 
-        // Deny subsequent activity ingestion for a revoked logical device id before persistence or blob side effects.
-        if (input.DeviceId.HasValue && input.DeviceId.Value != Guid.Empty)
+        // A block an owner or manager deleted stays deleted: its record keeps the client id, so a replay is refused
+        // (410, the agent drops the row) instead of bringing the time and its captures back.
+        if (await LazyServiceProvider.LazyGetRequiredService<Erasure.TrackedDataEraser>()
+                .IsBlockErasedAsync(userId, input.ClientActivityId))
         {
-            var isRevoked = await _revocationRepository.AnyAsync(r =>
-                r.WorkspaceId == CurrentWorkspace.GetId() &&
-                r.UserId == userId &&
-                r.DeviceId == input.DeviceId.Value);
-
-            if (isRevoked)
-            {
-                throw new BusinessException(TrackerDomainErrorCodes.DeviceRevoked)
-                    .WithData("deviceId", input.DeviceId.Value);
-            }
+            throw new BusinessException(TrackerDomainErrorCodes.ActivityDeleted)
+                .WithData("clientActivityId", input.ClientActivityId);
         }
+
+        // A revoked install is refused before persistence or blob side effects, whether it is named by the token it
+        // signed in with or by the block; a block naming no device at all is refused (revocation could not apply).
+        var deviceId = await _revocationManager.EnsureCanIngestAsync(
+            CurrentWorkspace.GetId(), userId, TokenDeviceId, input.DeviceId);
 
         var project = await GetUploadProjectAsync(userId, input.ProjectId);
 
@@ -157,7 +163,7 @@ public class ActivityAppService : TrackerAppService, IActivityAppService
             throw new BusinessException(TrackerDomainErrorCodes.SubscriptionInactive);
         }
 
-        var activity = BuildActivity(userId, project, input);
+        var activity = BuildActivity(userId, project, input, deviceId);
         var captures = DecodeCaptures(project, input);
 
         return await StoreAsync(activity, captures);
@@ -232,25 +238,7 @@ public class ActivityAppService : TrackerAppService, IActivityAppService
     {
         var activity = await _activityRepository.GetAsync(id);
 
-        if (activity.UserId == CurrentUser.GetId())
-        {
-            var age = UtcNow - AgentContextNormalizer.AsUtc(activity.StartedAt);
-            if (age > NoteEditWindow && !await AuthorizationService.IsGrantedAsync(TrackerPermissions.Team.Manage))
-            {
-                throw new AbpAuthorizationException(
-                    $"The note of a block can be changed within {NoteEditWindow.TotalDays:0} days of its start.");
-            }
-        }
-        else if (!await AuthorizationService.IsGrantedAsync(TrackerPermissions.Team.Manage))
-        {
-            if (!await AuthorizationService.IsGrantedAsync(TrackerPermissions.Activities.ViewAll))
-            {
-                // Other members' blocks are hidden entirely from callers who cannot read them.
-                throw new EntityNotFoundException(typeof(Activity), id);
-            }
-
-            throw new AbpAuthorizationException("Only the member who tracked a block, or a team manager, can change its note.");
-        }
+        await LazyServiceProvider.LazyGetRequiredService<ActivityNoteRules>().EnsureCanEditNoteAsync(activity);
 
         activity.Description = AgentContextNormalizer.CleanNote(input.Description, UpdateActivityNoteDto.MaxDescriptionLength);
         await _activityRepository.UpdateAsync(activity, autoSave: true);
@@ -288,8 +276,9 @@ public class ActivityAppService : TrackerAppService, IActivityAppService
     /// <summary>
     /// The time rules of shared contract §1, in its order: a valid range, a project not archived before the block
     /// started, at most <see cref="MaxBlockLength"/> long, ending no later than <see cref="MaxFutureSkew"/> after the
-    /// server's clock, starting within <see cref="ActivityIngestOptions.MaxBlockAge"/>, and no overlap of more than
-    /// <see cref="AllowedOverlap"/> with the member's other blocks. Times are compared as UTC.
+    /// server's clock, starting within <see cref="ActivityIngestOptions.MaxBlockAge"/>, and neither starting at the
+    /// very instant another block of the member starts nor overlapping one by more than <see cref="ToleratedOverlap"/>.
+    /// Times are compared as UTC.
     /// </summary>
     private async Task ValidateBlockAsync(Guid userId, Project project, CreateActivityDto input)
     {
@@ -333,20 +322,19 @@ public class ActivityAppService : TrackerAppService, IActivityAppService
                 .WithData("maxAgeDays", Math.Round(_ingestOptions.MaxBlockAge.TotalDays, 1));
         }
 
-        // Coarse DB filter, then the exact check. An overlap longer than AllowedOverlap implies both range bounds,
-        // and a stored block (at most MaxBlockLength long) that reaches past this one's start began at most
-        // MaxBlockLength earlier, which keeps the scan to a few rows of the (WorkspaceId, UserId, StartedAt) index.
+        // Coarse DB filter (every block of the member touching this one), then the exact check. A stored block (at most
+        // MaxBlockLength long) that reaches past this one's start began at most MaxBlockLength earlier, which keeps the
+        // scan to a few rows of the (WorkspaceId, UserId, StartedAt) index.
         var earliestStart = start - MaxBlockLength;
-        var overlapFrom = start + AllowedOverlap;
-        var overlapTo = end - AllowedOverlap;
         var candidates = await _activityRepository.GetListAsync(a =>
-            a.UserId == userId && a.StartedAt >= earliestStart && a.StartedAt < overlapTo && a.EndedAt > overlapFrom);
+            a.UserId == userId && a.StartedAt >= earliestStart && a.StartedAt < end && a.EndedAt > start);
 
         var clash = candidates.FirstOrDefault(a =>
         {
             var otherStart = AgentContextNormalizer.AsUtc(a.StartedAt);
             var otherEnd = AgentContextNormalizer.AsUtc(a.EndedAt);
-            return (otherEnd < end ? otherEnd : end) - (otherStart > start ? otherStart : start) > AllowedOverlap;
+            var overlap = (otherEnd < end ? otherEnd : end) - (otherStart > start ? otherStart : start);
+            return otherStart == start || overlap > ToleratedOverlap(end - start, otherEnd - otherStart);
         });
         if (clash != null)
         {
@@ -356,10 +344,19 @@ public class ActivityAppService : TrackerAppService, IActivityAppService
         }
     }
 
+    /// <summary>How much two blocks of a member may overlap: <see cref="AllowedOverlap"/>, but never more than
+    /// <see cref="MaxOverlapShare"/> of the shorter one.</summary>
+    public static TimeSpan ToleratedOverlap(TimeSpan blockLength, TimeSpan otherLength)
+    {
+        var shorter = blockLength < otherLength ? blockLength : otherLength;
+        var share = shorter * MaxOverlapShare;
+        return share < AllowedOverlap ? share : AllowedOverlap;
+    }
+
     /// <summary>The block as stored. The capture policy is enforced server-side too: data the project does not
     /// allow is not stored, even if an outdated or misconfigured agent sends it; the time block itself is always kept.
     /// The optional context is normalized (an unusable value becomes null, never a rejection).</summary>
-    private Activity BuildActivity(Guid userId, Project project, CreateActivityDto input)
+    private Activity BuildActivity(Guid userId, Project project, CreateActivityDto input, Guid deviceId)
     {
         var blockLength = AgentContextNormalizer.AsUtc(input.EndedAt) - AgentContextNormalizer.AsUtc(input.StartedAt);
         // Activity % and input integrity mean nothing when the project measures neither keyboard nor mouse.
@@ -378,8 +375,8 @@ public class ActivityAppService : TrackerAppService, IActivityAppService
         )
         {
             Productivity = measuresInput ? input.Productivity : null,
-            MouseClicks = project.AllowMouse ? Math.Max(0, input.MouseClicks) : 0,
-            KeyboardHits = project.AllowKeyboard ? Math.Max(0, input.KeyboardHits) : 0,
+            MouseClicks = MeasuredCount(project.AllowMouse, input.MouseClicks),
+            KeyboardHits = MeasuredCount(project.AllowKeyboard, input.KeyboardHits),
             Description = AgentContextNormalizer.CleanNote(input.Description, UpdateActivityNoteDto.MaxDescriptionLength),
             ActiveWindowsJson = project.AllowActiveWindow ? SerializeWindows(input.ActiveWindows, project, blockLength) : "[]",
             RunningProgramsJson = project.AllowRunningPrograms ? SerializeRunningPrograms(input.RunningPrograms) : "[]",
@@ -387,7 +384,7 @@ public class ActivityAppService : TrackerAppService, IActivityAppService
             Platform = AgentContextNormalizer.NormalizePlatform(input.Platform),
             OsVersion = AgentContextNormalizer.CleanText(input.OsVersion, ActivityConsts.MaxOsVersionLength),
             AgentVersion = AgentContextNormalizer.CleanText(input.AgentVersion, ActivityConsts.MaxAgentVersionLength),
-            DeviceId = AgentContextNormalizer.NormalizeDeviceId(input.DeviceId),
+            DeviceId = deviceId,
             DeviceName = AgentContextNormalizer.CleanText(input.DeviceName, ActivityConsts.MaxDeviceNameLength),
             TimeZone = AgentContextNormalizer.NormalizeTimeZone(input.TimeZone),
             UtcOffsetMinutes = AgentContextNormalizer.NormalizeUtcOffset(input.UtcOffsetMinutes),
@@ -397,6 +394,11 @@ public class ActivityAppService : TrackerAppService, IActivityAppService
             InjectedInputEvents = measuresInput && input.InjectedInputEvents >= 0 ? input.InjectedInputEvents : null
         };
     }
+
+    /// <summary>A reported input count as stored: null when it was not measured (the agent sent none) or the project
+    /// does not allow that input — never a fabricated 0 — and a negative count is no measurement either.</summary>
+    private static int? MeasuredCount(bool allowed, int? reported) =>
+        allowed && reported is >= 0 ? reported : null;
 
     /// <summary>The reported idle seconds clamped to the block's length (a negative count is not a measurement);
     /// when the agent sent none, derived from the timeline's inactive buckets. Without input measurement (the
@@ -467,9 +469,10 @@ public class ActivityAppService : TrackerAppService, IActivityAppService
 
     /// <summary>The per-minute timeline as stored: buckets outside the block (minute &lt; 0, or past its last
     /// minute plus one bucket of slack for a partial trailing minute) are dropped, duplicates keep the first
-    /// entry, counts are clamped to non-negative, and data the project does not allow is blanked (counts
-    /// zeroed, app name removed). The minute, its active flag and its active seconds are time data and always
-    /// kept; active seconds outside 0..90 are not a measurement and are dropped.</summary>
+    /// entry, and counts that are negative, missing or not allowed by the project are stored as not measured
+    /// (null), never as 0; an app name the project does not allow is removed. The minute, its active flag and its
+    /// active seconds are time data and always kept; active seconds outside 0..90 are not a measurement and are
+    /// dropped.</summary>
     private static List<ActivityMinuteDto> SanitizeTimeline(
         List<ActivityMinuteDto>? timeline, Project project, TimeSpan blockLength)
     {
@@ -488,8 +491,8 @@ public class ActivityAppService : TrackerAppService, IActivityAppService
             .Select(m => new ActivityMinuteDto
             {
                 Minute = m.Minute,
-                KeyboardHits = project.AllowKeyboard ? Math.Max(0, m.KeyboardHits) : 0,
-                MouseClicks = project.AllowMouse ? Math.Max(0, m.MouseClicks) : 0,
+                KeyboardHits = MeasuredCount(project.AllowKeyboard, m.KeyboardHits),
+                MouseClicks = MeasuredCount(project.AllowMouse, m.MouseClicks),
                 Active = m.Active,
                 AppName = project.AllowActiveWindow ? AgentContextNormalizer.Truncate(m.AppName, MaxAppNameLength) : null,
                 ActiveSeconds = m.ActiveSeconds is >= 0 and <= ActivityConsts.MaxMinuteActiveSeconds ? m.ActiveSeconds : null

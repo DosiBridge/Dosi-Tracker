@@ -270,7 +270,7 @@ public abstract class TeamAppServiceTests<TStartupModule> : TeamTestBase<TStartu
     }
 
     [Fact]
-    public async Task Invite_Of_An_Existing_Account_Should_Add_It_At_Once()
+    public async Task Invite_Of_An_Existing_Account_Should_Create_A_Pending_Invitation_Not_A_Membership()
     {
         var projectA = await CreateProjectAsync();
         var existing = await CreateUserAsync("repeat.worker", email: "repeat.worker@acme.test", member: false);
@@ -283,14 +283,25 @@ public abstract class TeamAppServiceTests<TStartupModule> : TeamTestBase<TStartu
             HourlyRate = 30m
         });
 
-        first.Added.ShouldBeTrue();
-        first.InvitePath.ShouldBeNull();
-        first.Member!.UserId.ShouldBe(existing.Id);
-        first.Member.HourlyRate.ShouldBe(30m);
-        (await IsInRoleAsync(existing.Id, WorkspaceRoles.Member)).ShouldBeTrue();
+        // Nobody joins a workspace without accepting, and the answer looks exactly like one for an unknown email.
+        first.Added.ShouldBeFalse();
+        first.Member.ShouldBeNull();
+        first.WorkspaceRole.ShouldBe(WorkspaceRoles.Member);
+        first.InvitationId.ShouldNotBeNull();
+        first.InvitePath.ShouldNotBeNull().ShouldStartWith("/invite/");
+        (await IsActiveMemberAsync(existing.Id)).ShouldBeFalse();
+        (await GetMembershipsOfUserAsync(existing.Id)).ShouldBeEmpty();
         await WithUnitOfWorkAsync(async () =>
-            (await _notificationRepository.GetListAsync(n => n.UserId == existing.Id)).Count.ShouldBe(1));
+            (await _notificationRepository.GetListAsync(n => n.UserId == existing.Id)).ShouldBeEmpty());
 
+        // Accepting with the link joins the workspace and the project at the invited rate.
+        var accepted = await AcceptAsync(existing.Id, first);
+        accepted.WorkspaceId.ShouldBe(TrackerTestConsts.WorkspaceId);
+        accepted.Role.ShouldBe(WorkspaceRoles.Member);
+        (await IsInRoleAsync(existing.Id, WorkspaceRoles.Member)).ShouldBeTrue();
+        (await GetMembershipsOfUserAsync(existing.Id)).ShouldHaveSingleItem().HourlyRate.ShouldBe(30m);
+
+        // Once a member, an invitation to another project adds them to it at once.
         var projectB = await CreateProjectAsync("Second Invite Project");
         var second = await TeamAppService.InviteMemberAsync(new InviteMemberDto
         {
@@ -300,6 +311,7 @@ public abstract class TeamAppServiceTests<TStartupModule> : TeamTestBase<TStartu
         });
 
         second.Added.ShouldBeTrue();
+        second.InvitePath.ShouldBeNull();
         second.Member!.UserId.ShouldBe(existing.Id);
         second.WorkspaceRole.ShouldBe(WorkspaceRoles.Manager);
 
@@ -310,7 +322,36 @@ public abstract class TeamAppServiceTests<TStartupModule> : TeamTestBase<TStartu
     }
 
     [Fact]
-    public async Task Invite_Without_A_Project_Should_Only_Add_To_The_Workspace()
+    public async Task Invite_Should_Answer_The_Same_For_Accounts_That_Exist_Are_Inactive_Or_Do_Not_Exist()
+    {
+        var existing = await CreateUserAsync("outsider", member: false);
+        var inactive = await CreateUserAsync("disabled", member: false);
+        await WithUnitOfWorkAsync(async () =>
+        {
+            var userManager = GetRequiredService<IdentityUserManager>();
+            var stored = await userManager.GetByIdAsync(inactive.Id);
+            stored.SetIsActive(false);
+            (await userManager.UpdateAsync(stored)).Succeeded.ShouldBeTrue();
+        });
+
+        foreach (var email in new[] { existing.Email, inactive.Email, "nobody@acme.test" })
+        {
+            var result = await TeamAppService.InviteMemberAsync(new InviteMemberDto { Email = email });
+
+            result.Added.ShouldBeFalse();
+            result.Member.ShouldBeNull();
+            result.WorkspaceRole.ShouldBe(WorkspaceRoles.Member);
+            result.InvitationId.ShouldNotBeNull();
+            result.InvitePath.ShouldNotBeNull();
+        }
+
+        (await IsActiveMemberAsync(existing.Id)).ShouldBeFalse();
+        (await IsActiveMemberAsync(inactive.Id)).ShouldBeFalse();
+        (await TeamAppService.GetInvitationsAsync()).Items.Count.ShouldBe(3);
+    }
+
+    [Fact]
+    public async Task Invite_Without_A_Project_Should_Only_Grant_The_Workspace_Once_Accepted()
     {
         var existing = await CreateUserAsync("solo", member: false);
 
@@ -320,9 +361,102 @@ public abstract class TeamAppServiceTests<TStartupModule> : TeamTestBase<TStartu
             WorkspaceRole = "manager"
         });
 
-        result.Added.ShouldBeTrue();
+        result.Added.ShouldBeFalse();
         result.Member.ShouldBeNull();
+        result.WorkspaceRole.ShouldBe(WorkspaceRoles.Manager);
+        (await IsActiveMemberAsync(existing.Id)).ShouldBeFalse();
+
+        await AcceptAsync(existing.Id, result);
+
         (await IsInRoleAsync(existing.Id, WorkspaceRoles.Manager)).ShouldBeTrue();
+        (await GetMembershipsOfUserAsync(existing.Id)).ShouldBeEmpty();
+    }
+
+    [Fact]
+    public async Task An_Email_Squatter_Should_Never_Join_A_Workspace_That_Invites_The_Email()
+    {
+        // Anyone can sign up with any address: the "invitee" here registered it first, unverified.
+        var projectId = await CreateProjectAsync();
+        var squatter = await CreateUserAsync("future.hire", email: "future.hire@acme.test", member: false);
+
+        var invitation = await TeamAppService.InviteMemberAsync(new InviteMemberDto
+        {
+            ProjectId = projectId,
+            Email = "future.hire@acme.test",
+            Role = "Manager",
+            WorkspaceRole = "manager"
+        });
+
+        (await IsActiveMemberAsync(squatter.Id)).ShouldBeFalse();
+        (await GetMembershipsOfUserAsync(squatter.Id)).ShouldBeEmpty();
+
+        // An unverified email neither lists the invitation nor stands in for its token.
+        var mine = await AsUserAsync(squatter.Id, service => service.GetMyInvitationsAsync());
+        mine.EmailConfirmed.ShouldBeFalse();
+        mine.Items.ShouldBeEmpty();
+
+        (await Should.ThrowAsync<BusinessException>(() => AsUserAsync(squatter.Id,
+                service => service.AcceptMyInvitationAsync(invitation.InvitationId!.Value))))
+            .Code.ShouldBe(TrackerDomainErrorCodes.EmailNotConfirmed);
+        (await Should.ThrowAsync<BusinessException>(() => AsUserAsync(squatter.Id, async service =>
+            {
+                await service.DeclineMyInvitationAsync(invitation.InvitationId!.Value);
+                return true;
+            })))
+            .Code.ShouldBe(TrackerDomainErrorCodes.EmailNotConfirmed);
+
+        (await IsActiveMemberAsync(squatter.Id)).ShouldBeFalse();
+        (await TeamAppService.GetInvitationsAsync()).Items.ShouldHaveSingleItem().Id.ShouldBe(invitation.InvitationId!.Value);
+    }
+
+    [Fact]
+    public async Task A_Verified_Invitee_Should_See_And_Accept_Their_Invitations_Without_The_Link()
+    {
+        var invitee = await CreateUserAsync("verified", emailConfirmed: true, member: false);
+        var stranger = await CreateUserAsync("other.verified", emailConfirmed: true, member: false);
+
+        var invitation = await TeamAppService.InviteMemberAsync(new InviteMemberDto
+        {
+            Email = "VERIFIED@acme.test",
+            WorkspaceRole = "manager"
+        });
+        var declined = await TeamAppService.InviteMemberAsync(new InviteMemberDto { Email = stranger.Email });
+
+        var mine = await AsUserAsync(invitee.Id, service => service.GetMyInvitationsAsync());
+        mine.EmailConfirmed.ShouldBeTrue();
+        var item = mine.Items.ShouldHaveSingleItem();
+        item.Id.ShouldBe(invitation.InvitationId!.Value);
+        item.WorkspaceId.ShouldBe(TrackerTestConsts.WorkspaceId);
+        item.WorkspaceName.ShouldNotBeNullOrWhiteSpace();
+        item.Role.ShouldBe(WorkspaceRoles.Manager);
+
+        // Someone else's invitation is not found by id, so ids reveal nothing.
+        (await Should.ThrowAsync<BusinessException>(() => AsUserAsync(invitee.Id,
+                service => service.AcceptMyInvitationAsync(declined.InvitationId!.Value))))
+            .Code.ShouldBe(TrackerDomainErrorCodes.InvitationNotFound);
+        (await Should.ThrowAsync<BusinessException>(() => AsUserAsync(invitee.Id,
+                service => service.AcceptMyInvitationAsync(Guid.NewGuid()))))
+            .Code.ShouldBe(TrackerDomainErrorCodes.InvitationNotFound);
+
+        var accepted = await AsUserAsync(invitee.Id, service => service.AcceptMyInvitationAsync(item.Id));
+        accepted.WorkspaceId.ShouldBe(TrackerTestConsts.WorkspaceId);
+        accepted.Role.ShouldBe(WorkspaceRoles.Manager);
+        (await IsInRoleAsync(invitee.Id, WorkspaceRoles.Manager)).ShouldBeTrue();
+
+        // A used invitation is gone from the list and cannot be used again.
+        (await AsUserAsync(invitee.Id, service => service.GetMyInvitationsAsync())).Items.ShouldBeEmpty();
+        (await Should.ThrowAsync<BusinessException>(() => AsUserAsync(invitee.Id,
+                service => service.AcceptMyInvitationAsync(item.Id))))
+            .Code.ShouldBe(TrackerDomainErrorCodes.InvitationExpired);
+
+        // The other verified invitee declines theirs by id: no membership, and the invitation is gone.
+        await AsUserAsync(stranger.Id, async service =>
+        {
+            await service.DeclineMyInvitationAsync(declined.InvitationId!.Value);
+            return true;
+        });
+        (await IsActiveMemberAsync(stranger.Id)).ShouldBeFalse();
+        (await TeamAppService.GetInvitationsAsync()).Items.ShouldBeEmpty();
     }
 
     [Fact]
@@ -391,10 +525,10 @@ public abstract class TeamAppServiceTests<TStartupModule> : TeamTestBase<TStartu
     }
 
     [Fact]
-    public async Task Invite_As_Manager_Should_Grant_The_Manager_Role()
+    public async Task Invite_As_Manager_Should_Grant_The_Manager_Role_Once_Accepted()
     {
         var projectId = await CreateProjectAsync();
-        await CreateUserAsync("lead", email: "lead@acme.test", member: false);
+        var lead = await CreateUserAsync("lead", email: "lead@acme.test", member: false);
 
         var result = await TeamAppService.InviteMemberAsync(new InviteMemberDto
         {
@@ -403,7 +537,13 @@ public abstract class TeamAppServiceTests<TStartupModule> : TeamTestBase<TStartu
             Role = "Manager"
         });
 
-        (await IsInRoleAsync(result.Member!.UserId, WorkspaceRoles.Manager)).ShouldBeTrue();
+        result.WorkspaceRole.ShouldBe(WorkspaceRoles.Manager);
+        (await IsActiveMemberAsync(lead.Id)).ShouldBeFalse();
+
+        await AcceptAsync(lead.Id, result);
+
+        (await IsInRoleAsync(lead.Id, WorkspaceRoles.Manager)).ShouldBeTrue();
+        (await GetMembershipsOfUserAsync(lead.Id)).ShouldHaveSingleItem().Role.ShouldBe("Manager");
     }
 
     [Fact]

@@ -6,6 +6,9 @@ public class InvoiceSweepResult
     /// <summary>The sweep did not run because another one held the sweep lock.</summary>
     public bool Skipped { get; init; }
 
+    /// <summary>The sweep did not run because billing is off on this deployment (<see cref="BillingOptions"/>).</summary>
+    public bool BillingDisabled { get; init; }
+
     /// <summary>Invoices created by this sweep.</summary>
     public int Generated { get; set; }
 

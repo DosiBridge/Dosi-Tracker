@@ -39,6 +39,7 @@ public sealed class AuthRateLimitingTests : IAsyncLifetime
                 ["App:RateLimiting:RefreshPermitLimit"] = "8",
                 ["App:RateLimiting:AccountPermitLimit"] = "2",
                 ["App:RateLimiting:SignUpPermitLimit"] = "2",
+                ["App:RateLimiting:InvitePermitLimit"] = "3",
                 ["App:ForwardedHeaders:KnownProxies"] = TrustedProxy
             })
             .Build();
@@ -73,6 +74,7 @@ public sealed class AuthRateLimitingTests : IAsyncLifetime
                         });
                         endpoints.MapPost("/api/account/login", () => "signed in");
                         endpoints.MapPost("/api/app/workspace/register", () => "registered");
+                        endpoints.MapPost("/api/app/team/invite-member", () => "invited");
                         endpoints.MapPost("/api/app/activity", () => "stored");
                     });
                 }))
@@ -247,6 +249,23 @@ public sealed class AuthRateLimitingTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Team_Invitations_Should_Be_Limited_Per_Client()
+    {
+        for (var invite = 0; invite < 3; invite++)
+        {
+            (await PostAsync("/api/app/team/invite-member")).Response.StatusCode.ShouldBe(StatusCodes.Status200OK);
+        }
+
+        var rejected = await PostAsync("/api/app/team/invite-member");
+        rejected.Response.StatusCode.ShouldBe(StatusCodes.Status429TooManyRequests);
+        int.Parse(rejected.Response.Headers.RetryAfter.ToString()).ShouldBeInRange(1, 60);
+
+        // Its own budget: sign-up and other callers are unaffected.
+        (await PostAsync("/api/app/workspace/register")).Response.StatusCode.ShouldBe(StatusCodes.Status200OK);
+        (await PostAsync("/api/app/team/invite-member", peer: "203.0.113.99")).Response.StatusCode.ShouldBe(StatusCodes.Status200OK);
+    }
+
+    [Fact]
     public async Task Everything_Else_Should_Never_Be_Limited()
     {
         for (var upload = 0; upload < 20; upload++)
@@ -287,7 +306,19 @@ public sealed class AuthRateLimitingTests : IAsyncLifetime
     [InlineData("POST", "/api/app/workspace/find-my-workspaces", null, AuthRateLimiting.RequestKind.None)]
     [InlineData("GET", "/connect/token", null, AuthRateLimiting.RequestKind.None)]
     [InlineData("GET", "/api/account/my-profile", null, AuthRateLimiting.RequestKind.None)]
-    [InlineData("POST", "/api/app/team/invite-member", null, AuthRateLimiting.RequestKind.None)]
+    [InlineData("POST", "/api/app/invitations/mine/0f8fad5b-d9cb-469f-a165-70867728950e/accept", null, AuthRateLimiting.RequestKind.Account)]
+    [InlineData("GET", "/api/app/invitations/mine", null, AuthRateLimiting.RequestKind.None)]
+    [InlineData("POST", "/api/app/team/invite-member", null, AuthRateLimiting.RequestKind.Invite)]
+    [InlineData("GET", "/api/app/team/invitations", null, AuthRateLimiting.RequestKind.None)]
+    [InlineData("POST", "/api/app/team/0f8fad5b-d9cb-469f-a165-70867728950e/resend-invitation", null, AuthRateLimiting.RequestKind.Invite)]
+    [InlineData("POST", "/api/app/team/send-password-reset", null, AuthRateLimiting.RequestKind.Invite)]
+    [InlineData("POST", "/api/app/team/member", null, AuthRateLimiting.RequestKind.None)]
+    [InlineData("POST", "/api/account/send-password-reset-code", null, AuthRateLimiting.RequestKind.Account)]
+    [InlineData("POST", "/api/account/reset-password", null, AuthRateLimiting.RequestKind.Account)]
+    [InlineData("POST", "/api/app/my-account/confirm-email", null, AuthRateLimiting.RequestKind.Account)]
+    [InlineData("POST", "/api/app/my-account/send-email-confirmation", null, AuthRateLimiting.RequestKind.Account)]
+    [InlineData("POST", "/api/app/my-account/delete", null, AuthRateLimiting.RequestKind.Account)]
+    [InlineData("GET", "/api/app/my-account/deletion-check", null, AuthRateLimiting.RequestKind.None)]
     public void Requests_Should_Be_Classified_By_Endpoint_And_Grant(string method, string path, string? form, AuthRateLimiting.RequestKind expected)
     {
         var context = new DefaultHttpContext();

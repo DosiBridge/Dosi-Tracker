@@ -1,5 +1,5 @@
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.DependencyInjection.Extensions;
 using Dosi.Tracker.Localization;
 using Dosi.Tracker.MultiTenancy;
 using System;
@@ -75,9 +75,21 @@ public class TrackerDomainModule : AbpModule
             options.Kind = DateTimeKind.Utc;
         });
 
-#if DEBUG
-        context.Services.Replace(ServiceDescriptor.Singleton<IEmailSender, NullEmailSender>());
-#endif
+        // Bound from the application's configuration when the options are first read, so a host that replaces its
+        // configuration after the modules are configured still gets its own values.
+        context.Services.AddOptions<Billing.BillingOptions>()
+            .Configure<IConfiguration>((options, configuration) =>
+                configuration.GetSection(Billing.BillingOptions.SectionName).Bind(options));
+        context.Services.AddOptions<Erasure.DataErasureOptions>()
+            .Configure<IConfiguration>((options, configuration) =>
+                configuration.GetSection(Erasure.DataErasureOptions.SectionName).Bind(options));
+        // AI assist (section "AI"; off by default). The provider key is not part of these options.
+        context.Services.AddOptions<AiAssist.AiOptions>()
+            .Configure<IConfiguration>((options, configuration) =>
+                configuration.GetSection(AiAssist.AiOptions.SectionName).Bind(options));
+
+        // Email goes through Emailing.TrackerEmailSender, which sends nothing (and only logs that it did not) until an SMTP
+        // host is configured, so a deployment without SMTP — and every development machine — never fails on email.
     }
 
     private static void InsertBefore<T>(Volo.Abp.Collections.ITypeList<T> list, Type before, Type type)

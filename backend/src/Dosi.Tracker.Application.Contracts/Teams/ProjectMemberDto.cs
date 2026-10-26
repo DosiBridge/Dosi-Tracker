@@ -42,8 +42,10 @@ public class CreateProjectMemberDto
     public decimal HourlyRate { get; set; }
 }
 
-/// <summary>Invite someone by email (<c>POST /api/app/team/invite-member</c>). A person who has an account joins the
-/// workspace (and the project) at once; anyone else gets a pending invitation, answered with its link.</summary>
+/// <summary>Invite someone by email (<c>POST /api/app/team/invite-member</c>). Nobody is ever added to the workspace
+/// without accepting: whether or not the email has an account, a pending invitation is created and answered with its
+/// link (the answer does not reveal whether the account exists). Only an active member of this workspace invited to a
+/// project joins that project at once.</summary>
 public class InviteMemberDto
 {
     /// <summary>Optional: the project the person joins as well.</summary>
@@ -71,16 +73,17 @@ public class InviteMemberDto
 
 public class InviteMemberResultDto
 {
-    /// <summary>True when the person had an account and is now an active member.</summary>
+    /// <summary>True only when the person was already an active member of the workspace and was added to the project
+    /// at once; false when a pending invitation was created.</summary>
     public bool Added { get; set; }
 
-    /// <summary>The person's workspace role.</summary>
+    /// <summary>The person's workspace role (the role the invitation grants once accepted).</summary>
     public string WorkspaceRole { get; set; } = string.Empty;
 
-    /// <summary>The new project membership, when a project was given and the person was added.</summary>
+    /// <summary>The new project membership, when an existing member was added to the project.</summary>
     public ProjectMemberDto? Member { get; set; }
 
-    /// <summary>A pending invitation (the email has no account yet).</summary>
+    /// <summary>The pending invitation the invitee has to accept.</summary>
     public Guid? InvitationId { get; set; }
 
     /// <summary>Path of the invitation link, <c>/invite/{token}</c> (null when added at once). Share it with the
@@ -88,6 +91,17 @@ public class InviteMemberResultDto
     public string? InvitePath { get; set; }
 
     public DateTime? ExpiresAt { get; set; }
+
+    /// <summary>Whether the invitation was also emailed to the invitee. False when this server sends no email (no SMTP
+    /// configured): share the link yourself then. It never depends on whether the address has an account.</summary>
+    public bool EmailSent { get; set; }
+}
+
+/// <summary><c>POST /api/app/team/send-password-reset?userId=</c>: whether the member was emailed a link to choose a new
+/// password (false when this server sends no email). The link goes only to the member's own address.</summary>
+public class PasswordResetSentDto
+{
+    public bool EmailSent { get; set; }
 }
 
 /// <summary>A pending invitation of the current workspace.</summary>

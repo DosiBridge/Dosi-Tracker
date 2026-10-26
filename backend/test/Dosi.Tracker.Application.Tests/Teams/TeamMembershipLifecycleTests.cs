@@ -148,9 +148,13 @@ public abstract class TeamMembershipLifecycleTests<TStartupModule> : TeamTestBas
 
         var again = await TeamAppService.InviteMemberAsync(new InviteMemberDto { ProjectId = projectId, Email = "returning@acme.test", HourlyRate = 22m });
 
-        again.Added.ShouldBeTrue();
-        again.Member!.UserId.ShouldBe(returning.Id);
-        again.Member.HourlyRate.ShouldBe(22m); // the rate it had
+        // Someone who left is never put back without accepting: the invitation waits for them.
+        again.Added.ShouldBeFalse();
+        (await IsActiveMemberAsync(returning.Id)).ShouldBeFalse();
+
+        await AcceptAsync(returning.Id, again);
+
+        (await GetMembershipsOfUserAsync(returning.Id)).ShouldHaveSingleItem().HourlyRate.ShouldBe(22m); // the rate it had
         (await IsInRoleAsync(returning.Id, WorkspaceRoles.Member)).ShouldBeTrue();
         (await FindUserAsync(returning.Id))!.SecurityStamp.ShouldBe(returning.SecurityStamp);
         (await GetRatesAsync(projectId, returning.Id)).ShouldHaveSingleItem().HourlyRate.ShouldBe(22m);

@@ -51,6 +51,12 @@ public class WorkspacesController : TrackerController
         return _workspaceAppService.RestoreAsync(id);
     }
 
+    [HttpPost("{id}/delete")]
+    public Task<DeletedWorkspaceDto> DeleteAsync(Guid id, [FromBody] DeleteWorkspaceDto input)
+    {
+        return _workspaceAppService.DeleteAsync(id, input);
+    }
+
     [HttpGet("{id}/capture-retention")]
     public Task<WorkspaceCaptureRetentionDto> GetCaptureRetentionAsync(Guid id)
     {
@@ -62,9 +68,21 @@ public class WorkspacesController : TrackerController
     {
         return _workspaceAppService.UpdateCaptureRetentionAsync(id, input);
     }
+
+    [HttpGet("{id}/activity-retention")]
+    public Task<WorkspaceActivityRetentionDto> GetActivityRetentionAsync(Guid id)
+    {
+        return _workspaceAppService.GetActivityRetentionAsync(id);
+    }
+
+    [HttpPut("{id}/activity-retention")]
+    public Task<WorkspaceActivityRetentionDto> UpdateActivityRetentionAsync(Guid id, [FromBody] WorkspaceActivityRetentionDto input)
+    {
+        return _workspaceAppService.UpdateActivityRetentionAsync(id, input);
+    }
 }
 
-/// <summary>Workspace invitations, addressed by their token.</summary>
+/// <summary>Workspace invitations, addressed by their token — or, under <c>mine</c>, the signed-in user's own by id.</summary>
 [Route("api/app/invitations")]
 [WorkspaceNotRequired]
 public class InvitationsController : TrackerController
@@ -74,6 +92,28 @@ public class InvitationsController : TrackerController
     public InvitationsController(IWorkspaceAppService workspaceAppService)
     {
         _workspaceAppService = workspaceAppService;
+    }
+
+    /// <summary>The caller's pending invitations (a literal segment, so it wins over <c>{token}</c>).</summary>
+    [HttpGet("mine")]
+    [Authorize]
+    public Task<MyInvitationsDto> GetMineAsync()
+    {
+        return _workspaceAppService.GetMyInvitationsAsync();
+    }
+
+    [HttpPost("mine/{id:guid}/accept")]
+    [Authorize]
+    public Task<AcceptInvitationResultDto> AcceptMineAsync(Guid id)
+    {
+        return _workspaceAppService.AcceptMyInvitationAsync(id);
+    }
+
+    [HttpPost("mine/{id:guid}/decline")]
+    [Authorize]
+    public Task DeclineMineAsync(Guid id)
+    {
+        return _workspaceAppService.DeclineMyInvitationAsync(id);
     }
 
     [HttpGet("{token}")]

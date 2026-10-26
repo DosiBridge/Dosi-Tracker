@@ -11,8 +11,12 @@ public interface IWorkspaceAppService : IApplicationService
     /// <summary>The current workspace's subscription; null (HTTP 204) when it has none.</summary>
     Task<SubscriptionDto?> GetCurrentSubscriptionAsync();
 
-    /// <summary>Anonymous: every plan, cheapest first (the sign-up page offers them).</summary>
+    /// <summary>Anonymous: every plan, cheapest first (the sign-up page offers them while billing is on).</summary>
     Task<ListResultDto<PlanDto>> GetAvailablePlansAsync();
+
+    /// <summary><c>GET /api/app/workspace/billing-mode</c> (anonymous): whether this deployment bills workspaces.
+    /// While it does not, sign-up ignores the plan and every workspace is active.</summary>
+    Task<BillingModeDto> GetBillingModeAsync();
 
     /// <summary>Anonymous sign-up: creates the account and a workspace it owns (or joins an invited workspace).
     /// <c>Tracker:EmailAlreadyRegistered</c> when the email has an account already.</summary>
@@ -44,11 +48,23 @@ public interface IWorkspaceAppService : IApplicationService
     /// <summary><c>POST /api/app/workspaces/{id}/restore</c>: Active owner of target workspace only. Idempotent.</summary>
     Task<WorkspaceDto> RestoreAsync(Guid id);
 
+    /// <summary><c>POST /api/app/workspaces/{id}/delete</c>: active owners only, confirmed by typing the workspace's
+    /// name (<c>Tracker:WorkspaceDeleteConfirmationMismatch</c>). The workspace is gone at once for everyone — members
+    /// and their agents are answered <c>Tracker:NotWorkspaceMember</c> — and its data, captures included, is purged
+    /// after the grace period.</summary>
+    Task<DeletedWorkspaceDto> DeleteAsync(Guid id, DeleteWorkspaceDto input);
+
     /// <summary><c>GET /api/app/workspaces/{id}/capture-retention</c>: Active member of target workspace only.</summary>
     Task<WorkspaceCaptureRetentionDto> GetCaptureRetentionAsync(Guid id);
 
     /// <summary><c>PUT /api/app/workspaces/{id}/capture-retention</c>: Active owner of target workspace only.</summary>
     Task<WorkspaceCaptureRetentionDto> UpdateCaptureRetentionAsync(Guid id, WorkspaceCaptureRetentionDto input);
+
+    /// <summary><c>GET /api/app/workspaces/{id}/activity-retention</c>: Active member of target workspace only.</summary>
+    Task<WorkspaceActivityRetentionDto> GetActivityRetentionAsync(Guid id);
+
+    /// <summary><c>PUT /api/app/workspaces/{id}/activity-retention</c>: Active owner of target workspace only.</summary>
+    Task<WorkspaceActivityRetentionDto> UpdateActivityRetentionAsync(Guid id, WorkspaceActivityRetentionDto input);
 
     /// <summary><c>GET /api/app/invitations/{token}</c> (anonymous).</summary>
     Task<InvitationInfoDto> GetInvitationAsync(string token);
@@ -58,4 +74,15 @@ public interface IWorkspaceAppService : IApplicationService
 
     /// <summary><c>POST /api/app/invitations/{token}/decline</c>: the authenticated caller's email must match the invited one.</summary>
     Task DeclineInvitationAsync(string token);
+
+    /// <summary><c>GET /api/app/invitations/mine</c>: the caller's pending invitations, matched by the account's email
+    /// only once it is verified (an empty list otherwise).</summary>
+    Task<MyInvitationsDto> GetMyInvitationsAsync();
+
+    /// <summary><c>POST /api/app/invitations/mine/{id}/accept</c>: accepts one of <see cref="GetMyInvitationsAsync"/>
+    /// without its token; 403 <c>Tracker:EmailNotConfirmed</c> while the account's email is unverified.</summary>
+    Task<AcceptInvitationResultDto> AcceptMyInvitationAsync(Guid id);
+
+    /// <summary><c>POST /api/app/invitations/mine/{id}/decline</c>: same rules as <see cref="AcceptMyInvitationAsync"/>.</summary>
+    Task DeclineMyInvitationAsync(Guid id);
 }

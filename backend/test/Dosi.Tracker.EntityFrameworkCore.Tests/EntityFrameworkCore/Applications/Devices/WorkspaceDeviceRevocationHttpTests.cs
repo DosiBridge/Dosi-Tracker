@@ -40,7 +40,8 @@ namespace Dosi.Tracker.EntityFrameworkCore.Applications.Devices;
 /// 9. Stale presence cleanup cannot remove persistent revocation record.
 /// 10. Malformed/unobserved device targets rejected (400 Tracker:DeviceNotObserved) without creating tombstones.
 /// 11. Status inspection and bounded listing contracts work as expected.
-/// 12. Legacy missing-DeviceId activity behavior preserved.
+/// 12. An activity naming no device (neither token nor body) is refused (400 Tracker:DeviceIdRequired); a
+///     device-bound token alone is enough.
 /// </summary>
 public class WorkspaceDeviceRevocationHttpTests : WorkspaceHttpTestBase<TrackerHttpApiServerTestModule>
 {
@@ -742,21 +743,47 @@ public class WorkspaceDeviceRevocationHttpTests : WorkspaceHttpTestBase<TrackerH
     }
 
     [Fact]
-    public async Task Legacy_Missing_DeviceId_Activity_Behavior_Is_Preserved()
+    public async Task Activity_Naming_No_Device_Is_Refused_And_A_Device_Bound_Token_Is_Enough()
     {
         var (wsA, _, projA, _) = await SeedFixturesAsync();
         var client = CreateHttpClient();
+        var blockTime = DateTime.UtcNow.AddMinutes(-10);
 
-        // Activity without deviceId (legacy client) succeeds
-        var legacyActReq = CreateRequest(HttpMethod.Post, "/api/app/activity", UserA, wsA, new
+        // Neither the token nor the block names an install: revocation could not apply, so it is refused.
+        var anonymousId = _guidGenerator.Create();
+        var anonymousResp = await client.SendAsync(CreateRequest(HttpMethod.Post, "/api/app/activity", UserA, wsA, new
         {
             projectId = projA,
-            clientActivityId = _guidGenerator.Create(),
-            startedAt = DateTime.UtcNow.AddMinutes(-10),
-            endedAt = DateTime.UtcNow,
+            clientActivityId = anonymousId,
+            startedAt = blockTime,
+            endedAt = blockTime.AddMinutes(10),
+            productivity = 50
+        }));
+        anonymousResp.StatusCode.ShouldBe(HttpStatusCode.BadRequest);
+        (await anonymousResp.Content.ReadAsStringAsync()).ShouldContain(TrackerDomainErrorCodes.DeviceIdRequired);
+
+        // A device-bound token (every current agent's) names the install; the block is recorded for it.
+        var tokenDevice = _guidGenerator.Create();
+        var boundId = _guidGenerator.Create();
+        var boundReq = CreateRequest(HttpMethod.Post, "/api/app/activity", UserA, wsA, new
+        {
+            projectId = projA,
+            clientActivityId = boundId,
+            startedAt = blockTime,
+            endedAt = blockTime.AddMinutes(10),
             productivity = 50
         });
-        var actResp = await client.SendAsync(legacyActReq);
-        actResp.StatusCode.ShouldBe(HttpStatusCode.OK);
+        boundReq.Headers.Add(TestAuthHandler.DeviceHeaderName, tokenDevice.ToString());
+        var boundResp = await client.SendAsync(boundReq);
+        boundResp.StatusCode.ShouldBe(HttpStatusCode.OK, await boundResp.Content.ReadAsStringAsync());
+
+        await WithUnitOfWorkAsync(async () =>
+        {
+            using (_currentWorkspace.Change(wsA))
+            {
+                (await _activityRepository.AnyAsync(a => a.ClientActivityId == anonymousId)).ShouldBeFalse();
+                (await _activityRepository.SingleAsync(a => a.ClientActivityId == boundId)).DeviceId.ShouldBe(tokenDevice);
+            }
+        });
     }
 }

@@ -31,6 +31,7 @@ public sealed class ActivityTrackingSteps
     {
         ProjectId = projectId,
         ClientActivityId = clientId,
+        DeviceId = Guid.Parse("5d0c1f6a-3b8e-4a51-9c2e-7f40a1b2c3d4"),
         StartedAt = start,
         EndedAt = start.AddMinutes(10),
         Productivity = 80,

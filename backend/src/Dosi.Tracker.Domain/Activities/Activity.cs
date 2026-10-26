@@ -17,8 +17,14 @@ public class Activity : CreationAuditedAggregateRoot<Guid>, IWorkspaceScoped
     public DateTime EndedAt { get; set; }   // Must be UTC
 
     public int? Productivity { get; set; } // 0 - 100; null = not measured (input capture unavailable or not allowed)
-    public int MouseClicks { get; set; }
-    public int KeyboardHits { get; set; }
+
+    /// <summary>Mouse clicks of the block; null = not measured (the project does not allow mouse capture, the member
+    /// did not consent, or the session cannot count input, e.g. Wayland). 0 means measured and none.</summary>
+    public int? MouseClicks { get; set; }
+
+    /// <summary>Keystrokes (a count only, never which keys) of the block; null = not measured, as for
+    /// <see cref="MouseClicks"/>.</summary>
+    public int? KeyboardHits { get; set; }
 
     public string? Description { get; set; } // Optional: agents typically send no description
     public string ActiveWindowsJson { get; set; } = "[]"; // JSON array of active windows

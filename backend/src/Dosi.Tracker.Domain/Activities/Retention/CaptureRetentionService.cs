@@ -340,7 +340,7 @@ public class CaptureRetentionService : ICaptureRetentionService, ITransientDepen
         return string.Equals(storageUrl, canonicalKey, StringComparison.Ordinal);
     }
 
-    private static bool IsBlobNotFoundException(Exception ex)
+    internal static bool IsBlobNotFoundException(Exception ex)
     {
         return ex.GetType().Name.Contains("NotFound", StringComparison.OrdinalIgnoreCase) ||
                ex is KeyNotFoundException;

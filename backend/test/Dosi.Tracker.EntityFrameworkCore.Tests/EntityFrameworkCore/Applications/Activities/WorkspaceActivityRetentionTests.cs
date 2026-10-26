@@ -804,6 +804,7 @@ public class WorkspaceActivityRetentionTests : TrackerEntityFrameworkCoreTestBas
             {
                 ProjectId = projA,
                 ClientActivityId = clientActivityId,
+                DeviceId = Guid.NewGuid(),
                 StartedAt = startedAt,
                 EndedAt = endedAt,
                 Productivity = 80,
@@ -855,6 +856,7 @@ public class WorkspaceActivityRetentionTests : TrackerEntityFrameworkCoreTestBas
             {
                 ProjectId = projA,
                 ClientActivityId = oldClientActivityId,
+                DeviceId = Guid.NewGuid(),
                 StartedAt = oldStartedAt,
                 EndedAt = oldStartedAt.AddMinutes(10),
                 Productivity = 80,

@@ -26,11 +26,24 @@ public static class TrackerPermissions
         /// <summary>See every member's activities/screenshots (owners/admins).
         /// Without it, activity queries are scoped to the caller's own data.</summary>
         public const string ViewAll = Default + ".ViewAll";
+
+        /// <summary>Delete a tracked block with its captures, or a capture alone (owners and managers; a reason is
+        /// required and every deletion is recorded). Members delete their own captures without it, within the
+        /// workspace's short window after upload.</summary>
+        public const string Delete = Default + ".Delete";
     }
 
     public static class Team
     {
         public const string Default = GroupName + ".Team";
+        public const string Manage = Default + ".Manage";
+    }
+
+    /// <summary>Desktop agent installs. Members manage their own devices with no permission; revoking or restoring
+    /// another member's device needs <see cref="Manage"/>.</summary>
+    public static class Devices
+    {
+        public const string Default = GroupName + ".Devices";
         public const string Manage = Default + ".Manage";
     }
 

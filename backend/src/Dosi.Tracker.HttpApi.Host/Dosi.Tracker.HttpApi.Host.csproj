@@ -20,6 +20,7 @@
     <PackageReference Include="AspNetCore.HealthChecks.UI.InMemory.Storage" Version="9.0.0" />
     <PackageReference Include="Microsoft.AspNetCore.Mvc.Razor.RuntimeCompilation" Version="10.0.9" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.InMemory" Version="10.0.9" />
+    <PackageReference Include="Microsoft.Extensions.AI.OpenAI" Version="10.11.0" />
     <PackageReference Include="Serilog.AspNetCore" Version="9.0.0" />
     <PackageReference Include="Serilog.Sinks.Async" Version="2.1.0" />
     <PackageReference Include="Volo.Abp.BlobStoring.Aws" Version="10.5.0" />
@@ -54,6 +55,20 @@
     <Content Remove="Logs\**" />
     <EmbeddedResource Remove="Logs\**" />
     <None Remove="Logs\**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Git-ignored, developer-local secrets (the local DB password, an AI provider key). Optional, and never
+         published: AddAppSettingsSecretsJson() is registered AFTER environment variables, so a published copy
+         would silently override the container's ConnectionStrings__Default / AI__OpenAI__ApiKey, and the
+         Dockerfiles copy the publish folder into the image. The Web SDK already globs it in as Content (published),
+         so that item is removed and re-added with the publish rule. -->
+    <None Remove="appsettings.secrets.json" />
+    <Content Remove="appsettings.secrets.json" />
+    <Content Include="appsettings.secrets.json" Condition="Exists('appsettings.secrets.json')">
+      <CopyToPublishDirectory>Never</CopyToPublishDirectory>
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </Content>
   </ItemGroup>
 
 </Project>

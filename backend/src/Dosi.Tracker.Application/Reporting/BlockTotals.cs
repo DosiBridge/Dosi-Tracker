@@ -5,7 +5,8 @@ namespace Dosi.Tracker.Reporting;
 /// <summary>
 /// Running totals of a group of blocks (a member, a project, a day, …), fed one block at a time so a report never
 /// holds the range's rows in memory. Minutes are real block durations; idle minutes come only from blocks that
-/// measured them; activity % is the duration-weighted mean of the blocks that measured it.
+/// measured them; activity % is the duration-weighted mean of the blocks that measured it; click and keystroke totals
+/// sum only the blocks that counted them, and say how many did.
 /// </summary>
 internal sealed class BlockTotals
 {
@@ -20,13 +21,29 @@ internal sealed class BlockTotals
     public long MouseClicks { get; private set; }
     public long KeyboardHits { get; private set; }
 
-    public void Add(double minutes, int? productivity, double idleMinutes, long mouseClicks = 0, long keyboardHits = 0)
+    /// <summary>Blocks whose mouse clicks were measured (the others are not counted as 0 clicks).</summary>
+    public int MouseMeasuredCount { get; private set; }
+
+    /// <summary>Blocks whose keystrokes were measured.</summary>
+    public int KeyboardMeasuredCount { get; private set; }
+
+    public void Add(double minutes, int? productivity, double idleMinutes, long? mouseClicks = null, long? keyboardHits = null)
     {
         Count++;
         Minutes += minutes;
         IdleMinutes += idleMinutes;
-        MouseClicks += mouseClicks;
-        KeyboardHits += keyboardHits;
+
+        if (mouseClicks.HasValue)
+        {
+            MouseClicks += mouseClicks.Value;
+            MouseMeasuredCount++;
+        }
+
+        if (keyboardHits.HasValue)
+        {
+            KeyboardHits += keyboardHits.Value;
+            KeyboardMeasuredCount++;
+        }
 
         // Unmeasured blocks (null) are left out of both sums, so they never drag the average towards 0%.
         if (productivity.HasValue)

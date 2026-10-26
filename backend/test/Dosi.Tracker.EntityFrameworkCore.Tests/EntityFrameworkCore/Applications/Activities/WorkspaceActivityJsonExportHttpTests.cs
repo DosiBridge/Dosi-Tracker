@@ -299,7 +299,7 @@ public class WorkspaceActivityJsonExportHttpTests : WorkspaceHttpTestBase<Tracke
         var doc = JsonSerializer.Deserialize<ActivityJsonExportDocumentDto>(jsonString, JsonExportHelper.JsonOptions);
 
         doc.ShouldNotBeNull();
-        doc.Version.ShouldBe("1.0");
+        doc.Version.ShouldBe("1.1");
         doc.WorkspaceId.ShouldBe(wsA);
         doc.TotalCount.ShouldBe(1);
         doc.Activities.Count.ShouldBe(1);
@@ -828,8 +828,19 @@ public class WorkspaceActivityJsonExportHttpTests : WorkspaceHttpTestBase<Tracke
                     Description = "বাংলা স্প্রিন্ট টাস্ক (Sprint Planning) \"উন্নয়ন\"\nনতুন লাইন 🚀"
                 };
 
+                // Item 3: input counts not measured (e.g. a Wayland session) -> null, not 0
+                var a3 = new Activity(
+                    _guidGenerator.Create(), wsA, UserA, projA, _guidGenerator.Create(),
+                    baseTime.AddMinutes(30), baseTime.AddMinutes(40))
+                {
+                    Description = "unmeasured input",
+                    MouseClicks = null,
+                    KeyboardHits = null
+                };
+
                 await _activityRepository.InsertAsync(a1, autoSave: true);
                 await _activityRepository.InsertAsync(a2, autoSave: true);
+                await _activityRepository.InsertAsync(a3, autoSave: true);
             }
         });
 
@@ -847,6 +858,8 @@ public class WorkspaceActivityJsonExportHttpTests : WorkspaceHttpTestBase<Tracke
         // 2. Historical zeros preserved as 0
         jsonString.ShouldContain("\"mouseClicks\":0");
         jsonString.ShouldContain("\"keyboardHits\":0");
+        jsonString.ShouldContain("\"mouseClicks\":null");
+        jsonString.ShouldContain("\"keyboardHits\":null");
 
         // 3. Non-ASCII Bengali and emoji preservation
         jsonString.ShouldContain("বাংলা স্প্রিন্ট টাস্ক (Sprint Planning)");
@@ -855,7 +868,11 @@ public class WorkspaceActivityJsonExportHttpTests : WorkspaceHttpTestBase<Tracke
         // 4. Strongly-typed deserialization roundtrip
         var doc = JsonSerializer.Deserialize<ActivityJsonExportDocumentDto>(jsonString, JsonExportHelper.JsonOptions);
         doc.ShouldNotBeNull();
-        doc.Activities.Count.ShouldBe(2);
+        doc.Activities.Count.ShouldBe(3);
+
+        var unmeasuredItem = doc.Activities.Single(a => a.Description == "unmeasured input");
+        unmeasuredItem.MouseClicks.ShouldBeNull();
+        unmeasuredItem.KeyboardHits.ShouldBeNull();
 
         var nullItem = doc.Activities.First(a => a.Description == null);
         nullItem.Productivity.ShouldBeNull();
