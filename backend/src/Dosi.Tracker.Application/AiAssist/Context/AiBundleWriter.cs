@@ -26,6 +26,11 @@ public sealed class AiBundleWriter
     public const string TitlePrefix = "W";
     public const string NotePrefix = "N";
 
+    /// <summary>Quoted context the answer may draw on but never cites (no placeholder can name a <c>D</c> or <c>G</c>
+    /// id): a project description, a caller's goal.</summary>
+    public const string DescriptionPrefix = "D";
+    public const string GoalPrefix = "G";
+
     /// <summary>The caveat added once when an instruction-shaped phrase was removed from quoted text.</summary>
     public const string OmittedTextCaveat = "Some titles were omitted.";
 
@@ -34,6 +39,7 @@ public sealed class AiBundleWriter
 
     private readonly AiPseudonymizer _pseudonymizer;
     private readonly List<KeyValuePair<string, AiFact>> _facts = new();
+    private readonly Dictionary<string, string> _factSubjects = new(StringComparer.Ordinal);
     private readonly List<KeyValuePair<string, string>> _labels = new();
     private readonly Dictionary<string, string> _labelIdsByKey = new(StringComparer.Ordinal);
     private readonly Dictionary<string, int> _labelCounts = new(StringComparer.Ordinal);
@@ -61,8 +67,13 @@ public sealed class AiBundleWriter
     public int InjectionRemovals { get; private set; }
 
     /// <summary>A fact; returns its id (<c>F1</c>…).</summary>
+    /// <param name="label">What the value is (server text without digits).</param>
+    /// <param name="display">The formatted value.</param>
+    /// <param name="subject">The member handle or label id the fact is about (<c>M1</c>, <c>P2</c> …), if any. It is
+    /// never sent (the data's lists say what a fact belongs to); it only names the fact for the reader in "the figures
+    /// used".</param>
     /// <exception cref="ArgumentException">The label is blank or holds a digit (values belong in the display).</exception>
-    public string AddFact(string label, string display)
+    public string AddFact(string label, string display, string? subject = null)
     {
         if (string.IsNullOrWhiteSpace(label) || label.Any(char.IsDigit))
         {
@@ -71,6 +82,11 @@ public sealed class AiBundleWriter
 
         var id = FactPrefix + (_facts.Count + 1).ToString(CultureInfo.InvariantCulture);
         _facts.Add(new KeyValuePair<string, AiFact>(id, new AiFact(label.Trim(), display ?? string.Empty)));
+        if (!string.IsNullOrWhiteSpace(subject))
+        {
+            _factSubjects[id] = subject;
+        }
+
         return id;
     }
 
@@ -100,6 +116,13 @@ public sealed class AiBundleWriter
 
     /// <summary>A note's id (<c>N1</c>…); the same sanitized text keeps one id.</summary>
     public string AddNote(string? note) => AddLabel(NotePrefix, null, note, AiAssistConsts.MaxNoteLength);
+
+    /// <summary>A project description's id (<c>D1</c>…), quoted context only.</summary>
+    public string AddDescription(string? description) =>
+        AddLabel(DescriptionPrefix, null, description, AiAssistConsts.MaxDescriptionLength);
+
+    /// <summary>The caller's goal (<c>G1</c>…), quoted context only.</summary>
+    public string AddGoal(string? goal) => AddLabel(GoalPrefix, null, goal, AiAssistConsts.MaxGoalLength);
 
     /// <summary>A named list (its values are ids); replaces a list of the same name. The node is copied.</summary>
     public AiBundleWriter SetList(string name, JsonNode? list)
@@ -159,7 +182,8 @@ public sealed class AiBundleWriter
             _routes.ToList(),
             (JsonArray)_candidates.DeepClone(),
             new Dictionary<string, AiAlias>(_resolution, StringComparer.Ordinal),
-            InjectionRemovals);
+            InjectionRemovals,
+            new Dictionary<string, string>(_factSubjects, StringComparer.Ordinal));
     }
 
     private string AddLabel(string prefix, string? identity, string? raw, int max)

@@ -31,9 +31,11 @@ public sealed class AiContextBundle
         IReadOnlyList<string> routes,
         JsonArray candidates,
         IReadOnlyDictionary<string, AiAlias> resolution,
-        int injectionRemovals = 0)
+        int injectionRemovals = 0,
+        IReadOnlyDictionary<string, string>? factSubjects = null)
     {
         InjectionRemovals = injectionRemovals;
+        FactSubjects = factSubjects ?? new Dictionary<string, string>(StringComparer.Ordinal);
         CallerId = callerId;
         FactList = facts;
         Facts = facts.ToDictionary(f => f.Key, f => f.Value, StringComparer.Ordinal);
@@ -79,6 +81,10 @@ public sealed class AiContextBundle
 
     /// <summary>Member handles to the people they stand for. Never serialized.</summary>
     public IReadOnlyDictionary<string, AiAlias> Resolution { get; }
+
+    /// <summary>Fact id → the member handle or label id the fact is about, to name it for the reader. Never
+    /// serialized.</summary>
+    public IReadOnlyDictionary<string, string> FactSubjects { get; }
 
     /// <summary>Every id a placeholder may name: facts, labels, member handles and <c>ME</c>.</summary>
     public IReadOnlySet<string> KnownIds { get; }

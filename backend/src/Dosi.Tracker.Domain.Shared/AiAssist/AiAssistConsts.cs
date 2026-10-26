@@ -31,6 +31,9 @@ public static class AiAssistConsts
     public const int MaxNoteLength = 120;
     public const int MaxTitleLength = 120;
 
+    /// <summary>A project description given to task drafts as context.</summary>
+    public const int MaxDescriptionLength = 500;
+
     // How much one bundle carries.
     public const int MaxBundleMembers = 12;
     public const int MaxBundleProjects = 10;
