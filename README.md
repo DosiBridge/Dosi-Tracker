@@ -133,4 +133,4 @@ module structure ready to be built out.
 
 ## License
 
-MIT
+[MIT](./LICENSE)
