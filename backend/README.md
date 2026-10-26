@@ -44,7 +44,22 @@ container's environment there).
 #### AI assist (off by default)
 
 AI assist will send aggregated tracker data to an OpenAI-protocol provider, only in workspaces whose owner turns it on.
-So far the server has the provider configuration only; no feature calls it yet. It is off unless `AI__Enabled=true`.
+So far the server has the provider configuration, the workspace settings and the usage views; no feature calls the
+provider yet. It is off unless `AI__Enabled=true`.
+
+- **Owners opt in** (`PUT /api/app/ai-assist/settings`) after acknowledging the current disclosure version
+  (`"1.{AI:Disclosure:Version}"`); turning on window titles or task notes needs the same acknowledgement. Every change
+  is kept in the consent history (`AppAiConsentEvents`), and every active member gets an in-app notification when AI
+  assist starts or may send more of their data. Only the workspace's own setting counts: a global or configured value
+  can never turn it on. Raising `AI__Disclosure__Version` asks every owner to consent again.
+- **Everyone reads** `GET /api/app/ai-assist/status` (what is available to them and why not) and
+  `GET /api/app/ai-assist/usage`; owners and managers read the settings.
+- **The platform console** (`/api/app/platform-ai/overview`, `PUT /api/app/platform-ai/status`) shows the provider state
+  and the month's usage across workspaces, and switches AI assist off everywhere at once without a restart.
+- **The usage ledger** (`AppAiUsageRecords`) holds one row per served request (feature, tokens, cost, outcome; never a
+  prompt, an answer or a name). Rows older than `AI__Usage__RetentionDays` (400) are deleted daily. A deleted
+  workspace's ledger and consent history are purged with the rest of its data.
+
 At start-up the host logs one line with the provider state (`Disabled`,
 `Configured`, or what is missing). The key is never logged, and it must never be written into a tracked file:
 the start-up guard refuses an `AI:OpenAI:ApiKey` read from `appsettings.json`, and a test fails on any settings file
@@ -62,6 +77,9 @@ under `backend/` that carries one.
 | `AI__ReasoningEffort`, `AI__Temperature` | Sent only when set (reasoning models reject a temperature) | none |
 | `AI__Features__<Feature>__Enabled`, `__Model`, `__MaxOutputTokens` | Per feature: `PeriodSummary`, `MemberDaySummary`, `ReportExplanation`, `DataQualityReview`, `NoteSuggestions`, `TaskDrafts`, `Ask` | on, the default model, per feature |
 | `AI__Pricing__<n>__Model`, `__InputPer1M`, `__CachedInputPer1M`, `__OutputPer1M` | USD per million tokens, for cost estimates and the USD budget | none |
+| `AI__Quotas__Default__*`, `AI__Quotas__Plans__<Plan>__*` | `MonthlyRequests`, `MonthlyTokens`, `UserDailyRequests`, `UserPerMinute`, by plan name (built in: Free, Starter, Business; anything else uses Default: 200 / 800,000 / 20 / 4) | see text |
+| `AI__Disclosure__ProviderDisplayName`, `__ProcessingRegion`, `__RetentionNote`, `__Version` | What owners are shown before they opt in; raise `Version` to ask for consent again | `OpenAI`, none, none, `0` |
+| `AI__Usage__RetentionDays` | How long usage-ledger rows are kept | `400` |
 
 List the models your key can use locally (`GET https://api.openai.com/v1/models`), never in CI. Prefer a dedicated
 OpenAI project per environment with a project-scoped key, a model allowlist and a monthly budget.
