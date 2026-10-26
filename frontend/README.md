@@ -28,6 +28,32 @@ browser leads to `/login`, never to demo data. The demo dataset
 (`src/lib/demo-tenants.ts`) is loaded with a dynamic `import()` only in demo
 mode; `.dependency-cruiser.cjs` forbids static imports of it.
 
+## Accounts, email and billing
+
+Some pages depend on how the API is set up:
+
+- **Emailed links.** Invitations, password resets and email confirmations
+  are emailed by the API (when it has SMTP configured) as links into this
+  site: `/invite/{token}`, `/reset-password?userId=&resetToken=` and
+  `/confirm-email?userId=&token=`. Set the API's `App:ClientUrl` to this
+  site's address. `/forgot-password`, `/reset-password` and `/confirm-email`
+  are public pages; the forgot page answers the same whether or not an
+  address has an account. Without SMTP, nothing is emailed: the team page
+  says so and shows the invitation link to share by hand.
+- **Invitations.** Nobody joins a workspace without accepting. Signed-in
+  people answer the invitations sent to their *confirmed* email on
+  `/workspaces`, or open the invitation link.
+- **Billing.** The app asks the API whether it bills workspaces
+  (`Billing:Enabled`, off by default). While it doesn't, the app shows no
+  plans, trials, seat limits or invoices. While it does, owners can switch
+  to a free plan their team fits, or cancel a paid one, on `/billing`;
+  paid plans are assigned by the platform operator.
+- **Deletion and retention.** Owners and managers delete a time block or a
+  capture from the activity report (with a reason the API records); members
+  delete their own captures for a while after upload. Owners set capture and
+  activity retention, and can delete the workspace, in Settings → Workspace;
+  anyone can delete their account in Settings → Security.
+
 ## Downloads
 
 [`src/lib/agent-downloads.ts`](src/lib/agent-downloads.ts) is the single source
