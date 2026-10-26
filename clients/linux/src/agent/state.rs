@@ -373,11 +373,37 @@ impl Notice {
 /// A workspace offered by the picker.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceChoice {
+    /// The workspace's id (a GUID), so clients can choose by id.
+    #[serde(default)]
+    pub id: String,
     pub name: String,
     /// The user's role there ("Owner", "Admin", "Member"…).
     pub role: Option<String>,
     /// The workspace tracked in now.
     pub is_current: bool,
+}
+
+/// Why the last sign-in attempt failed, for clients that act on it (the CLI
+/// maps it to its exit codes); `login_error` has the words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoginErrorKind {
+    /// The server refused the email or password.
+    Refused,
+    /// The server could not be reached.
+    Offline,
+    /// The server answered with an error that is not about the sign-in.
+    Server,
+    /// The server address is invalid or not allowed (plain `http://`).
+    InvalidServer,
+    /// No server address was given and none is configured.
+    NoServer,
+    /// The account is in no workspace (or not in the one named).
+    NoWorkspace,
+    /// The workspace named is archived.
+    ArchivedWorkspace,
+    /// The saved sign-in is no longer accepted.
+    Expired,
 }
 
 /// How many notices are kept for the clients to pick up.
@@ -672,6 +698,9 @@ pub struct SharedState {
     pub last_error: Option<String>,
     /// Set once a sign-in attempt fails so the login view can show it.
     pub login_error: Option<String>,
+    /// What kind of failure `login_error` is.
+    #[serde(default)]
+    pub login_error_kind: Option<LoginErrorKind>,
     pub signing_in: bool,
     /// Workspaces to choose from after a sign-in or "Switch workspace".
     pub workspace_choices: Vec<WorkspaceChoice>,
@@ -703,6 +732,11 @@ pub struct SharedState {
     pub manual_mode: bool,
     /// Linux: the daemon serving this snapshot.
     pub daemon: Option<DaemonInfo>,
+    /// How many [`Command`]s the worker has handled. Never serialized: the
+    /// IPC server compares it with the sequence number of a command it sent
+    /// to know when that command was applied.
+    #[serde(skip)]
+    pub commands_handled: u64,
 }
 
 fn screenshot_time<S: Serializer>(
@@ -766,6 +800,7 @@ impl Default for SharedState {
             clock_skew_minutes: None,
             last_error: None,
             login_error: None,
+            login_error_kind: None,
             signing_in: false,
             workspace_choices: Vec::new(),
             finding_workspaces: false,
@@ -781,6 +816,7 @@ impl Default for SharedState {
             credentials_locked: false,
             manual_mode: false,
             daemon: None,
+            commands_handled: 0,
         }
     }
 }
@@ -929,6 +965,10 @@ pub enum Command {
         username: String,
         password: Secret,
         server: Option<String>,
+        /// Keep the password in the keyring; `None` follows
+        /// `credentials.remember_password`.
+        #[serde(default)]
+        remember_password: Option<bool>,
     },
     /// Use `workspace_choices[index]` after signing in.
     ChooseWorkspace { index: usize },
@@ -978,6 +1018,22 @@ pub enum Command {
     ReloadCredentials,
     /// Linux: ask the screenshot portal again after the user refused it.
     RetryCapture,
+    /// Linux: fetch the project list (and each project's policy) now.
+    RefreshProjects,
+    /// Linux: delete the signed-in account's queued rows of `which` kind
+    /// (confirmed by the user).
+    PurgeQueue { which: PurgeQueue },
+}
+
+/// Which queued rows [`Command::PurgeQueue`] deletes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PurgeQueue {
+    /// Waiting to upload.
+    Pending,
+    /// Refused by the server and kept for diagnostics.
+    Parked,
+    All,
 }
 
 /// Requests from outside the clients (a second GUI launch, the installer,
@@ -1195,6 +1251,7 @@ mod tests {
             username: "ayesha@acme.test".into(),
             password: Secret::new("canary-pw-4711"),
             server: None,
+            remember_password: None,
         };
         let debug = format!("{sign_in:?}");
         assert!(!debug.contains("canary-pw-4711"), "{debug}");

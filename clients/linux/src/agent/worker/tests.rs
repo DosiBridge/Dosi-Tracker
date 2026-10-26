@@ -1879,6 +1879,7 @@ fn a_refused_sign_in_stops_tracking_keeps_the_queue_and_asks_for_the_password() 
             username: "alice@acme.com".into(),
             password: Secret::new("new"),
             server: None,
+            remember_password: None,
         },
     );
     let account = match h.control_requests().pop() {
@@ -1929,6 +1930,7 @@ fn a_sign_in_with_a_server_address_saves_it() {
             username: "alice@acme.com".into(),
             password: Secret::new("pw"),
             server: Some("ftp://nope".into()),
+            remember_password: None,
         },
     );
     assert!(
@@ -1944,6 +1946,7 @@ fn a_sign_in_with_a_server_address_saves_it() {
             username: "alice@acme.com".into(),
             password: Secret::new("pw"),
             server: Some("tracker.acme.com/".into()),
+            remember_password: None,
         },
     );
     let account = match h.control_requests().pop() {
@@ -2153,6 +2156,7 @@ fn typed_sign_in(h: &mut Harness, workspace: Option<&str>) -> Account {
             username: "alice@acme.com".into(),
             password: Secret::new("pw"),
             server: None,
+            remember_password: None,
         },
     );
     assert!(h.state.snapshot().signing_in);
@@ -4610,4 +4614,181 @@ impl Machine for ClockedTracker {
     fn retry_capture_permission(&self) {
         self.inner.retry_capture_permission()
     }
+}
+
+// ---- Linux: what the IPC server relies on (L6) ------------------------------------------
+
+#[test]
+fn every_command_is_counted_once_it_is_applied() {
+    let mut h = tracking();
+    let before = h.state.snapshot().commands_handled;
+    h.command(
+        at("10:01:00"),
+        Command::SetTaskNote {
+            note: "Invoices".into(),
+            at: at("10:01:00"),
+        },
+    );
+    h.command(at("10:01:05"), Command::RefreshProjects);
+    h.command(at("10:01:10"), Command::ResolveAway { keep: false });
+    assert_eq!(h.state.snapshot().commands_handled, before + 3);
+    let json = serde_json::to_value(h.state.snapshot()).unwrap();
+    assert!(
+        json.get("commands_handled").is_none(),
+        "never in the snapshot"
+    );
+}
+
+#[test]
+fn refresh_projects_asks_the_server_when_signed_in() {
+    let mut h = tracking();
+    h.control_requests();
+    h.command(at("10:01:00"), Command::RefreshProjects);
+    assert!(h
+        .control_requests()
+        .iter()
+        .any(|r| matches!(r, ControlRequest::RefreshProjects)));
+
+    let mut signed_out = harness_at(at("10:00:00"), None, false, None);
+    signed_out.command(at("10:01:00"), Command::RefreshProjects);
+    assert!(signed_out.control_requests().is_empty());
+}
+
+#[test]
+fn purge_queue_deletes_the_accounts_rows_and_shows_the_new_counts() {
+    let mut h = tracking();
+    h.command(at("10:12:00"), Command::SyncNow { at: at("10:12:00") });
+    let queued = h.queued().len();
+    assert!(queued >= 1);
+    assert_eq!(h.state.snapshot().pending_uploads as usize, queued);
+    h.command(
+        at("10:12:10"),
+        Command::PurgeQueue {
+            which: PurgeQueue::Parked,
+        },
+    );
+    assert_eq!(
+        h.queued().len(),
+        queued,
+        "only parked rows go with --parked"
+    );
+    h.command(
+        at("10:12:20"),
+        Command::PurgeQueue {
+            which: PurgeQueue::Pending,
+        },
+    );
+    assert!(h.queued().is_empty());
+    assert_eq!(h.state.snapshot().pending_uploads, 0);
+    assert!(h.state.snapshot().queue_rows.is_empty());
+}
+
+#[test]
+fn sign_in_failures_say_what_kind_they_are() {
+    let mut h = harness_at(at("10:00:00"), None, false, None);
+    h.command(
+        at("10:00:00"),
+        Command::SignIn {
+            workspace: None,
+            username: "alice@acme.com".into(),
+            password: Secret::new("pw"),
+            server: Some("ftp://nope".into()),
+            remember_password: None,
+        },
+    );
+    assert_eq!(
+        h.state.snapshot().login_error_kind,
+        Some(LoginErrorKind::InvalidServer)
+    );
+
+    let account = typed_sign_in(&mut h, None);
+    assert_eq!(
+        h.state.snapshot().login_error_kind,
+        None,
+        "cleared on a new try"
+    );
+    h.worker.on_control(ControlEvent::SignedIn {
+        account,
+        workspaces: Ok(vec![]),
+    });
+    h.worker.publish();
+    assert_eq!(
+        h.state.snapshot().login_error_kind,
+        Some(LoginErrorKind::NoWorkspace)
+    );
+
+    let _ = typed_sign_in(&mut h, None);
+    h.worker
+        .on_control(ControlEvent::SignInFailed(AuthError::Offline(
+            "down".into(),
+        )));
+    h.worker.publish();
+    assert_eq!(
+        h.state.snapshot().login_error_kind,
+        Some(LoginErrorKind::Offline)
+    );
+    assert_eq!(
+        login_error_kind(&AuthError::Rejected("no".into())),
+        LoginErrorKind::Refused
+    );
+}
+
+#[test]
+fn a_sign_in_that_says_not_to_remember_keeps_no_password() {
+    let mut h = harness_at(at("10:00:00"), None, false, None);
+    h.command(
+        at("10:00:00"),
+        Command::SignIn {
+            workspace: None,
+            username: "alice@acme.com".into(),
+            password: Secret::new("pw"),
+            server: None,
+            remember_password: Some(false),
+        },
+    );
+    let account = match h.control_requests().pop() {
+        Some(ControlRequest::SignIn(account)) => account,
+        other => panic!("expected a sign-in check, got {other:?}"),
+    };
+    h.worker.on_control(ControlEvent::SignedIn {
+        account,
+        workspaces: Ok(vec![workspace("w1", "Acme")]),
+    });
+    h.worker.publish();
+    let saved = h.credentials.load_account(&h.owner()).unwrap().unwrap();
+    assert!(saved.password.is_none());
+    assert!(saved.device_signing_key.is_some());
+
+    let mut remembered = harness_at(at("10:00:00"), None, false, None);
+    let account = typed_sign_in(&mut remembered, None);
+    remembered.worker.on_control(ControlEvent::SignedIn {
+        account,
+        workspaces: Ok(vec![workspace("w1", "Acme")]),
+    });
+    let saved = remembered
+        .credentials
+        .load_account(&remembered.owner())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        saved.password.as_deref(),
+        Some("pw"),
+        "remembered by default"
+    );
+}
+
+#[test]
+fn workspace_choices_carry_their_ids() {
+    let mut h = harness_at(at("10:00:00"), None, false, None);
+    let account = typed_sign_in(&mut h, None);
+    h.worker.on_control(ControlEvent::SignedIn {
+        account,
+        workspaces: Ok(vec![workspace("w1", "Acme"), workspace("w2", "Other")]),
+    });
+    h.worker.publish();
+    let choices = h.state.snapshot().workspace_choices;
+    assert_eq!(
+        choices.iter().map(|c| c.id.clone()).collect::<Vec<_>>(),
+        [wid("w1"), wid("w2")]
+    );
 }

@@ -13,7 +13,9 @@
 #   harness    the #[ignore]d display/bus tests inside ci/xvfb-session.sh
 #   installer  tests/test_installer_lifecycle.sh as a non-root user
 #   release    release build, release-mode tests, dynamic-link allowlist,
-#              --version, doctor --json and the outbox fail-closed checks
+#              --version, doctor --json, the outbox fail-closed checks, no
+#              test hooks in the binary, and argv passwords / status
+#              without an agent failing closed
 #   all        fmt clippy test harness installer release
 #
 # An unknown stage exits 2 before anything runs.
@@ -151,6 +153,45 @@ stage_release() {
 
   log "outbox status fails closed on a missing DB"
   check_outbox_status_fails_closed "${cli}"
+
+  log "no test hooks in the release binary"
+  if "${cli}" daemon --help | grep -Eiq 'fake|test'; then
+    die "daemon --help shows a test flag"
+  fi
+  if grep -aq 'DOSI_TEST_' "${cli}"; then
+    die "test-support is compiled into the release binary"
+  fi
+
+  log "passwords on argv are refused, status without an agent creates nothing"
+  check_cli_fails_closed "${cli}"
+}
+
+# `login --password x` exits 2 without echoing x; `status --no-start` exits
+# 3; neither leaves a file behind.
+check_cli_fails_closed() {
+  local bin="$1"
+  local home code out
+  home="$(mktemp -d)"
+  chmod 700 "${home}"
+  touch "${home}/.stamp"
+  sleep 1
+  set +e
+  out="$(isolated_env "${home}" XDG_RUNTIME_DIR="${home}" "${bin}" login --password release-canary-x 2>&1)"
+  code=$?
+  set -e
+  [ "${code}" -eq 2 ] || die "login --password exited ${code}, not 2"
+  if printf '%s' "${out}" | grep -q 'release-canary-x'; then
+    die "login --password echoed the password"
+  fi
+  set +e
+  isolated_env "${home}" "${bin}" status --no-start >/dev/null 2>&1
+  code=$?
+  set -e
+  [ "${code}" -eq 3 ] || die "status --no-start exited ${code}, not 3"
+  if [ -n "$(find "${home}" -mindepth 1 -newer "${home}/.stamp")" ]; then
+    die "login/status created files: $(find "${home}" -mindepth 1 -newer "${home}/.stamp")"
+  fi
+  rm -rf "${home}"
 }
 
 run_stage() {

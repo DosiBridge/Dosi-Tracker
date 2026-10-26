@@ -61,9 +61,10 @@ use super::session::{
 use super::session_events::{SystemEvent, SystemNotice};
 use super::session_store::{self, ProjectCache, SavedPause, SavedWorkspace, SessionData};
 use super::state::{
-    AwayPrompt, Capabilities, CapabilityInfo, CaptureFlags, Command, LastScreenshot, NoticeKind,
-    PlatformAvailability, ProjectOption, QueuedRow, RecentBlock, RowStatus, Secret, SessionSummary,
-    StateHandle, TrackerStatus, UploadState, WorkspaceChoice, RECENT_BLOCKS,
+    AwayPrompt, Capabilities, CapabilityInfo, CaptureFlags, Command, LastScreenshot,
+    LoginErrorKind, NoticeKind, PlatformAvailability, ProjectOption, PurgeQueue, QueuedRow,
+    RecentBlock, RowStatus, Secret, SessionSummary, StateHandle, TrackerStatus, UploadState,
+    WorkspaceChoice, RECENT_BLOCKS,
 };
 use super::uploader::{self, UploadCommand, UploadEvent, UploaderHandle};
 use crate::api::{ApiClient, ApiError, AuthError, ServerClock, TokenCell};
@@ -71,8 +72,8 @@ use crate::consent::{ConsentedPermissions, LocalConsent};
 use crate::credentials::{CredentialError, CredentialStore, Credentials};
 use crate::lifecycle::TrackerLifecycle;
 use crate::outbox::{
-    EnqueueResult, Outbox, OutboxLimits, OutboxScope, PendingActivity, QueueLimits, RowState,
-    PARKED_RETENTION_DAYS,
+    EnqueueResult, Outbox, OutboxLimits, OutboxScope, PendingActivity, PurgeTarget, QueueLimits,
+    RowState, PARKED_RETENTION_DAYS,
 };
 use crate::tracking::build::{BlockSpec, BuiltBlock, ProvenanceScreenCapture};
 use crate::tracking::capture::ScreenCapture;
@@ -515,7 +516,10 @@ async fn run(
                 tokio::select! {
                     command = commands.recv() => match command {
                         None | Some(Command::Shutdown { .. }) => return,
-                        Some(_) => tracing::warn!("command ignored while the local queue is unavailable"),
+                        Some(_) => {
+                            tracing::warn!("command ignored while the local queue is unavailable");
+                            state.update(|s| s.commands_handled += 1);
+                        }
                     },
                     _ = tokio::time::sleep(STORAGE_RETRY) => {}
                 }
@@ -749,6 +753,9 @@ pub(crate) struct Worker {
     lifecycle: Arc<Mutex<TrackerLifecycle>>,
     credentials: Arc<dyn CredentialStore>,
     persister: TokenPersister,
+    /// Keep the password in the keyring: `credentials.remember_password`,
+    /// or what the latest sign-in asked for.
+    remember_password: bool,
     session_file: Option<PathBuf>,
     launch: Launch,
     clock: ServerClock,
@@ -835,6 +842,7 @@ pub(crate) struct Worker {
 impl Worker {
     pub(crate) fn new(parts: WorkerParts) -> Self {
         let now = Instant::now();
+        let remember_password = parts.cfg.credentials.remember_password;
         let presence_since = parts.machine.now();
         let session_summary = parts.machine.session_summary();
         let platform = parts.machine.platform();
@@ -847,6 +855,7 @@ impl Worker {
             lifecycle: parts.lifecycle,
             credentials: parts.credentials,
             persister,
+            remember_password,
             session_file: parts.session_file,
             launch: parts.launch,
             clock: parts.clock,
@@ -1042,6 +1051,7 @@ impl Worker {
                         "Your sign-in has expired. Enter your password to continue — your tracked time is kept."
                             .into(),
                     );
+                    s.login_error_kind = Some(LoginErrorKind::Expired);
                     s.push_notice(NoticeKind::SignInExpired, now);
                 });
             }
@@ -1086,15 +1096,13 @@ impl Worker {
         };
         let mut credentials = Credentials::new(account.owner(), None);
         credentials.password = password
-            .filter(|_| self.cfg.credentials.remember_password)
+            .filter(|_| self.remember_password)
             .filter(|p| !p.is_empty())
             .map(str::to_owned);
         if credentials.password.is_none() {
             // Keep a password remembered earlier.
             if let Ok(Some(old)) = self.credentials.load_account(&account.owner()) {
-                credentials.password = old
-                    .password
-                    .filter(|_| self.cfg.credentials.remember_password);
+                credentials.password = old.password.filter(|_| self.remember_password);
             }
         }
         credentials.server_url = Some(account.server.clone());
@@ -1953,7 +1961,13 @@ impl Worker {
                 username,
                 password,
                 server,
-            } => self.sign_in(workspace, username, password, server),
+                remember_password,
+            } => {
+                if let Some(remember) = remember_password {
+                    self.remember_password = remember;
+                }
+                self.sign_in(workspace, username, password, server)
+            }
             Command::ChooseWorkspace { index } => self.choose_workspace(index),
             Command::CancelWorkspaceChoice => self.clear_choices(),
             Command::SwitchWorkspace => self.switch_workspace(),
@@ -1990,8 +2004,54 @@ impl Worker {
                 self.machine.retry_capture_permission();
                 self.refresh_platform();
             }
+            Command::RefreshProjects => {
+                if self
+                    .account
+                    .as_ref()
+                    .is_some_and(|a| a.workspace_id.is_some())
+                    && !self.expired
+                    && !self.credentials_locked
+                {
+                    self.control.send(ControlRequest::RefreshProjects);
+                    self.next_projects_refresh = Instant::now() + PROJECTS_REFRESH;
+                }
+            }
+            Command::PurgeQueue { which } => self.purge_queue(which),
         }
-        self.state.update(|s| s.pending_action = None);
+        // The IPC server waits for this count to know the command applied.
+        self.state.update(|s| {
+            s.pending_action = None;
+            s.commands_handled += 1;
+        });
+    }
+
+    /// Delete the signed-in account's queued rows of `which` kind.
+    fn purge_queue(&mut self, which: PurgeQueue) {
+        let Some(owner) = self.account.as_ref().map(Account::owner) else {
+            return;
+        };
+        let target = match which {
+            PurgeQueue::Pending => PurgeTarget::Pending,
+            PurgeQueue::Parked => PurgeTarget::Parked,
+            PurgeQueue::All => PurgeTarget::All,
+        };
+        match self.store.purge(&owner, target) {
+            Ok(removed) => {
+                tracing::info!(removed, ?which, "queued rows purged on request");
+                if matches!(which, PurgeQueue::Pending | PurgeQueue::All) {
+                    self.unsigned.clear();
+                }
+                if let Err(e) = self.store.reclaim_space() {
+                    tracing::warn!(error = %e, "could not reclaim the purged rows' space");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "could not purge the queue");
+                let message = format!("The queue could not be purged ({e}).");
+                self.state.update(|s| s.last_error = Some(message));
+            }
+        }
+        publish_queue(&self.store, &self.state, Some(&owner));
     }
 
     /// The keyring was unlocked: read the sign-in's secrets again.
@@ -2120,7 +2180,10 @@ impl Worker {
         {
             Ok(typed) => typed,
             Err(e) => {
-                self.state.update(|s| s.login_error = Some(e.to_string()));
+                self.state.update(|s| {
+                    s.login_error = Some(e.to_string());
+                    s.login_error_kind = Some(LoginErrorKind::InvalidServer);
+                });
                 return;
             }
         };
@@ -2134,8 +2197,10 @@ impl Worker {
         let Some(server) =
             typed.or_else(|| self.cfg.effective_api_base_url(saved_server.as_deref()))
         else {
-            self.state
-                .update(|s| s.login_error = Some(NO_SERVER.into()));
+            self.state.update(|s| {
+                s.login_error = Some(NO_SERVER.into());
+                s.login_error_kind = Some(LoginErrorKind::NoServer);
+            });
             return;
         };
         self.clear_choices();
@@ -2147,6 +2212,7 @@ impl Worker {
         self.state.update(|s| {
             s.signing_in = true;
             s.login_error = None;
+            s.login_error_kind = None;
         });
         let account = self.new_account(server, username.trim().to_owned(), password.expose());
         self.control.send(ControlRequest::SignIn(account));
@@ -2166,16 +2232,21 @@ impl Worker {
         let workspaces = match workspaces {
             Ok(workspaces) => workspaces,
             Err(error) => {
-                let message = match &error {
-                    ApiError::Auth(e) => auth_message(e),
-                    ApiError::Offline(_) => auth_message(&AuthError::Offline(String::new())),
-                    other => {
-                        format!("Signed in, but your workspaces could not be loaded ({other}).")
-                    }
+                let (message, kind) = match &error {
+                    ApiError::Auth(e) => (auth_message(e), login_error_kind(e)),
+                    ApiError::Offline(_) => (
+                        auth_message(&AuthError::Offline(String::new())),
+                        LoginErrorKind::Offline,
+                    ),
+                    other => (
+                        format!("Signed in, but your workspaces could not be loaded ({other})."),
+                        LoginErrorKind::Server,
+                    ),
                 };
                 return self.state.update(|s| {
                     s.signing_in = false;
                     s.login_error = Some(message);
+                    s.login_error_kind = Some(kind);
                 });
             }
         };
@@ -2195,6 +2266,7 @@ impl Worker {
             return self.state.update(|s| {
                 s.signing_in = false;
                 s.login_error = Some(ARCHIVED_WORKSPACE.to_owned());
+                s.login_error_kind = Some(LoginErrorKind::ArchivedWorkspace);
             });
         }
         let selectable: Vec<Workspace> = workspaces
@@ -2209,6 +2281,7 @@ impl Worker {
             (None, []) => self.state.update(|s| {
                 s.signing_in = false;
                 s.login_error = Some(NO_WORKSPACE.to_owned());
+                s.login_error_kind = Some(LoginErrorKind::NoWorkspace);
             }),
             (Some(workspace), _) => {
                 let account = account.in_workspace(&workspace.id, &workspace.name);
@@ -2229,6 +2302,7 @@ impl Worker {
         let choices: Vec<WorkspaceChoice> = workspaces
             .iter()
             .map(|w| WorkspaceChoice {
+                id: w.id.clone(),
                 name: w.name.clone(),
                 role: w.role.clone(),
                 is_current: current == Some(w.id.as_str()),
@@ -2504,6 +2578,7 @@ impl Worker {
             s.server_url = server;
             s.signing_in = false;
             s.login_error = None;
+            s.login_error_kind = None;
             s.workspace_lost = None;
         });
         self.expired = false;
@@ -2526,9 +2601,11 @@ impl Worker {
             tracing::warn!(%error, "could not sign in");
         }
         let message = auth_message(error);
+        let kind = login_error_kind(error);
         self.state.update(|s| {
             s.signing_in = false;
             s.login_error = Some(message);
+            s.login_error_kind = Some(kind);
         });
     }
 
@@ -2553,6 +2630,7 @@ impl Worker {
         let message = format!("Your sign-in has expired ({reason}). Enter your password to continue — your tracked time is kept.");
         self.state.update(|s| {
             s.login_error = Some(message);
+            s.login_error_kind = Some(LoginErrorKind::Expired);
             s.push_notice(NoticeKind::SignInExpired, now);
         });
     }
@@ -3332,6 +3410,15 @@ pub fn clean_note(note: &str) -> Option<String> {
     let note: String = collapsed.chars().take(TASK_NOTE_MAX_CHARS).collect();
     let note = note.trim_end();
     (!note.is_empty()).then(|| note.to_string())
+}
+
+/// What kind of failure `error` is, for clients that act on it.
+pub fn login_error_kind(error: &AuthError) -> LoginErrorKind {
+    match error {
+        AuthError::Rejected(_) => LoginErrorKind::Refused,
+        AuthError::Offline(_) => LoginErrorKind::Offline,
+        AuthError::Server(_) => LoginErrorKind::Server,
+    }
 }
 
 /// A sign-in failure, worded for the login form.

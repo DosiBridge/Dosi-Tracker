@@ -2581,6 +2581,47 @@ fn validate_scope_for_status(scope: &OutboxScope) -> Result<(), OutboxStatusErro
     Ok(())
 }
 
+/// `path` with `-wal` appended (SQLite's write-ahead log next to it).
+fn wal_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push("-wal");
+    PathBuf::from(name)
+}
+
+/// `path` as a `file:` URI path, percent-encoding what URIs reserve.
+fn uri_path(path: &Path) -> String {
+    let mut out = String::new();
+    for byte in path.as_os_str().as_encoded_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+/// Open `path` read-only for inspection. Without a pending WAL the file is
+/// complete on its own and is opened `immutable` (no locks, no side files);
+/// with one, a plain read-only open reads its frames through the existing
+/// `-shm`.
+fn open_read_only(path: &Path) -> rusqlite::Result<Connection> {
+    let base = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    if std::fs::symlink_metadata(wal_path(path)).is_ok() {
+        return Connection::open_with_flags(path, base);
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|dir| dir.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let uri = format!("file:{}?mode=ro&immutable=1", uri_path(&absolute));
+    Connection::open_with_flags(uri, base | OpenFlags::SQLITE_OPEN_URI)
+}
+
 fn map_sqlite_open_error(err: rusqlite::Error) -> OutboxStatusError {
     match err {
         rusqlite::Error::SqliteFailure(ffi_err, _) => match ffi_err.code {
@@ -2621,6 +2662,9 @@ fn map_sqlite_query_error(err: rusqlite::Error) -> OutboxStatusError {
 /// - Opens SQLite using `OpenFlags::SQLITE_OPEN_READ_ONLY`.
 /// - Evaluates SQLite WAL mode safely; uncheckpointed WAL frames are read if WAL/SHM
 ///   files are readable, and connection conservatively fails closed if SHM/WAL are unreadable.
+/// - Creates no side files: without a `-wal` file (the store was closed cleanly,
+///   everything is in the main file) the database is opened `immutable`, so
+///   SQLite does not create `-wal`/`-shm` for the reader.
 /// - Strictly bounded work budget: evaluates at most [`MAX_STATUS_ROW_BOUND`] records
 ///   and [`DEFAULT_MAX_SQLITE_WORK_STEPS`] SQLite virtual machine execution steps,
 ///   rejecting overflows without returning partial successful counts.
@@ -2682,9 +2726,9 @@ pub fn inspect_outbox_status_instrumented(
     // 4. Validate scope strictly with allowlisted categories
     validate_scope_for_status(scope)?;
 
-    // 5. Open connection strictly READ-ONLY
-    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let conn = Connection::open_with_flags(db_path, flags).map_err(map_sqlite_open_error)?;
+    // 5. Open connection strictly READ-ONLY (immutable when no WAL is pending,
+    // so the reader leaves no -wal/-shm behind).
+    let conn = open_read_only(db_path).map_err(map_sqlite_open_error)?;
 
     // 6. Install finite execution work budget handler covering all validation and summary queries
     let progress_ctx = ProgressContext {

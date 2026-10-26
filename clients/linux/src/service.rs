@@ -590,6 +590,12 @@ pub struct SessionStartContext<'a> {
     pub systemctl: &'a Systemctl,
 }
 
+/// Tells the daemon it was started by the login hook (`DOSI_LAUNCH=login`,
+/// in the env file and for the detached spawn): tracking then resumes by
+/// itself only as `tracking.resume_at_login` and the indicators allow.
+pub const LAUNCH_VAR: &str = "DOSI_LAUNCH";
+pub const LAUNCH_AT_LOGIN: &str = "login";
+
 /// The autostart hook (design 3.1): write the session env file, then start
 /// (or, when `XDG_SESSION_ID` changed, restart) the unit; without a user
 /// manager or a loadable unit, spawn `dosi-tracker daemon --detach`.
@@ -605,7 +611,8 @@ pub fn session_start(ctx: &SessionStartContext<'_>) -> Result<SessionStart, Serv
         .ok()
         .flatten()
         .and_then(|text| session_id_in_env_file(&text));
-    let contents = render_session_env(&ctx.session_vars)?;
+    let mut contents = render_session_env(&ctx.session_vars)?;
+    contents.push_str(&format!("{LAUNCH_VAR}=\"{LAUNCH_AT_LOGIN}\"\n"));
     crate::paths::write_private_atomic(&env_file, contents.as_bytes())?;
 
     let systemctl = ctx.systemctl;
@@ -655,6 +662,7 @@ fn spawn_detached(ctx: &SessionStartContext<'_>) -> Result<u32, ServiceError> {
             "XDG_STATE_HOME",
             ctx.paths.state_dir.parent().unwrap_or(&ctx.paths.state_dir),
         )
+        .env(LAUNCH_VAR, LAUNCH_AT_LOGIN)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
