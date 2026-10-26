@@ -45,7 +45,15 @@ jobs:
     timeout-minutes: 5
     outputs:
       version: ${{ steps.resolve.outputs.version }}
+      is_latest: ${{ steps.latest.outputs.is_latest }}
     steps:
+      # Full tag history, so "is this the highest released version" (below) can see every release, not just the
+      # ref this run happens to be on.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
       # The tag push (vX.Y.Z) is the normal path; workflow_dispatch's input is for a
       # manual re-run (e.g. re-signing, or a GHCR-only re-push) against a chosen ref.
       - name: From the tag or the dispatch input
@@ -65,6 +73,15 @@ jobs:
           esac
           echo "Releasing ${version}"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      # Gates the `images` job's `:latest` tag (see is-latest-release.sh): a workflow_dispatch re-run against an
+      # older version (the comment above documents that path as supported) must not win the floating `:latest` tag
+      # away from a version that shipped after it.
+      - name: Is this the latest release?
+        id: latest
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: echo "is_latest=$(bash .github/scripts/is-latest-release.sh)" >> "$GITHUB_OUTPUT"
 
   windows:
     name: Windows installer
@@ -316,6 +333,7 @@ jobs:
       packages: write
     env:
       VERSION: ${{ needs.version.outputs.version }}
+      IS_LATEST: ${{ needs.version.outputs.is_latest }}
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
@@ -327,15 +345,33 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Only the highest released version also gets the floating `:latest` tag (needs.version resolved that with
+      # is-latest-release.sh). Docker tags have no version ordering, so a workflow_dispatch re-run against an older
+      # version (the `version` job's own comment documents that as a supported path, e.g. to re-sign the Windows
+      # installer) must keep `:latest` pointed at whatever actually shipped last, not silently regress it.
+      - name: Resolve image tags
+        id: tags
+        run: |
+          for name in migrator api web; do
+            image="${REGISTRY}/${IMAGE_OWNER}/dosi-tracker-${name}"
+            tags="${image}:${VERSION}"
+            if [[ "${IS_LATEST}" == "true" ]]; then
+              tags+=$'\n'"${image}:latest"
+            fi
+            {
+              echo "${name}<<TAGS_EOF"
+              echo "${tags}"
+              echo "TAGS_EOF"
+            } >> "$GITHUB_OUTPUT"
+          done
+
       - name: Build & push the migrator image
         uses: docker/build-push-action@v7
         with:
           context: backend
           file: backend/src/Dosi.Tracker.DbMigrator/Dockerfile
           push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/dosi-tracker-migrator:${{ env.VERSION }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/dosi-tracker-migrator:latest
+          tags: ${{ steps.tags.outputs.migrator }}
           cache-from: type=gha,scope=migrator
           cache-to: type=gha,mode=max,scope=migrator
 
@@ -345,9 +381,7 @@ jobs:
           context: backend
           file: backend/src/Dosi.Tracker.HttpApi.Host/Dockerfile
           push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/dosi-tracker-api:${{ env.VERSION }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/dosi-tracker-api:latest
+          tags: ${{ steps.tags.outputs.api }}
           cache-from: type=gha,scope=api
           cache-to: type=gha,mode=max,scope=api
 
@@ -357,9 +391,7 @@ jobs:
           context: frontend
           file: frontend/Dockerfile
           push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/dosi-tracker-web:${{ env.VERSION }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/dosi-tracker-web:latest
+          tags: ${{ steps.tags.outputs.web }}
           cache-from: type=gha,scope=web
           cache-to: type=gha,mode=max,scope=web
 

@@ -48,6 +48,19 @@ jobs:
             -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' \
             "${GITLEAKS_IMAGE}" git /repo --config /repo/.github/gitleaks.toml --redact --no-banner --verbose
 
+  release-scripts:
+    name: Release workflow helper scripts (unit tests)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      # .github/scripts/is-latest-release.sh decides whether a release workflow run also tags the GHCR images
+      # `:latest` (release.yml's `images` job); exercised here against synthetic tag histories so a regression in
+      # that logic fails CI on every PR, not only during a real release.
+      - name: is-latest-release.sh
+        run: bash .github/scripts/test-is-latest-release.sh
+
   backend:
     name: Backend build, tests & coverage gate
     runs-on: ubuntu-24.04
