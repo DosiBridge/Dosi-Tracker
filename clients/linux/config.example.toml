@@ -1,0 +1,77 @@
+# Dosi Tracker configuration (example).
+#
+# Layers, lowest first; a later layer overrides an earlier one:
+#   1. built-in defaults (the values shown below, except the URLs)
+#   2. /etc/dosi-tracker/config.toml          (administrators, config management)
+#   3. ~/.config/dosi-tracker/config.toml     ($XDG_CONFIG_HOME; 0600, yours only)
+#   4. DOSI__* environment variables, e.g. DOSI__API_BASE_URL=https://...,
+#      DOSI__CAPTURE__SCREENSHOT=false
+#
+# The [capture] switches only restrict: a layer that sets one to false cannot
+# be overridden by a later layer. blur_screenshots only adds: true in any
+# layer blurs. Neither grants anything; what is recorded is always your
+# consent (dosi-tracker consent grant) AND the workspace's project policy AND
+# these switches AND what your desktop can provide.
+#
+# Change your own file with `dosi-tracker config set KEY VALUE` (validated,
+# written atomically as 0600); `dosi-tracker config show` prints the effective
+# values and any problem found in a file. The agent reads its configuration
+# when it starts: run `dosi-tracker service restart` after a change.
+
+# The Dosi Tracker server. There is no built-in default. A bare host gets
+# https://; credentials, a query or a fragment are refused.
+api_base_url = "https://tracker.example.com"
+
+# The web dashboard (`dosi-tracker open dashboard`).
+dashboard_url = "https://app.example.com"
+
+# Length of one tracked block, in minutes (clamped to 5..60).
+interval_minutes = 10
+
+# Allow a plain http:// server that is not on this computer. Off by default:
+# only https:// and loopback http:// are accepted otherwise.
+allow_insecure_http = false
+
+[capture]
+# Local restrictions only (see above).
+screenshot = true
+keyboard = true
+mouse = true
+active_window = true
+running_programs = true
+blur_screenshots = false
+
+[credentials]
+# auto: the Secret Service (GNOME Keyring, KWallet, KeePassXC); without one,
+#       signing in fails with a hint instead of falling back to a file.
+# secret-service: always the Secret Service.
+# file: an owner-only 0600 file in ~/.local/share/dosi-tracker holding the
+#       refresh token (never the password). Explicit opt-in; doctor warns.
+store = "auto"
+# Also keep the password in the keyring item (never in a file). The agent
+# never signs in again with it by itself: an expired sign-in always asks.
+remember_password = true
+
+[tracking]
+# Resume tracking by itself when the agent starts at login (only when a
+# notification server can show that it is tracking).
+resume_at_login = true
+# Without an idle source (manual mode), pause after this many hours (1..24).
+manual_max_hours = 10
+
+[notifications]
+enabled = true
+
+[gui]
+# auto: X11 when DISPLAY is set, else Wayland. Also DOSI_GUI_BACKEND or
+# dosi-tracker-gui --backend.
+backend = "auto"
+open_window_at_login = false
+# Goals shown in the window (hours 1..24, days 1..7).
+daily_goal_hours = 8
+work_days_per_week = 5
+
+[log]
+# error, warn, info, debug or trace. Logs never contain window titles, program
+# names, tokens or passwords.
+level = "info"

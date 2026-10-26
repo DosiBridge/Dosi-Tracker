@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Copyright DosiBridge -->
+<component type="desktop-application">
+  <id>io.github.dosibridge.DosiTracker</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+
+  <name>Dosi Tracker</name>
+  <summary>Record working time and, with your consent, activity for your team's workspace</summary>
+
+  <description>
+    <p>
+      Dosi Tracker is the Linux agent of a team time-tracking service. It is
+      workplace monitoring software: while you track time on a project, it
+      records your working time in blocks and uploads them, together with
+      whatever activity details you agreed to, to the Dosi Tracker server of
+      the workspace you signed in to. The workspace owner and admins can see
+      that data in their dashboard.
+    </p>
+    <p>
+      Nothing is recorded until you sign in, choose a project and give your
+      consent on this computer. Each kind of detail is a separate choice that
+      you can withdraw at any time, also without a network connection:
+    </p>
+    <ul>
+      <li>keyboard and mouse activity as counts per minute (never which keys or buttons);</li>
+      <li>the name and title of the active window, and which of your programs are running;</li>
+      <li>screenshots of your screen, optionally blurred.</li>
+    </ul>
+    <p>Dosi Tracker never collects:</p>
+    <ul>
+      <li>what you type: no keystrokes, key codes, text or passwords;</li>
+      <li>the clipboard, your files or your browser history;</li>
+      <li>webcam pictures or audio (the webcam is not available on Linux in this version);</li>
+      <li>anything while tracking is paused, the screen is locked or you are signed out.</li>
+    </ul>
+    <p>
+      It runs as your user, never as root, and needs no input-device access.
+      On Wayland, keyboard and mouse counts and the active window are not
+      available and are reported as not measured, never as zero. Screenshots on
+      Wayland go through the desktop's screenshot permission.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">io.github.dosibridge.DosiTracker.desktop</launchable>
+
+  <url type="homepage">https://github.com/DosiBridge/Dosi-Tracker</url>
+  <url type="bugtracker">https://github.com/DosiBridge/Dosi-Tracker/issues</url>
+  <url type="help">https://github.com/DosiBridge/Dosi-Tracker/tree/main/clients/linux#readme</url>
+
+  <developer_name>DosiBridge</developer_name>
+
+  <provides>
+    <binary>dosi-tracker</binary>
+    <binary>dosi-tracker-gui</binary>
+  </provides>
+
+  <keywords>
+    <keyword>time tracking</keyword>
+    <keyword>timesheet</keyword>
+    <keyword>work hours</keyword>
+  </keywords>
+
+  <content_rating type="oars-1.1">
+    <content_attribute id="social-info">intense</content_attribute>
+  </content_rating>
+
+  <releases>
+    <release version="0.1.0" date="2026-10-26">
+      <description>
+        <p>First release of the Linux agent.</p>
+        <ul>
+          <li>Background agent with a systemd user service, a tray icon and a window.</li>
+          <li>Command line with JSON output for every action.</li>
+          <li>Per-capability consent on this computer; unmeasured values are sent as not measured.</li>
+          <li>Offline queue that uploads when the server is reachable again.</li>
+          <li>Packages for Ubuntu, Debian and Fedora, and a tarball that installs without root.</li>
+        </ul>
+      </description>
+    </release>
+  </releases>
+</component>

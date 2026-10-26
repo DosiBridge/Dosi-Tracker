@@ -82,6 +82,90 @@ libc = "0.2"
 tempfile = "3"
 proptest = "1"
 
+# Packages (design 15.1/15.2). Built by `bash ci/check.sh package` from the
+# release binaries plus the files packaging/build-dist.sh renders into
+# target/release/dist-assets (both tools map `target/release/` to the real
+# target directory). No maintainer scripts: the user unit and the desktop
+# files are installed, never enabled, and nothing goes to /etc/xdg/autostart.
+[package.metadata.deb]
+name = "dosi-tracker"
+maintainer = "DosiBridge <https://github.com/DosiBridge/Dosi-Tracker/issues>"
+copyright = "DosiBridge"
+section = "utils"
+priority = "optional"
+revision = "1"
+extended-description = """Per-user agent of the Dosi Tracker team time-tracking service: a background agent (systemd user service), a command line, a tray icon and a window. It records working time and, only with the user's consent on this computer, keyboard and mouse counts, the active window, running programs and screenshots, and uploads them to the workspace's server. It never records keystrokes, the clipboard or the webcam, and never runs as root."""
+depends = "$auto"
+recommends = "libegl1 | libgl1, libxkbcommon-x11-0, libxcursor1, libxrandr2, libxi6, libx11-xcb1, xdg-desktop-portal, gnome-keyring | kwalletmanager | keepassxc, ca-certificates"
+suggests = "gnome-shell-extension-appindicator"
+assets = [
+    ["target/release/dosi-tracker", "usr/bin/dosi-tracker", "755"],
+    ["target/release/dosi-tracker-gui", "usr/bin/dosi-tracker-gui", "755"],
+    ["target/release/dist-assets/usr/dosi-tracker.service", "usr/lib/systemd/user/dosi-tracker.service", "644"],
+    ["target/release/dist-assets/usr/io.github.dosibridge.DosiTracker.desktop", "usr/share/applications/io.github.dosibridge.DosiTracker.desktop", "644"],
+    ["packaging/metainfo/io.github.dosibridge.DosiTracker.metainfo.xml", "usr/share/metainfo/io.github.dosibridge.DosiTracker.metainfo.xml", "644"],
+    ["packaging/icons/hicolor/scalable/apps/io.github.dosibridge.DosiTracker.svg", "usr/share/icons/hicolor/scalable/apps/io.github.dosibridge.DosiTracker.svg", "644"],
+    ["packaging/icons/hicolor/16x16/apps/io.github.dosibridge.DosiTracker.png", "usr/share/icons/hicolor/16x16/apps/io.github.dosibridge.DosiTracker.png", "644"],
+    ["packaging/icons/hicolor/22x22/apps/io.github.dosibridge.DosiTracker.png", "usr/share/icons/hicolor/22x22/apps/io.github.dosibridge.DosiTracker.png", "644"],
+    ["packaging/icons/hicolor/24x24/apps/io.github.dosibridge.DosiTracker.png", "usr/share/icons/hicolor/24x24/apps/io.github.dosibridge.DosiTracker.png", "644"],
+    ["packaging/icons/hicolor/32x32/apps/io.github.dosibridge.DosiTracker.png", "usr/share/icons/hicolor/32x32/apps/io.github.dosibridge.DosiTracker.png", "644"],
+    ["packaging/icons/hicolor/48x48/apps/io.github.dosibridge.DosiTracker.png", "usr/share/icons/hicolor/48x48/apps/io.github.dosibridge.DosiTracker.png", "644"],
+    ["packaging/icons/hicolor/64x64/apps/io.github.dosibridge.DosiTracker.png", "usr/share/icons/hicolor/64x64/apps/io.github.dosibridge.DosiTracker.png", "644"],
+    ["packaging/icons/hicolor/128x128/apps/io.github.dosibridge.DosiTracker.png", "usr/share/icons/hicolor/128x128/apps/io.github.dosibridge.DosiTracker.png", "644"],
+    ["packaging/icons/hicolor/256x256/apps/io.github.dosibridge.DosiTracker.png", "usr/share/icons/hicolor/256x256/apps/io.github.dosibridge.DosiTracker.png", "644"],
+    ["packaging/icons/hicolor/512x512/apps/io.github.dosibridge.DosiTracker.png", "usr/share/icons/hicolor/512x512/apps/io.github.dosibridge.DosiTracker.png", "644"],
+    ["target/release/dist-assets/completions/dosi-tracker.bash", "usr/share/bash-completion/completions/dosi-tracker", "644"],
+    ["target/release/dist-assets/completions/_dosi-tracker", "usr/share/zsh/vendor-completions/_dosi-tracker", "644"],
+    ["target/release/dist-assets/completions/dosi-tracker.fish", "usr/share/fish/vendor_completions.d/dosi-tracker.fish", "644"],
+    ["README.md", "usr/share/doc/dosi-tracker/README.md", "644"],
+    ["config.example.toml", "usr/share/doc/dosi-tracker/config.example.toml", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "dosi-tracker"
+release = "1"
+summary = "Dosi Tracker per-user time-tracking agent (daemon, CLI, tray, window)"
+description = "Per-user agent of the Dosi Tracker team time-tracking service: a background agent (systemd user service), a command line, a tray icon and a window. It records working time and, only with the user's consent on this computer, keyboard and mouse counts, the active window, running programs and screenshots, and uploads them to the workspace's server. It never records keystrokes, the clipboard or the webcam, and never runs as root."
+url = "https://github.com/DosiBridge/Dosi-Tracker"
+assets = [
+    { source = "target/release/dosi-tracker", dest = "/usr/bin/dosi-tracker", mode = "755" },
+    { source = "target/release/dosi-tracker-gui", dest = "/usr/bin/dosi-tracker-gui", mode = "755" },
+    { source = "target/release/dist-assets/usr/dosi-tracker.service", dest = "/usr/lib/systemd/user/dosi-tracker.service", mode = "644" },
+    { source = "target/release/dist-assets/usr/io.github.dosibridge.DosiTracker.desktop", dest = "/usr/share/applications/io.github.dosibridge.DosiTracker.desktop", mode = "644" },
+    { source = "packaging/metainfo/io.github.dosibridge.DosiTracker.metainfo.xml", dest = "/usr/share/metainfo/io.github.dosibridge.DosiTracker.metainfo.xml", mode = "644" },
+    { source = "packaging/icons/hicolor/scalable/apps/io.github.dosibridge.DosiTracker.svg", dest = "/usr/share/icons/hicolor/scalable/apps/io.github.dosibridge.DosiTracker.svg", mode = "644" },
+    { source = "packaging/icons/hicolor/16x16/apps/io.github.dosibridge.DosiTracker.png", dest = "/usr/share/icons/hicolor/16x16/apps/io.github.dosibridge.DosiTracker.png", mode = "644" },
+    { source = "packaging/icons/hicolor/22x22/apps/io.github.dosibridge.DosiTracker.png", dest = "/usr/share/icons/hicolor/22x22/apps/io.github.dosibridge.DosiTracker.png", mode = "644" },
+    { source = "packaging/icons/hicolor/24x24/apps/io.github.dosibridge.DosiTracker.png", dest = "/usr/share/icons/hicolor/24x24/apps/io.github.dosibridge.DosiTracker.png", mode = "644" },
+    { source = "packaging/icons/hicolor/32x32/apps/io.github.dosibridge.DosiTracker.png", dest = "/usr/share/icons/hicolor/32x32/apps/io.github.dosibridge.DosiTracker.png", mode = "644" },
+    { source = "packaging/icons/hicolor/48x48/apps/io.github.dosibridge.DosiTracker.png", dest = "/usr/share/icons/hicolor/48x48/apps/io.github.dosibridge.DosiTracker.png", mode = "644" },
+    { source = "packaging/icons/hicolor/64x64/apps/io.github.dosibridge.DosiTracker.png", dest = "/usr/share/icons/hicolor/64x64/apps/io.github.dosibridge.DosiTracker.png", mode = "644" },
+    { source = "packaging/icons/hicolor/128x128/apps/io.github.dosibridge.DosiTracker.png", dest = "/usr/share/icons/hicolor/128x128/apps/io.github.dosibridge.DosiTracker.png", mode = "644" },
+    { source = "packaging/icons/hicolor/256x256/apps/io.github.dosibridge.DosiTracker.png", dest = "/usr/share/icons/hicolor/256x256/apps/io.github.dosibridge.DosiTracker.png", mode = "644" },
+    { source = "packaging/icons/hicolor/512x512/apps/io.github.dosibridge.DosiTracker.png", dest = "/usr/share/icons/hicolor/512x512/apps/io.github.dosibridge.DosiTracker.png", mode = "644" },
+    { source = "target/release/dist-assets/completions/dosi-tracker.bash", dest = "/usr/share/bash-completion/completions/dosi-tracker", mode = "644" },
+    { source = "target/release/dist-assets/completions/_dosi-tracker", dest = "/usr/share/zsh/site-functions/_dosi-tracker", mode = "644" },
+    { source = "target/release/dist-assets/completions/dosi-tracker.fish", dest = "/usr/share/fish/vendor_completions.d/dosi-tracker.fish", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/dosi-tracker/README.md", mode = "644" },
+    { source = "config.example.toml", dest = "/usr/share/doc/dosi-tracker/config.example.toml", mode = "644" },
+]
+
+[package.metadata.generate-rpm.recommends]
+mesa-libEGL = "*"
+libxkbcommon-x11 = "*"
+libXcursor = "*"
+libXrandr = "*"
+libXi = "*"
+xdg-desktop-portal = "*"
+gnome-keyring = "*"
+
+# Test builds encode screenshots (JPEG ladder, thumbnail, blur) within the same
+# bounded time as release builds (3 s for the capture at a block's end);
+# unoptimized image code is about ten times slower and made the Xvfb harness
+# flaky under load. Release builds are unaffected.
+[profile.dev.package.image]
+opt-level = 3
+
 [profile.release]
 opt-level = 3
 lto = true
