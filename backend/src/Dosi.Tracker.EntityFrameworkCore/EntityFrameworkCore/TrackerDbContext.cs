@@ -24,6 +24,7 @@ using Dosi.Tracker.Activities;
 using Dosi.Tracker.Devices;
 using Dosi.Tracker.Presence;
 using Dosi.Tracker.Erasure;
+using Dosi.Tracker.AiAssist;
 using Microsoft.AspNetCore.DataProtection.EntityFrameworkCore;
 
 namespace Dosi.Tracker.EntityFrameworkCore;
@@ -46,6 +47,8 @@ public class TrackerDbContext :
     public DbSet<DeviceRevocation> DeviceRevocations { get; set; }
     public DbSet<ActivityErasure> ActivityErasures { get; set; }
     public DbSet<AccountErasure> AccountErasures { get; set; }
+    public DbSet<AiUsageRecord> AiUsageRecords { get; set; }
+    public DbSet<AiConsentEvent> AiConsentEvents { get; set; }
 
     /// <summary>ASP.NET Core Data Protection keys (sign-in cookies, antiforgery and password-reset tokens), kept here so
     /// they survive restarts and are shared by every API instance.</summary>
@@ -260,6 +263,38 @@ public class TrackerDbContext :
             b.ConfigureByConvention();
             b.HasIndex(x => x.UserId);
             b.HasIndex(x => x.CompletedTime);
+        });
+
+        builder.Entity<AiUsageRecord>(b =>
+        {
+            b.ToTable(TrackerConsts.DbTablePrefix + "AiUsageRecords", TrackerConsts.DbSchema);
+            b.ConfigureByConvention();
+            b.Property(x => x.FeatureId).IsRequired().HasMaxLength(AiUsageRecord.MaxFeatureIdLength);
+            b.Property(x => x.PromptVersion).IsRequired().HasMaxLength(AiUsageRecord.MaxPromptVersionLength);
+            b.Property(x => x.Audience).IsRequired().HasMaxLength(AiUsageRecord.MaxAudienceLength);
+            b.Property(x => x.DataCategories).IsRequired().HasMaxLength(AiUsageRecord.MaxDataCategoriesLength);
+            b.Property(x => x.Provider).IsRequired().HasMaxLength(AiUsageRecord.MaxProviderLength);
+            b.Property(x => x.Model).HasMaxLength(AiUsageRecord.MaxModelLength);
+            b.Property(x => x.Outcome).IsRequired().HasMaxLength(AiUsageRecord.MaxOutcomeLength);
+            b.Property(x => x.ErrorCode).HasMaxLength(AiUsageRecord.MaxErrorCodeLength);
+            b.Property(x => x.ToolCalls).HasMaxLength(AiUsageRecord.MaxToolCallsLength);
+            b.Property(x => x.FeedbackRating).HasMaxLength(AiUsageRecord.MaxFeedbackRatingLength);
+            b.Property(x => x.FeedbackReason).HasMaxLength(AiUsageRecord.MaxFeedbackReasonLength);
+            b.Property(x => x.EstimatedCostUsd).HasPrecision(18, 6);
+            // The workspace's monthly allowance and usage view; the member's per-minute and daily limits; the retention sweep.
+            b.HasIndex(x => new { x.WorkspaceId, x.CreationTime });
+            b.HasIndex(x => new { x.WorkspaceId, x.UserId, x.CreationTime });
+            b.HasIndex(x => x.CreationTime);
+        });
+
+        builder.Entity<AiConsentEvent>(b =>
+        {
+            b.ToTable(TrackerConsts.DbTablePrefix + "AiConsentEvents", TrackerConsts.DbSchema);
+            b.ConfigureByConvention();
+            b.Property(x => x.Action).IsRequired().HasMaxLength(AiConsentEvent.MaxActionLength);
+            b.Property(x => x.DisclosureVersion).IsRequired().HasMaxLength(AiConsentEvent.MaxDisclosureVersionLength);
+            b.Property(x => x.Flags).IsRequired().HasMaxLength(AiConsentEvent.MaxFlagsLength);
+            b.HasIndex(x => new { x.WorkspaceId, x.CreationTime });
         });
 
         builder.Entity<DataProtectionKey>(b =>

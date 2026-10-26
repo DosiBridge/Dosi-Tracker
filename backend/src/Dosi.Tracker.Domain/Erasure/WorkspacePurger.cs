@@ -3,6 +3,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Dosi.Tracker.Activities;
+using Dosi.Tracker.AiAssist;
 using Dosi.Tracker.Devices;
 using Dosi.Tracker.Notifications;
 using Dosi.Tracker.Presence;
@@ -20,10 +21,11 @@ namespace Dosi.Tracker.Erasure;
 
 /// <summary>
 /// Purges a deleted workspace's data: its captures and their files, its tracked time and the records of deletions, its
-/// projects (with tasks, members and rates), presence, device revocations, notifications, invitations, settings and
-/// memberships. Its subscription (canceled at deletion) and its invoices stay as the platform's accounting records; the
-/// workspace row stays too, without its name (<see cref="Workspace.MarkPurged"/>). Idempotent and resumable: a file that
-/// cannot be deleted keeps its capture, and the workspace counts as purged only once nothing of it is left.
+/// projects (with tasks, members and rates), presence, device revocations, notifications, the AI usage ledger and the AI
+/// consent history, invitations, settings and memberships. Its subscription (canceled at deletion) and its invoices stay
+/// as the platform's accounting records; the workspace row stays too, without its name (<see cref="Workspace.MarkPurged"/>).
+/// Idempotent and resumable: a file that cannot be deleted keeps its capture, and the workspace counts as purged only once
+/// nothing of it is left.
 /// </summary>
 public class WorkspacePurger : TrackerDomainService
 {
@@ -128,6 +130,8 @@ public class WorkspacePurger : TrackerDomainService
         await Repository<AgentPresence>().DeleteDirectAsync(p => p.WorkspaceId == workspaceId, cancellationToken);
         await Repository<DeviceRevocation>().DeleteDirectAsync(r => r.WorkspaceId == workspaceId, cancellationToken);
         await Repository<Notification>().DeleteDirectAsync(n => n.WorkspaceId == workspaceId, cancellationToken);
+        await Repository<AiUsageRecord>().DeleteDirectAsync(r => r.WorkspaceId == workspaceId, cancellationToken);
+        await Repository<AiConsentEvent>().DeleteDirectAsync(e => e.WorkspaceId == workspaceId, cancellationToken);
         await Repository<WorkspaceInvitation>().DeleteDirectAsync(i => i.WorkspaceId == workspaceId, cancellationToken);
         await Repository<ProjectTask>().DeleteDirectAsync(t => t.WorkspaceId == workspaceId, cancellationToken);
         await Repository<ProjectMemberRate>().DeleteDirectAsync(r => r.WorkspaceId == workspaceId, cancellationToken);

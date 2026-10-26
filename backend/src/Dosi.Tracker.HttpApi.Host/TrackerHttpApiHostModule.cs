@@ -609,6 +609,10 @@ public class TrackerHttpApiHostModule : AbpModule
         // Built now, so the AI provider's state is logged at start-up (and a configured key is read only once).
         context.ServiceProvider.GetRequiredService<IAiChatClientProvider>();
 
+        // Deletes AI usage-ledger rows past AI:Usage:RetentionDays, daily (whether or not AI assist is on now: rows from
+        // when it was must still expire).
+        await context.AddBackgroundWorkerAsync<AiUsageRetentionWorker>();
+
         // Trials and invoices exist only on a deployment that bills (Billing:Enabled; off by default).
         if (context.ServiceProvider.GetRequiredService<IOptions<BillingOptions>>().Value.Enabled)
         {

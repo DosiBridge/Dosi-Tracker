@@ -24,6 +24,15 @@ public class TrackerSettingDefinitionProvider : SettingDefinitionProvider
             WorkspaceSetting(TrackerSettings.Workspace.CaptureRetention.RetentionDays, defaultValue: null),
             WorkspaceSetting(TrackerSettings.Workspace.ActivityRetention.IsEnabled, defaultValue: null),
             WorkspaceSetting(TrackerSettings.Workspace.ActivityRetention.RetentionDays, defaultValue: null),
+            WorkspaceOnlySetting(TrackerSettings.Workspace.Ai.IsEnabled, SettingValueFormat.Write(false)),
+            WorkspaceOnlySetting(TrackerSettings.Workspace.Ai.AllowManagers, SettingValueFormat.Write(true)),
+            WorkspaceOnlySetting(TrackerSettings.Workspace.Ai.AllowMemberSelfService, SettingValueFormat.Write(true)),
+            WorkspaceOnlySetting(TrackerSettings.Workspace.Ai.AllowWindowTitles, SettingValueFormat.Write(false)),
+            WorkspaceOnlySetting(TrackerSettings.Workspace.Ai.AllowNotes, SettingValueFormat.Write(false)),
+            WorkspaceOnlySetting(TrackerSettings.Workspace.Ai.ConsentVersion, defaultValue: null),
+            WorkspaceOnlySetting(TrackerSettings.Workspace.Ai.EnabledAt, defaultValue: null),
+            WorkspaceOnlySetting(TrackerSettings.Workspace.Ai.EnabledBy, defaultValue: null),
+            GlobalOnlySetting(TrackerSettings.Platform.AiEnabled, SettingValueFormat.Write(true)),
             new SettingDefinition(TrackerSettings.User.TimeZone)
                 .WithProviders(DefaultValueSettingValueProvider.ProviderName, UserSettingValueProvider.ProviderName));
     }
@@ -37,5 +46,22 @@ public class TrackerSettingDefinitionProvider : SettingDefinitionProvider
             ConfigurationSettingValueProvider.ProviderName,
             GlobalSettingValueProvider.ProviderName,
             WorkspaceSettingValueProvider.ProviderName);
+    }
+
+    /// <summary>A setting only the workspace itself can set: a global or configured value never applies to it (AI assist
+    /// must never be switched on for a workspace by anyone but its owner).</summary>
+    private static SettingDefinition WorkspaceOnlySetting(string name, string? defaultValue)
+    {
+        return new SettingDefinition(name, defaultValue).WithProviders(
+            DefaultValueSettingValueProvider.ProviderName,
+            WorkspaceSettingValueProvider.ProviderName);
+    }
+
+    /// <summary>A platform-wide setting the platform administrators set at run time (never per workspace or user).</summary>
+    private static SettingDefinition GlobalOnlySetting(string name, string? defaultValue)
+    {
+        return new SettingDefinition(name, defaultValue).WithProviders(
+            DefaultValueSettingValueProvider.ProviderName,
+            GlobalSettingValueProvider.ProviderName);
     }
 }

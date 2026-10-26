@@ -8,6 +8,7 @@ using Dosi.Tracker.Activities;
 using Dosi.Tracker.Billing;
 using Dosi.Tracker.Erasure;
 using Dosi.Tracker.Notifications;
+using Dosi.Tracker.AiAssist;
 using Dosi.Tracker.Presence;
 using Dosi.Tracker.Projects;
 using Dosi.Tracker.SaaS;
@@ -126,6 +127,11 @@ public class WorkspaceDeletionHttpTests : WorkspaceHttpTestBase<TrackerHttpApiSe
                     new AgentPresence(_guidGenerator.Create(), workspaceId, Member, Guid.NewGuid(), "active", _clock.Now), autoSave: true);
                 await GetRequiredService<IRepository<Notification, Guid>>()
                     .InsertAsync(new Notification(_guidGenerator.Create(), workspaceId, Owner, "Hello"), autoSave: true);
+                await GetRequiredService<IRepository<AiUsageRecord, Guid>>().InsertAsync(new AiUsageRecord(
+                    _guidGenerator.Create(), workspaceId, Owner, AiFeatureIds.PeriodSummaryId, "period-summary.v1",
+                    AiUsageRecord.TeamAudience, AiOptions.ProviderOpenAi, "gpt-5.4-mini", AiUsageOutcomes.Generated), autoSave: true);
+                await GetRequiredService<IRepository<AiConsentEvent, Guid>>().InsertAsync(new AiConsentEvent(
+                    _guidGenerator.Create(), workspaceId, Owner, AiConsentEvent.EnabledAction, "1.0", "managers=1"), autoSave: true);
                 await GetRequiredService<WorkspaceSettingsManager>().SetMemberCaptureDeleteMinutesAsync(15);
                 await GetRequiredService<IRepository<WorkspaceInvitation, Guid>>().InsertAsync(new WorkspaceInvitation(
                     _guidGenerator.Create(), workspaceId, "invitee@acme.test", WorkspaceRoles.Member, null, null, null,
@@ -255,6 +261,8 @@ public class WorkspaceDeletionHttpTests : WorkspaceHttpTestBase<TrackerHttpApiSe
         (await CountAsync<WorkspaceMember>(m => m.WorkspaceId == id)).ShouldBe(0);
         (await CountAsync<AgentPresence>(p => p.WorkspaceId == id)).ShouldBe(0);
         (await CountAsync<Notification>(n => n.WorkspaceId == id)).ShouldBe(0);
+        (await CountAsync<AiUsageRecord>(r => r.WorkspaceId == id)).ShouldBe(0);
+        (await CountAsync<AiConsentEvent>(e => e.WorkspaceId == id)).ShouldBe(0);
         (await WithUnitOfWorkAsync(() => GetRequiredService<ISettingRepository>()
             .GetListAsync(WorkspaceSettingValueProvider.ProviderName, id.ToString()))).ShouldBeEmpty();
         (await CountAsync<Invoice>(i => i.WorkspaceId == id)).ShouldBe(1); // accounting records stay
@@ -267,6 +275,8 @@ public class WorkspaceDeletionHttpTests : WorkspaceHttpTestBase<TrackerHttpApiSe
         (await CountAsync<Screenshot>(s => s.WorkspaceId == keptId)).ShouldBe(2);
         (await CountAsync<Activity>(a => a.WorkspaceId == keptId)).ShouldBe(1);
         (await CountAsync<WorkspaceMember>(m => m.WorkspaceId == keptId)).ShouldBe(3);
+        (await CountAsync<AiUsageRecord>(r => r.WorkspaceId == keptId)).ShouldBe(1);
+        (await CountAsync<AiConsentEvent>(e => e.WorkspaceId == keptId)).ShouldBe(1);
         (await NewWorker(graceDays: 0).SweepAsync(ServiceProvider)).WorkspacesPurged.ShouldBe(0);
     }
 
