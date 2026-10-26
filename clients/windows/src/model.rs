@@ -154,8 +154,14 @@ pub struct Activity {
     /// an older server stores its default instead of rejecting a null.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub productivity: Option<u8>,
-    pub mouse_clicks: u64,
-    pub keyboard_hits: u64,
+    /// Clicks / key presses in the block. `None` (sent as `null`) = not
+    /// measured: the project or the local consent does not record that kind
+    /// of input, or capture was unavailable for part of the block. `0` only
+    /// when measured as zero (CONTRACT: nullable counts).
+    #[serde(default)]
+    pub mouse_clicks: Option<u64>,
+    #[serde(default)]
+    pub keyboard_hits: Option<u64>,
     /// Foreground usage over the whole block, one entry per (app, window
     /// title), most-used first.
     pub active_windows: Vec<WindowInfo>,
@@ -216,10 +222,11 @@ pub struct Activity {
     /// activity %.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub injected_input_events: Option<u32>,
-    /// HMAC-SHA256 of the payload bytes as queued locally (base64url, no pad).
-    /// Set at enqueue time; the server verifies before accepting the block.
-    /// Absent on rows queued before signing was introduced or in tests that
-    /// construct Activity values directly.
+    /// HMAC-SHA256 of the payload bytes as queued locally (base64url, no pad),
+    /// with a key that never leaves this computer ([`crate::signing`]). The
+    /// server does **not** verify it (it has no copy of the key), so it
+    /// proves nothing about the block. Absent on rows queued before signing
+    /// was introduced or in tests that construct Activity values directly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload_signature: Option<String>,
 }
@@ -235,8 +242,8 @@ impl Activity {
             ended_at,
             description: None,
             productivity: None,
-            mouse_clicks: 0,
-            keyboard_hits: 0,
+            mouse_clicks: None,
+            keyboard_hits: None,
             active_windows: Vec::new(),
             running_programs: Vec::new(),
             timeline: Vec::new(),
@@ -290,8 +297,11 @@ pub struct WindowInfo {
 pub struct ActivityMinute {
     /// 0-based minute of the block.
     pub minute: u32,
-    pub keyboard_hits: u64,
-    pub mouse_clicks: u64,
+    /// `None` (`null`) when that kind of input is not measured.
+    #[serde(default)]
+    pub keyboard_hits: Option<u64>,
+    #[serde(default)]
+    pub mouse_clicks: Option<u64>,
     pub active: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_name: Option<String>,
@@ -514,6 +524,24 @@ mod tests {
     }
 
     #[test]
+    fn unmeasured_counts_are_sent_as_null_and_measured_zeros_as_zero() {
+        // Never a fabricated zero: not measured is null.
+        let json = serde_json::to_value(block()).unwrap();
+        assert!(json["mouseClicks"].is_null() && json["keyboardHits"].is_null(), "{json}");
+        let measured = Activity { keyboard_hits: Some(0), mouse_clicks: Some(7), ..block() };
+        let json = serde_json::to_value(&measured).unwrap();
+        assert_eq!((json["keyboardHits"].as_u64(), json["mouseClicks"].as_u64()), (Some(0), Some(7)));
+        // And they survive the local queue as they were.
+        let back: Activity = serde_json::from_value(json).unwrap();
+        assert_eq!((back.keyboard_hits, back.mouse_clicks), (Some(0), Some(7)));
+
+        let minute = ActivityMinute { minute: 0, keyboard_hits: Some(4), mouse_clicks: None, active: true, app_name: None, active_seconds: None };
+        let json = serde_json::to_value(&minute).unwrap();
+        assert_eq!(json["keyboardHits"], 4);
+        assert!(json["mouseClicks"].is_null());
+    }
+
+    #[test]
     fn new_fields_use_the_contract_names() {
         let at = DateTime::parse_from_rfc3339("2026-10-05T10:00:00Z").unwrap().with_timezone(&Utc);
         let activity = Activity {
@@ -599,8 +627,8 @@ mod tests {
     fn timeline_minutes_carry_active_seconds_only_when_known() {
         let minute = ActivityMinute {
             minute: 0,
-            keyboard_hits: 3,
-            mouse_clicks: 1,
+            keyboard_hits: Some(3),
+            mouse_clicks: Some(1),
             active: true,
             app_name: None,
             active_seconds: Some(42),

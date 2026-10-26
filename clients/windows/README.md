@@ -16,8 +16,11 @@ shows the timer, what was recorded, and what your workspace captures.
 1. Download `dosi-tracker-setup-<version>.exe` (CI builds it on every push).
 2. Run it. It installs **for your Windows user only** — no administrator rights —
    to `%LOCALAPPDATA%\Programs\DosiTracker`, adds a Start menu shortcut, and
-   starts Dosi Tracker when you sign in to Windows. If SmartScreen says
-   *Windows protected your PC*, choose **More info → Run anyway**.
+   (on a first install) starts Dosi Tracker when you sign in to Windows. Builds
+   are code-signed only where a signing certificate is configured (see
+   [The installer](#the-installer)); for an unsigned build SmartScreen may say
+   *Windows protected your PC* — check where the file came from, then choose
+   **More info → Run anyway**.
 3. Sign in (below).
 
 Admins can deploy it silently and point it at their server, so nobody has to
@@ -40,38 +43,79 @@ the installer (exit code 2) instead of installing an agent that cannot connect.
 Installing over a running agent first asks it to **quit gracefully**
 (`dosi-tracker.exe --quit`: the block in progress is saved and uploaded), and
 only ends it if it has not quit within 30 s — or if it is an older build that
-does not know `--quit`.
+does not know `--quit`. Only *your* agent, in your Windows session, is ever
+ended: an installer run by an admin or in another session leaves other users'
+agents alone.
+
+**Upgrades keep your choices.** *Start with Windows* is switched on by a first
+install only; an upgrade leaves it as you set it in the app. After a **silent**
+upgrade (`/S`, e.g. from MDM) the agent is started again (with `--autostart`,
+so it comes back in the tray) if it was running before, or if it is signed in
+and starts with Windows — nobody is left untracked until their next Windows
+sign-in. An interactive install offers *Start Dosi Tracker now* on its last
+page instead.
 
 ## Sign in
 
-Enter your **workspace**, **email** and **password** (Enter submits). The
+Enter your **email** and **password** (Enter submits). The
 server address is under **Advanced**: it is filled in from the installer's
 `/SERVER` (or `config.toml`), and opens by itself when no server was ever set on
 this computer or when the server cannot be reached. Paste the address shown on
 the web dashboard's **Download** page; a bare host (`tracker.example.com`)
 becomes `https://tracker.example.com`. The address you sign in with is saved
-with your sign-in.
+with your sign-in. A plain `http://` address is refused unless it is this
+computer (`localhost`, `127.x.x.x`, `[::1]`) — or an admin set
+`allow_insecure_http = true` in `config.toml`, in which case the window warns
+that the connection is not encrypted.
 
-The sign-in is stored **encrypted with Windows DPAPI**, keyed to your Windows
-user — the password is never stored in clear text or in environment variables.
+After signing in the agent lists your workspaces and uses the only one, or
+asks; **archived workspaces are never offered**. The sign-in is stored
+**encrypted with Windows DPAPI**, keyed to your Windows user and to this app
+(DPAPI "entropy", so a tool that sweeps every DPAPI blob of your user does not
+open it). Only the refresh token the server grants is kept — **never the
+password**: it is sent once, when you sign in, and forgotten as soon as the
+server accepts it. The server replaces the refresh token on every renewal; the
+new one is saved within seconds. A sign-in saved by an older build that still
+held the password is rewritten without it at the first start of this one (the
+password is used once more, in memory, to obtain a refresh token).
+
+**Signing out** uploads what it can (up to 15 s), then **revokes the refresh
+token at the server** (OpenIddict's revocation endpoint, as the server's
+`/.well-known/openid-configuration` names it, else `/connect/revocat`) and
+deletes the saved sign-in. If the server is out of reach the token is still
+forgotten on this computer and expires on the server by itself.
 
 When signing in fails, the form says why:
 
 | Message | Meaning |
 |---|---|
 | **Can't reach the server** | No answer: wrong address, no network or VPN, a firewall, or a certificate Windows does not trust. Check the address under Advanced. |
-| **Check the server address** | What was typed is not a usable `http(s)://` address. |
-| **Workspace not found** | The server has no such workspace (or it is inactive). |
-| **Sign-in refused** | The server's own words: wrong email or password (also when the account is in another workspace), a locked-out or deactivated account. |
+| **Check the server address** | What was typed is not a usable address, or it is plain `http://` to another computer. |
+| **No workspace yet** | The account is in no workspace, or all of its workspaces are archived. |
+| **Sign-in refused** | The server's own words: wrong email or password, a locked-out or deactivated account. |
 | **Too many sign-in attempts** | Wait a minute and try again. |
-| **The server couldn't sign you in** | The server failed (5xx), or the address is not a Dosi Tracker server (e.g. HTTP 404). |
+| **The server couldn't sign you in** | The server failed (5xx), answered with a redirect (never followed), or the address is not a Dosi Tracker server (e.g. HTTP 404). |
+| **This computer was removed** | A workspace admin removed this computer: tracking stopped and the saved sign-in was forgotten. |
 
-**Sign-in expired.** If the server stops accepting the saved password (changed,
-reset, account deactivated), tracking stops and the window asks for the
-**password only** — workspace and email are kept. Everything recorded so far
-stays queued and uploads once you are back. *Use a different account* signs out
-instead; that account's unsent blocks stay on the computer and upload if it
-signs in again within 14 days.
+**Sign-in expired.** When the server refuses the saved sign-in (the refresh
+token was revoked or expired, the password changed, the account was
+deactivated), tracking stops and the window asks for the **password only** —
+the email is kept. The agent never signs in again with a password behind your
+back. Everything recorded so far stays queued and uploads once you are back.
+*Use a different account* signs out instead; that account's unsent blocks stay
+on the computer and upload if it signs in again (on the same server) within 14
+days.
+
+**Workspace removed or archived.** When the server says you are no longer a
+member of the workspace you track in, or that it was archived, tracking and
+presence stop there and the window asks for another workspace. The blocks
+recorded there are **held** — not sent again — until you track in that
+workspace again; held blocks are deleted after 14 days.
+
+**Computer removed.** When a workspace admin removes this computer, tracking,
+presence and uploads stop at once and the saved sign-in is forgotten. The
+blocks recorded so far stay on the computer (and upload if the computer is
+restored and you sign in again).
 
 ## Using the app
 
@@ -121,6 +165,18 @@ and the window — and a tray notification, if the window is closed — asks:
 *Keep as work* records that time on the project you were on, as blocks with
 no activity (each at most one interval long), with your task note.
 *Discard* — or no answer — records nothing.
+
+While you are away (or paused, or locked) the input hooks are off. Your return
+is noticed through Windows' own idle clock (`GetLastInputInfo`: when the last
+input happened, nothing else). That clock also moves for software-injected
+input such as a mouse jiggler, so when the project records keyboard and mouse
+counts the agent attaches its input hooks — counting only, nothing else runs —
+and the time away ends at your own next input (time a jiggler ran before it is
+time away, never work). A timed break that ends while nobody is at the computer
+resumes the same way. When keyboard and mouse counts are not allowed — or the
+hooks cannot attach, for example because security software blocks them — idle
+detection relies on Windows' idle clock alone, so time is still recorded and
+still ends when you leave.
 
 ### Locking, sleep and shutdown
 
@@ -197,8 +253,8 @@ carries:
 | Data | When | Details |
 |---|---|---|
 | Start and end, project, task note | always | UTC times; the reason the block ended (interval, pause, break, idle, lock, sleep, project, task, sign-out, quit, shutdown). |
-| Keyboard activity | if allowed | **How many** key presses, per minute — never which keys or what you type. A held key counts once. |
-| Mouse activity | if allowed | Click counts; movement and scrolling mark a minute as active. |
+| Keyboard activity | if allowed | **How many** key presses, per minute — never which keys or what you type. A held key counts once. Sent as *not measured* (`null`, never 0) when not allowed or when input capture was unavailable during the block. |
+| Mouse activity | if allowed | Click counts; movement and scrolling mark a minute as active. *Not measured* (`null`) like the keyboard. |
 | Activity % and idle time | keyboard or mouse allowed | The share of the block's minutes with input, and the seconds without it. Software-injected input (mouse jigglers, remote tools) is counted aside, never as activity. *Not measured* when input capture is unavailable. |
 | Apps and window titles | if allowed | The app in front, its window title, how long, and the input while it was in front; per minute, the app mostly in front. |
 | Running programs | if allowed | **Names only** (e.g. `chrome.exe`) — never the titles of background windows. |
@@ -227,15 +283,18 @@ audio, files, or the window titles of programs in the background.
   decide whether the tray notifications appear; the window shows them anyway.
 - **Network**: HTTPS to your server. Certificates are always verified, against
   the Windows certificate store (so a company CA deployed to Windows works) and
-  the bundled Mozilla roots.
+  the bundled Mozilla roots. Plain `http://` only to this computer, unless an
+  admin sets `allow_insecure_http`; redirects are never followed.
 
 ## Files and uninstall
 
 | Where | What |
 |---|---|
 | `%LOCALAPPDATA%\Programs\DosiTracker\` | `dosi-tracker.exe`, `config.toml` (if written by the installer), `uninstall.exe` |
-| `%APPDATA%\DosiTracker\credentials.bin` | the sign-in, DPAPI-encrypted, with the chosen project, the last project list (for offline starts), a pause and the task note |
+| `%APPDATA%\DosiTracker\credentials.bin` | the sign-in — the refresh token, never the password — DPAPI-encrypted, with the chosen project, the last project list (for offline starts), a pause and the task note |
 | `%APPDATA%\DosiTracker\preferences.json` | your preferences (window behaviour, notifications, goals) |
+| `%APPDATA%\DosiTracker\consent.json` | what you agreed to capture on this computer |
+| `%APPDATA%\DosiTracker\signing.key` | a DPAPI-encrypted key for the local tag on each queued block (the server does not verify it) |
 | `%LOCALAPPDATA%\DosiTracker\dosi-tracker.db` | the offline queue (SQLite), with screenshots waiting to upload |
 | `%LOCALAPPDATA%\DosiTracker\logs\` | daily logs, kept 7 days |
 | `%LOCALAPPDATA%\DosiTracker\device.json` | the device ID |
@@ -245,9 +304,19 @@ Builds before this one kept the queue and logs in `%APPDATA%`; they are moved to
 
 **Uninstall** from *Settings → Apps* (or `uninstall.exe`). It asks the agent to
 quit gracefully, removes the program, shortcut and autostart entry, and then
-**asks whether to delete your data** (sign-in, preferences, logs, and any time
-not uploaded yet). A silent uninstall (`/S`) deletes it; add `/KEEPDATA` to
-keep it.
+**asks whether to delete your data** (everything in the table above outside the
+program folder: sign-in, preferences, consent, logs, and any time not uploaded
+yet). From a script:
+
+| Command | Your data |
+|---|---|
+| `uninstall.exe /S` | **kept** — so tracked time not uploaded yet is never lost by accident |
+| `uninstall.exe /S /PURGE` | deleted, without asking (offboarding a computer) |
+| `uninstall.exe /S /KEEPDATA` | kept (also wins over `/PURGE`) |
+
+Deleting the data removes the saved sign-in from this computer, but does not
+revoke it at the server: sign out in the app first (that revokes the refresh
+token), or let the workspace admin remove the computer.
 
 ## Configuration
 
@@ -258,6 +327,7 @@ directory — handy for `cargo run`); every key is optional. See
 | Key | Default | |
 |---|---|---|
 | `api_base_url` | `https://localhost:6006` | the server; an address typed at sign-in wins |
+| `allow_insecure_http` | `false` | allow plain `http://` to a server on another computer (the window warns); `http://localhost` is always allowed |
 | `dashboard_url` | `http://localhost:6005` | the web dashboard; greyed out in the app when left at this local default while the server is elsewhere |
 | `interval_minutes` | `10` | until the project's interval is known (5–60) |
 | `[capture]` | all on but `webcam` and `blur_screenshots` | can only turn captures off (or blur on) |
@@ -269,7 +339,8 @@ Any key can also be set as an environment variable, e.g. `DOSI__API_BASE_URL`,
 
 | | |
 |---|---|
-| Sign-in | OpenIddict password flow, `POST /connect/token` (`client_id=Tracker_App`, `scope=Tracker`), workspace as `__tenant`. The token is renewed before it expires; a 401 signs in again once. |
+| Sign-in | OpenIddict password grant, `POST /connect/token` (`client_id=Tracker_App`, scope `openid profile email roles offline_access Tracker`, no `__tenant`), with `device_id` (this install's UUID) on the password and every refresh grant. Then `GET /api/app/workspaces/mine`; every workspace-scoped call carries `X-Workspace-Id`. The token is renewed with the refresh token before it expires and once after a 401; a refused refresh token means *sign-in expired*. |
+| Sign-out | After the last uploads (up to 15 s), the refresh token is revoked: `POST` to the `revocation_endpoint` of `/.well-known/openid-configuration` when it is on the same server, else `/connect/revocat` (`token`, `token_type_hint=refresh_token`, `client_id=Tracker_App`). Best effort, 5 s; the saved sign-in is deleted either way. |
 | Projects | `GET /api/app/project/my-projects` every 5 minutes and after a 403/409 from an upload: interval, capture permissions, idle threshold, blur. |
 | Upload | `POST /api/app/activity`, one block at a time, oldest first, on a thread of its own (so pausing, locking or quitting never waits for a slow upload). |
 | Presence | `POST /api/app/presence/heartbeat` every 60 s and on every status change; "stopped" / "signed out" when quitting or signing out. |
@@ -281,20 +352,25 @@ What an upload's answer does (the blocks are always saved locally first):
 | Answer | What happens |
 |---|---|
 | 2xx | uploaded; removed from the queue |
-| network error, timeout, 5xx, 404/405/408/429, a 4xx without an error code | kept; retried after 30 s, doubling up to 30 min (`Retry-After` honoured) |
+| network error, timeout, a redirect, 5xx, 404/405/408/429, a 4xx without an error code | kept; retried after 30 s, doubling up to 30 min (`Retry-After` honoured) |
 | sign-in refused | kept; uploads stop and the window asks for the password |
 | 402 subscription inactive | kept; retried hourly |
+| 403 device revoked | kept; uploads, tracking and presence stop and the saved sign-in is forgotten |
+| 403 not a workspace member / workspace archived, 400 workspace required | kept and **held** with the rest of that workspace's blocks (not sent again until the workspace is used again); the other blocks go on; the window asks for another workspace |
 | 403 not a project member / 409 project archived | the project list is fetched again; not accepted only if the project is really gone |
 | 425 in the future | kept; retried in 5 minutes (your clock is ahead) |
 | 413, capture too large or invalid | sent again at once without its images |
+| an error code this agent does not know, or still too large without images | kept; **that block alone** is retried later (5 min, doubling up to 6 h) while the others go on; not accepted after 10 tries |
 | overlap, id conflict, too long, too old, invalid range, validation errors | **not accepted**: kept 14 days with the server's reason, never retried |
 
 **Offline**: tracking goes on with the project list saved in the last 7 days;
 blocks upload when the server answers again (*Sync now* retries at once). The
 queue keeps every block's time data; screenshots are dropped first — beyond the
 newest 500 blocks, 300 MB of images, or 30 days — and beyond 10,000 waiting
-blocks the oldest are dropped. Each account's blocks upload only under that
-account; another account's are kept 14 days for it.
+blocks the oldest are dropped. Each block belongs to the account — the user
+**on the server** — that recorded it: it uploads only under that account's
+token and only to that server, never to another server where the same email
+signs in. Another account's blocks are kept 14 days for it.
 
 ## Troubleshooting
 
@@ -304,11 +380,12 @@ account; another account's are kept 14 days for it.
   so will the agent — install your company's CA in Windows, or for local
   development run `dotnet dev-certs https --trust` as the same Windows user and
   restart the agent.
-- **"Sign-in refused" with the right password** — check the workspace name: an
-  account belongs to one workspace, and the server answers the same way for a
-  wrong workspace.
+- **"Sign-in refused" with the right password** — check the server address
+  under *Advanced*: the same email can have another password on another
+  server.
 - **Nothing is tracked** — the status pill says why: *Choose a project*, *Paused*
-  (a pause survives restarts — press Resume), *Away* (move the mouse),
+  (a pause survives restarts — press Resume), *Away* (type or click: a mouse
+  jiggler alone does not end it),
   *Locked*, *Sign-in expired*, or *Offline* (no server and no saved project
   list yet).
 - **The time-away question keeps appearing in meetings** — idle detection ends
@@ -341,9 +418,12 @@ account; another account's are kept 14 days for it.
 
 ### Prerequisites
 
-- **Rust** — `winget install Rustlang.Rustup` (or https://rustup.rs)
+- **Rust** — `winget install Rustlang.Rustup` (or https://rustup.rs). The
+  toolchain is pinned in `rust-toolchain.toml` (rustc 1.97.1 with clippy);
+  rustup installs and uses it by itself inside `clients/windows`.
 - **MSVC C++ build tools + Windows SDK** — needed by the `windows`, `rusqlite`
-  (bundled SQLite) and `nokhwa` crates:
+  (bundled SQLite) and `nokhwa` crates, and the SDK's `rc.exe` by `build.rs`
+  (set `RC_PATH` if it is somewhere unusual):
   ```powershell
   winget install --id Microsoft.VisualStudio.2022.BuildTools `
     --override "--quiet --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
@@ -356,20 +436,72 @@ account; another account's are kept 14 days for it.
 cd clients/windows
 copy config.example.toml config.toml   # optional: point it at your server
 cargo run                              # or cargo run --release
-cargo test
-cargo clippy --all-targets -- -D warnings   # CI enforces this
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings   # CI enforces this
 ```
+
+### Versions
+
+`build.rs` stamps the version into the program: the `agentVersion` every block
+and heartbeat carries (also shown in the window's footer and *Help & support*,
+and sent in the HTTP user agent), and a Windows **version resource** (Explorer's
+*Properties → Details*) with an **application manifest** (`asInvoker`, Windows
+10/11, per-monitor DPI awareness, Common Controls 6;
+`build-support/dosi-tracker.exe.manifest`). The rules are in
+`build-support/version.rs` and tested with the crate:
+
+| Variable | Effect |
+|---|---|
+| — | The version is `Cargo.toml`'s (`0.1.0`). |
+| `DOSI_VERSION` | The release version instead, e.g. from a tag (`v1.2.3` → `1.2.3`; a pre-release such as `1.2.3-rc.1` is fine). |
+| `DOSI_GIT_SHA` (else `GITHUB_SHA`) | The commit, appended as build metadata: `1.2.3+0123456789ab` (cut to 7 digits if the whole would pass the server's 32 characters). |
+| `DOSI_BUILD_NUMBER` | The resource's fourth number (`1.2.3.417`), e.g. CI's run number; 0 by default. |
+
+A version that a version resource cannot hold (not `MAJOR.MINOR.PATCH`, a part
+above 65535) or a commit that is not hex fails the build rather than ship a
+wrong label.
 
 ### The installer
 
 ```powershell
-cargo build --release
+cargo build --locked --release
 cd installer
 makensis /DVERSION=0.1.0 dosi-tracker.nsi   # -> dosi-tracker-setup-0.1.0.exe
 ```
 
-CI takes the version from `Cargo.toml`, builds the installer on every push and
-uploads it as a workflow artifact.
+Without `/DVERSION` the installer takes the version from the program's version
+resource; with it (CI passes the release version, `VERSION_NUMERIC` without a
+pre-release suffix, and `BUILD_NUMBER`) the numbers must match the program's or
+the build stops. `/DOUTFILE=dosi-tracker-setup.exe` writes the setup under
+another name (the version-less release asset). CI builds the installer on every
+push and uploads it as a workflow artifact. Without Windows, `makensis` from the
+Linux `nsis` package builds the same unsigned installer (CI uses the Windows
+build of NSIS).
+
+**Code signing.** When a certificate is configured in the environment, the
+installer build Authenticode-signs (SHA-256, RFC 3161 timestamp) the program —
+in `target\release`, before packing it — the uninstaller and the setup file,
+with `installer\sign.ps1` and the Windows SDK's `signtool`. Any one of these
+turns it on; a configuration that is set but does not work fails the build:
+
+| Variable | Certificate |
+|---|---|
+| `DOSI_SIGN_PFX` (+ `DOSI_SIGN_PFX_PASSWORD`) | a `.pfx` file |
+| `DOSI_SIGN_CERT_SHA1` | the thumbprint of a certificate in the Windows certificate store (a hardware token, a cloud HSM) |
+| `DOSI_SIGN_DLIB` + `DOSI_SIGN_DMDF` | a signtool dlib and its metadata file, e.g. Azure Trusted Signing |
+| `DOSI_SIGN_TIMESTAMP_URL` | the timestamp server (default `http://timestamp.digicert.com`) |
+| `DOSI_SIGNTOOL` | `signtool.exe` (default: on `PATH`, else the newest Windows SDK's) |
+
+Without any of them nothing is signed. Keep the certificate and its password
+in CI secrets, never in the repository. `sign.ps1 <file>` also signs a single
+file by hand.
+
+Things to check by hand on a test machine after changing it (they need a real
+Windows session): a first install turns *Start with Windows* on; turning it off
+in the app and upgrading keeps it off; a silent upgrade (`/S`) over a running,
+signed-in agent restarts it in the tray; `uninstall.exe /S` keeps
+`%APPDATA%\DosiTracker` and `%LOCALAPPDATA%\DosiTracker`, `/S /PURGE` removes
+both.
 
 ### Reviewing the window without a backend
 
@@ -398,55 +530,117 @@ A debug build can also sign in by itself for end-to-end runs:
 | Part | Owns |
 |------|------|
 | UI thread | the egui window and the tray icon; renders a cheap state snapshot (`state::SharedState`) and sends commands (`state::Command`) |
-| Worker thread (`worker.rs`) | when blocks start and end — from commands, session and power events, input and the clocks — and queues them locally; never waits on the network |
+| Worker thread (`worker.rs` + `worker/`) | when blocks start and end — from commands, session and power events, input and the clocks — and queues them locally; never waits on the network |
 | Control task (`worker/control.rs`) | sign-in, the project list, presence, totals |
 | Uploader thread (`worker/uploader.rs`) | drains the queue with its own connection to it |
 | Session events (`session_events.rs`) | a hidden window hearing lock/unlock, sleep/resume and shutdown |
 | Input hooks (`tracking/input.rs`) | low-level keyboard/mouse hooks that only timestamp events, with a watchdog |
 
+Large modules are a folder: the parent file keeps the type and its core, and
+each concern is a file beside it (methods of the same type, `pub(super)` to its
+siblings). Tests live in a `tests.rs` (or `tests/`) next to the code they test.
+
 ```
+build.rs                 # version (agentVersion), version resource + manifest
+build-support/
+├── version.rs           # the version rules (shared with the crate's tests)
+└── dosi-tracker.exe.manifest
+rust-toolchain.toml      # the pinned toolchain
+installer/
+├── dosi-tracker.nsi     # the per-user NSIS installer
+└── sign.ps1             # Authenticode signing, when a certificate is configured
 src/
 ├── main.rs              # entry: window options, wiring, --quit, UI preview seed
 ├── ui/
-│   ├── mod.rs           # TrackerApp: window behaviour, tray events, notices, layout
+│   ├── mod.rs           # TrackerApp: state, the frame loop (logic / ui)
+│   ├── window.rs        # show / hide / quit, tray events and retry, notices
+│   ├── layout.rs        # header, tabs, footer; shared layout pieces
 │   ├── login.rs         # sign-in, server address (Advanced), sign-in expired
 │   ├── timer.rs         # Timer tab, project chooser, task note, time-away question
 │   ├── activity.rs      # Activity tab (blocks, upload status, server reasons)
 │   ├── settings.rs      # Settings tab (privacy, this device, account)
 │   ├── alerts.rs        # what needs attention (banners), decided from the state
 │   ├── preview.rs       # debug-only preview scenes
+│   ├── consent.rs       # the local consent card
 │   ├── widgets.rs       # painted icons, buttons, toggles, callouts, charts
-│   └── format.rs        # shared formatting (clock, durations, app names)
+│   ├── format.rs        # shared formatting (clock, durations, app names)
+│   └── tests.rs
 ├── tray.rs              # tray icon: badge, tooltip, menu, notifications
 ├── theme.rs             # palette (web design tokens) + Segoe UI fonts
 ├── prefs.rs             # local preferences
-├── worker.rs            # the worker loop (+ worker/: blocks, session, control, uploader)
+├── worker.rs            # the worker loop, the Worker state and its start
+├── worker/
+│   ├── machine.rs       # Machine: what the worker asks of the computer
+│   ├── account.rs       # Account; sign in / out, expired, removed computer, saved sign-in
+│   ├── workspaces.rs    # choosing, switching and losing the workspace
+│   ├── projects.rs      # the tracked project and its policy
+│   ├── presence.rs      # tracking on/off, idle and return, breaks, lock, sleep, the tick
+│   ├── recording.rs     # finished blocks built and queued
+│   ├── queue.rs         # queue upkeep and the window's queue lists
+│   ├── consent.rs       # local consent changes
+│   ├── commands.rs      # the window's commands (pause, sync, task note, quit)
+│   ├── events.rs        # what the control task and the uploader report
+│   ├── publish.rs       # the window's view, presence heartbeats
+│   ├── calendar.rs      # local days and weeks for the totals
+│   ├── blocks.rs        # the block clock: interval cuts, idle cuts, capture moment
+│   ├── session.rs       # project choice, policy, status rules
+│   ├── control.rs       # control task: sign-in, projects, presence, totals
+│   ├── uploader.rs      # uploader thread
+│   └── tests/           # fake machine + harness (mod.rs), tests by concern
 ├── state.rs             # shared snapshot + commands
 ├── session_events.rs    # lock / sleep / shutdown events
 ├── power.rs             # awake-time clock (missed-suspend detection)
 ├── single_instance.rs   # one agent per user; --quit and "show" signals
 ├── shell.rs             # folders, opening URLs, work area, window visibility
-├── credentials.rs       # DPAPI-encrypted sign-in
+├── credentials.rs       # DPAPI-encrypted sign-in (refresh token only)
+├── dpapi.rs             # DPAPI protect / unprotect
+├── fsutil.rs            # write-then-rename for every saved file
+├── signing.rs           # the device key for the local payload tag
 ├── autostart.rs         # "Start with Windows" (HKCU Run key, --autostart)
 ├── config.rs            # config.toml + DOSI__* env vars, server address rules
 ├── model.rs             # wire types (Project, Activity, Heartbeat, …)
-├── api.rs               # REST client: token, projects, upload, presence, totals
-├── storage.rs           # the offline SQLite queue
+├── api.rs               # REST client: projects, upload, presence, totals
+├── api/
+│   ├── tokens.rs        # token grants, the shared token, revocation
+│   ├── errors.rs        # error types; how failed answers are classified
+│   ├── clock.rs         # server clock (Date header), Retry-After
+│   └── tests.rs
+├── storage.rs           # the offline SQLite queue: rows
+├── storage/
+│   ├── open.rs          # schema, migrations, vacuum, a damaged queue moved aside
+│   ├── limits.rs        # image / row bounds, purges, space reclaimed
+│   └── tests.rs
 └── tracking/
-    ├── mod.rs           # Tracker: builds a block's upload
+    ├── mod.rs           # Tracker: sensors, capability generations, snapshots
+    ├── acquisition.rs   # screen / webcam / window / programs boundary (+ test fake)
+    ├── payload.rs       # a block's upload payload, kept idle blocks
+    ├── lifecycle.rs     # sensor drivers (native + fake)
     ├── input.rs         # input hooks, activity %, idle
     ├── usage.rs         # foreground-window usage, per-minute timeline
     ├── screenshot.rs    # foreground-monitor JPEG capture, thumbnail, blur
     ├── webcam.rs        # one webcam photo, with warm-up and timeout
     ├── active_window.rs # foreground window, running programs
-    └── system.rs        # device id, computer name, Windows version, time zone
+    ├── system.rs        # device id, computer name, Windows version, time zone
+    └── tests.rs
 ```
 
 ## Known gaps
 
 - No automatic updater — new versions are installed by running the setup again.
-- A worker that panics is reported (red *Stopped*) but not restarted
-  automatically; restarting the app recovers.
+- A worker that panics is reported (red *Stopped*) and the panic — message,
+  place and backtrace — is written to the log, but the worker is not
+  restarted automatically; restarting the app recovers.
+- Sign-in is the OpenIddict password grant: an account that requires
+  single sign-on or multi-factor sign-in cannot sign in from the agent yet
+  (that needs the browser-based authorization-code flow).
+- Builds are code-signed only where a signing certificate is configured
+  ([The installer](#the-installer)); without one, Defender SmartScreen and
+  managed-fleet policies (WDAC, AppLocker) may warn about or block the agent.
+  The per-block `payloadSignature` is a local tag the server does not verify
+  (no tamper protection).
+- The window and tray icons are drawn at run time; the `.exe` file itself has
+  no icon resource yet, so Explorer, the Start menu shortcut and *Installed
+  apps* show Windows' default program icon.
 - Autostart uses the per-user Run key, not a Windows service: capture needs the
   user's interactive session, which a session-0 service cannot reach.
 - Input to apps running as administrator is not counted (see Troubleshooting).

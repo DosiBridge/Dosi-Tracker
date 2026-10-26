@@ -11,15 +11,22 @@
 //! | network, 5xx, 404/405/408/429, a 4xx without a code | kept; retried after 30 s, doubling up to 30 min (`Retry-After` honoured) |
 //! | sign-in refused | kept; uploads stop, the worker asks for the password |
 //! | 402 subscription inactive | kept; retried hourly |
-//! | 403 not a workspace member | kept; that workspace's rows wait, the worker asks for another workspace |
+//! | 403 device revoked | kept; uploads stop, the worker stops tracking and forgets the sign-in |
+//! | 403 not a workspace member / workspace archived, 400 workspace required | kept; that workspace's rows are held (not sent again) until it is used again; the rest go on; the worker asks for another workspace |
 //! | 403 not a member / 409 archived | the projects are fetched again: parked if the project is gone, else kept |
 //! | 425 in the future | kept; retried in 5 minutes (the clock is ahead) |
 //! | 413, capture too large/invalid | the images are stripped and it is sent again at once |
+//! | a business error this agent does not know, or still too large without images | kept; that row alone is retried later (5 min doubling to 6 h), parked after 10 attempts; the rest go on |
 //! | overlap, id conflict, too long/old, invalid range, validation | parked with the server's reason |
 //!
 //! Each row is sent to the workspace it was recorded in (`X-Workspace-Id`),
-//! whichever workspace is tracked now. `sentAt` is stamped by the API client
-//! on every attempt.
+//! whichever workspace is tracked now, and only ever to the server it was
+//! recorded for (the queue's owner names the server). `sentAt` is stamped by
+//! the API client on every attempt.
+//!
+//! Signing out, the uploader is the last to use the account's token: after
+//! its final bounded drain it revokes the refresh token at the server (best
+//! effort) and lets the account go.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -29,7 +36,7 @@ use chrono::Utc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::Instant;
 
-use crate::api::{ApiClient, ServerClock, SubmitError};
+use crate::api::{ApiClient, Revocation, ServerClock, SubmitError, WorkspaceRefusal};
 use crate::model::Project;
 use crate::state::{StateHandle, UploadIssue, UploadState};
 use crate::storage::Storage;
@@ -42,8 +49,26 @@ pub const SUBSCRIPTION_RETRY: Duration = Duration::from_secs(60 * 60);
 /// Retried after a 425 (the block ends in the server's future).
 pub const CLOCK_AHEAD_RETRY: Duration = Duration::from_secs(5 * 60);
 
+/// Budget for revoking the refresh token when signing out.
+const REVOKE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// How often opening (or reading) the queue is retried after it failed.
 const STORE_RETRY: Duration = Duration::from_secs(60);
+
+/// A row the server answered an unknown error about is retried after this,
+/// doubling…
+const ROW_RETRY_FIRST: Duration = Duration::from_secs(5 * 60);
+
+/// …up to this…
+const ROW_RETRY_MAX: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// …and parked after this many attempts (about a day of trying).
+pub const MAX_ROW_ATTEMPTS: u32 = 10;
+
+/// The wait before a row's next attempt, after `attempts` failed ones.
+pub fn row_retry_after(attempts: u32) -> Duration {
+    ROW_RETRY_FIRST.saturating_mul(1u32 << attempts.saturating_sub(1).min(16)).min(ROW_RETRY_MAX)
+}
 
 /// Exponential back-off for transient failures: 30 s, doubling, at most 30
 /// min — and never sooner than the server's `Retry-After`.
@@ -77,8 +102,9 @@ pub enum UploadCommand {
     RowsQueued,
     /// Upload now, whatever the back-off ("Sync now", the server is back).
     Now,
-    /// Signing out: upload what fits before `deadline`, then stop.
-    SignOut { deadline: std::time::Instant },
+    /// Signing out: upload what fits before `deadline`, then (with `revoke`)
+    /// revoke the refresh token at the server, and stop.
+    SignOut { deadline: std::time::Instant, revoke: bool },
     /// Quitting: upload what fits before `deadline`, then end the thread.
     Shutdown { deadline: std::time::Instant },
 }
@@ -87,7 +113,7 @@ impl UploadCommand {
     /// A command that must cut a running pass short: by when.
     fn deadline(&self) -> Option<std::time::Instant> {
         match self {
-            UploadCommand::SignOut { deadline } | UploadCommand::Shutdown { deadline } => Some(*deadline),
+            UploadCommand::SignOut { deadline, .. } | UploadCommand::Shutdown { deadline } => Some(*deadline),
             // Another account: the current pass (of the previous one) stops now.
             UploadCommand::Account(_) => Some(std::time::Instant::now()),
             UploadCommand::RowsQueued | UploadCommand::Now => None,
@@ -102,7 +128,7 @@ impl UploadCommand {
 /// account (a sign-out's final drain) can still report after another account
 /// signed in, and must not be applied to it.
 pub enum UploadEvent {
-    /// The server no longer accepts the saved password of `owner`.
+    /// The server no longer accepts the saved sign-in of `owner`.
     SignInExpired { owner: String, reason: String },
     /// The project list of `owner`, fetched after a 403/409.
     Projects { owner: String, projects: Vec<Project> },
@@ -111,8 +137,10 @@ pub enum UploadEvent {
     /// Rows of `owner` were parked (rejected by the server): the project list
     /// is worth fetching again (CONTRACT §2: after any 403/409).
     Parked { owner: String, count: u32 },
-    /// `owner` is no longer a member of `workspace_id`.
-    WorkspaceLost { owner: String, workspace_id: String },
+    /// The server refused `owner`'s `workspace_id`.
+    WorkspaceLost { owner: String, workspace_id: String, refusal: WorkspaceRefusal },
+    /// A workspace admin removed this computer from `owner`'s server.
+    DeviceRevoked { owner: String, reason: String },
 }
 
 /// How a pass ended.
@@ -122,7 +150,7 @@ pub enum PassEnd {
     Drained,
     /// A row must wait; the next attempt is scheduled.
     Waiting,
-    /// The sign-in was refused: uploads stopped.
+    /// The sign-in was refused, or this device revoked: uploads stopped.
     SignInExpired,
     /// The queue could not be read; retried later.
     StoreFailed,
@@ -303,26 +331,33 @@ impl Uploader {
         }
     }
 
-    fn pending(&self) -> u32 {
+    /// How many rows may be sent now (neither held nor deferred).
+    fn due(&self) -> u32 {
         match (&self.store, &self.current) {
-            (Some(store), Some(current)) => store.pending_count(&current.owner).unwrap_or(0),
+            (Some(store), Some(current)) => store.due_count(&current.owner).unwrap_or(0),
             _ => 0,
         }
     }
 
-    /// Is there something to upload, and may it be uploaded now?
-    fn ready(&self) -> bool {
-        self.not_before.is_none_or(|at| at <= Instant::now()) && self.pending() > 0
+    /// When the earliest deferred row may be sent again.
+    fn next_row_retry(&self) -> Option<Instant> {
+        let (Some(store), Some(current)) = (&self.store, &self.current) else { return None };
+        let at = store.next_retry_at(&current.owner).ok().flatten()?;
+        let wait = (at - Utc::now()).to_std().unwrap_or_default();
+        Some(Instant::now() + wait)
     }
 
-    /// When the loop must wake up by itself: to retry after a wait, or to
-    /// open the queue again.
+    /// Is there something to upload, and may it be uploaded now?
+    fn ready(&self) -> bool {
+        self.not_before.is_none_or(|at| at <= Instant::now()) && self.due() > 0
+    }
+
+    /// When the loop must wake up by itself: to retry after a wait, to send
+    /// a deferred row, or to open the queue again.
     fn next_wake(&self) -> Option<Instant> {
-        let retry = self.not_before.filter(|_| self.pending() > 0);
-        match (retry, self.store_retry_at.filter(|_| self.store.is_none())) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        let retry = self.not_before.filter(|_| self.due() > 0);
+        let row = self.next_row_retry().map(|at| self.not_before.map_or(at, |not_before| at.max(not_before)));
+        [retry, row, self.store_retry_at.filter(|_| self.store.is_none())].into_iter().flatten().min()
     }
 
     /// Run a pass while still taking commands: one that must cut it short
@@ -369,8 +404,11 @@ impl Uploader {
             UploadCommand::Account(None) => self.drop_account(),
             UploadCommand::RowsQueued => {}
             UploadCommand::Now => self.not_before = None,
-            UploadCommand::SignOut { deadline } => {
+            UploadCommand::SignOut { deadline, revoke } => {
                 self.final_drain(deadline).await;
+                if revoke {
+                    self.revoke().await;
+                }
                 self.drop_account();
             }
             UploadCommand::Shutdown { deadline } => {
@@ -400,6 +438,23 @@ impl Uploader {
         self.state.update(|s| s.upload_issue = None);
     }
 
+    /// Signed out: revoke the account's refresh token at the server, so the
+    /// sign-in cannot be used again from a copy of it (best effort: a server
+    /// out of reach or without revocation lets it expire by itself).
+    async fn revoke(&mut self) {
+        let Some(current) = self.current.as_ref() else { return };
+        match current.client.revoke_refresh_token(REVOKE_TIMEOUT).await {
+            Revocation::Revoked => tracing::info!("signed out; the server revoked the refresh token"),
+            Revocation::NothingToRevoke => {}
+            Revocation::Unsupported(reason) => {
+                tracing::info!(%reason, "signed out; the server does not revoke tokens, it expires by itself")
+            }
+            Revocation::Failed(reason) => {
+                tracing::warn!(%reason, "signed out, but the refresh token could not be revoked; it expires by itself")
+            }
+        }
+    }
+
     /// One last bounded pass (quitting, signing out), whatever the back-off.
     async fn final_drain(&mut self, deadline: std::time::Instant) {
         if self.current.is_none() {
@@ -424,8 +479,6 @@ impl Uploader {
         let mut parked = 0u32;
         // A workspace's project list, once fetched in this pass (after a 403/409).
         let mut listed: Option<(String, Vec<Project>)> = None;
-        // Workspaces this user lost access to: their rows wait.
-        let mut blocked: Vec<String> = Vec::new();
 
         let end = loop {
             if uploaded + parked > 0 {
@@ -444,22 +497,10 @@ impl Uploader {
                 }
             };
             let Some(row) = row else {
-                if blocked.is_empty() {
-                    break PassEnd::Drained;
-                }
-                // Only rows of workspaces this user lost remain: they wait.
-                let delay = self.backoff.next(None);
-                let next = Utc::now() + chrono::Duration::from_std(delay).unwrap_or_default();
-                let reason = "No access to the workspace these blocks were recorded in.".to_owned();
-                self.not_before = Some(Instant::now() + delay);
-                self.state.update(|s| s.upload_issue = Some(UploadIssue::Retrying { next_attempt_at: next, reason }));
-                break PassEnd::Waiting;
+                break PassEnd::Drained;
             };
-            let (id, activity, workspace) = (row.id, row.activity, row.workspace_id);
+            let (id, activity, workspace, attempts) = (row.id, row.activity, row.workspace_id, row.attempts);
             cursor = id;
-            if blocked.contains(&workspace) {
-                continue;
-            }
             current.client.set_workspace(Some(workspace.clone()));
             let tracked = tracked_workspace.as_deref() == Some(workspace.as_str());
 
@@ -506,18 +547,54 @@ impl Uploader {
                     Ok(false) => {
                         // Nothing left to strip: the block itself is too
                         // big for the server (or a proxy in front of it).
-                        Wait::Backoff { reason, retry_after: None }
+                        match retry_row_later(store, &self.state, id, attempts, &reason) {
+                            Some(was_parked) => {
+                                parked += u32::from(was_parked);
+                                continue;
+                            }
+                            None => {
+                                self.not_before = Some(Instant::now() + STORE_RETRY);
+                                break PassEnd::StoreFailed;
+                            }
+                        }
                     }
                     Err(e) => Wait::Backoff { reason: format!("could not strip the images: {e}"), retry_after: None },
                 },
-                SubmitError::NotWorkspaceMember(message) => {
-                    tracing::warn!(id, %workspace, "no longer a member of the block's workspace; its blocks wait");
-                    let _ = store.note_attempt(id, Some(&message));
-                    if tracked {
-                        let _ = self.events.send(UploadEvent::WorkspaceLost { owner: owner.clone(), workspace_id: workspace.clone() });
+                SubmitError::RowRetry(reason) => match retry_row_later(store, &self.state, id, attempts, &reason) {
+                    Some(was_parked) => {
+                        parked += u32::from(was_parked);
+                        continue;
                     }
-                    blocked.push(workspace);
+                    None => {
+                        self.not_before = Some(Instant::now() + STORE_RETRY);
+                        break PassEnd::StoreFailed;
+                    }
+                },
+                SubmitError::Workspace { refusal, message } => {
+                    // Its rows are not sent again until the workspace is used
+                    // again: no screenshot goes on being re-sent to a server
+                    // that refuses it.
+                    tracing::warn!(id, %workspace, %refusal, "the server refused the block's workspace; its blocks are held");
+                    if let Err(e) = store.hold_workspace(&owner, &workspace, &message) {
+                        tracing::error!(?e, "could not hold the workspace's blocks");
+                        self.not_before = Some(Instant::now() + STORE_RETRY);
+                        break PassEnd::StoreFailed;
+                    }
+                    if tracked {
+                        let _ = self.events.send(UploadEvent::WorkspaceLost {
+                            owner: owner.clone(),
+                            workspace_id: workspace.clone(),
+                            refusal,
+                        });
+                    }
+                    publish_queue(store, &self.state, Some(&owner));
                     continue;
+                }
+                SubmitError::DeviceRevoked(reason) => {
+                    tracing::warn!(%reason, "this device was revoked; uploads stop");
+                    let _ = store.note_attempt(id, Some(&format!("device removed: {reason}")));
+                    let _ = self.events.send(UploadEvent::DeviceRevoked { owner: owner.clone(), reason });
+                    break PassEnd::SignInExpired;
                 }
                 SubmitError::ProjectUnavailable { code, message } => {
                     if listed.as_ref().is_none_or(|(of, _)| *of != workspace) {
@@ -617,6 +694,28 @@ enum Wait {
     Backoff { reason: String, retry_after: Option<Duration> },
     Subscription(String),
     ClockAhead(String),
+}
+
+/// The server answered an error about this row alone: try it again later
+/// (the rows behind it go on meanwhile), or park it once it has had
+/// [`MAX_ROW_ATTEMPTS`]. Whether it was parked; `None` when the queue could
+/// not be updated.
+fn retry_row_later(store: &Storage, state: &StateHandle, id: i64, attempts: u32, reason: &str) -> Option<bool> {
+    let attempts = attempts + 1;
+    if attempts >= MAX_ROW_ATTEMPTS {
+        let reason = format!("{reason} (gave up after {attempts} attempts)");
+        return park(store, state, id, &reason).then_some(true);
+    }
+    let wait = row_retry_after(attempts);
+    let retry_at = Utc::now() + chrono::Duration::from_std(wait).unwrap_or_default();
+    tracing::warn!(id, %reason, ?wait, "the server refused this block; retrying it later");
+    match store.defer(id, reason, retry_at) {
+        Ok(_) => Some(false),
+        Err(e) => {
+            tracing::error!(?e, id, "could not defer the block");
+            None
+        }
+    }
 }
 
 /// The server will never take this row: keep it (and its reason) for the
@@ -926,7 +1025,7 @@ mod tests {
     async fn rows_of_another_account_are_never_uploaded() {
         let (url, requests) = canned_server(vec![token_ok()]);
         let mut h = harness(&url);
-        let bob = crate::storage::owner_key("bob@acme.com");
+        let bob = crate::storage::owner_key(&url, "bob@acme.com");
         let now = Utc::now();
         h.store().enqueue(&Activity::new("p1", now - chrono::Duration::minutes(10), now), &bob, "w1").unwrap();
         assert!(!h.uploader.ready());
@@ -984,17 +1083,152 @@ mod tests {
         h.queue_in("w1", Activity::new("p1", now - chrono::Duration::minutes(30), now - chrono::Duration::minutes(20)));
         h.queue_in("w2", Activity::new("p2", now - chrono::Duration::minutes(40), now - chrono::Duration::minutes(30)));
 
-        assert_eq!(h.uploader.drain(None).await, PassEnd::Waiting);
+        assert_eq!(h.uploader.drain(None).await, PassEnd::Drained);
         let requests: Vec<String> = requests.try_iter().collect();
         assert_eq!(requests.len(), 3, "one try in w1, then w2's row; w1's second row is not tried");
         assert_eq!(header_of(&requests[2], "x-workspace-id").as_deref(), Some("w2"));
         let rows = h.rows();
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|r| r.status == RowStatus::Queued), "never parked: {rows:?}");
-        assert_eq!(rows.iter().find(|r| r.id == kept).unwrap().reason.as_deref(), Some("You are not a member of this workspace."));
-        assert_eq!(h.waits_for(), Some(30));
+        assert!(rows.iter().all(|r| r.reason.as_deref() == Some("You are not a member of this workspace.")), "{rows:?}");
+        assert_eq!(rows.iter().find(|r| r.id == kept).unwrap().status, RowStatus::Queued);
+        // Held: not re-sent on a timer, so no wait is scheduled for them.
+        assert_eq!(h.waits_for(), None);
+        assert!(!h.uploader.ready());
+        assert_eq!(h.uploader.next_wake(), None);
         let events: Vec<UploadEvent> = std::iter::from_fn(|| h.events.try_recv().ok()).collect();
-        assert!(events.iter().any(|e| matches!(e, UploadEvent::WorkspaceLost { workspace_id, .. } if workspace_id == "w1")), "{events:?}");
+        assert!(
+            events.iter().any(|e| matches!(e, UploadEvent::WorkspaceLost { workspace_id, refusal: WorkspaceRefusal::NotMember, .. } if workspace_id == "w1")),
+            "{events:?}"
+        );
         assert!(events.iter().any(|e| matches!(e, UploadEvent::Uploaded(1))), "{events:?}");
+
+        // Using the workspace again releases them.
+        assert_eq!(h.store().release_workspace(&h.owner, "w1").unwrap(), 2);
+        assert!(h.uploader.ready());
+    }
+
+    #[tokio::test]
+    async fn an_archived_workspace_holds_its_rows_and_is_reported_as_archived() {
+        let archived = abp("Tracker:WorkspaceArchived", "This workspace is archived.");
+        let (url, requests) = canned_server(vec![token_ok(), http("403 Forbidden", &[], &archived)]);
+        let mut h = harness(&url);
+        h.queue("p1", true);
+        h.queue("p1", false);
+
+        assert_eq!(h.uploader.drain(None).await, PassEnd::Drained);
+        assert_eq!(requests.try_iter().count(), 2, "one attempt, then the workspace's rows are held");
+        assert!(h.rows().iter().all(|r| r.status == RowStatus::Queued), "kept, images and all");
+        let events: Vec<UploadEvent> = std::iter::from_fn(|| h.events.try_recv().ok()).collect();
+        assert!(events.iter().any(|e| matches!(e, UploadEvent::WorkspaceLost { refusal: WorkspaceRefusal::Archived, .. })), "{events:?}");
+        assert!(!h.uploader.ready());
+    }
+
+    #[tokio::test]
+    async fn signing_out_uploads_what_it_can_then_revokes_the_refresh_token() {
+        let granted = http("200 OK", &[], r#"{"access_token":"t0k3n","refresh_token":"r1","expires_in":3600}"#);
+        let (url, requests) = canned_server(vec![
+            granted,
+            http("200 OK", &[], "{}"),
+            http("404 Not Found", &[], ""),
+            http("200 OK", &[], ""),
+        ]);
+        let mut h = harness(&url);
+        h.queue("p1", false);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        assert!(matches!(h.uploader.apply(UploadCommand::SignOut { deadline, revoke: true }).await, Flow::Continue));
+
+        let requests: Vec<String> = requests.try_iter().collect();
+        let lines: Vec<&str> = requests.iter().map(|r| r.lines().next().unwrap_or_default()).collect();
+        assert!(lines[1].starts_with("POST /api/app/activity "), "the block first: {lines:?}");
+        assert!(lines[3].starts_with("POST /connect/revocat "), "then the revocation: {lines:?}");
+        assert!(requests[3].contains("token=r1"));
+        assert!(h.uploader.current.is_none(), "the account is let go");
+        assert!(h.rows().iter().all(|r| r.status != RowStatus::Queued), "uploaded before letting go");
+
+        // Without `revoke` (an expired sign-in), nothing is sent for it.
+        let (url, requests) = canned_server(vec![]);
+        let mut h = harness(&url);
+        assert!(matches!(h.uploader.apply(UploadCommand::SignOut { deadline, revoke: false }).await, Flow::Continue));
+        assert_eq!(requests.try_iter().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_revoked_device_stops_uploads_and_keeps_the_queue() {
+        let revoked = abp("Tracker:DeviceRevoked", "This device was removed by an administrator.");
+        let (url, requests) = canned_server(vec![token_ok(), http("403 Forbidden", &[], &revoked)]);
+        let mut h = harness(&url);
+        h.queue("p1", true);
+        h.queue("p1", false);
+
+        assert_eq!(h.uploader.drain(None).await, PassEnd::SignInExpired);
+        assert_eq!(requests.try_iter().count(), 2, "nothing more is sent from this device");
+        match h.events.try_recv() {
+            Ok(UploadEvent::DeviceRevoked { reason, owner }) => {
+                assert_eq!(reason, "This device was removed by an administrator.");
+                assert_eq!(owner, h.owner);
+            }
+            other => panic!("expected the device revoked, got {other:?}"),
+        }
+        assert!(h.uploader.current.is_none());
+        assert!(h.rows().iter().all(|r| r.status == RowStatus::Queued), "kept");
+        assert_eq!(h.uploader.drain(None).await, PassEnd::Idle);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_rejection_of_one_row_never_stalls_the_rows_behind_it() {
+        let unknown = abp("Tracker:SomethingNew", "Something new went wrong.");
+        let (url, requests) = canned_server(vec![token_ok(), http("422 Unprocessable Entity", &[], &unknown), http("200 OK", &[], "{}")]);
+        let mut h = harness(&url);
+        let stuck = h.queue("p1", false);
+        h.queue("p1", false);
+
+        assert_eq!(h.uploader.drain(None).await, PassEnd::Drained);
+        assert_eq!(requests.try_iter().count(), 3);
+        let rows = h.rows();
+        assert_eq!(rows.len(), 1, "the second row went up");
+        assert_eq!((rows[0].id, rows[0].status), (stuck, RowStatus::Queued));
+        assert!(rows[0].reason.as_deref().is_some_and(|r| r.contains("Tracker:SomethingNew")), "{rows:?}");
+        // Retried on its own schedule, not by the queue-wide back-off.
+        assert_eq!(h.waits_for(), None);
+        assert!(!h.uploader.ready());
+        let wake = h.uploader.next_wake().expect("woken for the row's retry");
+        let wait = wake.saturating_duration_since(Instant::now()).as_secs();
+        assert!((290..=300).contains(&wait), "{wait}");
+    }
+
+    #[tokio::test]
+    async fn a_row_refused_too_often_is_parked_with_its_reason() {
+        let unknown = abp("Tracker:SomethingNew", "Something new went wrong.");
+        let (url, _requests) = canned_server(vec![token_ok(), http("422 Unprocessable Entity", &[], &unknown)]);
+        let mut h = harness(&url);
+        let id = h.queue("p1", false);
+        // Its earlier attempts, already used up but one.
+        for _ in 0..MAX_ROW_ATTEMPTS - 1 {
+            h.store().defer(id, "earlier", Utc::now() - chrono::Duration::seconds(1)).unwrap();
+        }
+        assert_eq!(h.uploader.drain(None).await, PassEnd::Drained);
+        let rows = h.rows();
+        assert_eq!(rows[0].status, RowStatus::Rejected);
+        assert!(rows[0].reason.as_deref().is_some_and(|r| r.contains("gave up after 10 attempts")), "{rows:?}");
+    }
+
+    #[test]
+    fn rows_are_retried_ever_later_up_to_six_hours() {
+        let waits: Vec<u64> = (1..=MAX_ROW_ATTEMPTS).map(|n| row_retry_after(n).as_secs() / 60).collect();
+        assert_eq!(waits, [5, 10, 20, 40, 80, 160, 320, 360, 360, 360]);
+    }
+
+    #[tokio::test]
+    async fn rows_recorded_for_another_server_are_never_sent_here() {
+        // The same email signed in on another organisation's server.
+        let (url, requests) = canned_server(vec![token_ok()]);
+        let mut h = harness(&url);
+        let elsewhere = crate::storage::owner_key("https://tracker.globex.com", "alice@acme.com");
+        let now = Utc::now();
+        h.store().enqueue(&Activity::new("p1", now - chrono::Duration::minutes(10), now), &elsewhere, "w1").unwrap();
+        assert!(!h.uploader.ready());
+        assert_eq!(h.uploader.drain(None).await, PassEnd::Drained);
+        assert_eq!(requests.try_iter().count(), 0, "nothing was sent");
     }
 }

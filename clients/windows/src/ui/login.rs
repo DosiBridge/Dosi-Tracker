@@ -7,7 +7,7 @@ use egui::{Align, Layout, Vec2};
 use super::widgets::{self, ButtonKind, Callout, Icon, Tone};
 use super::{format, TrackerApp};
 use crate::api::{classify_token_failure, AuthError};
-use crate::config::{normalize_server_url, AppConfig, ServerUrlError};
+use crate::config::{check_transport, normalize_server_url, AppConfig, ServerUrlError};
 use crate::state::{Command, SharedState, TrackerStatus, WorkspaceChoice};
 use crate::theme;
 
@@ -63,8 +63,10 @@ pub(super) enum SignInProblem {
     Throttled,
     /// The server failed, or answered with something that is not a sign-in.
     ServerError,
-    /// The saved password stopped working (the worker's own message).
+    /// The saved sign-in stopped working (the worker's own message).
     Expired,
+    /// A workspace admin removed this computer; it was signed out.
+    DeviceRemoved,
     /// The server refused the email or password; its own words say why
     /// (wrong password, locked out, not allowed).
     Refused,
@@ -85,8 +87,10 @@ impl SignInProblem {
             SignInProblem::Unreachable
         } else if message == classify_token_failure(429, "").user_message() || message.starts_with(THROTTLED_PREFIX) {
             SignInProblem::Throttled
-        } else if message == crate::worker::NO_WORKSPACE {
+        } else if message == crate::worker::NO_WORKSPACE || message == crate::worker::ALL_ARCHIVED {
             SignInProblem::NoWorkspace
+        } else if message == crate::state::DEVICE_REVOKED_TEXT {
+            SignInProblem::DeviceRemoved
         } else if SERVER_ERROR_PREFIXES.iter().any(|prefix| message.starts_with(prefix)) {
             SignInProblem::ServerError
         } else if message.starts_with(EXPIRED_PREFIX) {
@@ -94,6 +98,7 @@ impl SignInProblem {
         } else if message.starts_with(SCHEME_PREFIX)
             || message == ServerUrlError::Empty.to_string()
             || message == ServerUrlError::Invalid.to_string()
+            || message == ServerUrlError::Insecure.to_string()
         {
             SignInProblem::ServerAddress
         } else {
@@ -110,6 +115,7 @@ impl SignInProblem {
             SignInProblem::Throttled => "Too many sign-in attempts",
             SignInProblem::ServerError => "The server couldn't sign you in",
             SignInProblem::Expired => "",
+            SignInProblem::DeviceRemoved => "This computer was removed",
             SignInProblem::Refused => "Sign-in refused",
         }
     }
@@ -212,7 +218,11 @@ impl TrackerApp {
             submit |= self.password_row(ui);
             ui.add_space(6.0);
 
-            let server = normalize_server_url(&self.login.server);
+            // Refused here already as the worker would: never http:// to
+            // another computer without the admin's opt-in.
+            let allow_insecure_http = self.links.allow_insecure_http;
+            let server = normalize_server_url(&self.login.server)
+                .and_then(|url| check_transport(&url, allow_insecure_http).map(|()| url));
             submit |= self.advanced(ui, &server);
 
             if let Some(error) = &snapshot.login_error {
@@ -317,6 +327,11 @@ impl TrackerApp {
             Err(e) if self.login.server_edited => {
                 ui.add(egui::Label::new(egui::RichText::new(e.to_string()).font(theme::regular(11.5)).color(theme::DANGER_ON_TINT)).wrap());
             }
+            // Allowed by the admin, but say what it means.
+            Ok(normalized) if crate::config::is_unencrypted_remote(normalized) => {
+                let warning = format!("Not encrypted: {normalized} can be read on the network.");
+                ui.add(egui::Label::new(egui::RichText::new(warning).font(theme::regular(11.5)).color(theme::DANGER_ON_TINT)).wrap());
+            }
             // A bare host becomes https://…: say where it will go.
             Ok(normalized) if normalized != self.login.server.trim() => {
                 widgets::muted(ui, &format!("Signs in to {normalized}"));
@@ -366,8 +381,8 @@ impl TrackerApp {
         }
     }
 
-    /// The saved password stopped working: ask for it again, for the same
-    /// account — or let someone else sign in.
+    /// The saved sign-in stopped working: ask for the password again, for the
+    /// same account — or let someone else sign in.
     fn expired_form(&mut self, ui: &mut egui::Ui, snapshot: &SharedState) {
         ui.vertical_centered(|ui| {
             theme::logo_mark(ui, 52.0);
@@ -549,6 +564,7 @@ mod tests {
             ServerUrlError::Empty,
             ServerUrlError::Invalid,
             ServerUrlError::UnsupportedScheme("ftp".into()),
+            ServerUrlError::Insecure,
         ] {
             let problem = SignInProblem::of(&error.to_string());
             assert_eq!(problem, SignInProblem::ServerAddress, "{error}");
@@ -566,6 +582,14 @@ mod tests {
         assert_eq!(problem.tone(), Tone::Warning);
         assert!(problem.title().is_empty(), "the message says it all");
         assert_eq!(SignInProblem::Refused.tone(), Tone::Danger);
+    }
+
+    #[test]
+    fn a_removed_computer_and_archived_workspaces_are_named() {
+        let removed = SignInProblem::of(crate::state::DEVICE_REVOKED_TEXT);
+        assert_eq!((removed, removed.title(), removed.tone()), (SignInProblem::DeviceRemoved, "This computer was removed", Tone::Danger));
+        assert!(!removed.concerns_server());
+        assert_eq!(SignInProblem::of(crate::worker::ALL_ARCHIVED), SignInProblem::NoWorkspace);
     }
 
     #[test]

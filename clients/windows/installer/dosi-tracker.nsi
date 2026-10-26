@@ -7,26 +7,62 @@
 ;     so a machine-wide service would not work anyway.
 ;
 ; Build:  makensis /DVERSION=0.1.0 dosi-tracker.nsi
-;         (CI passes the version from Cargo.toml; VERSION_NUMERIC is the same
-;         without a pre-release suffix, for the Windows version resource.)
+;         (CI passes the agent's version; VERSION_NUMERIC is the same without
+;         a pre-release suffix, for the Windows version resource, and
+;         BUILD_NUMBER its fourth number.) Without them the version comes from
+;         the program's own version resource (build.rs), and given ones must
+;         match it.
+;         /DOUTFILE=<name> names the setup file (default
+;         dosi-tracker-setup-<VERSION>.exe).
 ; Expects the release binary at ..\target\release\dosi-tracker.exe
+;
+; Code signing: when a signing certificate is configured in the environment
+; (DOSI_SIGN_PFX, DOSI_SIGN_CERT_SHA1 or DOSI_SIGN_DLIB; see sign.ps1), the
+; program (in place, before it is packed), the uninstaller and the setup file
+; are Authenticode-signed with a timestamp, and the build fails if signing
+; fails. Without one, nothing is signed (and PowerShell is not needed).
 ;
 ; Command line (also with /S for a silent install):
 ;   /SERVER=<url>      the server address the agent signs in to; written to
-;                      config.toml next to the program (api_base_url)
+;                      config.toml next to the program (api_base_url). Must
+;                      be https:// (http:// only to this computer)
 ;   /DASHBOARD=<url>   the web dashboard opened from the app (dashboard_url)
 ; Other settings already in that config.toml are kept.
 ;
-; Uninstaller:
-;   /KEEPDATA          keep the sign-in, preferences, logs and offline queue
-;                      (otherwise it asks; a silent uninstall keeps them, so
-;                      tracked time not uploaded yet is never lost)
+;
+; Upgrading over an older install keeps the user's choices: "Start with
+; Windows" is only switched on by a first install (an upgrade leaves it as the
+; user set it in the app), and an agent that was running — or, signed in, would
+; have started with Windows anyway — is started again after a silent (/S)
+; install. An interactive install offers "Start Dosi Tracker now" instead.
+;
+; Uninstaller (also with /S):
+;   /KEEPDATA          keep the user's data: the sign-in, preferences, consent,
+;                      logs and the offline queue (with tracked time not
+;                      uploaded yet)
+;   /PURGE             delete that data, without asking (offboarding)
+; Without either, an interactive uninstall asks; a silent one KEEPS the data,
+; so tracked time not uploaded yet is never lost by accident. /KEEPDATA wins
+; over /PURGE.
 
+; The program's version resource: MAJOR.MINOR.PATCH.BUILD as EXE_V_1..4.
+!getdllversion "${__FILEDIR__}\..\target\release\dosi-tracker.exe" EXE_V_
 !ifndef VERSION
-  !define VERSION "0.1.0"
+  !define VERSION "${EXE_V_1}.${EXE_V_2}.${EXE_V_3}"
 !endif
 !ifndef VERSION_NUMERIC
   !define VERSION_NUMERIC "${VERSION}"
+!endif
+!ifndef BUILD_NUMBER
+  !define BUILD_NUMBER "${EXE_V_4}"
+!endif
+; A setup labelled with another version than the program it carries would
+; mislead support and the upgrade logic.
+!if "${VERSION_NUMERIC}.${BUILD_NUMBER}" != "${EXE_V_1}.${EXE_V_2}.${EXE_V_3}.${EXE_V_4}"
+  !error "VERSION ${VERSION_NUMERIC}.${BUILD_NUMBER} does not match dosi-tracker.exe's ${EXE_V_1}.${EXE_V_2}.${EXE_V_3}.${EXE_V_4}: build both with the same DOSI_VERSION and DOSI_BUILD_NUMBER"
+!endif
+!ifndef OUTFILE
+  !define OUTFILE "dosi-tracker-setup-${VERSION}.exe"
 !endif
 
 !define APP_NAME    "Dosi Tracker"
@@ -36,9 +72,11 @@
 !define DATA_DIR    "DosiTracker"
 !define REG_UNINST  "Software\Microsoft\Windows\CurrentVersion\Uninstall\DosiTracker"
 !define REG_RUN     "Software\Microsoft\Windows\CurrentVersion\Run"
+; Held by the running agent (src/single_instance.rs), per Windows session.
+!define MUTEX_NAME  "Local\DosiTracker.SingleInstance"
 
 Name "${APP_NAME}"
-OutFile "dosi-tracker-setup-${VERSION}.exe"
+OutFile "${OUTFILE}"
 Unicode True
 RequestExecutionLevel user               ; per-user: never prompts for UAC
 InstallDir "$LOCALAPPDATA\Programs\DosiTracker"
@@ -46,13 +84,35 @@ InstallDirRegKey HKCU "Software\DosiTracker" "InstallDir"
 ShowInstDetails show
 ShowUnInstDetails show
 
-VIProductVersion "${VERSION_NUMERIC}.0"
+VIProductVersion "${VERSION_NUMERIC}.${BUILD_NUMBER}"
 VIAddVersionKey "ProductName"    "${APP_NAME}"
 VIAddVersionKey "CompanyName"    "${COMPANY}"
 VIAddVersionKey "FileDescription" "${APP_NAME} activity agent"
 VIAddVersionKey "FileVersion"    "${VERSION}"
 VIAddVersionKey "ProductVersion" "${VERSION}"
 VIAddVersionKey "LegalCopyright" "MIT"
+
+; Authenticode signing, only with a certificate in the environment (an unset
+; variable stays as the literal "$%NAME%" here).
+!macro _SignWhenSet NAME
+  !searchparse /noerrors "$%${NAME}%" "$%" _UNSET_${NAME}
+  !ifndef _UNSET_${NAME}
+    !if "$%${NAME}%" != ""
+      !define /ifndef SIGN
+    !endif
+  !endif
+!macroend
+!insertmacro _SignWhenSet DOSI_SIGN_PFX
+!insertmacro _SignWhenSet DOSI_SIGN_CERT_SHA1
+!insertmacro _SignWhenSet DOSI_SIGN_DLIB
+!ifdef SIGN
+  !define SIGN_CMD 'powershell -NoProfile -ExecutionPolicy Bypass -File "${__FILEDIR__}\sign.ps1"'
+  ; The program first, before File packs it.
+  !system '${SIGN_CMD} "${__FILEDIR__}\..\target\release\${EXE_NAME}"' = 0
+  ; The uninstaller as it is written into the setup, and the setup itself.
+  !uninstfinalize '${SIGN_CMD} "%1"' = 0
+  !finalize '${SIGN_CMD} "%1"' = 0
+!endif
 
 !include "MUI2.nsh"
 !include "FileFunc.nsh"
@@ -76,19 +136,39 @@ Var DashboardUrl
 ; What SetConfigValue writes.
 Var CfgKey
 Var CfgValue
+; The agent ran in this session when the installer started.
+Var WasRunning
+
+; Is the agent running in this Windows session? Its single-instance mutex
+; exists then (the name is per session, so other users' agents do not count).
+; Out: "1" or "0" in OUT.
+!macro IsAgentRunning OUT
+  System::Call 'kernel32::OpenMutexW(i 0x00100000, i 0, w "${MUTEX_NAME}") p.r9'
+  ${If} $9 != 0
+    System::Call 'kernel32::CloseHandle(p r9)'
+    StrCpy ${OUT} 1
+  ${Else}
+    StrCpy ${OUT} 0
+  ${EndIf}
+!macroend
 
 ; Ask a running agent to quit gracefully — it saves the block in progress
 ; first — using EXE (a build that knows --quit; it waits up to 30 s), then
 ; end whatever still runs: an older build that does not listen for --quit,
 ; or one that did not finish in time. The file must not be locked when it is
-; replaced or removed.
+; replaced or removed. Only this user's agent in this Windows session is
+; ended: an installer run by an admin (or in another session) never kills
+; other users' agents, which would lose their unsaved block.
 !macro StopRunningAgent EXE
   DetailPrint "Asking ${APP_NAME} to save its work and close…"
   ${If} ${FileExists} "${EXE}"
     nsExec::ExecToLog '"${EXE}" --quit'
     Pop $0
   ${EndIf}
-  nsExec::ExecToLog 'taskkill /F /IM "${EXE_NAME}"'
+  System::Call 'kernel32::GetCurrentProcessId() i.r8'
+  System::Call 'kernel32::ProcessIdToSessionId(i r8, *i .r9)'
+  ReadEnvStr $7 USERNAME
+  nsExec::ExecToLog 'taskkill /F /IM "${EXE_NAME}" /FI "SESSION eq $9" /FI "USERNAME eq $7"'
   Pop $0
   Sleep 800
 !macroend
@@ -195,6 +275,77 @@ Function ValidateUrl
     Goto scan
   scanned:
   StrCpy $0 $1
+  Pop $3
+  Pop $2
+  Pop $1
+  Exch $0
+FunctionEnd
+
+; Is this a plain http:// address of another computer? The agent refuses
+; those (the password and screenshots would cross the network unencrypted)
+; unless an admin sets allow_insecure_http = true in config.toml by hand;
+; http:// to this computer (localhost, 127.x.x.x, [::1]) is fine.
+; In: the address on the stack. Out: "1" (insecure) or "0" on the stack.
+Function IsInsecureRemote
+  Exch $0
+  Push $1
+  Push $2
+  Push $3
+  Push $4
+  StrCpy $1 0
+  StrCpy $2 $0 7
+  ${If} $2 == "http://"
+    StrCpy $0 $0 "" 7
+    ; The host runs to the first "/" or ":" (outside an [IPv6] literal).
+    StrCpy $2 0
+    StrCpy $4 0
+    host_scan:
+      StrCpy $3 $0 1 $2
+      StrCmp $3 "" host_done
+      StrCmp $3 "/" host_done
+      ${If} $3 == ":"
+      ${AndIf} $4 == 0
+        Goto host_done
+      ${EndIf}
+      ${If} $3 == "["
+        StrCpy $4 1
+      ${ElseIf} $3 == "]"
+        StrCpy $4 0
+      ${EndIf}
+      IntOp $2 $2 + 1
+      Goto host_scan
+    host_done:
+    StrCpy $0 $0 $2
+    StrCpy $1 1
+    StrCpy $3 $0 "" -10
+    ; String comparisons are case-insensitive.
+    ${If} $0 == "localhost"
+    ${OrIf} $0 == "[::1]"
+    ${OrIf} $3 == ".localhost"
+      StrCpy $1 0
+    ${EndIf}
+    ; 127.x.x.x: "127." followed by digits and dots only (not 127.example.com).
+    StrCpy $2 $0 4
+    ${If} $2 == "127."
+      StrCpy $1 0
+      StrCpy $2 4
+      ip_scan:
+        StrCpy $3 $0 1 $2
+        StrCmp $3 "" ip_done
+        ; A digit is "0", or a character IntOp reads as 1..9.
+        IntOp $4 $3 + 0
+        ${If} $3 != "."
+        ${AndIf} $3 != "0"
+        ${AndIf} $4 == 0
+          StrCpy $1 1
+        ${EndIf}
+        IntOp $2 $2 + 1
+        Goto ip_scan
+      ip_done:
+    ${EndIf}
+  ${EndIf}
+  StrCpy $0 $1
+  Pop $4
   Pop $3
   Pop $2
   Pop $1
@@ -374,6 +525,14 @@ Function .onInit
       SetErrorLevel 2
       Abort
     ${EndIf}
+    Push $ServerUrl
+    Call IsInsecureRemote
+    Pop $R1
+    ${If} $R1 == 1
+      MessageBox MB_ICONSTOP "/SERVER must use https:// (got: $ServerUrl). Plain http:// would send passwords and screenshots unencrypted; only http://localhost is accepted. On a network you trust, set allow_insecure_http = true in config.toml yourself." /SD IDOK
+      SetErrorLevel 2
+      Abort
+    ${EndIf}
   ${EndIf}
   ${If} $DashboardUrl != ""
     Push $DashboardUrl
@@ -388,6 +547,13 @@ Function .onInit
 FunctionEnd
 
 Section "Install"
+  ; What was there before: an earlier install, its autostart choice, and
+  ; whether the agent runs now (read before anything is changed).
+  ReadRegStr $R5 HKCU "Software\DosiTracker" "InstallDir"
+  ReadRegStr $R6 HKCU "${REG_UNINST}" "UninstallString"
+  ReadRegStr $R7 HKCU "${REG_RUN}" "DosiTracker"
+  !insertmacro IsAgentRunning $WasRunning
+
   ; The new build first, in a temporary folder: it knows how to ask the
   ; running agent to quit gracefully (an older one would only be ended).
   InitPluginsDir
@@ -424,8 +590,17 @@ Section "Install"
   CreateShortCut "$SMPROGRAMS\${COMPANY}\${APP_NAME}.lnk" "$INSTDIR\${EXE_NAME}"
 
   ; Start with Windows (the in-app Settings toggle manages the same value).
-  ; --autostart lets the app start quietly in the tray at sign-in.
-  WriteRegStr HKCU "${REG_RUN}" "DosiTracker" '"$INSTDIR\${EXE_NAME}" --autostart'
+  ; --autostart lets the app start quietly in the tray at sign-in. A first
+  ; install switches it on; an upgrade keeps the user's choice (the value is
+  ; rewritten only when it is there, for the folder installed to now).
+  ${If} $R5 == ""
+  ${AndIf} $R6 == ""
+    WriteRegStr HKCU "${REG_RUN}" "DosiTracker" '"$INSTDIR\${EXE_NAME}" --autostart'
+  ${ElseIf} $R7 != ""
+    WriteRegStr HKCU "${REG_RUN}" "DosiTracker" '"$INSTDIR\${EXE_NAME}" --autostart'
+  ${Else}
+    DetailPrint "Start with Windows stays off, as set in ${APP_NAME}."
+  ${EndIf}
 
   ; Add/Remove Programs entry
   WriteRegStr   HKCU "${REG_UNINST}" "DisplayName"     "${APP_NAME}"
@@ -438,6 +613,24 @@ Section "Install"
   WriteRegDWORD HKCU "${REG_UNINST}" "NoRepair" 1
 
   WriteUninstaller "$INSTDIR\uninstall.exe"
+
+  ; A silent upgrade (MDM, a script) must not leave the user untracked until
+  ; their next Windows sign-in: start the agent again if it was running, or
+  ; if it is signed in and starts with Windows (so it would be running).
+  ; --autostart: it comes back the way it starts at sign-in, in the tray.
+  ; Interactively the finish page offers to start it.
+  ${If} ${Silent}
+    StrCpy $R8 $WasRunning
+    ReadRegStr $R7 HKCU "${REG_RUN}" "DosiTracker"
+    ${If} $R7 != ""
+    ${AndIf} ${FileExists} "$APPDATA\${DATA_DIR}\credentials.bin"
+      StrCpy $R8 1
+    ${EndIf}
+    ${If} $R8 == 1
+      DetailPrint "Starting ${APP_NAME} again."
+      Exec '"$INSTDIR\${EXE_NAME}" --autostart'
+    ${EndIf}
+  ${EndIf}
 SectionEnd
 
 Section "Uninstall"
@@ -456,22 +649,39 @@ Section "Uninstall"
   DeleteRegKey   HKCU "${REG_UNINST}"
   DeleteRegKey   HKCU "Software\DosiTracker"
 
-  ; The user's data: the DPAPI-encrypted sign-in and the preferences
-  ; (%APPDATA%\DosiTracker), and the offline queue — with any tracked time
-  ; not uploaded yet — the logs and the device id (%LOCALAPPDATA%\DosiTracker).
+  ; The user's data: the DPAPI-encrypted sign-in, the preferences, the
+  ; consent record and the device signing key (%APPDATA%\DosiTracker), and
+  ; the offline queue — with any tracked time not uploaded yet — the logs and
+  ; the device id (%LOCALAPPDATA%\DosiTracker). /KEEPDATA keeps it, /PURGE
+  ; deletes it; otherwise an interactive uninstall asks and a silent one
+  ; keeps it.
   ${un.GetParameters} $R0
+  StrCpy $R2 "ask"
+  ClearErrors
+  ${un.GetOptions} $R0 "/PURGE" $R1
+  ${IfNot} ${Errors}
+    StrCpy $R2 "purge"
+  ${EndIf}
   ClearErrors
   ${un.GetOptions} $R0 "/KEEPDATA" $R1
   ${IfNot} ${Errors}
-    DetailPrint "Keeping your ${APP_NAME} data (/KEEPDATA)."
+    StrCpy $R2 "keep"
+  ${EndIf}
+  ${If} $R2 == "ask"
+    ${If} ${Silent}
+      StrCpy $R2 "keep"
+    ${Else}
+      StrCpy $R2 "keep"
+      MessageBox MB_YESNO|MB_ICONQUESTION "Also delete your ${APP_NAME} data from this computer?$\r$\n$\r$\nThis removes your saved sign-in and preferences, the logs, and any tracked time that has not been uploaded yet.$\r$\n$\r$\nChoose No to keep it for a later install." IDNO data_chosen
+        StrCpy $R2 "purge"
+      data_chosen:
+    ${EndIf}
+  ${EndIf}
+  ${If} $R2 == "purge"
+    RMDir /r "$APPDATA\${DATA_DIR}"
+    RMDir /r "$LOCALAPPDATA\${DATA_DIR}"
+    DetailPrint "Removed your ${APP_NAME} data."
   ${Else}
-    MessageBox MB_YESNO|MB_ICONQUESTION "Also delete your ${APP_NAME} data from this computer?$\r$\n$\r$\nThis removes your saved sign-in and preferences, the logs, and any tracked time that has not been uploaded yet.$\r$\n$\r$\nChoose No to keep it for a later install." /SD IDNO IDNO keep_data
-      RMDir /r "$APPDATA\${DATA_DIR}"
-      RMDir /r "$LOCALAPPDATA\${DATA_DIR}"
-      DetailPrint "Removed your ${APP_NAME} data."
-      Goto data_done
-    keep_data:
-      DetailPrint "Kept your ${APP_NAME} data in $APPDATA\${DATA_DIR} and $LOCALAPPDATA\${DATA_DIR}."
-    data_done:
+    DetailPrint "Kept your ${APP_NAME} data in $APPDATA\${DATA_DIR} and $LOCALAPPDATA\${DATA_DIR}."
   ${EndIf}
 SectionEnd

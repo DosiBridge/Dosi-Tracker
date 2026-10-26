@@ -1,12 +1,16 @@
-//! Device-local HMAC-SHA256 payload signing.
+//! Device-local HMAC-SHA256 payload tags.
 //!
 //! Each device generates a 32-byte secret key once, encrypts it with Windows
-//! DPAPI (user-scoped, same as the credentials file), and stores it next to
-//! the credentials. Every activity payload written to the local SQLite queue is
-//! signed with that key before it reaches disk. The server verifies the
-//! signature on upload using the key it received at heartbeat registration, so
-//! a row whose `sig` column has been edited (or whose payload was modified after
-//! signing) is rejected before it can affect billing or reports.
+//! DPAPI (user-scoped, see [`crate::dpapi`]), and stores it next to the
+//! credentials. Every activity payload written to the local SQLite queue is
+//! tagged with that key before it reaches disk.
+//!
+//! **This is not tamper protection the server enforces.** The key is never
+//! sent to the server and the server does not verify the tag, so an edited
+//! queue row is uploaded like any other; a row whose images were stripped
+//! after a 413 no longer matches its tag either. Real attestation needs a
+//! per-device key registered with the server, a signature over the exact
+//! uploaded body and server-side verification — none of which exists yet.
 //!
 //! `sign_payload` and `verify_payload` are HMAC-SHA256 over the canonical UTF-8
 //! JSON bytes of the activity as serialised by `serde_json`. Any field edit
@@ -41,7 +45,7 @@ pub fn load_or_create_key() -> Result<Vec<u8>> {
 pub fn load_or_create_key_at(path: &Path) -> Result<Vec<u8>> {
     if path.exists() {
         if let Ok(raw) = std::fs::read(path) {
-            if let Ok(key) = dpapi::unprotect(&raw) {
+            if let Ok(key) = crate::dpapi::unprotect(&raw, None) {
                 if key.len() == 32 {
                     return Ok(key);
                 }
@@ -63,13 +67,7 @@ fn generate_key() -> Vec<u8> {
 }
 
 fn save_key_at(path: &Path, key: &[u8]) -> Result<()> {
-    let encrypted = dpapi::protect(key)?;
-    let mut temp = path.as_os_str().to_os_string();
-    temp.push(".tmp");
-    let temp = PathBuf::from(temp);
-    std::fs::write(&temp, &encrypted)?;
-    std::fs::rename(&temp, path)?;
-    Ok(())
+    crate::fsutil::write_atomically(path, &crate::dpapi::protect(key, None)?)
 }
 
 /// Sign `payload_json` (the canonical bytes written to the SQLite queue) and
@@ -90,86 +88,6 @@ pub fn verify_payload(key: &[u8], payload_json: &[u8], sig: &str) -> bool {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key size");
     mac.update(payload_json);
     mac.verify_slice(&tag).is_ok()
-}
-
-// ─── DPAPI shim (same pattern as credentials.rs) ────────────────────────────
-
-#[cfg(windows)]
-mod dpapi {
-    use anyhow::{anyhow, Result};
-    use windows::Win32::Foundation::LocalFree;
-    use windows::Win32::Security::Cryptography::{
-        CryptProtectData, CryptUnprotectData, CRYPT_INTEGER_BLOB,
-    };
-
-    unsafe fn take_blob(blob: &CRYPT_INTEGER_BLOB) -> Vec<u8> {
-        let out = if blob.pbData.is_null() {
-            Vec::new()
-        } else {
-            unsafe { std::slice::from_raw_parts(blob.pbData, blob.cbData as usize) }.to_vec()
-        };
-        if !blob.pbData.is_null() {
-            let _ = unsafe {
-                LocalFree(windows::Win32::Foundation::HLOCAL(
-                    blob.pbData as *mut core::ffi::c_void,
-                ))
-            };
-        }
-        out
-    }
-
-    pub fn protect(plaintext: &[u8]) -> Result<Vec<u8>> {
-        let input = CRYPT_INTEGER_BLOB {
-            cbData: plaintext.len() as u32,
-            pbData: plaintext.as_ptr() as *mut u8,
-        };
-        let mut output = CRYPT_INTEGER_BLOB::default();
-        unsafe {
-            CryptProtectData(
-                &input,
-                None,
-                None,
-                None,
-                None,
-                windows::Win32::Security::Cryptography::CRYPTPROTECT_UI_FORBIDDEN,
-                &mut output,
-            )
-            .map_err(|e| anyhow!("CryptProtectData failed: {e}"))?;
-            Ok(take_blob(&output))
-        }
-    }
-
-    pub fn unprotect(ciphertext: &[u8]) -> Result<Vec<u8>> {
-        let input = CRYPT_INTEGER_BLOB {
-            cbData: ciphertext.len() as u32,
-            pbData: ciphertext.as_ptr() as *mut u8,
-        };
-        let mut output = CRYPT_INTEGER_BLOB::default();
-        unsafe {
-            CryptUnprotectData(
-                &input,
-                None,
-                None,
-                None,
-                None,
-                windows::Win32::Security::Cryptography::CRYPTPROTECT_UI_FORBIDDEN,
-                &mut output,
-            )
-            .map_err(|e| anyhow!("CryptUnprotectData failed: {e}"))?;
-            Ok(take_blob(&output))
-        }
-    }
-}
-
-#[cfg(not(windows))]
-mod dpapi {
-    use anyhow::Result;
-    pub fn protect(plaintext: &[u8]) -> Result<Vec<u8>> {
-        Ok(plaintext.to_vec())
-    }
-    pub fn unprotect(ciphertext: &[u8]) -> Result<Vec<u8>> {
-        Ok(ciphertext.to_vec())
-    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────

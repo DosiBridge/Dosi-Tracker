@@ -38,9 +38,10 @@ pub enum TrackerStatus {
     /// Signed in, but no project is chosen: there are several and none was
     /// remembered, the remembered one is gone, or there are none at all.
     ChooseProject,
-    /// The server no longer accepts the saved password (changed, reset or the
-    /// account deactivated). Tracking stopped; the queue is kept and uploads
-    /// once the password is entered again (workspace and email prefilled).
+    /// The server no longer accepts the saved sign-in (the refresh token was
+    /// revoked or expired, the password changed, the account deactivated).
+    /// Tracking stopped; the queue is kept and uploads once the password is
+    /// entered again (workspace and email prefilled).
     SignInExpired,
     /// Affirmative local consent has not been granted, or was revoked.
     ConsentRequired,
@@ -120,8 +121,9 @@ pub struct RecentBlock {
     pub started_at: DateTime<Utc>,
     pub ended_at: DateTime<Utc>,
     pub productivity: u8,
-    pub keyboard_hits: u64,
-    pub mouse_clicks: u64,
+    /// `None` when that kind of input was not measured.
+    pub keyboard_hits: Option<u64>,
+    pub mouse_clicks: Option<u64>,
     pub screenshot: bool,
     pub upload: UploadState,
 }
@@ -229,10 +231,14 @@ pub enum NoticeKind {
     /// The local queue was damaged; it was set aside at `moved_to` and a fresh
     /// one started.
     QueueReset { moved_to: String },
-    /// The saved password no longer works.
+    /// The saved sign-in no longer works.
     SignInExpired,
-    /// The account lost access to the workspace it tracked in.
-    WorkspaceLost { name: String },
+    /// The server refused the workspace tracked in: access removed, the
+    /// workspace archived, or (a setup problem) the workspace never named.
+    WorkspaceLost { name: String, refusal: crate::api::WorkspaceRefusal },
+    /// A workspace admin removed this computer: tracking stopped and the
+    /// saved sign-in was forgotten.
+    DeviceRevoked,
 }
 
 impl Notice {
@@ -254,7 +260,23 @@ impl Notice {
                 format!("The local queue was damaged and was set aside ({moved_to}). Tracking continues.")
             }
             NoticeKind::SignInExpired => "Your sign-in has expired. Enter your password to continue tracking.".to_owned(),
-            NoticeKind::WorkspaceLost { name } => format!("You no longer have access to {name}. Choose another workspace."),
+            NoticeKind::WorkspaceLost { name, refusal } => format!("{} Choose another workspace.", workspace_lost_text(name, *refusal)),
+            NoticeKind::DeviceRevoked => DEVICE_REVOKED_TEXT.to_owned(),
+        }
+    }
+}
+
+/// Why tracking stopped after a workspace admin removed this computer.
+pub const DEVICE_REVOKED_TEXT: &str = "This computer was removed from Dosi Tracker by your workspace admin. \
+     Tracking stopped and you were signed out; your recorded time is kept on this computer.";
+
+/// One sentence on why the workspace `name` can no longer be tracked in.
+pub fn workspace_lost_text(name: &str, refusal: crate::api::WorkspaceRefusal) -> String {
+    match refusal {
+        crate::api::WorkspaceRefusal::NotMember => format!("You no longer have access to {name}."),
+        crate::api::WorkspaceRefusal::Archived => format!("{name} was archived; nothing more can be tracked there."),
+        crate::api::WorkspaceRefusal::Required => {
+            format!("The server did not receive which workspace to use ({name}); a proxy may be removing it.")
         }
     }
 }
@@ -284,8 +306,11 @@ pub struct SharedState {
     /// The name of the workspace tracked in.
     pub workspace: String,
     /// The server this account talks to (the address saved at sign-in, else
-    /// the configured one).
+    /// the configured one). Set with [`SharedState::set_server`].
     pub server_url: String,
+    /// `server_url` is plain `http://` to another computer (the admin allowed
+    /// it): the window warns that the connection is not encrypted.
+    pub unencrypted_connection: bool,
     /// Whether the server answered the latest request. Tracking goes on
     /// offline (on the saved project list); blocks upload once it is back.
     pub server_reachable: bool,
@@ -378,6 +403,7 @@ impl Default for SharedState {
             display_name: String::new(),
             workspace: String::new(),
             server_url: String::new(),
+            unencrypted_connection: false,
             server_reachable: true,
             projects: Vec::new(),
             selected_project: None,
@@ -426,6 +452,12 @@ impl SharedState {
     pub fn current_project(&self) -> Option<&ProjectOption> {
         let id = self.selected_project.as_deref()?;
         self.projects.iter().find(|p| p.id == id)
+    }
+
+    /// Show `server` as the one talked to, and whether that is unencrypted.
+    pub fn set_server(&mut self, server: String) {
+        self.unencrypted_connection = crate::config::is_unencrypted_remote(&server);
+        self.server_url = server;
     }
 
     /// Queue a notice for the window, keeping the newest [`MAX_NOTICES`].

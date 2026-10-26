@@ -9,6 +9,13 @@
 # sign-in screen is saved with that sign-in and wins over this one.
 api_base_url = "https://localhost:6006"
 
+# Plain http:// is refused for any server other than this computer
+# (localhost, 127.x.x.x, [::1]): the password, tokens, screenshots and window
+# titles would cross the network unencrypted. Only on a network you trust,
+# an admin may allow it here; the window then warns that the connection is
+# not encrypted. Redirects are never followed either way.
+allow_insecure_http = false
+
 # The web dashboard, opened by "Web dashboard" in the window and the tray menu.
 # Left at this local default while the server is elsewhere, the app greys the
 # dashboard buttons out rather than open a page that does not exist.

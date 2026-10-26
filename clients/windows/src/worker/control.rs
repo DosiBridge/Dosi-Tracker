@@ -13,7 +13,7 @@ use chrono::{DateTime, Local, Utc};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
-use crate::api::{ApiClient, ApiError, AuthError, ServerClock, Workspace};
+use crate::api::{ApiClient, ApiError, AuthError, ServerClock, Workspace, WorkspaceRefusal};
 use crate::model::{Heartbeat, Project};
 use crate::state::StateHandle;
 
@@ -58,11 +58,13 @@ pub enum ControlEvent {
     SignedIn { account: Account, workspaces: Result<Vec<Workspace>, ApiError> },
     SignInFailed(AuthError),
     MyWorkspaces(Result<Vec<Workspace>, String>),
-    /// 403 `Tracker:NotWorkspaceMember` for this workspace.
-    WorkspaceLost(String),
+    /// The server refused this workspace (access lost, archived, required).
+    WorkspaceLost(String, WorkspaceRefusal),
+    /// 403 `Tracker:DeviceRevoked`: a workspace admin removed this computer.
+    DeviceRevoked(String),
     Projects(Vec<Project>),
     ProjectsFailed(ApiError),
-    /// The server no longer accepts the saved password.
+    /// The server no longer accepts the saved sign-in (its refresh token).
     SignInExpired(String),
     /// Whether the server answered.
     Reachable(bool),
@@ -149,9 +151,11 @@ impl Control {
     fn report(&self, error: &ApiError) {
         if let ApiError::Auth(AuthError::Rejected(reason)) = error {
             self.emit(ControlEvent::SignInExpired(reason.clone()));
-        } else if let ApiError::NotWorkspaceMember(_) = error {
+        } else if let ApiError::DeviceRevoked(reason) = error {
+            self.emit(ControlEvent::DeviceRevoked(reason.clone()));
+        } else if let ApiError::Workspace { refusal, .. } = error {
             if let Some(workspace) = self.client.as_ref().and_then(ApiClient::workspace_id) {
-                self.emit(ControlEvent::WorkspaceLost(workspace.to_owned()));
+                self.emit(ControlEvent::WorkspaceLost(workspace.to_owned(), *refusal));
             }
         } else if matches!(error, ApiError::Offline(_)) {
             self.emit(ControlEvent::Reachable(false));
@@ -402,9 +406,47 @@ mod tests {
         link.send(ControlRequest::UseAccount(Some(account(&url))));
         link.send(ControlRequest::RefreshProjects);
         match next(&mut events).await {
-            ControlEvent::WorkspaceLost(workspace) => assert_eq!(workspace, "w1"),
+            ControlEvent::WorkspaceLost(workspace, refusal) => assert_eq!((workspace.as_str(), refusal), ("w1", WorkspaceRefusal::NotMember)),
             other => panic!("expected the workspace lost, got {other:?}"),
         }
-        assert!(matches!(next(&mut events).await, ControlEvent::ProjectsFailed(ApiError::NotWorkspaceMember(_))));
+        assert!(matches!(
+            next(&mut events).await,
+            ControlEvent::ProjectsFailed(ApiError::Workspace { refusal: WorkspaceRefusal::NotMember, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_archived_workspace_and_a_revoked_device_are_reported() {
+        let token = r#"{"access_token":"t","expires_in":3600}"#;
+        let archived = r#"{"error":{"code":"Tracker:WorkspaceArchived","message":"Archived"}}"#;
+        let revoked = r#"{"error":{"code":"Tracker:DeviceRevoked","message":"This device was removed."}}"#;
+        let url = canned_server(vec![http("200 OK", token), http("403 Forbidden", archived), http("403 Forbidden", revoked)]);
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let link = spawn(StateHandle::new(), ServerClock::default(), tx);
+        link.send(ControlRequest::UseAccount(Some(account(&url))));
+        link.send(ControlRequest::RefreshProjects);
+        assert!(matches!(next(&mut events).await, ControlEvent::WorkspaceLost(w, WorkspaceRefusal::Archived) if w == "w1"));
+        assert!(matches!(next(&mut events).await, ControlEvent::ProjectsFailed(_)));
+
+        // A heartbeat answered 403 DeviceRevoked.
+        let heartbeat = crate::model::Heartbeat {
+            device_id: "5b0c1b9e-8f2c-4a43-9a51-0c7f6f2d9b11".into(),
+            device_name: None,
+            platform: Some("windows".into()),
+            os_version: None,
+            agent_version: None,
+            status: crate::model::PresenceStatus::Tracking,
+            project_id: None,
+            status_since: None,
+            current_app: None,
+            time_zone: None,
+            utc_offset_minutes: None,
+            sent_at: None,
+        };
+        link.send(ControlRequest::Heartbeat(Box::new(heartbeat)));
+        match next(&mut events).await {
+            ControlEvent::DeviceRevoked(reason) => assert_eq!(reason, "This device was removed."),
+            other => panic!("expected the device revoked, got {other:?}"),
+        }
     }
 }
