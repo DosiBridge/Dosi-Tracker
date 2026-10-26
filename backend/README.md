@@ -43,10 +43,10 @@ container's environment there).
 
 #### AI assist (off by default)
 
-AI assist will send aggregated tracker data to an OpenAI-protocol provider, only in workspaces whose owner turns it on.
-So far the server has the provider configuration, the workspace settings, the usage views, the toolkit that
-prepares requests and checks answers, the request pipeline and the read layer; no endpoint calls the provider yet. It
-is off unless `AI__Enabled=true`.
+AI assist sends aggregated tracker data to an OpenAI-protocol provider, only in workspaces whose owner turns it on,
+and only when someone clicks an AI card (nothing generates on its own). The server has the provider configuration, the
+workspace settings, the usage views, the toolkit that prepares requests and checks answers, the request pipeline, the
+read layer and the six AI cards below; Ask AI is not served yet. It is off unless `AI__Enabled=true`.
 
 - **Owners opt in** (`PUT /api/app/ai-assist/settings`) after acknowledging the current disclosure version
   (`"1.{AI:Disclosure:Version}"`); turning on window titles or task notes needs the same acknowledgement. Every change
@@ -78,6 +78,24 @@ is off unless `AI__Enabled=true`.
   or an open breaker gives the feature's deterministic fallback. Every served request writes one ledger row in its own
   short transaction, refusals write none, and AI-calling methods must not hold a database transaction. Metrics are on
   the `Dosi.Tracker.AI` meter (`ai.requests`, `ai.tokens`, `ai.latency_ms`, `ai.injection_flags`).
+- **The AI cards** (`Application/AiAssist/Features`, all `POST /api/app/ai-assist/...`):
+  - `period-summary`: the team, one project ("project pulse", with its task counts) or the caller's own time, at most
+    31 days; members carry their tracked time only (at most 12 by name, the rest folded), never their activity %.
+  - `member-day-summary`: one local day of the caller, or of another member for owners and managers who see the team.
+  - `report-explanation`: the nine reports of the web app's catalog (never payroll), owners and managers only, at most
+    366 days (weeks above 31 days, months above 92); device names and OS versions are never read.
+  - `data-quality-review`: fixed rules (`DataQualityRules`: gaps of three weekdays or more, device clocks over five
+    minutes off, more than 30% of time without activity measurement, three or more blocks with software-generated
+    input, and for teams members who never tracked and outdated agents) find at most 20 candidates; the model only
+    picks and explains at most five, and items naming anything else are dropped. No candidates, no call.
+  - `note-suggestions`: up to three notes for a block whose note the caller could save; nothing is written.
+  - `task-drafts`: drafts for a project whose tasks the caller could add; nothing is created. It has no fallback: an
+    answer that stays invalid is `Tracker:AiOutputInvalid` (502).
+  - `feedback`: helpful / not helpful on one of the caller's own results (204; anyone else's id is a 404).
+
+  Window titles and notes are sent only when the owner allows them (day summaries and note suggestions). When the
+  provider fails or an answer stays invalid, every card but task drafts answers with a deterministic summary built from
+  the same figures (`meta.status` `fallback`). The task-drafts goal is kept out of the audit log.
 - **The read layer** (`Application/AiAssist/Read`) is the only way AI reads workspace data: the reporting, activity,
   team, project and task app services, called as the caller, projected to models without emails, device names, OS
   versions, input counts, timelines, captures or pay. A caller who does not see the team reads only their own data,
