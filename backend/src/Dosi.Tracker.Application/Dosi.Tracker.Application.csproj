@@ -9,6 +9,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <EmbeddedResource Include="AiAssist\Help\*.md" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\Dosi.Tracker.Domain\Dosi.Tracker.Domain.csproj" />
     <ProjectReference Include="..\Dosi.Tracker.Application.Contracts\Dosi.Tracker.Application.Contracts.csproj" />
   </ItemGroup>
