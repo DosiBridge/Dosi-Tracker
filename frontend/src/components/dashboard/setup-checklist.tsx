@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { CheckCircle2, Circle, Download, FolderPlus, UserPlus, ArrowRight } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { AiSetupHelpButton } from "@/components/ai/ai-setup-help-button";
 import { projects, users, activities } from "@/lib/tenant-data";
 import { isTrackedMember } from "@/lib/roles";
 import { cn } from "@/lib/utils";
@@ -62,11 +63,14 @@ export function SetupChecklist({ isOwner }: { isOwner: boolean }) {
               {remaining} {remaining === 1 ? "step" : "steps"} left — create a project, invite people to it, then install the agent.
             </p>
           </div>
-          {isOwner && (
-            <Link href="/billing" className="text-xs text-muted-foreground hover:text-foreground hover:underline">
-              Plan & billing later →
-            </Link>
-          )}
+          <div className="flex flex-wrap items-center gap-3">
+            <AiSetupHelpButton />
+            {isOwner && (
+              <Link href="/billing" className="text-xs text-muted-foreground hover:text-foreground hover:underline">
+                Plan & billing later →
+              </Link>
+            )}
+          </div>
         </div>
       </CardHeader>
       <CardContent>

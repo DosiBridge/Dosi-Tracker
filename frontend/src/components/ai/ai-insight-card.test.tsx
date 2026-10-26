@@ -45,6 +45,8 @@ function context(patch: Partial<AiAssistantValue> = {}): AiAssistantValue {
     cache: { get: () => undefined, set: () => {} },
     drawerOpen: false,
     setDrawerOpen: () => {},
+    openAssistant: () => {},
+    drawerRequest: { seq: 0, chips: "page", prompt: null },
     pageContext: null,
     ...patch,
   };

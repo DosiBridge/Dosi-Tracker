@@ -8,6 +8,7 @@ import { Topbar } from "@/components/layout/topbar";
 import { CommandPalette } from "@/components/command-palette";
 import { AiAssistantProvider } from "@/components/ai/ai-provider";
 import { AiCardsPreload } from "@/components/ai/ai-cards-preload";
+import { AiAssistantMount } from "@/components/ai/ai-assistant-mount";
 import { ToastViewport } from "@/components/toast";
 import { RoleGuard } from "@/components/role-guard";
 import { PageEnter } from "@/components/motion/reveal";
@@ -31,7 +32,7 @@ function DashboardShell({ children }: { children: React.ReactNode }) {
   const { workspace, user, isImpersonating, stopImpersonating } = useSession();
 
   return (
-    // AI assist's context (status, results, drawer): scoped to the workspace, reset by a switch.
+    // AI assist's context (status, results, the Ask AI drawer): scoped to the workspace, reset by a switch.
     <AiAssistantProvider>
       <AiCardsPreload />
       <div className="min-h-screen">
@@ -77,6 +78,7 @@ function DashboardShell({ children }: { children: React.ReactNode }) {
           </main>
         </div>
         <CommandPalette />
+        <AiAssistantMount />
         <ToastViewport />
       </div>
     </AiAssistantProvider>

@@ -24,7 +24,8 @@ import {
   type AiTaskDraftsDto,
   type AiTaskDraftsInput,
 } from "./ai-contract";
-import { AI_PROMPT_CHIPS, DEMO_NOTE, stableKey } from "./ai-assist";
+import { AI_PROMPT_CHIPS, DEMO_NOTE, WHATS_SENT, stableKey } from "./ai-assist";
+import { RELEASE_ASSET_FILES } from "./agent-downloads";
 import { friendlyAppName } from "./apps";
 import { DAY_MS, NOW } from "./demo-clock";
 import { activityPercent, dayKeyIn, durationMinutes, isActivityMeasured, minutesByProject, totalIdleMinutes, totalMinutes } from "./metrics";
@@ -637,6 +638,28 @@ export function demoAnswer(chipId: string, page: AiPage, workspaceId: string = a
           "Linux: install the .deb or .rpm package, or unpack the tarball",
         ]),
         [{ label: "Download", routeId: "download", routeArg: null }],
+      );
+    case "help-install-macos":
+      return answer(
+        lines("On a Mac:", [
+          `Download ${RELEASE_ASSET_FILES.macosZip} from Download in the sidebar`,
+          "Open the zip and move Dosi Tracker to Applications; if macOS blocks the first launch, choose Open Anyway in System Settings > Privacy & Security",
+          "Sign in with the server address shown on the Download page and your usual sign-in details",
+          "Allow Screen Recording, Input Monitoring and Accessibility only for what your project records; skipping one leaves just that part out",
+        ]),
+        [
+          { label: "macOS setup guide", routeId: "install.macos", routeArg: null },
+          { label: "Download", routeId: "download", routeArg: null },
+        ],
+      );
+    case "help-ai-sent":
+      return answer(
+        [
+          lines("When someone asks for a summary, AI assist sends:", [...WHATS_SENT.always]),
+          lines("Only when the workspace owner allows it:", [...WHATS_SENT.whenAllowed]),
+          lines("Never sent:", [...WHATS_SENT.never]),
+        ].join("\n"),
+        [{ label: "Privacy settings", routeId: "settings.privacy", routeArg: null }],
       );
     case "help-not-measured":
       return answer(

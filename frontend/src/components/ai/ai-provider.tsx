@@ -5,7 +5,7 @@ import { useSession } from "@/components/session-provider";
 import { useAiStatus } from "@/hooks/use-ai-status";
 import type { AiResultCache } from "@/hooks/use-ai-request";
 import type { AiPageContextDto, AiStatusDto } from "@/lib/ai-contract";
-import { stableKey } from "@/lib/ai-assist";
+import { stableKey, type AiPromptChip } from "@/lib/ai-assist";
 import type { Role } from "@/lib/types";
 
 /* ============================================================================
@@ -17,7 +17,8 @@ import type { Role } from "@/lib/types";
  *  - the caller's AI status (useAiStatus: read once, shared by every card);
  *  - the page view's result cache, so a card shows its last result again
  *    after navigating away and back (React state only, never web storage);
- *  - whether the Ask AI drawer is open;
+ *  - whether the Ask AI drawer is open, and what it was opened for (the
+ *    setup assistant's questions, a suggested question to ask at once);
  *  - the page context cards register (useAiPageContext), which Ask AI sends
  *    with a question so it knows what the person is looking at.
  *
@@ -35,6 +36,21 @@ export interface AiPageContextStore {
   subscribe(onChange: () => void): () => void;
 }
 
+/** What the Ask AI drawer was last opened for. */
+export interface AiAssistantRequest {
+  /** Bumped by every openAssistant(): the drawer acts on each request once. */
+  seq: number;
+  /** "setup": the setup assistant's help questions instead of the page's. */
+  chips: "page" | "setup";
+  /** A suggested question to ask as soon as the drawer opens. */
+  prompt: AiPromptChip | null;
+}
+
+export interface AiAssistantOpenOptions {
+  chips?: "page" | "setup";
+  prompt?: AiPromptChip | null;
+}
+
 export interface AiAssistantValue {
   status: AiStatusDto | null;
   statusLoading: boolean;
@@ -48,6 +64,9 @@ export interface AiAssistantValue {
   cache: AiResultCache;
   drawerOpen: boolean;
   setDrawerOpen: (open: boolean) => void;
+  /** Open the Ask AI drawer, optionally with the setup questions or a question to ask at once. */
+  openAssistant: (options?: AiAssistantOpenOptions) => void;
+  drawerRequest: AiAssistantRequest;
   pageContext: AiPageContextStore | null;
 }
 
@@ -64,6 +83,8 @@ const DEFAULT_VALUE: AiAssistantValue = {
   cache: noCache,
   drawerOpen: false,
   setDrawerOpen: () => {},
+  openAssistant: () => {},
+  drawerRequest: { seq: 0, chips: "page", prompt: null },
   pageContext: null,
 };
 
@@ -102,6 +123,11 @@ export function AiAssistantProvider({ children }: { children: React.ReactNode })
   const { isLive, user, workspace } = useSession();
   const { status, loading, refresh } = useAiStatus({ live: isLive, role: user.role, workspaceId: workspace.id });
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [drawerRequest, setDrawerRequest] = useState<AiAssistantRequest>(DEFAULT_VALUE.drawerRequest);
+  const openAssistant = useCallback((options: AiAssistantOpenOptions = {}) => {
+    setDrawerRequest((r) => ({ seq: r.seq + 1, chips: options.chips ?? "page", prompt: options.prompt ?? null }));
+    setDrawerOpen(true);
+  }, []);
   const [scope, setScope] = useState(() => ({ workspaceId: workspace.id, cache: createResultCache() }));
   // A workspace switch drops the previous workspace's results and closes the drawer, without
   // remounting the shell around it (its toasts, menus and sidebar stay as they are).
@@ -124,9 +150,11 @@ export function AiAssistantProvider({ children }: { children: React.ReactNode })
       cache,
       drawerOpen,
       setDrawerOpen,
+      openAssistant,
+      drawerRequest,
       pageContext,
     }),
-    [status, loading, refresh, isLive, user.role, user.id, workspace.id, cache, drawerOpen, pageContext],
+    [status, loading, refresh, isLive, user.role, user.id, workspace.id, cache, drawerOpen, openAssistant, drawerRequest, pageContext],
   );
   return <AiAssistantContext.Provider value={value}>{children}</AiAssistantContext.Provider>;
 }

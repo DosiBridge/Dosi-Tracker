@@ -29,9 +29,21 @@ const chip = (pressed: boolean) =>
  * Under every AI result: the disclaimer (the demo note for sample output),
  * when it was generated and whether it was reused, "What's sent?", Helpful /
  * Not helpful (with a reason), and Copy. Feedback goes to the server only
- * for a live result; a demo keeps it on the page.
+ * for a live result; a demo keeps it on the page. `compact` leaves the
+ * disclaimer out, for a surface that already carries it (an Ask AI answer,
+ * a task draft list).
  */
-export function AiFooter({ meta, copyText, reused = false }: { meta: AiResultMetaDto; copyText: string; reused?: boolean }) {
+export function AiFooter({
+  meta,
+  copyText,
+  reused = false,
+  compact = false,
+}: {
+  meta: AiResultMetaDto;
+  copyText: string;
+  reused?: boolean;
+  compact?: boolean;
+}) {
   const { live } = useAiAssistant();
   const timeZone = useBrowserTimeZone();
   const [rating, setRating] = useState<AiFeedbackRating | null>(null);
@@ -74,8 +86,8 @@ export function AiFooter({ meta, copyText, reused = false }: { meta: AiResultMet
   }
 
   return (
-    <div className="mt-4 space-y-3 border-t border-border pt-3 text-xs text-muted-foreground">
-      <p>{demo ? DEMO_NOTE : meta.disclaimer || DISCLAIMER}</p>
+    <div className={cn("space-y-3 text-xs text-muted-foreground", compact ? "mt-2" : "mt-4 border-t border-border pt-3")}>
+      {!compact && <p>{demo ? DEMO_NOTE : meta.disclaimer || DISCLAIMER}</p>}
       <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
         {Number.isFinite(generatedAt) && (
           <span>

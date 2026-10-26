@@ -44,6 +44,7 @@ import {
   roleChoices,
 } from "@/components/projects/membership";
 import { requestErrorText } from "@/components/layout/request-error";
+import { DataQualityCard } from "@/components/ai/data-quality-card";
 import { activities, projects, users } from "@/lib/tenant-data";
 import { useSession } from "@/components/session-provider";
 import { countSeats, inviteableRoles, roleLabels } from "@/lib/roles";
@@ -66,6 +67,7 @@ import {
 import { useReportingZone } from "@/hooks/use-reporting-zone";
 import { mapTeamMember, type ApiTeamMemberDto } from "@/lib/live-dataset";
 import { referenceNow } from "@/lib/live-session";
+import { AGENT_HEALTH_KINDS } from "@/lib/ai-assist";
 import {
   TEAM_ROUTES,
   memberAccountActions,
@@ -77,7 +79,7 @@ import {
   type WorkspaceInvitationDto,
 } from "@/lib/api-contract";
 import { workspaceRoleLabel, type WorkspaceRole } from "@/lib/sign-in";
-import { zonedDayKey, zonedDayRange } from "@/lib/time-zone";
+import { addZonedDays, zonedDayKey, zonedDayRange } from "@/lib/time-zone";
 import { toast } from "@/components/toast";
 
 const roleTone: Record<Role, "primary" | "info" | "warning" | "muted"> = {
@@ -185,6 +187,11 @@ export default function TeamPage() {
   const [liveProjects, setLiveProjects] = useState<ProjectOption[] | null>(null);
   const [presence, setPresence] = useState<Map<string, UserStatus> | null>(null);
   const [today, setToday] = useState<Map<string, { minutes: number; activity: number | null }> | null>(null);
+  // "Agent health" looks at the last 14 days, today included, in the reporting zone (the demo's frozen clock in a demo).
+  const healthPeriod = useMemo(() => {
+    const last = zonedDayKey(referenceNow(), zone.timeZone);
+    return zonedDayRange(addZonedDays(last, -13), last, zone.timeZone);
+  }, [zone.timeZone]);
 
   const loadRoster = useCallback(async () => {
     setLiveLoading(true);
@@ -576,6 +583,18 @@ export default function TeamPage() {
       <div role="tabpanel" id={`team-${view}-panel`} aria-labelledby={`team-${view}-tab`} className="space-y-6">
         {view === "members" ? (
           <>
+            {canManage && zone.ready && (
+              <DataQualityCard
+                title="Agent health"
+                purpose="Which agents need attention over the last 14 days: gaps, clock problems, members who never tracked, outdated agents."
+                page="team"
+                scope="team"
+                kinds={AGENT_HEALTH_KINDS}
+                from={healthPeriod.from}
+                to={healthPeriod.to}
+                timeZone={zone.timeZone}
+              />
+            )}
             {roster}
             {isLive && canManage && <PendingInvitations key={invitesKey} />}
           </>

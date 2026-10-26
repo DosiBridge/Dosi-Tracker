@@ -9,12 +9,15 @@ import { Avatar } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { activities, users } from "@/lib/tenant-data";
 import { useSession } from "@/components/session-provider";
+import { useAiAssistant } from "@/components/ai/ai-provider";
+import { DataQualityCard } from "@/components/ai/data-quality-card";
 import { trackedMembers } from "@/lib/roles";
 import { cn, formatDuration } from "@/lib/utils";
 import { getApi } from "@/hooks/useApi";
 import { useReportingZone } from "@/hooks/use-reporting-zone";
 import { reportingRoute } from "@/lib/api-contract";
 import { referenceNow } from "@/lib/live-session";
+import { TIMESHEET_DATA_QUALITY_KINDS } from "@/lib/ai-assist";
 import { formatDayKey, timeZoneLabel } from "@/lib/time-zone";
 import {
   averagePerWorkedDay,
@@ -66,6 +69,10 @@ export default function TimesheetPage() {
   const timeZone = zone.timeZone;
   const [now] = useState(() => referenceNow());
   const week = useMemo(() => timesheetWeek(now, timeZone, weekOffset), [now, timeZone, weekOffset]);
+  // "Week review": the team's week for owners and managers (their own when the server allows them only that), a member's own.
+  const { status: aiStatus } = useAiAssistant();
+  const teamReview = aiStatus?.features.find((f) => f.featureId === "data-quality-review")?.scopes.includes("team") !== false;
+  const reviewScope = selfOnly || !teamReview ? "self" : "team";
 
   // LIVE MODE: real per-member, per-day minutes for the displayed week from
   // GET /api/app/reporting/user-daily-series, asked for the reporting zone so
@@ -356,6 +363,23 @@ export default function TimesheetPage() {
           </div>
         </CardContent>
       </Card>
+
+      {zone.ready && (
+        <DataQualityCard
+          title="Week review"
+          purpose={
+            reviewScope === "self"
+              ? `What in your tracking for ${week.span} is worth a look: gaps, clock problems, input that wasn't measured.`
+              : `What in the team's tracking for ${week.span} is worth a look: gaps, clock problems, input that wasn't measured.`
+          }
+          page="timesheet"
+          scope={reviewScope}
+          kinds={TIMESHEET_DATA_QUALITY_KINDS}
+          from={week.from}
+          to={week.to}
+          timeZone={timeZone}
+        />
+      )}
     </PageStack>
   );
 }

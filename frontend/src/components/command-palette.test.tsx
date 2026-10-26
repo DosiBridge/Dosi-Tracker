@@ -7,10 +7,13 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import { screen, fireEvent, within } from "@testing-library/react";
 import { axe } from "jest-axe";
 import { CommandPalette } from "@/components/command-palette";
+import { AiAssistantMount } from "@/components/ai/ai-assistant-mount";
+import { AiAssistantProvider } from "@/components/ai/ai-provider";
+import { AI_PROMPT_CHIPS } from "@/lib/ai-assist";
 import { canAccess } from "@/lib/roles";
 import { reportCatalog } from "@/lib/reports-data";
 import { renderAsRole, resetPrototypeState } from "@/test/harness";
-import { __router } from "@/test/next-navigation-stub";
+import { __router, __setPathname } from "@/test/next-navigation-stub";
 
 // Mirror of the palette's own page list (label + guarding href).
 const PALETTE_PAGES = [
@@ -173,5 +176,67 @@ describe("CommandPalette semantics", () => {
     const { container } = renderAsRole(<CommandPalette />, "owner");
     pressShortcut();
     expect(await axe(container)).toHaveNoViolations();
+  });
+});
+
+describe("CommandPalette Ask AI", () => {
+  const withAi = (ui: React.ReactNode) => (
+    <AiAssistantProvider>
+      {ui}
+      <AiAssistantMount />
+    </AiAssistantProvider>
+  );
+  const askGroup = () => screen.queryByRole("group", { name: "Ask AI" });
+
+  it("offers Ask AI... and this page's suggested questions", () => {
+    __setPathname("/timesheet");
+    renderAsRole(withAi(<CommandPalette />), "owner");
+    pressShortcut();
+    const group = askGroup();
+    expect(group).not.toBeNull();
+    expect(within(group!).getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "Ask AI...",
+      ...AI_PROMPT_CHIPS.timesheet.map((c) => `${c.label}Ask AI`),
+    ]);
+  });
+
+  it("Ask AI... opens the drawer and closes the palette", async () => {
+    renderAsRole(withAi(<CommandPalette />), "owner");
+    pressShortcut();
+    fireEvent.click(within(askGroup()!).getByRole("option", { name: /^Ask AI\.\.\./ }));
+    expect(queryInput()).not.toBeInTheDocument();
+    expect(await screen.findByRole("dialog", { name: "Ask AI" })).toBeInTheDocument();
+  });
+
+  it("a suggested question opens the drawer and asks it (the demo answers, with no network)", async () => {
+    const fetchSpy = vi.fn();
+    vi.stubGlobal("fetch", fetchSpy);
+    renderAsRole(withAi(<CommandPalette />), "owner");
+    pressShortcut();
+    const chip = AI_PROMPT_CHIPS.dashboard[0];
+    fireEvent.click(within(askGroup()!).getByRole("option", { name: (name) => name.startsWith(chip.label) }));
+    const drawer = await screen.findByRole("dialog", { name: "Ask AI" });
+    const log = within(drawer).getByRole("log", { name: "Conversation" });
+    expect(await within(log).findByText(/^The team tracked .+ in the last 7 days/)).toBeInTheDocument();
+    expect(within(log).getByText(chip.label)).toBeInTheDocument();
+    expect(fetchSpy).not.toHaveBeenCalled();
+    vi.unstubAllGlobals();
+  });
+
+  it("is searchable like any other entry", () => {
+    renderAsRole(withAi(<CommandPalette />), "worker");
+    pressShortcut();
+    fireEvent.change(screen.getByPlaceholderText(/search pages/i), { target: { value: "ask ai" } });
+    expect(within(askGroup()!).getAllByRole("option").length).toBeGreaterThan(1);
+  });
+
+  it("is left out for a client, and without the AI context", () => {
+    const client = renderAsRole(withAi(<CommandPalette />), "client");
+    pressShortcut();
+    expect(askGroup()).toBeNull();
+    client.unmount();
+    renderAsRole(<CommandPalette />, "owner");
+    pressShortcut();
+    expect(askGroup()).toBeNull();
   });
 });

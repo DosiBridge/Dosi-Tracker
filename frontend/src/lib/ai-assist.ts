@@ -1,4 +1,5 @@
 import {
+  type AiDataQualityKind,
   type AiFeatureId,
   type AiPage,
   type AiResultMetaDto,
@@ -8,6 +9,7 @@ import {
   type AiWorkspaceSettingsDto,
   type UpdateAiWorkspaceSettingsDto,
 } from "./ai-contract";
+import { PROJECT_TASK_LIMITS } from "./api-contract";
 import { reportCatalog } from "./reports-data";
 import { formatInZone } from "./time-zone";
 import type { Role } from "./types";
@@ -506,10 +508,19 @@ export interface AiPromptChip {
   label: string;
 }
 
-const HELP_CHIPS: AiPromptChip[] = [
+/**
+ * The setup assistant's questions ("Ask the setup assistant" on the setup
+ * checklist and the Download page): answered from the curated help articles.
+ */
+export const AI_SETUP_HELP_CHIPS: readonly AiPromptChip[] = [
+  { id: "help-install-macos", label: "How do I install the agent on macOS?" },
+  { id: "help-ai-sent", label: "What does AI assist send to the provider?" },
   { id: "help-install", label: "How do I install the desktop agent?" },
   { id: "help-not-measured", label: "Why does activity say \"not measured\"?" },
 ];
+
+const HELP_CHIPS: readonly AiPromptChip[] = AI_SETUP_HELP_CHIPS;
+const INSTALL_CHIP = AI_SETUP_HELP_CHIPS[2];
 
 /** The suggested questions of each page's Ask AI drawer. */
 export const AI_PROMPT_CHIPS: Record<AiPage, readonly AiPromptChip[]> = {
@@ -531,11 +542,147 @@ export const AI_PROMPT_CHIPS: Record<AiPage, readonly AiPromptChip[]> = {
   ],
   projects: [{ id: "top-projects", label: "Which projects took the most time this week?" }],
   activities: [{ id: "top-apps", label: "Which apps were used most today?" }],
-  team: [{ id: "data-gaps", label: "Are there gaps in this week's tracking?" }, HELP_CHIPS[0]],
+  team: [{ id: "data-gaps", label: "Are there gaps in this week's tracking?" }, INSTALL_CHIP],
   settings: HELP_CHIPS,
   download: HELP_CHIPS,
-  other: [{ id: "week-overview", label: "How did this week go?" }, HELP_CHIPS[0]],
+  other: [{ id: "week-overview", label: "How did this week go?" }, INSTALL_CHIP],
 };
+
+const PAGE_OF_SECTION: Record<string, AiPage> = {
+  dashboard: "dashboard",
+  insights: "dashboard",
+  monitor: "monitor",
+  timesheet: "timesheet",
+  reports: "reports",
+  projects: "projects",
+  activities: "activities",
+  screenshots: "activities",
+  team: "team",
+  settings: "settings",
+  download: "download",
+};
+
+/** The Ask AI page a path belongs to ("/reports/weekly" → "reports"); "other" for anything else. */
+export function aiPageForPath(pathname: string | null | undefined): AiPage {
+  const section = (pathname ?? "").split(/[?#]/)[0].split("/").filter(Boolean)[0] ?? "dashboard";
+  return Object.prototype.hasOwnProperty.call(PAGE_OF_SECTION, section) ? PAGE_OF_SECTION[section] : "other";
+}
+
+/* ----------------------------- Ask AI ----------------------------- */
+
+/** The most a question may say (the server's AiAskInput cap). */
+export const AI_QUESTION_MAX_LENGTH = 1000;
+
+/** Under the drawer's heading and on every answer. */
+export const AI_ANSWER_LABEL = "AI-generated, may be inaccurate";
+
+/**
+ * What the Ask AI launcher offers this caller (§18.3):
+ *  - "ready": the assistant;
+ *  - "quota": the assistant, with the allowance note (answers may be refused);
+ *  - "turn-on": the owner of a workspace that hasn't opted in: an explainer
+ *    with "Review and turn on";
+ *  - null: nothing (no AI on the server, Ask AI not allowed, or a manager or
+ *    member of a workspace with AI off).
+ */
+export type AiAssistantMode = "ready" | "quota" | "turn-on" | null;
+
+export function aiAssistantMode(status: AiStatusDto | null | undefined, role: Role): AiAssistantMode {
+  const ask = aiAvailability(status, "ask");
+  if (ask.visible) return ask.reason === "quota" ? "quota" : "ready";
+  return aiSetupNotice(status, role) === "turn-on" ? "turn-on" : null;
+}
+
+/**
+ * The drawer's scope chip: whose activity the assistant can look up. The
+ * team's for an owner or manager the server lets see the team (its period
+ * summary offers the team scope), otherwise only the caller's own.
+ */
+export function aiAskScopeLabel(status: AiStatusDto | null | undefined, role: Role): "Team" | "Only your activity" {
+  if (role !== "owner" && role !== "admin") return "Only your activity";
+  const period = status?.features.find((f) => f.featureId === "period-summary");
+  return period && period.allowed && !period.scopes.includes("team") ? "Only your activity" : "Team";
+}
+
+/** A piece of an answer: a paragraph, or the list its "- " lines make. */
+export type AiAnswerBlock = { kind: "paragraph"; text: string } | { kind: "list"; items: string[] };
+
+/**
+ * An answer's plain text as paragraphs and lists (§5.5): consecutive lines
+ * starting "- " are one list, other lines one paragraph each, blank lines
+ * dropped. Nothing else is interpreted: no markup, no links.
+ */
+export function aiAnswerBlocks(answer: string | null | undefined): AiAnswerBlock[] {
+  const blocks: AiAnswerBlock[] = [];
+  for (const raw of (answer ?? "").split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    // "- item", and a bare "- " whose item is empty (dropped).
+    if (/^- /.test(raw.trimStart())) {
+      const item = line.slice(1).trim();
+      if (!item) continue;
+      const last = blocks[blocks.length - 1];
+      if (last?.kind === "list") last.items.push(item);
+      else blocks.push({ kind: "list", items: [item] });
+    } else {
+      blocks.push({ kind: "paragraph", text: line });
+    }
+  }
+  return blocks;
+}
+
+/* ----------------------------- Data quality ----------------------------- */
+
+/** "Week review" on the timesheet: the checks that apply to the team and to one member. */
+export const TIMESHEET_DATA_QUALITY_KINDS: readonly AiDataQualityKind[] = ["data-gap", "clock-skew", "unmeasured-activity", "software-input"];
+
+/** "Agent health" on the team page: the agents' side of tracking (team only). */
+export const AGENT_HEALTH_KINDS: readonly AiDataQualityKind[] = ["data-gap", "clock-skew", "never-tracked", "outdated-agent"];
+
+/** A finding's severity in words (shown with an icon: never colour alone). */
+export function dataQualitySeverityLabel(severity: string): string {
+  return severity === "notice" ? "Worth a look" : "For information";
+}
+
+const DATA_QUALITY_ACTIONS: Record<string, string> = {
+  "check-agent-running": "Check the desktop agent",
+  "check-os-permissions": "Review the agent's permissions",
+  "send-install-link": "Get the install link",
+  "update-agent": "Get the latest agent",
+  "sync-device-clock": "How to sync the clock",
+};
+
+/** The words of a finding's action button; "Open" for an action the web doesn't know yet. */
+export function dataQualityActionLabel(actionId: string | null | undefined): string {
+  return actionId && Object.prototype.hasOwnProperty.call(DATA_QUALITY_ACTIONS, actionId) ? DATA_QUALITY_ACTIONS[actionId] : "Open";
+}
+
+/* ----------------------------- Task drafts ----------------------------- */
+
+/** The goal a task draft request describes: 3 to 500 characters (the server's AiTaskDraftsInput). */
+export const AI_GOAL_MIN_LENGTH = 3;
+export const AI_GOAL_MAX_LENGTH = 500;
+/** How many drafts may be asked for (default 5). */
+export const AI_MAX_TASK_DRAFTS = 8;
+
+/**
+ * Why an edited draft can't be saved as a task, in the existing task form's
+ * words (the project-task limits); null when it can.
+ */
+export function taskDraftProblem(title: string, description: string): string | null {
+  const trimmed = title.trim();
+  if (!trimmed) return "The task needs a title.";
+  if (trimmed.length > PROJECT_TASK_LIMITS.titleMaxLength) return `The title cannot exceed ${PROJECT_TASK_LIMITS.titleMaxLength} characters.`;
+  if (description.length > PROJECT_TASK_LIMITS.descriptionMaxLength) {
+    return `The description cannot exceed ${PROJECT_TASK_LIMITS.descriptionMaxLength} characters.`;
+  }
+  return null;
+}
+
+/** "3 tasks selected", for the dialog's live count. */
+export function selectedTasksText(count: number): string {
+  return `${count} ${count === 1 ? "task" : "tasks"} selected`;
+}
 
 /* ----------------------------- Cache keys ----------------------------- */
 

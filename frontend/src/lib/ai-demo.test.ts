@@ -4,7 +4,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { demoAiResult, demoAnswer, demoDataQualityCandidates, formatAiDuration } from "./ai-demo";
 import { demoAiStatus } from "./ai-demo-status";
-import { AI_PROMPT_CHIPS, DEMO_NOTE } from "./ai-assist";
+import { AI_PROMPT_CHIPS, DEMO_NOTE, WHATS_SENT } from "./ai-assist";
+import { RELEASE_ASSET_FILES } from "./agent-downloads";
 import { activityPercent, dayKeyIn, minutesByProject, totalIdleMinutes, totalMinutes } from "./metrics";
 import { DAY_MS, NOW, TODAY } from "./demo-clock";
 import { datasetFor, type Dataset } from "./tenant-data";
@@ -481,6 +482,18 @@ describe("demoAnswer", () => {
       `The apps with the most focused time in the last 7 days:\n- ${friendlyAppName("Visual Studio Code")}: 5 min`,
     );
     expect(demoAnswer("data-gaps", "team", "ai-test").answer).toBe("1 thing in this week's tracking is worth a look:\n- Gap in tracked days");
+  });
+
+  it("answers the setup assistant's questions from the help pages' facts", () => {
+    const mac = demoAnswer("help-install-macos", "download", "w1");
+    expect(mac.answer).toContain(RELEASE_ASSET_FILES.macosZip);
+    expect(mac.answer).toContain("Open Anyway");
+    expect(mac.sources.map((s) => s.routeId)).toEqual(["install.macos", "download"]);
+    const sent = demoAnswer("help-ai-sent", "settings", "w1");
+    for (const line of [...WHATS_SENT.always, ...WHATS_SENT.whenAllowed, ...WHATS_SENT.never]) expect(sent.answer).toContain(`- ${line}`);
+    expect(sent.answer.indexOf("Never sent:")).toBeGreaterThan(sent.answer.indexOf("Only when the workspace owner allows it:"));
+    expect(sent.sources).toEqual([{ label: "Privacy settings", routeId: "settings.privacy", routeArg: null }]);
+    expect(mac.answer + sent.answer).not.toMatch(/secret|password|api[_-]?key/i);
   });
 
   it("answers only chips: anything else lists the page's questions", () => {

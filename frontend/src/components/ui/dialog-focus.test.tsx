@@ -4,7 +4,7 @@
 // Tab walked straight out of the open dialog, and closing it dropped focus to
 // the top of the document. Each test here failed against that implementation.
 import { describe, it, expect, beforeEach } from "vitest";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Modal } from "@/components/ui/modal";
@@ -90,5 +90,38 @@ describe.each(["modal", "drawer"] as const)("%s focus management", (kind) => {
 
     await user.click(screen.getByRole("button", { name: "Close" }));
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+});
+
+describe("drawer initial focus", () => {
+  function ComposerHost({ composerDisabled = false }: { composerDisabled?: boolean }) {
+    const [open, setOpen] = useState(false);
+    const composer = useRef<HTMLTextAreaElement>(null);
+    return (
+      <div>
+        <button onClick={() => setOpen(true)}>Open dialog</button>
+        <Drawer open={open} onClose={() => setOpen(false)} title="Ask" initialFocus={composer}>
+          <button>Suggested question</button>
+          <textarea ref={composer} aria-label="Your question" disabled={composerDisabled} />
+        </Drawer>
+      </div>
+    );
+  }
+
+  it("starts on the control it names instead of the first one, and still returns focus on close", async () => {
+    const user = userEvent.setup();
+    render(<ComposerHost />);
+    const opener = screen.getByRole("button", { name: "Open dialog" });
+    await user.click(opener);
+    expect(screen.getByRole("textbox", { name: "Your question" })).toHaveFocus();
+    await user.keyboard("{Escape}");
+    expect(opener).toHaveFocus();
+  });
+
+  it("falls back to the first control while the named one is disabled", async () => {
+    const user = userEvent.setup();
+    render(<ComposerHost composerDisabled />);
+    await user.click(screen.getByRole("button", { name: "Open dialog" }));
+    expect(screen.getByRole("button", { name: "Close" })).toHaveFocus();
   });
 });

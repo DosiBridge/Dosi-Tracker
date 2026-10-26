@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useId, useMemo, useState } from "react";
-import { useRouter } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import {
   Search,
   LayoutDashboard,
@@ -19,6 +19,7 @@ import {
   ArrowUp,
   ArrowDown,
   Download,
+  Sparkles,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -26,9 +27,11 @@ import { users } from "@/lib/tenant-data";
 import { reportCatalog } from "@/lib/reports-data";
 import { useTheme } from "@/components/theme-provider";
 import { useSession } from "@/components/session-provider";
+import { useAiAssistant, useAiPageContextValue } from "@/components/ai/ai-provider";
 import { useDialogFocus } from "@/components/ui/use-dialog-focus";
 import { reportAccessFor } from "@/lib/report-math";
 import { canAccess } from "@/lib/roles";
+import { AI_PROMPT_CHIPS, aiAssistantMode, aiPageForPath, type AiPromptChip } from "@/lib/ai-assist";
 import { scopeProjects } from "@/lib/scope";
 
 interface Item {
@@ -41,10 +44,13 @@ interface Item {
 }
 
 /**
- * ⌘K / Ctrl+K: jump to a page, report, project or member. A modal dialog
+ * ⌘K / Ctrl+K: jump to a page, report, project or member, or ask AI. A modal dialog
  * holding a combobox: the search field keeps focus while ↑ ↓ move through the
  * results (announced through aria-activedescendant), Enter opens one and
  * Escape closes — focus then returns to where it was.
+ *
+ * "Ask AI" (when the server allows it, AI assist spec §18.5) opens the Ask AI
+ * drawer, or asks one of this page's suggested questions straight away.
  */
 export function CommandPalette() {
   const [open, setOpen] = useState(false);
@@ -56,6 +62,12 @@ export function CommandPalette() {
   // Who may see pay: the permissions the session read at sign-in (the role's defaults otherwise).
   const manageTeam = reportAccessFor(user.role, isLive ? livePolicies : null).manageTeam;
   const dialogRef = useDialogFocus<HTMLDivElement>(open);
+  const pathname = usePathname();
+  const { status: aiStatus, openAssistant } = useAiAssistant();
+  const aiContext = useAiPageContextValue();
+  const aiMode = aiAssistantMode(aiStatus, user.role);
+  // The questions of the page in view (one this role may open; anything else gets the general ones).
+  const aiPage = canAccess(user.role, pathname) ? (aiContext?.page ?? aiPageForPath(pathname)) : "other";
   const baseId = useId();
   const listId = `${baseId}-results`;
 
@@ -162,8 +174,21 @@ export function CommandPalette() {
         },
       },
     ];
-    return [...pages, ...reports, ...projItems, ...memberItems, ...actions];
-  }, [theme, user, workspace.id, go, setTheme, manageTeam]); // eslint-disable-line react-hooks/exhaustive-deps
+    // Ask AI: the drawer, and this page's suggested questions once the assistant can answer them.
+    const ask = (prompt?: AiPromptChip) => () => {
+      setOpen(false);
+      openAssistant(prompt ? { prompt } : undefined);
+    };
+    const askItems: Item[] = !aiMode
+      ? []
+      : [
+          { id: "ai-ask", label: "Ask AI...", group: "Ask AI", icon: Sparkles, action: ask() },
+          ...(aiMode === "turn-on"
+            ? []
+            : AI_PROMPT_CHIPS[aiPage].map((chip) => ({ id: `ai-${chip.id}`, label: chip.label, hint: "Ask AI", group: "Ask AI", icon: Sparkles, action: ask(chip) }))),
+        ];
+    return [...pages, ...askItems, ...reports, ...projItems, ...memberItems, ...actions];
+  }, [theme, user, workspace.id, go, setTheme, manageTeam, aiMode, aiPage, openAssistant]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();

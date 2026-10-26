@@ -7,6 +7,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { PageHeader, PageStack } from "@/components/ui/page-header";
 import { useSession } from "@/components/session-provider";
+import { AiSetupHelpButton } from "@/components/ai/ai-setup-help-button";
 import { linkButtonClass } from "@/components/dashboard/link-button";
 import { SignInDetails, useVisitorOs, type VisitorOs } from "@/components/dashboard/agent-setup";
 import {
@@ -41,6 +42,7 @@ export default function DownloadPage() {
         eyebrow="Get started"
         title="Desktop agent"
         description="Install the agent on each computer you want to track. Time and activity appear here after its first upload."
+        actions={<AiSetupHelpButton />}
       />
 
       <SignInDetails

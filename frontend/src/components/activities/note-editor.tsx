@@ -3,6 +3,7 @@
 import { useId, useRef, useState } from "react";
 import { Loader2, Pencil, StickyNote } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { NoteSuggestions } from "@/components/ai/note-suggestions";
 import { ACTIVITY_NOTE_MAX_LENGTH, normalizeActivityNote } from "@/lib/api-contract";
 import { cn } from "@/lib/utils";
 
@@ -15,6 +16,10 @@ import { cn } from "@/lib/utils";
  * so an empty note clears it. A failure keeps the draft and says why. Enter
  * saves, Shift+Enter starts a new line, Escape cancels — without closing the
  * dialog the editor sits in.
+ *
+ * With `suggest`, the open editor also offers AI note suggestions (when the
+ * server allows them): choosing one fills the draft, and only "Save note"
+ * stores it.
  * ========================================================================== */
 
 /** Show a character count once the note is this close to the server's limit. */
@@ -31,12 +36,15 @@ export function NoteEditor({
   note,
   editing,
   emptyLabel = "No task note",
+  suggest,
   className,
 }: {
   /** The current note (null: none). */
   note: string | null;
   /** Omitted: the note is read-only. */
   editing?: NoteEditing;
+  /** The block AI note suggestions are for (offered only while the note may be edited). */
+  suggest?: { activityId: string };
   /** Shown when there is no note. */
   emptyLabel?: string;
   className?: string;
@@ -140,6 +148,18 @@ export function NoteEditor({
           <p id={errorId} role="alert" className="text-xs font-medium text-danger-on-tint">
             {error}
           </p>
+        )}
+        {suggest && canEdit && (
+          <NoteSuggestions
+            activityId={suggest.activityId}
+            disabled={saving}
+            onPick={(text) => {
+              setDraft(text);
+              setError(null);
+              // Back to the note, so the suggestion can be edited before it is saved.
+              field.current?.focus();
+            }}
+          />
         )}
         <div className="flex flex-wrap items-center justify-between gap-2">
           <p className="text-[11px] text-muted-foreground">
