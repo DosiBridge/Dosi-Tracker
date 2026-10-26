@@ -351,9 +351,14 @@ pub fn uninstall(ctx: &Ctx, purge: bool, yes: bool) -> u8 {
             reset_inner(ctx, yes)?;
         }
         if script.is_file() && !exe.starts_with("/usr/bin") {
-            let status = std::process::Command::new("sh")
+            // The uninstaller is a bash script (arrays, process substitution);
+            // `sh` is dash on Debian and Ubuntu.
+            // Its progress goes to stderr: stdout carries only this command's
+            // result (one JSON document with --json).
+            let status = std::process::Command::new("bash")
                 .arg(&script)
                 .args(if yes { vec!["--yes"] } else { Vec::new() })
+                .stdout(std::process::Stdio::from(std::io::stderr()))
                 .status()
                 .map_err(|e| CliError::failed(format!("the uninstaller could not run: {e}")))?;
             if !status.success() {

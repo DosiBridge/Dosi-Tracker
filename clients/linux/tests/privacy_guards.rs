@@ -100,7 +100,15 @@ fn the_xi2_key_path_never_reads_the_keycode() {
 
 #[test]
 fn nothing_installs_a_system_wide_autostart_entry() {
+    // packaging/smoke.sh installs nothing: it fails a distro smoke test when
+    // an entry shows up there, so it names the directory.
+    let smoke = crate_dir().join("packaging/smoke.sh");
+    let smoke_text = std::fs::read_to_string(&smoke).unwrap();
+    assert!(smoke_text.contains("die \"an autostart entry was installed\""));
     for path in files_under(&crate_dir().join("packaging")) {
+        if path == smoke {
+            continue;
+        }
         let text = path.to_string_lossy();
         assert!(!text.contains("etc/xdg/autostart"), "{text}");
         let contents = std::fs::read_to_string(&path).unwrap_or_default();
