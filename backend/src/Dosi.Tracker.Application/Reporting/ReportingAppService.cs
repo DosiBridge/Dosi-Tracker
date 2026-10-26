@@ -511,6 +511,52 @@ public class ReportingAppService : TrackerAppService, IReportingAppService
             .ToList();
     }
 
+    public async Task<List<DataQualityRowDto>> GetDataQualityAsync(GetReportSummaryInput input)
+    {
+        var scope = await ResolveScopeAsync(input);
+        var activities = await ScopedActivitiesAsync(scope);
+
+        var rows = activities.Select(a => new DataQualityBlock
+        {
+            UserId = a.UserId,
+            StartedAt = a.StartedAt,
+            EndedAt = a.EndedAt,
+            Productivity = a.Productivity,
+            ClockSkewSeconds = a.ClockSkewSeconds,
+            InjectedInputEvents = a.InjectedInputEvents
+        });
+
+        var perUser = new Dictionary<Guid, DataQualityTotals>();
+        await foreach (var block in StreamAsync(rows))
+        {
+            if (!perUser.TryGetValue(block.UserId, out var totals))
+            {
+                totals = new DataQualityTotals();
+                perUser[block.UserId] = totals;
+            }
+
+            totals.Add(block);
+        }
+
+        var users = await UsersAsync(perUser.Keys);
+
+        return perUser
+            .Select(entry => new DataQualityRowDto
+            {
+                UserId = entry.Key,
+                UserName = UserNameOf(users, entry.Key),
+                Blocks = entry.Value.Blocks,
+                TrackedMinutes = Math.Round(entry.Value.TrackedMinutes, 2),
+                UnmeasuredMinutes = Math.Round(entry.Value.UnmeasuredMinutes, 2),
+                MaxAbsClockSkewSeconds = entry.Value.MaxAbsClockSkewSeconds,
+                BlocksWithInjectedInput = entry.Value.BlocksWithInjectedInput,
+                LastActivityAt = entry.Value.LastEndedAt
+            })
+            .OrderBy(r => r.UserName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(r => r.UserId)
+            .ToList();
+    }
+
     // ---- Scope ----
 
     /// <summary>Who and what a report request may see; see the class remarks for the rules.</summary>
@@ -1018,6 +1064,57 @@ public class ReportingAppService : TrackerAppService, IReportingAppService
             {
                 Latest = block;
             }
+        }
+    }
+
+    // ---- Data quality ----
+
+    /// <summary>The slice of a block the data-quality report reads: no names, windows, input counts or captures.</summary>
+    private sealed class DataQualityBlock
+    {
+        public Guid UserId { get; set; }
+        public DateTime StartedAt { get; set; }
+        public DateTime EndedAt { get; set; }
+        public int? Productivity { get; set; }
+        public int? ClockSkewSeconds { get; set; }
+        public int? InjectedInputEvents { get; set; }
+    }
+
+    /// <summary>One member's data-quality signals, folded block by block.</summary>
+    private sealed class DataQualityTotals
+    {
+        public int Blocks { get; private set; }
+        public double TrackedMinutes { get; private set; }
+        public double UnmeasuredMinutes { get; private set; }
+        public int? MaxAbsClockSkewSeconds { get; private set; }
+        public int BlocksWithInjectedInput { get; private set; }
+        public DateTime? LastEndedAt { get; private set; }
+
+        public void Add(DataQualityBlock block)
+        {
+            var minutes = MinutesOf(block.StartedAt, block.EndedAt);
+
+            Blocks++;
+            TrackedMinutes += minutes;
+            if (block.Productivity == null)
+            {
+                UnmeasuredMinutes += minutes;
+            }
+
+            if (block.ClockSkewSeconds.HasValue)
+            {
+                // Ingest clamps skews to ±10 days; widening first keeps any stored value from overflowing.
+                var skew = (int)Math.Min(Math.Abs((long)block.ClockSkewSeconds.Value), int.MaxValue);
+                MaxAbsClockSkewSeconds = MaxAbsClockSkewSeconds is { } max && max >= skew ? max : skew;
+            }
+
+            if (block.InjectedInputEvents is > 0)
+            {
+                BlocksWithInjectedInput++;
+            }
+
+            var end = ReportCalendar.AsUtc(block.EndedAt);
+            LastEndedAt = LastEndedAt is { } last && last >= end ? last : end;
         }
     }
 

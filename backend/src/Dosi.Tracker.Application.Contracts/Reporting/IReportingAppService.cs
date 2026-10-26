@@ -41,4 +41,12 @@ public interface IReportingAppService : IApplicationService
 
     /// <summary>GET /api/app/reporting/devices — tracked time per member and device over the range.</summary>
     Task<List<DeviceReportRowDto>> GetDevicesAsync(GetReportSummaryInput input);
+
+    /// <summary>GET /api/app/reporting/data-quality — per member with blocks in the range: block count, tracked and
+    /// unmeasured minutes, the largest device clock skew, blocks with software-generated input and the latest block's
+    /// end. Ordered by user name, then user id. Scoped like every report: the whole team for callers holding
+    /// Tracker.Activities.ViewAll and Tracker.Reporting; a ViewAll caller without Reporting only for themselves (any
+    /// other request is refused with 403); a client of projects every member on those projects plus themselves; anyone
+    /// else only themselves, whatever <see cref="GetReportSummaryInput.UserId"/> names.</summary>
+    Task<List<DataQualityRowDto>> GetDataQualityAsync(GetReportSummaryInput input);
 }

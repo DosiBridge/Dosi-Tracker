@@ -40,6 +40,7 @@ public class ContractRoutesTests
     [InlineData(typeof(ReportingAppService), nameof(ReportingAppService.GetPayrollAsync), "GET", "api/app/reporting/payroll")]
     [InlineData(typeof(ReportingAppService), nameof(ReportingAppService.GetHourlyAsync), "GET", "api/app/reporting/hourly")]
     [InlineData(typeof(ReportingAppService), nameof(ReportingAppService.GetDevicesAsync), "GET", "api/app/reporting/devices")]
+    [InlineData(typeof(ReportingAppService), nameof(ReportingAppService.GetDataQualityAsync), "GET", "api/app/reporting/data-quality")]
     // §7 workspace settings, preferences and sign-up
     [InlineData(typeof(WorkspaceAppService), nameof(WorkspaceAppService.GetSettingsAsync), "GET", "api/app/workspace/settings")]
     [InlineData(typeof(WorkspaceAppService), nameof(WorkspaceAppService.UpdateSettingsAsync), "PUT", "api/app/workspace/settings")]

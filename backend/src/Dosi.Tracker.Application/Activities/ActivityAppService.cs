@@ -58,8 +58,9 @@ public class ActivityAppService : TrackerAppService, IActivityAppService
     /// <summary>A screen capture time reported by the agent is kept while it lies at most this far outside the block.</summary>
     public static readonly TimeSpan CaptureTimeTolerance = TimeSpan.FromSeconds(60);
 
-    /// <summary>How long after its start the owner of a block may still change its note.</summary>
-    public static readonly TimeSpan NoteEditWindow = TimeSpan.FromDays(30);
+    /// <summary>How long after its start the owner of a block may still change its note
+    /// (<see cref="ActivityNoteRules.NoteEditWindow"/>, where the rule lives).</summary>
+    public static readonly TimeSpan NoteEditWindow = ActivityNoteRules.NoteEditWindow;
 
     /// <summary>How long an upload waits for another upload of the same member to finish.</summary>
     private static readonly TimeSpan IngestLockTimeout = TimeSpan.FromSeconds(30);
@@ -237,25 +238,7 @@ public class ActivityAppService : TrackerAppService, IActivityAppService
     {
         var activity = await _activityRepository.GetAsync(id);
 
-        if (activity.UserId == CurrentUser.GetId())
-        {
-            var age = UtcNow - AgentContextNormalizer.AsUtc(activity.StartedAt);
-            if (age > NoteEditWindow && !await AuthorizationService.IsGrantedAsync(TrackerPermissions.Team.Manage))
-            {
-                throw new AbpAuthorizationException(
-                    $"The note of a block can be changed within {NoteEditWindow.TotalDays:0} days of its start.");
-            }
-        }
-        else if (!await AuthorizationService.IsGrantedAsync(TrackerPermissions.Team.Manage))
-        {
-            if (!await AuthorizationService.IsGrantedAsync(TrackerPermissions.Activities.ViewAll))
-            {
-                // Other members' blocks are hidden entirely from callers who cannot read them.
-                throw new EntityNotFoundException(typeof(Activity), id);
-            }
-
-            throw new AbpAuthorizationException("Only the member who tracked a block, or a team manager, can change its note.");
-        }
+        await LazyServiceProvider.LazyGetRequiredService<ActivityNoteRules>().EnsureCanEditNoteAsync(activity);
 
         activity.Description = AgentContextNormalizer.CleanNote(input.Description, UpdateActivityNoteDto.MaxDescriptionLength);
         await _activityRepository.UpdateAsync(activity, autoSave: true);
