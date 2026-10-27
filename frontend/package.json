@@ -48,7 +48,7 @@
     "@vitejs/plugin-react": "^6.0.4",
     "@vitest/coverage-v8": "^4.1.12",
     "dependency-cruiser": "^18.2.0",
-    "eslint": "^9",
+    "eslint": "^10",
     "eslint-config-next": "16.4.3",
     "fast-check": "^4.9.0",
     "jest-axe": "^11.0.0",
