@@ -58,7 +58,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"
 anyhow = "1"
-toml = "0.8"
+toml = "1.1"
 # GUI (feature `gui`): glow renderer; X11, xkbcommon, EGL and GL are dlopened, so
 # release binaries link nothing beyond libc/libm/libgcc_s.
 eframe = { version = "0.35", optional = true, default-features = false, features = ["glow", "default_fonts", "x11", "wayland", "accesskit"] }
