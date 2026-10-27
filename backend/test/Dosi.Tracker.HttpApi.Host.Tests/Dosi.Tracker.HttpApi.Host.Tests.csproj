@@ -46,9 +46,9 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Volo.Abp.AspNetCore.Mvc" Version="10.5.0" />
+    <PackageReference Include="Volo.Abp.AspNetCore.Mvc" Version="10.7.0" />
     <!-- The account endpoints the web calls (self-service password change); TrackerHttpApiModule depends on this module. -->
-    <PackageReference Include="Volo.Abp.Account.HttpApi" Version="10.5.0" />
+    <PackageReference Include="Volo.Abp.Account.HttpApi" Version="10.7.0" />
     <PackageReference Include="Microsoft.AspNetCore.TestHost" Version="10.0.8" />
     <!-- Same version as the host (AiAssist above). -->
     <PackageReference Include="Microsoft.Extensions.AI.OpenAI" Version="10.11.0" />
