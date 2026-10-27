@@ -33,7 +33,7 @@
     <!-- Via Volo.Abp.TextTemplating.Scriban. -->
     <PackageReference Include="Scriban" Version="7.5.3" />
     <!-- Via ABP's Swagger/OpenAPI setup; stays on the 2.x line Swashbuckle expects. -->
-    <PackageReference Include="Microsoft.OpenApi" Version="2.13.0" />
+    <PackageReference Include="Microsoft.OpenApi" Version="3.11.0" />
     <!-- Via Microsoft.Data.Sqlite (EF Core's SQLite provider, used by the agents' local queue tests). -->
     <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" Version="2.1.14" />
     <!-- Out-of-band .NET packages; the SDK's own copy lags the patched release. -->
