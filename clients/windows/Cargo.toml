@@ -25,7 +25,7 @@ serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
 
 # Local offline-first storage (bundled SQLite, no system dependency)
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # Timestamps
 chrono = { version = "0.4", features = ["serde"] }
