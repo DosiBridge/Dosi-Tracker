@@ -12,6 +12,7 @@ using Dosi.Tracker.Compatibility;
 using Dosi.Tracker.Devices;
 using Dosi.Tracker.Erasure;
 using Microsoft.AspNetCore.DataProtection;
+using Microsoft.AspNetCore.Diagnostics;
 using Microsoft.Extensions.Logging;
 using Dosi.Tracker.Retention;
 using Dosi.Tracker.SaaS;
@@ -420,10 +421,21 @@ public class TrackerHttpApiHostModule : AbpModule
         });
 
         // This host has no browser sign-in flow that a human ever reaches: the product's login UI is the
-        // Next.js dashboard, and desktop agents are headless API clients. Left at its ASP.NET Core Identity
-        // default, a missing or rejected bearer token answers with a 302 to the (unused) Account/Login page
-        // instead of 401, which breaks every API caller that checks the status code. Every unauthenticated
-        // or forbidden request gets the status code an API expects; nothing here is ever redirected.
+        // Next.js dashboard, and desktop agents are headless API clients. Left at the Identity module's default
+        // (DefaultChallengeScheme = Identity.Application, the cookie scheme), [Authorize] on an endpoint that
+        // names no scheme — every ABP auto-API controller — answers a missing or rejected bearer token with a
+        // 302 to the (unused) Account/Login page instead of 401, which breaks every API caller that checks the
+        // status code (confirmed end to end: a Production deploy answered GET /api/app/workspace/my-list with
+        // an invalid access token as 302, not 401). The challenge now always goes straight to OpenIddict's
+        // bearer validation — which answers 401/403 itself, never a redirect — regardless of forwarding, cookie
+        // events, or which scheme ends up registered as the Identity cookie's own name.
+        context.Services.Configure<AuthenticationOptions>(options =>
+        {
+            options.DefaultChallengeScheme = OpenIddictValidationAspNetCoreDefaults.AuthenticationScheme;
+        });
+
+        // Belt-and-suspenders against the same 302: a cookie challenge that does still reach the Identity
+        // scheme's own events (a future code path that names it explicitly) answers an API status code too.
         context.Services.Configure<CookieAuthenticationOptions>(IdentityConstants.ApplicationScheme, options =>
         {
             options.Events.OnRedirectToLogin = ctx =>
@@ -569,6 +581,29 @@ public class TrackerHttpApiHostModule : AbpModule
         {
             app.UseErrorPage();
         }
+
+        // UseErrorPage() (ABP's theme) re-executes ANY empty-bodied non-2xx response as a redirect to the themed
+        // /Error page — including OpenIddict's bearer-challenge 401/403, which never writes a body (confirmed end
+        // to end: a Production deploy answered GET /api/app/workspace/my-list with an invalid access token as a
+        // 302 to /Error?httpStatusCode=401, with the WWW-Authenticate header proving OpenIddict had already
+        // decided 401 correctly). It never reproduced locally because UseErrorPage() itself is skipped in
+        // Development. Every API caller needs the real status code, not a themed HTML page, so API requests opt
+        // out of the re-execute here — the standard ASP.NET Core technique (IStatusCodePagesFeature.Enabled)
+        // works because UseErrorPage()'s middleware sets that feature before calling next(), so anything
+        // registered after it (this) can still flip it off before the feature is consulted on the way back out.
+        app.Use(async (httpContext, next) =>
+        {
+            if (httpContext.Request.Path.StartsWithSegments("/api"))
+            {
+                var statusCodePagesFeature = httpContext.Features.Get<IStatusCodePagesFeature>();
+                if (statusCodePagesFeature != null)
+                {
+                    statusCodePagesFeature.Enabled = false;
+                }
+            }
+
+            await next();
+        });
 
         app.UseRouting();
         app.MapAbpStaticAssets();
