@@ -48,7 +48,7 @@ iana-time-zone = "0.1"
 nokhwa = { version = "0.10", features = ["input-native"] }
 
 # HMAC-SHA256 payload signing (tamper-detection on the local SQLite queue)
-hmac = "0.12"
+hmac = "0.13"
 sha2 = "0.10"
 rand = { version = "0.8", features = ["getrandom"] }
 
