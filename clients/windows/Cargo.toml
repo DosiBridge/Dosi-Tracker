@@ -64,7 +64,7 @@ config = "0.14"
 # Minimal feature set on purpose: the OpenGL (glow) backend instead of wgpu, and
 # no Linux windowing/accessibility stacks — this is a lightweight Windows agent,
 # so binary size and idle memory matter more than GPU features.
-eframe = { version = "0.35.0", default-features = false, features = ["glow", "default_fonts"] }
+eframe = { version = "0.36.2", default-features = false, features = ["glow", "default_fonts"] }
 egui = { version = "0.35.0", default-features = false }
 tray-icon = "0.24.1"
 # The window's native handle, to ask Windows whether it is really shown
