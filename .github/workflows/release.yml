@@ -49,7 +49,7 @@ jobs:
     steps:
       # Full tag history, so "is this the highest released version" (below) can see every release, not just the
       # ref this run happens to be on.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           fetch-tags: true
@@ -91,7 +91,7 @@ jobs:
     env:
       VERSION: ${{ needs.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
 
       # The windows-2025 images no longer ship NSIS; this pinned version is installed
       # before anything else (same as ci.yml's windows-agent job).
@@ -122,7 +122,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Cache cargo
-        uses: actions/cache@v6
+        uses: actions/cache@v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -194,7 +194,7 @@ jobs:
     env:
       VERSION: ${{ needs.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
 
       # macos-14 is retired; macos-15 with an explicitly selected Xcode 16 keeps the
       # compiler fixed (same as ci.yml's macos-agent job).
@@ -287,10 +287,10 @@ jobs:
     env:
       CI_IMAGE: dosi-linux-ci:22.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
 
       - name: Cache cargo registry and packaging tools
-        uses: actions/cache@v6
+        uses: actions/cache@v6.1.0
         with:
           path: ${{ runner.temp }}/cargo-registry
           key: linux-cargo-package-${{ hashFiles('clients/linux/Cargo.lock', 'clients/linux/ci/check.sh') }}
@@ -335,7 +335,7 @@ jobs:
       VERSION: ${{ needs.version.outputs.version }}
       IS_LATEST: ${{ needs.version.outputs.is_latest }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
       - uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
