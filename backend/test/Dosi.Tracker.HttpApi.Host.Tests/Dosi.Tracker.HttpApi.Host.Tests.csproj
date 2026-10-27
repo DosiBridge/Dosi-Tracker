@@ -49,10 +49,10 @@
     <PackageReference Include="Volo.Abp.AspNetCore.Mvc" Version="10.5.0" />
     <!-- The account endpoints the web calls (self-service password change); TrackerHttpApiModule depends on this module. -->
     <PackageReference Include="Volo.Abp.Account.HttpApi" Version="10.5.0" />
-    <PackageReference Include="Microsoft.AspNetCore.TestHost" Version="10.0.8" />
+    <PackageReference Include="Microsoft.AspNetCore.TestHost" Version="10.0.14" />
     <!-- Same version as the host (AiAssist above). -->
     <PackageReference Include="Microsoft.Extensions.AI.OpenAI" Version="10.11.0" />
-    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.11.0" />
     <PackageReference Include="Shouldly" Version="4.3.0" />
     <PackageReference Include="xunit" Version="2.9.3" />
     <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
