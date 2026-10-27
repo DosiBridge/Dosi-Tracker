@@ -61,7 +61,7 @@ anyhow = "1"
 toml = "0.8"
 # GUI (feature `gui`): glow renderer; X11, xkbcommon, EGL and GL are dlopened, so
 # release binaries link nothing beyond libc/libm/libgcc_s.
-eframe = { version = "0.35", optional = true, default-features = false, features = ["glow", "default_fonts", "x11", "wayland", "accesskit"] }
+eframe = { version = "0.37", optional = true, default-features = false, features = ["glow", "default_fonts", "x11", "wayland", "accesskit"] }
 egui = { version = "0.35", optional = true }
 # Direct dependency only to dlopen libwayland (winit's `wayland` alone links it).
 winit = { version = "0.30", optional = true, default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen", "wayland-csd-adwaita"] }
