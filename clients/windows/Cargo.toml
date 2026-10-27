@@ -65,7 +65,7 @@ config = "0.14"
 # no Linux windowing/accessibility stacks — this is a lightweight Windows agent,
 # so binary size and idle memory matter more than GPU features.
 eframe = { version = "0.35.0", default-features = false, features = ["glow", "default_fonts"] }
-egui = { version = "0.35.0", default-features = false }
+egui = { version = "0.36.2", default-features = false }
 tray-icon = "0.24.1"
 # The window's native handle, to ask Windows whether it is really shown
 # (already in the tree through eframe/winit — no extra download).
