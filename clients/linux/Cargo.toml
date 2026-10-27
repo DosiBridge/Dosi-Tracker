@@ -42,7 +42,7 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", 
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 base64 = "0.22"
-hmac = "0.12"
+hmac = "0.13"
 sha2 = "0.10"
 rand = { version = "0.8", features = ["getrandom"] }
 # Pure-Rust X11: XI2 counts, MIT-SCREEN-SAVER idle, RandR monitors, GetImage, EWMH.
