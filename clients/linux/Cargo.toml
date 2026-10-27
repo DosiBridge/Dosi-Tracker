@@ -36,7 +36,7 @@ test-support = []
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "signal", "net", "io-util"] }
 # TLS roots: the system store plus the bundled Mozilla roots. Verification is never disabled.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots"] }
