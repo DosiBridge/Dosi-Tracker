@@ -314,7 +314,7 @@ if [[ ${guard_status} -eq 0 || ${guard_status} -eq 124 ]]; then
   tail -50 "${work_dir}/guard.log" >&2
   fail "the API started (or hung) with template secrets in Production (exit ${guard_status})"
 fi
-grep -q "Refusing to start in Production with repository/template secrets" "${work_dir}/guard.log" \
+grep -q "Refusing to start outside Development with repository/template secrets" "${work_dir}/guard.log" \
   || { tail -50 "${work_dir}/guard.log" >&2; fail "the API stopped, but not because of the secrets guard"; }
 echo "ok - the API refuses to start with template secrets (exit ${guard_status})"
 
