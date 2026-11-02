@@ -23,21 +23,21 @@
     <PackageReference Include="Microsoft.Extensions.AI.OpenAI" Version="10.11.0" />
     <PackageReference Include="Serilog.AspNetCore" Version="9.0.0" />
     <PackageReference Include="Serilog.Sinks.Async" Version="2.1.0" />
-    <PackageReference Include="Volo.Abp.BlobStoring.Aws" Version="10.5.0" />
+    <PackageReference Include="Volo.Abp.BlobStoring.Aws" Version="10.7.0" />
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Volo.Abp.Autofac" Version="10.5.0" />
-    <PackageReference Include="Volo.Abp.AspNetCore.Serilog" Version="10.5.0" />
-    <PackageReference Include="Volo.Abp.Swashbuckle" Version="10.5.0" />
+    <PackageReference Include="Volo.Abp.Autofac" Version="10.7.0" />
+    <PackageReference Include="Volo.Abp.AspNetCore.Serilog" Version="10.7.0" />
+    <PackageReference Include="Volo.Abp.Swashbuckle" Version="10.7.0" />
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Volo.Abp.Account.Web.OpenIddict" Version="10.5.0" />
+    <PackageReference Include="Volo.Abp.Account.Web.OpenIddict" Version="10.7.0" />
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Volo.Abp.AspNetCore.Mvc.UI.Theme.LeptonXLite" Version="5.5.0" />
+    <PackageReference Include="Volo.Abp.AspNetCore.Mvc.UI.Theme.LeptonXLite" Version="5.7.0" />
   </ItemGroup>
 
   <ItemGroup>
@@ -47,7 +47,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Volo.Abp.Studio.Client.AspNetCore" Version="3.0.7" />
+    <PackageReference Include="Volo.Abp.Studio.Client.AspNetCore" Version="3.1.6" />
   </ItemGroup>
 
   <ItemGroup>
